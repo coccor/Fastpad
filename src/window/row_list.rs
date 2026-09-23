@@ -270,6 +270,19 @@ impl RowListState {
     }
 }
 
+/// A row's text color: the selection's own color only over the focused selection, whose
+/// background `paint` fills; an unfocused selection sits on the inactive-selection background and
+/// keeps the editor's text color. Every sidebar list colors its rows with it.
+pub(crate) fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
+    if look.selected && look.focused {
+        palette
+            .selection_foreground
+            .unwrap_or(palette.editor_foreground)
+    } else {
+        palette.editor_foreground
+    }
+}
+
 /// Paints the rows in view into `area` of `hdc`. For each row it paints the selection (the
 /// unfocused color when `focused` is false) or the hover background, then calls `draw_row` with
 /// the row's index, rectangle and look. Last it paints the thin scroll thumb at the right edge.

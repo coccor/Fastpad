@@ -723,7 +723,7 @@ struct NotebookChecked {
     folder: PathBuf,
     exists: bool,
     /// Show the Notebook view once the notebook is open, with the focus in it for `Some(true)`.
-    /// Task 12's Favorites view asks for it.
+    /// The Favorites view asks for it.
     show_notebook: Option<bool>,
     /// `LibraryHost::check_request` when this check started. If the host's has since moved on (a
     /// newer check, or an explicit switch or close), this answer is stale and is dropped.
@@ -735,6 +735,13 @@ struct NotebookChecked {
 /// and nothing changes. Unlike startup, nothing falls back to `Documents\FastPad`.
 pub(crate) fn open_listed_notebook(hwnd: HWND, folder: &Path) {
     check_listed_notebook(hwnd, folder, None);
+}
+
+/// Opens a listed notebook like `open_listed_notebook`, then shows the Notebook view once it is
+/// open, with the focus in it for `focus`. A missing notebook changes nothing, the view included
+/// (spec §7).
+pub(crate) fn open_listed_notebook_in_view(hwnd: HWND, folder: &Path, focus: bool) {
+    check_listed_notebook(hwnd, folder, Some(focus));
 }
 
 fn check_listed_notebook(hwnd: HWND, folder: &Path, show_notebook: Option<bool>) {
@@ -871,10 +878,6 @@ pub(crate) fn notebook_name(folder: &Path) -> String {
 }
 
 /// Favorite notebooks in `folders.ini` order (the Favorites view sorts them by name).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read from Task 12's Favorites view on")
-)]
 pub(crate) fn favorites(hwnd: HWND) -> Vec<PathBuf> {
     known_folders(hwnd, false).favorites
 }
@@ -913,10 +916,6 @@ pub(crate) fn toggle_notebook_favorite(hwnd: HWND) {
 }
 
 /// Removes `folder` from the favorites; nothing happens if it is not one.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called from Task 12's Favorites view on")
-)]
 pub(crate) fn remove_favorite(hwnd: HWND, folder: &Path) {
     let removed = update_folders(hwnd, |folders| {
         folders.is_favorite(folder) && !folders.toggle_favorite(folder)

@@ -135,10 +135,9 @@ pub(crate) fn register_class() -> crate::Result<&'static [u16]> {
     side_panel::register_child_class(&CLASS, "FastPadActivityBar", 0, Some(bar_proc))
 }
 
-/// The Settings button's click handler. Task 12 points it at `main_window::open_settings_palette`,
-/// which lists only the settings commands.
+/// The Settings button's click handler: the palette listing only the settings commands.
 fn open_settings(main: HWND) {
-    super::main_window::open_command_palette(main);
+    super::main_window::open_settings_palette(main);
 }
 
 /// A click on `button`: an inactive view opens, the active one closes the panel, and Settings

@@ -128,6 +128,30 @@ pub(crate) const ENTRIES: [PaletteEntry; 63] = [
     entry("File: Exit", CommandId::Exit),
 ];
 
+/// What the activity bar's Settings button lists: every command that changes a `fastpad.ini`
+/// setting or the open notebook's autosave switch. The palette shows them in catalog order.
+pub(crate) const SETTINGS_COMMANDS: &[CommandId] = &[
+    CommandId::ToggleRestoreSession,
+    CommandId::ToggleNotesMode,
+    CommandId::ToggleFolderAutosave,
+    CommandId::ToggleWordWrap,
+    CommandId::ToggleLineNumbers,
+    CommandId::FontSizeIncrease,
+    CommandId::FontSizeDecrease,
+    CommandId::FontSizeReset,
+    CommandId::ThemeSystem,
+    CommandId::ThemeLight,
+    CommandId::ThemeDark,
+    CommandId::ThemeCatppuccin,
+    CommandId::ThemeCatppuccinLatte,
+    CommandId::ThemeCatppuccinFrappe,
+    CommandId::ThemeCatppuccinMacchiato,
+    CommandId::ThemeCatppuccinMocha,
+    CommandId::TabWidth2,
+    CommandId::TabWidth4,
+    CommandId::TabWidth8,
+];
+
 /// How well `query` matches `label`, lower is better; `None` when it does not match at all.
 /// Case-insensitive and whitespace-insensitive in the query: a label prefix beats a word prefix,
 /// which beats a substring, which beats the query's characters merely appearing in order.
@@ -360,6 +384,8 @@ pub(crate) struct CommandPalette {
     picker: Option<Picker>,
     /// The rows `picker` currently shows, filtered by the query.
     picker_rows: Vec<PickerRow>,
+    /// `Some` while command mode lists only these commands (the Settings button).
+    subset: Option<&'static [CommandId]>,
     visible: bool,
     colors: Palette,
     layout: Option<PanelLayout>,
@@ -404,6 +430,7 @@ impl CommandPalette {
             shown: Vec::new(),
             picker: None,
             picker_rows: Vec::new(),
+            subset: None,
             visible: false,
             colors,
             layout: None,
@@ -468,6 +495,7 @@ impl CommandPalette {
     pub(crate) fn mark_hidden(&mut self) -> bool {
         self.picker = None;
         self.picker_rows = Vec::new();
+        self.subset = None;
         std::mem::take(&mut self.visible)
     }
 
@@ -499,6 +527,15 @@ impl CommandPalette {
 
     pub(crate) fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
+    }
+
+    /// Limits command mode to `subset`, or lifts the limit with `None`.
+    pub(crate) fn set_subset(&mut self, subset: Option<&'static [CommandId]>) {
+        self.subset = subset;
+    }
+
+    pub(crate) fn subset(&self) -> Option<&'static [CommandId]> {
+        self.subset
     }
 
     /// Records the picker rows to list; `fill_list` then puts them in the list box.
@@ -926,10 +963,31 @@ unsafe extern "system" fn palette_control_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, filter_entries, match_rank,
-        picker_row_label, picker_rows, shortcut_text,
+        ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, SETTINGS_COMMANDS, filter_entries,
+        match_rank, picker_row_label, picker_rows, shortcut_text,
     };
     use crate::window::commands::CommandId;
+
+    #[test]
+    fn every_settings_command_has_exactly_one_palette_entry() {
+        // Break caught: a Settings button entry with no palette row, which the filtered palette
+        // could never show, or a settings list that lets non-settings commands through.
+        for command in SETTINGS_COMMANDS {
+            let listed = ENTRIES
+                .iter()
+                .filter(|entry| entry.command == *command)
+                .count();
+            assert_eq!(listed, 1, "{command:?}");
+        }
+        let listed = filter_entries("", |command| SETTINGS_COMMANDS.contains(&command));
+        assert_eq!(listed.len(), SETTINGS_COMMANDS.len());
+        assert!(listed.iter().all(|entry| entry.command != CommandId::Save));
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.command == CommandId::ThemeCatppuccinMocha)
+        );
+    }
 
     fn labels(query: &str) -> Vec<&'static str> {
         filter_entries(query, |_| true)

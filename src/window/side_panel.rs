@@ -1,8 +1,7 @@
 //! The sidebar: the activity bar and one side panel, two painted child windows along the main
 //! window's left edge, present only in notes mode. Everything else in the window is laid out to
 //! their right (`left_edge`). The panel paints the current view. The views plug in through the
-//! `PanelView` dispatch (`paint_view`, `view_mouse`, `view_key`, `header_is_caption`), which
-//! Tasks 10 and 12 extend.
+//! `PanelView` dispatch (`paint_view`, `view_mouse`, `view_key`, `header_is_caption`).
 //!
 //! The strip above the first activity button and the empty part of the panel header belong to the
 //! window caption. Both windows answer `WM_NCHITTEST` there with `HTTRANSPARENT`, so the main
@@ -25,9 +24,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DRAW_TEXT_FORMAT, DT_CALCRECT,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, FW_NORMAL, FW_SEMIBOLD, HDC, HFONT, InvalidateRect, PAINTSTRUCT, SRCCOPY,
-    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FW_SEMIBOLD, HDC, HFONT,
+    InvalidateRect, PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -36,13 +35,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, ReleaseCapture, SetCapture, SetFocus,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, DefWindowProcW, DestroyWindow, GWL_STYLE, GetClientRect, GetCursorPos, GetParent,
-    GetWindowLongPtrW, HTTRANSPARENT, IDC_ARROW, IDC_SIZEWE, IsChild, LoadCursorW, RegisterClassW,
-    SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetWindowPos, ShowWindow,
-    WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WNDCLASSW, WNDPROC,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CS_DBLCLKS, DefWindowProcW, DestroyWindow, EN_CHANGE, GWL_STYLE, GetClientRect, GetCursorPos,
+    GetParent, GetWindowLongPtrW, HTTRANSPARENT, IDC_ARROW, IDC_SIZEWE, IsChild, LoadCursorW,
+    RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetWindowPos,
+    ShowWindow, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETFOCUS, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_VISIBLE,
 };
 
 /// Sizes at 96 DPI, scaled with `panel::scale`.
@@ -51,7 +51,6 @@ pub(crate) const EDITOR_MIN_WIDTH_96: i32 = 320;
 pub(crate) const HEADER_HEIGHT_96: i32 = 38;
 /// The strip along the panel's right edge that resizes it.
 pub(crate) const GRIP_WIDTH_96: i32 = 4;
-const HEADER_INSET_96: i32 = 16;
 
 /// The sidebar's fonts at one DPI. Painting copies them out; `Sidebar` owns and deletes them.
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +116,8 @@ pub(crate) struct Sidebar {
     pub(crate) bar_state: BarState,
     /// The Notebook view's rows, selection and hover.
     pub(crate) notebook: crate::window::notebook_view::NotebookView,
+    pub(crate) favorites: crate::window::favorites_view::FavoritesView,
+    pub(crate) search: crate::window::search_view::SearchView,
     /// The view Ctrl+B reopens while the panel is closed.
     last_view: SidebarView,
     /// The live width (96-DPI pixels) while the panel edge is dragged. The setting changes once,
@@ -151,7 +152,7 @@ impl Drop for Sidebar {
     }
 }
 
-/// The view the panel is showing. Tasks 10 and 12 give each view its painting and input
+/// The view the panel is showing. Each view gets its painting and input
 /// through the `match`es in `paint_view`, `view_mouse`, `view_key` and `header_is_caption`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PanelView {
@@ -167,15 +168,6 @@ impl PanelView {
             SidebarView::Search => Some(Self::Search),
             SidebarView::Favorites => Some(Self::Favorites),
             SidebarView::Hidden => None,
-        }
-    }
-
-    /// The header's title, in small capitals.
-    pub(crate) const fn title(self) -> &'static str {
-        match self {
-            Self::Notebook => "NOTEBOOK",
-            Self::Search => "SEARCH",
-            Self::Favorites => "FAVORITES",
         }
     }
 }
@@ -339,12 +331,25 @@ pub(crate) fn create(hwnd: HWND) -> crate::Result<Sidebar> {
             return Err(error);
         }
     };
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let search = match crate::window::search_view::SearchView::create(panel, dpi) {
+        Ok(search) => search,
+        Err(error) => {
+            unsafe {
+                DestroyWindow(panel);
+                DestroyWindow(bar);
+            }
+            return Err(error);
+        }
+    };
     Ok(Sidebar {
         bar,
         panel,
         tooltip: Tooltip::create(bar),
         bar_state: BarState::default(),
         notebook: crate::window::notebook_view::NotebookView::new(panel),
+        favorites: crate::window::favorites_view::FavoritesView::new(dpi),
+        search,
         last_view: SidebarView::Notebook,
         drag_width: None,
         fonts: None,
@@ -435,10 +440,11 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
         unsafe { ShowWindow(panel, SW_HIDE) };
     }
     update_tools(hwnd);
+    crate::window::search_view::layout(hwnd);
 }
 
 /// Shows `view`, or closes the panel for `Hidden`, and saves it as `sidebar_view`. `focus` moves
-/// the keyboard focus into the panel. Task 12 moves it into the search box for Search.
+/// the keyboard focus into the panel, or into the search box for Search.
 pub(crate) fn show_view(hwnd: HWND, view: SidebarView, focus: bool) {
     let Some(panel) = with_sidebar(hwnd, |sidebar| {
         if view != SidebarView::Hidden {
@@ -466,6 +472,11 @@ pub(crate) fn show_view(hwnd: HWND, view: SidebarView, focus: bool) {
     if focus && view != SidebarView::Hidden && is_shown(panel) {
         unsafe { SetFocus(panel) };
     }
+    if view == SidebarView::Search {
+        crate::window::search_view::shown(hwnd, focus);
+    } else {
+        crate::window::search_view::hidden(hwnd);
+    }
 }
 
 /// Ctrl+B: closes the panel, or reopens the last view.
@@ -488,6 +499,8 @@ pub(crate) fn refresh(hwnd: HWND) {
         return;
     };
     crate::window::notebook_view::rebuild(hwnd);
+    crate::window::favorites_view::refresh(hwnd, panel);
+    crate::window::search_view::library_changed(hwnd);
     update_tools(hwnd);
     unsafe {
         InvalidateRect(bar, std::ptr::null(), 0);
@@ -663,6 +676,14 @@ unsafe extern "system" fn panel_proc(
             unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
             0
         }
+        // The search box's text changed: re-run the search.
+        WM_COMMAND if lparam != 0 && ((wparam >> 16) & 0xffff) as u32 == EN_CHANGE => {
+            crate::window::search_view::query_changed(main);
+            0
+        }
+        WM_CTLCOLOREDIT => {
+            crate::window::search_view::control_color(main, wparam as HDC) as LRESULT
+        }
         _ => unsafe { DefWindowProcW(panel, message, wparam, lparam) },
     }
 }
@@ -717,39 +738,17 @@ fn paint_panel(main: HWND, panel: HWND) {
     });
 }
 
-/// Paints `view` over the panel's background. Task 12 gives the Search and Favorites views their
-/// own paint.
+/// Paints `view` over the panel's background.
 fn paint_view(main: HWND, view: PanelView, paint: &ViewPaint) {
     match view {
         PanelView::Notebook => crate::window::notebook_view::paint(main, paint),
-        PanelView::Search | PanelView::Favorites => paint_header_title(view, paint),
-    }
-}
-
-/// A view's header title alone, until the view paints itself.
-fn paint_header_title(view: PanelView, paint: &ViewPaint) {
-    let inset = scale(HEADER_INSET_96, paint.dpi);
-    let title = RECT {
-        left: paint.client.left + inset,
-        right: (paint.client.right - inset).max(paint.client.left + inset),
-        bottom: (paint.client.top + scale(HEADER_HEIGHT_96, paint.dpi)).min(paint.client.bottom),
-        ..paint.client
-    };
-    unsafe {
-        draw_text(
-            paint.hdc,
-            view.title(),
-            title,
-            paint.fonts.bold,
-            paint.palette.muted_foreground,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
+        PanelView::Search => crate::window::search_view::paint(main, paint),
+        PanelView::Favorites => crate::window::favorites_view::paint(main, paint),
     }
 }
 
 /// Mouse input (and `WM_CONTEXTMENU`, `WM_MOUSELEAVE`, `WM_CAPTURECHANGED`) for `view`, with the
-/// message's own `wparam` and `lparam`. `None` leaves it to `DefWindowProcW`. Task 12 replaces
-/// the Search and Favorites arm.
+/// message's own `wparam` and `lparam`. `None` leaves it to `DefWindowProcW`.
 fn view_mouse(
     main: HWND,
     view: PanelView,
@@ -760,36 +759,43 @@ fn view_mouse(
 ) -> Option<LRESULT> {
     match view {
         PanelView::Notebook => crate::window::notebook_view::handle(main, message, wparam, lparam),
-        PanelView::Search | PanelView::Favorites => (message == WM_LBUTTONDOWN).then(|| {
-            unsafe { SetFocus(panel) };
-            0
-        }),
+        PanelView::Search => {
+            crate::window::search_view::handle(main, panel, message, wparam, lparam)
+        }
+        PanelView::Favorites => {
+            crate::window::favorites_view::handle(main, panel, message, wparam, lparam)
+        }
     }
 }
 
 /// `WM_KEYDOWN` and `WM_CHAR` while the panel has the focus. `None` leaves the key to
-/// `DefWindowProcW`. Task 12 handles the lists' keys.
+/// `DefWindowProcW`. Each view's `handle` takes keys and mouse messages alike.
 fn view_key(
     main: HWND,
     view: PanelView,
-    _panel: HWND,
+    panel: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
-    match view {
-        PanelView::Notebook => crate::window::notebook_view::handle(main, message, wparam, lparam),
-        PanelView::Search | PanelView::Favorites => None,
-    }
+    view_mouse(main, view, panel, message, wparam, lparam)
 }
 
 /// Whether header point `x`, `y` (panel client coordinates) is empty, so the window drags from
-/// it. The Notebook header's name and buttons stay client area. Task 12 excludes the Favorites
-/// header's Open notebook… button.
-fn header_is_caption(main: HWND, view: PanelView, _panel: HWND, x: i32, y: i32) -> bool {
+/// it: not the Notebook header's title and buttons, nor the Favorites header's Open notebook…
+/// button. The search box is a child window, so it never reaches the panel's hit test.
+fn header_is_caption(main: HWND, view: PanelView, panel: HWND, x: i32, y: i32) -> bool {
     match view {
         PanelView::Notebook => !crate::window::notebook_view::header_hit(main, x, y),
-        PanelView::Search | PanelView::Favorites => true,
+        PanelView::Search => true,
+        PanelView::Favorites => {
+            let mut client = RECT::default();
+            unsafe { GetClientRect(panel, &mut client) };
+            let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+            !crate::window::favorites_view::header_controls(client, dpi)
+                .iter()
+                .any(|rect| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+        }
     }
 }
 
@@ -915,6 +921,5 @@ mod tests {
             Some(PanelView::Favorites)
         );
         assert_eq!(PanelView::of(SidebarView::Hidden), None);
-        assert_eq!(PanelView::Favorites.title(), "FAVORITES");
     }
 }

@@ -1229,6 +1229,15 @@ fn take_palette_note_target(hwnd: HWND) -> Option<std::path::PathBuf> {
 }
 
 pub(crate) fn open_command_palette(hwnd: HWND) {
+    show_command_palette(hwnd, None);
+}
+
+/// The activity bar's Settings button: the palette listing only `SETTINGS_COMMANDS`.
+pub(crate) fn open_settings_palette(hwnd: HWND) {
+    show_command_palette(hwnd, Some(command_palette::SETTINGS_COMMANDS));
+}
+
+fn show_command_palette(hwnd: HWND, subset: Option<&'static [CommandId]>) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
@@ -1243,12 +1252,14 @@ pub(crate) fn open_command_palette(hwnd: HWND) {
         let newly_shown = palette.mark_shown(colors);
         // Reopening the palette normally always shows commands, even right after a picker.
         palette.set_picker(None);
+        palette.set_subset(subset);
         Some(newly_shown)
     });
     let Some(newly_shown) = newly_shown else {
         return;
     };
-    if newly_shown {
+    // A query typed for the full list would hide most settings, so Settings always starts empty.
+    if newly_shown || subset.is_some() {
         // Clearing the field sends EN_CHANGE, which lists every available command.
         with_command_palette(hwnd, CommandPalette::clear_query);
     }
@@ -1354,8 +1365,10 @@ fn refilter_command_palette(hwnd: HWND) {
         let has_tabs = tab_count(hwnd) > 0;
         let markdown = crate::window::preview_host::buttons_visible(hwnd);
         let sidebar = notes_mode_enabled(hwnd);
+        let subset = with_command_palette(hwnd, CommandPalette::subset).flatten();
         let entries = command_palette::filter_entries(&query, |command| {
-            (has_tabs || !command.needs_document())
+            subset.is_none_or(|subset| subset.contains(&command))
+                && (has_tabs || !command.needs_document())
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
         });
@@ -6739,15 +6752,14 @@ mod tests {
         assert_eq!(view(), SidebarView::Search);
         assert_eq!(saved(), "# kept\r\nsidebar_view=search\r\n");
 
-        // Settings opens the command palette; Task 12 narrows it to the settings commands.
+        // Settings opens the command palette listing only the settings commands.
         let (x, y) = button_center(window.hwnd, ActivityButton::Settings);
         click(bar, x, y);
-        assert!(
-            app_mut(window.hwnd)
-                .command_palette
-                .as_ref()
-                .unwrap()
-                .is_visible()
+        let palette = app_mut(window.hwnd).command_palette.as_ref().unwrap();
+        assert!(palette.is_visible());
+        assert_eq!(
+            palette.subset(),
+            Some(crate::window::command_palette::SETTINGS_COMMANDS)
         );
         assert_eq!(view(), SidebarView::Search);
         super::save_settings_to(None);
@@ -10556,5 +10568,189 @@ mod tests {
             "a save must not recreate the file at the old location"
         );
         assert_eq!(std::fs::read_to_string(&moved).unwrap(), "unsaved edit");
+    }
+
+    fn sidebar_panel(hwnd: HWND) -> HWND {
+        crate::window::side_panel::windows(hwnd).unwrap().1
+    }
+
+    fn type_into_search(hwnd: HWND, text: &str) {
+        let edit = crate::window::search_view::edit_hwnd(hwnd).unwrap();
+        let wide = crate::platform::wide_null(text);
+        // The Edit sends EN_CHANGE to the panel, which re-runs the search synchronously.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
+        }
+    }
+
+    #[test]
+    fn the_search_view_matches_names_shows_folders_and_opens_the_preview_tab() {
+        // Break caught: search over full paths instead of names, results without their folder,
+        // or Enter opening a normal tab instead of the preview tab.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-view");
+        scratch.note("Alpha.md", "a");
+        scratch.note("beta.md", "b");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\alphabet.md", "c");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        assert_eq!(crate::window::search_view::status(window.hwnd), None);
+
+        type_into_search(window.hwnd, "alp");
+        assert_eq!(
+            crate::window::search_view::shown_results(window.hwnd),
+            vec![
+                ("Alpha".to_owned(), String::new()),
+                ("alphabet".to_owned(), "sub".to_owned())
+            ]
+        );
+        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(
+            active.path.as_deref(),
+            Some(scratch.folder().join("Alpha.md").as_path())
+        );
+        let active_id = active.id;
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), Some(active_id));
+
+        type_into_search(window.hwnd, "zzz");
+        assert_eq!(
+            crate::window::search_view::status(window.hwnd),
+            Some(crate::window::search_view::NO_MATCH)
+        );
+    }
+
+    #[test]
+    fn the_search_query_survives_a_view_switch_but_not_a_notebook_switch() {
+        // Break caught: the query lost whenever another view is shown, or kept (with results
+        // from the old notebook) after a different notebook opens.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("search-keep-a");
+        first.note("plan.md", "p");
+        let second = LibraryScratch::new("search-keep-b");
+        second.note("other.md", "o");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        first.install(window.hwnd);
+        use crate::config::SidebarView;
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
+        type_into_search(window.hwnd, "pl");
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
+        assert_eq!(
+            crate::window::search_view::shown_results(window.hwnd).len(),
+            1
+        );
+
+        second.install(window.hwnd);
+        assert!(crate::window::search_view::shown_results(window.hwnd).is_empty());
+        let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit) },
+            0
+        );
+    }
+
+    #[test]
+    fn with_no_notebook_the_search_view_says_to_open_one() {
+        // Break caught: an empty Search view with a live box that searches nothing.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        assert_eq!(
+            crate::window::search_view::status(window.hwnd),
+            Some(crate::window::search_view::NO_NOTEBOOK)
+        );
+    }
+
+    #[test]
+    fn a_favorite_opens_from_the_favorites_view_and_its_menu_removes_it() {
+        // Break caught: a click on a favorite not switching the notebook or leaving the Favorites
+        // view up, or "Remove from favorites" in the row menu doing nothing.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("favorites-a");
+        let second = LibraryScratch::new("favorites-b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        second.install(window.hwnd);
+        crate::window::library_host::toggle_notebook_favorite(window.hwnd);
+        first.install(window.hwnd);
+        use crate::config::SidebarView;
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Favorites, true);
+        let rows = crate::window::favorites_view::shown_rows(window.hwnd);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].open);
+
+        crate::window::favorites_view::run(
+            window.hwnd,
+            crate::window::favorites_view::FavoriteAction::Open(second.folder()),
+            true,
+        );
+        // The folder is checked on a worker; the view switches once the notebook is open.
+        pump_until(window.hwnd, || {
+            crate::window::side_panel::current_view(window.hwnd) == SidebarView::Notebook
+        });
+        assert!(crate::library::model::same_path(
+            &crate::window::library_host::folder(window.hwnd).unwrap(),
+            &second.folder()
+        ));
+
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Favorites, true);
+        let panel = sidebar_panel(window.hwnd);
+        unsafe {
+            SendMessageW(
+                panel,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                0x24,
+                0,
+            );
+        }
+        crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::ToggleNotebookFavorite));
+        // Shift+F10 arrives as WM_CONTEXTMENU with (-1, -1).
+        unsafe {
+            SendMessageW(
+                panel,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU,
+                panel as usize,
+                0xffff_ffff,
+            );
+        }
+        assert!(crate::window::favorites_view::shown_rows(window.hwnd).is_empty());
+    }
+
+    #[test]
+    fn the_settings_button_lists_only_settings_and_the_next_palette_lists_everything() {
+        // Break caught: Settings showing the full command list, or its filter sticking to the
+        // next Ctrl+Shift+P.
+        let window = ProductionWindow::new(make_app());
+        super::open_settings_palette(window.hwnd);
+        let shown = with_command_palette(window.hwnd, |palette| {
+            palette
+                .shown()
+                .iter()
+                .map(|entry| entry.command)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        assert!(shown.contains(&CommandId::ThemeDark));
+        assert!(
+            shown
+                .iter()
+                .all(|command| crate::window::command_palette::SETTINGS_COMMANDS.contains(command))
+        );
+        super::close_command_palette(window.hwnd, false);
+
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let shown = with_command_palette(window.hwnd, |palette| palette.shown().len()).unwrap();
+        assert!(shown > crate::window::command_palette::SETTINGS_COMMANDS.len());
     }
 }

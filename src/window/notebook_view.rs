@@ -11,7 +11,7 @@ use crate::window::commands::CommandId;
 use crate::window::menus::MenuEntry;
 use crate::window::palette::Palette;
 use crate::window::panel::{fill, scale};
-use crate::window::row_list::{self, ListKey, RowListState, RowLook};
+use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::tooltip::Tooltip;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -404,19 +404,6 @@ const fn contains(rect: RECT, x: i32, y: i32) -> bool {
 
 const LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX;
 const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
-
-/// A row's text color: the selection's own color only over the focused selection, whose
-/// background `row_list::paint` fills; an unfocused selection sits on the inactive-selection
-/// background and keeps the editor's text color.
-fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
-    if look.selected && look.focused {
-        palette
-            .selection_foreground
-            .unwrap_or(palette.editor_foreground)
-    } else {
-        palette.editor_foreground
-    }
-}
 
 #[allow(
     clippy::too_many_arguments,
