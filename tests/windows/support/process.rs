@@ -38,21 +38,70 @@ type TestResult<T> = Result<T, Box<dyn Error>>;
 #[cfg(windows)]
 pub struct FastPadProcess {
     process: std::process::Child,
+    /// The `LOCALAPPDATA` a plain `spawn` created for this process; removed once it has exited.
+    owned_local_app_data: Option<std::path::PathBuf>,
+}
+
+/// Name of the notes folder seeded inside a scratch `LOCALAPPDATA`.
+#[cfg(windows)]
+pub const SCRATCH_NOTES_FOLDER: &str = "FastPad-notes";
+
+/// Points `folders.ini` at a scratch notes folder inside `local_app_data`, unless the test already
+/// wrote its own. With notes mode on (the default), FastPad otherwise opens the user's real recent
+/// folder or `Documents\FastPad`, scanning it and writing `.fastpad\library.ini` there.
+#[cfg(windows)]
+pub fn seed_scratch_notes_folder(local_app_data: &std::path::Path) -> TestResult<()> {
+    let data = local_app_data.join("FastPad");
+    let folders = fastpad::library::local::folders_file(&data);
+    if folders.exists() {
+        return Ok(());
+    }
+    let notes = local_app_data.join(SCRATCH_NOTES_FOLDER);
+    std::fs::create_dir_all(&notes)?;
+    std::fs::create_dir_all(&data)?;
+    let recent = fastpad::library::local::RecentFolders {
+        folders: vec![notes],
+    };
+    std::fs::write(&folders, recent.encode())?;
+    Ok(())
+}
+
+/// A fresh, empty `LOCALAPPDATA` for a spawn that did not name one.
+#[cfg(windows)]
+fn owned_scratch_local_app_data() -> TestResult<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "fastpad-spawn-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+    Ok(root)
 }
 
 #[cfg(windows)]
 impl FastPadProcess {
+    /// Spawns FastPad with a fresh scratch `LOCALAPPDATA`, removed after the process exits.
     pub fn spawn<I, S>(args: I) -> TestResult<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
-        command.args(args);
-        Self::spawn_command(command)
+        let local_app_data = owned_scratch_local_app_data()?;
+        let mut process = Self::spawn_with_local_app_data(args, &local_app_data);
+        match &mut process {
+            Ok(process) => process.owned_local_app_data = Some(local_app_data),
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&local_app_data);
+            }
+        }
+        process
     }
 
-    /// Spawns FastPad with `LOCALAPPDATA` redirected so settings never touch the real profile.
+    /// Spawns FastPad with `LOCALAPPDATA` redirected so settings never touch the real profile, and
+    /// its notes folder seeded inside it (see `seed_scratch_notes_folder`).
     pub fn spawn_with_local_app_data<I, S>(
         args: I,
         local_app_data: &std::path::Path,
@@ -61,6 +110,7 @@ impl FastPadProcess {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        seed_scratch_notes_folder(local_app_data)?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
         command.args(args).env("LOCALAPPDATA", local_app_data);
         Self::spawn_command(command)
@@ -78,6 +128,7 @@ impl FastPadProcess {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        seed_scratch_notes_folder(local_app_data)?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
         command.args(args).env("LOCALAPPDATA", local_app_data);
         for (name, value) in environment {
@@ -85,6 +136,7 @@ impl FastPadProcess {
         }
         Ok(Self {
             process: command.spawn()?,
+            owned_local_app_data: None,
         })
     }
 
@@ -109,7 +161,10 @@ impl FastPadProcess {
             WaitForInputIdle(process_raw_handle(&process), 2_000);
         }
 
-        Ok(Self { process })
+        Ok(Self {
+            process,
+            owned_local_app_data: None,
+        })
     }
 
     pub fn id(&self) -> u32 {
@@ -168,6 +223,9 @@ impl FastPadProcess {
 impl Drop for FastPadProcess {
     fn drop(&mut self) {
         let _ = cleanup_process(&mut self.process, &Deadline::after(Duration::from_secs(2)));
+        if let Some(local_app_data) = self.owned_local_app_data.take() {
+            let _ = std::fs::remove_dir_all(local_app_data);
+        }
     }
 }
 
