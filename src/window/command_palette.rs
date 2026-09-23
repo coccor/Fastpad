@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 52] = [
+pub(crate) const ENTRIES: [PaletteEntry; 63] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open folder...", CommandId::OpenFolder),
@@ -64,6 +64,20 @@ pub(crate) const ENTRIES: [PaletteEntry; 52] = [
     ),
     entry("Note: Reload from disk", CommandId::NoteReloadFromDisk),
     entry("Note: Keep my version", CommandId::NoteKeepMine),
+    entry("Note: Toggle favorite", CommandId::NoteToggleFavorite),
+    entry("Note: Toggle pin", CommandId::NoteTogglePin),
+    entry("Note: Move to notebook...", CommandId::NoteMoveToNotebook),
+    entry("Note: Add tag...", CommandId::NoteAddTag),
+    entry("Note: Remove tag...", CommandId::NoteRemoveTag),
+    entry("Notebook: New...", CommandId::NotebookNew),
+    entry("Notebook: Rename...", CommandId::NotebookRename),
+    entry("Notebook: Change color...", CommandId::NotebookChangeColor),
+    entry("Notebook: Delete...", CommandId::NotebookDelete),
+    entry("Tag: Rename...", CommandId::TagRename),
+    entry(
+        "Tag: Remove from all notes...",
+        CommandId::TagRemoveEverywhere,
+    ),
     entry("Edit: Undo", CommandId::Undo),
     entry("Edit: Redo", CommandId::Redo),
     entry("Edit: Cut", CommandId::Cut),
@@ -176,10 +190,6 @@ pub(crate) fn filter_entries(
 }
 
 /// What a picker is choosing; decides what `library_host::picked` does with the choice.
-#[allow(
-    dead_code,
-    reason = "the organizing pickers of Task 19 construct the remaining kinds"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PickerKind {
     RecentFolder,

@@ -49,13 +49,10 @@ pub(crate) enum NamePurpose {
     FirstSave(DocumentId),
     #[allow(dead_code, reason = "Task 20 renames notes through the name box")]
     RenameNote(DocumentId),
-    #[allow(dead_code, reason = "Task 19 names new notebooks through the name box")]
     NewNotebook {
         then_move: Option<DocumentId>,
     },
-    #[allow(dead_code, reason = "Task 19 renames notebooks through the name box")]
     RenameNotebook(NotebookId),
-    #[allow(dead_code, reason = "Task 19 renames tags through the name box")]
     RenameTag(TagId),
 }
 

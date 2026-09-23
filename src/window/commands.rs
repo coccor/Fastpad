@@ -64,6 +64,17 @@ pub enum CommandId {
     ToggleFolderAutosave,
     NoteReloadFromDisk,
     NoteKeepMine,
+    NoteToggleFavorite,
+    NoteTogglePin,
+    NoteMoveToNotebook,
+    NoteAddTag,
+    NoteRemoveTag,
+    NotebookNew,
+    NotebookRename,
+    NotebookChangeColor,
+    NotebookDelete,
+    TagRename,
+    TagRemoveEverywhere,
 }
 
 impl CommandId {
@@ -97,6 +108,12 @@ impl CommandId {
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
                 | Self::ToggleFolderAutosave
+                | Self::NotebookNew
+                | Self::NotebookRename
+                | Self::NotebookChangeColor
+                | Self::NotebookDelete
+                | Self::TagRename
+                | Self::TagRemoveEverywhere
         )
     }
 
@@ -126,7 +143,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 63] = [
+        const COMMANDS: [CommandId; 74] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -190,6 +207,17 @@ impl TryFrom<u16> for CommandId {
             CommandId::ToggleFolderAutosave,
             CommandId::NoteReloadFromDisk,
             CommandId::NoteKeepMine,
+            CommandId::NoteToggleFavorite,
+            CommandId::NoteTogglePin,
+            CommandId::NoteMoveToNotebook,
+            CommandId::NoteAddTag,
+            CommandId::NoteRemoveTag,
+            CommandId::NotebookNew,
+            CommandId::NotebookRename,
+            CommandId::NotebookChangeColor,
+            CommandId::NotebookDelete,
+            CommandId::TagRename,
+            CommandId::TagRemoveEverywhere,
         ];
         COMMANDS
             .into_iter()
@@ -260,6 +288,21 @@ mod tests {
         assert!(!CommandId::ToggleFolderAutosave.needs_document());
         assert!(CommandId::NoteReloadFromDisk.needs_document());
         assert!(CommandId::NoteKeepMine.needs_document());
+        assert_eq!(CommandId::try_from(163), Ok(CommandId::NoteToggleFavorite));
+        assert_eq!(CommandId::try_from(164), Ok(CommandId::NoteTogglePin));
+        assert_eq!(CommandId::try_from(165), Ok(CommandId::NoteMoveToNotebook));
+        assert_eq!(CommandId::try_from(166), Ok(CommandId::NoteAddTag));
+        assert_eq!(CommandId::try_from(167), Ok(CommandId::NoteRemoveTag));
+        assert_eq!(CommandId::try_from(168), Ok(CommandId::NotebookNew));
+        assert_eq!(CommandId::try_from(169), Ok(CommandId::NotebookRename));
+        assert_eq!(CommandId::try_from(170), Ok(CommandId::NotebookChangeColor));
+        assert_eq!(CommandId::try_from(171), Ok(CommandId::NotebookDelete));
+        assert_eq!(CommandId::try_from(172), Ok(CommandId::TagRename));
+        assert_eq!(CommandId::try_from(173), Ok(CommandId::TagRemoveEverywhere));
+        assert!(CommandId::NoteToggleFavorite.needs_document());
+        assert!(CommandId::NoteRemoveTag.needs_document());
+        assert!(!CommandId::NotebookNew.needs_document());
+        assert!(!CommandId::TagRemoveEverywhere.needs_document());
     }
 
     #[test]

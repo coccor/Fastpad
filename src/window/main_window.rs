@@ -1823,6 +1823,17 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         }
         CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
         CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
+        CommandId::NoteToggleFavorite
+        | CommandId::NoteTogglePin
+        | CommandId::NoteMoveToNotebook
+        | CommandId::NoteAddTag
+        | CommandId::NoteRemoveTag
+        | CommandId::NotebookNew
+        | CommandId::NotebookRename
+        | CommandId::NotebookChangeColor
+        | CommandId::NotebookDelete
+        | CommandId::TagRename
+        | CommandId::TagRemoveEverywhere => crate::window::library_host::organize(hwnd, command),
         CommandId::FontSizeIncrease => {
             set_font_size(hwnd, |size| {
                 size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
@@ -7979,5 +7990,245 @@ mod tests {
         crate::window::library_host::activation_changed(window.hwnd, false);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
         assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    use crate::window::command_palette::{PickerChoice, PickerKind};
+
+    fn library(hwnd: HWND) -> &'static crate::library::model::Library {
+        &app_mut(hwnd).library.state.as_ref().unwrap().library
+    }
+
+    #[test]
+    fn favorite_pin_notebook_and_tags_apply_to_the_active_file_and_persist() {
+        // Break caught: organizing commands changing only memory, or recording the wrong file.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("organize");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "a");
+        let hwnd = window.hwnd;
+
+        execute_command(hwnd, CommandId::NoteToggleFavorite);
+        execute_command(hwnd, CommandId::NoteTogglePin);
+        execute_command(hwnd, CommandId::NotebookNew);
+        type_into_name_box(hwnd, "Work");
+        crate::window::library_host::name_box_submit(hwnd);
+        execute_command(hwnd, CommandId::NoteMoveToNotebook);
+        // Row 0 is "Notes", row 1 is "Work".
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::MoveToNotebook,
+            PickerChoice::Item(1),
+        );
+        execute_command(hwnd, CommandId::NoteAddTag);
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::AddTag,
+            PickerChoice::Create("#idea".into()),
+        );
+
+        let record = app_mut(hwnd)
+            .library
+            .state
+            .as_ref()
+            .unwrap()
+            .record_for(&path)
+            .unwrap()
+            .clone();
+        assert!(record.favorite && record.pinned);
+        assert_eq!(
+            library(hwnd)
+                .notebook(record.notebook.unwrap())
+                .unwrap()
+                .name,
+            "Work"
+        );
+        assert_eq!(library(hwnd).tag(record.tags[0]).unwrap().name, "idea");
+
+        crate::window::library_host::flush_now(hwnd);
+        let reloaded =
+            crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
+        assert!(reloaded.record_for(&path).unwrap().favorite);
+    }
+
+    #[test]
+    fn duplicate_notebook_names_show_an_inline_error_and_keep_the_box_open() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("dup-notebook");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        open_note(&window, &scratch, "a.md", "a");
+        for _ in 0..2 {
+            execute_command(window.hwnd, CommandId::NotebookNew);
+            type_into_name_box(window.hwnd, "work");
+            crate::window::library_host::name_box_submit(window.hwnd);
+        }
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(name_box.error(), Some("That name is already used."));
+        assert_eq!(library(window.hwnd).notebooks.len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_notebook_asks_first_and_moves_its_notes_to_notes() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("delete-notebook");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "a");
+        let hwnd = window.hwnd;
+        execute_command(hwnd, CommandId::NotebookNew);
+        type_into_name_box(hwnd, "Work");
+        crate::window::library_host::name_box_submit(hwnd);
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::MoveToNotebook,
+            PickerChoice::Item(1),
+        );
+
+        crate::window::answer_next_confirm(|_| false);
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::DeleteNotebook,
+            PickerChoice::Item(0),
+        );
+        assert_eq!(library(hwnd).notebooks.len(), 1, "cancelled");
+
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::DeleteNotebook,
+            PickerChoice::Item(0),
+        );
+        assert!(library(hwnd).notebooks.is_empty());
+        let state = app_mut(hwnd).library.state.as_ref().unwrap();
+        assert_eq!(state.record_for(&path).unwrap().notebook, None);
+        assert!(path.exists(), "no note content is deleted");
+    }
+
+    #[test]
+    fn an_untitled_tab_must_be_saved_before_it_can_be_organized() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("untitled-organize");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::create_new_document(window.hwnd).unwrap();
+        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n == "Save this note first to organize it.")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_library_disables_organizing_with_an_explanation() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("readonly");
+        let ini = crate::library::store::library_file(&scratch.folder());
+        std::fs::create_dir_all(ini.parent().unwrap()).unwrap();
+        std::fs::write(&ini, "version=99\r\n").unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        open_note(&window, &scratch, "a.md", "a");
+        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        crate::window::library_host::flush_now(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "version=99\r\n");
+        assert!(notices(window.hwnd).iter().any(|n| n.contains("read-only")));
+    }
+
+    #[test]
+    fn recoloring_renaming_and_removing_a_tag_act_on_the_picked_rows() {
+        // Break caught: a multi-step flow losing the notebook it acts on, or a tag rename or
+        // removal hitting the wrong tag.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("recolor-tags");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "a");
+        let hwnd = window.hwnd;
+        execute_command(hwnd, CommandId::NotebookNew);
+        type_into_name_box(hwnd, "Work");
+        crate::window::library_host::name_box_submit(hwnd);
+        execute_command(hwnd, CommandId::NoteAddTag);
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::AddTag,
+            PickerChoice::Create("idea".into()),
+        );
+
+        execute_command(hwnd, CommandId::NotebookChangeColor);
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::RecolorNotebook,
+            PickerChoice::Item(0),
+        );
+        // Row 0 is "No color", row 1 the first color.
+        crate::window::library_host::picked(hwnd, PickerKind::ChooseColor, PickerChoice::Item(1));
+        assert_eq!(
+            library(hwnd).notebooks[0].color,
+            Some(crate::library::model::NotebookColor::ALL[0])
+        );
+
+        execute_command(hwnd, CommandId::TagRename);
+        crate::window::library_host::picked(hwnd, PickerKind::RenameTag, PickerChoice::Item(0));
+        assert_eq!(app_mut(hwnd).name_box.as_ref().unwrap().text(), "idea");
+        type_into_name_box(hwnd, "#ideas");
+        crate::window::library_host::name_box_submit(hwnd);
+        assert_eq!(library(hwnd).tags[0].name, "ideas");
+
+        crate::window::answer_next_confirm(|_| true);
+        execute_command(hwnd, CommandId::TagRemoveEverywhere);
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::RemoveTagEverywhere,
+            PickerChoice::Item(0),
+        );
+        assert!(library(hwnd).tags.is_empty());
+        let state = app_mut(hwnd).library.state.as_ref().unwrap();
+        assert!(state.record_for(&path).unwrap().tags.is_empty());
+    }
+
+    #[test]
+    fn a_pick_resolves_against_the_rows_the_picker_showed() {
+        // Break caught: a notebook list that changed while the picker was open (a sync, another
+        // command) making the pick act on a different notebook than the row the user chose.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("shown-rows");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        open_note(&window, &scratch, "a.md", "a");
+        let hwnd = window.hwnd;
+        for name in ["A", "B"] {
+            execute_command(hwnd, CommandId::NotebookNew);
+            type_into_name_box(hwnd, name);
+            crate::window::library_host::name_box_submit(hwnd);
+        }
+        execute_command(hwnd, CommandId::NotebookRename);
+        let first = library(hwnd).notebooks_in_order()[0].id;
+        let second = library(hwnd).notebooks_in_order()[1].id;
+        app_mut(hwnd)
+            .library
+            .state
+            .as_mut()
+            .unwrap()
+            .apply(crate::library::ops::PendingOp::DeleteNotebook { id: first })
+            .unwrap();
+        // Row 1 was "B" when shown; the live list now has "B" at row 0 and no row 1.
+        crate::window::library_host::picked(
+            hwnd,
+            PickerKind::RenameNotebook,
+            PickerChoice::Item(1),
+        );
+        let name_box = app_mut(hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(
+            name_box.purpose(),
+            Some(&crate::window::name_box::NamePurpose::RenameNotebook(
+                second
+            ))
+        );
+        assert_eq!(name_box.text(), "B");
     }
 }
