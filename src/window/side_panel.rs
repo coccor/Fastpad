@@ -365,10 +365,7 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
         match create(hwnd) {
             Ok(sidebar) => match unsafe { app_ptr(hwnd) } {
                 Some(mut app) => unsafe { app.as_mut() }.sidebar = Some(sidebar),
-                None => unsafe {
-                    DestroyWindow(sidebar.panel);
-                    DestroyWindow(sidebar.bar);
-                },
+                None => destroy_windows(&sidebar),
             },
             Err(error) => push_notice(hwnd, format!("FastPad could not show the sidebar: {error}")),
         }
@@ -379,11 +376,7 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
             if focus_is_in(sidebar.panel) || focus_is_in(sidebar.bar) {
                 return_focus(hwnd);
             }
-            // The bar owns the tooltip, which goes with it.
-            unsafe {
-                DestroyWindow(sidebar.panel);
-                DestroyWindow(sidebar.bar);
-            }
+            destroy_windows(&sidebar);
         }
     }
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
@@ -397,6 +390,18 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     }
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
+}
+
+/// Destroys the sidebar's windows. The tooltip is owned by the main window, not the bar, so it
+/// is destroyed explicitly.
+fn destroy_windows(sidebar: &Sidebar) {
+    if let Some(tooltip) = sidebar.tooltip {
+        tooltip.destroy();
+    }
+    unsafe {
+        DestroyWindow(sidebar.panel);
+        DestroyWindow(sidebar.bar);
+    }
 }
 
 /// Places the activity bar and the panel for the main window's `client` rectangle.

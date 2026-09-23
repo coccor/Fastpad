@@ -1,5 +1,7 @@
 //! A tooltip control (`TOOLTIPS_CLASS`) for rectangles of one painted window. The control
-//! subclasses its owner to see the pointer, and is destroyed with it.
+//! subclasses that window to see the pointer. Windows makes the popup owned by the window's
+//! top-level ancestor, so destroying the painted child leaves it alive: whoever destroys the child
+//! calls `Tooltip::destroy` too.
 
 use crate::platform::wide_null;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
@@ -9,8 +11,8 @@ use windows_sys::Win32::UI::Controls::{
     TTM_ADDTOOLW, TTM_DELTOOLW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SendMessageW, SetWindowPos, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, DestroyWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SendMessageW, SetWindowPos, WS_EX_TOPMOST, WS_POPUP,
 };
 
 /// FastPad has no comctl32 v6 manifest. The v5 control rejects the full `TTTOOLINFOW` size, and
@@ -99,6 +101,20 @@ impl Tooltip {
                 &mut info as *mut TTTOOLINFOW as LPARAM,
             );
         }
+    }
+
+    /// Destroys the control. The painted window it watches does not take it along.
+    pub(crate) fn destroy(self) {
+        unsafe { DestroyWindow(self.hwnd) };
+    }
+
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "only the in-process window tests read the handle, not the source-linked targets"
+    )]
+    pub(crate) fn hwnd(&self) -> HWND {
+        self.hwnd
     }
 
     #[cfg(test)]

@@ -1000,12 +1000,16 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     }
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     crate::window::side_panel::layout(hwnd, rect, dpi);
+    let left = crate::window::side_panel::left_edge(hwnd);
+    // The accessibility provider locates the tabs from this, never from the App.
+    if let Some(app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_ref() }.tabs.set_strip_left(left);
+    }
     layout_command_palette(hwnd);
     let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
         return;
     };
     let title_height = title_layout(hwnd).height + menu_band_height(hwnd);
-    let left = crate::window::side_panel::left_edge(hwnd);
     let width = (rect.right - rect.left - left).max(0);
     let font = title_chrome(hwnd).1.text();
     let find_bar_height = unsafe { app_ptr(hwnd) }
@@ -6347,6 +6351,12 @@ mod tests {
         app_mut(window.hwnd).settings.notes_mode = true;
         crate::window::side_panel::notes_mode_changed(window.hwnd, true);
         let (bar, _) = sidebar_windows(window.hwnd);
+        let tip = app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .and_then(|sidebar| sidebar.tooltip)
+            .expect("the activity bar has a tooltip")
+            .hwnd();
         let left = crate::window::side_panel::left_edge(window.hwnd);
         assert!(left > 0);
         assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
@@ -6354,6 +6364,9 @@ mod tests {
         app_mut(window.hwnd).settings.notes_mode = false;
         crate::window::side_panel::notes_mode_changed(window.hwnd, false);
         assert_eq!(unsafe { IsWindow(bar) }, 0);
+        // Break caught: a tooltip left alive (owned by the main window, not the bar) each time
+        // notes mode goes off.
+        assert_eq!(unsafe { IsWindow(tip) }, 0);
         assert_eq!(crate::window::side_panel::left_edge(window.hwnd), 0);
         assert_eq!(left_of(editor.hwnd(), window.hwnd), 0);
     }

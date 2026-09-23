@@ -3,12 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Title-strip state shared with the accessibility provider: the selected tab and how far the
-/// tab strip is scrolled, so both painting and accessibility locate the same tab rectangles.
+/// Title-strip state shared with the accessibility provider: the selected tab, how far the tab
+/// strip is scrolled and where it starts (right of the sidebar), so both painting and
+/// accessibility locate the same tab rectangles. The provider may run on another thread and never
+/// reads the App.
 #[derive(Clone, Debug)]
 pub(crate) struct TabSelection {
     active: Arc<AtomicUsize>,
     scroll: Arc<AtomicI32>,
+    strip_left: Arc<AtomicI32>,
 }
 
 impl TabSelection {
@@ -16,7 +19,17 @@ impl TabSelection {
         Self {
             active: Arc::new(AtomicUsize::new(active)),
             scroll: Arc::new(AtomicI32::new(0)),
+            strip_left: Arc::new(AtomicI32::new(0)),
         }
+    }
+
+    /// Where the tabs start: the sidebar's right edge, 0 without a sidebar.
+    pub(crate) fn strip_left(&self) -> i32 {
+        self.strip_left.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_strip_left(&self, left: i32) {
+        self.strip_left.store(left.max(0), Ordering::Release);
     }
 
     pub(crate) fn scroll_offset(&self) -> i32 {
@@ -169,6 +182,11 @@ impl Tabs {
     /// Returns whether the offset changed.
     pub(crate) fn set_scroll_offset(&self, offset: i32) -> bool {
         self.selection.set_scroll_offset(offset)
+    }
+
+    /// Publishes the sidebar's right edge for the accessibility provider (`TabSelection`).
+    pub(crate) fn set_strip_left(&self, left: i32) {
+        self.selection.set_strip_left(left);
     }
 
     pub(crate) fn selection(&self) -> TabSelection {
