@@ -318,6 +318,14 @@ fn run_library_scan(
     enforce_reference: bool,
 ) -> Result<i32, String> {
     if let Some(count) = count {
+        // Generating into a folder that holds anything could overwrite someone's notes.
+        let occupied = std::fs::read_dir(folder).is_ok_and(|mut entries| entries.next().is_some());
+        if occupied {
+            return Err(format!(
+                "{} is not empty; library-scan --count only generates into a new or empty folder",
+                folder.display()
+            ));
+        }
         create_library_fixture(folder, count)?;
     }
     let local = ScratchFile(
@@ -728,9 +736,7 @@ fn run_once(
     // Each run gets its own scratch profile so the benchmark never reads or writes real user data
     // and never carries a session manifest from one run into the next.
     let local_app_data = ScratchLocalAppData::create(&unique)?;
-    if let Some(folder) = notes_folder {
-        local_app_data.remember_notes_folder(folder)?;
-    }
+    local_app_data.seed_notes_folder(notes_folder)?;
     let mapping_name = wide_null(&format!("Local\\FastPadBenchMapping-{unique}"));
     let event_name = wide_null(&format!("Local\\FastPadBenchEvent-{unique}"));
     let security = SECURITY_ATTRIBUTES {
@@ -978,9 +984,19 @@ impl ScratchLocalAppData {
     }
 
     /// Writes `FastPad\folders.ini` naming `folder`, so the launch opens it as its library.
-    fn remember_notes_folder(&self, folder: &Path) -> Result<(), String> {
-        let folder = std::path::absolute(folder)
-            .map_err(|error| format!("could not resolve {}: {error}", folder.display()))?;
+    /// Without one it names an empty `notes` folder in this scratch profile: with notes mode on,
+    /// the launch would otherwise open the real `Documents\FastPad`.
+    fn seed_notes_folder(&self, folder: Option<&Path>) -> Result<(), String> {
+        let folder = match folder {
+            Some(folder) => std::path::absolute(folder)
+                .map_err(|error| format!("could not resolve {}: {error}", folder.display()))?,
+            None => {
+                let empty = self.0.join("notes");
+                std::fs::create_dir_all(&empty)
+                    .map_err(|error| format!("could not create {}: {error}", empty.display()))?;
+                empty
+            }
+        };
         let recent = fastpad::library::local::RecentFolders {
             folders: vec![folder],
         };

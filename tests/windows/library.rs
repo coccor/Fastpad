@@ -27,6 +27,7 @@ impl Scratch {
     /// `folders.ini` names the scratch notes folder, so the harness never seeds its own and no
     /// launch can fall back to the real `Documents\FastPad`.
     fn new(label: &str) -> Self {
+        assert_no_fastpad_running();
         let root = std::env::temp_dir().join(format!(
             "fastpad-library-e2e-{label}-{}",
             std::process::id()
@@ -64,6 +65,21 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A FastPad already running in this session would own the single-instance mutex: the spawns
+/// below would forward to it, and it would write the scratch folders into the real `folders.ini`.
+fn assert_no_fastpad_running() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    let names = fastpad::ipc::InstanceNames::for_current_session().unwrap();
+    let mutex = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, names.mutex.as_ptr()) };
+    if !mutex.is_null() {
+        unsafe {
+            CloseHandle(mutex);
+        }
+        panic!("close every FastPad window in this session before running the library tests");
     }
 }
 
@@ -180,7 +196,8 @@ fn a_note_in_the_folder_autosaves_but_never_overwrites_an_outside_edit() {
 #[test]
 fn a_note_keeps_its_favorite_after_being_renamed_in_explorer() {
     // Break caught: a rescan after reactivation treating a renamed file as a new note and
-    // dropping its favorite, or never rescanning at all.
+    // dropping its favorite, or never rescanning at all. The rename is matched by file ID, so
+    // %TEMP% must be on NTFS (or another volume with stable file IDs).
     let _lock = LIBRARY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let data = Scratch::new("explorer-rename");
     let note = data.note("a.md", "a");
@@ -205,15 +222,28 @@ fn a_note_keeps_its_favorite_after_being_renamed_in_explorer() {
     unsafe {
         PostMessageW(hwnd, WM_ACTIVATEAPP, 0, 0);
     }
-    // Only a return after `RESCAN_AFTER` (5 s) away rescans.
-    std::thread::sleep(Duration::from_millis(5_200));
+    // Only a return after `RESCAN_AFTER` (5 s) away rescans; a full second of margin keeps a slow
+    // machine from posting the return too early.
+    std::thread::sleep(Duration::from_secs(6));
     unsafe {
         PostMessageW(hwnd, WM_ACTIVATEAPP, 1, 0);
     }
     wait_until("the record to follow the rename", || {
         read(&data.library_ini()).ends_with("|b.md\r\n")
     });
-    assert!(read(&data.library_ini()).contains("|f|"));
+    let library = read(&data.library_ini());
+    assert!(
+        !library.lines().any(|line| line.ends_with("|a.md")),
+        "the old path must not keep a record: {library:?}"
+    );
+    let renamed = library
+        .lines()
+        .find(|line| line.ends_with("|b.md"))
+        .unwrap();
+    assert!(
+        renamed.contains("|f|"),
+        "the favorite must follow the rename: {renamed:?}"
+    );
     close(process, hwnd);
 }
 
@@ -278,11 +308,12 @@ fn with_notes_mode_off_nothing_is_written_and_save_uses_the_dialog() {
     send_text(editor, "plain").unwrap();
     command(hwnd, CommandId::Save);
     wait_and_cancel_dialog(process.id(), WAIT).unwrap();
-    assert!(!data.data().join("libraries").exists());
-    assert!(!data.folder().join(".fastpad").exists());
     unsafe {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
     }
     // restore_session is on by default, so closing does not prompt.
     wait_for_process_exit(process.id(), WAIT).unwrap();
+    // Checked after exit, so a write at shutdown would be caught too.
+    assert!(!data.data().join("libraries").exists());
+    assert!(!data.folder().join(".fastpad").exists());
 }

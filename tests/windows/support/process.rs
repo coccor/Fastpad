@@ -141,7 +141,7 @@ impl FastPadProcess {
     }
 
     pub fn has_dialog(&self) -> TestResult<bool> {
-        Ok(find_unsaved_changes_dialog(self.process.id())?.is_some())
+        Ok(find_dialog(self.process.id())?.is_some())
     }
 
     /// The child's exit code straight from `GetExitCodeProcess`, or `None` while it still runs.
@@ -290,62 +290,52 @@ pub fn process_has_module_loaded(process_id: u32, module_file_name: &str) -> Tes
 /// overlap with a second dialog `close()` may need to show/dismiss reentrantly (nested modal
 /// `MessageBoxW` calls on the same thread are surprising to reason about; avoiding the overlap in
 /// the first place is simpler than making `close()` robust to it).
-///
-/// Returns only once the dialog window is gone: a slow runner can list the `#32770` window before
-/// its buttons exist, so a single dismissal attempt could silently do nothing.
 #[cfg(windows)]
 pub fn wait_and_dismiss_dialog(process_id: u32, timeout: Duration) -> TestResult<()> {
-    let deadline = Deadline::after(timeout);
-    let mut dismissed = None;
-    loop {
-        match dismissed {
-            Some(dialog) if unsafe { IsWindow(dialog) } == 0 => return Ok(()),
-            Some(_) => {}
-            None => {
-                if let Some(dialog) = find_unsaved_changes_dialog(process_id)?
-                    && dismiss_dialog(dialog)
-                {
-                    dismissed = Some(dialog);
-                    continue;
-                }
-            }
-        }
-        if deadline.expired() {
-            return Err(match dismissed {
-                Some(_) => "timed out waiting for a dismissed dialog to close".into(),
-                None => "timed out waiting for a dialog to appear".into(),
-            });
-        }
-        deadline.sleep_step();
-    }
+    wait_and_answer_dialog(process_id, timeout, dismiss_dialog)
 }
 
-/// Waits for a dialog (window class `"#32770"`) over `process_id`'s windows, such as the Save As
-/// dialog, and cancels it with `IDCANCEL`. Returns once the dialog window is gone.
+/// Waits for a dialog over `process_id`'s windows, such as the Save As dialog, and cancels it with
+/// `IDCANCEL`.
 #[cfg(windows)]
 pub fn wait_and_cancel_dialog(process_id: u32, timeout: Duration) -> TestResult<()> {
     use windows_sys::Win32::UI::WindowsAndMessaging::IDCANCEL;
+    wait_and_answer_dialog(process_id, timeout, |dialog| unsafe {
+        PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0) != 0
+    })
+}
+
+/// Waits for a dialog to appear, then calls `answer` on it until the dialog window is gone.
+/// `answer` returns false while it could not act yet.
+///
+/// Answering is repeated because a slow runner can list the `#32770` window before its buttons
+/// exist or before it handles commands, so a single attempt could silently do nothing.
+#[cfg(windows)]
+fn wait_and_answer_dialog(
+    process_id: u32,
+    timeout: Duration,
+    answer: impl Fn(HWND) -> bool,
+) -> TestResult<()> {
     let deadline = Deadline::after(timeout);
-    let mut cancelled: Option<HWND> = None;
+    let mut answered: Option<HWND> = None;
     loop {
-        if let Some(dialog) = cancelled
+        if let Some(dialog) = answered
             && unsafe { IsWindow(dialog) } == 0
         {
             return Ok(());
         }
-        // Posted until it closes: a dialog still being built can drop an early IDCANCEL.
-        if let Some(dialog) = match cancelled {
+        let dialog = match answered {
             Some(dialog) => Some(dialog),
-            None => find_unsaved_changes_dialog(process_id)?,
-        } {
-            unsafe {
-                PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
-            }
-            cancelled = Some(dialog);
+            None => find_dialog(process_id)?,
+        };
+        if let Some(dialog) = dialog
+            && answer(dialog)
+        {
+            answered = Some(dialog);
         }
         if deadline.expired() {
-            return Err(match cancelled {
-                Some(_) => "timed out waiting for a cancelled dialog to close".into(),
+            return Err(match answered {
+                Some(_) => "timed out waiting for an answered dialog to close".into(),
                 None => "timed out waiting for a dialog to appear".into(),
             });
         }
@@ -480,10 +470,10 @@ unsafe extern "system" fn enum_no_or_ok_button(hwnd: HWND, lparam: LPARAM) -> BO
     1
 }
 
-/// Finds a top-level standard `MessageBoxW` dialog (window class `"#32770"`) owned by `process_id`,
-/// such as FastPad's "Save changes?" close prompt.
+/// Finds a top-level dialog (window class `"#32770"`) owned by `process_id`: a `MessageBoxW` such
+/// as FastPad's "Save changes?" close prompt, or a common dialog such as Save As.
 #[cfg(windows)]
-fn find_unsaved_changes_dialog(process_id: u32) -> TestResult<Option<HWND>> {
+fn find_dialog(process_id: u32) -> TestResult<Option<HWND>> {
     let mut search = DialogSearch {
         process_id,
         hwnd: None,
