@@ -5,6 +5,7 @@
 pub mod ids;
 pub mod local;
 pub mod model;
+pub mod name_search;
 pub mod ops;
 pub mod reconcile;
 pub mod scan;
