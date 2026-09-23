@@ -96,6 +96,15 @@ pub fn disk_stamp(path: &Path) -> Option<DiskStamp> {
     })
 }
 
+/// Windows FILETIME ticks (100 ns intervals) between 1601-01-01 and the Unix epoch.
+const FILETIME_UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+
+/// Converts a Unix-epoch nanosecond timestamp (as `store::stamp` reports) to Windows FILETIME
+/// ticks, the unit `scan::ScanEntry::mtime` (and so `NoteEntry::mtime`) is stored in.
+fn filetime_ticks(unix_nanos: u64) -> u64 {
+    unix_nanos / 100 + FILETIME_UNIX_EPOCH_TICKS
+}
+
 /// Reads both library files, scans the folder and reconciles. Runs on the worker thread.
 pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> {
     let library_path = store::library_file(folder);
@@ -209,7 +218,7 @@ fn merge_notes(folder: &Path, previous: Vec<NoteEntry>, fresh: Vec<NoteEntry>) -
     }
     for note in differing {
         if let Some(stamp) = store::stamp(&folder.join(&note.path)) {
-            merged.push(NoteEntry { path: note.path, size: stamp.size, mtime: stamp.modified });
+            merged.push(NoteEntry { path: note.path, size: stamp.size, mtime: filetime_ticks(stamp.modified) });
         }
     }
     merged
@@ -228,14 +237,16 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
     } = previous;
     let mut fresh = fresh;
 
-    // The live library (what the UI has shown and already flushed) always wins over a rescan's
-    // snapshot of a since-changed file: replaying the rescan's own reconcile ops on top of it
-    // keeps both what was flushed and what the rescan found, instead of reverting to the state
-    // the rescan read the file in.
-    if previous_metadata == Metadata::Ready
+    // A stamp mismatch alone does not say which side is current: the live library may have
+    // flushed while the rescan was reading (previous is current and belongs on disk), or the
+    // file may have changed outside FastPad while it was inactive, e.g. another PC's sync
+    // (the rescan's own read is current). One more stamp, taken now, tells them apart.
+    let previous_is_current = previous_metadata == Metadata::Ready
         && fresh.metadata == Metadata::Ready
         && previous_stamp != fresh.stamp
-    {
+        && store::stamp(&store::library_file(&fresh.folder)) == previous_stamp;
+
+    if previous_is_current {
         let mut library = previous_library;
         ops::replay(&mut library, &fresh.pending);
         fresh.library = library;
@@ -249,6 +260,11 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
     fresh.pending = pending;
 
     fresh.notes = merge_notes(&fresh.folder, previous_notes, fresh.notes);
+    if fresh.truncated {
+        // A truncated scan's own list is already capped at the limit; previous-only entries
+        // that survived the merge must not push it past that.
+        fresh.notes.truncate(scan::NOTE_LIMIT);
+    }
 
     fresh.local.merge_recent(&previous_local);
     fresh.local.autosave = previous_local.autosave;
@@ -291,7 +307,7 @@ impl LibraryState {
         }
         let stamp = store::stamp(path);
         let size = stamp.map_or(0, |stamp| stamp.size);
-        let mtime = stamp.map_or(0, |stamp| stamp.modified);
+        let mtime = stamp.map_or(0, |stamp| filetime_ticks(stamp.modified));
         if let Some(existing) = self.notes.iter_mut().find(|note| same_path(&note.path, &relative)) {
             existing.size = size;
             existing.mtime = mtime;
@@ -526,6 +542,102 @@ mod tests {
         assert!(paths.contains("renamed.md"), "a rename made during the rescan survives");
         assert!(!paths.contains("old.md"), "the old name is gone from disk and is not kept from fresh");
         assert_eq!(merged.notes.len(), 3);
+    }
+
+    #[test]
+    fn a_rescan_absorbs_a_change_made_outside_fastpad_while_it_was_inactive() {
+        // Break caught: treating any stamp mismatch as "the live library flushed during the
+        // scan" and keeping a stale library forever when the file actually changed from
+        // outside (another PC's sync) while this FastPad made no local changes of its own.
+        let scratch = Scratch::new("rescan-outside-sync");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let mut ids = IdSource::new(1, 2);
+
+        // Organize once, so `library.ini` exists and `previous` loads with a real stamp.
+        let mut setup = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let target = setup.note_ref(&mut ids, &a);
+        setup.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+        assert!(flush(&mut setup).unwrap());
+
+        let previous = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+        assert!(previous.stamp.is_some());
+
+        // Another PC syncs a change directly into the file while this FastPad is inactive.
+        let path = store::library_file(&scratch.folder());
+        let mut outside = match store::read(&path) {
+            store::ReadOutcome::Loaded(library, _) => library,
+            _ => panic!("expected a library"),
+        };
+        outside.create_notebook(NotebookId(77), "Synced", 5).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store::write(&path, &outside).unwrap();
+
+        let fresh = load(&scratch.folder(), &scratch.local(), 102).unwrap();
+        assert_ne!(fresh.stamp, previous.stamp);
+        let current = store::stamp(&path);
+
+        let merged = merge_rescan(previous, fresh);
+        assert!(merged.library.notebook(NotebookId(77)).is_some(), "the outside change is visible");
+        assert!(merged.record_for(&a).unwrap().favorite, "the earlier favorite is still there");
+        assert_eq!(merged.stamp, current);
+    }
+
+    #[test]
+    fn note_entry_mtimes_are_filetime_ticks_like_a_scan_reports() {
+        // Break caught: add_note (and merge_notes) storing mtime as Unix nanoseconds while
+        // scan.rs reports Windows FILETIME ticks (100 ns since 1601), so entries from different
+        // sources in the same list could not be compared or sorted.
+        let scratch = Scratch::new("mtime-scale");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let raw_nanos = disk_stamp(&a).unwrap().modified;
+        let expected = raw_nanos / 100 + FILETIME_UNIX_EPOCH_TICKS;
+
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let from_scan = state.notes[0].mtime;
+        state.notes.clear();
+        state.add_note(&a);
+        let from_add_note = state.notes[0].mtime;
+
+        assert_eq!(from_add_note, expected);
+        // Both are FILETIME ticks for the same write; allow a little slack for rounding between
+        // the OS-reported FILETIME and the nanosecond-precision `SystemTime` conversion.
+        let ticks_per_second = 10_000_000;
+        assert!(
+            from_scan.abs_diff(from_add_note) < ticks_per_second,
+            "scan: {from_scan}, add_note: {from_add_note}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_rescan_caps_the_merged_notes_list_at_the_scan_limit() {
+        // Break caught: previous-only entries surviving the notes merge and pushing a truncated
+        // scan's list past the limit it was supposed to be capped at.
+        let scratch = Scratch::new("rescan-cap");
+        let folder = scratch.folder();
+        let entries = |count: usize| -> Vec<NoteEntry> {
+            (0..count)
+                .map(|index| NoteEntry { path: PathBuf::from(format!("f{index}.md")), size: 0, mtime: 0 })
+                .collect()
+        };
+        let state = |notes: Vec<NoteEntry>, truncated: bool| LibraryState {
+            folder: folder.clone(),
+            local_path: scratch.local(),
+            library: Library::default(),
+            metadata: Metadata::Ready,
+            stamp: None,
+            local: LocalState::new(folder.clone()),
+            notes,
+            truncated,
+            pending: Vec::new(),
+            relocated: Vec::new(),
+        };
+        // Identical lists: every entry is common to both, so none needs to exist on disk.
+        let previous = state(entries(scan::NOTE_LIMIT + 5), false);
+        let fresh = state(entries(scan::NOTE_LIMIT + 5), true);
+        let merged = merge_rescan(previous, fresh);
+        assert_eq!(merged.notes.len(), scan::NOTE_LIMIT);
     }
 
     #[test]
