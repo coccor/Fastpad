@@ -167,6 +167,87 @@ pub(crate) fn filter_entries(
     ranked.into_iter().map(|(_, entry)| entry).collect()
 }
 
+/// What a picker is choosing; decides what `library_host::picked` does with the choice.
+#[allow(
+    dead_code,
+    reason = "constructed by open_picker's callers in Tasks 15 and 19"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PickerKind {
+    RecentFolder,
+    MoveToNotebook,
+    AddTag,
+    RemoveTag,
+    RenameNotebook,
+    RecolorNotebook,
+    ChooseColor,
+    DeleteNotebook,
+    RenameTag,
+    RemoveTagEverywhere,
+}
+
+/// A list of runtime items shown in the palette instead of commands.
+#[derive(Clone, Debug)]
+pub(crate) struct Picker {
+    pub kind: PickerKind,
+    pub items: Vec<String>,
+    /// When set, a typed name that matches no item exactly is offered as "<create> "<name>"".
+    pub create: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PickerRow {
+    Item(usize),
+    Create(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PickerChoice {
+    Item(usize),
+    Create(String),
+}
+
+pub(crate) fn picker_rows(picker: &Picker, query: &str) -> Vec<PickerRow> {
+    let query = query.trim();
+    let mut ranked: Vec<(u8, usize)> = picker
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            if query.is_empty() {
+                Some((0, index))
+            } else {
+                match_rank(query, item).map(|rank| (rank, index))
+            }
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, index)| (rank, index));
+    let mut rows: Vec<PickerRow> = ranked
+        .into_iter()
+        .map(|(_, index)| PickerRow::Item(index))
+        .collect();
+    let exact = picker
+        .items
+        .iter()
+        .any(|item| item.to_lowercase() == query.to_lowercase());
+    if picker.create.is_some() && !query.is_empty() && !exact {
+        rows.push(PickerRow::Create(query.to_owned()));
+    }
+    rows
+}
+
+pub(crate) fn picker_row_label(picker: &Picker, row: &PickerRow) -> String {
+    match row {
+        PickerRow::Item(index) => picker.items.get(*index).cloned().unwrap_or_default(),
+        PickerRow::Create(name) => {
+            format!(
+                "{} \u{201c}{name}\u{201d}",
+                picker.create.unwrap_or("Create")
+            )
+        }
+    }
+}
+
 /// The first keyboard shortcut bound to `command`, spelled the way the menus spell shortcuts.
 pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
@@ -265,6 +346,10 @@ pub(crate) struct CommandPalette {
     query_edit: HWND,
     list: HWND,
     shown: Vec<PaletteEntry>,
+    /// `Some` while the palette lists runtime items instead of commands.
+    picker: Option<Picker>,
+    /// The rows `picker` currently shows, filtered by the query.
+    picker_rows: Vec<PickerRow>,
     visible: bool,
     colors: Palette,
     layout: Option<PanelLayout>,
@@ -307,6 +392,8 @@ impl CommandPalette {
             query_edit,
             list,
             shown: Vec::new(),
+            picker: None,
+            picker_rows: Vec::new(),
             visible: false,
             colors,
             layout: None,
@@ -369,6 +456,8 @@ impl CommandPalette {
 
     /// Returns whether it was visible; `hide_controls` then removes it from the screen.
     pub(crate) fn mark_hidden(&mut self) -> bool {
+        self.picker = None;
+        self.picker_rows = Vec::new();
         std::mem::take(&mut self.visible)
     }
 
@@ -391,18 +480,45 @@ impl CommandPalette {
         self.shown = entries;
     }
 
+    /// Switches between command mode (`None`) and picker mode; also clears any rows from a
+    /// previous filter, so a stale selection index can't leak into the new mode.
+    pub(crate) fn set_picker(&mut self, picker: Option<Picker>) {
+        self.picker = picker;
+        self.picker_rows = Vec::new();
+    }
+
+    pub(crate) fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
+    }
+
+    /// Records the picker rows to list; `fill_list` then puts them in the list box.
+    pub(crate) fn set_picker_rows(&mut self, rows: Vec<PickerRow>) {
+        self.picker_rows = rows;
+    }
+
     /// Refills the list box from the recorded rows and selects the best match.
     pub(crate) fn fill_list(&self) {
         unsafe {
             SendMessageW(self.list, LB_RESETCONTENT, 0, 0);
         }
-        for entry in &self.shown {
-            let label = wide_null(entry.label);
-            unsafe {
-                SendMessageW(self.list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM);
+        let count = if self.picker.is_some() {
+            let empty = wide_null("");
+            for _ in 0..self.picker_rows.len() {
+                unsafe {
+                    SendMessageW(self.list, LB_ADDSTRING, 0, empty.as_ptr() as LPARAM);
+                }
             }
-        }
-        if !self.shown.is_empty() {
+            self.picker_rows.len()
+        } else {
+            for entry in &self.shown {
+                let label = wide_null(entry.label);
+                unsafe {
+                    SendMessageW(self.list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM);
+                }
+            }
+            self.shown.len()
+        };
+        if count > 0 {
             unsafe {
                 SendMessageW(self.list, LB_SETCURSEL, 0, 0);
             }
@@ -419,7 +535,7 @@ impl CommandPalette {
             width,
             dpi,
             text_height,
-            self.shown.len(),
+            self.row_count(),
         ));
     }
 
@@ -494,9 +610,18 @@ impl CommandPalette {
         }
     }
 
+    /// The number of rows currently listed: `picker_rows` in picker mode, `shown` otherwise.
+    fn row_count(&self) -> usize {
+        if self.picker.is_some() {
+            self.picker_rows.len()
+        } else {
+            self.shown.len()
+        }
+    }
+
     /// Moves the selection by `delta` rows, clamped to the list.
     pub(crate) fn move_selection(&self, delta: isize) {
-        let Some(last) = self.shown.len().checked_sub(1) else {
+        let Some(last) = self.row_count().checked_sub(1) else {
             return;
         };
         let current = unsafe { SendMessageW(self.list, LB_GETCURSEL, 0, 0) }.max(0);
@@ -514,11 +639,24 @@ impl CommandPalette {
             .map(|entry| entry.command)
     }
 
+    /// The picker row under the list's current selection, converted into a choice; `None` outside
+    /// picker mode or with nothing selected.
+    pub(crate) fn selected_choice(&self) -> Option<PickerChoice> {
+        let index = unsafe { SendMessageW(self.list, LB_GETCURSEL, 0, 0) };
+        let row = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.picker_rows.get(index))?;
+        Some(match row {
+            PickerRow::Item(index) => PickerChoice::Item(*index),
+            PickerRow::Create(name) => PickerChoice::Create(name.clone()),
+        })
+    }
+
     /// Selects the row under a list-client point from `WM_LBUTTONDOWN`'s `lparam`.
     pub(crate) fn select_row_at(&self, lparam: LPARAM) -> bool {
         let hit = unsafe { SendMessageW(self.list, LB_ITEMFROMPOINT, 0, lparam) } as usize;
         // The high word is nonzero when the point lies outside every item.
-        if (hit >> 16) & 0xffff != 0 || (hit & 0xffff) >= self.shown.len() {
+        if (hit >> 16) & 0xffff != 0 || (hit & 0xffff) >= self.row_count() {
             return false;
         }
         unsafe {
@@ -568,12 +706,22 @@ impl CommandPalette {
     }
 
     /// `WM_DRAWITEM` for the list: label on the left, shortcut right-aligned in the muted color.
+    /// A picker row has no shortcut and its label comes from `picker_row_label`.
     pub(crate) fn draw_item(&self, item: &DRAWITEMSTRUCT) {
-        let Some(entry) = usize::try_from(item.itemID)
-            .ok()
-            .and_then(|index| self.shown.get(index))
-        else {
-            return;
+        let index = usize::try_from(item.itemID).ok();
+        let (label, shortcut) = if let Some(picker) = &self.picker {
+            let Some(label) = index
+                .and_then(|index| self.picker_rows.get(index))
+                .map(|row| picker_row_label(picker, row))
+            else {
+                return;
+            };
+            (label, None)
+        } else {
+            let Some(entry) = index.and_then(|index| self.shown.get(index)) else {
+                return;
+            };
+            (entry.label.to_owned(), shortcut_text(entry.command))
         };
         let selected = item.itemState & ODS_SELECTED != 0;
         let colors = self.colors;
@@ -604,7 +752,7 @@ impl CommandPalette {
             let font = SendMessageW(self.list, WM_GETFONT, 0, 0);
             let previous = (font != 0).then(|| SelectObject(dc, font as _));
             let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
-            if let Some(shortcut) = shortcut_text(entry.command) {
+            if let Some(shortcut) = shortcut {
                 let mut shortcut = shortcut.encode_utf16().collect::<Vec<_>>();
                 SetTextColor(dc, muted);
                 let mut measured = text;
@@ -625,7 +773,7 @@ impl CommandPalette {
                 // Keep the label clear of the shortcut column.
                 text.right -= (measured.right - measured.left) + padding;
             }
-            let mut label = entry.label.encode_utf16().collect::<Vec<_>>();
+            let mut label = label.encode_utf16().collect::<Vec<_>>();
             SetTextColor(dc, foreground);
             DrawTextW(
                 dc,
@@ -760,7 +908,10 @@ unsafe extern "system" fn palette_control_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::{ENTRIES, PanelLayout, filter_entries, match_rank, shortcut_text};
+    use super::{
+        ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, filter_entries, match_rank,
+        picker_row_label, picker_rows, shortcut_text,
+    };
     use crate::window::commands::CommandId;
 
     fn labels(query: &str) -> Vec<&'static str> {
@@ -866,6 +1017,36 @@ mod tests {
             Some("Ctrl+Shift+P")
         );
         assert_eq!(shortcut_text(CommandId::Copy), None);
+    }
+
+    fn picker(create: Option<&'static str>) -> Picker {
+        Picker {
+            kind: PickerKind::AddTag,
+            items: vec!["idea".into(), "reference".into(), "todo".into()],
+            create,
+        }
+    }
+
+    #[test]
+    fn picker_rows_filter_items_like_commands_and_offer_to_create_a_new_name() {
+        // Break caught: typing a new tag name leaving nothing to press Enter on, or offering to
+        // create a tag that already exists under another case.
+        let with_create = picker(Some("Add tag"));
+        assert_eq!(
+            picker_rows(&with_create, ""),
+            vec![PickerRow::Item(0), PickerRow::Item(1), PickerRow::Item(2)]
+        );
+        assert_eq!(
+            picker_rows(&with_create, "ref"),
+            vec![PickerRow::Item(1), PickerRow::Create("ref".into())]
+        );
+        assert_eq!(picker_rows(&with_create, "TODO"), vec![PickerRow::Item(2)]);
+        assert_eq!(picker_rows(&picker(None), "zzz"), vec![]);
+        assert_eq!(
+            picker_row_label(&with_create, &PickerRow::Create("urgent".into())),
+            "Add tag \u{201c}urgent\u{201d}"
+        );
+        assert_eq!(picker_row_label(&with_create, &PickerRow::Item(0)), "idea");
     }
 
     #[test]

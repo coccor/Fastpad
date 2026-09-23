@@ -1082,13 +1082,51 @@ fn open_command_palette(hwnd: HWND) {
         if app.command_palette.is_none() {
             app.command_palette = CommandPalette::create(hwnd).ok();
         }
-        Some(app.command_palette.as_mut()?.mark_shown(colors))
+        let palette = app.command_palette.as_mut()?;
+        let newly_shown = palette.mark_shown(colors);
+        // Reopening the palette normally always shows commands, even right after a picker.
+        palette.set_picker(None);
+        Some(newly_shown)
     });
     let Some(newly_shown) = newly_shown else {
         return;
     };
     if newly_shown {
         // Clearing the field sends EN_CHANGE, which lists every available command.
+        with_command_palette(hwnd, CommandPalette::clear_query);
+    }
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    refilter_command_palette(hwnd);
+    with_command_palette(hwnd, CommandPalette::focus_query);
+}
+
+/// Opens the palette in picker mode: it lists `picker`'s items instead of commands, and the
+/// choice made on Enter goes to `library_host::picked` instead of running a command.
+#[allow(
+    dead_code,
+    reason = "called by the organizing commands Tasks 15 and 19 add"
+)]
+pub(crate) fn open_picker(hwnd: HWND, picker: command_palette::Picker) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let colors = title_chrome(hwnd).0;
+    let newly_shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.command_palette.is_none() {
+            app.command_palette = CommandPalette::create(hwnd).ok();
+        }
+        let palette = app.command_palette.as_mut()?;
+        let newly_shown = palette.mark_shown(colors);
+        palette.set_picker(Some(picker));
+        Some(newly_shown)
+    });
+    let Some(newly_shown) = newly_shown else {
+        return;
+    };
+    if newly_shown {
         with_command_palette(hwnd, CommandPalette::clear_query);
     }
     if !identity.is_live_for(hwnd) {
@@ -1137,15 +1175,27 @@ fn refilter_command_palette(hwnd: HWND) {
     .flatten() else {
         return;
     };
-    let has_tabs = tab_count(hwnd) > 0;
-    let markdown = crate::window::preview_host::buttons_visible(hwnd);
-    let entries = command_palette::filter_entries(&query, |command| {
-        (has_tabs || !command.needs_document()) && (markdown || !command.is_markdown_preview())
-    });
-    if let Some(mut app) = unsafe { app_ptr(hwnd) }
-        && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
-    {
-        palette.set_entries(entries);
+    let is_picker =
+        with_command_palette(hwnd, |palette| palette.picker().is_some()).unwrap_or(false);
+    if is_picker {
+        if let Some(mut app) = unsafe { app_ptr(hwnd) }
+            && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
+            && let Some(picker) = palette.picker()
+        {
+            let rows = command_palette::picker_rows(picker, &query);
+            palette.set_picker_rows(rows);
+        }
+    } else {
+        let has_tabs = tab_count(hwnd) > 0;
+        let markdown = crate::window::preview_host::buttons_visible(hwnd);
+        let entries = command_palette::filter_entries(&query, |command| {
+            (has_tabs || !command.needs_document()) && (markdown || !command.is_markdown_preview())
+        });
+        if let Some(mut app) = unsafe { app_ptr(hwnd) }
+            && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
+        {
+            palette.set_entries(entries);
+        }
     }
     with_command_palette(hwnd, CommandPalette::fill_list);
     layout_command_palette(hwnd);
@@ -1175,10 +1225,26 @@ pub(crate) fn paint_panel(hwnd: HWND, panel: HWND) {
 }
 
 pub(crate) fn run_command_palette_selection(hwnd: HWND) {
-    let command = with_command_palette(hwnd, CommandPalette::selected_command).flatten();
+    let pick = with_command_palette(hwnd, |palette| {
+        palette
+            .picker()
+            .map(|picker| (picker.kind, palette.selected_choice()))
+    })
+    .flatten();
+    let command = if pick.is_none() {
+        with_command_palette(hwnd, CommandPalette::selected_command).flatten()
+    } else {
+        None
+    };
     close_command_palette(hwnd, true);
-    if let Some(command) = command {
-        execute_command(hwnd, command);
+    match pick {
+        Some((kind, Some(choice))) => crate::window::library_host::picked(hwnd, kind, choice),
+        Some((_, None)) => {}
+        None => {
+            if let Some(command) = command {
+                execute_command(hwnd, command);
+            }
+        }
     }
 }
 
@@ -4160,7 +4226,7 @@ fn store_app(hwnd: HWND, value: Box<App>) {
 mod tests {
     use super::{
         MainWindowClass, WindowCreateContext, execute_command, handle_paint_with,
-        mark_first_paint_complete, take_deferred_start_pending,
+        mark_first_paint_complete, take_deferred_start_pending, with_command_palette,
     };
     use crate::app::App;
     use crate::document::{CloseDecision, Language, RecoveryId};
@@ -4615,6 +4681,35 @@ mod tests {
             unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) },
             -1
         );
+    }
+
+    #[test]
+    fn a_picker_lists_its_items_and_enter_reports_the_choice() {
+        // Break caught: a picker whose choice never reaches library_host, or that leaves the
+        // palette stuck showing runtime items the next time it opens for commands.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        super::open_picker(
+            window.hwnd,
+            crate::window::command_palette::Picker {
+                kind: crate::window::command_palette::PickerKind::RecentFolder,
+                items: vec![r"D:\A".into(), r"D:\B".into()],
+                create: None,
+            },
+        );
+        super::move_command_palette_selection(window.hwnd, 1);
+        super::run_command_palette_selection(window.hwnd);
+        assert_eq!(
+            crate::window::library_host::take_last_pick(),
+            Some((
+                crate::window::command_palette::PickerKind::RecentFolder,
+                crate::window::command_palette::PickerChoice::Item(1)
+            ))
+        );
+        // The palette went back to command mode.
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        assert!(with_command_palette(window.hwnd, |p| p.picker().is_none()).unwrap());
     }
 
     #[test]
