@@ -48,6 +48,9 @@ pub struct NoteEntry {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: u64,
+    /// The file's data is only in the cloud (a OneDrive "online only" file): reading it would
+    /// download it, so text search skips it. Set by the scan; a save by FastPad clears it.
+    pub online_only: bool,
 }
 
 #[derive(Debug)]
@@ -228,6 +231,7 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
             path: entry.path.clone(),
             size: entry.size,
             mtime: entry.mtime,
+            online_only: entry.online_only,
         })
         .collect();
     // Built from the note list itself: a copy of 10,000 paths would outlive the scan as freed
@@ -318,6 +322,11 @@ fn merge_notes(folder: &Path, fresh: Vec<NoteEntry>, touched: &[PathBuf]) -> Vec
         if !seen.insert(path.to_string_lossy().to_lowercase()) {
             continue;
         }
+        // A rename leaves a file online only, and the rescan's own entry says whether it still is.
+        let online_only = merged
+            .iter()
+            .find(|note| same_path(&note.path, path))
+            .is_some_and(|note| note.online_only);
         merged.retain(|note| !same_path(&note.path, path));
         let is_note = path
             .extension()
@@ -327,6 +336,7 @@ fn merge_notes(folder: &Path, fresh: Vec<NoteEntry>, touched: &[PathBuf]) -> Vec
                 path: path.clone(),
                 size: stamp.size,
                 mtime: filetime_ticks(stamp.modified),
+                online_only,
             });
         }
     }
@@ -473,6 +483,8 @@ impl LibraryState {
         {
             existing.size = size;
             existing.mtime = mtime;
+            // FastPad just wrote the file, so its data is on this PC.
+            existing.online_only = false;
             false
         } else {
             let pinned = self.is_pinned(&relative);
@@ -481,6 +493,7 @@ impl LibraryState {
                 path: relative,
                 size,
                 mtime,
+                online_only: false,
             });
             true
         }
@@ -498,6 +511,12 @@ impl LibraryState {
     /// Follows a rename FastPad made: the record, the index and the tree. The record moves first,
     /// so the entry added for the new name finds its pin.
     pub fn rename_note(&mut self, old: &Path, new: &Path) {
+        // A rename moves no data: an online-only note stays online only.
+        let online_only = strip_folder(&self.folder, old).is_some_and(|stored| {
+            self.notes
+                .iter()
+                .any(|note| note.online_only && same_path(&note.path, &stored))
+        });
         let old_stored = record_path(&self.folder, old);
         let new_stored = record_path(&self.folder, new);
         if let Some(record) = self.library.note_by_path(&old_stored) {
@@ -512,6 +531,15 @@ impl LibraryState {
         }
         self.remove_note(old);
         let _ = self.add_note(new);
+        if online_only
+            && let Some(relative) = strip_folder(&self.folder, new)
+            && let Some(entry) = self
+                .notes
+                .iter_mut()
+                .find(|note| same_path(&note.path, &relative))
+        {
+            entry.online_only = true;
+        }
     }
 }
 
@@ -901,6 +929,7 @@ mod tests {
                 path: PathBuf::from(format!("f{index}.md")),
                 size: 0,
                 mtime: 0,
+                online_only: false,
             })
             .collect()
     }
@@ -922,6 +951,79 @@ mod tests {
             touched: Vec::new(),
             written_local: local::Conveniences::default(),
         }
+    }
+
+    fn mark_online_only(path: &Path) {
+        let wide = crate::platform::wide_null(&path.to_string_lossy());
+        let marked = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_OFFLINE,
+            )
+        };
+        assert_ne!(marked, 0, "SetFileAttributesW failed");
+    }
+
+    fn online_only(state: &LibraryState, relative: &str) -> bool {
+        state
+            .notes
+            .iter()
+            .find(|note| note.path == Path::new(relative))
+            .unwrap()
+            .online_only
+    }
+
+    #[test]
+    fn an_online_only_file_is_marked_in_the_note_list() {
+        // Break caught: text search opening a OneDrive online-only note, which downloads it.
+        let scratch = Scratch::new("online-only");
+        let cloud = scratch.folder().join("cloud.md");
+        std::fs::write(&cloud, "a").unwrap();
+        std::fs::write(scratch.folder().join("here.md"), "b").unwrap();
+        mark_online_only(&cloud);
+        let state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        assert!(online_only(&state, "cloud.md"));
+        assert!(!online_only(&state, "here.md"));
+    }
+
+    #[test]
+    fn a_rename_keeps_a_notes_online_only_flag_and_a_save_clears_it() {
+        // Break caught: renaming an online-only note in FastPad making the next search download
+        // it, or a note FastPad just saved still skipped as online only.
+        let scratch = Scratch::new("online-rename");
+        let old = scratch.folder().join("old.md");
+        std::fs::write(&old, "a").unwrap();
+        mark_online_only(&old);
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let new = scratch.folder().join("new.md");
+        std::fs::rename(&old, &new).unwrap();
+        state.rename_note(&old, &new);
+        assert!(online_only(&state, "new.md"));
+        std::fs::write(&new, "saved").unwrap();
+        state.add_note(&new);
+        assert!(!online_only(&state, "new.md"));
+        let added = scratch.folder().join("added.md");
+        std::fs::write(&added, "c").unwrap();
+        assert!(state.add_note(&added));
+        assert!(!online_only(&state, "added.md"));
+    }
+
+    #[test]
+    fn a_merged_rescan_keeps_the_scans_online_only_flag_for_a_touched_note() {
+        let scratch = Scratch::new("online-merge");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let mut previous = bare_state(&scratch, Vec::new(), false);
+        previous.add_note(&a);
+        let seen_online_only = NoteEntry {
+            path: PathBuf::from("a.md"),
+            size: 1,
+            mtime: 0,
+            online_only: true,
+        };
+        let fresh = bare_state(&scratch, vec![seen_online_only], false);
+        let merged = merge_rescan(previous, fresh);
+        assert!(online_only(&merged, "a.md"));
     }
 
     #[test]
