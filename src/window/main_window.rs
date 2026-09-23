@@ -10833,6 +10833,49 @@ mod tests {
     }
 
     #[test]
+    fn a_note_changed_outside_fastpad_is_not_moved_over_its_change() {
+        // Break caught: a move saving the tab's edits over a change made outside FastPad (a sync,
+        // another editor), which autosave refuses to do.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("move-changed-a");
+        let second = LibraryScratch::new("move-changed-b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let a = open_note(&window, &first, "a.md", "a");
+        editor.set_text("unsaved edit").unwrap();
+        write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+        std::fs::write(&a, "changed elsewhere").unwrap();
+        let before = notices(window.hwnd).len();
+
+        execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "changed elsewhere");
+        assert!(!second.folder().join("a.md").exists(), "nothing moved");
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(a.as_path()));
+        assert!(active.dirty && active.autosave_paused);
+        let added = &notices(window.hwnd)[before..];
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].contains("Nothing was moved"), "{added:?}");
+
+        // Already paused: refused again, without writing.
+        execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "changed elsewhere");
+        assert!(!second.folder().join("a.md").exists());
+    }
+
+    #[test]
     fn a_note_whose_edits_cannot_be_saved_is_not_moved() {
         // Break caught: a move going ahead after the save of the tab's edits failed, so the
         // moved file lacks them and the tab's text no longer matches either location.

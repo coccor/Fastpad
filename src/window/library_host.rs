@@ -1774,15 +1774,40 @@ fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
 /// that is not active is saved through a brief switch to it, as `autosave_all` does. False (and
 /// a notice) when the save failed: nothing may move then.
 fn save_before_move(hwnd: HWND, note: &Path) -> bool {
-    let Some((id, active)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+    let Some((id, active, paused, known)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let tabs = &unsafe { app.as_ref() }.tabs;
         let id = tabs.find_stored_path(note)?;
-        tabs.document(id)?
-            .dirty
-            .then(|| (id, tabs.active().map(|document| document.id)))
+        let document = tabs.document(id)?;
+        document.dirty.then(|| {
+            (
+                id,
+                tabs.active().map(|document| document.id),
+                document.autosave_paused,
+                document.disk_stamp,
+            )
+        })
     }) else {
         return true;
     };
+    // The same guard as autosave: a file changed outside FastPad (or one whose stamp FastPad
+    // never knew) is never written over by a move. The user saves or reloads it first.
+    let changed = known.is_none() || known != library::disk_stamp(note);
+    if paused || changed {
+        if changed
+            && let Some(mut app) = unsafe { app_ptr(hwnd) }
+            && let Some(document) = unsafe { app.as_mut() }.tabs.document_mut(id)
+        {
+            document.autosave_paused = true;
+        }
+        push_notice(
+            hwnd,
+            format!(
+                "{} changed on disk. Nothing was moved: save it with Note: Keep my version, or use Note: Reload from disk, then move it.",
+                title::note_title(note)
+            ),
+        );
+        return false;
+    }
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
