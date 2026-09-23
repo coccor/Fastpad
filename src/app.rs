@@ -82,6 +82,7 @@ pub struct App {
     pub(crate) ipc_requests: Vec<crate::ipc::IpcRequest>,
     pub(crate) last_snapshot_duration: Option<std::time::Duration>,
     pub(crate) last_snapshot_attempt: Option<DocumentId>,
+    pub(crate) library: crate::window::library_host::LibraryHost,
     next_document_id: u64,
     process_start: u64,
 }
@@ -90,6 +91,7 @@ static NEXT_RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl App {
     pub fn new(launch: LaunchOptions, startup: StartupMetrics) -> Self {
+        let process_start = startup.start_tick() as u64;
         Self {
             hwnd: std::ptr::null_mut(),
             editor: None,
@@ -133,7 +135,8 @@ impl App {
             last_snapshot_duration: None,
             last_snapshot_attempt: None,
             next_document_id: 2,
-            process_start: startup.start_tick() as u64,
+            library: crate::window::library_host::LibraryHost::new(process_start),
+            process_start,
             startup,
         }
     }

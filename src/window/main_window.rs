@@ -36,14 +36,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE,
     SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW,
-    WHEEL_DELTA, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO,
-    WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE,
-    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WHEEL_DELTA, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DWMCOLORIZATIONCOLORCHANGED,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE,
+    WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
+    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -214,6 +214,7 @@ unsafe extern "system" fn main_window_proc(
                 };
                 remove_session_snapshots(hwnd, &discarded);
             }
+            crate::window::library_host::flush_now(hwnd);
             shutdown_ipc(hwnd);
             clear_documents_for_shutdown(hwnd);
             unsafe {
@@ -225,6 +226,7 @@ unsafe extern "system" fn main_window_proc(
             unsafe {
                 KillTimer(hwnd, crate::recovery::RECOVERY_TIMER_ID);
                 KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
+                KillTimer(hwnd, crate::window::library_host::LIBRARY_WRITE_TIMER_ID);
                 PostQuitMessage(0);
             }
             0
@@ -236,6 +238,14 @@ unsafe extern "system" fn main_window_proc(
         WM_TIMER if wparam == crate::window::preview_host::PREVIEW_TIMER_ID => {
             crate::window::preview_host::flush(hwnd);
             0
+        }
+        WM_TIMER if wparam == crate::window::library_host::LIBRARY_WRITE_TIMER_ID => {
+            crate::window::library_host::flush_now(hwnd);
+            0
+        }
+        WM_ACTIVATEAPP => {
+            crate::window::library_host::activation_changed(hwnd, wparam != 0);
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_PAINT => {
             sync_window_title(hwnd);
@@ -573,6 +583,11 @@ unsafe extern "system" fn main_window_proc(
             result
         }
         _ => {
+            // The worker's boxed result: handled at once, since a held message would lose it.
+            if message == crate::window::WM_FASTPAD_LIBRARY_READY {
+                crate::window::library_host::library_ready(hwnd, lparam);
+                return 0;
+            }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
             // IPC drain wait for it to end so they cannot change the document it acts on.
             if (message == crate::window::WM_FASTPAD_IPC_REQUEST
@@ -681,13 +696,17 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
     }
     // Only `WM_FASTPAD_RESTORE_SESSION` processed with no input pending produces this action.
     // Each pass reopens at most one session entry and reposts the unit until none remain.
-    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_OPEN_REQUEST)
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_OPEN_LIBRARY)
         && restore_session_step(hwnd) == RestoreStep::Continue
     {
         unsafe {
             PostMessageW(hwnd, crate::window::WM_FASTPAD_RESTORE_SESSION, 0, 0);
         }
         return 0;
+    }
+    // Only `WM_FASTPAD_OPEN_LIBRARY` processed with no input pending produces this action.
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_OPEN_REQUEST) {
+        crate::window::library_host::open_library_step(hwnd);
     }
     if action == DeferredAction::RecordFullyReady {
         build_chrome(hwnd);
@@ -1703,6 +1722,7 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             });
             let enabled = unsafe { app_ptr(hwnd) }
                 .is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode);
+            crate::window::library_host::notes_mode_changed(hwnd, enabled);
             push_notice(
                 hwnd,
                 crate::window::library_host::notes_mode_notice(enabled).to_owned(),
@@ -6277,7 +6297,7 @@ mod tests {
         assert!(!scratch.path().join("session.ini").exists());
     }
 
-    /// Runs only the session unit until it hands over to `WM_FASTPAD_OPEN_REQUEST`, without
+    /// Runs only the session unit until it hands over to `WM_FASTPAD_OPEN_LIBRARY`, without
     /// pumping the rest of the chain (which would bind the real single-instance pipe).
     fn run_session_restore(hwnd: HWND) {
         use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -6583,7 +6603,7 @@ mod tests {
         unsafe { DispatchMessageW(&message) };
         discard_posted(window.hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE);
         discard_posted(window.hwnd, crate::window::WM_FASTPAD_RECOVERY);
-        discard_posted(window.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST);
+        discard_posted(window.hwnd, crate::window::WM_FASTPAD_OPEN_LIBRARY);
 
         let app = app_mut(window.hwnd);
         assert_eq!(app.tabs.len(), 3);
@@ -6627,6 +6647,132 @@ mod tests {
     fn discard_posted(hwnd: HWND, message: u32) {
         let mut queued = MSG::default();
         while unsafe { PeekMessageW(&mut queued, hwnd, message, message, PM_REMOVE) } != 0 {}
+    }
+
+    struct LibraryScratch {
+        root: std::path::PathBuf,
+    }
+
+    impl LibraryScratch {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("fastpad-libhost-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("notes")).unwrap();
+            std::fs::create_dir_all(root.join("data")).unwrap();
+            Self { root }
+        }
+        fn folder(&self) -> std::path::PathBuf {
+            self.root.join("notes")
+        }
+        fn data(&self) -> std::path::PathBuf {
+            self.root.join("data")
+        }
+        fn note(&self, name: &str, text: &str) -> std::path::PathBuf {
+            let path = self.folder().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+        /// Loads the folder synchronously and installs it, as LIBRARY_READY would.
+        fn install(&self, hwnd: HWND) {
+            let local = crate::library::local::local_file(&self.data(), &self.folder());
+            let state =
+                crate::library::load(&self.folder(), &local, crate::library::now_unix()).unwrap();
+            crate::window::library_host::install_for_test(hwnd, state);
+        }
+    }
+
+    impl Drop for LibraryScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Pumps posted messages until `done` or 5 s.
+    fn pump_until(hwnd: HWND, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            pump_posted_messages(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_library_step_loads_the_remembered_folder_on_a_worker_thread() {
+        // Break caught: the scan running on the UI thread, or the remembered folder ignored.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("startup");
+        scratch.note("a.md", "a");
+        let mut folders = crate::library::local::RecentFolders::default();
+        folders.push(scratch.folder());
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(&scratch.data()),
+            &folders,
+        )
+        .unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::window::library_host::open_library_step(window.hwnd);
+        assert_eq!(
+            crate::window::library_host::folder(window.hwnd),
+            Some(scratch.folder())
+        );
+        pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+        assert_eq!(
+            app_mut(window.hwnd)
+                .library
+                .state
+                .as_ref()
+                .unwrap()
+                .notes
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn with_notes_mode_off_the_library_step_does_nothing() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("off");
+        let window = ProductionWindow::new(make_app());
+        app_mut(window.hwnd).settings.notes_mode = false;
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::window::library_host::open_library_step(window.hwnd);
+        assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+        assert!(!app_mut(window.hwnd).library.scanning);
+    }
+
+    #[test]
+    fn a_stale_ready_message_is_dropped_and_writes_are_flushed_on_demand() {
+        // Break caught: a slow scan of the previous folder replacing the folder just opened.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("stale");
+        let a = scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let stale = crate::window::library_host::test_ready_payload(
+            app_mut(window.hwnd).library.generation.wrapping_sub(1),
+            Err("old".into()),
+        );
+        crate::window::library_host::library_ready(window.hwnd, stale);
+        assert!(app_mut(window.hwnd).library.state.is_some());
+        assert!(notices(window.hwnd).iter().all(|n| !n.contains("old")));
+
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            let mut ids = crate::library::ids::IdSource::new(1, 1);
+            let target = state.note_ref(&mut ids, &a);
+            state
+                .apply(crate::library::ops::PendingOp::SetFavorite {
+                    note: target,
+                    value: true,
+                })
+                .unwrap();
+        });
+        crate::window::library_host::flush_now(window.hwnd);
+        assert!(crate::library::store::library_file(&scratch.folder()).exists());
     }
 
     #[test]
