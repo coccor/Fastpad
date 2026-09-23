@@ -7,7 +7,7 @@ mod main_window;
 pub(crate) mod menu_band;
 pub(crate) mod menus;
 mod messages;
-mod modal;
+pub(crate) mod modal;
 pub mod notification;
 pub mod palette;
 pub(crate) mod panel;
@@ -41,4 +41,7 @@ pub use messages::{
     unused_imports,
     reason = "consumed by the source-linked save_file integration target"
 )]
-pub(crate) use modal::{answer_next_close_prompt, answer_next_save_dialog};
+pub(crate) use modal::{
+    answer_next_close_prompt, answer_next_confirm, answer_next_folder_dialog,
+    answer_next_save_dialog,
+};

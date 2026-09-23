@@ -1,4 +1,5 @@
 pub mod dialogs;
+pub mod files;
 pub mod handles;
 pub mod paths;
 pub mod theme;

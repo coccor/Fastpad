@@ -191,11 +191,22 @@ pub(crate) fn choose_open_path(
     crate::platform::dialogs::show_open_dialog(owner)
 }
 
+#[allow(
+    dead_code,
+    reason = "consumed by the Task 15 Open Folder command, not yet wired"
+)]
+pub(crate) fn choose_folder_path(
+    owner: windows_sys::Win32::Foundation::HWND,
+) -> crate::Result<Option<std::path::PathBuf>> {
+    crate::platform::dialogs::show_folder_dialog(owner)
+}
+
 pub(crate) fn choose_save_path(
     owner: windows_sys::Win32::Foundation::HWND,
     suggested_name: &str,
+    folder: Option<&std::path::Path>,
 ) -> crate::Result<Option<std::path::PathBuf>> {
-    crate::platform::dialogs::show_save_dialog(owner, suggested_name)
+    crate::platform::dialogs::show_save_dialog(owner, suggested_name, folder)
 }
 
 #[cfg(test)]

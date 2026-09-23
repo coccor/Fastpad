@@ -2659,7 +2659,7 @@ fn save_active_document_as(hwnd: HWND) -> bool {
         return false;
     };
     // Modal Show reenters the window procedure. Only an owned identity crosses it.
-    let selection = crate::window::modal::choose_save_path(hwnd, &suggested);
+    let selection = crate::window::modal::choose_save_path(hwnd, &suggested, None);
     if !identity.is_live_for(hwnd) {
         return false;
     }
@@ -5078,6 +5078,19 @@ mod tests {
             app.tabs.document(chosen).unwrap().path.as_deref(),
             Some(target.as_path())
         );
+    }
+
+    #[test]
+    fn folder_and_confirm_seams_answer_inside_their_modal_scope() {
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        crate::window::answer_next_folder_dialog(|_| Some(std::path::PathBuf::from(r"D:\Notes")));
+        assert_eq!(
+            crate::window::modal::choose_folder(window.hwnd).unwrap(),
+            Some(std::path::PathBuf::from(r"D:\Notes"))
+        );
+        crate::window::answer_next_confirm(|_| false);
+        assert!(!crate::window::modal::confirm(window.hwnd, "Delete?"));
     }
 
     #[test]

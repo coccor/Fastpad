@@ -9,7 +9,8 @@ use crate::platform::wide_null;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW, PostMessageW,
+    IDCANCEL, IDNO, IDOK, IDYES, MB_ICONWARNING, MB_OKCANCEL, MB_YESNOCANCEL, MessageBoxW,
+    PostMessageW,
 };
 
 /// Raises `App::modal_depth` for its lifetime; leaving the outermost scope re-posts held messages.
@@ -99,18 +100,51 @@ pub(super) fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
     }
 }
 
-pub(super) fn choose_save_path(hwnd: HWND, suggested_name: &str) -> crate::Result<Option<PathBuf>> {
+pub(super) fn choose_save_path(
+    hwnd: HWND,
+    suggested_name: &str,
+    folder: Option<&std::path::Path>,
+) -> crate::Result<Option<PathBuf>> {
     let _modal = ModalScope::enter(hwnd);
     #[cfg(test)]
     if let Some(answer) = SAVE_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return Ok(answer(hwnd));
     }
-    crate::window::commands::choose_save_path(hwnd, suggested_name)
+    crate::window::commands::choose_save_path(hwnd, suggested_name, folder)
 }
 
 pub(super) fn choose_open_path(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
     let _modal = ModalScope::enter(hwnd);
     crate::window::commands::choose_open_path(hwnd)
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the Task 15 Open Folder command, not yet wired"
+)]
+pub(crate) fn choose_folder(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
+    let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    if let Some(answer) = FOLDER_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return Ok(answer(hwnd));
+    }
+    crate::window::commands::choose_folder_path(hwnd)
+}
+
+/// OK/Cancel warning. Returns whether the user chose OK.
+#[allow(
+    dead_code,
+    reason = "consumed by the Task 18/20 delete and reload-conflict prompts, not yet wired"
+)]
+pub(crate) fn confirm(hwnd: HWND, text: &str) -> bool {
+    let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    if let Some(answer) = CONFIRM_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return answer(hwnd);
+    }
+    let text = wide_null(text);
+    let caption = wide_null("FastPad");
+    unsafe { MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK }
 }
 
 #[cfg(test)]
@@ -121,6 +155,10 @@ thread_local! {
     static CLOSE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<CloseDecision>>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static SAVE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<Option<PathBuf>>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static FOLDER_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<Option<PathBuf>>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static CONFIRM_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<bool>>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
@@ -134,4 +172,16 @@ pub(crate) fn answer_next_close_prompt(answer: impl FnOnce(HWND) -> CloseDecisio
 #[cfg(test)]
 pub(crate) fn answer_next_save_dialog(answer: impl FnOnce(HWND) -> Option<PathBuf> + 'static) {
     SAVE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// Answers the next folder picker from inside its modal scope; `None` is Cancel.
+#[cfg(test)]
+pub(crate) fn answer_next_folder_dialog(answer: impl FnOnce(HWND) -> Option<PathBuf> + 'static) {
+    FOLDER_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// Answers the next OK/Cancel confirmation from inside its modal scope.
+#[cfg(test)]
+pub(crate) fn answer_next_confirm(answer: impl FnOnce(HWND) -> bool + 'static) {
+    CONFIRM_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }

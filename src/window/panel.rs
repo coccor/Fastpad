@@ -7,6 +7,7 @@ use crate::platform::{last_error, wide_null};
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::Graphics::Gdi::{
     DC_BRUSH, FillRect, GetDC, GetStockObject, GetTextMetricsW, HDC, HFONT, ReleaseDC,
     SelectObject, SetDCBrushColor, TEXTMETRICW,
@@ -133,6 +134,40 @@ pub(crate) fn create_child(parent: HWND, class: &[u16], style: u32) -> crate::Re
             0,
             parent,
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if hwnd.is_null() {
+        Err(last_error())
+    } else {
+        Ok(hwnd)
+    }
+}
+
+/// Like `create_child`, but with a control ID so `WM_COMMAND` can tell the child apart.
+#[allow(
+    dead_code,
+    reason = "consumed by the Task 17 folder tree / library panel controls, not yet wired"
+)]
+pub(crate) fn create_child_with_id(
+    parent: HWND,
+    class: &[u16],
+    style: u32,
+    id: u16,
+) -> crate::Result<HWND> {
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            std::ptr::null(),
+            style,
+            0,
+            0,
+            0,
+            0,
+            parent,
+            id as usize as HMENU,
             std::ptr::null_mut(),
             std::ptr::null(),
         )

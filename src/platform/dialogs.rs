@@ -2,20 +2,22 @@
 
 use crate::{FastPadError, Result};
 use std::ffi::{OsString, c_void};
-use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoTaskMemFree, CoUninitialize,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FileOpenDialog, FileSaveDialog, SIGDN_FILESYSPATH,
+    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog,
+    SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
 };
 use windows_sys::core::{GUID, HRESULT};
 
 const IID_IFILE_OPEN_DIALOG: GUID = GUID::from_u128(0xd57c7288_d4ad_4768_be02_9d969532d960);
 const IID_IFILE_SAVE_DIALOG: GUID = GUID::from_u128(0x84bccd23_5fde_4cdb_aea4_af64b83d78ab);
+const IID_ISHELL_ITEM: GUID = GUID::from_u128(0x43826d1e_e718_42ee_bc55_a1e261c37bfe);
 const CANCELLED: HRESULT = 0x800704c7u32 as i32;
 
 #[repr(C)]
@@ -38,7 +40,7 @@ struct FileDialogVtable {
     set_options: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
     get_options: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
     set_default_folder: usize,
-    set_folder: usize,
+    set_folder: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
     get_folder: usize,
     get_current_selection: usize,
     // Callable unconditionally: production show_save_dialog always prefills a suggested file name,
@@ -131,6 +133,15 @@ fn check(status: HRESULT) -> Result<()> {
 }
 
 pub fn show_open_dialog(owner: HWND) -> Result<Option<PathBuf>> {
+    run_open_dialog(owner, FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST)
+}
+
+/// A folder picker: the same `IFileOpenDialog` machinery, restricted to file-system folders.
+pub fn show_folder_dialog(owner: HWND) -> Result<Option<PathBuf>> {
+    run_open_dialog(owner, FOS_FORCEFILESYSTEM | FOS_PICKFOLDERS)
+}
+
+fn run_open_dialog(owner: HWND, options_to_add: u32) -> Result<Option<PathBuf>> {
     let _apartment = ComApartment::initialize()?;
     let mut dialog = Interface(std::ptr::null_mut());
     check(unsafe {
@@ -145,12 +156,9 @@ pub fn show_open_dialog(owner: HWND) -> Result<Option<PathBuf>> {
     dialog.require()?;
     let mut options = 0;
     check(unsafe { (dialog.dialog().get_options)(dialog.0, &mut options) })?;
-    check(unsafe {
-        (dialog.dialog().set_options)(dialog.0, options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST)
-    })?;
+    check(unsafe { (dialog.dialog().set_options)(dialog.0, options | options_to_add) })?;
     #[cfg(test)]
     if let Some(path) = NEXT_FILE_NAME.with(|value| value.borrow_mut().take()) {
-        use std::os::windows::ffi::OsStrExt;
         let name = path
             .as_os_str()
             .encode_wide()
@@ -190,7 +198,11 @@ pub fn show_open_dialog(owner: HWND) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-pub fn show_save_dialog(owner: HWND, suggested_name: &str) -> Result<Option<PathBuf>> {
+pub fn show_save_dialog(
+    owner: HWND,
+    suggested_name: &str,
+    folder: Option<&Path>,
+) -> Result<Option<PathBuf>> {
     let _apartment = ComApartment::initialize()?;
     let mut dialog = Interface(std::ptr::null_mut());
     check(unsafe {
@@ -218,6 +230,26 @@ pub fn show_save_dialog(owner: HWND, suggested_name: &str) -> Result<Option<Path
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     check(unsafe { (dialog.dialog().set_file_name)(dialog.0, name.as_ptr()) })?;
+    // Best-effort: if either call fails, the dialog simply opens where it normally would.
+    if let Some(folder) = folder.filter(|folder| folder.is_dir()) {
+        let wide_folder = folder
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut folder_item = Interface(std::ptr::null_mut());
+        let created = unsafe {
+            SHCreateItemFromParsingName(
+                wide_folder.as_ptr(),
+                std::ptr::null_mut(),
+                &IID_ISHELL_ITEM,
+                &mut folder_item.0,
+            )
+        };
+        if created >= 0 && !folder_item.0.is_null() {
+            unsafe { (dialog.dialog().set_folder)(dialog.0, folder_item.0) };
+        }
+    }
     let status = dialog.show(owner);
     #[cfg(test)]
     note_event(DialogEvent::ShowReturned);

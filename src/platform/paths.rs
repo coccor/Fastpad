@@ -29,6 +29,41 @@ pub fn fastpad_data_dir() -> Result<PathBuf> {
     ))
 }
 
+/// The user's Documents folder, from the known-folder database.
+#[cfg(windows)]
+pub fn documents_dir() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
+    let mut raw = std::ptr::null_mut();
+    let status =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut raw) };
+    if status < 0 || raw.is_null() {
+        if !raw.is_null() {
+            unsafe { CoTaskMemFree(raw.cast()) };
+        }
+        return Err(FastPadError::Win32(status as u32));
+    }
+    let mut len = 0;
+    // The shell owns this terminated UTF-16 allocation until CoTaskMemFree.
+    unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(raw, len)
+    }));
+    unsafe { CoTaskMemFree(raw.cast()) };
+    Ok(path)
+}
+
+/// Where Ctrl+N notes go before any folder was opened: `Documents\FastPad`.
+#[cfg(windows)]
+pub fn default_notes_folder() -> Result<PathBuf> {
+    Ok(documents_dir()?.join("FastPad"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::fastpad_data_dir;
