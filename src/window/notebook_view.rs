@@ -6,13 +6,14 @@
 use super::main_window::{OpenMode, app_ptr};
 use super::side_panel::{UiFonts, ViewPaint, draw_text, point_of};
 use crate::document::{Document, DocumentId};
-use crate::library::tree::{self, RowKind, TreeRow, UnsavedEntry};
+use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
 use crate::window::commands::CommandId;
 use crate::window::menus::MenuEntry;
 use crate::window::palette::Palette;
 use crate::window::panel::{fill, scale};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook};
 use crate::window::tooltip::Tooltip;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -276,6 +277,15 @@ pub(crate) fn follow(
     Some(old.unwrap_or(0).min(last))
 }
 
+/// An untitled tab's row name: its tab label, else its first line, else "Untitled".
+pub(crate) fn unsaved_label(document: &Document) -> String {
+    document
+        .untitled_label
+        .clone()
+        .or_else(|| document.first_line_label.clone())
+        .unwrap_or_else(|| "Untitled".to_owned())
+}
+
 /// One entry per untitled tab, keyed by its `DocumentId`, labelled like its tab (spec §6.2).
 pub(crate) fn unsaved_entries<'a>(
     documents: impl Iterator<Item = &'a Document>,
@@ -284,13 +294,28 @@ pub(crate) fn unsaved_entries<'a>(
         .filter(|document| document.path.is_none())
         .map(|document| UnsavedEntry {
             key: document.id.0,
-            label: document
-                .untitled_label
-                .clone()
-                .or_else(|| document.first_line_label.clone())
-                .unwrap_or_else(|| "Untitled".to_owned()),
+            label: unsaved_label(document),
         })
         .collect()
+}
+
+/// How `flatten` keys an expanded folder: the same lowercasing as `model::same_path`.
+fn expanded_key(path: &Path) -> String {
+    path.as_os_str().to_string_lossy().to_lowercase()
+}
+
+/// The visible rows of `tree` with `expanded` folders open. The expanded set is hashed once, so
+/// each folder row costs one lookup, not a scan of every expanded entry.
+pub(crate) fn flatten(
+    tree: &NoteTree,
+    expanded: &[PathBuf],
+    unsaved: &[UnsavedEntry],
+) -> Vec<TreeRow> {
+    let open: HashSet<String> = expanded.iter().map(|path| expanded_key(path)).collect();
+    tree.rows(
+        &|path: &Path| !open.is_empty() && open.contains(&expanded_key(path)),
+        unsaved,
+    )
 }
 
 /// Letters typed into the tree within a second of each other form one prefix.
@@ -312,6 +337,18 @@ impl TypeAhead {
         self.at = Some(now);
         &self.text
     }
+}
+
+/// Everything the rows depend on besides the library itself, whose changes always come through
+/// `side_panel::refresh` (a full rebuild). A tab switch that leaves this unchanged re-selects a
+/// row without flattening the tree again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RebuildKey {
+    root: Option<PathBuf>,
+    loaded: bool,
+    /// `library_host::expansion_revision`, bumped whenever a folder is expanded or collapsed.
+    expansion: u64,
+    unsaved: Vec<UnsavedEntry>,
 }
 
 /// The Notebook view's state, owned by `side_panel::Sidebar`.
@@ -337,6 +374,11 @@ pub(crate) struct NotebookView {
     typed: TypeAhead,
     thumb_grab: Option<i32>,
     tracking_leave: bool,
+    /// What the rows were last built from (`None` before the first rebuild).
+    built: Option<RebuildKey>,
+    /// Full rebuilds so far, for the tests that check a tab switch skips one.
+    #[cfg(test)]
+    pub(crate) rebuilds: usize,
 }
 
 impl std::fmt::Debug for NotebookView {
@@ -501,6 +543,9 @@ impl NotebookView {
             typed: TypeAhead::default(),
             thumb_grab: None,
             tracking_leave: false,
+            built: None,
+            #[cfg(test)]
+            rebuilds: 0,
         }
     }
 
@@ -604,6 +649,11 @@ impl NotebookView {
         self.truncated = snapshot.truncated;
         self.recent = snapshot.recent;
         self.recent_names = names;
+        self.built = Some(snapshot.key);
+        #[cfg(test)]
+        {
+            self.rebuilds += 1;
+        }
         let count = match self.mode {
             Mode::Tree => self.rows.len() + usize::from(self.truncated),
             Mode::NoNotebook => self.recent.len(),
@@ -1045,6 +1095,7 @@ struct Snapshot {
     recent: Vec<PathBuf>,
     root: Option<PathBuf>,
     favorite: bool,
+    key: RebuildKey,
 }
 
 fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -> Option<R> {
@@ -1056,9 +1107,28 @@ fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -> Option<R>
     })
 }
 
+/// What the rows would be built from now. Cheap: no flattening, no disk.
+fn rebuild_key(hwnd: HWND) -> RebuildKey {
+    let root = super::library_host::folder(hwnd);
+    let unsaved = if root.is_some() {
+        unsafe { app_ptr(hwnd) }
+            .map(|app| unsaved_entries(unsafe { app.as_ref() }.tabs.documents()))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    RebuildKey {
+        loaded: super::library_host::with_state(hwnd, |_| ()).is_some(),
+        expansion: super::library_host::expansion_revision(hwnd),
+        root,
+        unsaved,
+    }
+}
+
 /// Reads everything the rows need. Each call borrows the App on its own, never nested.
 fn snapshot(hwnd: HWND) -> Snapshot {
-    let Some(root) = super::library_host::folder(hwnd) else {
+    let key = rebuild_key(hwnd);
+    let Some(root) = key.root.clone() else {
         return Snapshot {
             mode: Mode::NoNotebook,
             rows: Vec::new(),
@@ -1066,17 +1136,12 @@ fn snapshot(hwnd: HWND) -> Snapshot {
             recent: super::library_host::recent_notebooks(hwnd),
             root: None,
             favorite: false,
+            key,
         };
     };
     let favorite = super::library_host::is_favorite(hwnd);
-    let unsaved = unsafe { app_ptr(hwnd) }
-        .map(|app| unsaved_entries(unsafe { app.as_ref() }.tabs.documents()))
-        .unwrap_or_default();
     let built = super::library_host::with_state(hwnd, |state| {
-        let state = &*state;
-        let rows = state
-            .tree
-            .rows(&|path: &Path| state.local.is_expanded(path), &unsaved);
+        let rows = flatten(&state.tree, &state.local.expanded, &key.unsaved);
         (rows, state.truncated)
     });
     let (mode, rows, truncated) = match built {
@@ -1091,6 +1156,7 @@ fn snapshot(hwnd: HWND) -> Snapshot {
         recent: Vec::new(),
         root: Some(root),
         favorite,
+        key,
     }
 }
 
@@ -1120,7 +1186,9 @@ fn active_target(hwnd: HWND) -> Option<RowKind> {
 }
 
 /// Every tab switch: the active note's row is selected and its folders expand (remembered per
-/// PC), without moving the keyboard focus (spec §6.1).
+/// PC), without moving the keyboard focus (spec §6.1). The tree is flattened again only when
+/// something the rows depend on changed (a folder newly expanded, an untitled tab added, closed
+/// or relabelled, another notebook); otherwise the row is just selected.
 pub(crate) fn active_tab_changed(hwnd: HWND) {
     let target = active_target(hwnd);
     if let Some(RowKind::Note(relative)) = &target {
@@ -1128,13 +1196,43 @@ pub(crate) fn active_tab_changed(hwnd: HWND) {
             super::library_host::set_expanded(hwnd, &folder, true);
         }
     }
-    rebuild(hwnd);
-    if let Some(kind) = target {
-        with_view(hwnd, |view| {
-            if let Some(index) = tree::row_index(&view.rows, &kind) {
-                view.select(index);
-            }
-        });
+    let key = rebuild_key(hwnd);
+    let stale = with_view(hwnd, |view| view.built.as_ref() != Some(&key)).unwrap_or(false);
+    if stale {
+        rebuild(hwnd);
+    }
+    with_view(hwnd, |view| {
+        if let Some(index) = target
+            .as_ref()
+            .and_then(|kind| tree::row_index(&view.rows, kind))
+        {
+            view.select(index);
+        }
+        view.invalidate();
+    });
+}
+
+/// An untitled tab's label changed (`library_host::refresh_label`): its row is renamed in place,
+/// with no rebuild. A row that is not there yet (its tab is new) comes with a rebuild.
+pub(crate) fn unsaved_label_changed(hwnd: HWND, id: DocumentId, label: &str) {
+    let renamed = with_view(hwnd, |view| {
+        if let Some(entry) = view
+            .built
+            .as_mut()
+            .and_then(|built| built.unsaved.iter_mut().find(|entry| entry.key == id.0))
+        {
+            entry.label = label.to_owned();
+        }
+        let Some(index) = tree::row_index(&view.rows, &RowKind::Unsaved(id.0)) else {
+            // Without a notebook, or while it loads, there are no rows to rename.
+            return !matches!(view.mode, Mode::Tree | Mode::Empty);
+        };
+        label.clone_into(&mut view.rows[index].name);
+        view.invalidate();
+        true
+    });
+    if renamed == Some(false) {
+        rebuild(hwnd);
     }
 }
 
@@ -1669,5 +1767,31 @@ mod tests {
         assert_eq!(typed.push('n', start), "n");
         assert_eq!(typed.push('o', start + Duration::from_millis(900)), "no");
         assert_eq!(typed.push('x', start + Duration::from_millis(2_000)), "x");
+    }
+
+    #[test]
+    fn a_thousand_expanded_folders_of_ten_notes_flatten_within_a_frame() {
+        // Break caught: a linear scan of the expanded list per folder row (with two lowercased
+        // allocations per comparison), which made a tab switch in a big, fully expanded
+        // notebook take close to 100 ms.
+        let notes: Vec<PathBuf> = (0..1_000)
+            .flat_map(|folder| {
+                (0..10).map(move |note| PathBuf::from(format!(r"Folder {folder}\Note {note}.md")))
+            })
+            .collect();
+        let tree = NoteTree::build(&notes, &[]);
+        // Stored as the per-PC file may spell them: case differences still match.
+        let expanded: Vec<PathBuf> = (0..1_000)
+            .map(|folder| PathBuf::from(format!("folder {folder}")))
+            .collect();
+        let started = Instant::now();
+        let rows = flatten(&tree, &expanded, &[]);
+        let elapsed = started.elapsed();
+        assert_eq!(rows.len(), 11_000);
+        assert!(rows[0].expanded);
+        assert_eq!(flatten(&tree, &[], &[]).len(), 1_000);
+        if !cfg!(debug_assertions) {
+            assert!(elapsed < Duration::from_millis(16), "{elapsed:?}");
+        }
     }
 }

@@ -62,6 +62,9 @@ pub(crate) struct LibraryHost {
     /// Bumped by each `open_listed_notebook` check and by any switch or close that makes an
     /// outstanding one stale: `notebook_checked` drops an answer whose value has fallen behind.
     check_request: u64,
+    /// Bumped whenever `set_expanded` changes the expanded set, so the Notebook view knows its
+    /// rows are stale without comparing the sets.
+    expansion_revision: u64,
 }
 
 impl LibraryHost {
@@ -81,6 +84,7 @@ impl LibraryHost {
             folders: None,
             folders_edited: false,
             check_request: 0,
+            expansion_revision: 0,
         }
     }
 }
@@ -440,6 +444,11 @@ fn install(hwnd: HWND, fresh: LibraryState) {
         },
     );
     super::side_panel::refresh(hwnd);
+    // A notebook's first load reveals the (restored) active note: its row is selected and its
+    // folders expand (spec §6.1). A rescan leaves the user's selection where it was.
+    if first_time {
+        super::side_panel::active_tab_changed(hwnd);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -490,6 +499,9 @@ pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
     })
     .unwrap_or(false);
     if changed {
+        host(hwnd, |host| {
+            host.expansion_revision = host.expansion_revision.wrapping_add(1);
+        });
         save_local(
             hwnd,
             LocalWrite {
@@ -498,6 +510,11 @@ pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
             },
         );
     }
+}
+
+/// Changes whenever a folder is expanded or collapsed.
+pub(crate) fn expansion_revision(hwnd: HWND) -> u64 {
+    host(hwnd, |host| host.expansion_revision).unwrap_or(0)
 }
 
 /// The open notebook's expanded folders, relative to it.
@@ -1052,16 +1069,12 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
 /// off too (only edits near the top recompute it), and shown only with notes mode on.
 pub(crate) fn refresh_label(hwnd: HWND) {
     let shown = notes_mode(hwnd);
-    let changed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+    let changed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let Some(editor) = app.editor.as_ref() else {
-            return false;
-        };
-        let Some(active) = app.tabs.active() else {
-            return false;
-        };
+        let editor = app.editor.as_ref()?;
+        let active = app.tabs.active()?;
         if active.path.is_some() {
-            return false;
+            return None;
         }
         let id = active.id;
         let count = editor
@@ -1072,20 +1085,19 @@ pub(crate) fn refresh_label(hwnd: HWND) {
             .map(|line| editor.line_text(line).unwrap_or_default())
             .collect();
         let label = title::untitled_label(lines.iter().map(String::as_str));
-        let Some(document) = app.tabs.document_mut(id) else {
-            return false;
-        };
+        let document = app.tabs.document_mut(id)?;
         document.label_watch = label.watch_through;
         document.first_line_label = label.text;
         if !shown || document.untitled_label == document.first_line_label {
-            return false;
+            return None;
         }
         document.untitled_label = document.first_line_label.clone();
-        true
+        Some((id, crate::window::notebook_view::unsaved_label(document)))
     });
-    if changed {
+    if let Some((id, label)) = changed {
         super::main_window::refresh_tab_view(hwnd);
-        super::side_panel::refresh(hwnd);
+        // Typing in the first line renames the unsaved row in place, without a rebuild.
+        crate::window::notebook_view::unsaved_label_changed(hwnd, id, &label);
     }
 }
 

@@ -10000,4 +10000,82 @@ mod tests {
         paint(window.hwnd);
         unsafe { windows_sys::Win32::Graphics::Gdi::ReleaseDC(panel, dc) };
     }
+
+    #[test]
+    fn switching_tabs_in_an_unchanged_notebook_and_typing_a_first_line_do_not_reflatten() {
+        // Break caught: every tab switch, and every keystroke in an untitled tab's first line,
+        // flattening the whole tree again (tens of milliseconds in a big, expanded notebook).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-no-reflatten");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        let id_of =
+            |path: &std::path::Path| app_mut(window.hwnd).tabs.find_stored_path(path).unwrap();
+        let (a_id, b_id) = (id_of(&a), id_of(&b));
+        // The deferred startup steps (theme, chrome) refresh the sidebar once; let them run.
+        pump_posted_messages(window.hwnd);
+        let before = notebook_view(window.hwnd).rebuilds;
+
+        assert!(super::activate_document_by_id(window.hwnd, a_id));
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into()))
+        );
+        assert!(super::activate_document_by_id(window.hwnd, b_id));
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("b.md".into()))
+        );
+        assert_eq!(notebook_view(window.hwnd).rebuilds, before, "no re-flatten");
+
+        // A new untitled tab adds a row, so that switch does rebuild; typing its first line
+        // then only renames the row.
+        execute_command(window.hwnd, CommandId::New);
+        let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let after_new = notebook_view(window.hwnd).rebuilds;
+        assert!(after_new > before);
+        editor.set_text("Groceries").unwrap();
+        pump_posted_messages(window.hwnd);
+        let row = row_of(window.hwnd, &RowKind::Unsaved(untitled.0));
+        assert_eq!(notebook_view(window.hwnd).rows[row].name, "Groceries");
+        assert_eq!(notebook_view(window.hwnd).rebuilds, after_new);
+        assert!(super::activate_document_by_id(window.hwnd, a_id));
+        assert_eq!(
+            notebook_view(window.hwnd).rebuilds,
+            after_new,
+            "the renamed row's label is part of the key, so switching away does not rebuild"
+        );
+    }
+
+    #[test]
+    fn a_notebooks_first_load_selects_the_restored_active_note_and_expands_its_folders() {
+        // Break caught: a restored session whose active note sits in a collapsed folder, with
+        // nothing selected, until the user switches tabs.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-restore-reveal");
+        std::fs::create_dir_all(scratch.folder().join(r"sub\deep")).unwrap();
+        let b = scratch.note(r"sub\deep\b.md", "b");
+        scratch.note("c.md", "c");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        super::open_path(window.hwnd, &b).unwrap();
+
+        scratch.install(window.hwnd);
+
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"sub\deep\b.md".into()))
+        );
+        let expanded = crate::window::library_host::expanded(window.hwnd);
+        assert!(expanded.contains(&std::path::PathBuf::from("sub")));
+        assert!(expanded.contains(&std::path::PathBuf::from(r"sub\deep")));
+    }
 }
