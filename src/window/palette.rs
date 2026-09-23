@@ -145,6 +145,11 @@ impl Palette {
         self.editor_background
     }
 
+    /// The side panel's background: halfway between the strip and the editor, channel by channel.
+    pub const fn panel_background(&self) -> u32 {
+        ((self.strip_background >> 1) & 0x007f_7f7f) + ((self.editor_background >> 1) & 0x007f_7f7f)
+    }
+
     fn high_contrast() -> Self {
         let color = |index| unsafe { GetSysColor(index) };
         let window = color(COLOR_WINDOW);

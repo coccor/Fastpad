@@ -69,6 +69,10 @@ pub enum CommandId {
     NoteMoveToNotebook = 165,
     NoteRename = 174,
     NoteDelete = 175,
+    ToggleSidebar = 176,
+    ShowNotebookView = 177,
+    ShowSearchView = 178,
+    ShowFavoritesView = 179,
 }
 
 impl CommandId {
@@ -102,6 +106,10 @@ impl CommandId {
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
                 | Self::ToggleFolderAutosave
+                | Self::ToggleSidebar
+                | Self::ShowNotebookView
+                | Self::ShowSearchView
+                | Self::ShowFavoritesView
         )
     }
 
@@ -112,6 +120,17 @@ impl CommandId {
                 | Self::MarkdownPreviewSide
                 | Self::MarkdownPreviewFull
                 | Self::MarkdownPreviewClose
+        )
+    }
+
+    /// Commands that act on the sidebar, which exists only in notes mode.
+    pub const fn is_sidebar(self) -> bool {
+        matches!(
+            self,
+            Self::ToggleSidebar
+                | Self::ShowNotebookView
+                | Self::ShowSearchView
+                | Self::ShowFavoritesView
         )
     }
 
@@ -131,7 +150,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 67] = [
+        const COMMANDS: [CommandId; 71] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -199,6 +218,10 @@ impl TryFrom<u16> for CommandId {
             CommandId::NoteMoveToNotebook,
             CommandId::NoteRename,
             CommandId::NoteDelete,
+            CommandId::ToggleSidebar,
+            CommandId::ShowNotebookView,
+            CommandId::ShowSearchView,
+            CommandId::ShowFavoritesView,
         ];
         COMMANDS
             .into_iter()
@@ -282,6 +305,26 @@ mod tests {
         assert!(CommandId::NoteMoveToNotebook.needs_document());
         assert!(CommandId::NoteRename.needs_document());
         assert!(CommandId::NoteDelete.needs_document());
+    }
+
+    #[test]
+    fn sidebar_commands_have_their_reserved_numbers_and_need_no_document() {
+        // Break caught: a renumbered view command, which would break the accelerator table and
+        // any WM_COMMAND an outside test posts by number.
+        assert_eq!(CommandId::try_from(176), Ok(CommandId::ToggleSidebar));
+        assert_eq!(CommandId::try_from(177), Ok(CommandId::ShowNotebookView));
+        assert_eq!(CommandId::try_from(178), Ok(CommandId::ShowSearchView));
+        assert_eq!(CommandId::try_from(179), Ok(CommandId::ShowFavoritesView));
+        for command in [
+            CommandId::ToggleSidebar,
+            CommandId::ShowNotebookView,
+            CommandId::ShowSearchView,
+            CommandId::ShowFavoritesView,
+        ] {
+            assert!(!command.needs_document());
+            assert!(command.is_sidebar());
+        }
+        assert!(!CommandId::Save.is_sidebar());
     }
 
     #[test]

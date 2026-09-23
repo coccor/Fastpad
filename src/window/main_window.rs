@@ -382,14 +382,14 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         // The empty tab-strip space is the only caption: double-clicking it opens a tab, VSCode
-        // style, instead of maximizing.
-        WM_NCLBUTTONDBLCLK if wparam == HTCAPTION as usize => {
+        // style, instead of maximizing. Over the sidebar's top strip it maximizes as usual.
+        WM_NCLBUTTONDBLCLK if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => {
             execute_command(hwnd, CommandId::New);
             0
         }
         // Its context menu replaces the system menu; Alt+Space still opens that.
-        WM_NCRBUTTONDOWN if wparam == HTCAPTION as usize => 0,
-        WM_NCRBUTTONUP if wparam == HTCAPTION as usize => {
+        WM_NCRBUTTONDOWN if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => 0,
+        WM_NCRBUTTONUP if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => {
             let mut point = windows_sys::Win32::Foundation::POINT {
                 x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
@@ -592,6 +592,9 @@ unsafe extern "system" fn main_window_proc(
             {
                 let _ = editor.set_text_padding(dpi);
             }
+            // The suggested rectangle may keep the size, and then no WM_SIZE re-lays out the
+            // sidebar and bands for the new DPI.
+            layout_editor_and_find_bar(hwnd);
             0
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
@@ -912,6 +915,8 @@ where
         install_editor(hwnd, editor, document)?;
         record_milestone(hwnd, Milestone::EditorCreated)?;
     }
+    // The sidebar comes with the window, before first paint, from the settings bootstrap read.
+    crate::window::side_panel::notes_mode_changed(hwnd, notes_mode_enabled(hwnd));
     Ok(editor_hwnd)
 }
 
@@ -986,26 +991,27 @@ fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
     action(editor);
 }
 
-/// Repositions the editor (and the find bar, if visible) to account for the title strip and an
-/// optional find/replace bar reserved above it. The sole layout choke point for both; extends the
-/// pre-Task-12 `WM_SIZE` editor-only positioning rather than duplicating it.
+/// Lays out the sidebar, then the find bar, the name box, the preview and the editor right of it,
+/// below the title strip. The sole layout choke point for all of them.
 pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
+    let mut rect = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect);
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    crate::window::side_panel::layout(hwnd, rect, dpi);
     layout_command_palette(hwnd);
     let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
         return;
     };
     let title_height = title_layout(hwnd).height + menu_band_height(hwnd);
-    let mut rect = RECT::default();
-    unsafe {
-        GetClientRect(hwnd, &mut rect);
-    }
-    let width = rect.right - rect.left;
-    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let left = crate::window::side_panel::left_edge(hwnd);
+    let width = (rect.right - rect.left - left).max(0);
     let font = title_chrome(hwnd).1.text();
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
-            bar.layout(width, title_height, dpi, font);
+            bar.layout(left, width, title_height, dpi, font);
             bar.is_visible().then(|| find_bar::find_bar_height(dpi))
         })
         .unwrap_or(0);
@@ -1013,7 +1019,7 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     let name_box_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
-            name_box.layout(width, title_height + find_bar_height, dpi, font);
+            name_box.layout(left, width, title_height + find_bar_height, dpi, font);
             name_box
                 .is_visible()
                 .then(|| crate::window::name_box::name_box_height(dpi))
@@ -1022,9 +1028,9 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     let content_top = title_height + find_bar_height + name_box_height;
     let status_height = status_bar_height(hwnd);
     let area = RECT {
-        left: 0,
+        left,
         top: content_top,
-        right: width,
+        right: left + width,
         bottom: (rect.bottom - rect.top - status_height).max(content_top),
     };
     let rects = crate::window::preview_host::layout(hwnd, area, dpi);
@@ -1113,6 +1119,20 @@ pub(crate) fn current_palette(hwnd: HWND) -> Palette {
     title_chrome(hwnd).0
 }
 
+/// The sidebar's fonts at the window's DPI, created on first use and again after a DPI change.
+/// Null handles without a sidebar. Call it with nothing of the App borrowed.
+pub(crate) fn ui_fonts(hwnd: HWND) -> crate::window::side_panel::UiFonts {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    unsafe { app_ptr(hwnd) }
+        .and_then(|mut app| {
+            unsafe { app.as_mut() }
+                .sidebar
+                .as_mut()
+                .map(|sidebar| sidebar.fonts(dpi))
+        })
+        .unwrap_or_default()
+}
+
 /// The height of the visible find bar or name box band above the editor, or 0.
 fn bar_band_height(hwnd: HWND) -> i32 {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
@@ -1138,7 +1158,7 @@ fn content_focus_target(hwnd: HWND) -> Option<HWND> {
     crate::window::preview_host::full_view_hwnd(hwnd).or_else(|| unsafe { editor_hwnd(hwnd) })
 }
 
-/// Overlays the palette at the top of the editor, even with no tab open (New and Open stay
+/// Overlays the palette at the top of the editor area, even with no tab open (New and Open stay
 /// available then), below a visible find bar or name box so both stay usable.
 fn layout_command_palette(hwnd: HWND) {
     if !with_command_palette(hwnd, CommandPalette::is_visible).unwrap_or(false) {
@@ -1151,13 +1171,16 @@ fn layout_command_palette(hwnd: HWND) {
     }
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     let font = title_chrome(hwnd).1.text();
-    let width = rect.right - rect.left;
+    let left = crate::window::side_panel::left_edge(hwnd);
+    let width = (rect.right - rect.left - left).max(0);
     if let Some(mut app) = unsafe { app_ptr(hwnd) }
         && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
     {
         palette.measure(width, dpi, font);
     }
-    with_command_palette(hwnd, |palette| palette.apply_layout(width, top, dpi, font));
+    with_command_palette(hwnd, |palette| {
+        palette.apply_layout(left, width, top, dpi, font)
+    });
 }
 
 /// Runs `action` on the palette through a shared borrow only, so re-entrant window-procedure
@@ -1167,7 +1190,7 @@ fn with_command_palette<R>(hwnd: HWND, action: impl FnOnce(&CommandPalette) -> R
     unsafe { app.as_ref() }.command_palette.as_ref().map(action)
 }
 
-fn open_command_palette(hwnd: HWND) {
+pub(crate) fn open_command_palette(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
@@ -1279,8 +1302,11 @@ fn refilter_command_palette(hwnd: HWND) {
     } else {
         let has_tabs = tab_count(hwnd) > 0;
         let markdown = crate::window::preview_host::buttons_visible(hwnd);
+        let sidebar = notes_mode_enabled(hwnd);
         let entries = command_palette::filter_entries(&query, |command| {
-            (has_tabs || !command.needs_document()) && (markdown || !command.is_markdown_preview())
+            (has_tabs || !command.needs_document())
+                && (markdown || !command.is_markdown_preview())
+                && (sidebar || !command.is_sidebar())
         });
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
@@ -1585,7 +1611,11 @@ fn scroll_tabs(hwnd: HWND, lparam: LPARAM, delta: i32) -> bool {
         windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
     }
     let layout = title_layout(hwnd);
-    if point.y < 0 || point.y >= layout.height || point.x < 0 || point.x >= layout.overflow.left {
+    if point.y < 0
+        || point.y >= layout.height
+        || point.x < layout.tabs.left
+        || point.x >= layout.overflow.left
+    {
         return false;
     }
     let scroll = layout.scroll_by_wheel(delta, WHEEL_DELTA as i32);
@@ -1700,6 +1730,7 @@ fn refresh_tabs(hwnd: HWND) {
     }
     crate::window::preview_host::sync_visibility(hwnd);
     crate::window::library_host::refresh_label(hwnd);
+    crate::window::side_panel::active_tab_changed(hwnd);
 }
 
 fn execute_command(hwnd: HWND, command: CommandId) {
@@ -1806,6 +1837,7 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             let enabled = unsafe { app_ptr(hwnd) }
                 .is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode);
             crate::window::library_host::notes_mode_changed(hwnd, enabled);
+            crate::window::side_panel::notes_mode_changed(hwnd, enabled);
             if enabled {
                 crate::window::library_host::show_labels(hwnd);
             } else {
@@ -1885,6 +1917,16 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         | CommandId::MarkdownPreviewClose => {
             crate::window::preview_host::run_command(hwnd, command)
         }
+        CommandId::ToggleSidebar => crate::window::side_panel::toggle(hwnd),
+        CommandId::ShowNotebookView => {
+            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, true)
+        }
+        CommandId::ShowSearchView => {
+            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true)
+        }
+        CommandId::ShowFavoritesView => {
+            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Favorites, true)
+        }
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);
@@ -1928,7 +1970,7 @@ fn set_theme(hwnd: HWND, theme: crate::config::ThemePreference) {
 
 /// Applies one settings change from a command and saves it to `fastpad.ini`. `change` edits the
 /// in-memory settings and names the `key=value` it made, or returns `None` when nothing changed.
-fn change_setting(
+pub(crate) fn change_setting(
     hwnd: HWND,
     change: impl FnOnce(&mut crate::config::Settings) -> Option<(&'static str, String)>,
 ) {
@@ -2043,10 +2085,17 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
     }
 }
 
-/// Runs only inside `WM_FASTPAD_LOAD_SETTINGS`: resolves and parses `fastpad.ini`, applies the
-/// editor view settings in place, and queues every rejected line as a non-modal notification.
+/// Runs only inside `WM_FASTPAD_LOAD_SETTINGS`: applies the settings `bootstrap::run` read before
+/// the window existed (or resolves and parses `fastpad.ini` now when nothing was preloaded),
+/// applies the editor view settings in place, and queues every rejected line as a non-modal
+/// notification.
 fn load_settings(hwnd: HWND) {
-    let (settings, warnings) = crate::config::load();
+    let preloaded = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let warnings = app.preloaded_settings_warnings.take()?;
+        Some((app.settings.clone(), warnings))
+    });
+    let (settings, warnings) = preloaded.unwrap_or_else(crate::config::load);
     apply_loaded_settings(hwnd, settings, warnings);
     start_recovery_timer(hwnd);
 }
@@ -2067,6 +2116,8 @@ fn apply_loaded_settings(
         }
     }
     apply_editor_settings(hwnd);
+    let notes_mode = notes_mode_enabled(hwnd);
+    crate::window::side_panel::notes_mode_changed(hwnd, notes_mode);
 }
 
 fn settings_warning_message(warning: &crate::config::SettingWarning) -> String {
@@ -2214,6 +2265,7 @@ fn apply_theme(hwnd: HWND) {
         apply_language(hwnd, language);
     }
     crate::window::preview_host::refresh_appearance(hwnd);
+    crate::window::side_panel::refresh(hwnd);
 }
 
 /// Copies what a title-strip paint needs out of App, creating the per-DPI fonts on first use.
@@ -2246,6 +2298,18 @@ fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
                 PointerState::default(),
             )
         })
+}
+
+/// Whether the screen point in a non-client mouse message's `lparam` is over the sidebar.
+fn over_sidebar(hwnd: HWND, lparam: LPARAM) -> bool {
+    let mut point = windows_sys::Win32::Foundation::POINT {
+        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    };
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+    }
+    point.x < crate::window::side_panel::left_edge(hwnd)
 }
 
 fn client_title_target(hwnd: HWND, lparam: LPARAM) -> Option<HitTarget> {
@@ -4251,7 +4315,12 @@ fn menu_headings(hwnd: HWND) -> Vec<RECT> {
     }
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     let widths = menu_band::measure_titles(hwnd, title_chrome(hwnd).1.text());
-    menu_band::heading_rects(&widths, title_layout(hwnd).height, dpi)
+    menu_band::heading_rects(
+        &widths,
+        crate::window::side_panel::left_edge(hwnd),
+        title_layout(hwnd).height,
+        dpi,
+    )
 }
 
 /// Stores `mode`, re-laying out the window when the band appears or disappears.
@@ -4344,6 +4413,7 @@ fn open_menu(hwnd: HWND, mut index: usize) {
                 menu,
                 crate::window::preview_host::buttons_visible(hwnd),
             );
+            menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
         }
         set_menu_mode(
             hwnd,
@@ -4814,16 +4884,21 @@ mod tests {
         execute_command(window.hwnd, CommandId::CloseTab);
         assert_eq!(editor.text().unwrap(), "");
 
+        // The empty strip right of the sidebar; over the sidebar the caption maximizes instead.
+        let drag = super::title_layout(window.hwnd).drag_region.center();
+        let strip = screen_lparam(window.hwnd, drag.x, drag.y);
         unsafe {
-            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, 0);
-            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, 0);
+            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, strip);
+            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, strip);
         }
         assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
         assert!(editor_visible());
 
         answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
+        let drag = super::title_layout(window.hwnd).drag_region.center();
+        let strip = screen_lparam(window.hwnd, drag.x, drag.y);
         unsafe {
-            SendMessageW(window.hwnd, WM_NCRBUTTONUP, HTCAPTION as usize, 0);
+            SendMessageW(window.hwnd, WM_NCRBUTTONUP, HTCAPTION as usize, strip);
         }
         assert!(app_mut(window.hwnd).tabs.is_empty());
         assert!(!editor_visible());
@@ -6139,6 +6214,481 @@ mod tests {
             .editor
             .clone()
             .unwrap()
+    }
+
+    fn sidebar_windows(hwnd: HWND) -> (HWND, HWND) {
+        let sidebar = app_mut(hwnd)
+            .sidebar
+            .as_ref()
+            .expect("notes mode shows the sidebar");
+        (sidebar.bar, sidebar.panel)
+    }
+
+    fn client_lparam(x: i32, y: i32) -> super::LPARAM {
+        ((y as u32) << 16 | (x as u32 & 0xffff)) as super::LPARAM
+    }
+
+    /// `window`'s client point `x`, `y` as a screen-coordinate `lParam`, as WM_NCHITTEST gets it.
+    fn screen_lparam(window: HWND, x: i32, y: i32) -> super::LPARAM {
+        let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window, &mut point) };
+        client_lparam(point.x, point.y)
+    }
+
+    fn client_size(window: HWND) -> (i32, i32) {
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(window, &mut rect) };
+        (rect.right, rect.bottom)
+    }
+
+    /// `child`'s left edge in `parent`'s client coordinates.
+    fn left_of(child: HWND, parent: HWND) -> i32 {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut rect = RECT::default();
+        let mut origin = windows_sys::Win32::Foundation::POINT::default();
+        unsafe {
+            GetWindowRect(child, &mut rect);
+            windows_sys::Win32::Graphics::Gdi::ClientToScreen(parent, &mut origin);
+        }
+        rect.left - origin.x
+    }
+
+    /// The test window is never shown, so check the child's own style bit.
+    fn is_shown(window: HWND) -> bool {
+        (unsafe { GetWindowLongPtrW(window, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
+    }
+
+    fn click(window: HWND, x: i32, y: i32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        unsafe {
+            SendMessageW(window, WM_LBUTTONDOWN, 0, client_lparam(x, y));
+            SendMessageW(window, WM_LBUTTONUP, 0, client_lparam(x, y));
+        }
+    }
+
+    fn button_center(
+        hwnd: HWND,
+        button: crate::window::activity_bar::ActivityButton,
+    ) -> (i32, i32) {
+        let (bar, _) = sidebar_windows(hwnd);
+        let (width, height) = client_size(bar);
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let dpi = unsafe { GetDpiForWindow(bar) }.max(96);
+        let rect = crate::window::activity_bar::button_rects(client, dpi)[button.index()];
+        ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+    }
+
+    /// Resizes the window so its client area is `client_width` wide.
+    fn set_client_width(hwnd: HWND, client_width: i32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowRect, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
+        };
+        let mut frame = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut frame) };
+        let border = (frame.right - frame.left) - client_size(hwnd).0;
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                client_width + border,
+                frame.bottom - frame.top,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+        }
+    }
+
+    /// A scratch `fastpad.ini` holding only a comment, which settings saves go to.
+    fn settings_scratch(label: &str) -> (RecoveryScratch, PathBuf) {
+        let scratch = RecoveryScratch::new(label);
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        (scratch, ini)
+    }
+
+    #[test]
+    fn with_notes_mode_off_there_is_no_sidebar_and_nothing_moves() {
+        // Break caught: an activity bar, or a gap where it would be, with notes mode off, where
+        // the layout must stay exactly what it was before the sidebar existed.
+        let _scintilla = load_native_scintilla();
+        let mut app = make_app();
+        app.settings.notes_mode = false;
+        let window = ProductionWindow::new(app);
+        let editor = install_test_editor(&window);
+        assert!(app_mut(window.hwnd).sidebar.is_none());
+        assert_eq!(crate::window::side_panel::left_edge(window.hwnd), 0);
+        assert_eq!(super::title_layout(window.hwnd).tab(0).left, 0);
+        assert_eq!(left_of(editor.hwnd(), window.hwnd), 0);
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            crate::config::SidebarView::Hidden
+        );
+        execute_command(window.hwnd, CommandId::ToggleSidebar);
+        assert!(app_mut(window.hwnd).sidebar.is_none());
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        assert!(
+            app_mut(window.hwnd)
+                .command_palette
+                .as_ref()
+                .unwrap()
+                .shown()
+                .iter()
+                .all(|entry| !entry.command.is_sidebar())
+        );
+        super::close_command_palette(window.hwnd, false);
+
+        app_mut(window.hwnd).settings.notes_mode = true;
+        crate::window::side_panel::notes_mode_changed(window.hwnd, true);
+        let (bar, _) = sidebar_windows(window.hwnd);
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        assert!(left > 0);
+        assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
+
+        app_mut(window.hwnd).settings.notes_mode = false;
+        crate::window::side_panel::notes_mode_changed(window.hwnd, false);
+        assert_eq!(unsafe { IsWindow(bar) }, 0);
+        assert_eq!(crate::window::side_panel::left_edge(window.hwnd), 0);
+        assert_eq!(left_of(editor.hwnd(), window.hwnd), 0);
+    }
+
+    #[test]
+    fn the_sidebar_takes_the_left_edge_and_everything_else_starts_right_of_it() {
+        // Break caught: tabs, the find bar, the menu band or the editor still starting at x = 0,
+        // under the activity bar and panel.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let (bar, panel) = sidebar_windows(window.hwnd);
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let (width, height) = client_size(window.hwnd);
+        let saved = app_mut(window.hwnd).settings.sidebar_width;
+        let (activity, panel_width) =
+            crate::window::side_panel::sidebar_widths(width, dpi, true, saved);
+        assert_eq!(client_size(bar), (activity, height));
+        assert_eq!(client_size(panel), (panel_width, height));
+        assert_eq!(left_of(panel, window.hwnd), activity);
+        let left = activity + panel_width;
+        assert_eq!(crate::window::side_panel::left_edge(window.hwnd), left);
+        assert_eq!(super::title_layout(window.hwnd).tab(0).left, left);
+        assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
+        assert_eq!(client_size(editor.hwnd()).0, width - left);
+        assert_eq!(
+            app_mut(window.hwnd)
+                .sidebar
+                .as_ref()
+                .unwrap()
+                .tooltip
+                .unwrap()
+                .tool_count(),
+            4
+        );
+        // An empty text removes a tool instead of showing an empty tip.
+        let tooltip = app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .tooltip
+            .unwrap();
+        tooltip.set_tool(9, RECT::default(), "extra");
+        assert_eq!(tooltip.tool_count(), 5);
+        tooltip.set_tool(9, RECT::default(), "");
+        assert_eq!(tooltip.tool_count(), 4);
+
+        execute_command(window.hwnd, CommandId::Find);
+        let find = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
+        assert_eq!(left_of(find, window.hwnd), left);
+        assert_eq!(client_size(find).0, width - left);
+        super::close_find_bar(window.hwnd);
+
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let palette = app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .panel_hwnd();
+        assert!(left_of(palette, window.hwnd) >= left);
+        super::close_command_palette(window.hwnd, false);
+
+        unsafe {
+            SendMessageW(
+                window.hwnd,
+                super::WM_SYSCOMMAND,
+                super::SC_KEYMENU as usize,
+                0,
+            )
+        };
+        assert_eq!(
+            super::menu_headings(window.hwnd)[0].left,
+            left + crate::window::panel::scale(4, dpi)
+        );
+        unsafe {
+            SendMessageW(
+                window.hwnd,
+                super::WM_SYSCOMMAND,
+                super::SC_KEYMENU as usize,
+                0,
+            )
+        };
+    }
+
+    #[test]
+    fn the_sidebar_top_strip_and_panel_header_are_caption() {
+        // Break caught: child windows under the title row that swallow the caption, so the
+        // window can no longer be dragged or top-resized there, or a lost left-border resize.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowRect, HTCAPTION, HTCLIENT, HTLEFT, HTTRANSPARENT, WM_NCHITTEST,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (bar, panel) = sidebar_windows(window.hwnd);
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let layout = super::title_layout(window.hwnd);
+        let hit = |target: HWND, x: i32, y: i32| unsafe {
+            SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
+        };
+        // Below the top resize band and above the first button.
+        let strip_y = layout.height - 2;
+        assert!(strip_y >= layout.resize_border);
+        let bar_x = client_size(bar).0 / 2;
+        assert_eq!(hit(bar, bar_x, strip_y), HTTRANSPARENT as LRESULT);
+        assert_eq!(hit(window.hwnd, bar_x, strip_y), HTCAPTION as LRESULT);
+        let (button_x, button_y) = button_center(
+            window.hwnd,
+            crate::window::activity_bar::ActivityButton::Notebook,
+        );
+        assert_eq!(hit(bar, button_x, button_y), HTCLIENT as LRESULT);
+
+        let header_y = layout.resize_border + 2;
+        let header = crate::window::panel::scale(crate::window::side_panel::HEADER_HEIGHT_96, dpi);
+        assert!(header_y < header);
+        let panel_x = client_size(panel).0 / 2;
+        assert_eq!(hit(panel, panel_x, header_y), HTTRANSPARENT as LRESULT);
+        assert_eq!(
+            hit(window.hwnd, left_of(panel, window.hwnd) + panel_x, header_y),
+            HTCAPTION as LRESULT
+        );
+        // Below the header, and on the resize edge, the panel keeps its own input.
+        assert_eq!(hit(panel, panel_x, header + 10), HTCLIENT as LRESULT);
+        assert_eq!(
+            hit(panel, client_size(panel).0 - 1, header_y),
+            HTCLIENT as LRESULT
+        );
+
+        // The left border is outside the client area, so no child covers it.
+        let mut frame = RECT::default();
+        let mut origin = windows_sys::Win32::Foundation::POINT::default();
+        unsafe {
+            GetWindowRect(window.hwnd, &mut frame);
+            windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut origin);
+        }
+        if origin.x > frame.left {
+            let border = client_lparam(
+                frame.left + (origin.x - frame.left) / 2,
+                origin.y + client_size(window.hwnd).1 / 2,
+            );
+            assert_eq!(
+                unsafe { SendMessageW(window.hwnd, WM_NCHITTEST, 0, border) },
+                HTLEFT as LRESULT
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_active_view_icon_closes_the_sidebar_panel_and_saves_none() {
+        // Break caught: an icon that only ever opens its view, so the mouse cannot close the
+        // panel, or a closed panel that reopens after a restart.
+        use crate::config::SidebarView;
+        use crate::window::activity_bar::ActivityButton;
+        let _scintilla = load_native_scintilla();
+        let (_scratch, ini) = settings_scratch("sidebar-click");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (bar, panel) = sidebar_windows(window.hwnd);
+        let activity = client_size(bar).0;
+        let view = || crate::window::side_panel::current_view(window.hwnd);
+        let saved = || std::fs::read_to_string(&ini).unwrap();
+
+        let (x, y) = button_center(window.hwnd, ActivityButton::Notebook);
+        click(bar, x, y);
+        assert_eq!(view(), SidebarView::Hidden);
+        assert!(!is_shown(panel));
+        assert_eq!(crate::window::side_panel::left_edge(window.hwnd), activity);
+        assert_eq!(saved(), "# kept\r\nsidebar_view=none\r\n");
+
+        click(bar, x, y);
+        assert_eq!(view(), SidebarView::Notebook);
+        assert!(is_shown(panel));
+        assert_eq!(saved(), "# kept\r\nsidebar_view=notebook\r\n");
+
+        let (x, y) = button_center(window.hwnd, ActivityButton::Search);
+        click(bar, x, y);
+        assert_eq!(view(), SidebarView::Search);
+        assert_eq!(saved(), "# kept\r\nsidebar_view=search\r\n");
+
+        // Settings opens the command palette; Task 12 narrows it to the settings commands.
+        let (x, y) = button_center(window.hwnd, ActivityButton::Settings);
+        click(bar, x, y);
+        assert!(
+            app_mut(window.hwnd)
+                .command_palette
+                .as_ref()
+                .unwrap()
+                .is_visible()
+        );
+        assert_eq!(view(), SidebarView::Search);
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn ctrl_b_toggles_the_sidebar_back_to_the_last_view_and_saves_each_change() {
+        // Break caught: a toggle that forgets which view was open, a shortcut that never
+        // reaches its command, or a change lost on restart.
+        use crate::config::SidebarView;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_SHIFT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let (_scratch, ini) = settings_scratch("sidebar-ctrl-b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        let press = |key: u8, shift: bool| {
+            let mut keys = [0u8; 256];
+            unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+            let original = keys;
+            keys[VK_CONTROL as usize] = 0x80;
+            keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
+            unsafe { SetKeyboardState(keys.as_ptr()) };
+            let message = MSG {
+                hwnd: editor.hwnd(),
+                message: WM_KEYDOWN,
+                wParam: usize::from(key),
+                ..Default::default()
+            };
+            let translated =
+                unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+            unsafe { SetKeyboardState(original.as_ptr()) };
+            translated
+        };
+        let view = || crate::window::side_panel::current_view(window.hwnd);
+        let saved = || std::fs::read_to_string(&ini).unwrap();
+
+        assert_eq!(view(), SidebarView::Notebook);
+        assert!(press(b'B', false));
+        assert_eq!(view(), SidebarView::Hidden);
+        assert_eq!(saved(), "# kept\r\nsidebar_view=none\r\n");
+        assert!(press(b'K', false));
+        assert_eq!(view(), SidebarView::Search);
+        assert!(press(b'B', false));
+        assert!(press(b'B', false));
+        assert_eq!(view(), SidebarView::Search, "Ctrl+B reopens the last view");
+        assert!(press(b'E', true));
+        assert_eq!(view(), SidebarView::Notebook);
+        execute_command(window.hwnd, CommandId::ShowFavoritesView);
+        assert_eq!(view(), SidebarView::Favorites);
+        assert_eq!(saved(), "# kept\r\nsidebar_view=favorites\r\n");
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn a_narrow_window_squeezes_the_panel_without_saving_it() {
+        // Break caught: an editor pushed below its 320 px minimum, a negative panel width, or a
+        // squeeze written to fastpad.ini so the panel stays narrow once the window widens again.
+        let _scintilla = load_native_scintilla();
+        let (_scratch, ini) = settings_scratch("sidebar-squeeze");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let (_, panel) = sidebar_windows(window.hwnd);
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let scale = |value| crate::window::panel::scale(value, dpi);
+
+        set_client_width(window.hwnd, scale(44 + 320 + 200));
+        let (width, _) = client_size(window.hwnd);
+        let (activity, squeezed) = crate::window::side_panel::sidebar_widths(width, dpi, true, 260);
+        assert_eq!(squeezed, width - activity - scale(320));
+        assert!(
+            squeezed > 0 && squeezed < scale(260),
+            "the window squeezes the panel"
+        );
+        assert_eq!(client_size(panel).0, squeezed);
+        assert_eq!(
+            crate::window::side_panel::left_edge(window.hwnd),
+            activity + squeezed
+        );
+        assert_eq!(
+            client_size(editor.hwnd()).0,
+            scale(320).max(width - activity - squeezed)
+        );
+        assert_eq!(app_mut(window.hwnd).settings.sidebar_width, 260);
+
+        set_client_width(window.hwnd, scale(1200));
+        assert_eq!(client_size(panel).0, scale(260));
+
+        // Narrower than the activity bar and the editor minimum: the panel hides, never goes
+        // below zero.
+        set_client_width(window.hwnd, scale(300));
+        assert!(!is_shown(panel));
+        assert_eq!(
+            crate::window::side_panel::left_edge(window.hwnd),
+            scale(44).min(client_size(window.hwnd).0)
+        );
+        assert_eq!(app_mut(window.hwnd).settings.sidebar_width, 260);
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn dragging_the_sidebar_edge_resizes_it_and_saves_the_width_once_on_release() {
+        // Break caught: a drag that writes fastpad.ini on every mouse move, never saves, ignores
+        // the 180–480 range, or an edge double-click that leaves a custom width in place.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        let _scintilla = load_native_scintilla();
+        let (_scratch, ini) = settings_scratch("sidebar-drag");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (_, panel) = sidebar_windows(window.hwnd);
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let scale = |value| crate::window::panel::scale(value, dpi);
+        set_client_width(window.hwnd, scale(1400));
+        let saved = || std::fs::read_to_string(&ini).unwrap();
+        let send = |message, x: i32| unsafe {
+            SendMessageW(
+                panel,
+                message,
+                0,
+                client_lparam(x, client_size(panel).1 / 2),
+            );
+        };
+
+        send(WM_LBUTTONDOWN, client_size(panel).0 - 1);
+        send(WM_MOUSEMOVE, scale(300));
+        assert_eq!(client_size(panel).0, scale(300));
+        assert_eq!(saved(), "# kept\r\n", "nothing is saved mid-drag");
+        send(WM_LBUTTONUP, scale(300));
+        assert_eq!(saved(), "# kept\r\nsidebar_width=300\r\n");
+        assert_eq!(app_mut(window.hwnd).settings.sidebar_width, 300);
+
+        send(WM_LBUTTONDOWN, client_size(panel).0 - 1);
+        send(WM_MOUSEMOVE, scale(900));
+        send(WM_LBUTTONUP, scale(900));
+        assert_eq!(saved(), "# kept\r\nsidebar_width=480\r\n");
+        assert_eq!(client_size(panel).0, scale(480));
+
+        send(WM_LBUTTONDBLCLK, client_size(panel).0 - 1);
+        assert_eq!(saved(), "# kept\r\nsidebar_width=260\r\n");
+        assert_eq!(client_size(panel).0, scale(260));
+        super::save_settings_to(None);
     }
 
     #[test]

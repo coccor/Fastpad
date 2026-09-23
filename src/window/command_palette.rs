@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 55] = [
+pub(crate) const ENTRIES: [PaletteEntry; 59] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open folder...", CommandId::OpenFolder),
@@ -87,6 +87,10 @@ pub(crate) const ENTRIES: [PaletteEntry; 55] = [
     entry("Close Markdown Preview", CommandId::MarkdownPreviewClose),
     entry("View: Next tab", CommandId::NextTab),
     entry("View: Previous tab", CommandId::PreviousTab),
+    entry("View: Toggle sidebar", CommandId::ToggleSidebar),
+    entry("View: Show notebook", CommandId::ShowNotebookView),
+    entry("View: Show search", CommandId::ShowSearchView),
+    entry("View: Show favorites", CommandId::ShowFavoritesView),
     entry("View: Zoom in", CommandId::ZoomIn),
     entry("View: Zoom out", CommandId::ZoomOut),
     entry("View: Reset zoom", CommandId::ZoomReset),
@@ -537,13 +541,20 @@ impl CommandPalette {
         ));
     }
 
-    /// Centers the measured panel horizontally in `parent_width`, starting at `top`, and places
-    /// the field and list inside it.
-    pub(crate) fn apply_layout(&self, parent_width: i32, top: i32, dpi: u32, font: HFONT) {
+    /// Centers the measured panel horizontally in the `parent_width` wide editor area starting at
+    /// `left`, from `top`, and places the field and list inside it.
+    pub(crate) fn apply_layout(
+        &self,
+        left: i32,
+        parent_width: i32,
+        top: i32,
+        dpi: u32,
+        font: HFONT,
+    ) {
         let Some(layout) = self.layout.filter(|_| self.visible) else {
             return;
         };
-        let left = ((parent_width - layout.width) / 2).max(0);
+        let left = left + ((parent_width - layout.width) / 2).max(0);
         let top = top + scale(MARGIN_AT_96_DPI, dpi);
         let move_to = |hwnd, rect: RECT| unsafe {
             MoveWindow(
@@ -939,6 +950,21 @@ mod tests {
             );
             assert_eq!(listed, expected, "{command:?}");
         }
+    }
+
+    #[test]
+    fn the_sidebar_commands_are_listed_with_their_shortcuts() {
+        assert_eq!(labels("sidebar")[0], "View: Toggle sidebar");
+        assert_eq!(labels("show search")[0], "View: Show search");
+        assert_eq!(
+            shortcut_text(CommandId::ToggleSidebar).as_deref(),
+            Some("Ctrl+B")
+        );
+        assert_eq!(
+            shortcut_text(CommandId::ShowNotebookView).as_deref(),
+            Some("Ctrl+Shift+E")
+        );
+        assert_eq!(shortcut_text(CommandId::ShowFavoritesView), None);
     }
 
     #[test]

@@ -258,10 +258,19 @@ fn title_layout(hwnd: HWND, tab_count: usize) -> TestResult<TitleBarLayout> {
     if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
         return Err(Box::new(fastpad::platform::last_error()));
     }
-    Ok(TitleBarLayout::calculate(
+    // The tabs start right of the notes-mode sidebar, where the editor starts.
+    let editor = find_child_by_class(hwnd, "Scintilla")?;
+    let mut editor_rect = windows_sys::Win32::Foundation::RECT::default();
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(editor, &mut editor_rect) };
+    let mut origin = POINT { x: 0, y: 0 };
+    unsafe { ClientToScreen(hwnd, &mut origin) };
+    Ok(TitleBarLayout::calculate_with_offset(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(hwnd) },
         tab_count,
+        0,
+        false,
+        editor_rect.left - origin.x,
     ))
 }
 

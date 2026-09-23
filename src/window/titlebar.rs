@@ -7,8 +7,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, DC_BRUSH, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT,
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FillRect,
-    GetMonitorInfoW, GetStockObject, HDC, HFONT, IntersectClipRect, InvalidateRect,
+    DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, ExcludeClipRect, FW_NORMAL,
+    FillRect, GetMonitorInfoW, GetStockObject, HDC, HFONT, IntersectClipRect, InvalidateRect,
     MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, ScreenToClient, SelectObject, SetBkMode,
     SetDCBrushColor, SetTextColor, TRANSPARENT,
@@ -214,6 +214,9 @@ pub struct TitleBarLayout {
     pub tabs: Rect,
     /// Empty strip beside the tabs: drags the window, opens a tab on double-click.
     pub drag_region: Rect,
+    /// The sidebar's share of the strip, left of the tabs. It is caption (dragging, top-edge
+    /// resizing, double-click to maximize), and empty without a sidebar.
+    pub sidebar: Rect,
     pub minimize: Rect,
     pub maximize: Rect,
     pub close: Rect,
@@ -256,9 +259,22 @@ impl TitleBarLayout {
         scroll: i32,
         preview_buttons: bool,
     ) -> Self {
+        Self::calculate_with_offset(client, dpi, tab_count, scroll, preview_buttons, 0)
+    }
+
+    /// The strip with the tabs starting at `left`, right of the sidebar. The caption buttons keep
+    /// the right edge, and everything left of `left` is caption.
+    pub fn calculate_with_offset(
+        client: Size,
+        dpi: u32,
+        tab_count: usize,
+        scroll: i32,
+        preview_buttons: bool,
+        left: i32,
+    ) -> Self {
         let width = client.width.max(0);
         let dpi = dpi.max(1);
-        let height = scale(40, dpi).max(unsafe { GetSystemMetricsForDpi(SM_CYSIZE, dpi) });
+        let height = strip_height(dpi);
         let resize_border = unsafe {
             GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
         }
@@ -285,31 +301,33 @@ impl TitleBarLayout {
             (None, None, overflow_left)
         };
 
+        let left = left.clamp(0, buttons_left);
         // Some empty strip always stays reachable, however many tabs are open.
-        let tabs_right = buttons_left - scale(48, dpi).min(buttons_left);
-        let tabs = Rect::new(0, 0, tabs_right, height);
+        let tabs_right = (buttons_left - scale(48, dpi)).max(left);
+        let tabs = Rect::new(left, 0, tabs_right, height);
+        let viewport = tabs_right - left;
         let preferred_tab_width = scale(200, dpi);
         let tab_width = if tab_count == 0 {
             0
         } else {
-            (tabs_right / tab_count as i32).clamp(scale(120, dpi), preferred_tab_width)
+            (viewport / tab_count as i32).clamp(scale(120, dpi), preferred_tab_width)
         };
         let content_width = tab_width.saturating_mul(tab_count as i32);
-        let max_scroll = (content_width - tabs_right).max(0);
+        let max_scroll = (content_width - viewport).max(0);
         let scroll = scroll.clamp(0, max_scroll);
 
         let close_size = scale(32, dpi).min(tab_width);
         let mut tab_rects = Vec::with_capacity(tab_count);
         let mut close_tab_rects = Vec::with_capacity(tab_count);
         for index in 0..tab_count {
-            let left = index as i32 * tab_width - scroll;
-            let right = left + tab_width;
-            tab_rects.push(Rect::new(left, 0, right, height));
+            let tab_left = left + index as i32 * tab_width - scroll;
+            let right = tab_left + tab_width;
+            tab_rects.push(Rect::new(tab_left, 0, right, height));
             close_tab_rects.push(Rect::new(right - close_size, 0, right, height));
         }
 
         let drag_region = Rect::new(
-            (content_width - scroll).clamp(0, tabs_right),
+            (left + content_width - scroll).clamp(left, tabs_right),
             0,
             buttons_left,
             height,
@@ -320,6 +338,7 @@ impl TitleBarLayout {
         Self {
             tabs,
             drag_region,
+            sidebar: Rect::new(0, 0, left, height),
             minimize,
             maximize,
             close,
@@ -421,7 +440,7 @@ impl TitleBarLayout {
                 }
             }
         }
-        if self.drag_region.contains(point) {
+        if self.sidebar.contains(point) || self.drag_region.contains(point) {
             return HitTarget::Caption;
         }
         HitTarget::Client
@@ -487,12 +506,13 @@ pub(crate) fn layout_for_window(
     unsafe {
         GetClientRect(hwnd, &mut client);
     }
-    TitleBarLayout::calculate_with_preview(
+    TitleBarLayout::calculate_with_offset(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(hwnd) }.max(96),
         tab_count,
         scroll,
         preview_buttons,
+        crate::window::side_panel::left_edge(hwnd),
     )
 }
 
@@ -569,7 +589,8 @@ impl Drop for TitleFonts {
     }
 }
 
-fn create_font(pixel_height: i32, face: &str) -> HFONT {
+/// A GDI font `pixel_height` device pixels tall. The title strip and the sidebar share it.
+pub(crate) fn create_ui_font(pixel_height: i32, face: &str, weight: i32, italic: bool) -> HFONT {
     let face = crate::platform::wide_null(face);
     unsafe {
         CreateFontW(
@@ -577,8 +598,8 @@ fn create_font(pixel_height: i32, face: &str) -> HFONT {
             0,
             0,
             0,
-            FW_NORMAL as i32,
-            0,
+            weight,
+            u32::from(italic),
             0,
             0,
             u32::from(DEFAULT_CHARSET),
@@ -589,6 +610,16 @@ fn create_font(pixel_height: i32, face: &str) -> HFONT {
             face.as_ptr(),
         )
     }
+}
+
+fn create_font(pixel_height: i32, face: &str) -> HFONT {
+    create_ui_font(pixel_height, face, FW_NORMAL as i32, false)
+}
+
+/// The title strip's height at `dpi`: 40 px at 96 DPI, never less than a caption button.
+pub(crate) fn strip_height(dpi: u32) -> i32 {
+    let dpi = dpi.max(1);
+    scale(40, dpi).max(unsafe { GetSystemMetricsForDpi(SM_CYSIZE, dpi) })
 }
 
 pub(crate) struct TitlePaint<'a> {
@@ -624,15 +655,22 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
         input.scroll,
         input.preview.is_some(),
     );
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut client);
+    }
+    // The activity bar and the panel paint themselves; the frame never paints under them.
+    let left = layout.sidebar.right;
+    if left > 0 {
+        unsafe {
+            ExcludeClipRect(dc, 0, 0, left, client.bottom);
+        }
+    }
     let maximized = unsafe { IsZoomed(hwnd) } != 0;
     if paint.rcPaint.top < layout.height {
         unsafe { paint_strip_buffered(dc, &layout, dpi, maximized, input) };
     }
 
-    let mut client = RECT::default();
-    unsafe {
-        GetClientRect(hwnd, &mut client);
-    }
     let status_height = if input.status.is_some() {
         crate::window::status::status_height(dpi)
     } else {
@@ -640,7 +678,7 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
     };
     if let Some(hint) = input.empty_hint {
         let content = Rect::new(
-            0,
+            left,
             layout.height,
             client.right,
             client.bottom - status_height,
@@ -669,7 +707,7 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
 
     if let Some(status) = input.status {
         let bar = Rect::new(
-            0,
+            left,
             client.bottom - status_height,
             client.right,
             client.bottom,
@@ -677,9 +715,9 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
         let margin = scale(10, dpi);
         let gap = scale(24, dpi);
         let text = Rect::new(
-            margin,
+            bar.left + margin,
             bar.top,
-            (bar.right - margin).max(margin),
+            (bar.right - margin).max(bar.left + margin),
             bar.bottom,
         );
         let format = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
@@ -715,6 +753,7 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
         unsafe {
             crate::window::menu_band::paint(
                 dc,
+                left,
                 client.right,
                 headings,
                 mode,
@@ -1183,6 +1222,61 @@ unsafe fn draw_text(dc: HDC, text: &str, rect: Rect, format: u32) {
 mod tests {
     use super::{HitTarget, PointerState, Rect, Size, TitleBarLayout, frame_client_rect};
     use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOP};
+
+    #[test]
+    fn a_sidebar_offset_moves_the_tabs_right_and_keeps_its_strip_as_caption() {
+        // Break caught: tabs painted under the activity bar, or a sidebar top strip that no
+        // longer drags the window or resizes it from the top edge.
+        let client = Size::new(1200, 800);
+        let plain = TitleBarLayout::calculate_with_preview(client, 96, 3, 0, false);
+        assert_eq!(
+            TitleBarLayout::calculate_with_offset(client, 96, 3, 0, false, 0),
+            plain
+        );
+        let layout = TitleBarLayout::calculate_with_offset(client, 96, 3, 0, false, 304);
+        assert_eq!(layout.tabs.left, 304);
+        assert_eq!(layout.tab(0).left, 304);
+        assert_eq!(layout.tab(1).left, layout.tab(0).right);
+        assert_eq!(layout.sidebar, Rect::new(0, 0, 304, layout.height));
+        assert_eq!(layout.close, plain.close);
+        assert!(layout.drag_region.left >= layout.tab(2).right);
+        assert_eq!(
+            layout.hit_test(super::Point::new(20, layout.height / 2)),
+            HitTarget::Caption
+        );
+        assert_eq!(layout.hit_test(layout.tab(0).center()), HitTarget::Tab(0));
+        assert_eq!(
+            layout.frame_hit_test(super::Point::new(20, 0), false),
+            HitTarget::ResizeTop
+        );
+        assert_eq!(
+            layout.frame_hit_test(super::Point::new(0, 0), false),
+            HitTarget::ResizeTopLeft
+        );
+    }
+
+    #[test]
+    fn crowded_tabs_behind_a_sidebar_scroll_inside_the_narrower_viewport() {
+        let client = Size::new(1200, 800);
+        let layout = TitleBarLayout::calculate_with_offset(client, 96, 30, 0, false, 304);
+        assert!(layout.max_scroll > 0);
+        let scrolled = TitleBarLayout::calculate_with_offset(
+            client,
+            96,
+            30,
+            layout.scroll_to_reveal(29),
+            false,
+            304,
+        );
+        assert!(scrolled.tab(29).left >= scrolled.tabs.left);
+        assert!(scrolled.tab(29).right <= scrolled.tabs.right);
+        assert_eq!(scrolled.scroll_bar.unwrap().left, 304);
+        // An offset wider than the strip leaves an empty viewport, never a negative one.
+        let squeezed =
+            TitleBarLayout::calculate_with_offset(Size::new(300, 800), 96, 2, 0, false, 5000);
+        assert!(squeezed.tabs.left <= squeezed.tabs.right);
+        assert_eq!(squeezed.close.right, 300);
+    }
 
     #[test]
     fn caption_buttons_sit_flush_with_the_top_right_edge() {

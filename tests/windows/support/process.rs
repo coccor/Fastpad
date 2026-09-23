@@ -414,7 +414,14 @@ unsafe extern "system" fn enum_main_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         GetWindowThreadProcessId(hwnd, &mut process_id);
     }
-    if process_id == search.process_id {
+    // Only the main window: the process also owns top-level popups, such as the sidebar's
+    // tooltip, that EnumWindows may list first.
+    let mut class_name = [0_u16; 32];
+    let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+    if process_id == search.process_id
+        && length > 0
+        && String::from_utf16_lossy(&class_name[..length as usize]) == "FastPadMainWindow"
+    {
         search.hwnd = Some(hwnd);
         return 0;
     }

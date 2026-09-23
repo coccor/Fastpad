@@ -84,6 +84,11 @@ pub struct App {
     pub(crate) last_snapshot_duration: Option<std::time::Duration>,
     pub(crate) last_snapshot_attempt: Option<DocumentId>,
     pub(crate) library: crate::window::library_host::LibraryHost,
+    /// The activity bar and side panel; present only in notes mode.
+    pub(crate) sidebar: Option<crate::window::side_panel::Sidebar>,
+    /// The warnings of the `fastpad.ini` that `bootstrap::run` read into `settings` before the
+    /// window existed. `Some` until `WM_FASTPAD_LOAD_SETTINGS` reports them.
+    pub(crate) preloaded_settings_warnings: Option<Vec<crate::config::SettingWarning>>,
     next_document_id: u64,
     process_start: u64,
 }
@@ -138,6 +143,8 @@ impl App {
             last_snapshot_attempt: None,
             next_document_id: 2,
             library: crate::window::library_host::LibraryHost::new(process_start),
+            sidebar: None,
+            preloaded_settings_warnings: None,
             process_start,
             startup,
         }

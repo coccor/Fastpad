@@ -376,8 +376,8 @@ impl FindBar {
         }
     }
 
-    /// Places the bar across `width` at `top` and its fields inside it.
-    pub(crate) fn layout(&self, width: i32, top: i32, dpi: u32, font: HFONT) {
+    /// Places the bar across `width` from `left`, at `top`, and its fields inside it.
+    pub(crate) fn layout(&self, left: i32, width: i32, top: i32, dpi: u32, font: HFONT) {
         if !self.visible {
             return;
         }
@@ -407,7 +407,7 @@ impl FindBar {
             SetWindowPos(
                 self.panel,
                 HWND_TOP,
-                0,
+                left,
                 top,
                 width.max(0),
                 find_bar_height(dpi),

@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 43] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 46] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -74,6 +74,9 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 43] {
         accelerator(FCONTROL, b'R', CommandId::TextRightToLeft),
         accelerator(FCONTROL | FSHIFT, b'P', CommandId::CommandPalette),
         accelerator(FCONTROL | FSHIFT, b'V', CommandId::MarkdownPreviewCycle),
+        accelerator(FCONTROL, b'B', CommandId::ToggleSidebar),
+        accelerator(FCONTROL | FSHIFT, b'E', CommandId::ShowNotebookView),
+        accelerator(FCONTROL, b'K', CommandId::ShowSearchView),
         accelerator(FALT, b'Z', CommandId::ToggleWordWrap),
     ]
 }
@@ -182,6 +185,8 @@ impl MenuBar {
                 MenuEntry::command("&Word wrap	Alt+Z", CommandId::ToggleWordWrap),
                 MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
                 MenuEntry::Separator,
+                MenuEntry::command("Side&bar	Ctrl+B", CommandId::ToggleSidebar),
+                MenuEntry::Separator,
                 MenuEntry::command(
                     "Markdown preview &side by side",
                     CommandId::MarkdownPreviewSide,
@@ -227,6 +232,12 @@ pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
     ] {
         unsafe { EnableMenuItem(menu, command as u32, state) };
     }
+}
+
+/// Grays the View menu's Sidebar entry while notes mode is off and there is no sidebar.
+pub(crate) fn set_sidebar_enabled(menu: HMENU, enabled: bool) {
+    let state = MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED };
+    unsafe { EnableMenuItem(menu, CommandId::ToggleSidebar as u32, state) };
 }
 
 impl Drop for MenuBar {
@@ -542,7 +553,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 43);
+        assert_eq!(specs.len(), 46);
     }
 
     #[test]
@@ -612,6 +623,34 @@ mod tests {
             ),
             Some(CommandId::ToggleWordWrap)
         );
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'B')),
+            Some(CommandId::ToggleSidebar)
+        );
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, u16::from(b'E')),
+            Some(CommandId::ShowNotebookView)
+        );
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'K')),
+            Some(CommandId::ShowSearchView)
+        );
+    }
+
+    #[test]
+    fn the_view_menu_toggles_the_sidebar_and_grays_it_without_notes_mode() {
+        // Break caught: a Sidebar entry that stays enabled with notes mode off, where it does
+        // nothing, or no entry at all.
+        use super::{MenuBar, set_sidebar_enabled};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_GRAYED};
+        let bar = MenuBar::create().unwrap();
+        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
+        let state = || unsafe { GetMenuState(view, CommandId::ToggleSidebar as u32, MF_BYCOMMAND) };
+        assert_ne!(state(), u32::MAX, "the View menu has a Sidebar entry");
+        set_sidebar_enabled(view, false);
+        assert_ne!(state() & MF_GRAYED, 0);
+        set_sidebar_enabled(view, true);
+        assert_eq!(state() & MF_GRAYED, 0);
     }
 
     #[test]

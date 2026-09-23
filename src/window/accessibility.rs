@@ -916,12 +916,13 @@ fn native_layout(item: &AccessibleProvider, tabs: usize) -> TitleBarLayout {
     unsafe {
         GetClientRect(item.hwnd, &mut client);
     }
-    TitleBarLayout::calculate_with_preview(
+    TitleBarLayout::calculate_with_offset(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(item.hwnd) }.max(96),
         tabs,
         item.selection.scroll_offset(),
         item.view.snapshot().preview_buttons,
+        crate::window::side_panel::left_edge(item.hwnd),
     )
 }
 

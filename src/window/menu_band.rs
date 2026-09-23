@@ -32,10 +32,11 @@ pub(crate) const fn band_height(dpi: u32) -> i32 {
     scale(BAND_HEIGHT_AT_96_DPI, dpi)
 }
 
-/// Heading rectangles for label widths `widths`, laid out left to right in a band at `top`.
-pub(crate) fn heading_rects(widths: &[i32], top: i32, dpi: u32) -> Vec<RECT> {
+/// Heading rectangles for label widths `widths`, laid out left to right from `left` in a band at
+/// `top`.
+pub(crate) fn heading_rects(widths: &[i32], left: i32, top: i32, dpi: u32) -> Vec<RECT> {
     let padding = scale(HEADING_PADDING_AT_96_DPI, dpi);
-    let mut left = scale(BAND_MARGIN_AT_96_DPI, dpi);
+    let mut left = left + scale(BAND_MARGIN_AT_96_DPI, dpi);
     widths
         .iter()
         .map(|width| {
@@ -110,10 +111,12 @@ pub(crate) fn measure_titles(hwnd: HWND, font: HFONT) -> Vec<i32> {
     }
 }
 
-/// Paints the band across `width` with `mode.hot` highlighted (pressed while its dropdown is open).
+/// Paints the band from `left` to `right` with `mode.hot` highlighted (pressed while its dropdown
+/// is open).
 pub(crate) unsafe fn paint(
     dc: HDC,
-    width: i32,
+    left: i32,
+    right: i32,
     headings: &[RECT],
     mode: MenuMode,
     palette: Palette,
@@ -123,9 +126,9 @@ pub(crate) unsafe fn paint(
         return;
     };
     let band = RECT {
-        left: 0,
+        left,
         top: first.top,
-        right: width,
+        right,
         bottom: first.bottom,
     };
     unsafe {
@@ -168,7 +171,7 @@ mod tests {
 
     #[test]
     fn headings_sit_side_by_side_inside_the_band() {
-        let headings = heading_rects(&[20, 30, 40, 25], 32, 96);
+        let headings = heading_rects(&[20, 30, 40, 25], 0, 32, 96);
         assert_eq!(headings.len(), 4);
         assert_eq!(headings[0].left, 4);
         assert_eq!(headings[0].right, 4 + 20 + 20);
@@ -180,12 +183,14 @@ mod tests {
                 .iter()
                 .all(|rect| rect.top == 32 && rect.bottom == 32 + band_height(96))
         );
-        assert_eq!(heading_rects(&[20], 0, 192)[0].right, 8 + 20 + 40);
+        assert_eq!(heading_rects(&[20], 0, 0, 192)[0].right, 8 + 20 + 40);
+        // Break caught: headings drawn under the sidebar instead of at the editor area's edge.
+        assert_eq!(heading_rects(&[20], 304, 0, 96)[0].left, 304 + 4);
     }
 
     #[test]
     fn hit_testing_finds_the_heading_under_the_pointer() {
-        let headings = heading_rects(&[20, 30, 40, 25], 32, 96);
+        let headings = heading_rects(&[20, 30, 40, 25], 0, 32, 96);
         assert_eq!(heading_at(&headings, 5, 33), Some(0));
         assert_eq!(heading_at(&headings, headings[1].left, 40), Some(1));
         assert_eq!(heading_at(&headings, 5, 31), None);

@@ -1,4 +1,5 @@
 pub(crate) mod accessibility;
+pub(crate) mod activity_bar;
 pub(crate) mod command_palette;
 pub mod commands;
 pub mod find_bar;
@@ -13,9 +14,11 @@ pub mod notification;
 pub mod palette;
 pub(crate) mod panel;
 pub(crate) mod preview_host;
+pub(crate) mod side_panel;
 pub mod status;
 pub mod tabs;
 pub mod titlebar;
+pub(crate) mod tooltip;
 
 pub(crate) use main_window::{
     INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
