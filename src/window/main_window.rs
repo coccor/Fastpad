@@ -1040,6 +1040,11 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    // The two bars share the band above the editor; only one shows at a time.
+    crate::window::library_host::close_name_box(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
     // A single-line selection is a reasonable query prefill; a multi-line one is not (the bar has
     // no way to display it), so it's left alone rather than truncated or rejected.
     let prefill = unsafe { app_ptr(hwnd) }.and_then(|app| {
@@ -1683,18 +1688,7 @@ fn refresh_tabs(hwnd: HWND) {
             }
         }
     }
-    // A name box for a tab that closed has nothing left to name.
-    let orphaned = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
-        let app = unsafe { app.as_ref() };
-        app.name_box
-            .as_ref()
-            .filter(|name_box| name_box.is_visible())
-            .and_then(|name_box| name_box.purpose()?.document())
-            .is_some_and(|id| app.tabs.document(id).is_none())
-    });
-    if orphaned {
-        crate::window::library_host::close_name_box(hwnd);
-    }
+    crate::window::library_host::close_stale_name_box(hwnd);
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
@@ -2847,7 +2841,7 @@ pub(super) fn save_active_document_as(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
-    let Some((target, named)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((target, named, notes_mode)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
         let document = app.tabs.active()?;
         Some((
@@ -2857,12 +2851,21 @@ pub(super) fn save_active_document_as(hwnd: HWND) -> bool {
                 .as_deref()
                 .and_then(std::path::Path::file_name)
                 .map(|name| name.to_string_lossy().into_owned()),
+            app.settings.notes_mode,
         ))
     }) else {
         return false;
     };
-    let suggested = named.unwrap_or_else(|| crate::window::library_host::suggested_file_name(hwnd));
-    let folder = crate::window::library_host::folder(hwnd);
+    // Only an untitled tab in notes mode starts in the notes folder under its label's name; every
+    // other Save As keeps the dialog's usual suggestion and starting folder.
+    let (suggested, folder) = match named {
+        Some(name) => (name, None),
+        None if notes_mode => (
+            crate::window::library_host::suggested_file_name(hwnd),
+            crate::window::library_host::folder(hwnd),
+        ),
+        None => ("Untitled.txt".to_owned(), None),
+    };
     // Modal Show reenters the window procedure. Only an owned identity crosses it.
     let selection = crate::window::modal::choose_save_path(hwnd, &suggested, folder.as_deref());
     if !identity.is_live_for(hwnd) {
@@ -2905,19 +2908,49 @@ pub(crate) fn save_path_as(hwnd: HWND, path: &std::path::Path) {
     complete_save(hwnd, &identity, Some(path.to_path_buf()));
 }
 
-/// Shared tail of plain Save and Save As. `new_path` is `Some` only for Save As: the active
-/// document's path is renamed (and checked against other open tabs' canonical paths) before the
-/// write. Plain Save (`new_path: None`) writes to the document's existing path unchanged.
-///
-/// For Save As, every failure after a successful rename (missing editor, a failed
-/// `editor.text()` read, or a failed `save_atomic`) reverts the tab's path back to whatever it
-/// held before this call: a failed write must never leave the tab claiming a path nothing was
-/// actually written to, orphaning it from the path it was last genuinely saved at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SaveOutcome {
+    Saved,
+    Failed,
+    /// A first save found a file already at the chosen path and left it alone.
+    NameTaken,
+}
+
+/// Shared tail of plain Save and Save As; see `save_active_to`.
 pub(super) fn complete_save(
     hwnd: HWND,
     identity: &WindowIdentity,
     new_path: Option<std::path::PathBuf>,
 ) -> bool {
+    save_active_to(hwnd, identity, new_path, false) == SaveOutcome::Saved
+}
+
+/// The first save of an untitled tab under a name picked in the name box. Never replaces a file:
+/// one that appeared at `path` since the name was checked gives `NameTaken`, with no notice, the
+/// tab still untitled and the file untouched.
+pub(super) fn complete_first_save(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    path: std::path::PathBuf,
+) -> SaveOutcome {
+    save_active_to(hwnd, identity, Some(path), true)
+}
+
+/// Shared tail of plain Save and Save As. `new_path` is `Some` only for Save As: the active
+/// document's path is renamed (and checked against other open tabs' canonical paths) before the
+/// write. Plain Save (`new_path: None`) writes to the document's existing path unchanged.
+/// `create_new` refuses to replace an existing file (`SaveOutcome::NameTaken`).
+///
+/// For Save As, every failure after a successful rename (missing editor, a failed
+/// `editor.text()` read, or a failed `save_atomic`) reverts the tab's path back to whatever it
+/// held before this call: a failed write must never leave the tab claiming a path nothing was
+/// actually written to, orphaning it from the path it was last genuinely saved at.
+fn save_active_to(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    new_path: Option<std::path::PathBuf>,
+    create_new: bool,
+) -> SaveOutcome {
     let is_save_as = new_path.is_some();
     let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
@@ -2932,13 +2965,13 @@ pub(super) fn complete_save(
                     hwnd,
                     "This file is already open in another tab. Choose a different name.".to_owned(),
                 );
-                return false;
+                return SaveOutcome::Failed;
             }
-            None => return false,
+            None => return SaveOutcome::Failed,
         }
     }
     if !identity.is_live_for(hwnd) {
-        return false;
+        return SaveOutcome::Failed;
     }
     let Some((editor, path, encoding)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
@@ -2949,18 +2982,22 @@ pub(super) fn complete_save(
         if is_save_as {
             revert_active_path(hwnd, original_path);
         }
-        return false;
+        return SaveOutcome::Failed;
     };
     let Ok(text) = editor.text() else {
         if is_save_as {
             revert_active_path(hwnd, original_path);
         }
-        return false;
+        return SaveOutcome::Failed;
     };
     let bytes = crate::file::encoding::encode(&text, encoding);
-    let result = crate::file::saver::save_atomic(&path, &bytes);
+    let result = if create_new {
+        crate::file::saver::save_atomic_new(&path, &bytes)
+    } else {
+        crate::file::saver::save_atomic(&path, &bytes)
+    };
     if !identity.is_live_for(hwnd) {
-        return false;
+        return SaveOutcome::Failed;
     }
     match result {
         Ok(()) => {
@@ -2982,18 +3019,21 @@ pub(super) fn complete_save(
             if identity.is_live_for(hwnd) {
                 crate::window::library_host::document_saved(hwnd);
             }
-            true
+            SaveOutcome::Saved
         }
-        Err(_) => {
+        Err(error) => {
             if is_save_as {
                 revert_active_path(hwnd, original_path);
+            }
+            if create_new && crate::file::saver::is_already_exists(&error) {
+                return SaveOutcome::NameTaken;
             }
             push_notice(
                 hwnd,
                 "FastPad could not save this file. The previous version on disk was not modified."
                     .to_owned(),
             );
-            false
+            SaveOutcome::Failed
         }
     }
 }
@@ -7397,5 +7437,164 @@ mod tests {
         execute_command(window.hwnd, CommandId::Save);
         assert!(target.exists());
         assert!(app_mut(window.hwnd).name_box.is_none());
+        // Break caught: notes-mode naming leaking into plain-editor Save As.
+        assert_eq!(
+            crate::window::modal::take_last_save_request(),
+            Some(("Untitled.txt".to_owned(), None))
+        );
+    }
+
+    #[test]
+    fn save_as_on_a_tab_with_a_path_starts_where_the_dialog_always_did() {
+        // Break caught: Save As of an ordinary file jumping to the notes folder.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("save-as-titled");
+        let outside = scratch.root.join("outside.txt");
+        std::fs::write(&outside, "o").unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &outside).unwrap();
+        crate::window::answer_next_save_dialog(|_| None);
+        execute_command(window.hwnd, CommandId::SaveAs);
+        assert_eq!(
+            crate::window::modal::take_last_save_request(),
+            Some(("outside.txt".to_owned(), None))
+        );
+        assert!(app_mut(window.hwnd).name_box.is_none());
+    }
+
+    #[test]
+    fn a_first_save_never_replaces_a_file_that_took_the_name_after_the_check() {
+        // Break caught: a note created in Explorer between the name check and the write being
+        // overwritten by the first save.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("first-save-race");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("mine").unwrap();
+        let late = scratch.note("Late.md", "theirs");
+        let identity = unsafe { super::window_identity(window.hwnd) }.unwrap();
+        assert_eq!(
+            super::complete_first_save(window.hwnd, &identity, late.clone()),
+            super::SaveOutcome::NameTaken
+        );
+        assert_eq!(std::fs::read_to_string(&late).unwrap(), "theirs");
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert!(active.path.is_none());
+        assert!(active.dirty);
+    }
+
+    fn open_first_save_box(
+        label: &str,
+    ) -> (LibraryScratch, ProductionWindow, crate::editor::Editor) {
+        let scratch = LibraryScratch::new(label);
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("Draft").unwrap();
+        execute_command(window.hwnd, CommandId::Save);
+        assert!(app_mut(window.hwnd).name_box.as_ref().unwrap().is_visible());
+        (scratch, window, editor)
+    }
+
+    fn name_box_visible(hwnd: HWND) -> bool {
+        app_mut(hwnd)
+            .name_box
+            .as_ref()
+            .is_some_and(|name_box| name_box.is_visible())
+    }
+
+    #[test]
+    fn escape_in_the_name_box_cancels_the_save() {
+        let _scintilla = load_native_scintilla();
+        let (_scratch, window, _editor) = open_first_save_box("escape");
+        let edit = app_mut(window.hwnd).name_box.as_ref().unwrap().edit_hwnd();
+        unsafe {
+            SendMessageW(
+                edit,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE as usize,
+                0,
+            );
+        }
+        assert!(!name_box_visible(window.hwnd));
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert!(active.path.is_none());
+        assert!(active.dirty);
+    }
+
+    #[test]
+    fn the_name_box_closes_with_its_tab_or_when_another_tab_is_activated() {
+        // Break caught: a box left naming a tab that is gone or not the one on screen.
+        let _scintilla = load_native_scintilla();
+        let (_scratch, window, _editor) = open_first_save_box("tab-change");
+        super::create_new_document(window.hwnd).unwrap();
+        assert!(!name_box_visible(window.hwnd));
+
+        execute_command(window.hwnd, CommandId::Save);
+        assert!(name_box_visible(window.hwnd));
+        super::close_active_document(window.hwnd);
+        assert!(!name_box_visible(window.hwnd));
+    }
+
+    #[test]
+    fn the_name_box_closes_once_its_tab_is_saved_another_way() {
+        let _scintilla = load_native_scintilla();
+        let (scratch, window, _editor) = open_first_save_box("saved-elsewhere");
+        super::save_path_as(window.hwnd, &scratch.root.join("elsewhere.md"));
+        assert!(!name_box_visible(window.hwnd));
+    }
+
+    #[test]
+    fn saving_again_while_the_box_is_open_keeps_what_was_typed() {
+        let _scintilla = load_native_scintilla();
+        let (_scratch, window, _editor) = open_first_save_box("save-twice");
+        type_into_name_box(window.hwnd, "Typed name.md");
+        execute_command(window.hwnd, CommandId::Save);
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(name_box.text(), "Typed name.md");
+    }
+
+    #[test]
+    fn opening_find_closes_the_name_box() {
+        let _scintilla = load_native_scintilla();
+        let (_scratch, window, _editor) = open_first_save_box("find-closes");
+        execute_command(window.hwnd, CommandId::Find);
+        assert!(!name_box_visible(window.hwnd));
+        assert!(app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+    }
+
+    #[test]
+    fn typed_names_with_invalid_characters_or_device_names_save_under_the_sanitized_name() {
+        // Break caught: a typed "con" or "a/b" failing the save with a Windows path error.
+        let _scintilla = load_native_scintilla();
+        let (scratch, window, _editor) = open_first_save_box("sanitize");
+        type_into_name_box(window.hwnd, "a/b: c?.md");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("ab c.md")).unwrap(),
+            "Draft"
+        );
+
+        super::create_new_document(window.hwnd).unwrap();
+        app_mut(window.hwnd)
+            .editor
+            .as_ref()
+            .unwrap()
+            .set_text("Device")
+            .unwrap();
+        execute_command(window.hwnd, CommandId::Save);
+        type_into_name_box(window.hwnd, "con");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("con_.md")).unwrap(),
+            "Device"
+        );
+        assert!(!name_box_visible(window.hwnd));
     }
 }

@@ -72,12 +72,15 @@ pub fn sanitize_stem(name: &str) -> String {
     if trimmed.is_empty() {
         return "Untitled".to_owned();
     }
-    let device = trimmed.split('.').next().unwrap_or("");
+    // Windows reads "con.txt" and "con .txt" as the device too: neutralise the part before the
+    // first dot.
+    let device = trimmed.split('.').next().unwrap_or("").trim_end();
     if RESERVED
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(device))
     {
-        return format!("{trimmed}_");
+        let (name, rest) = trimmed.split_at(device.len());
+        return format!("{name}_{rest}");
     }
     trimmed
 }
@@ -161,7 +164,10 @@ mod tests {
         assert_eq!(sanitize_stem("Notes...  "), "Notes");
         assert_eq!(sanitize_stem("Long title…"), "Long title");
         assert_eq!(sanitize_stem("con"), "con_");
-        assert_eq!(sanitize_stem("LPT9.draft"), "LPT9.draft_");
+        assert_eq!(sanitize_stem("LPT9.draft"), "LPT9_.draft");
+        assert_eq!(sanitize_stem("con.foo"), "con_.foo");
+        assert_eq!(sanitize_stem("con .foo"), "con_ .foo");
+        assert_eq!(sanitize_stem("console"), "console");
         assert_eq!(sanitize_stem("  \t "), "Untitled");
         assert_eq!(sanitize_stem("tab\there"), "tabhere");
     }

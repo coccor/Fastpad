@@ -107,6 +107,10 @@ pub(super) fn choose_save_path(
 ) -> crate::Result<Option<PathBuf>> {
     let _modal = ModalScope::enter(hwnd);
     #[cfg(test)]
+    LAST_SAVE_REQUEST.with(|last| {
+        *last.borrow_mut() = Some((suggested_name.to_owned(), folder.map(|f| f.to_path_buf())))
+    });
+    #[cfg(test)]
     if let Some(answer) = SAVE_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return Ok(answer(hwnd));
     }
@@ -163,6 +167,18 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static CONFIRM_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<bool>>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static LAST_SAVE_REQUEST: std::cell::RefCell<Option<(String, Option<PathBuf>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The suggested name and starting folder the last Save As dialog was opened with.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn take_last_save_request() -> Option<(String, Option<PathBuf>)> {
+    LAST_SAVE_REQUEST.with(|last| last.borrow_mut().take())
 }
 
 /// Answers the next close prompt from inside its modal scope instead of showing `MessageBoxW`.

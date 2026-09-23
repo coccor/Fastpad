@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
 };
@@ -18,6 +19,25 @@ use windows_sys::Win32::Storage::FileSystem::{
 /// exists, `MoveFileExW` when it does not. On any failure the original file (if any) is left
 /// untouched and the sibling temp file is removed.
 pub fn save_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_then_swap(path, bytes, false)
+}
+
+/// Like `save_atomic`, but never replaces a file: when `path` exists by the time the bytes are
+/// swapped in, it fails with `ERROR_ALREADY_EXISTS` (see `is_already_exists`) and leaves that
+/// file untouched. For a first save under a name the user just picked.
+pub fn save_atomic_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_then_swap(path, bytes, true)
+}
+
+/// Whether `error` is `save_atomic_new` refusing an existing destination.
+pub fn is_already_exists(error: &crate::FastPadError) -> bool {
+    matches!(
+        error,
+        crate::FastPadError::Win32(code) if *code == ERROR_ALREADY_EXISTS || *code == ERROR_FILE_EXISTS
+    )
+}
+
+fn write_then_swap(path: &Path, bytes: &[u8], create_new: bool) -> Result<()> {
     let temp = next_sibling_temp(path)?;
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
@@ -27,7 +47,11 @@ pub fn save_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        replace_or_move(&temp, path)
+        if create_new {
+            move_without_replacing(&temp, path)
+        } else {
+            replace_or_move(&temp, path)
+        }
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -74,6 +98,20 @@ fn replace_or_move(temp: &Path, destination: &Path) -> Result<()> {
                 MOVEFILE_WRITE_THROUGH,
             )
         }
+    };
+    if ok == 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` fails atomically when `destination` exists.
+fn move_without_replacing(temp: &Path, destination: &Path) -> Result<()> {
+    let temp_wide = wide_path(temp);
+    let destination_wide = wide_path(destination);
+    let ok = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
     };
     if ok == 0 { Err(last_error()) } else { Ok(()) }
 }
@@ -163,6 +201,25 @@ mod tests {
         fixture.deny_replacement();
         assert!(super::save_atomic(fixture.path(), b"replacement").is_err());
         assert_eq!(std::fs::read(fixture.path()).unwrap(), b"original");
+    }
+
+    #[test]
+    fn an_exclusive_save_onto_an_existing_file_fails_and_leaves_it_untouched() {
+        // Break caught: a first save under a freshly picked name replacing a file that appeared
+        // after the name was checked.
+        let fixture = ExistingFile::new(b"someone else's");
+        let error = super::save_atomic_new(fixture.path(), b"mine").unwrap_err();
+        assert!(super::is_already_exists(&error), "{error:?}");
+        assert_eq!(std::fs::read(fixture.path()).unwrap(), b"someone else's");
+        assert!(fixture.sibling_temp_files().is_empty());
+    }
+
+    #[test]
+    fn an_exclusive_save_to_a_free_name_creates_it() {
+        let fixture = ExistingFile::new(b"x");
+        let fresh = fixture.path().with_file_name("fresh.md");
+        super::save_atomic_new(&fresh, b"new").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
     }
 
     #[test]

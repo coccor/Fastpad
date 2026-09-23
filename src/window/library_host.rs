@@ -593,6 +593,11 @@ pub(crate) fn save_command(hwnd: HWND) {
         && folder(hwnd).is_some()
         && let Some(id) = active_untitled(hwnd)
     {
+        // Ctrl+S again while the box is open for this tab keeps what was typed.
+        if name_box_purpose(hwnd) == Some(NamePurpose::FirstSave(id)) {
+            focus_name_box(hwnd);
+            return;
+        }
         refresh_label(hwnd);
         let suffix = format!("in {}", folder_display_name(hwnd));
         open_name_box(
@@ -648,10 +653,46 @@ pub(crate) fn open_name_box(
         return;
     }
     super::main_window::layout_editor_and_find_bar(hwnd);
+    focus_name_box(hwnd);
+}
+
+fn focus_name_box(hwnd: HWND) {
     if let Some(app) = unsafe { app_ptr(hwnd) }
         && let Some(name_box) = unsafe { app.as_ref() }.name_box.as_ref()
     {
         name_box.focus();
+    }
+}
+
+/// The purpose of the visible name box, if one is showing.
+fn name_box_purpose(hwnd: HWND) -> Option<NamePurpose> {
+    unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
+        if !name_box.is_visible() {
+            return None;
+        }
+        name_box.purpose().cloned()
+    })
+}
+
+/// Closes a name box whose tab is gone or no longer active, or whose first save already happened.
+pub(crate) fn close_stale_name_box(hwnd: HWND) {
+    let Some(purpose) = name_box_purpose(hwnd) else {
+        return;
+    };
+    let Some(id) = purpose.document() else {
+        return;
+    };
+    let stale = unsafe { app_ptr(hwnd) }.is_none_or(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        let Some(document) = tabs.document(id) else {
+            return true;
+        };
+        tabs.active().is_none_or(|active| active.id != id)
+            || (matches!(purpose, NamePurpose::FirstSave(_)) && document.path.is_some())
+    });
+    if stale {
+        close_name_box(hwnd);
     }
 }
 
@@ -680,11 +721,23 @@ fn name_box_state(hwnd: HWND) -> Option<(NamePurpose, String)> {
 }
 
 fn name_box_error(hwnd: HWND, error: String) {
-    if let Some(mut app) = unsafe { app_ptr(hwnd) }
-        && let Some(name_box) = unsafe { app.as_mut() }.name_box.as_mut()
-    {
-        name_box.set_error(Some(error));
+    let stored = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        unsafe { app.as_mut() }
+            .name_box
+            .as_mut()
+            .map(|name_box| name_box.set_error(Some(error)))
+            .is_some()
+    });
+    // The error is wider than the suffix, so the field shrinks to make room.
+    if stored {
+        super::main_window::layout_editor_and_find_bar(hwnd);
     }
+}
+
+/// "<name> already exists. Try <first free name>."
+fn name_taken_error(folder: &Path, stem: &str, extension: &str) -> String {
+    let free = title::free_name(stem, extension, |candidate| folder.join(candidate).exists());
+    format!("{stem}.{extension} already exists. Try {free}.")
 }
 
 /// Enter or Save in the name box.
@@ -710,10 +763,7 @@ fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
     let name = format!("{stem}.{extension}");
     let target = folder.join(&name);
     if target.exists() {
-        let free = title::free_name(&stem, &extension, |candidate| {
-            folder.join(candidate).exists()
-        });
-        name_box_error(hwnd, format!("{name} already exists. Try {free}."));
+        name_box_error(hwnd, name_taken_error(&folder, &stem, &extension));
         return;
     }
     if let Err(error) = std::fs::create_dir_all(&folder) {
@@ -729,10 +779,17 @@ fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
     if !super::main_window::activate_document_by_id(hwnd, id) {
         return;
     }
-    if super::main_window::complete_save(hwnd, &identity, Some(target))
-        && identity.is_live_for(hwnd)
-    {
-        close_name_box(hwnd);
+    let outcome = super::main_window::complete_first_save(hwnd, &identity, target);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    match outcome {
+        super::main_window::SaveOutcome::Saved => close_name_box(hwnd),
+        // A file took the name after the check above; it is left alone.
+        super::main_window::SaveOutcome::NameTaken => {
+            name_box_error(hwnd, name_taken_error(&folder, &stem, &extension));
+        }
+        super::main_window::SaveOutcome::Failed => {}
     }
 }
 
@@ -761,6 +818,7 @@ pub(crate) fn document_saved(hwnd: HWND) {
     if let Some(path) = path {
         with_state(hwnd, |state| state.add_note(&path));
     }
+    close_stale_name_box(hwnd);
 }
 
 #[cfg(test)]

@@ -9,7 +9,6 @@ use crate::window::palette::Palette;
 use crate::window::panel::{
     create_child, create_child_with_id, create_panel, fill, inset, scale, text_height,
 };
-use std::cell::Cell;
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -155,8 +154,6 @@ pub(crate) struct NameBox {
     colors: Palette,
     field_brush: HBRUSH,
     strip_brush: HBRUSH,
-    /// The last `layout` arguments, so a new error can relayout the box on its own.
-    geometry: Cell<Option<(i32, i32, u32, HFONT)>>,
 }
 
 impl NameBox {
@@ -216,7 +213,6 @@ impl NameBox {
             colors,
             field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
             strip_brush: unsafe { CreateSolidBrush(colors.strip_background) },
-            geometry: Cell::new(None),
         })
     }
 
@@ -271,13 +267,10 @@ impl NameBox {
         }
     }
 
-    /// Shows `error` in place of the suffix, or the suffix again for `None`.
+    /// Shows `error` in place of the suffix, or the suffix again for `None`. Only stores it: the
+    /// caller lays the box out again (the note's width changes) once it holds no `App` borrow.
     pub(crate) fn set_error(&mut self, error: Option<String>) {
         self.error = error;
-        if let Some((width, top, dpi, font)) = self.geometry.get() {
-            self.layout(width, top, dpi, font);
-        }
-        self.invalidate();
     }
 
     /// Recolors for a theme change; the caller repaints with `invalidate`.
@@ -310,7 +303,6 @@ impl NameBox {
         if !self.visible {
             return;
         }
-        self.geometry.set(Some((width, top, dpi, font)));
         unsafe {
             if !font.is_null() {
                 for control in [self.edit, self.save, self.browse] {
