@@ -83,7 +83,7 @@ favorite=<absolute path>
 - **`folder=`** is the recent list, as before: most recent first, at most 10. Closing a notebook keeps it in the list.
 - **`favorite=`** lines are the favorite notebooks, at most 50. They are shown sorted by name (§7). Favoriting doesn't change the recent list.
 - **`open=none`** is present only when the last session ended with no notebook open. Opening a notebook removes it.
-- Paths are normalized as in the library spec §14. Unknown keys are ignored, so a PR #9 build reading this file loses nothing it understands.
+- Paths are normalized as in the library spec §14. Unknown keys are ignored.
 - **A notebook's display name is its folder's name.** Two favorites with the same folder name show their parent folder in dim text after the name.
 - Favorites and recent entries are never checked for existence when listed, so an offline drive can't stall anything. Opening one that is missing shows the notice "<path> is not available" and changes nothing. There is no fallback here, unlike at startup.
 
@@ -98,8 +98,7 @@ note=<id>|<flags>|<size>|<hash>|<path>
 
 - `<flags>` is `p` (pinned), `d` (deleted, library spec §8.4), both, or `-`. A note with no flags has no record, so unpinning a note deletes its record at the next flush.
 - `<path>` is relative to the notebook and is always the last field, unescaped, as before.
-- **Reading version 1** (files written by PR #9 builds): notebook and tag lines are dropped, and each `note` line keeps only its `p` and `d` flags. The file is rewritten as version 2 at the next flush that has something to write. Reading alone never rewrites it.
-- Any other version makes the file unreadable, handled as the library spec §6.2 and §7.6 describe: it's never overwritten, and pinning is off with a notice.
+- Any other version, or none, makes the file unreadable, handled as the library spec §6.2 and §7.6 describe: it's never overwritten, and pinning is off with a notice. There is no migration (§16): a version 1 file is unreadable, like any other unrecognized version.
 
 ### 5.2 Per-PC library file
 
@@ -109,7 +108,7 @@ The library spec §6.3 file drops `recent=` lines. It gains one line per expande
 expanded=<path relative to the notebook>
 ```
 
-This file is written with the library spec §14 mechanism (a copy of the state on a one-off writer thread). Unknown lines are ignored, so older files load.
+This file is written with the library spec §14 mechanism (a copy of the state on a one-off writer thread). Unknown lines are ignored.
 
 ## 6. The Notebook view
 
@@ -284,7 +283,7 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 - **`src/window/tabs.rs` / `document.rs`:** the preview-tab flag and in-place replacement.
 - **`main_window.rs`:** the layout slot in `layout_editor_and_find_bar`, and the titlebar offset so tabs start at the editor area.
 - **`config`:** the two new keys. **`folders.ini`:** the `favorite=` and `open=none` lines.
-- **Library model:** removes `Notebook`, `Tag`, and the favorite, notebook and tag fields of `NoteRecord`. It adds version 2 reading and writing and version 1 migration.
+- **Library model:** removes `Notebook`, `Tag`, and the favorite, notebook and tag fields of `NoteRecord`. It adds version 2 reading and writing.
 
 ## 12. Performance
 
@@ -316,7 +315,7 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
   - Incremental updates, compared with a full rebuild.
   - Flattening with expansion, parent and child navigation, type-ahead.
   - Name-search ranking.
-  - `library.ini` version 2 round trip, version 1 migration (keeping `p` and `d`, dropping the rest), and unknown versions.
+  - `library.ini` version 2 round trip and unknown versions.
   - `folders.ini` `favorite=` and `open=none` parsing and writing, the 50-favorite cap, normalization and display-name clashes.
   - Layout math: widths, clamps, the editor minimum, DPI.
   - Preview-tab rules: replace in place, promote on edit, double-click or save, switch to an already-open note.
@@ -346,6 +345,9 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 
 ## 16. Implementation notes
 
+- **No backward compatibility (user decision):** version 1 files are not migrated. `library.ini`
+  is version 2 only; a file with any other version, or none, is unreadable and never overwritten
+  (§5.1), the same as a damaged file.
 - **The search box's placeholder is painted, not a cue banner.** FastPad has no ComCtl32 v6
   manifest, so `EM_SETCUEBANNER` shows nothing. The Search view paints "Search <notebook>" the
   way the find bar paints "Find".

@@ -1116,55 +1116,6 @@ mod tests {
         assert_eq!(disk_stamp(&scratch.folder().join("none.md")), None);
     }
 
-    #[test]
-    fn a_version_one_library_loads_its_pins_and_is_rewritten_only_when_something_changes() {
-        // Break caught: a PR #9 notebook losing its pins on the first start of this build, or
-        // opening it rewriting library.ini before the user changed anything.
-        let scratch = Scratch::new("v1-migrate");
-        let a = scratch.folder().join("a.md");
-        std::fs::write(&a, "a").unwrap();
-        let b = scratch.folder().join("b.md");
-        std::fs::write(&b, "b").unwrap();
-        let path = store::library_file(&scratch.folder());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // The size and hash match a.md, so the load has no fingerprint to correct.
-        let v1 = format!(
-            "version=1\r\ntag={}|idea\r\nnote={}|-|fp|-|1|{:016x}|a.md\r\n",
-            NoteId(9).to_hex(),
-            NoteId(5).to_hex(),
-            ids::fnv1a(b"a")
-        );
-        std::fs::write(&path, &v1).unwrap();
-
-        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
-        assert_eq!(state.metadata, Metadata::Ready);
-        assert!(state.is_pinned(&a));
-        assert_eq!(flush(&mut state).unwrap(), Flushed::Nothing);
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            v1,
-            "reading alone never rewrites"
-        );
-
-        let mut ids = IdSource::new(1, 2);
-        let target = state.note_ref(&mut ids, &b);
-        state
-            .apply(PendingOp::SetPinned {
-                note: target,
-                value: true,
-            })
-            .unwrap();
-        assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.starts_with("version=2\r\n"), "{written:?}");
-        assert!(!written.contains("tag="), "{written:?}");
-        assert!(
-            written.contains(&format!("note={}|p|1|", NoteId(5).to_hex())),
-            "{written:?}"
-        );
-        assert!(written.ends_with("|b.md\r\n"), "{written:?}");
-    }
-
     fn tree_rows(tree: &tree::NoteTree) -> Vec<tree::TreeRow> {
         tree.rows(&|_| true, &[])
     }

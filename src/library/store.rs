@@ -7,15 +7,9 @@
 //!
 //! `<flags>` is `p` (pinned), `d` (deleted), both, or `-`. The path is relative to the notebook,
 //! last and unescaped, so splitting a `note` line on its first four `|` characters is
-//! unambiguous.
-//!
-//! Version 1 (the first note-library builds) is still read: its `notebook=` and `tag=` lines are
-//! dropped, and each `note=<id>|<notebook>|<flags>|<tags>|<size>|<hash>|<path>` line keeps only
-//! its `p` and `d` flags. It becomes version 2 at the next flush that has something to write;
-//! reading alone never rewrites it. Records whose path is not a plain relative path (version 1
-//! allowed absolute ones for files outside the folder) are dropped on read and never written. Any
-//! other version, or none, makes the whole file unreadable, and an unreadable file is never
-//! overwritten.
+//! unambiguous. Records whose path is not a plain relative path are dropped on read and never
+//! written. Any other version, or none, makes the whole file unreadable, and an unreadable file
+//! is never overwritten.
 
 use super::ids::NoteId;
 use super::model::{Library, NoteRecord};
@@ -23,7 +17,6 @@ use crate::Result;
 use std::path::{Component, Path, PathBuf};
 
 const VERSION: &str = "2";
-const VERSION_1: &str = "1";
 pub const LIBRARY_DIR: &str = ".fastpad";
 const LIBRARY_FILE: &str = "library.ini";
 
@@ -106,15 +99,13 @@ pub fn parse(source: &str) -> Option<Library> {
             _ => {}
         }
     }
-    let parse_line: fn(&str) -> Option<NoteRecord> = match version? {
-        VERSION => parse_note,
-        VERSION_1 => parse_note_v1,
-        _ => return None,
-    };
+    if version? != VERSION {
+        return None;
+    }
     let mut library = Library {
         notes: lines
             .into_iter()
-            .filter_map(parse_line)
+            .filter_map(parse_note)
             .filter(|note| is_notebook_path(&note.path))
             .collect(),
     };
@@ -135,17 +126,7 @@ fn parse_note(value: &str) -> Option<NoteRecord> {
     finish_note(id, flags, fields)
 }
 
-/// `<id>|<notebook>|<flags>|<tags>|<size>|<hash>|<path>`: the notebook and tags are dropped.
-fn parse_note_v1(value: &str) -> Option<NoteRecord> {
-    let mut fields = value.splitn(7, '|');
-    let id = NoteId::parse_hex(fields.next()?)?;
-    let _notebook = fields.next()?;
-    let flags = fields.next()?;
-    let _tags = fields.next()?;
-    finish_note(id, flags, fields)
-}
-
-/// The size, hash and path that end a `note` line in both versions. Only `p` and `d` flags count.
+/// The size, hash and path that end a `note` line. Only `p` and `d` flags count.
 fn finish_note<'a>(
     id: NoteId,
     flags: &str,
@@ -257,47 +238,12 @@ mod tests {
     }
 
     #[test]
-    fn a_version_one_file_keeps_its_pins_and_deleted_flags_and_drops_the_rest() {
-        // Break caught: a file from the first note-library builds read as unreadable (turning
-        // pinning off), or its favorites, notebooks and tags surviving into a version 2 write.
-        let text = "version=1\r\n\
-            notebook=00000000000000000000000000000001|0|teal|100|200|Work\r\n\
-            tag=00000000000000000000000000000002|idea\r\n\
-            note=0000000000000000000000000000000a|00000000000000000000000000000001|fp|\
-            00000000000000000000000000000002|12|000000000000feed|sub\\a b|c.md\r\n\
-            note=0000000000000000000000000000000b|-|fd|-|0|0000000000000000|b.md\r\n\
-            note=0000000000000000000000000000000c|-|f|-|0|0000000000000000|c.md\r\n";
-        let library = parse(text).unwrap();
-        let flags: Vec<_> = library
-            .notes
-            .iter()
-            .map(|note| (note.id, note.pinned, note.deleted))
-            .collect();
-        assert_eq!(
-            flags,
-            [
-                (NoteId(0xa), true, false),
-                (NoteId(0xb), false, true),
-                (NoteId(0xc), false, false)
-            ]
-        );
-        assert_eq!(library.notes[0].path, PathBuf::from(r"sub\a b|c.md"));
-        assert_eq!((library.notes[0].size, library.notes[0].hash), (12, 0xfeed));
-        let rewritten = encode(&library);
-        assert!(rewritten.starts_with("version=2\r\n"));
-        assert!(!rewritten.contains("notebook=") && !rewritten.contains("tag="));
-        assert!(rewritten.contains(
-            "note=0000000000000000000000000000000a|p|12|000000000000feed|sub\\a b|c.md\r\n"
-        ));
-    }
-
-    #[test]
-    fn only_version_one_and_two_files_are_readable() {
+    fn only_version_two_files_are_readable() {
         // Break caught: a newer FastPad's file (or a damaged one) read as an empty library and
         // then overwritten, destroying every pin.
         assert_eq!(parse("note=x\r\n"), None);
+        assert_eq!(parse("version=1\r\n"), None);
         assert_eq!(parse("version=3\r\n"), None);
-        assert_eq!(parse("version=1\r\n"), Some(Library::default()));
         assert_eq!(parse("\u{feff}version=2\r\n"), Some(Library::default()));
     }
 
@@ -317,13 +263,13 @@ mod tests {
 
     #[test]
     fn absolute_path_records_are_dropped_on_read_and_never_written() {
-        // Break caught: a version 1 record for a file outside the folder surviving into version
-        // 2, which has no way to say which drive it meant.
-        let text = "version=1\r\n\
-            note=0000000000000000000000000000000a|-|p|-|0|0000000000000000|C:\\elsewhere\\log.txt\r\n\
-            note=0000000000000000000000000000000b|-|p|-|0|0000000000000000|\\rooted.md\r\n\
-            note=0000000000000000000000000000000c|-|p|-|0|0000000000000000|..\\up.md\r\n\
-            note=0000000000000000000000000000000d|-|p|-|0|0000000000000000|kept.md\r\n";
+        // Break caught: a record for a file outside the folder surviving into a write, which
+        // has no way to say which drive it meant.
+        let text = "version=2\r\n\
+            note=0000000000000000000000000000000a|p|0|0000000000000000|C:\\elsewhere\\log.txt\r\n\
+            note=0000000000000000000000000000000b|p|0|0000000000000000|\\rooted.md\r\n\
+            note=0000000000000000000000000000000c|p|0|0000000000000000|..\\up.md\r\n\
+            note=0000000000000000000000000000000d|p|0|0000000000000000|kept.md\r\n";
         let library = parse(text).unwrap();
         let kept: Vec<_> = library.notes.iter().map(|note| note.id).collect();
         assert_eq!(kept, [NoteId(0xd)]);
@@ -353,14 +299,15 @@ mod tests {
             }
             _ => panic!("expected a loaded library"),
         }
-        // Break caught: reading a version 1 file rewriting it before anything changed.
+        // Break caught: a version 1 file read as loaded instead of unreadable, or reading it
+        // rewriting it before anything changed.
         std::fs::write(
             &path,
             "version=1\r\nnote=0000000000000000000000000000000a|-|p|-|0|0000000000000000|a.md\r\n",
         )
         .unwrap();
         let before = std::fs::read(&path).unwrap();
-        assert!(matches!(read(&path), ReadOutcome::Loaded(..)));
+        assert!(matches!(read(&path), ReadOutcome::Unreadable));
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,

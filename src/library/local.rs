@@ -84,8 +84,7 @@ impl LocalState {
         output
     }
 
-    /// `None` for anything but a version-1 file written for `folder`. Unknown lines (the
-    /// `recent=` lines older builds wrote) are ignored.
+    /// `None` for anything but a version-1 file written for `folder`. Unknown lines are ignored.
     pub fn parse(source: &str, folder: &Path) -> Option<Self> {
         let source = source.strip_prefix('\u{feff}').unwrap_or(source);
         let mut version = None;
@@ -252,8 +251,8 @@ pub fn write_in_order(path: &Path, state: &LocalState, order: u64) -> Result<()>
 }
 
 /// `folders.ini`: recent notebooks (most recent first; the first opens at startup), favorite
-/// notebooks, and whether the last session ended with no notebook open. Unknown keys are ignored,
-/// so an older build reading this file loses nothing it understands.
+/// notebooks, and whether the last session ended with no notebook open. Unknown keys are
+/// ignored.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecentFolders {
     pub folders: Vec<PathBuf>,
@@ -440,18 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn an_older_local_file_with_recent_notes_still_loads_and_drops_them() {
-        // Break caught: a PR #9 build's local file (with `recent=` lines) failing to parse, which
-        // throws away the scan cache and the folder's autosave switch.
-        let older = "version=1\r\nfolder=D:\\Notes\r\nautosave=false\r\nrecent=20|b.md\r\n\
-                     missing=5|00000000000000000000000000000009\r\n";
-        let state = LocalState::parse(older, Path::new(r"D:\Notes")).unwrap();
-        assert!(!state.autosave);
-        assert_eq!(state.missing, [(5, NoteId(9))]);
-        assert!(!state.encode().contains("recent="));
-    }
-
-    #[test]
     fn expanded_folders_are_kept_once_ignoring_case_and_collapse_away() {
         // Break caught: expanding a folder twice writing two lines, or collapsing `Sub` leaving
         // `sub` expanded.
@@ -511,8 +498,8 @@ mod tests {
 
     #[test]
     fn folders_ini_round_trips_recent_favorites_and_open_none() {
-        // Break caught: favorites or a closed notebook lost on restart, or a PR #9 build's
-        // folders.ini (no favorite= or open= lines) failing to load.
+        // Break caught: favorites or a closed notebook lost on restart, or a file with no
+        // favorite= or open= lines failing to load.
         let mut folders = RecentFolders::default();
         folders.push(PathBuf::from(r"D:\Work"));
         assert!(folders.toggle_favorite(Path::new(r"E:\Recipes")));
@@ -523,9 +510,9 @@ mod tests {
             "version=1\r\nopen=none\r\nfolder=D:\\Work\r\nfavorite=E:\\Recipes\r\n"
         );
         assert_eq!(RecentFolders::parse(&text), folders);
-        let older = RecentFolders::parse("version=1\r\nfolder=D:\\Work\r\nfuture=x\r\n");
-        assert_eq!(older.folders, [PathBuf::from(r"D:\Work")]);
-        assert!(older.favorites.is_empty() && !older.closed);
+        let sparse = RecentFolders::parse("version=1\r\nfolder=D:\\Work\r\nfuture=x\r\n");
+        assert_eq!(sparse.folders, [PathBuf::from(r"D:\Work")]);
+        assert!(sparse.favorites.is_empty() && !sparse.closed);
         assert!(!RecentFolders::parse("version=1\r\nopen=D:\\Work\r\n").closed);
     }
 

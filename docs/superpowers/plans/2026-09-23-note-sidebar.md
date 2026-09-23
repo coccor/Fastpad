@@ -21,7 +21,7 @@
 - **Startup:** the one new cost before first paint is reading `fastpad.ini`: `bootstrap::run` reads it before the window is created (it used to be read in the deferred `WM_FASTPAD_LOAD_SETTINGS`), so the activity bar and an empty panel frame paint their saved view and width in the first frame and nothing moves afterwards. `WM_FASTPAD_LOAD_SETTINGS` applies those settings and reports their warnings without reading the file again. Task 14's startup bench gate must show warm startup within noise of `feat/note-library`; if it doesn't, Task 14 moves the read back and the sidebar is reconciled in `apply_loaded_settings`. Nothing else new runs before first paint or first input. The panel reads no files before `WM_FASTPAD_LIBRARY_READY`, and shows "Loading…" until then.
 - **UI thread:** the tree is built on the scan worker. The UI thread never touches the disk for the sidebar, except for user-initiated file operations (move, rename, delete, reveal) and user-initiated changes to `folders.ini` (close, favorite). The sidebar's notebook lists come from a cache of `folders.ini` filled by the startup step, which already read it.
 - **Dependencies:** none new. Only the `editor` module sends `SCI_*` messages.
-- **`library.ini`:** version 2 is `version=2` plus `note=<id>|<flags>|<size>|<hash>|<path>`. Flags are `p`, `d`, both, or `-`. Version 1 is read and migrated, keeping `p` and `d`, dropping notebooks, tags, `f` and absolute-path records. Any other version is never overwritten.
+- **`library.ini`:** version 2 is `version=2` plus `note=<id>|<flags>|<size>|<hash>|<path>`. Flags are `p`, `d`, both, or `-`. Any other version, or none, is unreadable and never overwritten. No backward compatibility (user decision): version 1 files are not migrated.
 - **`folders.ini`:** `version=1`, `open=none` (only when the last session ended with no notebook), `folder=` (recent, at most 10), `favorite=` (at most 50).
 - **Per-PC library file:** drops `recent=` and gains `expanded=<relative path>`.
 - **`fastpad.ini`:** `sidebar_view` (`notebook`, `search`, `favorites` or `none`; default `notebook`) and `sidebar_width` (96-DPI pixels; default 260; valid range 180–480).
@@ -51,7 +51,7 @@
 
 | File | Responsibility | Task |
 |---|---|---|
-| `src/library/{model,ids,ops,store,mod,reconcile}.rs` | Pins-only model, `library.ini` v2 with v1 migration; the `reconcile.rs` test helper | 1 |
+| `src/library/{model,ids,ops,store,mod,reconcile}.rs` | Pins-only model, `library.ini` v2 only (no v1 migration); the `reconcile.rs` test helper | 1 |
 | `src/window/{commands,command_palette,library_host,name_box,main_window}.rs` | Remove favorite, tag and notebook commands, pickers, name-box purposes (`RenameNotebook`, `RenameTag`), `NameError` and `close_name_box_unless_error`; `execute_command`'s organize arm; the in-process tests (4 deleted, 1 replaced by 2 pin tests) | 1 |
 | `tests/windows/library.rs`, `src/bin/fastpad-bench.rs` | `NoteToggleFavorite` becomes `NoteTogglePin` (`\|f\|` becomes `\|p\|`), `PendingOp::SetFavorite` becomes `SetPinned` | 1 |
 | `src/library/local.rs`, `src/window/library_host.rs` | `expanded=`, `favorite=`, `open=none`, display names; drop recent notes; `Startup.closed`, `Loaded.closed` | 2 |
