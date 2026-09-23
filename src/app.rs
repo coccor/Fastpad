@@ -92,6 +92,13 @@ pub struct App {
     /// The warnings of the `fastpad.ini` that `bootstrap::run` read into `settings` before the
     /// window existed. `Some` until `WM_FASTPAD_LOAD_SETTINGS` reports them.
     pub(crate) preloaded_settings_warnings: Option<Vec<crate::config::SettingWarning>>,
+    /// The sidebar's focused note when the command palette most recently opened while the panel
+    /// had the keyboard focus (spec §6.3). Taken once by `run_command_palette_selection`, or
+    /// discarded when the palette closes without running a command.
+    pub(crate) palette_note_target: Option<std::path::PathBuf>,
+    /// Where focus returns when the command palette closes, since opening it took focus away
+    /// from the sidebar panel. `std::ptr::null_mut()` restores focus to the editor as before.
+    pub(crate) palette_focus_return: HWND,
     next_document_id: u64,
     process_start: u64,
 }
@@ -149,6 +156,8 @@ impl App {
             library: crate::window::library_host::LibraryHost::new(process_start),
             sidebar: None,
             preloaded_settings_warnings: None,
+            palette_note_target: None,
+            palette_focus_return: std::ptr::null_mut(),
             process_start,
             startup,
         }

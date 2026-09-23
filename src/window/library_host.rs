@@ -421,7 +421,10 @@ fn install(hwnd: HWND, fresh: LibraryState) {
     };
     let folder = folder(hwnd).unwrap_or_default();
     for (old, new) in relocated {
-        rebind_open_tab(hwnd, &folder.join(old), folder.join(new));
+        let (old_path, new_path) = (folder.join(old), folder.join(new));
+        if rebind_open_tab(hwnd, &old_path, new_path.clone()).is_err() {
+            report_rebind_failure(hwnd, &old_path, &new_path);
+        }
     }
     if first_time && truncated {
         push_notice(
@@ -527,20 +530,27 @@ pub(crate) fn expanded(hwnd: HWND) -> Vec<PathBuf> {
     with_state(hwnd, |state| state.local.expanded.clone()).unwrap_or_default()
 }
 
-/// A note moved outside FastPad: an open tab for it follows the file. The old path is gone, so
-/// the tab is found by its stored path, not through the disk. A move leaves the content alone,
-/// so when the new file's stamp is the one the tab knows, autosave carries on (or resumes, if it
-/// paused when the old file vanished); otherwise the tab keeps what it knew, and its next
-/// autosave pauses on the changed file.
-fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) {
+/// A note moved outside FastPad (or was moved/renamed by FastPad itself): an open tab for it
+/// follows the file. The old path is gone, so the tab is found by its stored path, not through
+/// the disk. A move leaves the content alone, so when the new file's stamp is the one the tab
+/// knows, autosave carries on (or resumes, if it paused when the old file vanished); otherwise
+/// the tab keeps what it knew, and its next autosave pauses on the changed file.
+///
+/// `Ok(true)` when a tab followed, `Ok(false)` when none had `old` open, `Err` when a tab had
+/// `old` open but could not be rebound because another tab already has `new` open — the file
+/// moved, but that tab is left pointing at a path that no longer exists. A user-initiated move
+/// or rename refuses upfront when the target is already open (`move_note_to`, `submit_rename`),
+/// so this should only be reachable from a race the rescan discovers later; the caller must not
+/// swallow it.
+fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) -> Result<bool, ()> {
     let stamp = library::disk_stamp(&new);
-    let changed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+    let outcome = unsafe { app_ptr(hwnd) }.map(|mut app| {
         let app = unsafe { app.as_mut() };
         let Some(id) = app.tabs.find_stored_path(old) else {
-            return false;
+            return Ok(false);
         };
         if app.tabs.rebind_path(id, new).is_err() {
-            return false;
+            return Err(());
         }
         if let Some(document) = app.tabs.document_mut(id)
             && document.disk_stamp.is_some()
@@ -548,10 +558,16 @@ fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) {
         {
             document.autosave_paused = false;
         }
-        true
+        Ok(true)
     });
-    if changed {
-        super::main_window::invalidate_title_strip(hwnd);
+    match outcome {
+        Some(Ok(true)) => {
+            super::main_window::invalidate_title_strip(hwnd);
+            Ok(true)
+        }
+        Some(Ok(false)) => Ok(false),
+        Some(Err(())) => Err(()),
+        None => Ok(false),
     }
 }
 
@@ -1604,8 +1620,44 @@ pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
     );
 }
 
-/// Moves `note` into `destination`'s root. A clash or a failure changes nothing and says so. The
-/// pin goes, because pins belong to a notebook, and an open tab follows the file.
+/// Whether some open tab already has `path`, by its stored path (which may no longer exist on
+/// disk, e.g. after the file it names was deleted or moved outside FastPad).
+fn tab_open_for(hwnd: HWND, path: &Path) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .find_stored_path(path)
+            .is_some()
+    })
+}
+
+/// Makes a `rebind_open_tab` failure visible: a race left a tab pointing at a path that no
+/// longer exists, because another tab already had the new one open. `move_note_to` and
+/// `submit_rename` already refuse upfront when the target is open, so this is only reachable
+/// from an external relocation the rescan discovers after another tab opened the target.
+fn report_rebind_failure(hwnd: HWND, old: &Path, new: &Path) {
+    debug_assert!(
+        false,
+        "rebind_open_tab: {} already open, so {} could not follow its move",
+        new.display(),
+        old.display()
+    );
+    push_notice(
+        hwnd,
+        format!(
+            "{} moved to {}, but another tab already has that file open. The tab for {} still shows the old location.",
+            title::note_title(old),
+            new.display(),
+            title::note_title(old)
+        ),
+    );
+}
+
+/// Moves `note` into `destination`'s root. A clash, another tab already at the target, or a
+/// failure changes nothing and says so. The pin goes, because pins belong to a notebook, and an
+/// open tab follows the file. A cross-volume move that copied but could not delete the source
+/// (spec: `MOVEFILE_COPY_ALLOWED`) leaves the source, its pin and its index entry alone: the
+/// library state must still match what's on disk.
 fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
     let Some(file_name) = note.file_name() else {
         return;
@@ -1629,12 +1681,35 @@ fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
         );
         return;
     }
+    if tab_open_for(hwnd, &target) {
+        push_notice(
+            hwnd,
+            format!(
+                "Another tab already has {} open. Nothing was moved.",
+                file_name.to_string_lossy()
+            ),
+        );
+        return;
+    }
     if let Err(error) = crate::platform::files::move_file(note, &target) {
         push_notice(
             hwnd,
             format!(
                 "FastPad could not move {} to {notebook}: {error}",
                 note.display()
+            ),
+        );
+        return;
+    }
+    if note.exists() {
+        // MOVEFILE_COPY_ALLOWED can report success after copying across volumes even when it
+        // could not then delete the source (still open elsewhere, read-only, a locked volume).
+        // The source is still there, so its pin and index entry still describe it correctly.
+        push_notice(
+            hwnd,
+            format!(
+                "{} was copied to {notebook}, but the original could not be removed.",
+                title::note_title(note)
             ),
         );
         return;
@@ -1650,7 +1725,9 @@ fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
         }
         with_state(hwnd, |state| state.remove_note(note));
     }
-    rebind_open_tab(hwnd, note, target.clone());
+    if rebind_open_tab(hwnd, note, target.clone()).is_err() {
+        report_rebind_failure(hwnd, note, &target);
+    }
     push_notice(
         hwnd,
         format!("Moved {} to {notebook}.", title::note_title(&target)),

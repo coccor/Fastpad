@@ -1207,10 +1207,32 @@ fn with_command_palette<R>(hwnd: HWND, action: impl FnOnce(&CommandPalette) -> R
     unsafe { app.as_ref() }.command_palette.as_ref().map(action)
 }
 
+/// Records where focus should return, and the sidebar's focused note if the panel had the
+/// keyboard focus, before the command palette or a picker takes it for its query field (spec
+/// §6.3). `close_command_palette` restores the focus; `run_command_palette_selection` takes the
+/// note for the command it runs.
+fn capture_palette_focus(hwnd: HWND) {
+    let panel = crate::window::side_panel::windows(hwnd).map(|(_, panel)| panel);
+    let focused_panel = panel.filter(|&panel| unsafe { GetFocus() } == panel);
+    let note = focused_panel.and_then(|_| crate::window::notebook_view::focused_note(hwnd));
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        app.palette_note_target = note;
+        app.palette_focus_return = focused_panel.unwrap_or(std::ptr::null_mut());
+    }
+}
+
+/// Takes the note `capture_palette_focus` recorded, if any. Consumed at most once per palette
+/// visit: by the command it runs, or discarded when the palette closes without running one.
+fn take_palette_note_target(hwnd: HWND) -> Option<std::path::PathBuf> {
+    unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.palette_note_target.take())
+}
+
 pub(crate) fn open_command_palette(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    capture_palette_focus(hwnd);
     let colors = title_chrome(hwnd).0;
     let newly_shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
@@ -1243,6 +1265,7 @@ pub(crate) fn open_picker(hwnd: HWND, picker: command_palette::Picker) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    capture_palette_focus(hwnd);
     let colors = title_chrome(hwnd).0;
     let newly_shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
@@ -1287,12 +1310,23 @@ pub(crate) fn close_command_palette(hwnd: HWND, restore_focus: bool) {
             windows_sys::Win32::Graphics::Gdi::UpdateWindow(editor_hwnd);
         }
     }
+    // A leftover note (the palette closed without running the command that would consume it)
+    // must not leak into some later, unrelated command.
+    let _ = take_palette_note_target(hwnd);
+    let panel_return = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let panel = std::mem::replace(&mut app.palette_focus_return, std::ptr::null_mut());
+        (!panel.is_null()).then_some(panel)
+    });
     if restore_focus {
-        let target = if tab_count(hwnd) > 0 {
-            content_focus_target(hwnd).unwrap_or(hwnd)
-        } else {
-            hwnd
-        };
+        // The panel had focus when the palette opened: give it back, rather than the editor.
+        let target = panel_return.unwrap_or_else(|| {
+            if tab_count(hwnd) > 0 {
+                content_focus_target(hwnd).unwrap_or(hwnd)
+            } else {
+                hwnd
+            }
+        });
         unsafe {
             SetFocus(target);
         }
@@ -1374,13 +1408,16 @@ pub(crate) fn run_command_palette_selection(hwnd: HWND) {
     } else {
         None
     };
+    // Taken before closing moves focus off the sidebar panel, so a note-scoped command still
+    // knows which row was focused when the palette opened (spec §6.3).
+    let note = take_palette_note_target(hwnd);
     close_command_palette(hwnd, true);
     match pick {
         Some((kind, Some(choice))) => crate::window::library_host::picked(hwnd, kind, choice),
         Some((_, None)) => {}
         None => {
             if let Some(command) = command {
-                execute_command(hwnd, command);
+                execute_command_with_note(hwnd, command, note);
             }
         }
     }
@@ -1751,12 +1788,44 @@ fn refresh_tabs(hwnd: HWND) {
     crate::window::side_panel::active_tab_changed(hwnd);
 }
 
+/// Commands that act on a note rather than a command in the general sense (spec §6.3): the row
+/// recorded when the palette opened or currently focused in the sidebar's tree, else (except
+/// Rename and Delete, whose no-target path looks up the active tab itself) the active tab's file.
+fn is_note_command(command: CommandId) -> bool {
+    matches!(
+        command,
+        CommandId::NoteTogglePin
+            | CommandId::NoteMoveToNotebook
+            | CommandId::NoteRevealInExplorer
+            | CommandId::NoteRename
+            | CommandId::NoteDelete
+    )
+}
+
+/// Pin/Move to notebook/Reveal's target: `tree` (the row the palette recorded, or the tree's
+/// currently focused row), else the active tab's file.
+fn note_target(hwnd: HWND, tree: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    tree.map(std::path::Path::to_path_buf)
+        .or_else(|| crate::window::library_host::active_file(hwnd))
+}
+
 fn execute_command(hwnd: HWND, command: CommandId) {
+    execute_command_with_note(hwnd, command, None);
+}
+
+/// `execute_command`, for a command chosen from the command palette: `recorded` is the sidebar
+/// row that `capture_palette_focus` recorded when the palette opened, taken by
+/// `run_command_palette_selection` before closing it moved focus off the panel (spec §6.3).
+fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathBuf>) {
     exit_menu_mode(hwnd);
     if file_population_active(hwnd) {
         return;
     }
-    if command.needs_document() && tab_count(hwnd) == 0 {
+    let tree_note = is_note_command(command)
+        .then(|| recorded.or_else(|| crate::window::notebook_view::focused_note(hwnd)))
+        .flatten();
+    // A focused (or recorded) note lets a note-scoped command through even with no tab open.
+    if command.needs_document() && tab_count(hwnd) == 0 && tree_note.is_none() {
         return;
     }
     if let Some(index) = command.tab_index() {
@@ -1872,38 +1941,32 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
         CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
         CommandId::NoteTogglePin => {
-            if let Some(path) = crate::window::notebook_view::focused_note(hwnd)
-                .or_else(|| crate::window::library_host::active_file(hwnd))
-            {
+            if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
                 crate::window::library_host::toggle_pin(hwnd, &path);
             }
         }
         CommandId::NoteMoveToNotebook => {
-            if let Some(path) = crate::window::notebook_view::focused_note(hwnd)
-                .or_else(|| crate::window::library_host::active_file(hwnd))
-            {
+            if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
                 crate::window::library_host::move_to_notebook(hwnd, &path);
             }
         }
         CommandId::NoteRevealInExplorer => {
-            if let Some(path) = crate::window::notebook_view::focused_note(hwnd)
-                .or_else(|| crate::window::library_host::active_file(hwnd))
-            {
+            if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
                 crate::window::library_host::reveal(hwnd, &path);
             }
         }
         CommandId::NoteRename => {
             if crate::window::library_host::ready_library(hwnd) {
-                match crate::window::notebook_view::focused_note(hwnd) {
-                    Some(path) => crate::window::library_host::rename_file(hwnd, &path),
+                match &tree_note {
+                    Some(path) => crate::window::library_host::rename_file(hwnd, path),
                     None => crate::window::library_host::rename_note(hwnd),
                 }
             }
         }
         CommandId::NoteDelete => {
             if crate::window::library_host::ready_library(hwnd) {
-                match crate::window::notebook_view::focused_note(hwnd) {
-                    Some(path) => crate::window::library_host::delete_file(hwnd, &path),
+                match &tree_note {
+                    Some(path) => crate::window::library_host::delete_file(hwnd, path),
                     None => crate::window::library_host::delete_note(hwnd),
                 }
             }
@@ -10340,5 +10403,158 @@ mod tests {
             name_box.purpose(),
             Some(&crate::window::name_box::NamePurpose::RenameNote(id))
         );
+    }
+
+    #[test]
+    fn palette_commands_act_on_the_row_focused_when_the_palette_opened() {
+        // Break caught: opening the palette moves focus to its query field, so by the time the
+        // chosen command runs, a live focus check sees nothing on the panel and falls back to
+        // the active tab instead of the row the user actually picked -- wrong for spec §6.3, and
+        // dangerous for Delete.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("palette-note-target");
+        let active_path = scratch.note("active.md", "active");
+        scratch.note("row.md", "row");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &active_path).unwrap();
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Note("row.md".into()));
+        let (_, panel) = sidebar_windows(window.hwnd);
+        unsafe { SetFocus(panel) };
+        assert_eq!(
+            unsafe { GetFocus() },
+            panel,
+            "the panel must hold focus to record the row"
+        );
+
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        // Opening the palette moved focus to its own query field.
+        assert_ne!(unsafe { GetFocus() }, panel);
+        let query = app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .query_hwnd();
+        let typed = crate::platform::wide_null("Toggle pin");
+        unsafe { SetWindowTextW(query, typed.as_ptr()) };
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(state.is_pinned(&scratch.folder().join("row.md")));
+            assert!(!state.is_pinned(&active_path));
+        });
+        // The panel had focus when the palette opened, so it gets it back.
+        assert_eq!(unsafe { GetFocus() }, panel);
+    }
+
+    #[test]
+    fn moving_a_note_onto_a_path_already_open_in_another_tab_is_refused() {
+        // Break caught: the target file having been deleted on disk lets the clash check through,
+        // then MoveFileExW succeeds and rebind_open_tab silently fails because another tab already
+        // has that path, leaving that tab pointing at a file that no longer exists anywhere.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("move-target-open-a");
+        let second = LibraryScratch::new("move-target-open-b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let a = open_note(&window, &first, "a.md", "a");
+        let target = second.note("a.md", "theirs");
+        super::open_path(window.hwnd, &target).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        write_notebooks(&first.data(), vec![second.folder()], vec![]);
+
+        crate::window::library_host::move_to_notebook(window.hwnd, &a);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+
+        assert!(a.exists());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
+        assert!(
+            !target.exists(),
+            "nothing was moved, so the deleted file stays deleted"
+        );
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("already has"))
+        );
+    }
+
+    #[test]
+    fn note_commands_reach_a_focused_tree_row_even_with_no_tab_open() {
+        // Break caught: the needs_document gate returning early for Ctrl+Shift+M and Reveal
+        // whenever no tab happens to be open, even though the tree still has a focused row.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("gate-no-tabs");
+        let path = scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        let (_, panel) = sidebar_windows(window.hwnd);
+        unsafe { SetFocus(panel) };
+        while super::tab_count(window.hwnd) > 0 {
+            super::close_active_document(window.hwnd);
+        }
+        assert_eq!(super::tab_count(window.hwnd), 0);
+
+        execute_command(window.hwnd, CommandId::NoteRevealInExplorer);
+
+        assert_eq!(crate::platform::shell::take_revealed(), vec![path]);
+    }
+
+    #[test]
+    fn moving_a_note_with_unsaved_edits_keeps_them_and_writes_only_at_the_new_path() {
+        // Break caught: a move losing the tab's unsaved edits, or an autosave after the move
+        // recreating the file at the old location instead of writing it to the new one.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("move-dirty-a");
+        let second = LibraryScratch::new("move-dirty-b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let a = open_note(&window, &first, "a.md", "a");
+        editor.set_text("unsaved edit").unwrap();
+        write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+
+        execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+
+        let moved = second.folder().join("a.md");
+        assert!(!a.exists());
+        assert_eq!(
+            std::fs::read_to_string(&moved).unwrap(),
+            "a",
+            "the move only relocates the file on disk; the unsaved edit stays in the buffer"
+        );
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(moved.as_path()));
+        assert!(active.dirty, "the unsaved edit followed the tab");
+        assert_eq!(editor.text().unwrap(), "unsaved edit");
+
+        // The move took the note out of the open notebook, so autosave no longer applies to it;
+        // an explicit save must still land only at the new path, never re-create the old one.
+        crate::window::library_host::save_command(window.hwnd);
+        assert!(
+            !a.exists(),
+            "a save must not recreate the file at the old location"
+        );
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "unsaved edit");
     }
 }
