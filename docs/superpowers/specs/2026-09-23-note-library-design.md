@@ -1,6 +1,6 @@
 # Note Library Design
 
-Status: Draft for review  
+Status: Approved design  
 Date: 23 September 2026
 
 ## 1. Purpose
@@ -370,3 +370,22 @@ These use a scratch `LOCALAPPDATA` and a temp folder, and run with `--test-threa
 - The sidebar's folder switcher, note list, and the unsaved-note entries in Notes (sub-project 2).
 - A shortcut for "toggle favorite" that does not clash with Format JSON (sub-project 2).
 - A per-folder ignore file, a file-system watcher, and merging OneDrive conflict copies of `library.ini`.
+
+## 14. Implementation notes
+
+Decisions made while building this design, not anticipated by the sections above.
+
+- **Deleting to the Recycle Bin** (§8.4) uses `SHFileOperationW` with `FOF_ALLOWUNDO` instead of `IFileOperation`. It gives the same behavior with no COM vtable. `recycle` takes only an absolute path to a file; a relative path or a directory is refused before anything is sent to the shell. The shell still warns before a permanent delete, for example when there is no Recycle Bin to send to (a network share, the bin disabled or over quota).
+- **Note extensions are an explicit list** (§5): `md`, `markdown`, `txt`, `text`, `json`, `log`, `ini`, `cfg`, `conf`, `yaml`, `yml`, `toml`, `csv`, `xml`. `detect_language`, which drives syntax highlighting, knows only `json` and `md`; every other note extension is plain text.
+- **OneDrive online-only files** (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` or `OFFLINE`) are listed by the scanner but never hashed, so reconciliation's fingerprint pass (§7.3) never downloads them.
+- **The disk-change notice** (§8.3) offers *Reload* and *Keep mine* as the palette commands "Note: Reload from disk" and "Note: Keep my version", since notices have no buttons yet. "Note: Keep my version" on a tab that has never been saved does nothing.
+- **Dropping files on the window opens them as tabs** (§5). FastPad handled no drops before this design, so "dropped files keep today's behavior" had nothing to keep. Both files and folders dropped on the text area work; FastPad wraps Scintilla's drop target, and text drag-and-drop inside the editor still goes to Scintilla.
+- **Reconciliation** (§7.3) runs the file-ID pass to completion before the fingerprint pass, and both passes only ever consider files whose path is new since the previous scan's cache — on a folder's first scan on a given PC, every file counts as new. A truncated scan (over the 10,000-note limit) never marks records missing or purges them, since it did not see the whole folder.
+- **Rescan merges** (§7.5): changes flushed to `library.ini` while a scan is running are kept; if another PC changed `library.ini` during the interval, one stat of the file decides which side is current; notes created or renamed while a scan is running stay in the index.
+- **Opening a folder is refused**, with the current folder left open and a notice shown, if the current library's pending metadata operations can't be flushed to disk first.
+- **The first save through the inline name box** (§8.2) never replaces an existing file, even one created after the name was checked; the save uses an exclusive create and reports `SaveOutcome::NameTaken` rather than overwriting.
+- **Save As** behaves differently depending on the setting: with notes mode off, it suggests "Untitled.txt" exactly as before this design; with notes mode on, Save As of a file that already has a path starts in today's dialog start folder, not the open folder.
+- **Autosave** (§8.3) waits until the folder has finished loading, and pauses instead of writing when FastPad has no known on-disk stamp for the file yet or the file has vanished. A failed autosave shows one notice naming the file.
+- **Organizing commands** (§8.5) work on files outside the open folder by creating a record with an absolute path, as §8.5 describes. They are refused outright — not just left with nothing to act on — while notes mode is off, the folder is still loading, or `library.ini` is unreadable.
+- **Two parts of this spec are deferred beyond what §13 lists:** reordering notebooks exists in the model (`move_notebook`) but has no command yet; sub-project 2's sidebar will drive it. The inline name box shows a name clash as text next to the field rather than as a separate notice.
+- **Tests:** in-process tests use a per-process scratch profile instead of the real one; real-exe tests in `tests/windows/` seed a scratch `folders.ini`; the library end-to-end tests refuse to run while any FastPad window is already open, to avoid colliding with a real session.

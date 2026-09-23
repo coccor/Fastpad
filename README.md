@@ -96,6 +96,18 @@ typing. Both panes scroll together.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
 
+### Notes and folders
+
+Open any folder with **Ctrl+Shift+O** and it becomes your note library. Ctrl+N gives you a new
+note, labelled by its first line as you type. The first Ctrl+S asks for its name inline and saves
+it into the folder; files already inside the folder save themselves from then on.
+
+Notebooks, tags, favorites and pins live in the command palette for now, and are stored in
+`.fastpad\library.ini` inside the folder, so they travel with it wherever it goes. Nothing is
+written into a folder until you organize something in it.
+
+Turn it all off with `notes_mode=false` in `fastpad.ini`.
+
 ### JSON you can trust
 
 <img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
@@ -161,6 +173,7 @@ before closing again.
 | Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Ctrl+1` … `Ctrl+9` |
 | Left-to-right text | `Ctrl+L` | | Right-to-left text | `Ctrl+R` |
+| Open folder | `Ctrl+Shift+O` | | | |
 
 ## Make it yours
 
