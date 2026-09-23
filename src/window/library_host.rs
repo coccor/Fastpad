@@ -1515,6 +1515,9 @@ pub(crate) fn rename_note(hwnd: HWND) {
     else {
         return;
     };
+    // The tab is about to be renamed: a preview would be replaced by the next click in the tree
+    // and take the name box with it, so it becomes a normal tab, as the sidebar's F2 makes it.
+    promote_tab_for(hwnd, &path);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1716,6 +1719,9 @@ fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
         );
         return;
     }
+    if !save_before_move(hwnd, note) {
+        return;
+    }
     if let Err(error) = crate::platform::files::move_file(note, &target) {
         push_notice(
             hwnd,
@@ -1750,14 +1756,66 @@ fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
         }
         with_state(hwnd, |state| state.remove_note(note));
     }
-    if rebind_open_tab(hwnd, note, target.clone()).is_err() {
-        report_rebind_failure(hwnd, note, &target);
+    match rebind_open_tab(hwnd, note, target.clone()) {
+        // The tab followed the note out of the notebook: a preview would be replaced by the
+        // next click in the tree, so it becomes a normal tab, as a rename makes it.
+        Ok(true) => promote_tab_for(hwnd, &target),
+        Ok(false) => {}
+        Err(()) => report_rebind_failure(hwnd, note, &target),
     }
     push_notice(
         hwnd,
         format!("Moved {} to {notebook}.", title::note_title(&target)),
     );
     super::side_panel::refresh(hwnd);
+}
+
+/// Writes the unsaved edits of `note`'s tab, if it has one, so they move with the file. A tab
+/// that is not active is saved through a brief switch to it, as `autosave_all` does. False (and
+/// a notice) when the save failed: nothing may move then.
+fn save_before_move(hwnd: HWND, note: &Path) -> bool {
+    let Some((id, active)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        let id = tabs.find_stored_path(note)?;
+        tabs.document(id)?
+            .dirty
+            .then(|| (id, tabs.active().map(|document| document.id)))
+    }) else {
+        return true;
+    };
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return false;
+    };
+    let saved = super::main_window::activate_document_by_id(hwnd, id)
+        && super::main_window::complete_autosave(hwnd, &identity);
+    if !identity.is_live_for(hwnd) {
+        return false;
+    }
+    if let Some(active) = active.filter(|&active| active != id) {
+        super::main_window::activate_document_by_id(hwnd, active);
+    }
+    if !saved {
+        push_notice(
+            hwnd,
+            format!(
+                "FastPad could not save {} before moving it. Nothing was moved.",
+                title::note_title(note)
+            ),
+        );
+    }
+    saved
+}
+
+/// Makes the tab that has `path` open a normal tab if it is the preview.
+fn promote_tab_for(hwnd: HWND, path: &Path) {
+    let promoted = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let tabs = &mut unsafe { app.as_mut() }.tabs;
+        tabs.find_stored_path(path)
+            .is_some_and(|id| tabs.promote(id))
+    });
+    if promoted {
+        super::main_window::invalidate_title_strip(hwnd);
+    }
 }
 
 /// Note: Reveal in Explorer, and the sidebar's Reveal entries.

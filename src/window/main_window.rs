@@ -10810,22 +10810,96 @@ mod tests {
         assert!(!a.exists());
         assert_eq!(
             std::fs::read_to_string(&moved).unwrap(),
-            "a",
-            "the move only relocates the file on disk; the unsaved edit stays in the buffer"
+            "unsaved edit",
+            "the edits were saved first, so they moved with the file"
         );
         let active = app_mut(window.hwnd).tabs.active().unwrap();
         assert_eq!(active.path.as_deref(), Some(moved.as_path()));
-        assert!(active.dirty, "the unsaved edit followed the tab");
+        assert!(!active.dirty);
         assert_eq!(editor.text().unwrap(), "unsaved edit");
 
-        // The move took the note out of the open notebook, so autosave no longer applies to it;
-        // an explicit save must still land only at the new path, never re-create the old one.
+        // A later edit and save must land only at the new path, never re-create the old one.
+        editor.set_text("later edit").unwrap();
         crate::window::library_host::save_command(window.hwnd);
         assert!(
             !a.exists(),
             "a save must not recreate the file at the old location"
         );
-        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "unsaved edit");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "later edit");
+    }
+
+    #[test]
+    fn a_note_whose_edits_cannot_be_saved_is_not_moved() {
+        // Break caught: a move going ahead after the save of the tab's edits failed, so the
+        // moved file lacks them and the tab's text no longer matches either location.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("move-save-fails-a");
+        let second = LibraryScratch::new("move-save-fails-b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let a = open_note(&window, &first, "a.md", "a");
+        editor.set_text("unsaved edit").unwrap();
+        write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+        // A file held open without sharing makes the save (and the move) fail.
+        use std::os::windows::fs::OpenOptionsExt;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&a)
+            .unwrap();
+        let before = notices(window.hwnd).len();
+
+        execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+        drop(lock);
+
+        assert!(a.exists());
+        assert!(!second.folder().join("a.md").exists(), "nothing moved");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(a.as_path()));
+        assert!(active.dirty);
+        let added = &notices(window.hwnd)[before..];
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].contains("Nothing was moved"), "{added:?}");
+    }
+
+    #[test]
+    fn a_palette_rename_and_a_move_turn_the_preview_into_a_normal_tab() {
+        // Break caught: a preview tab renamed from the palette, or moved to another notebook,
+        // staying the preview, so the next click in the tree replaces it.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("promote-a");
+        let second = LibraryScratch::new("promote-b");
+        let a = first.note("a.md", "a");
+        let b = first.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        first.install(window.hwnd);
+        write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+        assert!(app_mut(window.hwnd).tabs.preview_id().is_some());
+        execute_command(window.hwnd, CommandId::NoteRename);
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None, "rename");
+        crate::window::library_host::close_name_box(window.hwnd);
+
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+        assert!(app_mut(window.hwnd).tabs.preview_id().is_some());
+        execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+        assert!(second.folder().join("b.md").exists());
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None, "move");
     }
 
     fn sidebar_panel(hwnd: HWND) -> HWND {
