@@ -1094,12 +1094,12 @@ fn view_key(
 }
 
 /// Whether header point `x`, `y` (panel client coordinates) is empty, so the window drags from
-/// it: not the Notebook header's title and buttons, nor the Favorites header's Open notebook…
-/// button. The search box is a child window, so it never reaches the panel's hit test.
+/// it: not the Notebook header's title and buttons, the Search header's field (the search box
+/// and the padding painted around it), nor the Favorites header's Open notebook… button.
 fn header_is_caption(main: HWND, view: PanelView, panel: HWND, x: i32, y: i32) -> bool {
     match view {
         PanelView::Notebook => !crate::window::notebook_view::header_hit(main, x, y),
-        PanelView::Search => true,
+        PanelView::Search => !crate::window::search_view::header_hit(main, panel, x, y),
         PanelView::Favorites => {
             let mut client = RECT::default();
             unsafe { GetClientRect(panel, &mut client) };

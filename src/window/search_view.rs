@@ -650,6 +650,29 @@ fn enter_results(hwnd: HWND, panel: HWND) {
     }
 }
 
+/// Whether panel point (`x`, `y`) is on the painted search field, which is client area, not
+/// window caption. The field shows only while a notebook is open.
+pub(crate) fn header_hit(hwnd: HWND, panel: HWND, x: i32, y: i32) -> bool {
+    let (client, dpi) = geometry(panel);
+    with_view(hwnd, |view| view.notebook.is_some()).unwrap_or(false)
+        && inside(SearchView::field_rect(client, dpi), POINT { x, y })
+}
+
+/// A press on the field's padding, outside the box itself, puts the caret in the box. Reports
+/// whether the press was on the field.
+fn field_pressed(hwnd: HWND, panel: HWND, at: POINT) -> bool {
+    if !header_hit(hwnd, panel, at.x, at.y) {
+        return false;
+    }
+    // Focused with nothing of the App borrowed: SetFocus sends focus messages.
+    if let Some(edit) = with_view(hwnd, |view| view.edit).flatten() {
+        unsafe {
+            SetFocus(edit);
+        }
+    }
+    true
+}
+
 /// Input for the Search view's result list. `None` leaves the message to the panel.
 pub(crate) fn handle(
     hwnd: HWND,
@@ -693,6 +716,9 @@ pub(crate) fn handle(
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let at = point(lparam);
+            if field_pressed(hwnd, panel, at) {
+                return Some(0);
+            }
             // A press on the scroll thumb drags it, as in the Notebook view.
             let grabbed = message == WM_LBUTTONDOWN
                 && with_view(hwnd, |view| {

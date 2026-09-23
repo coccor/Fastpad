@@ -10873,6 +10873,64 @@ mod tests {
     }
 
     #[test]
+    fn the_search_field_is_client_area_and_a_press_on_its_padding_focuses_the_box() {
+        // Break caught: a press on the field's border or padding starting a window drag (the
+        // whole Search header answered HTTRANSPARENT), so the box could only be focused by
+        // hitting its text line exactly.
+        use windows_sys::Win32::Foundation::{LPARAM, POINT};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HTTRANSPARENT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCHITTEST,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-field-client");
+        scratch.note("plan.md", "p");
+        let window = shown_window();
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        let panel = sidebar_panel(window.hwnd);
+        let mut client = RECT::default();
+        unsafe { GetClientRect(panel, &mut client) };
+        let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+        let field = crate::window::search_view::SearchView::field_rect(client, dpi);
+        let hit_test = |x: i32, y: i32| {
+            let mut point = POINT { x, y };
+            unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(panel, &mut point) };
+            let lparam = ((point.y as u16 as u32) << 16 | point.x as u16 as u32) as LPARAM;
+            unsafe { SendMessageW(panel, WM_NCHITTEST, 0, lparam) }
+        };
+        // The field's top-left padding, outside the Edit, and the header left of the field.
+        assert_ne!(
+            hit_test(field.left + 1, field.top + 1),
+            HTTRANSPARENT as LRESULT,
+            "the field is client area"
+        );
+        assert_eq!(
+            hit_test(field.left - 2, field.top + 1),
+            HTTRANSPARENT as LRESULT,
+            "the header around the field still drags the window"
+        );
+
+        let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        unsafe { SetFocus(window.hwnd) };
+        let lparam = (((field.top + 1) as u32) << 16 | (field.left + 1) as u32) as LPARAM;
+        unsafe {
+            SendMessageW(panel, WM_LBUTTONDOWN, 0, lparam);
+            SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
+        }
+        assert_eq!(
+            unsafe { GetFocus() },
+            edit,
+            "the press put the caret in the box"
+        );
+    }
+
+    #[test]
     fn with_no_notebook_the_search_view_says_to_open_one() {
         // Break caught: an empty Search view with a live box that searches nothing.
         let _scintilla = load_native_scintilla();
