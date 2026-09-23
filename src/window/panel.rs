@@ -122,27 +122,7 @@ unsafe extern "system" fn panel_proc(
 }
 
 pub(crate) fn create_child(parent: HWND, class: &[u16], style: u32) -> crate::Result<HWND> {
-    let hwnd = unsafe {
-        CreateWindowExW(
-            0,
-            class.as_ptr(),
-            std::ptr::null(),
-            style,
-            0,
-            0,
-            0,
-            0,
-            parent,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if hwnd.is_null() {
-        Err(last_error())
-    } else {
-        Ok(hwnd)
-    }
+    create_child_with_menu(parent, class, style, std::ptr::null_mut())
 }
 
 /// Like `create_child`, but with a control ID so `WM_COMMAND` can tell the child apart.
@@ -156,6 +136,15 @@ pub(crate) fn create_child_with_id(
     style: u32,
     id: u16,
 ) -> crate::Result<HWND> {
+    create_child_with_menu(parent, class, style, id as usize as HMENU)
+}
+
+fn create_child_with_menu(
+    parent: HWND,
+    class: &[u16],
+    style: u32,
+    menu: HMENU,
+) -> crate::Result<HWND> {
     let hwnd = unsafe {
         CreateWindowExW(
             0,
@@ -167,7 +156,7 @@ pub(crate) fn create_child_with_id(
             0,
             0,
             parent,
-            id as usize as HMENU,
+            menu,
             std::ptr::null_mut(),
             std::ptr::null(),
         )

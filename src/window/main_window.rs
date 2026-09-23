@@ -5084,12 +5084,18 @@ mod tests {
     fn folder_and_confirm_seams_answer_inside_their_modal_scope() {
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
-        crate::window::answer_next_folder_dialog(|_| Some(std::path::PathBuf::from(r"D:\Notes")));
+        crate::window::answer_next_folder_dialog(|hwnd| {
+            assert!(crate::window::modal::modal_active(hwnd));
+            Some(std::path::PathBuf::from(r"D:\Notes"))
+        });
         assert_eq!(
             crate::window::modal::choose_folder(window.hwnd).unwrap(),
             Some(std::path::PathBuf::from(r"D:\Notes"))
         );
-        crate::window::answer_next_confirm(|_| false);
+        crate::window::answer_next_confirm(|hwnd| {
+            assert!(crate::window::modal::modal_active(hwnd));
+            false
+        });
         assert!(!crate::window::modal::confirm(window.hwnd, "Delete?"));
     }
 
