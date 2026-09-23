@@ -367,7 +367,7 @@ fn run_library_scan(
 }
 
 /// Writes `count` notes as `batch{i / 500}\note{i}.md`, about 200 bytes each, and a
-/// `.fastpad\library.ini` with favorite records spread across them.
+/// `.fastpad\library.ini` with pinned records spread across them.
 fn create_library_fixture(folder: &Path, count: usize) -> Result<(), String> {
     use fastpad::library::ids::{IdSource, NoteId, fnv1a};
     use fastpad::library::model::{Library, NoteRef};
@@ -403,7 +403,7 @@ fn create_library_fixture(folder: &Path, count: usize) -> Result<(), String> {
         };
         let content = text(index);
         for op in [
-            PendingOp::SetFavorite {
+            PendingOp::SetPinned {
                 note: note.clone(),
                 value: true,
             },

@@ -1,6 +1,6 @@
-//! The note library: a folder of plain text files seen as notes, plus sparse organizational
-//! metadata (notebooks, tags, favorites, pins) kept in `.fastpad\library.ini` and attached to
-//! files by path, file ID and content fingerprint. Nothing here touches a window.
+//! The note library: a notebook (a folder) of plain text files seen as notes, plus sparse pins
+//! kept in `.fastpad\library.ini` and attached to files by path, file ID and content fingerprint.
+//! Nothing here touches a window.
 
 pub mod ids;
 pub mod local;
@@ -346,6 +346,13 @@ impl LibraryState {
         self.library.note_by_path(&record_path(&self.folder, path))
     }
 
+    /// Whether the note at `path` (absolute, or as records store it) is pinned. A note FastPad
+    /// sent to the Recycle Bin is not.
+    pub fn is_pinned(&self, path: &Path) -> bool {
+        self.record_for(path)
+            .is_some_and(|record| record.pinned && !record.deleted)
+    }
+
     /// The existing record's ID for `path`, or a new ID.
     pub fn note_ref(&self, ids: &mut IdSource, path: &Path) -> NoteRef {
         let stored = record_path(&self.folder, path);
@@ -426,7 +433,7 @@ impl LibraryState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::library::ids::{NotebookId, TagId};
+    use crate::library::ids::NoteId;
 
     struct Scratch(PathBuf);
 
@@ -483,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn organizing_creates_the_library_file_and_a_reload_sees_it() {
+    fn pinning_creates_the_library_file_and_a_reload_sees_it() {
         let scratch = Scratch::new("organize");
         let note = scratch.folder().join("a.md");
         std::fs::write(&note, "a").unwrap();
@@ -491,15 +498,16 @@ mod tests {
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = state.note_ref(&mut ids, &note);
         state
-            .apply(PendingOp::SetFavorite {
+            .apply(PendingOp::SetPinned {
                 note: target,
                 value: true,
             })
             .unwrap();
+        assert!(state.is_pinned(&note));
         assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
         assert!(state.pending.is_empty());
         let reloaded = load(&scratch.folder(), &scratch.local(), 101).unwrap();
-        assert!(reloaded.record_for(&note).unwrap().favorite);
+        assert!(reloaded.is_pinned(&note));
         assert_eq!(
             reloaded.record_for(&note).unwrap().path,
             PathBuf::from("a.md")
@@ -508,44 +516,51 @@ mod tests {
 
     #[test]
     fn a_file_changed_on_disk_is_merged_not_overwritten() {
-        // Break caught: this PC's debounced write replacing the notebook another PC just synced.
+        // Break caught: this PC's debounced write replacing the pin another PC just synced.
         let scratch = Scratch::new("merge");
-        let a = scratch.folder().join("a.md");
-        std::fs::write(&a, "a").unwrap();
+        let [a, b, c] = ["a.md", "b.md", "c.md"].map(|name| {
+            let path = scratch.folder().join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        });
         let mut ids = IdSource::new(1, 2);
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = state.note_ref(&mut ids, &a);
         state
-            .apply(PendingOp::SetFavorite {
-                note: target.clone(),
+            .apply(PendingOp::SetPinned {
+                note: target,
                 value: true,
             })
             .unwrap();
         flush(&mut state).unwrap();
 
-        // "Another PC" adds a notebook directly in the file.
+        // "Another PC" pins b.md directly in the file.
         let path = store::library_file(&scratch.folder());
         let mut other = match store::read(&path) {
             store::ReadOutcome::Loaded(library, _) => library,
             _ => panic!("expected a library"),
         };
-        other.create_notebook(NotebookId(77), "Synced", 5).unwrap();
+        other
+            .resolve_note(&NoteRef {
+                id: NoteId(77),
+                path: "b.md".into(),
+            })
+            .pinned = true;
         std::thread::sleep(std::time::Duration::from_millis(20));
         store::write(&path, &other).unwrap();
 
+        let target = state.note_ref(&mut ids, &c);
         state
-            .apply(PendingOp::AddTag {
+            .apply(PendingOp::SetPinned {
                 note: target,
-                tag: TagId(5),
-                name: "idea".into(),
+                value: true,
             })
             .unwrap();
         flush(&mut state).unwrap();
         let final_state = load(&scratch.folder(), &scratch.local(), 102).unwrap();
-        assert!(final_state.library.notebook(NotebookId(77)).is_some());
-        let record = final_state.record_for(&a).unwrap();
-        assert!(record.favorite);
-        assert_eq!(record.tags.len(), 1);
+        assert!(final_state.is_pinned(&a));
+        assert!(final_state.is_pinned(&b), "the synced pin survives");
+        assert!(final_state.is_pinned(&c));
     }
 
     #[test]
@@ -561,7 +576,7 @@ mod tests {
         assert_eq!(state.metadata, Metadata::Unreadable);
         assert_eq!(state.notes.len(), 1, "notes are still listed");
         let target = state.note_ref(&mut ids, &a);
-        let _ = state.apply(PendingOp::SetFavorite {
+        let _ = state.apply(PendingOp::SetPinned {
             note: target,
             value: true,
         });
@@ -583,7 +598,7 @@ mod tests {
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = state.note_ref(&mut ids, &a);
         state
-            .apply(PendingOp::SetFavorite {
+            .apply(PendingOp::SetPinned {
                 note: target,
                 value: true,
             })
@@ -625,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rescan_does_not_revert_a_favorite_already_flushed_while_it_ran() {
+    fn a_rescan_does_not_revert_a_pin_already_flushed_while_it_ran() {
         // Break caught: merge_rescan replaying an empty pending list onto the rescan's own
         // (stale) snapshot of the library and installing the rescan's stamp, silently reverting
         // a change the live library had already flushed to disk before the merge happened.
@@ -637,7 +652,7 @@ mod tests {
         let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
         let target = previous.note_ref(&mut ids, &a);
         previous
-            .apply(PendingOp::SetFavorite {
+            .apply(PendingOp::SetPinned {
                 note: target,
                 value: true,
             })
@@ -645,19 +660,13 @@ mod tests {
         assert_eq!(flush(&mut previous).unwrap(), Flushed::Wrote);
 
         let mut merged = merge_rescan(previous, fresh);
-        assert!(
-            merged.record_for(&a).unwrap().favorite,
-            "the flushed favorite is still visible"
-        );
+        assert!(merged.is_pinned(&a), "the flushed pin is still visible");
         assert!(
             flush(&mut merged).unwrap() == Flushed::Nothing,
             "nothing pending: the flush is a no-op"
         );
         let reloaded = load(&scratch.folder(), &scratch.local(), 102).unwrap();
-        assert!(
-            reloaded.record_for(&a).unwrap().favorite,
-            "the flush did not revert it"
-        );
+        assert!(reloaded.is_pinned(&a), "the flush did not revert it");
     }
 
     #[test]
@@ -714,13 +723,15 @@ mod tests {
         let scratch = Scratch::new("rescan-outside-sync");
         let a = scratch.folder().join("a.md");
         std::fs::write(&a, "a").unwrap();
+        let b = scratch.folder().join("b.md");
+        std::fs::write(&b, "b").unwrap();
         let mut ids = IdSource::new(1, 2);
 
-        // Organize once, so `library.ini` exists and `previous` loads with a real stamp.
+        // Pin once, so `library.ini` exists and `previous` loads with a real stamp.
         let mut setup = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = setup.note_ref(&mut ids, &a);
         setup
-            .apply(PendingOp::SetFavorite {
+            .apply(PendingOp::SetPinned {
                 note: target,
                 value: true,
             })
@@ -730,15 +741,18 @@ mod tests {
         let previous = load(&scratch.folder(), &scratch.local(), 101).unwrap();
         assert!(previous.stamp.is_some());
 
-        // Another PC syncs a change directly into the file while this FastPad is inactive.
+        // Another PC syncs a pin directly into the file while this FastPad is inactive.
         let path = store::library_file(&scratch.folder());
         let mut outside = match store::read(&path) {
             store::ReadOutcome::Loaded(library, _) => library,
             _ => panic!("expected a library"),
         };
         outside
-            .create_notebook(NotebookId(77), "Synced", 5)
-            .unwrap();
+            .resolve_note(&NoteRef {
+                id: NoteId(77),
+                path: "b.md".into(),
+            })
+            .pinned = true;
         std::thread::sleep(std::time::Duration::from_millis(20));
         store::write(&path, &outside).unwrap();
 
@@ -747,14 +761,8 @@ mod tests {
         let current = store::stamp(&path);
 
         let merged = merge_rescan(previous, fresh);
-        assert!(
-            merged.library.notebook(NotebookId(77)).is_some(),
-            "the outside change is visible"
-        );
-        assert!(
-            merged.record_for(&a).unwrap().favorite,
-            "the earlier favorite is still there"
-        );
+        assert!(merged.is_pinned(&b), "the outside change is visible");
+        assert!(merged.is_pinned(&a), "the earlier pin is still there");
         assert_eq!(merged.stamp, current);
     }
 
@@ -845,7 +853,7 @@ mod tests {
     #[test]
     fn a_rescan_that_cannot_read_the_library_file_keeps_the_live_library_and_is_not_unreadable() {
         // Break caught: a sharing violation while OneDrive synced library.ini turning organizing
-        // off, or a rescan that met one replacing the live notebooks with an empty library.
+        // off, or a rescan that met one replacing the live pins with an empty library.
         use std::os::windows::fs::OpenOptionsExt;
         let scratch = Scratch::new("busy-load");
         let a = scratch.folder().join("a.md");
@@ -854,7 +862,7 @@ mod tests {
         let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = previous.note_ref(&mut ids, &a);
         previous
-            .apply(PendingOp::SetFavorite {
+            .apply(PendingOp::SetPinned {
                 note: target,
                 value: true,
             })
@@ -871,7 +879,7 @@ mod tests {
         assert_eq!(fresh.metadata, Metadata::Busy);
         let merged = merge_rescan(previous, fresh);
         assert_eq!(merged.metadata, Metadata::Ready);
-        assert!(merged.record_for(&a).unwrap().favorite);
+        assert!(merged.is_pinned(&a));
     }
 
     #[test]
@@ -882,11 +890,13 @@ mod tests {
         let scratch = Scratch::new("busy-flush");
         let a = scratch.folder().join("a.md");
         std::fs::write(&a, "a").unwrap();
+        let b = scratch.folder().join("b.md");
+        std::fs::write(&b, "b").unwrap();
         let mut ids = IdSource::new(1, 2);
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = state.note_ref(&mut ids, &a);
         state
-            .apply(PendingOp::SetFavorite {
+            .apply(PendingOp::SetPinned {
                 note: target,
                 value: true,
             })
@@ -894,7 +904,12 @@ mod tests {
         // Another PC's sync creates the file, so the flush must re-read it, while it is held open.
         let path = store::library_file(&scratch.folder());
         let mut other = Library::default();
-        other.create_notebook(NotebookId(77), "Synced", 5).unwrap();
+        other
+            .resolve_note(&NoteRef {
+                id: NoteId(77),
+                path: "b.md".into(),
+            })
+            .pinned = true;
         store::write(&path, &other).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -909,8 +924,8 @@ mod tests {
 
         assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
         let reloaded = load(&scratch.folder(), &scratch.local(), 101).unwrap();
-        assert!(reloaded.library.notebook(NotebookId(77)).is_some());
-        assert!(reloaded.record_for(&a).unwrap().favorite);
+        assert!(reloaded.is_pinned(&b));
+        assert!(reloaded.is_pinned(&a));
     }
 
     #[test]
@@ -992,7 +1007,7 @@ mod tests {
         let mut ids = IdSource::new(1, 2);
         let target = state.note_ref(&mut ids, &a);
         state
-            .apply(PendingOp::SetFavorite {
+            .apply(PendingOp::SetPinned {
                 note: target,
                 value: true,
             })
@@ -1015,5 +1030,54 @@ mod tests {
         std::fs::write(&a, "ab").unwrap();
         assert_ne!(disk_stamp(&a), Some(first));
         assert_eq!(disk_stamp(&scratch.folder().join("none.md")), None);
+    }
+
+    #[test]
+    fn a_version_one_library_loads_its_pins_and_is_rewritten_only_when_something_changes() {
+        // Break caught: a PR #9 notebook losing its pins on the first start of this build, or
+        // opening it rewriting library.ini before the user changed anything.
+        let scratch = Scratch::new("v1-migrate");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let b = scratch.folder().join("b.md");
+        std::fs::write(&b, "b").unwrap();
+        let path = store::library_file(&scratch.folder());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The size and hash match a.md, so the load has no fingerprint to correct.
+        let v1 = format!(
+            "version=1\r\ntag={}|idea\r\nnote={}|-|fp|-|1|{:016x}|a.md\r\n",
+            NoteId(9).to_hex(),
+            NoteId(5).to_hex(),
+            ids::fnv1a(b"a")
+        );
+        std::fs::write(&path, &v1).unwrap();
+
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        assert_eq!(state.metadata, Metadata::Ready);
+        assert!(state.is_pinned(&a));
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Nothing);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            v1,
+            "reading alone never rewrites"
+        );
+
+        let mut ids = IdSource::new(1, 2);
+        let target = state.note_ref(&mut ids, &b);
+        state
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("version=2\r\n"), "{written:?}");
+        assert!(!written.contains("tag="), "{written:?}");
+        assert!(
+            written.contains(&format!("note={}|p|1|", NoteId(5).to_hex())),
+            "{written:?}"
+        );
+        assert!(written.ends_with("|b.md\r\n"), "{written:?}");
     }
 }

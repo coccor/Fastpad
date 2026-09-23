@@ -273,7 +273,7 @@ mod tests {
 
     fn record(id: u128, path: &str, size: u64, hash: u64) -> NoteRecord {
         let mut record = NoteRecord::new(NoteId(id), path.into());
-        record.favorite = true;
+        record.pinned = true;
         record.size = size;
         record.hash = hash;
         record
@@ -302,10 +302,7 @@ mod tests {
             let mut local = LocalState::new(r"D:\Notes".into());
             local.files = cache;
             Self {
-                library: Library {
-                    notes: records,
-                    ..Library::default()
-                },
+                library: Library { notes: records },
                 local,
                 scan: Scan {
                     volume: VOLUME,
@@ -355,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_rename_outside_fastpad_is_followed_by_file_id() {
-        // Break caught: renaming a note in Explorer losing its notebook and tags.
+        // Break caught: renaming a note in Explorer losing its pin.
         let mut fixture = Fixture::new(
             vec![record(1, "old.md", 3, 9)],
             vec![cached("old.md", 3, 55)],

@@ -1,22 +1,29 @@
-//! `.fastpad\library.ini`: the shared metadata that travels with the folder.
+//! `.fastpad\library.ini`: the pins that travel with the notebook.
 //!
 //! ```text
-//! version=1
-//! notebook=<id>|<sort>|<color or ->|<created unix>|<modified unix>|<name>
-//! tag=<id>|<name>
-//! note=<id>|<notebook id or ->|<flags>|<tag ids or ->|<size>|<hash>|<path>
+//! version=2
+//! note=<id>|<flags>|<size>|<hash>|<path>
 //! ```
 //!
-//! Names are escaped (`ids::escape`); the path is last and unescaped, so splitting a `note` line on
-//! its first six `|` characters is unambiguous. A missing or unknown `version` makes the whole file
-//! unreadable, and an unreadable file is never overwritten.
+//! `<flags>` is `p` (pinned), `d` (deleted), both, or `-`. The path is relative to the notebook,
+//! last and unescaped, so splitting a `note` line on its first four `|` characters is
+//! unambiguous.
+//!
+//! Version 1 (the first note-library builds) is still read: its `notebook=` and `tag=` lines are
+//! dropped, and each `note=<id>|<notebook>|<flags>|<tags>|<size>|<hash>|<path>` line keeps only
+//! its `p` and `d` flags. It becomes version 2 at the next flush that has something to write;
+//! reading alone never rewrites it. Records whose path is not a plain relative path (version 1
+//! allowed absolute ones for files outside the folder) are dropped on read and never written. Any
+//! other version, or none, makes the whole file unreadable, and an unreadable file is never
+//! overwritten.
 
-use super::ids::{NoteId, NotebookId, TagId, escape, unescape};
-use super::model::{Library, NoteRecord, Notebook, NotebookColor, Tag};
+use super::ids::NoteId;
+use super::model::{Library, NoteRecord};
 use crate::Result;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-const VERSION: &str = "1";
+const VERSION: &str = "2";
+const VERSION_1: &str = "1";
 pub const LIBRARY_DIR: &str = ".fastpad";
 const LIBRARY_FILE: &str = "library.ini";
 
@@ -58,54 +65,28 @@ pub fn stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
+/// Whether a record path is a plain path inside the notebook: only normal components.
+fn is_notebook_path(path: &Path) -> bool {
+    path.components()
+        .all(|component| matches!(component, Component::Normal(_)))
+}
+
 pub fn encode(library: &Library) -> String {
     let mut output = format!("version={VERSION}\r\n");
-    for notebook in &library.notebooks {
-        output.push_str(&format!(
-            "notebook={}|{}|{}|{}|{}|{}\r\n",
-            notebook.id.to_hex(),
-            notebook.sort,
-            notebook.color.map_or("-", NotebookColor::name),
-            notebook.created,
-            notebook.modified,
-            escape(&notebook.name)
-        ));
-    }
-    for tag in &library.tags {
-        output.push_str(&format!(
-            "tag={}|{}\r\n",
-            tag.id.to_hex(),
-            escape(&tag.name)
-        ));
-    }
-    for note in &library.notes {
-        let mut flags = String::new();
-        if note.favorite {
-            flags.push('f');
-        }
-        if note.pinned {
-            flags.push('p');
-        }
-        if note.deleted {
-            flags.push('d');
-        }
-        if flags.is_empty() {
-            flags.push('-');
-        }
-        let tags = if note.tags.is_empty() {
-            "-".to_owned()
-        } else {
-            note.tags
-                .iter()
-                .map(|tag| tag.to_hex())
-                .collect::<Vec<_>>()
-                .join(",")
+    for note in library
+        .notes
+        .iter()
+        .filter(|note| is_notebook_path(&note.path))
+    {
+        let flags = match (note.pinned, note.deleted) {
+            (true, true) => "pd",
+            (true, false) => "p",
+            (false, true) => "d",
+            (false, false) => "-",
         };
         output.push_str(&format!(
-            "note={}|{}|{flags}|{tags}|{}|{:016x}|{}\r\n",
+            "note={}|{flags}|{}|{:016x}|{}\r\n",
             note.id.to_hex(),
-            note.notebook
-                .map_or_else(|| "-".to_owned(), NotebookId::to_hex),
             note.size,
             note.hash,
             note.path.to_string_lossy()
@@ -117,33 +98,27 @@ pub fn encode(library: &Library) -> String {
 pub fn parse(source: &str) -> Option<Library> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut version = None;
-    let mut library = Library::default();
+    let mut lines = Vec::new();
     for line in source.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "version" => version = Some(value),
-            "notebook" => library.notebooks.extend(parse_notebook(value)),
-            "tag" => library.tags.extend(parse_tag(value)),
-            "note" => library.notes.extend(parse_note(value)),
+        match line.split_once('=') {
+            Some(("version", value)) => version = Some(value),
+            Some(("note", value)) => lines.push(value),
             _ => {}
         }
     }
-    if version != Some(VERSION) {
-        return None;
-    }
-    dedupe_by(&mut library.notebooks, |notebook| notebook.id.0);
-    dedupe_by(&mut library.tags, |tag| tag.id.0);
+    let parse_line: fn(&str) -> Option<NoteRecord> = match version? {
+        VERSION => parse_note,
+        VERSION_1 => parse_note_v1,
+        _ => return None,
+    };
+    let mut library = Library {
+        notes: lines
+            .into_iter()
+            .filter_map(parse_line)
+            .filter(|note| is_notebook_path(&note.path))
+            .collect(),
+    };
     dedupe_by(&mut library.notes, |note| note.id.0);
-    let notebooks: Vec<NotebookId> = library.notebooks.iter().map(|n| n.id).collect();
-    let tags: Vec<TagId> = library.tags.iter().map(|t| t.id).collect();
-    for note in &mut library.notes {
-        if note.notebook.is_some_and(|id| !notebooks.contains(&id)) {
-            note.notebook = None;
-        }
-        note.tags.retain(|tag| tags.contains(tag));
-    }
     Some(library)
 }
 
@@ -152,54 +127,30 @@ fn dedupe_by<T>(items: &mut Vec<T>, key: impl Fn(&T) -> u128) {
     items.retain(|item| seen.insert(key(item)));
 }
 
-fn parse_notebook(value: &str) -> Option<Notebook> {
-    let mut fields = value.splitn(6, '|');
-    let id = NotebookId::parse_hex(fields.next()?)?;
-    let sort = fields.next()?.parse().ok()?;
-    let color = match fields.next()? {
-        "-" => None,
-        name => NotebookColor::parse(name),
-    };
-    let created = fields.next()?.parse().ok()?;
-    let modified = fields.next()?.parse().ok()?;
-    let name = unescape(fields.next()?);
-    if name.trim().is_empty() {
-        return None;
-    }
-    Some(Notebook {
-        id,
-        name,
-        color,
-        sort,
-        created,
-        modified,
-    })
-}
-
-fn parse_tag(value: &str) -> Option<Tag> {
-    let (id, name) = value.split_once('|')?;
-    let name = unescape(name);
-    if name.trim().is_empty() {
-        return None;
-    }
-    Some(Tag {
-        id: TagId::parse_hex(id)?,
-        name,
-    })
-}
-
+/// `<id>|<flags>|<size>|<hash>|<path>`.
 fn parse_note(value: &str) -> Option<NoteRecord> {
+    let mut fields = value.splitn(5, '|');
+    let id = NoteId::parse_hex(fields.next()?)?;
+    let flags = fields.next()?;
+    finish_note(id, flags, fields)
+}
+
+/// `<id>|<notebook>|<flags>|<tags>|<size>|<hash>|<path>`: the notebook and tags are dropped.
+fn parse_note_v1(value: &str) -> Option<NoteRecord> {
     let mut fields = value.splitn(7, '|');
     let id = NoteId::parse_hex(fields.next()?)?;
-    let notebook = match fields.next()? {
-        "-" => None,
-        text => Some(NotebookId::parse_hex(text)?),
-    };
+    let _notebook = fields.next()?;
     let flags = fields.next()?;
-    let tags = match fields.next()? {
-        "-" => Vec::new(),
-        text => text.split(',').filter_map(TagId::parse_hex).collect(),
-    };
+    let _tags = fields.next()?;
+    finish_note(id, flags, fields)
+}
+
+/// The size, hash and path that end a `note` line in both versions. Only `p` and `d` flags count.
+fn finish_note<'a>(
+    id: NoteId,
+    flags: &str,
+    mut fields: impl Iterator<Item = &'a str>,
+) -> Option<NoteRecord> {
     let size = fields.next()?.parse().ok()?;
     let hash = u64::from_str_radix(fields.next()?, 16).ok()?;
     let path = fields.next()?;
@@ -207,11 +158,8 @@ fn parse_note(value: &str) -> Option<NoteRecord> {
         return None;
     }
     let mut note = NoteRecord::new(id, PathBuf::from(path));
-    note.notebook = notebook;
-    note.favorite = flags.contains('f');
     note.pinned = flags.contains('p');
     note.deleted = flags.contains('d');
-    note.tags = tags;
     note.size = size;
     note.hash = hash;
     Some(note)
@@ -273,85 +221,120 @@ pub fn write(path: &Path, library: &Library) -> Result<FileStamp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::library::ids::{NoteId, NotebookId, TagId};
-    use crate::library::model::{NoteRecord, Notebook, NotebookColor, Tag};
+    use crate::library::ids::NoteId;
+    use crate::library::model::NoteRecord;
 
     fn sample() -> Library {
-        let mut note = NoteRecord::new(NoteId(0xa), PathBuf::from(r"sub\a b|c.md"));
-        note.notebook = Some(NotebookId(1));
-        note.favorite = true;
-        note.pinned = true;
-        note.tags = vec![TagId(2), TagId(3)];
-        note.size = 12;
-        note.hash = 0xfeed;
-        let mut external = NoteRecord::new(NoteId(0xb), PathBuf::from(r"C:\elsewhere\log.txt"));
-        external.deleted = true;
-        external.favorite = true;
+        let mut pinned = NoteRecord::new(NoteId(0xa), PathBuf::from(r"sub\a b|c.md"));
+        pinned.pinned = true;
+        pinned.size = 12;
+        pinned.hash = 0xfeed;
+        let mut deleted = NoteRecord::new(NoteId(0xb), PathBuf::from("b.md"));
+        deleted.deleted = true;
+        let mut both = NoteRecord::new(NoteId(0xc), PathBuf::from("c.md"));
+        both.pinned = true;
+        both.deleted = true;
         Library {
-            notebooks: vec![Notebook {
-                id: NotebookId(1),
-                name: "Work | 50%\nplans".into(),
-                color: Some(NotebookColor::Teal),
-                sort: 3,
-                created: 100,
-                modified: 200,
-            }],
-            tags: vec![
-                Tag {
-                    id: TagId(2),
-                    name: "idea".into(),
-                },
-                Tag {
-                    id: TagId(3),
-                    name: "to|do".into(),
-                },
-            ],
-            notes: vec![note, external],
+            notes: vec![pinned, deleted, both],
         }
     }
 
     #[test]
     fn a_library_round_trips_through_its_text_form() {
-        // Break caught: a name with `|`, `%` or a newline, a path with `|`, or an absolute path
-        // not surviving a write and read.
+        // Break caught: a path with `|` or a flag combination not surviving a write and read.
         let text = encode(&sample());
-        assert!(text.starts_with("version=1\r\n"));
+        assert!(text.starts_with("version=2\r\n"));
         assert!(text.contains(
-            "note=0000000000000000000000000000000a|00000000000000000000000000000001|fp|\
-             00000000000000000000000000000002,00000000000000000000000000000003|12|000000000000feed|sub\\a b|c.md\r\n"
+            "note=0000000000000000000000000000000a|p|12|000000000000feed|sub\\a b|c.md\r\n"
         ));
-        assert!(text.contains("|fd|-|0|0000000000000000|C:\\elsewhere\\log.txt\r\n"));
+        assert!(
+            text.contains("note=0000000000000000000000000000000b|d|0|0000000000000000|b.md\r\n")
+        );
+        assert!(
+            text.contains("note=0000000000000000000000000000000c|pd|0|0000000000000000|c.md\r\n")
+        );
         assert_eq!(parse(&text), Some(sample()));
     }
 
     #[test]
-    fn only_version_one_files_are_readable() {
-        // Break caught: a newer FastPad's file (or a damaged one) read as an empty library and
-        // then overwritten, destroying every notebook.
-        assert_eq!(parse("notebook=x\r\n"), None);
-        assert_eq!(parse("version=2\r\n"), None);
-        assert_eq!(parse("\u{feff}version=1\r\n"), Some(Library::default()));
+    fn a_version_one_file_keeps_its_pins_and_deleted_flags_and_drops_the_rest() {
+        // Break caught: a file from the first note-library builds read as unreadable (turning
+        // pinning off), or its favorites, notebooks and tags surviving into a version 2 write.
+        let text = "version=1\r\n\
+            notebook=00000000000000000000000000000001|0|teal|100|200|Work\r\n\
+            tag=00000000000000000000000000000002|idea\r\n\
+            note=0000000000000000000000000000000a|00000000000000000000000000000001|fp|\
+            00000000000000000000000000000002|12|000000000000feed|sub\\a b|c.md\r\n\
+            note=0000000000000000000000000000000b|-|fd|-|0|0000000000000000|b.md\r\n\
+            note=0000000000000000000000000000000c|-|f|-|0|0000000000000000|c.md\r\n";
+        let library = parse(text).unwrap();
+        let flags: Vec<_> = library
+            .notes
+            .iter()
+            .map(|note| (note.id, note.pinned, note.deleted))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (NoteId(0xa), true, false),
+                (NoteId(0xb), false, true),
+                (NoteId(0xc), false, false)
+            ]
+        );
+        assert_eq!(library.notes[0].path, PathBuf::from(r"sub\a b|c.md"));
+        assert_eq!((library.notes[0].size, library.notes[0].hash), (12, 0xfeed));
+        let rewritten = encode(&library);
+        assert!(rewritten.starts_with("version=2\r\n"));
+        assert!(!rewritten.contains("notebook=") && !rewritten.contains("tag="));
+        assert!(rewritten.contains(
+            "note=0000000000000000000000000000000a|p|12|000000000000feed|sub\\a b|c.md\r\n"
+        ));
     }
 
     #[test]
-    fn malformed_lines_unknown_keys_and_dangling_references_are_tolerated() {
-        let text = "version=1\n\
+    fn only_version_one_and_two_files_are_readable() {
+        // Break caught: a newer FastPad's file (or a damaged one) read as an empty library and
+        // then overwritten, destroying every pin.
+        assert_eq!(parse("note=x\r\n"), None);
+        assert_eq!(parse("version=3\r\n"), None);
+        assert_eq!(parse("version=1\r\n"), Some(Library::default()));
+        assert_eq!(parse("\u{feff}version=2\r\n"), Some(Library::default()));
+    }
+
+    #[test]
+    fn malformed_lines_unknown_keys_and_unknown_flags_are_tolerated() {
+        let text = "version=2\n\
             future=1\n\
-            notebook=bad\n\
-            tag=00000000000000000000000000000002|idea\n\
-            note=00000000000000000000000000000007|00000000000000000000000000000009|zq|\
-            00000000000000000000000000000002,00000000000000000000000000000004|5|0000000000000001|a.md\n\
-            note=short\n";
+            note=00000000000000000000000000000007|zq|5|0000000000000001|a.md\n\
+            note=short\n\
+            note=00000000000000000000000000000008|p|x|0000000000000001|b.md\n";
         let library = parse(text).unwrap();
-        assert!(library.notebooks.is_empty());
-        let note = &library.notes[0];
-        assert_eq!(note.notebook, None, "unknown notebook falls back to Notes");
-        assert_eq!(note.tags, vec![TagId(2)], "unknown tag IDs are dropped");
-        assert!(
-            !note.favorite && !note.pinned && !note.deleted,
-            "unknown flags are ignored"
-        );
         assert_eq!(library.notes.len(), 1);
+        let note = &library.notes[0];
+        assert!(!note.pinned && !note.deleted, "unknown flags are ignored");
+        assert_eq!((note.size, note.hash), (5, 1));
+    }
+
+    #[test]
+    fn absolute_path_records_are_dropped_on_read_and_never_written() {
+        // Break caught: a version 1 record for a file outside the folder surviving into version
+        // 2, which has no way to say which drive it meant.
+        let text = "version=1\r\n\
+            note=0000000000000000000000000000000a|-|p|-|0|0000000000000000|C:\\elsewhere\\log.txt\r\n\
+            note=0000000000000000000000000000000b|-|p|-|0|0000000000000000|\\rooted.md\r\n\
+            note=0000000000000000000000000000000c|-|p|-|0|0000000000000000|..\\up.md\r\n\
+            note=0000000000000000000000000000000d|-|p|-|0|0000000000000000|kept.md\r\n";
+        let library = parse(text).unwrap();
+        let kept: Vec<_> = library.notes.iter().map(|note| note.id).collect();
+        assert_eq!(kept, [NoteId(0xd)]);
+        let mut outside = NoteRecord::new(NoteId(0xe), PathBuf::from(r"D:\x.md"));
+        outside.pinned = true;
+        assert_eq!(
+            encode(&Library {
+                notes: vec![outside]
+            }),
+            "version=2\r\n"
+        );
     }
 
     #[test]
@@ -370,6 +353,19 @@ mod tests {
             }
             _ => panic!("expected a loaded library"),
         }
+        // Break caught: reading a version 1 file rewriting it before anything changed.
+        std::fs::write(
+            &path,
+            "version=1\r\nnote=0000000000000000000000000000000a|-|p|-|0|0000000000000000|a.md\r\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(read(&path), ReadOutcome::Loaded(..)));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "reading never rewrites"
+        );
         std::fs::write(&path, "version=9\r\n").unwrap();
         assert!(matches!(read(&path), ReadOutcome::Unreadable));
         std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
@@ -380,7 +376,7 @@ mod tests {
     #[test]
     fn a_file_held_open_by_another_process_reads_as_busy_not_unreadable() {
         // Break caught: a sharing violation while OneDrive syncs library.ini being taken for a
-        // damaged file, which turns organizing off for the whole session.
+        // damaged file, which turns pinning off for the whole session.
         use std::os::windows::fs::OpenOptionsExt;
         let dir = std::env::temp_dir().join(format!("fastpad-store-busy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

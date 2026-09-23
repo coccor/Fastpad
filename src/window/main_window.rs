@@ -1823,17 +1823,13 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         }
         CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
         CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
-        CommandId::NoteToggleFavorite
-        | CommandId::NoteTogglePin
-        | CommandId::NoteMoveToNotebook
-        | CommandId::NoteAddTag
-        | CommandId::NoteRemoveTag
-        | CommandId::NotebookNew
-        | CommandId::NotebookRename
-        | CommandId::NotebookChangeColor
-        | CommandId::NotebookDelete
-        | CommandId::TagRename
-        | CommandId::TagRemoveEverywhere => crate::window::library_host::organize(hwnd, command),
+        CommandId::NoteTogglePin => {
+            if let Some(path) = crate::window::library_host::active_file(hwnd) {
+                crate::window::library_host::toggle_pin(hwnd, &path);
+            }
+        }
+        // No palette row or shortcut reaches this until moving a note's file is wired in.
+        CommandId::NoteMoveToNotebook => {}
         CommandId::NoteRename => {
             if crate::window::library_host::ready_library(hwnd) {
                 crate::window::library_host::rename_note(hwnd);
@@ -7068,7 +7064,7 @@ mod tests {
     #[test]
     fn a_failed_flush_keeps_the_current_folder_open() {
         // Break caught: switching folders after library.ini could not be written, which drops
-        // the unsaved notebooks and tags with the old state.
+        // the unsaved pins with the old state.
         let _scintilla = load_native_scintilla();
         let first = LibraryScratch::new("flushfail-a");
         let second = LibraryScratch::new("flushfail-b");
@@ -7257,7 +7253,7 @@ mod tests {
             let mut ids = crate::library::ids::IdSource::new(1, 1);
             let target = state.note_ref(&mut ids, &a);
             state
-                .apply(crate::library::ops::PendingOp::SetFavorite {
+                .apply(crate::library::ops::PendingOp::SetPinned {
                     note: target,
                     value: true,
                 })
@@ -8035,118 +8031,70 @@ mod tests {
         assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
     }
 
-    use crate::window::command_palette::{PickerChoice, PickerKind};
-
     fn library(hwnd: HWND) -> &'static crate::library::model::Library {
         &app_mut(hwnd).library.state.as_ref().unwrap().library
     }
 
     #[test]
-    fn favorite_pin_notebook_and_tags_apply_to_the_active_file_and_persist() {
-        // Break caught: organizing commands changing only memory, or recording the wrong file.
+    fn toggling_a_pin_applies_to_the_active_note_and_persists() {
+        // Break caught: the pin command changing only memory, recording the wrong file, or an
+        // unpin leaving a record behind.
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("organize");
+        let scratch = LibraryScratch::new("pin");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         let path = open_note(&window, &scratch, "a.md", "a");
         let hwnd = window.hwnd;
 
-        execute_command(hwnd, CommandId::NoteToggleFavorite);
         execute_command(hwnd, CommandId::NoteTogglePin);
-        execute_command(hwnd, CommandId::NotebookNew);
-        type_into_name_box(hwnd, "Work");
-        crate::window::library_host::name_box_submit(hwnd);
-        execute_command(hwnd, CommandId::NoteMoveToNotebook);
-        // Row 0 is "Notes", row 1 is "Work".
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::MoveToNotebook,
-            PickerChoice::Item(1),
-        );
-        execute_command(hwnd, CommandId::NoteAddTag);
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::AddTag,
-            PickerChoice::Create("#idea".into()),
-        );
-
-        let record = app_mut(hwnd)
-            .library
-            .state
-            .as_ref()
-            .unwrap()
-            .record_for(&path)
-            .unwrap()
-            .clone();
-        assert!(record.favorite && record.pinned);
-        assert_eq!(
-            library(hwnd)
-                .notebook(record.notebook.unwrap())
+        assert!(
+            app_mut(hwnd)
+                .library
+                .state
+                .as_ref()
                 .unwrap()
-                .name,
-            "Work"
+                .is_pinned(&path)
         );
-        assert_eq!(library(hwnd).tag(record.tags[0]).unwrap().name, "idea");
-
+        assert!(notices(hwnd).iter().any(|n| n == "Pinned."));
         crate::window::library_host::flush_now(hwnd);
+        let ini = std::fs::read_to_string(crate::library::store::library_file(&scratch.folder()))
+            .unwrap();
+        assert!(ini.starts_with("version=2\r\n"), "{ini:?}");
+        assert!(ini.contains("|p|") && ini.ends_with("|a.md\r\n"), "{ini:?}");
         let reloaded =
             crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
-        assert!(reloaded.record_for(&path).unwrap().favorite);
+        assert!(reloaded.is_pinned(&path));
+
+        execute_command(hwnd, CommandId::NoteTogglePin);
+        crate::window::library_host::flush_now(hwnd);
+        assert!(notices(hwnd).iter().any(|n| n == "Unpinned."));
+        assert!(
+            library(hwnd).notes.is_empty(),
+            "an unpinned note keeps no record"
+        );
     }
 
     #[test]
-    fn duplicate_notebook_names_show_an_inline_error_and_keep_the_box_open() {
+    fn pinning_a_file_outside_the_open_notebook_is_refused() {
+        // Break caught: a pin on a file outside the notebook writing an absolute-path record
+        // that version 2 of library.ini cannot hold.
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("dup-notebook");
+        let scratch = LibraryScratch::new("pin-outside");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
-        open_note(&window, &scratch, "a.md", "a");
-        for _ in 0..2 {
-            execute_command(window.hwnd, CommandId::NotebookNew);
-            type_into_name_box(window.hwnd, "work");
-            crate::window::library_host::name_box_submit(window.hwnd);
-        }
-        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
-        assert!(name_box.is_visible());
-        assert_eq!(name_box.error(), Some("That name is already used."));
-        assert_eq!(library(window.hwnd).notebooks.len(), 1);
-    }
-
-    #[test]
-    fn deleting_a_notebook_asks_first_and_moves_its_notes_to_notes() {
-        let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("delete-notebook");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        let path = open_note(&window, &scratch, "a.md", "a");
-        let hwnd = window.hwnd;
-        execute_command(hwnd, CommandId::NotebookNew);
-        type_into_name_box(hwnd, "Work");
-        crate::window::library_host::name_box_submit(hwnd);
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::MoveToNotebook,
-            PickerChoice::Item(1),
+        scratch.install(window.hwnd);
+        let outside = scratch.root.join("outside.md");
+        std::fs::write(&outside, "x").unwrap();
+        super::open_path(window.hwnd, &outside).unwrap();
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n == "Only notes in the open notebook can be pinned.")
         );
-
-        crate::window::answer_next_confirm(|_| false);
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::DeleteNotebook,
-            PickerChoice::Item(0),
-        );
-        assert_eq!(library(hwnd).notebooks.len(), 1, "cancelled");
-
-        crate::window::answer_next_confirm(|_| true);
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::DeleteNotebook,
-            PickerChoice::Item(0),
-        );
-        assert!(library(hwnd).notebooks.is_empty());
-        let state = app_mut(hwnd).library.state.as_ref().unwrap();
-        assert_eq!(state.record_for(&path).unwrap().notebook, None);
-        assert!(path.exists(), "no note content is deleted");
+        let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.library.notes.is_empty());
     }
 
     #[test]
@@ -8157,7 +8105,7 @@ mod tests {
         let _editor = install_test_editor(&window);
         scratch.install(window.hwnd);
         super::create_new_document(window.hwnd).unwrap();
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         assert!(
             notices(window.hwnd)
                 .iter()
@@ -8166,7 +8114,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_library_disables_organizing_with_an_explanation() {
+    fn an_unreadable_library_disables_pinning_with_an_explanation() {
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("readonly");
         let ini = crate::library::store::library_file(&scratch.folder());
@@ -8175,115 +8123,21 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         open_note(&window, &scratch, "a.md", "a");
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         crate::window::library_host::flush_now(window.hwnd);
         assert_eq!(std::fs::read_to_string(&ini).unwrap(), "version=99\r\n");
         assert!(notices(window.hwnd).iter().any(|n| n.contains("read-only")));
     }
 
     #[test]
-    fn recoloring_renaming_and_removing_a_tag_act_on_the_picked_rows() {
-        // Break caught: a multi-step flow losing the notebook it acts on, or a tag rename or
-        // removal hitting the wrong tag.
-        let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("recolor-tags");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        let path = open_note(&window, &scratch, "a.md", "a");
-        let hwnd = window.hwnd;
-        execute_command(hwnd, CommandId::NotebookNew);
-        type_into_name_box(hwnd, "Work");
-        crate::window::library_host::name_box_submit(hwnd);
-        execute_command(hwnd, CommandId::NoteAddTag);
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::AddTag,
-            PickerChoice::Create("idea".into()),
-        );
-
-        execute_command(hwnd, CommandId::NotebookChangeColor);
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::RecolorNotebook,
-            PickerChoice::Item(0),
-        );
-        // Row 0 is "No color", row 1 the first color.
-        crate::window::library_host::picked(hwnd, PickerKind::ChooseColor, PickerChoice::Item(1));
-        assert_eq!(
-            library(hwnd).notebooks[0].color,
-            Some(crate::library::model::NotebookColor::ALL[0])
-        );
-
-        execute_command(hwnd, CommandId::TagRename);
-        crate::window::library_host::picked(hwnd, PickerKind::RenameTag, PickerChoice::Item(0));
-        assert_eq!(app_mut(hwnd).name_box.as_ref().unwrap().text(), "idea");
-        type_into_name_box(hwnd, "#ideas");
-        crate::window::library_host::name_box_submit(hwnd);
-        assert_eq!(library(hwnd).tags[0].name, "ideas");
-
-        crate::window::answer_next_confirm(|_| true);
-        execute_command(hwnd, CommandId::TagRemoveEverywhere);
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::RemoveTagEverywhere,
-            PickerChoice::Item(0),
-        );
-        assert!(library(hwnd).tags.is_empty());
-        let state = app_mut(hwnd).library.state.as_ref().unwrap();
-        assert!(state.record_for(&path).unwrap().tags.is_empty());
-    }
-
-    #[test]
-    fn a_pick_resolves_against_the_rows_the_picker_showed() {
-        // Break caught: a notebook list that changed while the picker was open (a sync, another
-        // command) making the pick act on a different notebook than the row the user chose.
-        let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("shown-rows");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        open_note(&window, &scratch, "a.md", "a");
-        let hwnd = window.hwnd;
-        for name in ["A", "B"] {
-            execute_command(hwnd, CommandId::NotebookNew);
-            type_into_name_box(hwnd, name);
-            crate::window::library_host::name_box_submit(hwnd);
-        }
-        execute_command(hwnd, CommandId::NotebookRename);
-        let first = library(hwnd).notebooks_in_order()[0].id;
-        let second = library(hwnd).notebooks_in_order()[1].id;
-        app_mut(hwnd)
-            .library
-            .state
-            .as_mut()
-            .unwrap()
-            .apply(crate::library::ops::PendingOp::DeleteNotebook { id: first })
-            .unwrap();
-        // Row 1 was "B" when shown; the live list now has "B" at row 0 and no row 1.
-        crate::window::library_host::picked(
-            hwnd,
-            PickerKind::RenameNotebook,
-            PickerChoice::Item(1),
-        );
-        let name_box = app_mut(hwnd).name_box.as_ref().unwrap();
-        assert!(name_box.is_visible());
-        assert_eq!(
-            name_box.purpose(),
-            Some(&crate::window::name_box::NamePurpose::RenameNotebook(
-                second
-            ))
-        );
-        assert_eq!(name_box.text(), "B");
-    }
-
-    #[test]
     fn renaming_a_note_renames_its_file_and_keeps_its_metadata() {
-        // Break caught: a rename losing the note's notebook, or the tab still pointing at the old path.
+        // Break caught: a rename losing the note's pin, or the tab still pointing at the old path.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("rename");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         let old = open_note(&window, &scratch, "a.md", "text");
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         execute_command(window.hwnd, CommandId::NoteRename);
         assert_eq!(
             app_mut(window.hwnd).name_box.as_ref().unwrap().text(),
@@ -8299,7 +8153,7 @@ mod tests {
             Some(new.as_path())
         );
         let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
-        assert!(state.record_for(&new).unwrap().favorite);
+        assert!(state.is_pinned(&new));
     }
 
     #[test]
@@ -8369,7 +8223,7 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         let path = open_note(&window, &scratch, "a.md", "a");
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         crate::window::answer_next_confirm(|_| false);
         execute_command(window.hwnd, CommandId::NoteDelete);
         assert!(path.exists());
@@ -8394,7 +8248,7 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let editor = install_test_editor(&window);
         let old = open_note(&window, &scratch, "a.md", "text");
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         crate::window::library_host::flush_now(window.hwnd);
         let new = scratch.folder().join("b.md");
         std::fs::rename(&old, &new).unwrap();
@@ -8417,7 +8271,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&new).unwrap(), "edited");
         assert!(!old.exists(), "the old name is not re-created");
         let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
-        assert!(state.record_for(&new).unwrap().favorite);
+        assert!(state.record_for(&new).unwrap().pinned);
     }
 
     #[test]
@@ -8427,7 +8281,7 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let editor = install_test_editor(&window);
         let old = open_note(&window, &scratch, "a.md", "text");
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         crate::window::library_host::flush_now(window.hwnd);
         let new = scratch.folder().join("b.md");
         std::fs::rename(&old, &new).unwrap();
@@ -8585,7 +8439,7 @@ mod tests {
         assert!(std::fs::read_to_string(&local).unwrap().contains("recent="));
         std::fs::remove_file(&local).unwrap();
 
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         crate::window::library_host::flush_now(window.hwnd);
         assert!(crate::library::store::library_file(&scratch.folder()).exists());
         assert!(!local.exists(), "only library.ini changed");
@@ -8638,7 +8492,7 @@ mod tests {
 
     #[test]
     fn turning_notes_mode_off_says_so_when_metadata_cannot_be_written_and_closes_the_name_box() {
-        // Break caught: the toggle dropping unsaved notebooks and tags silently when the flush
+        // Break caught: the toggle dropping unsaved pins silently when the flush
         // failed, or leaving a name box open that did nothing on Enter.
         let _scintilla = load_native_scintilla();
         let (scratch, window, _editor) = open_first_save_box("mode-off-flush");
@@ -8740,14 +8594,14 @@ mod tests {
     #[test]
     fn a_library_file_held_open_by_a_sync_keeps_the_operations_and_retries_without_a_notice() {
         // Break caught: a sharing violation on library.ini turning organizing off or dropping
-        // the pending notebooks and tags with an error notice.
+        // the pending pins with an error notice.
         use std::os::windows::fs::OpenOptionsExt;
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("busy-flush-window");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         let a = open_note(&window, &scratch, "a.md", "a");
-        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
         // Another PC's sync writes the file, so the flush must re-read it, and holds it open.
         let ini = crate::library::store::library_file(&scratch.folder());
         crate::library::store::write(&ini, &crate::library::model::Library::default()).unwrap();
@@ -8771,6 +8625,6 @@ mod tests {
         crate::window::library_host::flush_now(window.hwnd);
         let reloaded =
             crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
-        assert!(reloaded.record_for(&a).unwrap().favorite);
+        assert!(reloaded.is_pinned(&a));
     }
 }

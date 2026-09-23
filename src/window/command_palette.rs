@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 65] = [
+pub(crate) const ENTRIES: [PaletteEntry; 55] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open folder...", CommandId::OpenFolder),
@@ -64,22 +64,9 @@ pub(crate) const ENTRIES: [PaletteEntry; 65] = [
     ),
     entry("Note: Reload from disk", CommandId::NoteReloadFromDisk),
     entry("Note: Keep my version", CommandId::NoteKeepMine),
-    entry("Note: Toggle favorite", CommandId::NoteToggleFavorite),
     entry("Note: Toggle pin", CommandId::NoteTogglePin),
-    entry("Note: Move to notebook...", CommandId::NoteMoveToNotebook),
-    entry("Note: Add tag...", CommandId::NoteAddTag),
-    entry("Note: Remove tag...", CommandId::NoteRemoveTag),
     entry("Note: Rename...", CommandId::NoteRename),
     entry("Note: Delete", CommandId::NoteDelete),
-    entry("Notebook: New...", CommandId::NotebookNew),
-    entry("Notebook: Rename...", CommandId::NotebookRename),
-    entry("Notebook: Change color...", CommandId::NotebookChangeColor),
-    entry("Notebook: Delete...", CommandId::NotebookDelete),
-    entry("Tag: Rename...", CommandId::TagRename),
-    entry(
-        "Tag: Remove from all notes...",
-        CommandId::TagRemoveEverywhere,
-    ),
     entry("Edit: Undo", CommandId::Undo),
     entry("Edit: Redo", CommandId::Redo),
     entry("Edit: Cut", CommandId::Cut),
@@ -195,15 +182,6 @@ pub(crate) fn filter_entries(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PickerKind {
     RecentFolder,
-    MoveToNotebook,
-    AddTag,
-    RemoveTag,
-    RenameNotebook,
-    RecolorNotebook,
-    ChooseColor,
-    DeleteNotebook,
-    RenameTag,
-    RemoveTagEverywhere,
 }
 
 /// A list of runtime items shown in the palette instead of commands.
@@ -952,10 +930,12 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.command == command)
                 .count();
+            // Moving a note's file has no palette row until it moves the file.
             let expected = usize::from(
                 command.tab_index().is_none()
                     && command != CommandId::CommandPalette
-                    && command != CommandId::MarkdownPreviewCycle,
+                    && command != CommandId::MarkdownPreviewCycle
+                    && command != CommandId::NoteMoveToNotebook,
             );
             assert_eq!(listed, expected, "{command:?}");
         }
@@ -1041,7 +1021,7 @@ mod tests {
 
     fn picker(create: Option<&'static str>) -> Picker {
         Picker {
-            kind: PickerKind::AddTag,
+            kind: PickerKind::RecentFolder,
             items: vec!["idea".into(), "reference".into(), "todo".into()],
             create,
         }
@@ -1049,9 +1029,9 @@ mod tests {
 
     #[test]
     fn picker_rows_filter_items_like_commands_and_offer_to_create_a_new_name() {
-        // Break caught: typing a new tag name leaving nothing to press Enter on, or offering to
-        // create a tag that already exists under another case.
-        let with_create = picker(Some("Add tag"));
+        // Break caught: typing a new name leaving nothing to press Enter on, or offering to
+        // create a name that already exists under another case.
+        let with_create = picker(Some("Create"));
         assert_eq!(
             picker_rows(&with_create, ""),
             vec![PickerRow::Item(0), PickerRow::Item(1), PickerRow::Item(2)]
@@ -1064,7 +1044,7 @@ mod tests {
         assert_eq!(picker_rows(&picker(None), "zzz"), vec![]);
         assert_eq!(
             picker_row_label(&with_create, &PickerRow::Create("urgent".into())),
-            "Add tag \u{201c}urgent\u{201d}"
+            "Create \u{201c}urgent\u{201d}"
         );
         assert_eq!(picker_row_label(&with_create, &PickerRow::Item(0)), "idea");
     }

@@ -1,14 +1,12 @@
 //! Window wiring for the note library: the deferred load, rescans, debounced metadata writes,
-//! folder commands, first-save naming, autosave, and the organizing commands.
+//! folder commands, first-save naming, autosave, and pins.
 
 use super::main_window::{app_ptr, push_notice, window_identity};
-use crate::library::ids::{NotebookId, TagId};
-use crate::library::model::{LibraryError, NotebookColor};
+use crate::library::model::LibraryError;
 use crate::library::ops::PendingOp;
 use crate::library::title;
 use crate::library::{self, LibraryState, Metadata, ids::IdSource};
 use crate::window::command_palette::{Picker, PickerChoice, PickerKind};
-use crate::window::commands::CommandId;
 use crate::window::name_box::{NameBox, NamePurpose};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -51,23 +49,11 @@ pub(crate) struct LibraryHost {
     /// the merge that follows writes it again.
     local_written_during_scan: bool,
     pub(crate) inactive_since: Option<Instant>,
-    /// IDs for new notes, notebooks and tags.
+    /// IDs for new note records.
     pub(crate) ids: IdSource,
     notified: Option<PathBuf>,
     /// The folders the open recent-folder picker lists, in its row order.
     shown_recent_folders: Vec<PathBuf>,
-    /// The rows the open organizing picker lists, in its row order, so a pick acts on what was
-    /// shown even if the library changed meanwhile. `None` in a row is the "Notes" row.
-    shown_targets: Option<(PickerKind, Vec<Option<Target>>)>,
-    /// The notebook or tag a multi-step picker flow acts on (the notebook whose color is chosen).
-    pending_target: Option<Target>,
-}
-
-/// A notebook or tag an organizing picker row or flow acts on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Target {
-    Notebook(NotebookId),
-    Tag(TagId),
 }
 
 impl LibraryHost {
@@ -84,8 +70,6 @@ impl LibraryHost {
             ids: IdSource::new(process_start, std::process::id()),
             notified: None,
             shown_recent_folders: Vec::new(),
-            shown_targets: None,
-            pending_target: None,
         }
     }
 }
@@ -370,7 +354,7 @@ fn install(hwnd: HWND, fresh: LibraryState) {
         );
     }
     if first_time && unreadable {
-        push_notice(hwnd, "This folder's .fastpad\\library.ini is damaged or from a newer FastPad, so notebooks and tags are read-only.".to_owned());
+        push_notice(hwnd, READ_ONLY.to_owned());
     }
     if has_pending {
         schedule_write(hwnd);
@@ -520,7 +504,7 @@ fn flush_reporting(hwnd: HWND, wait: bool) {
         Ok(_) => {}
         Err(error) => push_notice(
             hwnd,
-            format!("FastPad could not save this folder's notebooks and tags: {error}"),
+            format!("FastPad could not save this folder's pins: {error}"),
         ),
     }
 }
@@ -557,7 +541,7 @@ pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
     if !identity.is_live_for(hwnd) {
         return;
     }
-    // Switching would drop the unsaved notebooks and tags, so a failed write keeps the old folder.
+    // Switching would drop the unsaved pins, so a failed write keeps the old folder.
     let failure = match try_flush(hwnd, false) {
         Ok(library::Flushed::Busy) => Some("its library.ini is in use by another program".into()),
         Ok(_) => None,
@@ -567,9 +551,7 @@ pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
         schedule_write(hwnd);
         push_notice(
             hwnd,
-            format!(
-                "FastPad kept this folder open because it could not save its notebooks and tags: {error}"
-            ),
+            format!("FastPad kept this folder open because it could not save its pins: {error}"),
         );
         return;
     }
@@ -1021,70 +1003,8 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
     };
     match purpose {
         NamePurpose::FirstSave(id) => submit_first_save(hwnd, id, &text),
-        NamePurpose::NewNotebook { .. }
-        | NamePurpose::RenameNotebook(_)
-        | NamePurpose::RenameTag(_)
-        | NamePurpose::RenameNote(_)
-            if !ready_library(hwnd) =>
-        {
-            close_name_box(hwnd);
-        }
-        NamePurpose::NewNotebook { then_move } => submit_new_notebook(hwnd, then_move, text),
-        NamePurpose::RenameNotebook(id) => {
-            let result = apply_op(hwnd, |_, _| {
-                Some(PendingOp::RenameNotebook {
-                    id,
-                    name: text,
-                    now: library::now_unix(),
-                })
-            });
-            close_name_box_unless_error(hwnd, result);
-        }
-        NamePurpose::RenameTag(id) => {
-            let result = apply_op(hwnd, |_, _| Some(PendingOp::RenameTag { id, name: text }));
-            close_name_box_unless_error(hwnd, result);
-        }
+        NamePurpose::RenameNote(_) if !ready_library(hwnd) => close_name_box(hwnd),
         NamePurpose::RenameNote(id) => submit_rename(hwnd, id, &text),
-    }
-}
-
-/// Closes the name box after a successful change; after a failed one, shows why and keeps it open.
-fn close_name_box_unless_error(hwnd: HWND, result: Result<(), LibraryError>) {
-    match result {
-        Ok(()) => close_name_box(hwnd),
-        Err(error) => name_box_error(hwnd, error.to_string()),
-    }
-}
-
-fn submit_new_notebook(hwnd: HWND, then_move: Option<crate::document::DocumentId>, name: String) {
-    let Some(id) = host(hwnd, |host| NotebookId(host.ids.next())) else {
-        return;
-    };
-    let result = apply_op(hwnd, |_, _| {
-        Some(PendingOp::CreateNotebook {
-            id,
-            name,
-            now: library::now_unix(),
-        })
-    });
-    if result.is_err() {
-        close_name_box_unless_error(hwnd, result);
-        return;
-    }
-    close_name_box(hwnd);
-    if let Some(document) = then_move
-        && super::main_window::activate_document_by_id(hwnd, document)
-        && let Some(path) = active_file(hwnd)
-    {
-        report(
-            hwnd,
-            apply_op(hwnd, |state, ids| {
-                Some(PendingOp::SetNoteNotebook {
-                    note: state.note_ref(ids, &path),
-                    notebook: Some(id),
-                })
-            }),
-        );
     }
 }
 
@@ -1560,7 +1480,7 @@ pub(crate) fn notes_mode_notice(enabled: bool) -> &'static str {
     }
 }
 
-const READ_ONLY: &str = "This folder's .fastpad\\library.ini is damaged or from a newer FastPad, so notebooks and tags are read-only.";
+const READ_ONLY: &str = "This folder's .fastpad\\library.ini is damaged or from a newer FastPad, so pins are read-only.";
 const BUSY: &str = "This folder's .fastpad\\library.ini is in use by another program. FastPad reads it again when you come back to the window.";
 
 /// True when organizing can proceed; otherwise explains why not.
@@ -1623,141 +1543,6 @@ fn report(hwnd: HWND, result: Result<(), LibraryError>) {
     }
 }
 
-type Row = (Option<Target>, String);
-
-fn notebook_rows(hwnd: HWND) -> Vec<Row> {
-    with_state(hwnd, |state| {
-        state
-            .library
-            .notebooks_in_order()
-            .iter()
-            .map(|n| (Some(Target::Notebook(n.id)), n.name.clone()))
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// Every tag, the most used first, then by name.
-fn tag_rows(hwnd: HWND) -> Vec<Row> {
-    with_state(hwnd, |state| {
-        let mut tags: Vec<_> = state
-            .library
-            .tags
-            .iter()
-            .map(|t| (t.id, t.name.clone()))
-            .collect();
-        tags.sort_by(|a, b| {
-            state
-                .library
-                .tag_count(b.0)
-                .cmp(&state.library.tag_count(a.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        tags.into_iter()
-            .map(|(id, name)| (Some(Target::Tag(id)), name))
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-fn note_tags(hwnd: HWND, path: &Path) -> Vec<TagId> {
-    with_state(hwnd, |state| {
-        state
-            .record_for(path)
-            .map_or_else(Vec::new, |record| record.tags.clone())
-    })
-    .unwrap_or_default()
-}
-
-fn note_tag_rows(hwnd: HWND, path: &Path) -> Vec<Row> {
-    with_state(hwnd, |state| {
-        state.record_for(path).map_or_else(Vec::new, |record| {
-            record
-                .tags
-                .iter()
-                .filter_map(|id| {
-                    Some((Some(Target::Tag(*id)), state.library.tag(*id)?.name.clone()))
-                })
-                .collect()
-        })
-    })
-    .unwrap_or_default()
-}
-
-/// "Notes", then every notebook.
-fn move_rows(hwnd: HWND) -> Vec<Row> {
-    let mut rows = vec![(None, "Notes".to_owned())];
-    rows.extend(notebook_rows(hwnd));
-    rows
-}
-
-/// The tags the note does not have yet.
-fn add_tag_rows(hwnd: HWND, path: &Path) -> Vec<Row> {
-    let on_note = note_tags(hwnd, path);
-    tag_rows(hwnd)
-        .into_iter()
-        .filter(|(target, _)| !matches!(target, Some(Target::Tag(id)) if on_note.contains(id)))
-        .collect()
-}
-
-/// Opens a picker over `rows` and remembers what each row stands for.
-fn picker(hwnd: HWND, kind: PickerKind, rows: Vec<Row>, create: Option<&'static str>) {
-    let (targets, items): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-    host(hwnd, |host| host.shown_targets = Some((kind, targets)));
-    super::main_window::open_picker(
-        hwnd,
-        Picker {
-            kind,
-            items,
-            create,
-        },
-    );
-}
-
-/// What row `index` of a `kind` picker stands for: the row that picker showed, or, when no such
-/// picker was shown, the row it would show now (`rows`). `None` when the row does not exist.
-fn shown_row(
-    hwnd: HWND,
-    kind: PickerKind,
-    index: usize,
-    rows: impl FnOnce() -> Vec<Row>,
-) -> Option<Option<Target>> {
-    let shown = host(hwnd, |host| host.shown_targets.take()).flatten();
-    let targets = match shown {
-        Some((shown_kind, targets)) if shown_kind == kind => targets,
-        _ => rows().into_iter().map(|(target, _)| target).collect(),
-    };
-    targets.get(index).copied()
-}
-
-fn shown_notebook(hwnd: HWND, kind: PickerKind, index: usize) -> Option<(NotebookId, String)> {
-    let Some(Some(Target::Notebook(id))) = shown_row(hwnd, kind, index, || notebook_rows(hwnd))
-    else {
-        return None;
-    };
-    let name = with_state(hwnd, |state| Some(state.library.notebook(id)?.name.clone())).flatten();
-    if name.is_none() {
-        report(hwnd, Err(LibraryError::NotFound));
-    }
-    Some((id, name?))
-}
-
-fn shown_tag(
-    hwnd: HWND,
-    kind: PickerKind,
-    index: usize,
-    rows: impl FnOnce() -> Vec<Row>,
-) -> Option<(TagId, String)> {
-    let Some(Some(Target::Tag(id))) = shown_row(hwnd, kind, index, rows) else {
-        return None;
-    };
-    let name = with_state(hwnd, |state| Some(state.library.tag(id)?.name.clone())).flatten();
-    if name.is_none() {
-        report(hwnd, Err(LibraryError::NotFound));
-    }
-    Some((id, name?))
-}
-
 /// Asks `question`; false also when the window went away meanwhile.
 fn confirmed(hwnd: HWND, question: &str) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
@@ -1766,113 +1551,35 @@ fn confirmed(hwnd: HWND, question: &str) -> bool {
     crate::window::modal::confirm(hwnd, question) && identity.is_live_for(hwnd)
 }
 
-fn toggle_flag(hwnd: HWND, favorite: bool) {
-    let Some(path) = active_file(hwnd) else {
+/// Pins or unpins `path`. Only a note inside the open notebook can be pinned: version 2 of
+/// `library.ini` has no records for files outside it.
+pub(crate) fn toggle_pin(hwnd: HWND, path: &Path) {
+    if !ready_library(hwnd) {
         return;
-    };
+    }
+    if !folder(hwnd).is_some_and(|folder| library::is_inside(&folder, path)) {
+        push_notice(
+            hwnd,
+            "Only notes in the open notebook can be pinned.".to_owned(),
+        );
+        return;
+    }
     let mut now_on = false;
     let result = apply_op(hwnd, |state, ids| {
-        let current = state
-            .record_for(&path)
-            .is_some_and(|r| if favorite { r.favorite } else { r.pinned });
-        now_on = !current;
-        let note = state.note_ref(ids, &path);
-        Some(if favorite {
-            PendingOp::SetFavorite {
-                note,
-                value: now_on,
-            }
-        } else {
-            PendingOp::SetPinned {
-                note,
-                value: now_on,
-            }
+        now_on = !state.is_pinned(path);
+        Some(PendingOp::SetPinned {
+            note: state.note_ref(ids, path),
+            value: now_on,
         })
     });
     if result.is_err() {
         report(hwnd, result);
         return;
     }
-    let notice = match (favorite, now_on) {
-        (true, true) => "Added to Favorites.",
-        (true, false) => "Removed from Favorites.",
-        (false, true) => "Pinned.",
-        (false, false) => "Unpinned.",
-    };
-    push_notice(hwnd, notice.to_owned());
-}
-
-/// Every organizing command.
-pub(crate) fn organize(hwnd: HWND, command: CommandId) {
-    if !ready_library(hwnd) {
-        return;
-    }
-    match command {
-        CommandId::NoteToggleFavorite => toggle_flag(hwnd, true),
-        CommandId::NoteTogglePin => toggle_flag(hwnd, false),
-        CommandId::NoteMoveToNotebook => {
-            if active_file(hwnd).is_some() {
-                let rows = move_rows(hwnd);
-                picker(hwnd, PickerKind::MoveToNotebook, rows, Some("New notebook"));
-            }
-        }
-        CommandId::NoteAddTag => {
-            if let Some(path) = active_file(hwnd) {
-                let rows = add_tag_rows(hwnd, &path);
-                picker(hwnd, PickerKind::AddTag, rows, Some("Add tag"));
-            }
-        }
-        CommandId::NoteRemoveTag => {
-            let Some(path) = active_file(hwnd) else {
-                return;
-            };
-            let rows = note_tag_rows(hwnd, &path);
-            if rows.is_empty() {
-                push_notice(hwnd, "This note has no tags.".to_owned());
-                return;
-            }
-            picker(hwnd, PickerKind::RemoveTag, rows, None);
-        }
-        CommandId::NotebookNew => {
-            open_name_box(
-                hwnd,
-                NamePurpose::NewNotebook { then_move: None },
-                "",
-                "New notebook".to_owned(),
-                false,
-            );
-        }
-        CommandId::NotebookRename | CommandId::NotebookChangeColor | CommandId::NotebookDelete => {
-            let rows = notebook_rows(hwnd);
-            if rows.is_empty() {
-                push_notice(
-                    hwnd,
-                    "There are no notebooks yet. Use Notebook: New.".to_owned(),
-                );
-                return;
-            }
-            let kind = match command {
-                CommandId::NotebookRename => PickerKind::RenameNotebook,
-                CommandId::NotebookChangeColor => PickerKind::RecolorNotebook,
-                _ => PickerKind::DeleteNotebook,
-            };
-            picker(hwnd, kind, rows, None);
-        }
-        CommandId::TagRename | CommandId::TagRemoveEverywhere => {
-            let rows = tag_rows(hwnd);
-            if rows.is_empty() {
-                push_notice(hwnd, "There are no tags yet. Use Note: Add tag.".to_owned());
-                return;
-            }
-            let kind = if command == CommandId::TagRename {
-                PickerKind::RenameTag
-            } else {
-                PickerKind::RemoveTagEverywhere
-            };
-            picker(hwnd, kind, rows, None);
-        }
-        _ => {}
-    }
+    push_notice(
+        hwnd,
+        if now_on { "Pinned." } else { "Unpinned." }.to_owned(),
+    );
 }
 
 #[cfg(test)]
@@ -1886,209 +1593,16 @@ pub(crate) fn take_last_pick() -> Option<(PickerKind, PickerChoice)> {
     LAST_PICK.with(|last| last.borrow_mut().take())
 }
 
-/// A picker row was chosen. Every kind resolves the row against what that picker showed.
+/// A picker row was chosen. The recent-folder picker is the only one; its row opens the folder
+/// that row showed, even if `folders.ini` changed meanwhile.
 pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
     #[cfg(test)]
     LAST_PICK.with(|last| *last.borrow_mut() = Some((kind, choice.clone())));
-    if kind != PickerKind::RecentFolder && !ready_library(hwnd) {
-        host(hwnd, |host| {
-            host.shown_targets = None;
-            host.pending_target = None;
-        });
+    let (PickerKind::RecentFolder, PickerChoice::Item(index)) = (kind, choice) else {
         return;
-    }
-    match (kind, choice) {
-        (PickerKind::RecentFolder, PickerChoice::Item(index)) => {
-            let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
-            if let Some(folder) = shown.unwrap_or_default().get(index) {
-                open_folder(hwnd, folder);
-            }
-        }
-        (PickerKind::MoveToNotebook, choice) => {
-            let Some(path) = active_file(hwnd) else {
-                return;
-            };
-            let notebook = match choice {
-                PickerChoice::Item(index) => {
-                    match shown_row(hwnd, kind, index, || move_rows(hwnd)) {
-                        Some(None) => None,
-                        Some(Some(Target::Notebook(id))) => Some(id),
-                        _ => return,
-                    }
-                }
-                PickerChoice::Create(name) => {
-                    host(hwnd, |host| host.shown_targets = None);
-                    let then_move = unsafe { app_ptr(hwnd) }
-                        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id));
-                    open_name_box(
-                        hwnd,
-                        NamePurpose::NewNotebook { then_move },
-                        &name,
-                        "New notebook".to_owned(),
-                        false,
-                    );
-                    return;
-                }
-            };
-            report(
-                hwnd,
-                apply_op(hwnd, |state, ids| {
-                    Some(PendingOp::SetNoteNotebook {
-                        note: state.note_ref(ids, &path),
-                        notebook,
-                    })
-                }),
-            );
-        }
-        (PickerKind::AddTag, choice) => {
-            let Some(path) = active_file(hwnd) else {
-                return;
-            };
-            let (tag, name) = match choice {
-                PickerChoice::Create(name) => {
-                    host(hwnd, |host| host.shown_targets = None);
-                    (None, name)
-                }
-                PickerChoice::Item(index) => {
-                    let Some((id, name)) =
-                        shown_tag(hwnd, kind, index, || add_tag_rows(hwnd, &path))
-                    else {
-                        return;
-                    };
-                    (Some(id), name)
-                }
-            };
-            report(
-                hwnd,
-                apply_op(hwnd, |state, ids| {
-                    let tag = tag
-                        .or_else(|| {
-                            let bare = name.trim().trim_start_matches('#');
-                            state.library.tag_by_name(bare).map(|t| t.id)
-                        })
-                        .unwrap_or_else(|| TagId(ids.next()));
-                    Some(PendingOp::AddTag {
-                        note: state.note_ref(ids, &path),
-                        tag,
-                        name,
-                    })
-                }),
-            );
-        }
-        (PickerKind::RemoveTag, PickerChoice::Item(index)) => {
-            let Some(path) = active_file(hwnd) else {
-                return;
-            };
-            let Some(Some(Target::Tag(tag))) =
-                shown_row(hwnd, kind, index, || note_tag_rows(hwnd, &path))
-            else {
-                return;
-            };
-            report(
-                hwnd,
-                apply_op(hwnd, |state, ids| {
-                    Some(PendingOp::RemoveTag {
-                        note: state.note_ref(ids, &path),
-                        tag,
-                    })
-                }),
-            );
-        }
-        (PickerKind::RenameNotebook, PickerChoice::Item(index)) => {
-            let Some((id, name)) = shown_notebook(hwnd, kind, index) else {
-                return;
-            };
-            open_name_box(
-                hwnd,
-                NamePurpose::RenameNotebook(id),
-                &name,
-                "Rename notebook".to_owned(),
-                false,
-            );
-        }
-        (PickerKind::RecolorNotebook, PickerChoice::Item(index)) => {
-            let Some((id, _)) = shown_notebook(hwnd, kind, index) else {
-                return;
-            };
-            host(hwnd, |host| {
-                host.pending_target = Some(Target::Notebook(id))
-            });
-            let mut rows = vec![(None, "No color".to_owned())];
-            rows.extend(
-                NotebookColor::ALL
-                    .iter()
-                    .map(|c| (None, c.name().to_owned())),
-            );
-            picker(hwnd, PickerKind::ChooseColor, rows, None);
-        }
-        (PickerKind::ChooseColor, PickerChoice::Item(index)) => {
-            host(hwnd, |host| host.shown_targets = None);
-            let Some(Some(Target::Notebook(id))) = host(hwnd, |host| host.pending_target.take())
-            else {
-                return;
-            };
-            let color = index
-                .checked_sub(1)
-                .and_then(|i| NotebookColor::ALL.get(i).copied());
-            report(
-                hwnd,
-                apply_op(hwnd, |_, _| {
-                    Some(PendingOp::SetNotebookColor {
-                        id,
-                        color,
-                        now: library::now_unix(),
-                    })
-                }),
-            );
-        }
-        (PickerKind::DeleteNotebook, PickerChoice::Item(index)) => {
-            let Some((id, name)) = shown_notebook(hwnd, kind, index) else {
-                return;
-            };
-            let count = with_state(hwnd, |state| {
-                state
-                    .library
-                    .notes
-                    .iter()
-                    .filter(|n| n.notebook == Some(id) && !n.deleted)
-                    .count()
-            })
-            .unwrap_or(0);
-            let question = format!(
-                "Delete the notebook \u{201c}{name}\u{201d}? Its {count} notes move to Notes. No note is deleted."
-            );
-            if confirmed(hwnd, &question) {
-                report(
-                    hwnd,
-                    apply_op(hwnd, |_, _| Some(PendingOp::DeleteNotebook { id })),
-                );
-            }
-        }
-        (PickerKind::RenameTag, PickerChoice::Item(index)) => {
-            let Some((id, name)) = shown_tag(hwnd, kind, index, || tag_rows(hwnd)) else {
-                return;
-            };
-            open_name_box(
-                hwnd,
-                NamePurpose::RenameTag(id),
-                &name,
-                "Rename tag".to_owned(),
-                false,
-            );
-        }
-        (PickerKind::RemoveTagEverywhere, PickerChoice::Item(index)) => {
-            let Some((id, name)) = shown_tag(hwnd, kind, index, || tag_rows(hwnd)) else {
-                return;
-            };
-            let count = with_state(hwnd, |state| state.library.tag_count(id)).unwrap_or(0);
-            let question = format!("Remove the tag \u{201c}{name}\u{201d} from {count} notes?");
-            if confirmed(hwnd, &question) {
-                report(
-                    hwnd,
-                    apply_op(hwnd, |_, _| Some(PendingOp::RemoveTagEverywhere { id })),
-                );
-            }
-        }
-        _ => {}
+    };
+    let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
+    if let Some(folder) = shown.unwrap_or_default().get(index) {
+        open_folder(hwnd, folder);
     }
 }

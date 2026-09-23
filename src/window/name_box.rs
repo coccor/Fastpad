@@ -1,9 +1,8 @@
 //! The inline name box: one text field with Save and Browse… buttons, shown above the editor for
-//! a first save and for naming notes, notebooks and tags. Enter saves, Esc cancels, Tab moves
-//! between the field and the buttons.
+//! a first save and for renaming a note. Enter saves, Esc cancels, Tab moves between the field
+//! and the buttons.
 
 use crate::document::DocumentId;
-use crate::library::ids::{NotebookId, TagId};
 use crate::platform::{last_error, wide_null};
 use crate::window::palette::Palette;
 use crate::window::panel::{
@@ -48,18 +47,13 @@ pub(crate) const fn name_box_height(dpi: u32) -> i32 {
 pub(crate) enum NamePurpose {
     FirstSave(DocumentId),
     RenameNote(DocumentId),
-    NewNotebook { then_move: Option<DocumentId> },
-    RenameNotebook(NotebookId),
-    RenameTag(TagId),
 }
 
 impl NamePurpose {
-    /// The tab this purpose acts on, if any: the box closes when that tab goes away.
+    /// The tab this purpose acts on: the box closes when that tab goes away.
     pub(crate) fn document(&self) -> Option<DocumentId> {
         match self {
             Self::FirstSave(id) | Self::RenameNote(id) => Some(*id),
-            Self::NewNotebook { then_move } => *then_move,
-            Self::RenameNotebook(_) | Self::RenameTag(_) => None,
         }
     }
 }

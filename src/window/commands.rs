@@ -64,19 +64,11 @@ pub enum CommandId {
     ToggleFolderAutosave,
     NoteReloadFromDisk,
     NoteKeepMine,
-    NoteToggleFavorite,
-    NoteTogglePin,
-    NoteMoveToNotebook,
-    NoteAddTag,
-    NoteRemoveTag,
-    NotebookNew,
-    NotebookRename,
-    NotebookChangeColor,
-    NotebookDelete,
-    TagRename,
-    TagRemoveEverywhere,
-    NoteRename,
-    NoteDelete,
+    // 163 and 166-173 were the favorite, tag and notebook commands: retired, never reused.
+    NoteTogglePin = 164,
+    NoteMoveToNotebook = 165,
+    NoteRename = 174,
+    NoteDelete = 175,
 }
 
 impl CommandId {
@@ -110,12 +102,6 @@ impl CommandId {
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
                 | Self::ToggleFolderAutosave
-                | Self::NotebookNew
-                | Self::NotebookRename
-                | Self::NotebookChangeColor
-                | Self::NotebookDelete
-                | Self::TagRename
-                | Self::TagRemoveEverywhere
         )
     }
 
@@ -145,7 +131,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 76] = [
+        const COMMANDS: [CommandId; 67] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -209,17 +195,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::ToggleFolderAutosave,
             CommandId::NoteReloadFromDisk,
             CommandId::NoteKeepMine,
-            CommandId::NoteToggleFavorite,
             CommandId::NoteTogglePin,
             CommandId::NoteMoveToNotebook,
-            CommandId::NoteAddTag,
-            CommandId::NoteRemoveTag,
-            CommandId::NotebookNew,
-            CommandId::NotebookRename,
-            CommandId::NotebookChangeColor,
-            CommandId::NotebookDelete,
-            CommandId::TagRename,
-            CommandId::TagRemoveEverywhere,
             CommandId::NoteRename,
             CommandId::NoteDelete,
         ];
@@ -292,23 +269,17 @@ mod tests {
         assert!(!CommandId::ToggleFolderAutosave.needs_document());
         assert!(CommandId::NoteReloadFromDisk.needs_document());
         assert!(CommandId::NoteKeepMine.needs_document());
-        assert_eq!(CommandId::try_from(163), Ok(CommandId::NoteToggleFavorite));
+        // Break caught: a removed command's number reused, so a stale shortcut or a test
+        // posting 163 runs something else.
+        for retired in [163_u16, 166, 167, 168, 169, 170, 171, 172, 173] {
+            assert!(CommandId::try_from(retired).is_err(), "{retired}");
+        }
         assert_eq!(CommandId::try_from(164), Ok(CommandId::NoteTogglePin));
         assert_eq!(CommandId::try_from(165), Ok(CommandId::NoteMoveToNotebook));
-        assert_eq!(CommandId::try_from(166), Ok(CommandId::NoteAddTag));
-        assert_eq!(CommandId::try_from(167), Ok(CommandId::NoteRemoveTag));
-        assert_eq!(CommandId::try_from(168), Ok(CommandId::NotebookNew));
-        assert_eq!(CommandId::try_from(169), Ok(CommandId::NotebookRename));
-        assert_eq!(CommandId::try_from(170), Ok(CommandId::NotebookChangeColor));
-        assert_eq!(CommandId::try_from(171), Ok(CommandId::NotebookDelete));
-        assert_eq!(CommandId::try_from(172), Ok(CommandId::TagRename));
-        assert_eq!(CommandId::try_from(173), Ok(CommandId::TagRemoveEverywhere));
         assert_eq!(CommandId::try_from(174), Ok(CommandId::NoteRename));
         assert_eq!(CommandId::try_from(175), Ok(CommandId::NoteDelete));
-        assert!(CommandId::NoteToggleFavorite.needs_document());
-        assert!(CommandId::NoteRemoveTag.needs_document());
-        assert!(!CommandId::NotebookNew.needs_document());
-        assert!(!CommandId::TagRemoveEverywhere.needs_document());
+        assert!(CommandId::NoteTogglePin.needs_document());
+        assert!(CommandId::NoteMoveToNotebook.needs_document());
         assert!(CommandId::NoteRename.needs_document());
         assert!(CommandId::NoteDelete.needs_document());
     }

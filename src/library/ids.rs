@@ -24,8 +24,6 @@ macro_rules! library_id {
 }
 
 library_id!(NoteId);
-library_id!(NotebookId);
-library_id!(TagId);
 
 /// Hands out IDs in the same shape as `RecoveryId`: process start, PID, then a counter.
 #[derive(Debug)]
@@ -161,10 +159,7 @@ mod tests {
         assert_eq!(NoteId::parse_hex(&id.to_hex()), Some(id));
         assert_eq!(NoteId::parse_hex("abc"), None);
         assert_eq!(NoteId::parse_hex("zz000000000000000000000000000abc"), None);
-        assert_eq!(
-            NotebookId::parse_hex(&"f".repeat(32)),
-            Some(NotebookId(u128::MAX))
-        );
+        assert_eq!(NoteId::parse_hex(&"f".repeat(32)), Some(NoteId(u128::MAX)));
     }
 
     #[test]

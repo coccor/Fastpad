@@ -210,12 +210,10 @@ fn a_note_keeps_its_favorite_after_being_renamed_in_explorer() {
     wait_until("the note to open", || {
         scintilla_text(editor).is_ok_and(|t| t == "a")
     });
-    command(hwnd, CommandId::NoteToggleFavorite);
+    command(hwnd, CommandId::NoteTogglePin);
     // A record made by a command carries no fingerprint until a rescan fills it; the rename below
     // is followed by the file ID the load cached.
-    wait_until("library.ini", || {
-        read(&data.library_ini()).contains("|f|-|")
-    });
+    wait_until("library.ini", || read(&data.library_ini()).contains("|p|"));
     assert!(read(&data.library_ini()).ends_with("|a.md\r\n"));
 
     std::fs::rename(&note, data.folder().join("b.md")).unwrap();
@@ -241,8 +239,8 @@ fn a_note_keeps_its_favorite_after_being_renamed_in_explorer() {
         .find(|line| line.ends_with("|b.md"))
         .unwrap();
     assert!(
-        renamed.contains("|f|"),
-        "the favorite must follow the rename: {renamed:?}"
+        renamed.contains("|p|"),
+        "the pin must follow the rename: {renamed:?}"
     );
     // The open tab followed too: its next autosave lands in b.md and never re-creates a.md.
     let moved = data.folder().join("b.md");
@@ -278,7 +276,7 @@ fn a_second_launch_with_a_folder_switches_the_running_window() {
 #[test]
 fn a_damaged_library_file_is_left_byte_for_byte_and_notes_still_open() {
     // Break caught: an unreadable or newer-version library.ini being rewritten (losing the
-    // user's notebooks and tags) or blocking the folder's notes from opening.
+    // user's pins) or blocking the folder's notes from opening.
     let _lock = LIBRARY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let data = Scratch::new("damaged");
     let note = data.note("a.md", "still readable");
@@ -294,7 +292,7 @@ fn a_damaged_library_file_is_left_byte_for_byte_and_notes_still_open() {
     wait_until("the note to open", || {
         scintilla_text(editor).is_ok_and(|t| t == "still readable")
     });
-    command(hwnd, CommandId::NoteToggleFavorite);
+    command(hwnd, CommandId::NoteTogglePin);
     // A write would follow the 500 ms debounce; give it well past that.
     std::thread::sleep(Duration::from_millis(1_500));
     close(process, hwnd);
