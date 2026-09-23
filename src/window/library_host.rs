@@ -59,6 +59,9 @@ pub(crate) struct LibraryHost {
     folders: Option<library::local::RecentFolders>,
     /// The user changed `folders.ini` since startup, so the startup worker's copy is older.
     folders_edited: bool,
+    /// Bumped by each `open_listed_notebook` check and by any switch or close that makes an
+    /// outstanding one stale: `notebook_checked` drops an answer whose value has fallen behind.
+    check_request: u64,
 }
 
 impl LibraryHost {
@@ -77,6 +80,7 @@ impl LibraryHost {
             shown_recent_folders: Vec::new(),
             folders: None,
             folders_edited: false,
+            check_request: 0,
         }
     }
 }
@@ -642,6 +646,8 @@ fn open_checked_folder(hwnd: HWND, path: PathBuf) {
     host(hwnd, |host| {
         host.state = None;
         host.folder = Some(path.clone());
+        // The user moved on: any check still in flight for a listed notebook is stale now.
+        host.check_request = host.check_request.wrapping_add(1);
     });
     update_folders(hwnd, |folders| folders.push(path.clone()));
     start_load(hwnd);
@@ -656,6 +662,9 @@ struct NotebookChecked {
     /// Show the Notebook view once the notebook is open, with the focus in it for `Some(true)`.
     /// Task 12's Favorites view asks for it.
     show_notebook: Option<bool>,
+    /// `LibraryHost::check_request` when this check started. If the host's has since moved on (a
+    /// newer check, or an explicit switch or close), this answer is stale and is dropped.
+    check_request: u64,
 }
 
 /// Opens a notebook picked from a list (recent, favorites, the no-notebook panel). Such an entry
@@ -671,6 +680,11 @@ fn check_listed_notebook(hwnd: HWND, folder: &Path, show_notebook: Option<bool>)
         return;
     }
     let folder = library::normalize_folder(folder);
+    let check_request = host(hwnd, |host| {
+        host.check_request = host.check_request.wrapping_add(1);
+        host.check_request
+    })
+    .unwrap_or(0);
     let target = hwnd as isize;
     std::thread::spawn(move || {
         let exists = library::folder_exists(&folder);
@@ -678,6 +692,7 @@ fn check_listed_notebook(hwnd: HWND, folder: &Path, show_notebook: Option<bool>)
             folder,
             exists,
             show_notebook,
+            check_request,
         }));
         if unsafe {
             PostMessageW(
@@ -693,14 +708,20 @@ fn check_listed_notebook(hwnd: HWND, folder: &Path, show_notebook: Option<bool>)
     });
 }
 
-/// `WM_FASTPAD_NOTEBOOK_CHECKED`: frees the worker's answer and switches if the folder exists.
-/// An answer that lands during a modal dialog is dropped, as a click there could not happen.
+/// `WM_FASTPAD_NOTEBOOK_CHECKED`: frees the worker's answer and switches if the folder exists. An
+/// answer whose `check_request` has fallen behind (a newer listed check, or an explicit open or
+/// close, ran since this one started) is dropped: the user has already moved on. An answer that
+/// lands during a modal dialog is dropped too, as a click there could not happen.
 pub(crate) fn notebook_checked(hwnd: HWND, lparam: LPARAM) {
     if lparam == 0 {
         return;
     }
     let checked = *unsafe { Box::from_raw(lparam as *mut NotebookChecked) };
     if super::modal::modal_active(hwnd) {
+        return;
+    }
+    let current = host(hwnd, |host| host.check_request).unwrap_or(checked.check_request);
+    if checked.check_request != current {
         return;
     }
     if !checked.exists {
@@ -787,19 +808,28 @@ pub(crate) fn notebook_name(folder: &Path) -> String {
 }
 
 /// Favorite notebooks in `folders.ini` order (the Favorites view sorts them by name).
-#[allow(dead_code, reason = "read from Task 12's Favorites view on")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read from Task 12's Favorites view on")
+)]
 pub(crate) fn favorites(hwnd: HWND) -> Vec<PathBuf> {
     known_folders(hwnd, false).favorites
 }
 
 /// Recent notebooks, most recent first.
-#[allow(dead_code, reason = "read from Task 10's no-notebook Notebook view on")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read from Task 10's no-notebook Notebook view on")
+)]
 pub(crate) fn recent_notebooks(hwnd: HWND) -> Vec<PathBuf> {
     known_folders(hwnd, false).folders
 }
 
 /// Whether the open notebook is a favorite.
-#[allow(dead_code, reason = "read from Task 10's Notebook view star on")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read from Task 10's Notebook view star on")
+)]
 pub(crate) fn is_favorite(hwnd: HWND) -> bool {
     folder(hwnd).is_some_and(|open| known_folders(hwnd, false).is_favorite(&open))
 }
@@ -828,7 +858,10 @@ pub(crate) fn toggle_notebook_favorite(hwnd: HWND) {
 }
 
 /// Removes `folder` from the favorites; nothing happens if it is not one.
-#[allow(dead_code, reason = "called from Task 12's Favorites view on")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called from Task 12's Favorites view on")
+)]
 pub(crate) fn remove_favorite(hwnd: HWND, folder: &Path) {
     let removed = update_folders(hwnd, |folders| {
         folders.is_favorite(folder) && !folders.toggle_favorite(folder)
@@ -863,6 +896,8 @@ pub(crate) fn close_notebook(hwnd: HWND) {
         host.generation = host.generation.wrapping_add(1);
         host.scanning = false;
         host.rescan_requested = false;
+        // The user moved on: any check still in flight for a listed notebook is stale now.
+        host.check_request = host.check_request.wrapping_add(1);
     });
     update_folders(hwnd, |folders| folders.set_closed(true));
     push_notice(
@@ -1158,7 +1193,7 @@ pub(crate) fn save_as_command(hwnd: HWND) {
 
 fn folder_display_name(hwnd: HWND) -> String {
     folder(hwnd)
-        .and_then(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .map(|f| notebook_name(&f))
         .unwrap_or_else(|| "the notebook".to_owned())
 }
 

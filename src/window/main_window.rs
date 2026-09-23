@@ -8484,6 +8484,43 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_listed_notebook_check_is_dropped_once_the_user_has_moved_on() {
+        // Break caught: a slow existence check for a notebook landing after the user already
+        // closed the open notebook (or switched to another one), reopening or replacing it anyway.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("stale-check");
+        let stale = LibraryScratch::new("stale-check-target");
+        let fresh = LibraryScratch::new("stale-check-fresh");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+
+        crate::window::library_host::open_listed_notebook(window.hwnd, &stale.folder());
+        // Close notebook runs on this thread before the check's worker answer is pumped: the
+        // close must invalidate the still-in-flight check.
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+        // Give the worker's existence check time to land and be pumped, then confirm it changed
+        // nothing: there is no positive signal for "was dropped", so this waits out a generous
+        // margin instead of polling for an effect that must not occur.
+        for _ in 0..60 {
+            pump_posted_messages(window.hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            crate::window::library_host::folder(window.hwnd),
+            None,
+            "a check that started before Close notebook must not reopen the notebook"
+        );
+
+        // A later, non-stale listed open still works normally.
+        crate::window::library_host::open_listed_notebook(window.hwnd, &fresh.folder());
+        pump_until(window.hwnd, || {
+            crate::window::library_host::folder(window.hwnd) == Some(fresh.folder())
+        });
+    }
+
+    #[test]
     fn a_note_inside_the_folder_autosaves_and_closing_it_never_prompts() {
         // Break caught: a notes-folder file still asking "Save changes?" or losing edits on close.
         let _scintilla = load_native_scintilla();
