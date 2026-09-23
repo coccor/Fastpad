@@ -76,7 +76,11 @@ pub(crate) enum Mode {
     /// Loaded, with no notes and no untitled tabs.
     Empty,
     Tree,
+    /// The notebook's load failed: a message, "Retry" and "Open notebook…".
+    Failed,
 }
+
+pub(crate) const LOAD_FAILED: &str = "Couldn't load this notebook.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeaderButton {
@@ -107,8 +111,10 @@ enum RowPart {
 enum Hit {
     Header(HeaderButton),
     Title,
-    /// "Open notebook…" (no notebook) or "New note" (empty notebook).
+    /// "Open notebook…" (no notebook), "New note" (empty notebook) or "Retry" (failed load).
     StateButton,
+    /// "Open notebook…" under "Retry", after a failed load.
+    SecondButton,
     /// The scroll thumb, with where on it the press landed.
     Thumb(i32),
     Row {
@@ -220,6 +226,8 @@ pub(crate) fn body_rect(area: RECT, dpi: u32) -> RECT {
 pub(crate) struct StateLayout {
     pub message: RECT,
     pub button: RECT,
+    /// "Open notebook…" under "Retry", in the failed state.
+    pub second: RECT,
     /// "RECENT", in the no-notebook state.
     pub label: RECT,
     /// The recent rows.
@@ -243,6 +251,11 @@ pub(crate) fn state_layout(body: RECT, dpi: u32) -> StateLayout {
         right: (left + scale(140, dpi)).min(right),
         bottom: message.bottom + scale(32, dpi),
     };
+    let second = RECT {
+        top: button.bottom + scale(8, dpi),
+        bottom: button.bottom + scale(8, dpi) + (button.bottom - button.top),
+        ..button
+    };
     let label = RECT {
         left,
         top: button.bottom + scale(16, dpi),
@@ -258,6 +271,7 @@ pub(crate) fn state_layout(body: RECT, dpi: u32) -> StateLayout {
     StateLayout {
         message,
         button,
+        second,
         label,
         list,
     }
@@ -347,6 +361,8 @@ impl TypeAhead {
 struct RebuildKey {
     root: Option<PathBuf>,
     loaded: bool,
+    /// The last load failed (`library_host::load_failed`).
+    failed: bool,
     /// `library_host::expansion_revision`, bumped whenever a folder is expanded or collapsed.
     expansion: u64,
     unsaved: Vec<UnsavedEntry>,
@@ -548,7 +564,7 @@ impl NotebookView {
         match self.mode {
             Mode::Tree => body,
             Mode::NoNotebook => state_layout(body, dpi).list,
-            Mode::Loading | Mode::Empty => RECT {
+            Mode::Loading | Mode::Empty | Mode::Failed => RECT {
                 bottom: body.top,
                 ..body
             },
@@ -604,7 +620,7 @@ impl NotebookView {
                 None if self.truncated && index == self.rows.len() => Target::Truncated,
                 None => Target::Nothing,
             },
-            Mode::Loading | Mode::Empty => Target::Nothing,
+            Mode::Loading | Mode::Empty | Mode::Failed => Target::Nothing,
         }
     }
 
@@ -660,7 +676,7 @@ impl NotebookView {
         let count = match self.mode {
             Mode::Tree => self.rows.len() + usize::from(self.truncated),
             Mode::NoNotebook => self.recent.len(),
-            Mode::Loading | Mode::Empty => 0,
+            Mode::Loading | Mode::Empty | Mode::Failed => 0,
         };
         self.list.set_count(count);
         // Measured in the new mode's list area.
@@ -693,10 +709,13 @@ impl NotebookView {
         }
         let body = body_rect(area, dpi);
         match self.mode {
-            Mode::NoNotebook | Mode::Empty => {
+            Mode::NoNotebook | Mode::Empty | Mode::Failed => {
                 let layout = state_layout(body, dpi);
                 if contains(layout.button, x, y) {
                     return Hit::StateButton;
+                }
+                if self.mode == Mode::Failed && contains(layout.second, x, y) {
+                    return Hit::SecondButton;
                 }
                 if self.mode == Mode::NoNotebook
                     && contains(layout.list, x, y)
@@ -823,7 +842,7 @@ impl NotebookView {
                     none
                 }
             }
-            Mode::Loading | Mode::Empty => none,
+            Mode::Loading | Mode::Empty | Mode::Failed => none,
         }
     }
 
@@ -897,7 +916,14 @@ impl NotebookView {
                         DT_WORDBREAK | DT_NOPREFIX,
                     )
                 };
-                self.paint_button(dc, layout.button, "Open notebook…", palette, fonts);
+                self.paint_button(
+                    dc,
+                    layout.button,
+                    "Open notebook…",
+                    Hit::StateButton,
+                    palette,
+                    fonts,
+                );
                 if !self.recent.is_empty() {
                     unsafe {
                         draw_text(
@@ -934,7 +960,35 @@ impl NotebookView {
                         DT_WORDBREAK | DT_NOPREFIX,
                     )
                 };
-                self.paint_button(dc, layout.button, "New note", palette, fonts);
+                self.paint_button(
+                    dc,
+                    layout.button,
+                    "New note",
+                    Hit::StateButton,
+                    palette,
+                    fonts,
+                );
+            }
+            Mode::Failed => {
+                unsafe {
+                    draw_text(
+                        dc,
+                        LOAD_FAILED,
+                        layout.message,
+                        fonts.text,
+                        palette.editor_foreground,
+                        DT_WORDBREAK | DT_NOPREFIX,
+                    )
+                };
+                self.paint_button(dc, layout.button, "Retry", Hit::StateButton, palette, fonts);
+                self.paint_button(
+                    dc,
+                    layout.second,
+                    "Open notebook…",
+                    Hit::SecondButton,
+                    palette,
+                    fonts,
+                );
             }
             Mode::Tree => {
                 // `row_list::paint` draws the rows in view and the scroll thumb.
@@ -1003,8 +1057,16 @@ impl NotebookView {
         }
     }
 
-    fn paint_button(&self, dc: HDC, rect: RECT, text: &str, palette: &Palette, fonts: UiFonts) {
-        let background = if self.hover == Some(Hit::StateButton) {
+    fn paint_button(
+        &self,
+        dc: HDC,
+        rect: RECT,
+        text: &str,
+        hit: Hit,
+        palette: &Palette,
+        fonts: UiFonts,
+    ) {
+        let background = if self.hover == Some(hit) {
             palette.hover_background
         } else {
             palette.pressed_background
@@ -1056,6 +1118,10 @@ impl NotebookView {
         match self.mode {
             Mode::NoNotebook => buttons.push(("Open notebook…".to_owned(), state.button)),
             Mode::Empty => buttons.push(("New note".to_owned(), state.button)),
+            Mode::Failed => {
+                buttons.push(("Retry".to_owned(), state.button));
+                buttons.push(("Open notebook…".to_owned(), state.second));
+            }
             Mode::Loading | Mode::Tree => {}
         }
         buttons
@@ -1103,6 +1169,7 @@ fn rebuild_key(hwnd: HWND) -> RebuildKey {
     };
     RebuildKey {
         loaded: super::library_host::with_state(hwnd, |_| ()).is_some(),
+        failed: super::library_host::load_failed(hwnd),
         expansion: super::library_host::expansion_revision(hwnd),
         root,
         unsaved,
@@ -1129,6 +1196,7 @@ fn snapshot(hwnd: HWND) -> Snapshot {
         (rows, state.truncated)
     });
     let (mode, rows, truncated) = match built {
+        None if key.failed => (Mode::Failed, Vec::new(), false),
         None => (Mode::Loading, Vec::new(), false),
         Some((rows, _)) if rows.is_empty() => (Mode::Empty, rows, false),
         Some((rows, truncated)) => (Mode::Tree, rows, truncated),
@@ -1508,7 +1576,8 @@ fn mouse_move(hwnd: HWND, x: i32, y: i32) {
             Hit::Row { index, part } => (Some(index), part == RowPart::Pin),
             _ => (None, false),
         };
-        let hot = matches!(hit, Hit::Header(_) | Hit::StateButton).then_some(hit);
+        let hot =
+            matches!(hit, Hit::Header(_) | Hit::StateButton | Hit::SecondButton).then_some(hit);
         let row_changed = view.list.set_hover(row);
         if row_changed || view.hover_pin != pin || view.hover != hot {
             view.hover_pin = pin;
@@ -1577,6 +1646,7 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
     match hit {
         Hit::Header(button) => header_clicked(hwnd, button),
         Hit::StateButton => state_button(hwnd),
+        Hit::SecondButton => super::library_host::choose_and_open_folder(hwnd),
         Hit::Thumb(grab) => {
             // Captured after the borrow ends: SetCapture sends WM_CAPTURECHANGED to the window
             // that held the capture before.
@@ -1720,6 +1790,7 @@ fn state_button(hwnd: HWND) {
     match with_view(hwnd, |view| view.mode) {
         Some(Mode::NoNotebook) => super::library_host::choose_and_open_folder(hwnd),
         Some(Mode::Empty) => run(hwnd, CommandId::New),
+        Some(Mode::Failed) => super::library_host::retry_load(hwnd),
         _ => {}
     }
 }

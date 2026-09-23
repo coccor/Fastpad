@@ -60,19 +60,22 @@ pub(crate) fn placeholder(notebook: Option<&Path>) -> String {
         .unwrap_or_else(|| "Search".to_owned())
 }
 
-/// The line shown instead of results, if any.
+/// The line shown instead of results, if any. `failed` is a notebook whose load failed.
 pub(crate) fn status_text(
     notebook_open: bool,
     loaded: bool,
+    failed: bool,
     query: &str,
     results: usize,
 ) -> Option<&'static str> {
     if !notebook_open {
         Some(NO_NOTEBOOK)
-    } else if query.trim().is_empty() {
-        None
+    } else if failed {
+        Some(crate::window::notebook_view::LOAD_FAILED)
     } else if !loaded {
         Some(LOADING)
+    } else if query.trim().is_empty() {
+        None
     } else if results == 0 {
         Some(NO_MATCH)
     } else {
@@ -112,6 +115,8 @@ pub(crate) struct SearchView {
     notebook: Option<PathBuf>,
     /// The library's state has loaded, so an empty result list means no match.
     loaded: bool,
+    /// The notebook's load failed (`library_host::load_failed`).
+    failed: bool,
     /// The library changed while the view was hidden: the query runs again when it shows. The
     /// search runs over the library's own note list, so the view never holds a copy of it.
     stale: bool,
@@ -137,6 +142,7 @@ impl SearchView {
             colors,
             notebook: None,
             loaded: false,
+            failed: false,
             stale: false,
             query: String::new(),
             results: Vec::new(),
@@ -218,6 +224,7 @@ impl SearchView {
         status_text(
             self.notebook.is_some(),
             self.loaded,
+            self.failed,
             &self.query,
             self.results.len(),
         )
@@ -400,10 +407,12 @@ pub(crate) fn query_changed(hwnd: HWND) {
             )
         }
     });
+    let failed = library_host::load_failed(hwnd);
     let panel = unsafe { GetParent(edit) };
     let (client, dpi) = geometry(panel);
     with_view(hwnd, |view| {
         view.loaded = found.is_some();
+        view.failed = failed;
         view.stale = false;
         view.set_results(&query, found.unwrap_or_default(), client, dpi);
     });
@@ -415,6 +424,7 @@ pub(crate) fn query_changed(hwnd: HWND) {
 pub(crate) fn library_changed(hwnd: HWND) {
     let notebook = library_host::folder(hwnd);
     let loaded = library_host::with_state(hwnd, |_| ()).is_some();
+    let failed = library_host::load_failed(hwnd);
     let Some((edit, changed)) = with_view(hwnd, |view| {
         let changed = match (&view.notebook, &notebook) {
             (Some(old), Some(new)) => !same_path(old, new),
@@ -422,6 +432,7 @@ pub(crate) fn library_changed(hwnd: HWND) {
             _ => true,
         };
         view.loaded = loaded;
+        view.failed = failed;
         if changed {
             view.notebook = notebook.clone();
             view.placeholder = placeholder(notebook.as_deref());
@@ -1007,18 +1018,22 @@ impl crate::window::sidebar_accessibility::AccessibleView for SearchView {
 #[cfg(test)]
 mod tests {
     use super::{LOADING, NO_MATCH, NO_NOTEBOOK, placeholder, status_text};
+    use crate::window::notebook_view::LOAD_FAILED;
     use std::path::Path;
 
     #[test]
     fn the_status_line_explains_an_empty_list() {
         // Break caught: a blank Search view with no notebook open, "No notes match." shown
         // before anything is typed, or a match count of zero reported while still loading.
-        assert_eq!(status_text(false, false, "x", 0), Some(NO_NOTEBOOK));
-        assert_eq!(status_text(true, true, "", 0), None);
-        assert_eq!(status_text(true, true, "   ", 0), None);
-        assert_eq!(status_text(true, false, "x", 0), Some(LOADING));
-        assert_eq!(status_text(true, true, "x", 0), Some(NO_MATCH));
-        assert_eq!(status_text(true, true, "x", 3), None);
+        assert_eq!(status_text(false, false, false, "x", 0), Some(NO_NOTEBOOK));
+        assert_eq!(status_text(true, true, false, "", 0), None);
+        assert_eq!(status_text(true, true, false, "   ", 0), None);
+        assert_eq!(status_text(true, false, false, "x", 0), Some(LOADING));
+        // Loading shows before anything is typed too (the box is there, but nothing to search).
+        assert_eq!(status_text(true, false, false, "", 0), Some(LOADING));
+        assert_eq!(status_text(true, false, true, "", 0), Some(LOAD_FAILED));
+        assert_eq!(status_text(true, true, false, "x", 0), Some(NO_MATCH));
+        assert_eq!(status_text(true, true, false, "x", 3), None);
     }
 
     #[test]

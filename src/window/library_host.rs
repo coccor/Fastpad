@@ -68,6 +68,9 @@ pub(crate) struct LibraryHost {
     /// The note an open Move to notebook picker moves, and the notebooks it lists, in row order.
     /// The row after the last is "Browse…".
     pub(crate) shown_move: Option<(PathBuf, Vec<PathBuf>)>,
+    /// The last load of the open notebook failed, so the sidebar offers Retry instead of saying
+    /// "Loading…" forever. Starting a load clears it.
+    pub(crate) load_failed: bool,
 }
 
 impl LibraryHost {
@@ -89,6 +92,7 @@ impl LibraryHost {
             check_request: 0,
             expansion_revision: 0,
             shown_move: None,
+            load_failed: false,
         }
     }
 }
@@ -223,6 +227,9 @@ pub(crate) fn open_library_step(hwnd: HWND) {
         })
     };
     host(hwnd, |host| host.folder = assumed);
+    // The sidebar says "Loading…" for the assumed notebook until the worker answers, not "Open a
+    // notebook" (a refresh earlier in startup saw no folder). No flattening: nothing is loaded.
+    super::side_panel::refresh(hwnd);
     spawn_load(
         hwnd,
         Some(Startup {
@@ -238,6 +245,28 @@ pub(crate) fn start_load(hwnd: HWND) {
     spawn_load(hwnd, None);
 }
 
+/// Whether the open notebook failed to load and has no state to show: the sidebar says so and
+/// offers Retry. A rescan that fails keeps the state it had, so this stays false then.
+pub(crate) fn load_failed(hwnd: HWND) -> bool {
+    host(hwnd, |host| {
+        host.load_failed && host.folder.is_some() && host.state.is_none()
+    })
+    .unwrap_or(false)
+}
+
+/// The sidebar's Retry after a failed load: loads the same notebook again, showing "Loading…"
+/// meanwhile.
+pub(crate) fn retry_load(hwnd: HWND) {
+    if folder(hwnd).is_none() {
+        return;
+    }
+    if host(hwnd, |host| host.scanning).unwrap_or(true) {
+        return;
+    }
+    start_load(hwnd);
+    super::side_panel::refresh(hwnd);
+}
+
 fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
     let Some(data) = data_dir(hwnd) else {
         return;
@@ -250,6 +279,7 @@ fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
         host.generation = host.generation.wrapping_add(1);
         host.scanning = true;
         host.rescan_requested = false;
+        host.load_failed = false;
         host.local_written_during_scan = false;
         // The merge re-checks only what FastPad changes in the index from here on.
         if let Some(state) = host.state.as_mut() {
@@ -380,6 +410,7 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
     match result {
         Ok(fresh) => install(hwnd, fresh),
         Err(error) => {
+            host(hwnd, |host| host.load_failed = true);
             push_notice(
                 hwnd,
                 format!(
@@ -538,10 +569,10 @@ pub(crate) fn expanded(hwnd: HWND) -> Vec<PathBuf> {
 ///
 /// `Ok(true)` when a tab followed, `Ok(false)` when none had `old` open, `Err` when a tab had
 /// `old` open but could not be rebound because another tab already has `new` open — the file
-/// moved, but that tab is left pointing at a path that no longer exists. A user-initiated move
-/// or rename refuses upfront when the target is already open (`move_note_to`, `submit_rename`),
-/// so this should only be reachable from a race the rescan discovers later; the caller must not
-/// swallow it.
+/// moved, but that tab is left pointing at a path that no longer exists. `move_note_to` refuses
+/// upfront when the target is already open, and `submit_rename` rebinds its own tab itself (and
+/// undoes the rename when it cannot), so `Err` comes from a relocation the rescan finds: a file
+/// moved outside FastPad onto a path another tab already has open. The caller reports it.
 fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) -> Result<bool, ()> {
     let stamp = library::disk_stamp(&new);
     let outcome = unsafe { app_ptr(hwnd) }.map(|mut app| {
@@ -1630,17 +1661,11 @@ fn tab_open_for(hwnd: HWND, path: &Path) -> bool {
     })
 }
 
-/// Makes a `rebind_open_tab` failure visible: a race left a tab pointing at a path that no
-/// longer exists, because another tab already had the new one open. `move_note_to` and
-/// `submit_rename` already refuse upfront when the target is open, so this is only reachable
-/// from an external relocation the rescan discovers after another tab opened the target.
+/// Makes a `rebind_open_tab` failure visible: a tab is left pointing at a path that no longer
+/// exists, because another tab already had the new one open. A file moved outside FastPad onto
+/// a path another tab has open reaches this through the rescan; `move_note_to` refuses such a
+/// move upfront, and `submit_rename` never calls `rebind_open_tab`.
 fn report_rebind_failure(hwnd: HWND, old: &Path, new: &Path) {
-    debug_assert!(
-        false,
-        "rebind_open_tab: {} already open, so {} could not follow its move",
-        new.display(),
-        old.display()
-    );
     push_notice(
         hwnd,
         format!(

@@ -10144,6 +10144,99 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_load_offers_retry_and_open_instead_of_loading_forever() {
+        // Break caught: a notebook whose load failed showing "Loading…" in both views for good,
+        // with no way to try again but reopening it.
+        use windows_sys::Win32::Foundation::LPARAM;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-failed");
+        scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        app_mut(window.hwnd).library.folder = Some(scratch.folder());
+        let generation = app_mut(window.hwnd).library.generation;
+        crate::window::library_host::library_ready(
+            window.hwnd,
+            crate::window::library_host::test_ready_payload(generation, Err("boom".to_owned())),
+        );
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Failed);
+        let panel = notebook_view(window.hwnd).panel;
+        let mut client = RECT::default();
+        unsafe { GetClientRect(panel, &mut client) };
+        let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+        let buttons = notebook_view(window.hwnd).buttons(client, dpi);
+        let names: Vec<&str> = buttons.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            names.ends_with(&["Retry", "Open notebook…"]),
+            "exposed to screen readers like the empty-state buttons: {names:?}"
+        );
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        assert_eq!(
+            crate::window::search_view::status(window.hwnd),
+            Some(crate::window::notebook_view::LOAD_FAILED)
+        );
+
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        let retry = buttons[buttons.len() - 2].1;
+        let lparam = ((((retry.top + retry.bottom) / 2) as u32) << 16
+            | ((retry.left + retry.right) / 2) as u32) as LPARAM;
+        unsafe {
+            SendMessageW(panel, WM_LBUTTONDOWN, 0, lparam);
+            SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
+        }
+        assert_eq!(
+            notebook_view(window.hwnd).mode,
+            Mode::Loading,
+            "Retry clears the failure and loads the same notebook again"
+        );
+        pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+    }
+
+    #[test]
+    fn at_startup_both_views_say_loading_for_the_notebook_being_opened() {
+        // Break caught: the Search view saying "Open a notebook to search it." while the
+        // remembered notebook loads.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("startup-loading");
+        scratch.note("a.md", "a");
+        write_notebooks(&scratch.data(), vec![scratch.folder()], vec![]);
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        assert_eq!(
+            crate::window::search_view::status(window.hwnd),
+            Some(crate::window::search_view::NO_NOTEBOOK)
+        );
+
+        crate::window::library_host::open_library_step(window.hwnd);
+        assert_eq!(
+            crate::window::search_view::status(window.hwnd),
+            Some(crate::window::search_view::LOADING)
+        );
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
+        pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+        assert_eq!(crate::window::search_view::status(window.hwnd), None);
+    }
+
+    #[test]
     fn an_empty_notebook_says_so_until_an_untitled_tab_appears_as_an_unsaved_row() {
         // Break caught: a blank panel for a notebook with no notes, or a new untitled tab that the
         // tree does not show until it is saved.
