@@ -75,6 +75,8 @@ pub enum CommandId {
     NotebookDelete,
     TagRename,
     TagRemoveEverywhere,
+    NoteRename,
+    NoteDelete,
 }
 
 impl CommandId {
@@ -143,7 +145,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 74] = [
+        const COMMANDS: [CommandId; 76] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -218,6 +220,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotebookDelete,
             CommandId::TagRename,
             CommandId::TagRemoveEverywhere,
+            CommandId::NoteRename,
+            CommandId::NoteDelete,
         ];
         COMMANDS
             .into_iter()
@@ -299,10 +303,14 @@ mod tests {
         assert_eq!(CommandId::try_from(171), Ok(CommandId::NotebookDelete));
         assert_eq!(CommandId::try_from(172), Ok(CommandId::TagRename));
         assert_eq!(CommandId::try_from(173), Ok(CommandId::TagRemoveEverywhere));
+        assert_eq!(CommandId::try_from(174), Ok(CommandId::NoteRename));
+        assert_eq!(CommandId::try_from(175), Ok(CommandId::NoteDelete));
         assert!(CommandId::NoteToggleFavorite.needs_document());
         assert!(CommandId::NoteRemoveTag.needs_document());
         assert!(!CommandId::NotebookNew.needs_document());
         assert!(!CommandId::TagRemoveEverywhere.needs_document());
+        assert!(CommandId::NoteRename.needs_document());
+        assert!(CommandId::NoteDelete.needs_document());
     }
 
     #[test]

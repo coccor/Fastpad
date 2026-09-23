@@ -1834,6 +1834,16 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         | CommandId::NotebookDelete
         | CommandId::TagRename
         | CommandId::TagRemoveEverywhere => crate::window::library_host::organize(hwnd, command),
+        CommandId::NoteRename => {
+            if crate::window::library_host::ready_library(hwnd) {
+                crate::window::library_host::rename_note(hwnd);
+            }
+        }
+        CommandId::NoteDelete => {
+            if crate::window::library_host::ready_library(hwnd) {
+                crate::window::library_host::delete_note(hwnd);
+            }
+        }
         CommandId::FontSizeIncrease => {
             set_font_size(hwnd, |size| {
                 size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
@@ -2797,7 +2807,38 @@ fn close_active_document(hwnd: HWND) {
     } else {
         review
     };
+    close_reviewed_document(hwnd, &identity, &editor, review, decision);
+}
 
+/// Closes `id` without asking, discarding any unsaved edits, e.g. once its file is deleted.
+pub(super) fn close_document_without_prompt(hwnd: HWND, id: DocumentId) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    if !activate_document_by_id(hwnd, id) || !identity.is_live_for(hwnd) {
+        return;
+    }
+    let reviewed = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        Some((app.tabs.active_close_review()?, app.editor.clone()?))
+    });
+    let Some((review, editor)) = reviewed else {
+        return;
+    };
+    if review.id == id {
+        close_reviewed_document(hwnd, &identity, &editor, review, CloseDecision::Discard);
+    }
+}
+
+/// The close itself, once `decision` is settled: closes the reviewed tab, removes its recovery
+/// snapshots and shows whichever tab takes its place.
+fn close_reviewed_document(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    editor: &Editor,
+    review: crate::window::tabs::CloseReview,
+    decision: CloseDecision,
+) {
     let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let closed = app.tabs.close_reviewed(review, decision).ok()?;
@@ -8230,5 +8271,114 @@ mod tests {
             ))
         );
         assert_eq!(name_box.text(), "B");
+    }
+
+    #[test]
+    fn renaming_a_note_renames_its_file_and_keeps_its_metadata() {
+        // Break caught: a rename losing the note's notebook, or the tab still pointing at the old path.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("rename");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let old = open_note(&window, &scratch, "a.md", "text");
+        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        execute_command(window.hwnd, CommandId::NoteRename);
+        assert_eq!(
+            app_mut(window.hwnd).name_box.as_ref().unwrap().text(),
+            "a.md"
+        );
+        type_into_name_box(window.hwnd, "Plan");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        let new = scratch.folder().join("Plan.md");
+        assert!(!old.exists());
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "text");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(new.as_path())
+        );
+        let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+        assert!(state.record_for(&new).unwrap().favorite);
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_file_is_refused() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("rename-clash");
+        scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let a = open_note(&window, &scratch, "a.md", "a");
+        execute_command(window.hwnd, CommandId::NoteRename);
+        type_into_name_box(window.hwnd, "B.md");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert!(a.exists());
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("b.md")).unwrap(),
+            "b"
+        );
+        assert!(
+            app_mut(window.hwnd)
+                .name_box
+                .as_ref()
+                .unwrap()
+                .error()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn renaming_a_note_changing_only_letter_case_works() {
+        // Break caught: the clash check or the tab collision check treating the note's own file
+        // as a different one that already has the new name.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("rename-case");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        open_note(&window, &scratch, "plan.md", "text");
+        execute_command(window.hwnd, CommandId::NoteRename);
+        type_into_name_box(window.hwnd, "Plan.md");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        let names: Vec<String> = std::fs::read_dir(scratch.folder())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".md"))
+            .collect();
+        assert_eq!(names, ["Plan.md"]);
+        let new = scratch.folder().join("Plan.md");
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .active()
+                .unwrap()
+                .path
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned()),
+            Some("Plan.md".to_owned())
+        );
+        assert!(!name_box_visible(window.hwnd));
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "text");
+    }
+
+    #[test]
+    fn deleting_a_note_asks_then_recycles_it_and_keeps_its_record_hidden() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("delete-note");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "a");
+        execute_command(window.hwnd, CommandId::NoteToggleFavorite);
+        crate::window::answer_next_confirm(|_| false);
+        execute_command(window.hwnd, CommandId::NoteDelete);
+        assert!(path.exists());
+        crate::window::answer_next_confirm(|_| true);
+        execute_command(window.hwnd, CommandId::NoteDelete);
+        assert!(!path.exists());
+        assert_eq!(super::tab_count(window.hwnd), 0);
+        let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+        let record = state.record_for(&path).unwrap();
+        assert!(record.deleted);
+        assert!(state.local.missing_since(record.id).is_some());
+        assert!(state.notes.is_empty());
     }
 }

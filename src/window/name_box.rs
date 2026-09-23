@@ -47,11 +47,8 @@ pub(crate) const fn name_box_height(dpi: u32) -> i32 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NamePurpose {
     FirstSave(DocumentId),
-    #[allow(dead_code, reason = "Task 20 renames notes through the name box")]
     RenameNote(DocumentId),
-    NewNotebook {
-        then_move: Option<DocumentId>,
-    },
+    NewNotebook { then_move: Option<DocumentId> },
     RenameNotebook(NotebookId),
     RenameTag(TagId),
 }

@@ -781,6 +781,7 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
         NamePurpose::NewNotebook { .. }
         | NamePurpose::RenameNotebook(_)
         | NamePurpose::RenameTag(_)
+        | NamePurpose::RenameNote(_)
             if !ready_library(hwnd) =>
         {
             close_name_box(hwnd);
@@ -800,8 +801,7 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
             let result = apply_op(hwnd, |_, _| Some(PendingOp::RenameTag { id, name: text }));
             close_name_box_unless_error(hwnd, result);
         }
-        // Task 20 adds renaming notes.
-        NamePurpose::RenameNote(_) => close_name_box(hwnd),
+        NamePurpose::RenameNote(id) => submit_rename(hwnd, id, &text),
     }
 }
 
@@ -884,6 +884,130 @@ fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
         }
         super::main_window::SaveOutcome::Failed => {}
     }
+}
+
+/// Note: Rename...: the name box, prefilled with the file's current name.
+pub(crate) fn rename_note(hwnd: HWND) {
+    let Some(path) = active_file(hwnd) else {
+        return;
+    };
+    let Some(id) =
+        unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+    else {
+        return;
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    open_name_box(
+        hwnd,
+        NamePurpose::RenameNote(id),
+        &name,
+        "Rename".to_owned(),
+        false,
+    );
+}
+
+/// Renames the tab's file in place, never over another file, then follows it in the tab and the
+/// library.
+fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
+    let Some(old) = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.document(id)?.path.clone())
+    else {
+        close_name_box(hwnd);
+        return;
+    };
+    let current_extension = old
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "md".into());
+    let (stem, extension) = title::split_typed_name(text, &current_extension);
+    let new = old.with_file_name(format!("{stem}.{extension}"));
+    if new == old {
+        close_name_box(hwnd);
+        return;
+    }
+    // A change of letter case only names the same file, so it is not a clash.
+    let case_only = library::model::same_path(&new, &old);
+    let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
+    if new.exists() && !case_only {
+        name_box_error(hwnd, name_taken_error(&parent, &stem, &extension));
+        return;
+    }
+    if let Err(error) = crate::platform::files::rename_no_replace(&old, &new) {
+        // A file may have taken the name after the check above; it is left alone.
+        let error = if new.exists() && !case_only {
+            name_taken_error(&parent, &stem, &extension)
+        } else {
+            format!("FastPad could not rename the file: {error}")
+        };
+        name_box_error(hwnd, error);
+        return;
+    }
+    let rebound = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        unsafe { app.as_mut() }
+            .tabs
+            .rebind_path(id, new.clone())
+            .is_ok()
+    });
+    if !rebound {
+        // Undo, so the tab and the disk agree.
+        let _ = crate::platform::files::rename_no_replace(&new, &old);
+        name_box_error(hwnd, "Another tab already has that file open.".to_owned());
+        return;
+    }
+    with_state(hwnd, |state| state.rename_note(&old, &new));
+    schedule_write(hwnd);
+    close_name_box(hwnd);
+    super::main_window::invalidate_title_strip(hwnd);
+    // The extension may have changed, and with it the language.
+    unsafe {
+        PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
+    }
+}
+
+/// Note: Delete: after a confirm, sends the file to the Recycle Bin and closes its tab. Any
+/// record stays, flagged deleted and marked missing, so the 30-day purge removes it.
+pub(crate) fn delete_note(hwnd: HWND) {
+    let Some(path) = active_file(hwnd) else {
+        return;
+    };
+    let Some(id) =
+        unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+    else {
+        return;
+    };
+    let question = format!(
+        "Move \u{201c}{}\u{201d} to the Recycle Bin?",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    if !confirmed(hwnd, &question) {
+        return;
+    }
+    if let Err(error) = crate::platform::files::recycle(&path) {
+        push_notice(
+            hwnd,
+            format!("FastPad could not delete {}: {error}", path.display()),
+        );
+        return;
+    }
+    let now = library::now_unix();
+    let record = with_state(hwnd, |state| state.record_for(&path).map(|r| r.id)).flatten();
+    if let Some(note_id) = record {
+        report(
+            hwnd,
+            apply_op(hwnd, |state, ids| {
+                Some(PendingOp::SetDeleted {
+                    note: state.note_ref(ids, &path),
+                    value: true,
+                })
+            }),
+        );
+        with_state(hwnd, |state| state.local.set_missing(note_id, now));
+    }
+    with_state(hwnd, |state| state.remove_note(&path));
+    super::main_window::close_document_without_prompt(hwnd, id);
 }
 
 /// Browse… in the name box: the system Save As dialog, starting in the folder.
@@ -1662,7 +1786,7 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
                     .library
                     .notes
                     .iter()
-                    .filter(|n| n.notebook == Some(id))
+                    .filter(|n| n.notebook == Some(id) && !n.deleted)
                     .count()
             })
             .unwrap_or(0);
