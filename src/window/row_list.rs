@@ -3,11 +3,6 @@
 //! plain data. `paint` draws only the rows in view, into the caller's double-buffered DC.
 //!
 //! Every `height` is the list area's height in pixels, and every `y` is relative to its top.
-// Task 10 is the first non-test user; it removes this.
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the sidebar views use it from Task 10")
-)]
 
 use crate::window::palette::Palette;
 use crate::window::panel::fill;
@@ -16,10 +11,27 @@ use windows_sys::Win32::Graphics::Gdi::{HDC, IntersectClipRect, RestoreDC, SaveD
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_DOWN, VK_END, VK_HOME, VK_NEXT, VK_PRIOR, VK_UP,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    SPI_GETWHEELSCROLLLINES, SystemParametersInfoW, WHEEL_DELTA,
+};
 
 /// `SPI_GETWHEELSCROLLLINES` reports this for "one screen at a time".
 const WHEEL_PAGESCROLL: u32 = u32::MAX;
+
+/// The user's wheel setting (`SPI_GETWHEELSCROLLLINES`), 3 lines if it can't be read. The
+/// sidebar's lists pass it to `RowListState::wheel`.
+pub(crate) fn wheel_lines() -> u32 {
+    let mut lines = 3u32;
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            (&mut lines as *mut u32).cast(),
+            0,
+        )
+    };
+    if read == 0 { 3 } else { lines }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListKey {

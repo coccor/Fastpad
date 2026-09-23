@@ -1,0 +1,1673 @@
+//! The Notebook view (spec §6): the open notebook's folder tree in the side panel, with its
+//! header, pins, type-ahead and the loading, no-notebook and empty states. The tree itself is
+//! built on the scan worker (`LibraryState.tree`). This module flattens the expanded part into
+//! rows, paints only the rows on screen, and turns clicks and keys into `open_note` calls.
+
+use super::main_window::{OpenMode, app_ptr};
+use super::side_panel::{UiFonts, ViewPaint, draw_text, point_of};
+use crate::document::{Document, DocumentId};
+use crate::library::tree::{self, RowKind, TreeRow, UnsavedEntry};
+use crate::window::commands::CommandId;
+use crate::window::menus::MenuEntry;
+use crate::window::palette::Palette;
+use crate::window::panel::{fill, scale};
+use crate::window::row_list::{self, ListKey, RowListState, RowLook};
+use crate::window::tooltip::Tooltip;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    ClientToScreen, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DT_WORDBREAK, GetDC, GetTextExtentPoint32W, HDC, HFONT, InvalidateRect, ReleaseDC,
+    ScreenToClient, SelectObject,
+};
+use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_CONTROL, VK_LEFT, VK_RETURN, VK_RIGHT,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetParent, SendMessageW, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+};
+
+// Sizes at 96 DPI; everything is scaled with `panel::scale`.
+const ROW_HEIGHT: i32 = 26;
+const HEADER_HEIGHT: i32 = 38;
+const INDENT: i32 = 12;
+const LEFT_PAD: i32 = 8;
+const GLYPH_BOX: i32 = 16;
+const GAP: i32 = 6;
+const PIN_BOX: i32 = 24;
+const HEADER_BUTTON: i32 = 28;
+const TYPE_AHEAD_RESET: Duration = Duration::from_secs(1);
+
+pub(crate) const TRUNCATED_ROW: &str = "Showing the first 10,000 notes";
+
+// Segoe MDL2 Assets, the font the title bar already uses.
+const GLYPH_CHEVRON_RIGHT: &str = "\u{E76C}";
+const GLYPH_CHEVRON_DOWN: &str = "\u{E70D}";
+const GLYPH_FOLDER: &str = "\u{E8B7}";
+const GLYPH_NOTE: &str = "\u{E8A5}";
+const GLYPH_PIN: &str = "\u{E718}";
+const GLYPH_PINNED: &str = "\u{E842}";
+const GLYPH_STAR: &str = "\u{E734}";
+const GLYPH_STAR_FILLED: &str = "\u{E735}";
+const GLYPH_ADD: &str = "\u{E710}";
+const GLYPH_MORE: &str = "\u{E712}";
+
+// Tooltip tool IDs.
+const TOOL_ROW: usize = 1;
+const TOOL_TITLE: usize = 2;
+const TOOL_FAVORITE: usize = 3;
+const TOOL_NEW: usize = 4;
+const TOOL_MORE: usize = 5;
+
+/// What the view shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mode {
+    /// No notebook: "Open a notebook to see its notes.", a button and the RECENT list.
+    NoNotebook,
+    /// A notebook is open but its state has not arrived from the worker.
+    Loading,
+    /// Loaded, with no notes and no untitled tabs.
+    Empty,
+    Tree,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeaderButton {
+    Favorite,
+    NewNote,
+    More,
+}
+
+/// How a note row is being opened (spec §6.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Activation {
+    /// A mouse click: the preview tab, focus to the editor.
+    Click,
+    /// Enter: the preview tab, focus stays in the tree for further browsing.
+    Enter,
+    /// Ctrl+Enter or a double-click: a normal tab, focus to the editor.
+    Permanent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowPart {
+    Chevron,
+    Pin,
+    Body,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hit {
+    Header(HeaderButton),
+    Title,
+    /// "Open notebook…" (no notebook) or "New note" (empty notebook).
+    StateButton,
+    /// The scroll thumb, with where on it the press landed.
+    Thumb(i32),
+    Row {
+        index: usize,
+        part: RowPart,
+    },
+    Empty,
+}
+
+/// What a list index stands for right now.
+#[derive(Clone, Debug)]
+enum Target {
+    Recent(PathBuf),
+    Row(TreeRow),
+    Truncated,
+    Nothing,
+}
+
+// windows-sys RECT is only Clone + Copy, so the layout structs are too.
+#[derive(Clone, Copy)]
+pub(crate) struct RowParts {
+    pub chevron: RECT,
+    pub icon: RECT,
+    pub name: RECT,
+    pub pin: RECT,
+}
+
+/// A tree row's pieces: the chevron (folders only) and icon, indented by `depth`, the name, and
+/// the pin button at the right edge. Every rectangle stays inside `row`, even in a narrow panel.
+pub(crate) fn row_parts(row: RECT, depth: u16, dpi: u32) -> RowParts {
+    let glyph = scale(GLYPH_BOX, dpi);
+    let chevron_left =
+        (row.left + scale(LEFT_PAD, dpi) + i32::from(depth) * scale(INDENT, dpi)).min(row.right);
+    let chevron = RECT {
+        left: chevron_left,
+        top: row.top,
+        right: (chevron_left + glyph).min(row.right),
+        bottom: row.bottom,
+    };
+    let icon = RECT {
+        left: chevron.right,
+        top: row.top,
+        right: (chevron.right + glyph).min(row.right),
+        bottom: row.bottom,
+    };
+    let pin_left = (row.right - scale(PIN_BOX, dpi)).max(icon.right);
+    let pin = RECT {
+        left: pin_left,
+        top: row.top,
+        right: row.right,
+        bottom: row.bottom,
+    };
+    let name = RECT {
+        left: (icon.right + scale(GAP, dpi)).min(pin_left),
+        top: row.top,
+        right: pin_left,
+        bottom: row.bottom,
+    };
+    RowParts {
+        chevron,
+        icon,
+        name,
+        pin,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HeaderLayout {
+    pub title: RECT,
+    /// Left to right: star, New note, "…".
+    pub buttons: [(HeaderButton, RECT); 3],
+}
+
+pub(crate) fn header_layout(area: RECT, dpi: u32) -> HeaderLayout {
+    let height = scale(HEADER_HEIGHT, dpi);
+    let size = scale(HEADER_BUTTON, dpi);
+    let top = area.top + (height - size) / 2;
+    let right = area.right - scale(6, dpi);
+    let slot = |from_right: i32| RECT {
+        left: right - (from_right + 1) * size,
+        top,
+        right: right - from_right * size,
+        bottom: top + size,
+    };
+    let buttons = [
+        (HeaderButton::Favorite, slot(2)),
+        (HeaderButton::NewNote, slot(1)),
+        (HeaderButton::More, slot(0)),
+    ];
+    let title_left = area.left + scale(12, dpi);
+    let title = RECT {
+        left: title_left,
+        top: area.top,
+        right: (buttons[0].1.left - scale(4, dpi)).max(title_left),
+        bottom: area.top + height,
+    };
+    HeaderLayout { title, buttons }
+}
+
+/// Everything below the header.
+pub(crate) fn body_rect(area: RECT, dpi: u32) -> RECT {
+    RECT {
+        top: (area.top + scale(HEADER_HEIGHT, dpi)).min(area.bottom),
+        ..area
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StateLayout {
+    pub message: RECT,
+    pub button: RECT,
+    /// "RECENT", in the no-notebook state.
+    pub label: RECT,
+    /// The recent rows.
+    pub list: RECT,
+}
+
+/// Where the no-notebook and empty states put their message, button and RECENT list.
+pub(crate) fn state_layout(body: RECT, dpi: u32) -> StateLayout {
+    let pad = scale(12, dpi);
+    let left = body.left + pad;
+    let right = (body.right - pad).max(left);
+    let message = RECT {
+        left,
+        top: body.top + scale(8, dpi),
+        right,
+        bottom: body.top + scale(48, dpi),
+    };
+    let button = RECT {
+        left,
+        top: message.bottom + scale(4, dpi),
+        right: (left + scale(140, dpi)).min(right),
+        bottom: message.bottom + scale(32, dpi),
+    };
+    let label = RECT {
+        left,
+        top: button.bottom + scale(16, dpi),
+        right,
+        bottom: button.bottom + scale(36, dpi),
+    };
+    let list = RECT {
+        left: body.left,
+        top: label.bottom.min(body.bottom),
+        right: body.right,
+        bottom: body.bottom,
+    };
+    StateLayout {
+        message,
+        button,
+        label,
+        list,
+    }
+}
+
+/// The row that stands for `kind` after a rebuild: the same path if it is still there, else the
+/// row that took its index (clamped to the list). Nothing selected stays nothing.
+pub(crate) fn follow(
+    rows: &[TreeRow],
+    kind: Option<&RowKind>,
+    old: Option<usize>,
+) -> Option<usize> {
+    let kind = kind?;
+    if let Some(index) = tree::row_index(rows, kind) {
+        return Some(index);
+    }
+    let last = rows.len().checked_sub(1)?;
+    Some(old.unwrap_or(0).min(last))
+}
+
+/// One entry per untitled tab, keyed by its `DocumentId`, labelled like its tab (spec §6.2).
+pub(crate) fn unsaved_entries<'a>(
+    documents: impl Iterator<Item = &'a Document>,
+) -> Vec<UnsavedEntry> {
+    documents
+        .filter(|document| document.path.is_none())
+        .map(|document| UnsavedEntry {
+            key: document.id.0,
+            label: document
+                .untitled_label
+                .clone()
+                .or_else(|| document.first_line_label.clone())
+                .unwrap_or_else(|| "Untitled".to_owned()),
+        })
+        .collect()
+}
+
+/// Letters typed into the tree within a second of each other form one prefix.
+#[derive(Debug, Default)]
+pub(crate) struct TypeAhead {
+    text: String,
+    at: Option<Instant>,
+}
+
+impl TypeAhead {
+    pub(crate) fn push(&mut self, ch: char, now: Instant) -> &str {
+        if self
+            .at
+            .is_none_or(|at| now.duration_since(at) >= TYPE_AHEAD_RESET)
+        {
+            self.text.clear();
+        }
+        self.text.push(ch);
+        self.at = Some(now);
+        &self.text
+    }
+}
+
+/// The Notebook view's state, owned by `side_panel::Sidebar`.
+pub(crate) struct NotebookView {
+    pub(crate) panel: HWND,
+    pub(crate) mode: Mode,
+    pub(crate) rows: Vec<TreeRow>,
+    /// The scan stopped at its limit: one more row, after the last, says so.
+    pub(crate) truncated: bool,
+    pub(crate) list: RowListState,
+    /// The no-notebook state's RECENT notebooks and their display names.
+    pub(crate) recent: Vec<PathBuf>,
+    recent_names: Vec<(String, Option<String>)>,
+    root: Option<PathBuf>,
+    name: String,
+    favorite: bool,
+    /// The header button (or state button) under the pointer.
+    hover: Option<Hit>,
+    /// The pointer is over the hovered row's pin button.
+    pub(crate) hover_pin: bool,
+    tooltip: Option<Tooltip>,
+    tooltip_failed: bool,
+    typed: TypeAhead,
+    thumb_grab: Option<i32>,
+    tracking_leave: bool,
+}
+
+impl std::fmt::Debug for NotebookView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NotebookView")
+            .field("mode", &self.mode)
+            .field("rows", &self.rows.len())
+            .field("selected", &self.list.selected)
+            .finish_non_exhaustive()
+    }
+}
+
+const fn height(rect: RECT) -> i32 {
+    let height = rect.bottom - rect.top;
+    if height > 0 { height } else { 0 }
+}
+
+const fn contains(rect: RECT, x: i32, y: i32) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+const LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX;
+const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
+
+/// A row's text color: the selection's own color only over the focused selection, whose
+/// background `row_list::paint` fills; an unfocused selection sits on the inactive-selection
+/// background and keeps the editor's text color.
+fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
+    if look.selected && look.focused {
+        palette
+            .selection_foreground
+            .unwrap_or(palette.editor_foreground)
+    } else {
+        palette.editor_foreground
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row's paint inputs, called from one closure"
+)]
+fn draw_tree_row(
+    dc: HDC,
+    row: Option<&TreeRow>,
+    rect: RECT,
+    look: RowLook,
+    palette: &Palette,
+    fonts: UiFonts,
+    dpi: u32,
+    pin_hot: bool,
+) {
+    let foreground = row_foreground(look, palette);
+    let muted = if look.selected && look.focused {
+        foreground
+    } else {
+        palette.muted_foreground
+    };
+    let Some(row) = row else {
+        let text = RECT {
+            left: rect.left + scale(LEFT_PAD, dpi),
+            ..rect
+        };
+        unsafe { draw_text(dc, TRUNCATED_ROW, text, fonts.italic, muted, LINE) };
+        return;
+    };
+    let parts = row_parts(rect, row.depth, dpi);
+    match &row.kind {
+        RowKind::Folder(_) => {
+            let chevron = if row.expanded {
+                GLYPH_CHEVRON_DOWN
+            } else {
+                GLYPH_CHEVRON_RIGHT
+            };
+            unsafe { draw_text(dc, chevron, parts.chevron, fonts.glyph, muted, CENTERED) };
+            unsafe { draw_text(dc, GLYPH_FOLDER, parts.icon, fonts.glyph, muted, CENTERED) };
+        }
+        RowKind::Note(_) | RowKind::Unsaved(_) => {
+            unsafe { draw_text(dc, GLYPH_NOTE, parts.icon, fonts.glyph, muted, CENTERED) };
+        }
+    }
+    if matches!(row.kind, RowKind::Note(_)) {
+        // Pinned is a filled glyph, never color alone (spec §10).
+        if row.pinned {
+            unsafe {
+                draw_text(
+                    dc,
+                    GLYPH_PINNED,
+                    parts.pin,
+                    fonts.glyph,
+                    foreground,
+                    CENTERED,
+                )
+            };
+        } else if look.hover || look.selected {
+            let color = if pin_hot { foreground } else { muted };
+            unsafe { draw_text(dc, GLYPH_PIN, parts.pin, fonts.glyph, color, CENTERED) };
+        }
+    }
+    let font = if matches!(row.kind, RowKind::Unsaved(_)) {
+        fonts.italic
+    } else {
+        fonts.text
+    };
+    unsafe { draw_text(dc, &row.name, parts.name, font, foreground, LINE) };
+}
+
+fn draw_recent_row(
+    dc: HDC,
+    name: Option<&(String, Option<String>)>,
+    rect: RECT,
+    look: RowLook,
+    palette: &Palette,
+    fonts: UiFonts,
+    dpi: u32,
+) {
+    let Some((name, hint)) = name else {
+        return;
+    };
+    let foreground = row_foreground(look, palette);
+    let parts = row_parts(rect, 0, dpi);
+    unsafe {
+        draw_text(
+            dc,
+            GLYPH_FOLDER,
+            parts.icon,
+            fonts.glyph,
+            palette.muted_foreground,
+            CENTERED,
+        )
+    };
+    let text = RECT {
+        right: rect.right - scale(LEFT_PAD, dpi),
+        ..parts.name
+    };
+    // A clash between two notebook names shows the parent folder, dimmed, after the name.
+    let label = match hint {
+        Some(hint) => format!("{name}  {hint}"),
+        None => name.clone(),
+    };
+    unsafe { draw_text(dc, &label, text, fonts.text, foreground, LINE) };
+}
+
+impl NotebookView {
+    pub(crate) fn new(panel: HWND) -> Self {
+        let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+        Self {
+            panel,
+            mode: Mode::Loading,
+            rows: Vec::new(),
+            truncated: false,
+            list: RowListState::new(scale(ROW_HEIGHT, dpi)),
+            recent: Vec::new(),
+            recent_names: Vec::new(),
+            root: None,
+            name: String::new(),
+            favorite: false,
+            hover: None,
+            hover_pin: false,
+            tooltip: None,
+            tooltip_failed: false,
+            typed: TypeAhead::default(),
+            thumb_grab: None,
+            tracking_leave: false,
+        }
+    }
+
+    /// The list's rectangle for the current mode, in the panel's `client` coordinates at `dpi`:
+    /// the tree rows, the RECENT rows, or an empty band while there are none.
+    pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
+        let body = body_rect(client, dpi);
+        match self.mode {
+            Mode::Tree => body,
+            Mode::NoNotebook => state_layout(body, dpi).list,
+            Mode::Loading | Mode::Empty => RECT {
+                bottom: body.top,
+                ..body
+            },
+        }
+    }
+
+    fn dpi(&self) -> u32 {
+        unsafe { GetDpiForWindow(self.panel) }.max(96)
+    }
+
+    fn client(&self) -> RECT {
+        let mut rect = RECT::default();
+        unsafe {
+            GetClientRect(self.panel, &mut rect);
+        }
+        rect
+    }
+
+    fn invalidate(&self) {
+        unsafe {
+            InvalidateRect(self.panel, std::ptr::null(), 0);
+        }
+    }
+
+    /// The list's rectangle in panel coordinates for the current mode.
+    fn list_rect(&self, area: RECT) -> RECT {
+        self.list_area(area, self.dpi())
+    }
+
+    fn list_height(&self) -> i32 {
+        height(self.list_rect(self.client())).max(self.list.row_height)
+    }
+
+    fn row_rect(&self, list: RECT, index: usize) -> Option<RECT> {
+        let top = self.list.row_top(index)?;
+        Some(RECT {
+            left: list.left,
+            top: list.top + top,
+            right: list.right,
+            bottom: list.top + top + self.list.row_height,
+        })
+    }
+
+    fn target(&self, index: usize) -> Target {
+        match self.mode {
+            Mode::NoNotebook => self
+                .recent
+                .get(index)
+                .cloned()
+                .map_or(Target::Nothing, Target::Recent),
+            Mode::Tree => match self.rows.get(index) {
+                Some(row) => Target::Row(row.clone()),
+                None if self.truncated && index == self.rows.len() => Target::Truncated,
+                None => Target::Nothing,
+            },
+            Mode::Loading | Mode::Empty => Target::Nothing,
+        }
+    }
+
+    fn select(&mut self, index: usize) {
+        let height = self.list_height();
+        self.list.select(index, height);
+        self.invalidate();
+    }
+
+    fn apply(&mut self, snapshot: Snapshot, names: Vec<(String, Option<String>)>) {
+        let reset = snapshot.mode != self.mode || snapshot.root != self.root;
+        if reset {
+            self.list = RowListState::new(self.list.row_height);
+            self.typed = TypeAhead::default();
+        }
+        let selected = self
+            .list
+            .selected
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.kind.clone());
+        let top = (!reset)
+            .then(|| self.rows.get(self.list.top).map(|row| row.kind.clone()))
+            .flatten();
+        let (old_selected, old_top) = (self.list.selected, self.list.top);
+        self.mode = snapshot.mode;
+        self.name = snapshot
+            .root
+            .as_deref()
+            .map(super::library_host::notebook_name)
+            .unwrap_or_default();
+        self.root = snapshot.root;
+        self.favorite = snapshot.favorite;
+        self.rows = snapshot.rows;
+        self.truncated = snapshot.truncated;
+        self.recent = snapshot.recent;
+        self.recent_names = names;
+        let count = match self.mode {
+            Mode::Tree => self.rows.len() + usize::from(self.truncated),
+            Mode::NoNotebook => self.recent.len(),
+            Mode::Loading | Mode::Empty => 0,
+        };
+        self.list.set_count(count);
+        // Measured in the new mode's list area.
+        let height = self.list_height();
+        if self.mode == Mode::Tree {
+            self.list.selected = follow(&self.rows, selected.as_ref(), old_selected);
+            self.list.top = follow(&self.rows, top.as_ref(), Some(old_top)).unwrap_or(0);
+            self.list.scroll_lines(0, height);
+        }
+        self.hover_pin = false;
+    }
+
+    fn hit_test(&self, x: i32, y: i32) -> Hit {
+        let area = self.client();
+        let dpi = self.dpi();
+        if y < area.top + scale(HEADER_HEIGHT, dpi) {
+            let header = header_layout(area, dpi);
+            if self.mode != Mode::NoNotebook {
+                for (button, rect) in header.buttons {
+                    if contains(rect, x, y) {
+                        return Hit::Header(button);
+                    }
+                }
+            }
+            return if contains(header.title, x, y) {
+                Hit::Title
+            } else {
+                Hit::Empty
+            };
+        }
+        let body = body_rect(area, dpi);
+        match self.mode {
+            Mode::NoNotebook | Mode::Empty => {
+                let layout = state_layout(body, dpi);
+                if contains(layout.button, x, y) {
+                    return Hit::StateButton;
+                }
+                if self.mode == Mode::NoNotebook
+                    && contains(layout.list, x, y)
+                    && let Some(index) = self.list.row_at(y - layout.list.top)
+                {
+                    return Hit::Row {
+                        index,
+                        part: RowPart::Body,
+                    };
+                }
+                Hit::Empty
+            }
+            Mode::Loading => Hit::Empty,
+            Mode::Tree => {
+                let list = self.list_rect(area);
+                if let Some(grab) = self.list.thumb_hit(
+                    x - list.left,
+                    y - list.top,
+                    list.right - list.left,
+                    height(list),
+                ) {
+                    return Hit::Thumb(grab);
+                }
+                let Some(index) = self.list.row_at(y - list.top) else {
+                    return Hit::Empty;
+                };
+                let (Some(row), Some(rect)) = (self.rows.get(index), self.row_rect(list, index))
+                else {
+                    return Hit::Row {
+                        index,
+                        part: RowPart::Body,
+                    };
+                };
+                let parts = row_parts(rect, row.depth, dpi);
+                let part = match row.kind {
+                    RowKind::Folder(_) if x < parts.icon.right => RowPart::Chevron,
+                    RowKind::Note(_) if x >= parts.pin.left => RowPart::Pin,
+                    _ => RowPart::Body,
+                };
+                Hit::Row { index, part }
+            }
+        }
+    }
+
+    /// `point` in panel coordinates, converted to the main window's client coordinates, which
+    /// `menus::track_popup` takes.
+    fn to_main(&self, point: POINT) -> POINT {
+        let mut point = point;
+        unsafe {
+            ClientToScreen(self.panel, &mut point);
+            ScreenToClient(GetParent(self.panel), &mut point);
+        }
+        point
+    }
+
+    fn text_width(&mut self, text: &str, font: HFONT) -> i32 {
+        let wide = text.encode_utf16().collect::<Vec<_>>();
+        if wide.is_empty() {
+            return 0;
+        }
+        let mut size = SIZE::default();
+        unsafe {
+            let dc = GetDC(self.panel);
+            if dc.is_null() {
+                return 0;
+            }
+            let previous = SelectObject(dc, font);
+            GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size);
+            SelectObject(dc, previous);
+            ReleaseDC(self.panel, dc);
+        }
+        size.cx
+    }
+
+    fn track_leave(&mut self) {
+        if self.tracking_leave {
+            return;
+        }
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.panel,
+            dwHoverTime: 0,
+        };
+        self.tracking_leave = unsafe { TrackMouseEvent(&mut track) } != 0;
+    }
+
+    /// Destroys the view's tooltip, if it made one. The popup is owned by the main window, so
+    /// destroying the panel does not take it along (`side_panel::destroy_windows` calls this).
+    pub(crate) fn destroy_tooltip(&self) {
+        if let Some(tooltip) = self.tooltip {
+            tooltip.destroy();
+        }
+    }
+
+    fn tooltip(&mut self) -> Option<&Tooltip> {
+        if self.tooltip.is_none() && !self.tooltip_failed {
+            self.tooltip = Tooltip::create(self.panel);
+            self.tooltip_failed = self.tooltip.is_none();
+        }
+        self.tooltip.as_ref()
+    }
+
+    /// The hovered row's tip: a truncated note name in full, or a recent notebook's path.
+    fn row_tip(&mut self, fonts: UiFonts) -> (RECT, String) {
+        let none = (RECT::default(), String::new());
+        let Some(index) = self.list.hover else {
+            return none;
+        };
+        let list = self.list_rect(self.client());
+        let Some(rect) = self.row_rect(list, index) else {
+            return none;
+        };
+        match self.mode {
+            Mode::NoNotebook => self
+                .recent
+                .get(index)
+                .map_or(none, |path| (rect, path.display().to_string())),
+            Mode::Tree => {
+                let Some(row) = self.rows.get(index).cloned() else {
+                    return none;
+                };
+                let parts = row_parts(rect, row.depth, self.dpi());
+                let font = if matches!(row.kind, RowKind::Unsaved(_)) {
+                    fonts.italic
+                } else {
+                    fonts.text
+                };
+                if self.text_width(&row.name, font) > parts.name.right - parts.name.left {
+                    (parts.name, row.name)
+                } else {
+                    none
+                }
+            }
+            Mode::Loading | Mode::Empty => none,
+        }
+    }
+
+    /// `fonts` measures whether the hovered name is cut off. A tool with an empty text is
+    /// removed, so a hidden button shows no tip.
+    fn update_tooltips(&mut self, fonts: UiFonts) {
+        let area = self.client();
+        let header = header_layout(area, self.dpi());
+        let title = self
+            .root
+            .as_ref()
+            .map(|root| root.display().to_string())
+            .unwrap_or_default();
+        let favorite = if self.favorite {
+            "Remove from favorites"
+        } else {
+            "Add to favorites"
+        };
+        let buttons_shown = self.mode != Mode::NoNotebook;
+        let (row_rect, row_text) = self.row_tip(fonts);
+        let Some(tooltip) = self.tooltip() else {
+            return;
+        };
+        tooltip.set_tool(TOOL_TITLE, header.title, &title);
+        for (button, rect) in header.buttons {
+            let (id, text) = match button {
+                HeaderButton::Favorite => (TOOL_FAVORITE, favorite),
+                HeaderButton::NewNote => (TOOL_NEW, "New note"),
+                HeaderButton::More => (TOOL_MORE, "More actions"),
+            };
+            tooltip.set_tool(id, rect, if buttons_shown { text } else { "" });
+        }
+        tooltip.set_tool(TOOL_ROW, row_rect, &row_text);
+    }
+
+    fn paint(&mut self, paint: &ViewPaint) {
+        let (dc, area, dpi, fonts, focused) = (
+            paint.hdc,
+            paint.client,
+            paint.dpi,
+            paint.fonts,
+            paint.focused,
+        );
+        let palette = &paint.palette;
+        self.list.row_height = scale(ROW_HEIGHT, dpi);
+        self.paint_header(dc, area, palette, fonts, dpi);
+        let body = body_rect(area, dpi);
+        let layout = state_layout(body, dpi);
+        match self.mode {
+            Mode::Loading => {
+                unsafe {
+                    draw_text(
+                        dc,
+                        "Loading…",
+                        layout.message,
+                        fonts.text,
+                        palette.muted_foreground,
+                        LINE,
+                    )
+                };
+            }
+            Mode::NoNotebook => {
+                let message = "Open a notebook to see its notes.";
+                unsafe {
+                    draw_text(
+                        dc,
+                        message,
+                        layout.message,
+                        fonts.text,
+                        palette.editor_foreground,
+                        DT_WORDBREAK | DT_NOPREFIX,
+                    )
+                };
+                self.paint_button(dc, layout.button, "Open notebook…", palette, fonts);
+                if !self.recent.is_empty() {
+                    unsafe {
+                        draw_text(
+                            dc,
+                            "RECENT",
+                            layout.label,
+                            fonts.bold,
+                            palette.muted_foreground,
+                            LINE,
+                        )
+                    };
+                }
+                let names = &self.recent_names;
+                row_list::paint(
+                    dc,
+                    layout.list,
+                    &self.list,
+                    palette,
+                    focused,
+                    &mut |dc, index, rect, look| {
+                        draw_recent_row(dc, names.get(index), rect, look, palette, fonts, dpi);
+                    },
+                );
+            }
+            Mode::Empty => {
+                let message = format!("No notes in {} yet.", self.name);
+                unsafe {
+                    draw_text(
+                        dc,
+                        &message,
+                        layout.message,
+                        fonts.text,
+                        palette.editor_foreground,
+                        DT_WORDBREAK | DT_NOPREFIX,
+                    )
+                };
+                self.paint_button(dc, layout.button, "New note", palette, fonts);
+            }
+            Mode::Tree => {
+                // `row_list::paint` draws the rows in view and the scroll thumb.
+                let list = self.list_rect(area);
+                let rows = &self.rows;
+                let hover_pin = self.hover_pin;
+                row_list::paint(
+                    dc,
+                    list,
+                    &self.list,
+                    palette,
+                    focused,
+                    &mut |dc, index, rect, look| {
+                        draw_tree_row(
+                            dc,
+                            rows.get(index),
+                            rect,
+                            look,
+                            palette,
+                            fonts,
+                            dpi,
+                            hover_pin && look.hover,
+                        );
+                    },
+                );
+            }
+        }
+    }
+
+    fn paint_header(&self, dc: HDC, area: RECT, palette: &Palette, fonts: UiFonts, dpi: u32) {
+        let layout = header_layout(area, dpi);
+        let title = match self.mode {
+            Mode::NoNotebook => "NOTEBOOK".to_owned(),
+            _ => self.name.to_uppercase(),
+        };
+        unsafe {
+            draw_text(
+                dc,
+                &title,
+                layout.title,
+                fonts.bold,
+                palette.muted_foreground,
+                LINE,
+            )
+        };
+        if self.mode == Mode::NoNotebook {
+            return;
+        }
+        for (button, rect) in layout.buttons {
+            let hot = self.hover == Some(Hit::Header(button));
+            if hot {
+                unsafe { fill(dc, rect, palette.hover_background) };
+            }
+            let glyph = match button {
+                HeaderButton::Favorite if self.favorite => GLYPH_STAR_FILLED,
+                HeaderButton::Favorite => GLYPH_STAR,
+                HeaderButton::NewNote => GLYPH_ADD,
+                HeaderButton::More => GLYPH_MORE,
+            };
+            let color = if hot {
+                palette.hover_foreground
+            } else {
+                palette.muted_foreground
+            };
+            unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
+        }
+    }
+
+    fn paint_button(&self, dc: HDC, rect: RECT, text: &str, palette: &Palette, fonts: UiFonts) {
+        let background = if self.hover == Some(Hit::StateButton) {
+            palette.hover_background
+        } else {
+            palette.pressed_background
+        };
+        unsafe { fill(dc, rect, background) };
+        unsafe {
+            draw_text(
+                dc,
+                text,
+                rect,
+                fonts.text,
+                palette.editor_foreground,
+                CENTERED,
+            )
+        };
+    }
+}
+
+/// What Task 13's MSAA provider reads of the view.
+#[allow(dead_code, reason = "Task 13's MSAA provider is the first reader")]
+impl NotebookView {
+    pub(crate) fn rows(&self) -> &[TreeRow] {
+        &self.rows
+    }
+
+    pub(crate) fn list(&self) -> &RowListState {
+        &self.list
+    }
+
+    pub(crate) fn list_mut(&mut self) -> &mut RowListState {
+        &mut self.list
+    }
+
+    /// Every push button painted, in paint order, with its accessible name: the header's star,
+    /// New note and "…" (not in the no-notebook state), then the state's own button.
+    pub(crate) fn buttons(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
+        let mut buttons = Vec::new();
+        if self.mode != Mode::NoNotebook {
+            for (button, rect) in header_layout(client, dpi).buttons {
+                let name = match button {
+                    HeaderButton::Favorite if self.favorite => "Remove from favorites",
+                    HeaderButton::Favorite => "Add to favorites",
+                    HeaderButton::NewNote => "New note",
+                    HeaderButton::More => "More actions",
+                };
+                buttons.push((name.to_owned(), rect));
+            }
+        }
+        let state = state_layout(body_rect(client, dpi), dpi);
+        match self.mode {
+            Mode::NoNotebook => buttons.push(("Open notebook…".to_owned(), state.button)),
+            Mode::Empty => buttons.push(("New note".to_owned(), state.button)),
+            Mode::Loading | Mode::Tree => {}
+        }
+        buttons
+    }
+
+    /// The no-notebook state's RECENT rows from the first one in view, with their names (and the
+    /// parent-folder hint on a name clash). Empty in every other state.
+    pub(crate) fn recent_rows(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
+        if self.mode != Mode::NoNotebook {
+            return Vec::new();
+        }
+        let list = state_layout(body_rect(client, dpi), dpi).list;
+        (0..self.recent.len())
+            .filter_map(|index| {
+                let rect = self.row_rect(list, index)?;
+                let name = match self.recent_names.get(index)? {
+                    (name, Some(hint)) => format!("{name}, {hint}"),
+                    (name, None) => name.clone(),
+                };
+                Some((name, rect))
+            })
+            .collect()
+    }
+}
+
+/// What a rebuild read from the library, the tabs and `folders.ini`'s cache.
+struct Snapshot {
+    mode: Mode,
+    rows: Vec<TreeRow>,
+    truncated: bool,
+    recent: Vec<PathBuf>,
+    root: Option<PathBuf>,
+    favorite: bool,
+}
+
+fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -> Option<R> {
+    unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        unsafe { app.as_mut() }
+            .sidebar
+            .as_mut()
+            .map(|sidebar| f(&mut sidebar.notebook))
+    })
+}
+
+/// Reads everything the rows need. Each call borrows the App on its own, never nested.
+fn snapshot(hwnd: HWND) -> Snapshot {
+    let Some(root) = super::library_host::folder(hwnd) else {
+        return Snapshot {
+            mode: Mode::NoNotebook,
+            rows: Vec::new(),
+            truncated: false,
+            recent: super::library_host::recent_notebooks(hwnd),
+            root: None,
+            favorite: false,
+        };
+    };
+    let favorite = super::library_host::is_favorite(hwnd);
+    let unsaved = unsafe { app_ptr(hwnd) }
+        .map(|app| unsaved_entries(unsafe { app.as_ref() }.tabs.documents()))
+        .unwrap_or_default();
+    let built = super::library_host::with_state(hwnd, |state| {
+        let state = &*state;
+        let rows = state
+            .tree
+            .rows(&|path: &Path| state.local.is_expanded(path), &unsaved);
+        (rows, state.truncated)
+    });
+    let (mode, rows, truncated) = match built {
+        None => (Mode::Loading, Vec::new(), false),
+        Some((rows, _)) if rows.is_empty() => (Mode::Empty, rows, false),
+        Some((rows, truncated)) => (Mode::Tree, rows, truncated),
+    };
+    Snapshot {
+        mode,
+        rows,
+        truncated,
+        recent: Vec::new(),
+        root: Some(root),
+        favorite,
+    }
+}
+
+/// Rebuilds the rows from the library, the tabs and the notebook lists, keeping the selection
+/// and the scroll position by path. `side_panel::refresh` calls it.
+pub(crate) fn rebuild(hwnd: HWND) {
+    let snapshot = snapshot(hwnd);
+    let names = crate::library::local::display_names(&snapshot.recent);
+    with_view(hwnd, |view| {
+        view.apply(snapshot, names);
+        view.invalidate();
+    });
+}
+
+/// The row for the active tab: its note inside the open notebook, or its unsaved entry.
+fn active_target(hwnd: HWND) -> Option<RowKind> {
+    let root = super::library_host::folder(hwnd)?;
+    let (id, path) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let active = unsafe { app.as_ref() }.tabs.active()?;
+        Some((active.id, active.path.clone()))
+    })?;
+    match path {
+        None => Some(RowKind::Unsaved(id.0)),
+        Some(path) => crate::library::is_inside(&root, &path)
+            .then(|| RowKind::Note(crate::library::record_path(&root, &path))),
+    }
+}
+
+/// Every tab switch: the active note's row is selected and its folders expand (remembered per
+/// PC), without moving the keyboard focus (spec §6.1).
+pub(crate) fn active_tab_changed(hwnd: HWND) {
+    let target = active_target(hwnd);
+    if let Some(RowKind::Note(relative)) = &target {
+        for folder in tree::ancestors(relative) {
+            super::library_host::set_expanded(hwnd, &folder, true);
+        }
+    }
+    rebuild(hwnd);
+    if let Some(kind) = target {
+        with_view(hwnd, |view| {
+            if let Some(index) = tree::row_index(&view.rows, &kind) {
+                view.select(index);
+            }
+        });
+    }
+}
+
+/// The panel's `WM_PAINT` while the Notebook view shows (`side_panel::paint_view`). The panel
+/// has already filled its background.
+pub(crate) fn paint(hwnd: HWND, paint: &ViewPaint) {
+    with_view(hwnd, |view| view.paint(paint));
+}
+
+/// Whether panel point (`x`, `y`) is over the header's name or a header button, which must stay
+/// client area. The rest of the header is a window drag area (spec §6.5).
+pub(crate) fn header_hit(hwnd: HWND, x: i32, y: i32) -> bool {
+    with_view(hwnd, |view| {
+        matches!(view.hit_test(x, y), Hit::Header(_) | Hit::Title)
+    })
+    .unwrap_or(false)
+}
+
+/// Runs a main-window command as the menus do.
+fn run(hwnd: HWND, command: CommandId) {
+    unsafe {
+        SendMessageW(hwnd, WM_COMMAND, command as usize, 0);
+    }
+}
+
+/// The panel's input while the Notebook view is shown (`side_panel::view_mouse` and `view_key`).
+/// `None` leaves the message to `DefWindowProcW`. The panel handles its resize edge itself.
+pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    match message {
+        WM_MOUSEMOVE => {
+            let (x, y) = point_of(lparam);
+            mouse_move(hwnd, x, y);
+            Some(0)
+        }
+        // The panel class has CS_DBLCLKS: the second press of a double-click comes as this.
+        WM_LBUTTONDBLCLK => {
+            let (x, y) = point_of(lparam);
+            double_click(hwnd, x, y);
+            Some(0)
+        }
+        WM_MOUSELEAVE => {
+            with_view(hwnd, |view| {
+                view.tracking_leave = false;
+                view.list.hover = None;
+                view.hover = None;
+                view.hover_pin = false;
+                view.invalidate();
+            });
+            Some(0)
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = point_of(lparam);
+            left_down(hwnd, x, y);
+            Some(0)
+        }
+        WM_LBUTTONUP => {
+            with_view(hwnd, |view| {
+                if view.thumb_grab.take().is_some() {
+                    unsafe {
+                        ReleaseCapture();
+                    }
+                }
+            });
+            Some(0)
+        }
+        WM_CAPTURECHANGED => {
+            with_view(hwnd, |view| view.thumb_grab = None);
+            Some(0)
+        }
+        WM_RBUTTONDOWN => {
+            // Selects the row; DefWindowProc turns the button-up into WM_CONTEXTMENU.
+            let (x, y) = point_of(lparam);
+            with_view(hwnd, |view| {
+                unsafe {
+                    SetFocus(view.panel);
+                }
+                if let Hit::Row { index, .. } = view.hit_test(x, y) {
+                    view.select(index);
+                }
+            });
+            Some(0)
+        }
+        WM_KEYDOWN => key_down(hwnd, wparam as u16).then_some(0),
+        WM_CHAR => {
+            let ch = char::from_u32(wparam as u32).filter(|ch| !ch.is_control())?;
+            typed(hwnd, ch);
+            Some(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = i32::from((wparam >> 16) as u16 as i16);
+            let lines = row_list::wheel_lines();
+            with_view(hwnd, |view| {
+                let height = view.list_height();
+                if view.list.wheel(delta, lines, height) {
+                    view.invalidate();
+                }
+            });
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+fn mouse_move(hwnd: HWND, x: i32, y: i32) {
+    // Read before the view is borrowed: `ui_fonts` borrows the App itself.
+    let fonts = super::main_window::ui_fonts(hwnd);
+    with_view(hwnd, |view| {
+        if let Some(grab) = view.thumb_grab {
+            let list = view.list_rect(view.client());
+            if view.list.drag_thumb(grab, y - list.top, height(list)) {
+                view.invalidate();
+            }
+            return;
+        }
+        view.track_leave();
+        let hit = view.hit_test(x, y);
+        let (row, pin) = match hit {
+            Hit::Row { index, part } => (Some(index), part == RowPart::Pin),
+            _ => (None, false),
+        };
+        let hot = matches!(hit, Hit::Header(_) | Hit::StateButton).then_some(hit);
+        let row_changed = view.list.set_hover(row);
+        if row_changed || view.hover_pin != pin || view.hover != hot {
+            view.hover_pin = pin;
+            view.hover = hot;
+            view.invalidate();
+            view.update_tooltips(fonts);
+        }
+    });
+}
+
+fn left_down(hwnd: HWND, x: i32, y: i32) {
+    let Some(hit) = with_view(hwnd, |view| {
+        unsafe {
+            SetFocus(view.panel);
+        }
+        view.hit_test(x, y)
+    }) else {
+        return;
+    };
+    match hit {
+        Hit::Header(button) => header_clicked(hwnd, button),
+        Hit::StateButton => state_button(hwnd),
+        Hit::Thumb(grab) => {
+            with_view(hwnd, |view| {
+                view.thumb_grab = Some(grab);
+                unsafe {
+                    SetCapture(view.panel);
+                }
+            });
+        }
+        Hit::Row { index, part } => {
+            with_view(hwnd, |view| view.select(index));
+            row_clicked(hwnd, index, part, false);
+        }
+        Hit::Title | Hit::Empty => {}
+    }
+}
+
+/// `WM_LBUTTONDBLCLK`: a row's second press opens it as a normal tab, which also promotes its
+/// preview (spec §6.4). Anywhere else it is one more click.
+fn double_click(hwnd: HWND, x: i32, y: i32) {
+    match with_view(hwnd, |view| view.hit_test(x, y)) {
+        Some(Hit::Row { index, part }) => row_clicked(hwnd, index, part, true),
+        Some(_) => left_down(hwnd, x, y),
+        None => {}
+    }
+}
+
+/// A press on row `index`. `double` is the second press of a double-click, whose first press
+/// already toggled a pin or a folder, or started opening a recent notebook.
+fn row_clicked(hwnd: HWND, index: usize, part: RowPart, double: bool) {
+    let Some(target) = with_view(hwnd, |view| view.target(index)) else {
+        return;
+    };
+    match target {
+        Target::Row(TreeRow {
+            kind: RowKind::Note(relative),
+            ..
+        }) if part == RowPart::Pin => {
+            if !double && let Some(root) = super::library_host::folder(hwnd) {
+                super::library_host::toggle_pin(hwnd, &root.join(relative));
+            }
+        }
+        Target::Row(TreeRow {
+            kind: RowKind::Folder(_),
+            ..
+        })
+        | Target::Recent(_)
+            if double => {}
+        _ => activate(
+            hwnd,
+            index,
+            if double {
+                Activation::Permanent
+            } else {
+                Activation::Click
+            },
+        ),
+    }
+}
+
+fn set_folder_expanded(hwnd: HWND, relative: &Path, expanded: bool) {
+    super::library_host::set_expanded(hwnd, relative, expanded);
+    rebuild(hwnd);
+}
+
+/// Opens or toggles row `index` (spec §6.4). A folder toggles, a note opens, an unsaved row
+/// switches to its tab, and a recent notebook opens.
+pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
+    let Some(target) = with_view(hwnd, |view| view.target(index)) else {
+        return;
+    };
+    match target {
+        Target::Recent(folder) => super::library_host::open_listed_notebook(hwnd, &folder),
+        Target::Row(row) => match row.kind {
+            RowKind::Folder(relative) => set_folder_expanded(hwnd, &relative, !row.expanded),
+            RowKind::Note(relative) => {
+                let Some(root) = super::library_host::folder(hwnd) else {
+                    return;
+                };
+                let path = root.join(relative);
+                let (mode, focus) = match how {
+                    Activation::Click => (OpenMode::Preview, true),
+                    Activation::Enter => (OpenMode::Preview, false),
+                    Activation::Permanent => (OpenMode::Permanent, true),
+                };
+                if let Err(error) = super::main_window::open_note(hwnd, &path, mode, focus) {
+                    super::main_window::report_open_failure(hwnd, &path, &error);
+                }
+            }
+            RowKind::Unsaved(key) => {
+                if super::main_window::activate_document_by_id(hwnd, DocumentId(key))
+                    && how != Activation::Enter
+                {
+                    super::main_window::focus_content(hwnd);
+                }
+            }
+        },
+        Target::Truncated | Target::Nothing => {}
+    }
+}
+
+/// The header's buttons (spec §6.5).
+pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
+    match button {
+        HeaderButton::Favorite => super::library_host::toggle_notebook_favorite(hwnd),
+        HeaderButton::NewNote => run(hwnd, CommandId::New),
+        HeaderButton::More => more_menu(hwnd),
+    }
+}
+
+/// "…": the notebook's own actions.
+fn more_menu(hwnd: HWND) {
+    let Some(at) = with_view(hwnd, |view| {
+        let rect = header_layout(view.client(), view.dpi()).buttons[2].1;
+        view.to_main(POINT {
+            x: rect.left,
+            y: rect.bottom,
+        })
+    }) else {
+        return;
+    };
+    let entries = [MenuEntry::command(
+        "Close notebook",
+        CommandId::CloseNotebook,
+    )];
+    if let Some(command) = super::menus::track_popup(hwnd, &entries, at) {
+        run(hwnd, command);
+    }
+}
+
+fn state_button(hwnd: HWND) {
+    match with_view(hwnd, |view| view.mode) {
+        Some(Mode::NoNotebook) => super::library_host::choose_and_open_folder(hwnd),
+        Some(Mode::Empty) => run(hwnd, CommandId::New),
+        _ => {}
+    }
+}
+
+/// The tree's keys (spec §10). Returns false for keys it leaves to the panel.
+pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
+    if let Some(list_key) = ListKey::from_virtual_key(u32::from(key)) {
+        with_view(hwnd, |view| {
+            let height = view.list_height();
+            if view.list.move_selection(list_key, height) {
+                view.invalidate();
+            }
+        });
+        return true;
+    }
+    let Some(selected) = with_view(hwnd, |view| view.list.selected).flatten() else {
+        return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT);
+    };
+    match key {
+        VK_RETURN => {
+            let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+            let how = if ctrl {
+                Activation::Permanent
+            } else {
+                Activation::Enter
+            };
+            activate(hwnd, selected, how);
+            true
+        }
+        VK_RIGHT => {
+            right(hwnd, selected);
+            true
+        }
+        VK_LEFT => {
+            left(hwnd, selected);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Right expands a folder, or moves into an expanded one.
+fn right(hwnd: HWND, index: usize) {
+    let Some(Target::Row(row)) = with_view(hwnd, |view| view.target(index)) else {
+        return;
+    };
+    let RowKind::Folder(relative) = &row.kind else {
+        return;
+    };
+    if !row.expanded {
+        set_folder_expanded(hwnd, relative, true);
+        return;
+    }
+    with_view(hwnd, |view| {
+        if view
+            .rows
+            .get(index + 1)
+            .is_some_and(|child| child.depth > row.depth)
+        {
+            view.select(index + 1);
+        }
+    });
+}
+
+/// Left collapses an expanded folder, or moves to the parent folder.
+fn left(hwnd: HWND, index: usize) {
+    let Some(Target::Row(row)) = with_view(hwnd, |view| view.target(index)) else {
+        return;
+    };
+    if let RowKind::Folder(relative) = &row.kind
+        && row.expanded
+    {
+        set_folder_expanded(hwnd, relative, false);
+        return;
+    }
+    with_view(hwnd, |view| {
+        if let Some(parent) = tree::parent_index(&view.rows, index) {
+            view.select(parent);
+        }
+    });
+}
+
+/// Type-ahead: the next row whose name starts with what was typed in the last second. A single
+/// letter searches from the row after the selection, so repeating it steps through matches.
+fn typed(hwnd: HWND, ch: char) {
+    with_view(hwnd, |view| {
+        if view.mode != Mode::Tree {
+            return;
+        }
+        let prefix = view.typed.push(ch, Instant::now()).to_owned();
+        let from = match view.list.selected {
+            Some(selected) if prefix.chars().count() == 1 => selected + 1,
+            Some(selected) => selected,
+            None => 0,
+        };
+        if let Some(index) = tree::type_ahead(&view.rows, from, &prefix) {
+            view.select(index);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RECT` has no `PartialEq` or `Debug` in windows-sys.
+    fn edges(rect: RECT) -> (i32, i32, i32, i32) {
+        (rect.left, rect.top, rect.right, rect.bottom)
+    }
+
+    fn row(kind: RowKind, depth: u16) -> TreeRow {
+        TreeRow {
+            kind,
+            depth,
+            name: String::new(),
+            pinned: false,
+            expanded: false,
+        }
+    }
+
+    #[test]
+    fn a_row_indents_by_depth_and_keeps_the_pin_at_the_right_edge() {
+        // Break caught: deep rows pushing the pin off the row, names drawn over the chevron, or
+        // an inverted name rectangle in a panel narrower than the indent.
+        let rect = RECT {
+            left: 0,
+            top: 26,
+            right: 260,
+            bottom: 52,
+        };
+        let top = row_parts(rect, 0, 96);
+        let deep = row_parts(rect, 3, 96);
+        assert_eq!(top.chevron.left, 8);
+        assert_eq!(deep.chevron.left, 8 + 3 * 12);
+        assert_eq!(edges(top.pin), (236, 26, 260, 52));
+        assert_eq!(edges(deep.pin), edges(top.pin));
+        assert!(deep.name.left >= deep.icon.right);
+        assert_eq!(deep.name.right, deep.pin.left);
+        let cramped = row_parts(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 40,
+                bottom: 26,
+            },
+            9,
+            96,
+        );
+        assert!(cramped.name.left <= cramped.name.right);
+        assert_eq!(row_parts(rect, 1, 192).chevron.left, 16 + 24);
+    }
+
+    #[test]
+    fn the_header_buttons_sit_right_to_left_and_the_title_stops_before_them() {
+        // Break caught: the notebook name drawn under the star, or buttons that do not follow
+        // the panel's right edge when it is resized.
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 260,
+            bottom: 600,
+        };
+        let layout = header_layout(area, 96);
+        let [(first, star), (second, new), (third, more)] = layout.buttons;
+        assert_eq!(
+            (first, second, third),
+            (
+                HeaderButton::Favorite,
+                HeaderButton::NewNote,
+                HeaderButton::More
+            )
+        );
+        assert_eq!(edges(more), (226, 5, 254, 33));
+        assert_eq!((star.right, new.right), (new.left, more.left));
+        assert!(layout.title.right <= star.left);
+        assert_eq!(layout.title.bottom, 38);
+        assert_eq!(body_rect(area, 96).top, 38);
+    }
+
+    #[test]
+    fn the_no_notebook_state_lists_recent_notebooks_below_its_button() {
+        // Break caught: the RECENT rows painted over the Open notebook… button, or a list rect
+        // that turns inside out in a short panel.
+        let body = RECT {
+            left: 0,
+            top: 38,
+            right: 260,
+            bottom: 600,
+        };
+        let layout = state_layout(body, 96);
+        assert!(layout.message.bottom <= layout.button.top);
+        assert!(layout.button.bottom <= layout.label.top);
+        assert_eq!(layout.list.top, layout.label.bottom);
+        assert_eq!(layout.list.bottom, 600);
+        let short = state_layout(
+            RECT {
+                left: 0,
+                top: 38,
+                right: 260,
+                bottom: 60,
+            },
+            96,
+        );
+        assert!(short.list.top <= short.list.bottom);
+    }
+
+    #[test]
+    fn a_vanished_selection_moves_to_the_row_that_took_its_place() {
+        // Break caught: a stale index past the end after a rescan removed rows, or a selection
+        // that jumps to the top instead of staying where it was.
+        let rows = vec![
+            row(RowKind::Folder("sub".into()), 0),
+            row(RowKind::Note(r"sub\a.md".into()), 1),
+            row(RowKind::Note("c.md".into()), 0),
+        ];
+        let a = RowKind::Note(r"sub\a.md".into());
+        assert_eq!(
+            follow(&rows, Some(&a), Some(7)),
+            Some(1),
+            "found by path first"
+        );
+        let gone = RowKind::Note(r"sub\b.md".into());
+        assert_eq!(follow(&rows, Some(&gone), Some(2)), Some(2));
+        assert_eq!(follow(&rows, Some(&gone), Some(9)), Some(2));
+        assert_eq!(follow(&[], Some(&gone), Some(1)), None);
+        assert_eq!(
+            follow(&rows, None, Some(1)),
+            None,
+            "nothing selected stays so"
+        );
+    }
+
+    #[test]
+    fn unsaved_rows_come_from_untitled_tabs_labelled_by_their_first_line() {
+        // Break caught: saved tabs listed twice (as a note and as unsaved), or untitled tabs
+        // with a blank first line shown with no label at all.
+        let mut labelled = Document::test_fixture(DocumentId(4), true);
+        labelled.first_line_label = Some("Groceries".to_owned());
+        let blank = Document::test_fixture(DocumentId(5), false);
+        let mut saved = Document::test_fixture(DocumentId(6), false);
+        saved.path = Some(PathBuf::from(r"C:\n\a.md"));
+        let entries = unsaved_entries([&labelled, &blank, &saved].into_iter());
+        let entries: Vec<_> = entries.into_iter().map(|e| (e.key, e.label)).collect();
+        assert_eq!(
+            entries,
+            [(4, "Groceries".to_owned()), (5, "Untitled".to_owned())]
+        );
+    }
+
+    #[test]
+    fn type_ahead_extends_the_prefix_within_a_second_and_starts_over_after() {
+        // Break caught: a prefix that never resets, so a second search a minute later matches
+        // nothing.
+        let start = Instant::now();
+        let mut typed = TypeAhead::default();
+        assert_eq!(typed.push('n', start), "n");
+        assert_eq!(typed.push('o', start + Duration::from_millis(900)), "no");
+        assert_eq!(typed.push('x', start + Duration::from_millis(2_000)), "x");
+    }
+}

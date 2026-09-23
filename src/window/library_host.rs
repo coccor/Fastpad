@@ -480,6 +480,32 @@ fn save_local(hwnd: HWND, how: LocalWrite) {
     }
 }
 
+/// Expands or collapses `path`, a folder relative to the open notebook, and remembers it in the
+/// per-PC file. The write happens on a writer thread, and only when the set changed.
+pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
+    let changed = with_state(hwnd, |state| {
+        let was = state.local.is_expanded(path);
+        state.local.set_expanded(path, expanded);
+        was != expanded
+    })
+    .unwrap_or(false);
+    if changed {
+        save_local(
+            hwnd,
+            LocalWrite {
+                wait: false,
+                force: false,
+            },
+        );
+    }
+}
+
+/// The open notebook's expanded folders, relative to it.
+#[cfg_attr(not(test), expect(dead_code, reason = "read by the window tests"))]
+pub(crate) fn expanded(hwnd: HWND) -> Vec<PathBuf> {
+    with_state(hwnd, |state| state.local.expanded.clone()).unwrap_or_default()
+}
+
 /// A note moved outside FastPad: an open tab for it follows the file. The old path is gone, so
 /// the tab is found by its stored path, not through the disk. A move leaves the content alone,
 /// so when the new file's stamp is the one the tab knows, autosave carries on (or resumes, if it
@@ -817,19 +843,11 @@ pub(crate) fn favorites(hwnd: HWND) -> Vec<PathBuf> {
 }
 
 /// Recent notebooks, most recent first.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read from Task 10's no-notebook Notebook view on")
-)]
 pub(crate) fn recent_notebooks(hwnd: HWND) -> Vec<PathBuf> {
     known_folders(hwnd, false).folders
 }
 
 /// Whether the open notebook is a favorite.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read from Task 10's Notebook view star on")
-)]
 pub(crate) fn is_favorite(hwnd: HWND) -> bool {
     folder(hwnd).is_some_and(|open| known_folders(hwnd, false).is_favorite(&open))
 }
@@ -1067,6 +1085,7 @@ pub(crate) fn refresh_label(hwnd: HWND) {
     });
     if changed {
         super::main_window::refresh_tab_view(hwnd);
+        super::side_panel::refresh(hwnd);
     }
 }
 

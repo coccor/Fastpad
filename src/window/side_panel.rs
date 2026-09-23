@@ -55,10 +55,6 @@ const HEADER_INSET_96: i32 = 16;
 
 /// The sidebar's fonts at one DPI. Painting copies them out; `Sidebar` owns and deletes them.
 #[derive(Clone, Copy, Debug)]
-#[allow(
-    dead_code,
-    reason = "the text, italic and glyph fonts are read from Task 10's Notebook view on"
-)]
 pub(crate) struct UiFonts {
     /// Row and body text: Segoe UI, 12 px at 96 DPI.
     pub(crate) text: HFONT,
@@ -119,6 +115,8 @@ pub(crate) struct Sidebar {
     pub(crate) panel: HWND,
     pub(crate) tooltip: Option<Tooltip>,
     pub(crate) bar_state: BarState,
+    /// The Notebook view's rows, selection and hover.
+    pub(crate) notebook: crate::window::notebook_view::NotebookView,
     /// The view Ctrl+B reopens while the panel is closed.
     last_view: SidebarView,
     /// The live width (96-DPI pixels) while the panel edge is dragged. The setting changes once,
@@ -185,10 +183,6 @@ impl PanelView {
 /// What a view paints with: the panel's buffered DC and everything a paint needs, built once per
 /// `WM_PAINT` by `view_paint`.
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "`focused` is read from Task 10's Notebook view on"
-)]
 pub(crate) struct ViewPaint {
     pub(crate) hdc: HDC,
     /// The panel's whole client rectangle. Each view lays out its header and body inside it.
@@ -350,6 +344,7 @@ pub(crate) fn create(hwnd: HWND) -> crate::Result<Sidebar> {
         panel,
         tooltip: Tooltip::create(bar),
         bar_state: BarState::default(),
+        notebook: crate::window::notebook_view::NotebookView::new(panel),
         last_view: SidebarView::Notebook,
         drag_width: None,
         fonts: None,
@@ -392,12 +387,13 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     invalidate_title_strip(hwnd);
 }
 
-/// Destroys the sidebar's windows. The tooltip is owned by the main window, not the bar, so it
-/// is destroyed explicitly.
+/// Destroys the sidebar's windows. The tooltips are owned by the main window, not the bar or the
+/// panel, so they are destroyed explicitly.
 fn destroy_windows(sidebar: &Sidebar) {
     if let Some(tooltip) = sidebar.tooltip {
         tooltip.destroy();
     }
+    sidebar.notebook.destroy_tooltip();
     unsafe {
         DestroyWindow(sidebar.panel);
         DestroyWindow(sidebar.bar);
@@ -461,6 +457,10 @@ pub(crate) fn show_view(hwnd: HWND, view: SidebarView, focus: bool) {
             ("sidebar_view", view.token().to_owned())
         })
     });
+    // A hidden view's rows may be stale.
+    if view == SidebarView::Notebook {
+        crate::window::notebook_view::rebuild(hwnd);
+    }
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
     if focus && view != SidebarView::Hidden && is_shown(panel) {
@@ -481,12 +481,13 @@ pub(crate) fn toggle(hwnd: HWND) {
     show_view(hwnd, next, false);
 }
 
-/// The library changed: re-reads what the sidebar shows of it (the notebook name in the
-/// Notebook tooltip) and repaints.
+/// The library changed: rebuilds the Notebook view's rows from `LibraryState.tree` (no disk),
+/// re-reads the notebook name for the Notebook tooltip, and repaints.
 pub(crate) fn refresh(hwnd: HWND) {
     let Some((bar, panel)) = windows(hwnd) else {
         return;
     };
+    crate::window::notebook_view::rebuild(hwnd);
     update_tools(hwnd);
     unsafe {
         InvalidateRect(bar, std::ptr::null(), 0);
@@ -494,12 +495,14 @@ pub(crate) fn refresh(hwnd: HWND) {
     }
 }
 
-/// The active tab changed (`main_window::refresh_tabs` calls it). Task 10 selects the active
-/// note's row here.
+/// The active tab changed (`main_window::refresh_tabs` calls it): the Notebook view selects the
+/// active note's row and expands its folders.
 pub(crate) fn active_tab_changed(hwnd: HWND) {
-    if let Some((_, panel)) = windows(hwnd) {
-        unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
-    }
+    let Some((_, panel)) = windows(hwnd) else {
+        return;
+    };
+    crate::window::notebook_view::active_tab_changed(hwnd);
+    unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
 }
 
 fn update_tools(hwnd: HWND) {
@@ -512,11 +515,8 @@ fn update_tools(hwnd: HWND) {
     let mut client = RECT::default();
     unsafe { GetClientRect(bar, &mut client) };
     let rects = activity_bar::button_rects(client, unsafe { GetDpiForWindow(bar) }.max(96));
-    let name = crate::window::library_host::folder(hwnd).and_then(|folder| {
-        folder
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-    });
+    let name = crate::window::library_host::folder(hwnd)
+        .map(|folder| crate::window::library_host::notebook_name(&folder));
     let notebook = activity_bar::notebook_label(name.as_deref());
     for button in ActivityButton::ALL {
         let text = if button == ActivityButton::Notebook {
@@ -717,13 +717,12 @@ fn paint_panel(main: HWND, panel: HWND) {
     });
 }
 
-/// Paints `view` over the panel's background. Task 10 gives the Notebook view its own paint,
-/// and Task 12 the other two.
-fn paint_view(_main: HWND, view: PanelView, paint: &ViewPaint) {
+/// Paints `view` over the panel's background. Task 12 gives the Search and Favorites views their
+/// own paint.
+fn paint_view(main: HWND, view: PanelView, paint: &ViewPaint) {
     match view {
-        PanelView::Notebook | PanelView::Search | PanelView::Favorites => {
-            paint_header_title(view, paint);
-        }
+        PanelView::Notebook => crate::window::notebook_view::paint(main, paint),
+        PanelView::Search | PanelView::Favorites => paint_header_title(view, paint),
     }
 }
 
@@ -749,47 +748,48 @@ fn paint_header_title(view: PanelView, paint: &ViewPaint) {
 }
 
 /// Mouse input (and `WM_CONTEXTMENU`, `WM_MOUSELEAVE`, `WM_CAPTURECHANGED`) for `view`, with the
-/// message's own `wparam` and `lparam`. `None` leaves it to `DefWindowProcW`. Tasks 10 and 12
-/// replace these arms with their views' handlers.
+/// message's own `wparam` and `lparam`. `None` leaves it to `DefWindowProcW`. Task 12 replaces
+/// the Search and Favorites arm.
 fn view_mouse(
-    _main: HWND,
+    main: HWND,
     view: PanelView,
     panel: HWND,
     message: u32,
-    _wparam: WPARAM,
-    _lparam: LPARAM,
+    wparam: WPARAM,
+    lparam: LPARAM,
 ) -> Option<LRESULT> {
     match view {
-        PanelView::Notebook | PanelView::Search | PanelView::Favorites => {
-            (message == WM_LBUTTONDOWN).then(|| {
-                unsafe { SetFocus(panel) };
-                0
-            })
-        }
+        PanelView::Notebook => crate::window::notebook_view::handle(main, message, wparam, lparam),
+        PanelView::Search | PanelView::Favorites => (message == WM_LBUTTONDOWN).then(|| {
+            unsafe { SetFocus(panel) };
+            0
+        }),
     }
 }
 
 /// `WM_KEYDOWN` and `WM_CHAR` while the panel has the focus. `None` leaves the key to
-/// `DefWindowProcW`. Task 10 handles the tree's keys and Task 12 the lists' keys.
+/// `DefWindowProcW`. Task 12 handles the lists' keys.
 fn view_key(
-    _main: HWND,
+    main: HWND,
     view: PanelView,
     _panel: HWND,
-    _message: u32,
-    _wparam: WPARAM,
-    _lparam: LPARAM,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
 ) -> Option<LRESULT> {
     match view {
-        PanelView::Notebook | PanelView::Search | PanelView::Favorites => None,
+        PanelView::Notebook => crate::window::notebook_view::handle(main, message, wparam, lparam),
+        PanelView::Search | PanelView::Favorites => None,
     }
 }
 
 /// Whether header point `x`, `y` (panel client coordinates) is empty, so the window drags from
-/// it. Task 10 excludes the Notebook header's buttons and title, and Task 12 the Favorites
+/// it. The Notebook header's name and buttons stay client area. Task 12 excludes the Favorites
 /// header's Open notebook… button.
-fn header_is_caption(_main: HWND, view: PanelView, _panel: HWND, _x: i32, _y: i32) -> bool {
+fn header_is_caption(main: HWND, view: PanelView, _panel: HWND, x: i32, y: i32) -> bool {
     match view {
-        PanelView::Notebook | PanelView::Search | PanelView::Favorites => true,
+        PanelView::Notebook => !crate::window::notebook_view::header_hit(main, x, y),
+        PanelView::Search | PanelView::Favorites => true,
     }
 }
 

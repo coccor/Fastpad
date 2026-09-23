@@ -10,6 +10,7 @@ pub(crate) mod menus;
 mod messages;
 pub(crate) mod modal;
 pub(crate) mod name_box;
+pub(crate) mod notebook_view;
 pub mod notification;
 pub mod palette;
 pub(crate) mod panel;

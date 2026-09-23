@@ -1857,6 +1857,8 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             crate::window::library_host::notes_mode_changed(hwnd, enabled);
             crate::window::side_panel::notes_mode_changed(hwnd, enabled);
             if enabled {
+                // The library step ran before the sidebar existed; its view catches up here.
+                crate::window::side_panel::refresh(hwnd);
                 crate::window::library_host::show_labels(hwnd);
             } else {
                 crate::window::library_host::clear_labels(hwnd);
@@ -2736,11 +2738,6 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
 }
 
 /// How `open_note` places a note that is not open yet.
-// Task 10 is the first non-test caller of `open_note`/`OpenMode`; it removes these attributes.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the sidebar opens notes through it from Task 10")
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenMode {
     /// In the preview tab, replaced in place by the next preview.
@@ -2752,10 +2749,6 @@ pub(crate) enum OpenMode {
 /// Opens `path` from the sidebar (spec §6.4). An already-open note is switched to, and a
 /// `Permanent` open keeps it. Otherwise `Preview` replaces the preview tab in place and
 /// `Permanent` opens a normal tab. `focus_editor` then moves the keyboard focus to the editor.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the sidebar opens notes through it from Task 10")
-)]
 pub(crate) fn open_note(
     hwnd: HWND,
     path: &std::path::Path,
@@ -6596,7 +6589,14 @@ mod tests {
         let header_y = layout.resize_border + 2;
         let header = crate::window::panel::scale(crate::window::side_panel::HEADER_HEIGHT_96, dpi);
         assert!(header_y < header);
-        let panel_x = client_size(panel).0 / 2;
+        // Left of the Notebook header's title (which starts 12 px in and stays client area, so
+        // its tooltip works): empty header, a drag area.
+        let panel_x = crate::window::panel::scale(4, dpi);
+        assert_eq!(
+            hit(panel, client_size(panel).0 / 2, header_y),
+            HTCLIENT as LRESULT,
+            "the notebook's name is not a drag area"
+        );
         assert_eq!(hit(panel, panel_x, header_y), HTTRANSPARENT as LRESULT);
         assert_eq!(
             hit(window.hwnd, left_of(panel, window.hwnd) + panel_x, header_y),
@@ -9733,5 +9733,271 @@ mod tests {
         let reloaded =
             crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
         assert!(reloaded.is_pinned(&a));
+    }
+
+    use crate::library::tree::RowKind;
+    use crate::window::notebook_view::{Activation, Mode, NotebookView};
+
+    /// Task 6 creates the sidebar with the window when notes mode is on; this makes sure of it.
+    fn ensure_sidebar(hwnd: HWND) {
+        if app_mut(hwnd).sidebar.is_none() {
+            crate::window::side_panel::notes_mode_changed(hwnd, true);
+        }
+    }
+
+    fn notebook_view<'a>(hwnd: HWND) -> &'a mut NotebookView {
+        &mut app_mut(hwnd).sidebar.as_mut().unwrap().notebook
+    }
+
+    fn row_of(hwnd: HWND, kind: &RowKind) -> usize {
+        crate::library::tree::row_index(&notebook_view(hwnd).rows, kind)
+            .unwrap_or_else(|| panic!("{kind:?} is not in {:?}", notebook_view(hwnd).rows))
+    }
+
+    fn selected_kind(hwnd: HWND) -> Option<RowKind> {
+        let view = notebook_view(hwnd);
+        view.list
+            .selected
+            .and_then(|index| view.rows.get(index))
+            .map(|row| row.kind.clone())
+    }
+
+    fn select_row(hwnd: HWND, kind: &RowKind) {
+        let index = row_of(hwnd, kind);
+        notebook_view(hwnd).list.selected = Some(index);
+    }
+
+    fn rescan_and_wait(hwnd: HWND) {
+        crate::window::library_host::request_rescan(hwnd);
+        pump_until(hwnd, || !app_mut(hwnd).library.scanning);
+    }
+
+    #[test]
+    fn a_rescan_keeps_selection_and_expansion_by_path() {
+        // Break caught: a rescan that rebuilds the rows and keeps the selected index, so the
+        // highlight jumps to another note; one that collapses the folder the user had open; or a
+        // vanished selection left pointing past the end of the list.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("rescan-selection");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\b.md", "b");
+        scratch.note("c.md", "c");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), true);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let b = RowKind::Note(r"sub\b.md".into());
+        select_row(window.hwnd, &b);
+
+        scratch.note(r"sub\a.md", "a");
+        rescan_and_wait(window.hwnd);
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(b.clone()),
+            "followed by path"
+        );
+        let sub = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+        assert!(notebook_view(window.hwnd).rows[sub].expanded);
+        assert!(row_of(window.hwnd, &RowKind::Note(r"sub\a.md".into())) < row_of(window.hwnd, &b));
+
+        let before = notebook_view(window.hwnd).list.selected.unwrap();
+        std::fs::remove_file(scratch.folder().join(r"sub\b.md")).unwrap();
+        rescan_and_wait(window.hwnd);
+        let view = notebook_view(window.hwnd);
+        let after = view
+            .list
+            .selected
+            .expect("the selection moves, it does not vanish");
+        assert!(after < view.rows.len());
+        assert_eq!(after, before.min(view.rows.len() - 1));
+        assert!(view.rows[sub].expanded);
+    }
+
+    #[test]
+    fn clicking_a_note_row_opens_the_preview_and_a_double_click_keeps_it() {
+        // Break caught: a click opening a normal tab every time (tabs pile up), or a double-click
+        // opening a second tab instead of keeping the preview.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-click");
+        let a = scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        let row = row_of(window.hwnd, &RowKind::Note("a.md".into()));
+
+        crate::window::notebook_view::activate(window.hwnd, row, Activation::Click);
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(a.as_path()));
+        assert!(active.preview);
+
+        let row = row_of(window.hwnd, &RowKind::Note("a.md".into()));
+        crate::window::notebook_view::activate(window.hwnd, row, Activation::Permanent);
+        assert_eq!(super::tab_count(window.hwnd), 1);
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
+    }
+
+    #[test]
+    fn switching_to_a_note_in_a_subfolder_selects_its_row_and_expands_its_folders() {
+        // Break caught: the tree not following the active tab, or following it into a collapsed
+        // folder so the selected row is hidden, or forgetting that expansion at the next start.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-reveal");
+        std::fs::create_dir_all(scratch.folder().join(r"sub\deep")).unwrap();
+        let b = scratch.note(r"sub\deep\b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+
+        super::open_path(window.hwnd, &b).unwrap();
+        crate::window::side_panel::active_tab_changed(window.hwnd);
+
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"sub\deep\b.md".into()))
+        );
+        let expanded = crate::window::library_host::expanded(window.hwnd);
+        assert!(expanded.contains(&std::path::PathBuf::from("sub")));
+        assert!(expanded.contains(&std::path::PathBuf::from(r"sub\deep")));
+        let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
+        let written = crate::library::local::read(&local, &scratch.folder());
+        assert!(
+            written
+                .expanded
+                .contains(&std::path::PathBuf::from(r"sub\deep"))
+        );
+    }
+
+    #[test]
+    fn right_expands_a_folder_then_enters_it_and_left_climbs_back_out() {
+        // Break caught: arrow keys that only move up and down, so a folder cannot be opened from
+        // the keyboard, or Left on a child that does nothing.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-keys");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        scratch.note("z.md", "z");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        let sub = RowKind::Folder("sub".into());
+        select_row(window.hwnd, &sub);
+        let key = |key| crate::window::notebook_view::key_down(window.hwnd, key);
+
+        assert!(key(VK_RIGHT));
+        assert!(notebook_view(window.hwnd).rows[row_of(window.hwnd, &sub)].expanded);
+        assert!(key(VK_RIGHT));
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"sub\a.md".into()))
+        );
+        assert!(key(VK_LEFT));
+        assert_eq!(selected_kind(window.hwnd), Some(sub.clone()));
+        assert!(key(VK_LEFT));
+        assert!(!notebook_view(window.hwnd).rows[row_of(window.hwnd, &sub)].expanded);
+    }
+
+    #[test]
+    fn the_view_says_loading_then_shows_the_tree_and_recent_notebooks_once_closed() {
+        // Break caught: an empty panel while the worker loads, a tree left on screen after Close
+        // notebook, or a no-notebook state without the RECENT list.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-states");
+        scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(&scratch.data()),
+            &crate::library::local::RecentFolders {
+                folders: vec![scratch.folder()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        app_mut(window.hwnd).library.folder = Some(scratch.folder());
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
+
+        scratch.install(window.hwnd);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
+        assert_eq!(notebook_view(window.hwnd).recent, vec![scratch.folder()]);
+    }
+
+    #[test]
+    fn an_empty_notebook_says_so_until_an_untitled_tab_appears_as_an_unsaved_row() {
+        // Break caught: a blank panel for a notebook with no notes, or a new untitled tab that the
+        // tree does not show until it is saved.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-empty");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
+        super::close_document_without_prompt(window.hwnd, start);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+
+        execute_command(window.hwnd, CommandId::New);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let view = notebook_view(window.hwnd);
+        assert_eq!(view.mode, Mode::Tree);
+        assert_eq!(view.rows[0].kind, RowKind::Unsaved(id.0));
+        assert_eq!(view.rows[0].name, "Untitled");
+    }
+
+    #[test]
+    fn the_header_star_favorites_the_notebook_and_every_state_paints() {
+        // Break caught: a star that does nothing, or a paint path that panics on an empty tree,
+        // the loading state or the no-notebook state.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-star");
+        scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+
+        crate::window::notebook_view::header_clicked(
+            window.hwnd,
+            crate::window::notebook_view::HeaderButton::Favorite,
+        );
+        assert!(crate::window::library_host::is_favorite(window.hwnd));
+
+        let panel = notebook_view(window.hwnd).panel;
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 260,
+            bottom: 400,
+        };
+        let dc = unsafe { windows_sys::Win32::Graphics::Gdi::GetDC(panel) };
+        let paint = |hwnd: HWND| {
+            let view_paint = crate::window::side_panel::view_paint(hwnd, panel, dc, area);
+            crate::window::notebook_view::paint(hwnd, &view_paint);
+        };
+        paint(window.hwnd);
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+        paint(window.hwnd);
+        app_mut(window.hwnd).library.folder = Some(scratch.folder());
+        crate::window::notebook_view::rebuild(window.hwnd);
+        paint(window.hwnd);
+        unsafe { windows_sys::Win32::Graphics::Gdi::ReleaseDC(panel, dc) };
     }
 }

@@ -248,13 +248,13 @@ impl Drop for MenuBar {
     }
 }
 
-enum MenuEntry {
+pub(crate) enum MenuEntry {
     Command(&'static str, CommandId),
     Separator,
 }
 
 impl MenuEntry {
-    const fn command(label: &'static str, command: CommandId) -> Self {
+    pub(crate) const fn command(label: &'static str, command: CommandId) -> Self {
         Self::Command(label, command)
     }
 }
@@ -327,7 +327,7 @@ pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) ->
     track_popup(hwnd, &entries, POINT { x, y })
 }
 
-fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> Option<CommandId> {
+pub(crate) fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> Option<CommandId> {
     // TrackPopupMenuEx runs a nested modal loop that reenters the window procedure, exactly as the
     // file dialogs do. Hold deferred, IPC and snapshot work for its duration so the command the
     // user picks still acts on the document that was active when they opened the menu.
