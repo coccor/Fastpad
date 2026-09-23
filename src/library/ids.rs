@@ -161,7 +161,10 @@ mod tests {
         assert_eq!(NoteId::parse_hex(&id.to_hex()), Some(id));
         assert_eq!(NoteId::parse_hex("abc"), None);
         assert_eq!(NoteId::parse_hex("zz000000000000000000000000000abc"), None);
-        assert_eq!(NotebookId::parse_hex(&"f".repeat(32)), Some(NotebookId(u128::MAX)));
+        assert_eq!(
+            NotebookId::parse_hex(&"f".repeat(32)),
+            Some(NotebookId(u128::MAX))
+        );
     }
 
     #[test]

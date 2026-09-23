@@ -129,7 +129,10 @@ impl Document {
             // A session tab reopened unbound, because its file was already open elsewhere,
             // still names that file.
             (None, Some(origin)) if origin.original_path.is_some() => origin.display_name(),
-            (None, _) => self.untitled_label.clone().unwrap_or_else(|| "Untitled".to_owned()),
+            (None, _) => self
+                .untitled_label
+                .clone()
+                .unwrap_or_else(|| "Untitled".to_owned()),
             (Some(path), _) => file_name_or_untitled(Some(path)),
         };
         if self.dirty {

@@ -144,7 +144,14 @@ pub(crate) fn confirm(hwnd: HWND, text: &str) -> bool {
     }
     let text = wide_null(text);
     let caption = wide_null("FastPad");
-    unsafe { MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK }
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OKCANCEL | MB_ICONWARNING,
+        ) == IDOK
+    }
 }
 
 #[cfg(test)]

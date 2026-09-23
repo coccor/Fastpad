@@ -197,7 +197,11 @@ impl Library {
             .notes
             .iter()
             .position(|note| note.id == target.id)
-            .or_else(|| self.notes.iter().position(|note| same_path(&note.path, &target.path)))?;
+            .or_else(|| {
+                self.notes
+                    .iter()
+                    .position(|note| same_path(&note.path, &target.path))
+            })?;
         self.notes.get_mut(index)
     }
 
@@ -207,9 +211,14 @@ impl Library {
             .notes
             .iter()
             .position(|note| note.id == target.id)
-            .or_else(|| self.notes.iter().position(|note| same_path(&note.path, &target.path)));
+            .or_else(|| {
+                self.notes
+                    .iter()
+                    .position(|note| same_path(&note.path, &target.path))
+            });
         let index = index.unwrap_or_else(|| {
-            self.notes.push(NoteRecord::new(target.id, target.path.clone()));
+            self.notes
+                .push(NoteRecord::new(target.id, target.path.clone()));
             self.notes.len() - 1
         });
         &mut self.notes[index]
@@ -290,7 +299,10 @@ impl Library {
     /// Moves the notebook to `index` in display order (clamped) and renumbers every sort key.
     pub fn move_notebook(&mut self, id: NotebookId, index: usize) -> Result<(), LibraryError> {
         let mut order: Vec<NotebookId> = self.notebooks_in_order().iter().map(|n| n.id).collect();
-        let from = order.iter().position(|&n| n == id).ok_or(LibraryError::NotFound)?;
+        let from = order
+            .iter()
+            .position(|&n| n == id)
+            .ok_or(LibraryError::NotFound)?;
         order.remove(from);
         order.insert(index.min(order.len()), id);
         for (sort, id) in order.into_iter().enumerate() {
@@ -333,10 +345,18 @@ impl Library {
 
     pub fn rename_tag(&mut self, id: TagId, name: &str) -> Result<(), LibraryError> {
         let name = normalize_tag_name(name).map_err(LibraryError::Name)?;
-        if self.tags.iter().any(|tag| tag.id != id && same_name(&tag.name, &name)) {
+        if self
+            .tags
+            .iter()
+            .any(|tag| tag.id != id && same_name(&tag.name, &name))
+        {
             return Err(LibraryError::Name(NameError::Duplicate));
         }
-        let tag = self.tags.iter_mut().find(|tag| tag.id == id).ok_or(LibraryError::NotFound)?;
+        let tag = self
+            .tags
+            .iter_mut()
+            .find(|tag| tag.id == id)
+            .ok_or(LibraryError::NotFound)?;
         tag.name = name;
         Ok(())
     }
@@ -365,7 +385,8 @@ impl Library {
     pub fn prune(&mut self) {
         self.notes.retain(NoteRecord::has_metadata);
         let notes = &self.notes;
-        self.tags.retain(|tag| notes.iter().any(|note| note.tags.contains(&tag.id)));
+        self.tags
+            .retain(|tag| notes.iter().any(|note| note.tags.contains(&tag.id)));
     }
 }
 
@@ -418,7 +439,11 @@ mod tests {
             library.create_notebook(nb(id), name, 0).unwrap();
         }
         library.move_notebook(nb(3), 0).unwrap();
-        let order: Vec<_> = library.notebooks_in_order().iter().map(|n| n.name.as_str()).collect();
+        let order: Vec<_> = library
+            .notebooks_in_order()
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
         assert_eq!(order, ["C", "A", "B"]);
         library.create_notebook(nb(4), "D", 0).unwrap();
         assert_eq!(library.notebooks_in_order().last().unwrap().name, "D");
@@ -431,7 +456,10 @@ mod tests {
         // Break caught: deleting a notebook deleting its notes' records (and their tags).
         let mut library = Library::default();
         library.create_notebook(nb(1), "Work", 0).unwrap();
-        let note = library.resolve_note(&NoteRef { id: NoteId(9), path: "a.md".into() });
+        let note = library.resolve_note(&NoteRef {
+            id: NoteId(9),
+            path: "a.md".into(),
+        });
         note.notebook = Some(nb(1));
         note.favorite = true;
         assert_eq!(library.delete_notebook(nb(1)), Ok(1));
@@ -444,12 +472,24 @@ mod tests {
     #[test]
     fn resolve_finds_by_id_then_by_path_ignoring_case_then_creates() {
         let mut library = Library::default();
-        library.resolve_note(&NoteRef { id: NoteId(1), path: "Plan.md".into() });
-        let by_path = library.resolve_note(&NoteRef { id: NoteId(2), path: "plan.MD".into() });
+        library.resolve_note(&NoteRef {
+            id: NoteId(1),
+            path: "Plan.md".into(),
+        });
+        let by_path = library.resolve_note(&NoteRef {
+            id: NoteId(2),
+            path: "plan.MD".into(),
+        });
         assert_eq!(by_path.id, NoteId(1));
-        let by_id = library.resolve_note(&NoteRef { id: NoteId(1), path: "other.md".into() });
+        let by_id = library.resolve_note(&NoteRef {
+            id: NoteId(1),
+            path: "other.md".into(),
+        });
         assert_eq!(by_id.path, PathBuf::from("Plan.md"));
-        library.resolve_note(&NoteRef { id: NoteId(3), path: "new.md".into() });
+        library.resolve_note(&NoteRef {
+            id: NoteId(3),
+            path: "new.md".into(),
+        });
         assert_eq!(library.notes.len(), 2);
     }
 
@@ -464,7 +504,13 @@ mod tests {
             library.create_tag(TagId(3), " # "),
             Err(LibraryError::Name(NameError::Empty))
         );
-        library.resolve_note(&NoteRef { id: NoteId(5), path: "a.md".into() }).tags.push(TagId(1));
+        library
+            .resolve_note(&NoteRef {
+                id: NoteId(5),
+                path: "a.md".into(),
+            })
+            .tags
+            .push(TagId(1));
         library.create_tag(TagId(4), "todo").unwrap();
         library.prune();
         assert!(library.tag(TagId(1)).is_some());
@@ -476,9 +522,20 @@ mod tests {
         let mut library = Library::default();
         library.create_tag(TagId(1), "todo").unwrap();
         for (id, path) in [(1, "a.md"), (2, "b.md")] {
-            library.resolve_note(&NoteRef { id: NoteId(id), path: path.into() }).tags.push(TagId(1));
+            library
+                .resolve_note(&NoteRef {
+                    id: NoteId(id),
+                    path: path.into(),
+                })
+                .tags
+                .push(TagId(1));
         }
-        library.resolve_note(&NoteRef { id: NoteId(2), path: "b.md".into() }).favorite = true;
+        library
+            .resolve_note(&NoteRef {
+                id: NoteId(2),
+                path: "b.md".into(),
+            })
+            .favorite = true;
         assert_eq!(library.tag_count(TagId(1)), 2);
         assert_eq!(library.remove_tag_everywhere(TagId(1)), Ok(2));
         library.prune();
@@ -489,7 +546,10 @@ mod tests {
 
     #[test]
     fn paths_compare_ignoring_case_like_ntfs() {
-        assert!(same_path(Path::new(r"Sub\Plan.md"), Path::new(r"sub\plan.MD")));
+        assert!(same_path(
+            Path::new(r"Sub\Plan.md"),
+            Path::new(r"sub\plan.MD")
+        ));
         assert!(!same_path(Path::new("a.md"), Path::new("b.md")));
     }
 }

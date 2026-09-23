@@ -5025,9 +5025,10 @@ mod tests {
             std::fs::read_to_string(&ini).unwrap(),
             "# kept\r\nnotes_mode=false\r\n"
         );
-        assert!(notices(window.hwnd).contains(
-            &crate::window::library_host::notes_mode_notice(false).to_owned()
-        ));
+        assert!(
+            notices(window.hwnd)
+                .contains(&crate::window::library_host::notes_mode_notice(false).to_owned())
+        );
         super::save_settings_to(None);
     }
 

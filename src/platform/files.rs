@@ -12,7 +12,10 @@ use windows_sys::Win32::UI::Shell::{
 };
 
 fn wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`: fails if `new` already exists (a change of
@@ -46,11 +49,9 @@ pub fn recycle(path: &Path) -> Result<()> {
     let mut operation: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     operation.wFunc = FO_DELETE;
     operation.pFrom = from.as_ptr();
-    operation.fFlags = (FOF_ALLOWUNDO
-        | FOF_NOCONFIRMATION
-        | FOF_SILENT
-        | FOF_NOERRORUI
-        | FOF_WANTNUKEWARNING) as _;
+    operation.fFlags =
+        (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING)
+            as _;
     let status = unsafe { SHFileOperationW(&mut operation) };
     if operation.fAnyOperationsAborted != 0 {
         return Err(crate::FastPadError::Invariant("recycle aborted"));
@@ -66,7 +67,8 @@ mod tests {
     use super::*;
 
     fn scratch(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("fastpad-files-{label}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("fastpad-files-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -125,6 +127,9 @@ mod tests {
     fn the_default_notes_folder_is_under_documents() {
         let documents = crate::platform::paths::documents_dir().unwrap();
         assert!(documents.is_dir());
-        assert_eq!(crate::platform::paths::default_notes_folder().unwrap(), documents.join("FastPad"));
+        assert_eq!(
+            crate::platform::paths::default_notes_folder().unwrap(),
+            documents.join("FastPad")
+        );
     }
 }

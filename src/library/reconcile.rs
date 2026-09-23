@@ -46,14 +46,24 @@ fn relocate(
     record: &NoteRecord,
     path: PathBuf,
 ) {
-    let note = NoteRef { id: record.id, path: record.path.clone() };
+    let note = NoteRef {
+        id: record.id,
+        path: record.path.clone(),
+    };
     local.clear_missing(record.id);
-    let op = PendingOp::Relocate { note: note.clone(), path: path.clone() };
+    let op = PendingOp::Relocate {
+        note: note.clone(),
+        path: path.clone(),
+    };
     if apply_op(library, &mut result.ops, op) {
         result.relocated.push((record.path.clone(), path));
     }
     if record.deleted {
-        apply_op(library, &mut result.ops, PendingOp::SetDeleted { note, value: false });
+        apply_op(
+            library,
+            &mut result.ops,
+            PendingOp::SetDeleted { note, value: false },
+        );
     }
 }
 
@@ -72,8 +82,11 @@ pub fn reconcile(
         .map(|(index, entry)| (key(&entry.path), index))
         .collect();
     // The scan cache as of the previous scan. A path already in it is not "new".
-    let cache: HashMap<String, CachedFile> =
-        local.files.iter().map(|file| (key(&file.path), file.clone())).collect();
+    let cache: HashMap<String, CachedFile> = local
+        .files
+        .iter()
+        .map(|file| (key(&file.path), file.clone()))
+        .collect();
     let is_new = |index: usize| !cache.contains_key(&key(&scan.entries[index].path));
     let mut claimed = vec![false; scan.entries.len()];
     let mut hashes: HashMap<usize, Option<u64>> = HashMap::new();
@@ -81,24 +94,47 @@ pub fn reconcile(
     // 1. Path (ignoring case). A record whose path is already claimed by an earlier record
     // (two records collapsing onto the same case-insensitive path) is treated as unmatched.
     let mut unmatched = Vec::new();
-    for record in library.notes.clone().into_iter().filter(|record| !record.path.is_absolute()) {
-        let index = by_path.get(&key(&record.path)).copied().filter(|&index| !claimed[index]);
+    for record in library
+        .notes
+        .clone()
+        .into_iter()
+        .filter(|record| !record.path.is_absolute())
+    {
+        let index = by_path
+            .get(&key(&record.path))
+            .copied()
+            .filter(|&index| !claimed[index]);
         let Some(index) = index else {
             unmatched.push(record);
             continue;
         };
         claimed[index] = true;
-        let note = NoteRef { id: record.id, path: record.path.clone() };
+        let note = NoteRef {
+            id: record.id,
+            path: record.path.clone(),
+        };
         let entry = &scan.entries[index];
         local.clear_missing(record.id);
         if record.path != entry.path {
-            let op = PendingOp::Relocate { note: note.clone(), path: entry.path.clone() };
+            let op = PendingOp::Relocate {
+                note: note.clone(),
+                path: entry.path.clone(),
+            };
             if apply_op(library, &mut result.ops, op) {
-                result.relocated.push((record.path.clone(), entry.path.clone()));
+                result
+                    .relocated
+                    .push((record.path.clone(), entry.path.clone()));
             }
         }
         if record.deleted {
-            apply_op(library, &mut result.ops, PendingOp::SetDeleted { note: note.clone(), value: false });
+            apply_op(
+                library,
+                &mut result.ops,
+                PendingOp::SetDeleted {
+                    note: note.clone(),
+                    value: false,
+                },
+            );
         }
         let changed = cache
             .get(&key(&entry.path))
@@ -110,7 +146,15 @@ pub fn reconcile(
             && let Some(value) = *hashes.entry(index).or_insert_with(|| hash(&entry.path))
             && (value != record.hash || entry.size != record.size)
         {
-            apply_op(library, &mut result.ops, PendingOp::SetFingerprint { note, size: entry.size, hash: value });
+            apply_op(
+                library,
+                &mut result.ops,
+                PendingOp::SetFingerprint {
+                    note,
+                    size: entry.size,
+                    hash: value,
+                },
+            );
         }
     }
 
@@ -123,13 +167,21 @@ pub fn reconcile(
             .filter(|cached| cached.file_id != 0 && cached.volume == scan.volume)
             .and_then(|cached| {
                 (0..scan.entries.len()).find(|&index| {
-                    !claimed[index] && is_new(index) && scan.entries[index].file_id == cached.file_id
+                    !claimed[index]
+                        && is_new(index)
+                        && scan.entries[index].file_id == cached.file_id
                 })
             });
         match by_id {
             Some(index) => {
                 claimed[index] = true;
-                relocate(library, local, &mut result, &record, scan.entries[index].path.clone());
+                relocate(
+                    library,
+                    local,
+                    &mut result,
+                    &record,
+                    scan.entries[index].path.clone(),
+                );
             }
             None => still_unmatched.push(record),
         }
@@ -147,13 +199,20 @@ pub fn reconcile(
                     && is_new(index)
                     && !entry.online_only
                     && entry.size == record.size
-                    && *hashes.entry(index).or_insert_with(|| hash(&entry.path)) == Some(record.hash)
+                    && *hashes.entry(index).or_insert_with(|| hash(&entry.path))
+                        == Some(record.hash)
             })
         };
         match found {
             Some(index) => {
                 claimed[index] = true;
-                relocate(library, local, &mut result, &record, scan.entries[index].path.clone());
+                relocate(
+                    library,
+                    local,
+                    &mut result,
+                    &record,
+                    scan.entries[index].path.clone(),
+                );
             }
             None => missing.push(record),
         }
@@ -203,7 +262,13 @@ mod tests {
     const VOLUME: u32 = 0xabcd;
 
     fn entry(path: &str, size: u64, file_id: u64) -> ScanEntry {
-        ScanEntry { path: path.into(), size, mtime: 1, file_id, online_only: false }
+        ScanEntry {
+            path: path.into(),
+            size,
+            mtime: 1,
+            file_id,
+            online_only: false,
+        }
     }
 
     fn record(id: u128, path: &str, size: u64, hash: u64) -> NoteRecord {
@@ -215,7 +280,13 @@ mod tests {
     }
 
     fn cached(path: &str, size: u64, file_id: u64) -> CachedFile {
-        CachedFile { volume: VOLUME, file_id, mtime: 1, size, path: path.into() }
+        CachedFile {
+            volume: VOLUME,
+            file_id,
+            mtime: 1,
+            size,
+            path: path.into(),
+        }
     }
 
     struct Fixture {
@@ -231,9 +302,16 @@ mod tests {
             let mut local = LocalState::new(r"D:\Notes".into());
             local.files = cache;
             Self {
-                library: Library { notes: records, ..Library::default() },
+                library: Library {
+                    notes: records,
+                    ..Library::default()
+                },
                 local,
-                scan: Scan { volume: VOLUME, entries, truncated: false },
+                scan: Scan {
+                    volume: VOLUME,
+                    entries,
+                    truncated: false,
+                },
                 hashes: HashMap::new(),
                 hashed: Vec::new(),
             }
@@ -242,11 +320,17 @@ mod tests {
         fn run(&mut self, now: u64) -> Reconciled {
             let hashes = self.hashes.clone();
             let hashed = &mut self.hashed;
-            reconcile(&mut self.library, &mut self.local, &self.scan, now, &mut |path| {
-                let key = path.to_string_lossy().into_owned();
-                hashed.push(key.clone());
-                hashes.get(&key).copied()
-            })
+            reconcile(
+                &mut self.library,
+                &mut self.local,
+                &self.scan,
+                now,
+                &mut |path| {
+                    let key = path.to_string_lossy().into_owned();
+                    hashed.push(key.clone());
+                    hashes.get(&key).copied()
+                },
+            )
         }
 
         fn path_of(&self, id: u128) -> Option<PathBuf> {
@@ -263,7 +347,10 @@ mod tests {
         );
         let result = fixture.run(100);
         assert!(result.ops.is_empty());
-        assert!(fixture.hashed.is_empty(), "an unchanged file is not re-hashed");
+        assert!(
+            fixture.hashed.is_empty(),
+            "an unchanged file is not re-hashed"
+        );
     }
 
     #[test]
@@ -276,7 +363,10 @@ mod tests {
         );
         let result = fixture.run(100);
         assert_eq!(fixture.path_of(1), Some(PathBuf::from(r"sub\new.md")));
-        assert_eq!(result.relocated, vec![(PathBuf::from("old.md"), PathBuf::from(r"sub\new.md"))]);
+        assert_eq!(
+            result.relocated,
+            vec![(PathBuf::from("old.md"), PathBuf::from(r"sub\new.md"))]
+        );
         assert!(fixture.hashed.is_empty(), "the file ID was enough");
         assert_eq!(fixture.local.files[0].path, PathBuf::from(r"sub\new.md"));
     }
@@ -296,7 +386,11 @@ mod tests {
 
     #[test]
     fn the_same_size_with_a_different_hash_is_not_a_match() {
-        let mut fixture = Fixture::new(vec![record(1, "old.md", 3, 9)], vec![], vec![entry("x.md", 3, 70)]);
+        let mut fixture = Fixture::new(
+            vec![record(1, "old.md", 3, 9)],
+            vec![],
+            vec![entry("x.md", 3, 70)],
+        );
         fixture.hashes.insert("x.md".into(), 8);
         fixture.run(100);
         assert_eq!(fixture.path_of(1), Some(PathBuf::from("old.md")));
@@ -330,7 +424,11 @@ mod tests {
     #[test]
     fn files_over_the_hash_limit_are_never_hashed() {
         let big = HASH_LIMIT + 1;
-        let mut fixture = Fixture::new(vec![record(1, "old.log", big, 9)], vec![], vec![entry("huge.log", big, 70)]);
+        let mut fixture = Fixture::new(
+            vec![record(1, "old.log", big, 9)],
+            vec![],
+            vec![entry("huge.log", big, 70)],
+        );
         fixture.run(100);
         assert!(fixture.hashed.is_empty());
         assert_eq!(fixture.path_of(1), Some(PathBuf::from("old.log")));
@@ -404,9 +502,21 @@ mod tests {
         );
         fixture.hashes.insert("c.md".into(), 9);
         fixture.run(100);
-        assert_eq!(fixture.path_of(2), Some(PathBuf::from("c.md")), "B keeps its file-ID match");
-        assert_eq!(fixture.path_of(1), Some(PathBuf::from("a.md")), "A is not relocated");
-        assert_eq!(fixture.local.missing_since(NoteId(1)), Some(100), "A goes missing instead");
+        assert_eq!(
+            fixture.path_of(2),
+            Some(PathBuf::from("c.md")),
+            "B keeps its file-ID match"
+        );
+        assert_eq!(
+            fixture.path_of(1),
+            Some(PathBuf::from("a.md")),
+            "A is not relocated"
+        );
+        assert_eq!(
+            fixture.local.missing_since(NoteId(1)),
+            Some(100),
+            "A goes missing instead"
+        );
     }
 
     #[test]
@@ -420,9 +530,16 @@ mod tests {
         );
         fixture.hashes.insert("b.md".into(), 9);
         fixture.run(100);
-        assert_eq!(fixture.path_of(1), Some(PathBuf::from("a.md")), "b.md already existed, so it cannot match");
+        assert_eq!(
+            fixture.path_of(1),
+            Some(PathBuf::from("a.md")),
+            "b.md already existed, so it cannot match"
+        );
         assert_eq!(fixture.local.missing_since(NoteId(1)), Some(100));
-        assert!(fixture.hashed.is_empty(), "a file that is not new is never hashed");
+        assert!(
+            fixture.hashed.is_empty(),
+            "a file that is not new is never hashed"
+        );
     }
 
     #[test]
@@ -430,10 +547,17 @@ mod tests {
         let mut fixture = Fixture::new(vec![record(1, "gone.md", 3, 9)], vec![], vec![]);
         fixture.scan.truncated = true;
         fixture.run(1_000);
-        assert_eq!(fixture.local.missing_since(NoteId(1)), None, "a truncated scan never marks missing");
+        assert_eq!(
+            fixture.local.missing_since(NoteId(1)),
+            None,
+            "a truncated scan never marks missing"
+        );
         fixture.local.set_missing(NoteId(1), 1_000);
         let result = fixture.run(1_000 + PURGE_AFTER_SECS);
-        assert!(fixture.library.note(NoteId(1)).is_some(), "a truncated scan never purges");
+        assert!(
+            fixture.library.note(NoteId(1)).is_some(),
+            "a truncated scan never purges"
+        );
         assert!(result.ops.is_empty());
     }
 

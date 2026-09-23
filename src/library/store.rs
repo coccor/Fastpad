@@ -59,7 +59,11 @@ pub fn encode(library: &Library) -> String {
         ));
     }
     for tag in &library.tags {
-        output.push_str(&format!("tag={}|{}\r\n", tag.id.to_hex(), escape(&tag.name)));
+        output.push_str(&format!(
+            "tag={}|{}\r\n",
+            tag.id.to_hex(),
+            escape(&tag.name)
+        ));
     }
     for note in &library.notes {
         let mut flags = String::new();
@@ -78,12 +82,17 @@ pub fn encode(library: &Library) -> String {
         let tags = if note.tags.is_empty() {
             "-".to_owned()
         } else {
-            note.tags.iter().map(|tag| tag.to_hex()).collect::<Vec<_>>().join(",")
+            note.tags
+                .iter()
+                .map(|tag| tag.to_hex())
+                .collect::<Vec<_>>()
+                .join(",")
         };
         output.push_str(&format!(
             "note={}|{}|{flags}|{tags}|{}|{:016x}|{}\r\n",
             note.id.to_hex(),
-            note.notebook.map_or_else(|| "-".to_owned(), NotebookId::to_hex),
+            note.notebook
+                .map_or_else(|| "-".to_owned(), NotebookId::to_hex),
             note.size,
             note.hash,
             note.path.to_string_lossy()
@@ -144,7 +153,14 @@ fn parse_notebook(value: &str) -> Option<Notebook> {
     if name.trim().is_empty() {
         return None;
     }
-    Some(Notebook { id, name, color, sort, created, modified })
+    Some(Notebook {
+        id,
+        name,
+        color,
+        sort,
+        created,
+        modified,
+    })
 }
 
 fn parse_tag(value: &str) -> Option<Tag> {
@@ -153,7 +169,10 @@ fn parse_tag(value: &str) -> Option<Tag> {
     if name.trim().is_empty() {
         return None;
     }
-    Some(Tag { id: TagId::parse_hex(id)?, name })
+    Some(Tag {
+        id: TagId::parse_hex(id)?,
+        name,
+    })
 }
 
 fn parse_note(value: &str) -> Option<NoteRecord> {
@@ -220,7 +239,7 @@ pub fn write(path: &Path, library: &Library) -> Result<FileStamp> {
 mod tests {
     use super::*;
     use crate::library::ids::{NoteId, NotebookId, TagId};
-    use crate::library::model::{Notebook, NotebookColor, NoteRecord, Tag};
+    use crate::library::model::{NoteRecord, Notebook, NotebookColor, Tag};
 
     fn sample() -> Library {
         let mut note = NoteRecord::new(NoteId(0xa), PathBuf::from(r"sub\a b|c.md"));
@@ -243,8 +262,14 @@ mod tests {
                 modified: 200,
             }],
             tags: vec![
-                Tag { id: TagId(2), name: "idea".into() },
-                Tag { id: TagId(3), name: "to|do".into() },
+                Tag {
+                    id: TagId(2),
+                    name: "idea".into(),
+                },
+                Tag {
+                    id: TagId(3),
+                    name: "to|do".into(),
+                },
             ],
             notes: vec![note, external],
         }
@@ -287,7 +312,10 @@ mod tests {
         let note = &library.notes[0];
         assert_eq!(note.notebook, None, "unknown notebook falls back to Notes");
         assert_eq!(note.tags, vec![TagId(2)], "unknown tag IDs are dropped");
-        assert!(!note.favorite && !note.pinned && !note.deleted, "unknown flags are ignored");
+        assert!(
+            !note.favorite && !note.pinned && !note.deleted,
+            "unknown flags are ignored"
+        );
         assert_eq!(library.notes.len(), 1);
     }
 

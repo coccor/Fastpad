@@ -13,7 +13,9 @@ pub const NOTE_EXTENSIONS: [&str; 14] = [
 ];
 
 pub fn is_note_extension(extension: &str) -> bool {
-    NOTE_EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(extension))
+    NOTE_EXTENSIONS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(extension))
 }
 
 /// An untitled tab's label, and the last line whose edits can change it.
@@ -62,12 +64,19 @@ pub fn sanitize_stem(name: &str) -> String {
         .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
         .filter(|c| !c.is_control())
         .collect();
-    let trimmed = cleaned.trim().trim_end_matches(['.', ' ', '…']).trim().to_owned();
+    let trimmed = cleaned
+        .trim()
+        .trim_end_matches(['.', ' ', '…'])
+        .trim()
+        .to_owned();
     if trimmed.is_empty() {
         return "Untitled".to_owned();
     }
     let device = trimmed.split('.').next().unwrap_or("");
-    if RESERVED.iter().any(|reserved| reserved.eq_ignore_ascii_case(device)) {
+    if RESERVED
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(device))
+    {
         return format!("{trimmed}_");
     }
     trimmed
@@ -159,10 +168,22 @@ mod tests {
 
     #[test]
     fn typed_names_keep_a_known_extension_and_otherwise_get_the_default() {
-        assert_eq!(split_typed_name("plan.txt", "md"), ("plan".into(), "txt".into()));
-        assert_eq!(split_typed_name("v1.2 plan", "md"), ("v1.2 plan".into(), "md".into()));
-        assert_eq!(split_typed_name("data.JSON", "md"), ("data".into(), "JSON".into()));
-        assert_eq!(split_typed_name(".md", "md"), ("Untitled".into(), "md".into()));
+        assert_eq!(
+            split_typed_name("plan.txt", "md"),
+            ("plan".into(), "txt".into())
+        );
+        assert_eq!(
+            split_typed_name("v1.2 plan", "md"),
+            ("v1.2 plan".into(), "md".into())
+        );
+        assert_eq!(
+            split_typed_name("data.JSON", "md"),
+            ("data".into(), "JSON".into())
+        );
+        assert_eq!(
+            split_typed_name(".md", "md"),
+            ("Untitled".into(), "md".into())
+        );
         assert_eq!(default_extension(Language::Json), "json");
         assert_eq!(default_extension(Language::PlainText), "md");
     }
@@ -178,7 +199,10 @@ mod tests {
 
     #[test]
     fn a_saved_notes_title_is_its_file_stem() {
-        assert_eq!(note_title(Path::new(r"D:\Notes\sub\Meeting notes.md")), "Meeting notes");
+        assert_eq!(
+            note_title(Path::new(r"D:\Notes\sub\Meeting notes.md")),
+            "Meeting notes"
+        );
         assert!(is_note_extension("YML"));
         assert!(!is_note_extension("png"));
     }

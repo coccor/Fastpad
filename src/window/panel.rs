@@ -7,13 +7,13 @@ use crate::platform::{last_error, wide_null};
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::Graphics::Gdi::{
     DC_BRUSH, FillRect, GetDC, GetStockObject, GetTextMetricsW, HDC, HFONT, ReleaseDC,
     SelectObject, SetDCBrushColor, TEXTMETRICW,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, RegisterClassW,
     SendMessageW, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DRAWITEM, WM_ERASEBKGND,

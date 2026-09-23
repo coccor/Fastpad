@@ -448,7 +448,11 @@ impl Tabs {
     /// Rejects the path if it canonicalizes to the same file another open tab already owns; see
     /// `reject_path_collision`. Updates the tab view so the tab strip and accessibility see the
     /// new title.
-    pub fn rebind_path(&mut self, id: DocumentId, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
+    pub fn rebind_path(
+        &mut self,
+        id: DocumentId,
+        path: PathBuf,
+    ) -> Result<(), DuplicateDocumentPath> {
         let Some(index) = self.documents.iter().position(|document| document.id == id) else {
             return Err(DuplicateDocumentPath(path));
         };

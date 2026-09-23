@@ -107,7 +107,8 @@ impl LocalState {
     }
 
     pub fn note_opened(&mut self, path: &Path, now: u64) {
-        self.recent.retain(|(_, existing)| !same_path(existing, path));
+        self.recent
+            .retain(|(_, existing)| !same_path(existing, path));
         self.recent.insert(0, (now, path.to_path_buf()));
         self.recent.truncate(RECENT_LIMIT);
     }
@@ -123,7 +124,11 @@ impl LocalState {
     /// Keeps the newest open time per path from both lists, most recent first.
     pub fn merge_recent(&mut self, other: &LocalState) {
         for (time, path) in &other.recent {
-            match self.recent.iter_mut().find(|(_, existing)| same_path(existing, path)) {
+            match self
+                .recent
+                .iter_mut()
+                .find(|(_, existing)| same_path(existing, path))
+            {
                 Some(entry) if entry.0 < *time => entry.0 = *time,
                 Some(_) => {}
                 None => self.recent.push((*time, path.clone())),
@@ -134,7 +139,10 @@ impl LocalState {
     }
 
     pub fn missing_since(&self, id: NoteId) -> Option<u64> {
-        self.missing.iter().find(|(_, missing)| *missing == id).map(|(time, _)| *time)
+        self.missing
+            .iter()
+            .find(|(_, missing)| *missing == id)
+            .map(|(time, _)| *time)
     }
 
     pub fn set_missing(&mut self, id: NoteId, now: u64) {
@@ -158,15 +166,26 @@ fn parse_file(value: &str) -> Option<CachedFile> {
     if path.is_empty() {
         return None;
     }
-    Some(CachedFile { volume, file_id, mtime, size, path: PathBuf::from(path) })
+    Some(CachedFile {
+        volume,
+        file_id,
+        mtime,
+        size,
+        path: PathBuf::from(path),
+    })
 }
 
 pub fn folder_key(folder: &Path) -> String {
-    format!("{:016x}", fnv1a(folder.to_string_lossy().to_lowercase().as_bytes()))
+    format!(
+        "{:016x}",
+        fnv1a(folder.to_string_lossy().to_lowercase().as_bytes())
+    )
 }
 
 pub fn local_file(data_dir: &Path, folder: &Path) -> PathBuf {
-    data_dir.join("libraries").join(format!("{}.ini", folder_key(folder)))
+    data_dir
+        .join("libraries")
+        .join(format!("{}.ini", folder_key(folder)))
 }
 
 pub fn read(path: &Path, folder: &Path) -> LocalState {
@@ -217,7 +236,8 @@ impl RecentFolders {
     }
 
     pub fn push(&mut self, folder: PathBuf) {
-        self.folders.retain(|existing| !same_path(existing, &folder));
+        self.folders
+            .retain(|existing| !same_path(existing, &folder));
         self.folders.insert(0, folder);
         self.folders.truncate(FOLDER_LIMIT);
     }
@@ -247,7 +267,10 @@ mod tests {
     fn sample() -> LocalState {
         let mut state = LocalState::new(PathBuf::from(r"D:\Notes"));
         state.autosave = false;
-        state.recent = vec![(20, PathBuf::from("b.md")), (10, PathBuf::from(r"sub\a|x.md"))];
+        state.recent = vec![
+            (20, PathBuf::from("b.md")),
+            (10, PathBuf::from(r"sub\a|x.md")),
+        ];
         state.missing = vec![(5, NoteId(9))];
         state.files = vec![CachedFile {
             volume: 0x1234,
@@ -264,10 +287,19 @@ mod tests {
         // Break caught: two folders whose keys collide sharing one cache, or `|` in a path
         // breaking the scan cache.
         let text = sample().encode();
-        assert_eq!(LocalState::parse(&text, Path::new(r"D:\Notes")), Some(sample()));
-        assert!(LocalState::parse(&text, Path::new(r"d:\notes")).is_some(), "case is ignored");
+        assert_eq!(
+            LocalState::parse(&text, Path::new(r"D:\Notes")),
+            Some(sample())
+        );
+        assert!(
+            LocalState::parse(&text, Path::new(r"d:\notes")).is_some(),
+            "case is ignored"
+        );
         assert_eq!(LocalState::parse(&text, Path::new(r"D:\Other")), None);
-        assert_eq!(LocalState::parse("version=2\r\n", Path::new(r"D:\Notes")), None);
+        assert_eq!(
+            LocalState::parse("version=2\r\n", Path::new(r"D:\Notes")),
+            None
+        );
     }
 
     #[test]
@@ -279,7 +311,14 @@ mod tests {
         assert_eq!(state.recent.len(), RECENT_LIMIT);
         state.note_opened(Path::new("10.MD"), 999);
         assert_eq!(state.recent[0], (999, PathBuf::from("10.MD")));
-        assert_eq!(state.recent.iter().filter(|(_, p)| same_path(p, Path::new("10.md"))).count(), 1);
+        assert_eq!(
+            state
+                .recent
+                .iter()
+                .filter(|(_, p)| same_path(p, Path::new("10.md")))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -291,7 +330,12 @@ mod tests {
         other.recent = vec![(50, PathBuf::from("b.md")), (1, PathBuf::from("c.md"))];
         state.merge_recent(&other);
         assert_eq!(state.recent[0], (50, PathBuf::from("b.md")));
-        assert!(state.recent.iter().any(|(t, p)| *t == 1 && p == Path::new("c.md")));
+        assert!(
+            state
+                .recent
+                .iter()
+                .any(|(t, p)| *t == 1 && p == Path::new("c.md"))
+        );
     }
 
     #[test]
@@ -307,11 +351,15 @@ mod tests {
     #[test]
     fn folder_keys_ignore_case_and_name_the_local_file() {
         let data = Path::new(r"C:\Users\u\AppData\Local\FastPad");
-        assert_eq!(folder_key(Path::new(r"D:\Notes")), folder_key(Path::new(r"d:\NOTES")));
+        assert_eq!(
+            folder_key(Path::new(r"D:\Notes")),
+            folder_key(Path::new(r"d:\NOTES"))
+        );
         assert_eq!(folder_key(Path::new(r"D:\Notes")).len(), 16);
         assert_eq!(
             local_file(data, Path::new(r"D:\Notes")),
-            data.join("libraries").join(format!("{}.ini", folder_key(Path::new(r"D:\Notes"))))
+            data.join("libraries")
+                .join(format!("{}.ini", folder_key(Path::new(r"D:\Notes"))))
         );
     }
 
@@ -325,7 +373,10 @@ mod tests {
         assert_eq!(folders.folders.len(), FOLDER_LIMIT);
         assert_eq!(folders.folders[0], PathBuf::from(r"d:\f5"));
         assert_eq!(RecentFolders::parse(&folders.encode()), folders);
-        assert_eq!(RecentFolders::parse("version=7\r\nfolder=D:\\x\r\n"), RecentFolders::default());
+        assert_eq!(
+            RecentFolders::parse("version=7\r\nfolder=D:\\x\r\n"),
+            RecentFolders::default()
+        );
     }
 
     #[test]

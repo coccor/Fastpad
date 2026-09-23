@@ -37,7 +37,10 @@ pub struct Scan {
 }
 
 pub fn skip_directory(name: &str) -> bool {
-    name.starts_with('.') || SKIPPED.iter().any(|skipped| skipped.eq_ignore_ascii_case(name))
+    name.starts_with('.')
+        || SKIPPED
+            .iter()
+            .any(|skipped| skipped.eq_ignore_ascii_case(name))
 }
 
 fn open_directory(path: &Path) -> Result<OwnedHandle> {
@@ -99,7 +102,11 @@ pub fn scan(folder: &Path, limit: usize) -> Result<Scan> {
             loop {
                 // Entries are packed back to back; NextEntryOffset is 8-byte aligned.
                 let entry = unsafe {
-                    &*(buffer.as_ptr().cast::<u8>().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>())
+                    &*(buffer
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<FILE_ID_BOTH_DIR_INFO>())
                 };
                 let name = unsafe {
                     std::slice::from_raw_parts(
@@ -107,13 +114,16 @@ pub fn scan(folder: &Path, limit: usize) -> Result<Scan> {
                         (entry.FileNameLength / 2) as usize,
                     )
                 };
-                let name = std::ffi::OsString::from_wide(name).to_string_lossy().into_owned();
+                let name = std::ffi::OsString::from_wide(name)
+                    .to_string_lossy()
+                    .into_owned();
                 let attributes = entry.FileAttributes;
                 let skipped_attributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
                 if name != "." && name != ".." && attributes & skipped_attributes == 0 {
                     let path = relative.join(&name);
                     if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                        if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 && !skip_directory(&name) {
+                        if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 && !skip_directory(&name)
+                        {
                             pending.push((path, None));
                         }
                     } else if Path::new(&name)
@@ -153,7 +163,8 @@ mod tests {
 
     impl Scratch {
         fn new(label: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("fastpad-scan-{label}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("fastpad-scan-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Self(root)
@@ -173,7 +184,11 @@ mod tests {
     }
 
     fn paths(scan: &Scan) -> Vec<String> {
-        let mut paths: Vec<_> = scan.entries.iter().map(|e| e.path.to_string_lossy().into_owned()).collect();
+        let mut paths: Vec<_> = scan
+            .entries
+            .iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
         paths.sort();
         paths
     }
@@ -199,7 +214,11 @@ mod tests {
         }
         let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
         assert_eq!(paths(&scan), [r"a.md", r"sub\deeper\b.TXT"]);
-        let b = scan.entries.iter().find(|e| e.path.ends_with("b.TXT")).unwrap();
+        let b = scan
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("b.TXT"))
+            .unwrap();
         assert_eq!(b.size, 2);
         assert_ne!(b.file_id, 0, "NTFS reports file IDs");
         assert_ne!(b.mtime, 0);

@@ -218,7 +218,11 @@ fn merge_notes(folder: &Path, previous: Vec<NoteEntry>, fresh: Vec<NoteEntry>) -
     }
     for note in differing {
         if let Some(stamp) = store::stamp(&folder.join(&note.path)) {
-            merged.push(NoteEntry { path: note.path, size: stamp.size, mtime: filetime_ticks(stamp.modified) });
+            merged.push(NoteEntry {
+                path: note.path,
+                size: stamp.size,
+                mtime: filetime_ticks(stamp.modified),
+            });
         }
     }
     merged
@@ -308,11 +312,19 @@ impl LibraryState {
         let stamp = store::stamp(path);
         let size = stamp.map_or(0, |stamp| stamp.size);
         let mtime = stamp.map_or(0, |stamp| filetime_ticks(stamp.modified));
-        if let Some(existing) = self.notes.iter_mut().find(|note| same_path(&note.path, &relative)) {
+        if let Some(existing) = self
+            .notes
+            .iter_mut()
+            .find(|note| same_path(&note.path, &relative))
+        {
             existing.size = size;
             existing.mtime = mtime;
         } else {
-            self.notes.push(NoteEntry { path: relative, size, mtime });
+            self.notes.push(NoteEntry {
+                path: relative,
+                size,
+                mtime,
+            });
         }
     }
 
@@ -329,8 +341,14 @@ impl LibraryState {
         self.add_note(new);
         self.local.rename_path(&old_stored, &new_stored);
         if let Some(record) = self.library.note_by_path(&old_stored) {
-            let note = NoteRef { id: record.id, path: old_stored };
-            let _ = self.apply(PendingOp::Relocate { note, path: new_stored });
+            let note = NoteRef {
+                id: record.id,
+                path: old_stored,
+            };
+            let _ = self.apply(PendingOp::Relocate {
+                note,
+                path: new_stored,
+            });
         }
     }
 }
@@ -344,7 +362,8 @@ mod tests {
 
     impl Scratch {
         fn new(label: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("fastpad-library-{label}-{}", std::process::id()));
+            let root = std::env::temp_dir()
+                .join(format!("fastpad-library-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("notes")).unwrap();
             Self(root)
@@ -366,9 +385,18 @@ mod tests {
     #[test]
     fn record_paths_are_relative_inside_the_folder_ignoring_case_and_absolute_outside() {
         let folder = Path::new(r"D:\Notes");
-        assert_eq!(record_path(folder, Path::new(r"d:\notes\sub\a.md")), PathBuf::from(r"sub\a.md"));
-        assert_eq!(record_path(folder, Path::new(r"D:\Other\a.md")), PathBuf::from(r"D:\Other\a.md"));
-        assert_eq!(record_path(folder, Path::new(r"D:\NotesArchive\a.md")), PathBuf::from(r"D:\NotesArchive\a.md"));
+        assert_eq!(
+            record_path(folder, Path::new(r"d:\notes\sub\a.md")),
+            PathBuf::from(r"sub\a.md")
+        );
+        assert_eq!(
+            record_path(folder, Path::new(r"D:\Other\a.md")),
+            PathBuf::from(r"D:\Other\a.md")
+        );
+        assert_eq!(
+            record_path(folder, Path::new(r"D:\NotesArchive\a.md")),
+            PathBuf::from(r"D:\NotesArchive\a.md")
+        );
         assert!(is_inside(folder, Path::new(r"D:\NOTES\a.md")));
         assert!(!is_inside(folder, folder));
     }
@@ -392,12 +420,20 @@ mod tests {
         let mut ids = IdSource::new(1, 2);
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = state.note_ref(&mut ids, &note);
-        state.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+        state
+            .apply(PendingOp::SetFavorite {
+                note: target,
+                value: true,
+            })
+            .unwrap();
         assert!(flush(&mut state).unwrap());
         assert!(state.pending.is_empty());
         let reloaded = load(&scratch.folder(), &scratch.local(), 101).unwrap();
         assert!(reloaded.record_for(&note).unwrap().favorite);
-        assert_eq!(reloaded.record_for(&note).unwrap().path, PathBuf::from("a.md"));
+        assert_eq!(
+            reloaded.record_for(&note).unwrap().path,
+            PathBuf::from("a.md")
+        );
     }
 
     #[test]
@@ -409,7 +445,12 @@ mod tests {
         let mut ids = IdSource::new(1, 2);
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = state.note_ref(&mut ids, &a);
-        state.apply(PendingOp::SetFavorite { note: target.clone(), value: true }).unwrap();
+        state
+            .apply(PendingOp::SetFavorite {
+                note: target.clone(),
+                value: true,
+            })
+            .unwrap();
         flush(&mut state).unwrap();
 
         // "Another PC" adds a notebook directly in the file.
@@ -422,7 +463,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         store::write(&path, &other).unwrap();
 
-        state.apply(PendingOp::AddTag { note: target, tag: TagId(5), name: "idea".into() }).unwrap();
+        state
+            .apply(PendingOp::AddTag {
+                note: target,
+                tag: TagId(5),
+                name: "idea".into(),
+            })
+            .unwrap();
         flush(&mut state).unwrap();
         let final_state = load(&scratch.folder(), &scratch.local(), 102).unwrap();
         assert!(final_state.library.notebook(NotebookId(77)).is_some());
@@ -444,9 +491,15 @@ mod tests {
         assert_eq!(state.metadata, Metadata::Unreadable);
         assert_eq!(state.notes.len(), 1, "notes are still listed");
         let target = state.note_ref(&mut ids, &a);
-        let _ = state.apply(PendingOp::SetFavorite { note: target, value: true });
+        let _ = state.apply(PendingOp::SetFavorite {
+            note: target,
+            value: true,
+        });
         assert!(!flush(&mut state).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version=9\r\nnote=future\r\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version=9\r\nnote=future\r\n"
+        );
     }
 
     #[test]
@@ -459,7 +512,12 @@ mod tests {
         let mut ids = IdSource::new(1, 2);
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = state.note_ref(&mut ids, &a);
-        state.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+        state
+            .apply(PendingOp::SetFavorite {
+                note: target,
+                value: true,
+            })
+            .unwrap();
 
         // Another process replaces library.ini with a file from a newer, unreadable version.
         let path = store::library_file(&scratch.folder());
@@ -468,7 +526,10 @@ mod tests {
 
         assert!(flush(&mut state).is_err());
         assert_eq!(state.metadata, Metadata::Unreadable);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version=9\r\nnote=future\r\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version=9\r\nnote=future\r\n"
+        );
     }
 
     #[test]
@@ -480,7 +541,12 @@ mod tests {
         let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
         let target = previous.note_ref(&mut ids, &a);
-        previous.apply(PendingOp::SetPinned { note: target, value: true }).unwrap();
+        previous
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
         previous.local.note_opened(Path::new("a.md"), 150);
         let merged = merge_rescan(previous, fresh);
         assert!(merged.record_for(&a).unwrap().pinned);
@@ -500,14 +566,28 @@ mod tests {
         let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
         let target = previous.note_ref(&mut ids, &a);
-        previous.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+        previous
+            .apply(PendingOp::SetFavorite {
+                note: target,
+                value: true,
+            })
+            .unwrap();
         assert!(flush(&mut previous).unwrap());
 
         let mut merged = merge_rescan(previous, fresh);
-        assert!(merged.record_for(&a).unwrap().favorite, "the flushed favorite is still visible");
-        assert!(!flush(&mut merged).unwrap(), "nothing pending: the flush is a no-op");
+        assert!(
+            merged.record_for(&a).unwrap().favorite,
+            "the flushed favorite is still visible"
+        );
+        assert!(
+            !flush(&mut merged).unwrap(),
+            "nothing pending: the flush is a no-op"
+        );
         let reloaded = load(&scratch.folder(), &scratch.local(), 102).unwrap();
-        assert!(reloaded.record_for(&a).unwrap().favorite, "the flush did not revert it");
+        assert!(
+            reloaded.record_for(&a).unwrap().favorite,
+            "the flush did not revert it"
+        );
     }
 
     #[test]
@@ -535,12 +615,24 @@ mod tests {
         previous.rename_note(&old, &renamed);
 
         let merged = merge_rescan(previous, fresh);
-        let paths: std::collections::HashSet<_> =
-            merged.notes.iter().map(|note| note.path.to_string_lossy().to_lowercase()).collect();
+        let paths: std::collections::HashSet<_> = merged
+            .notes
+            .iter()
+            .map(|note| note.path.to_string_lossy().to_lowercase())
+            .collect();
         assert!(paths.contains("a.md"));
-        assert!(paths.contains("b.md"), "a note added during the rescan survives");
-        assert!(paths.contains("renamed.md"), "a rename made during the rescan survives");
-        assert!(!paths.contains("old.md"), "the old name is gone from disk and is not kept from fresh");
+        assert!(
+            paths.contains("b.md"),
+            "a note added during the rescan survives"
+        );
+        assert!(
+            paths.contains("renamed.md"),
+            "a rename made during the rescan survives"
+        );
+        assert!(
+            !paths.contains("old.md"),
+            "the old name is gone from disk and is not kept from fresh"
+        );
         assert_eq!(merged.notes.len(), 3);
     }
 
@@ -557,7 +649,12 @@ mod tests {
         // Organize once, so `library.ini` exists and `previous` loads with a real stamp.
         let mut setup = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let target = setup.note_ref(&mut ids, &a);
-        setup.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+        setup
+            .apply(PendingOp::SetFavorite {
+                note: target,
+                value: true,
+            })
+            .unwrap();
         assert!(flush(&mut setup).unwrap());
 
         let previous = load(&scratch.folder(), &scratch.local(), 101).unwrap();
@@ -569,7 +666,9 @@ mod tests {
             store::ReadOutcome::Loaded(library, _) => library,
             _ => panic!("expected a library"),
         };
-        outside.create_notebook(NotebookId(77), "Synced", 5).unwrap();
+        outside
+            .create_notebook(NotebookId(77), "Synced", 5)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         store::write(&path, &outside).unwrap();
 
@@ -578,8 +677,14 @@ mod tests {
         let current = store::stamp(&path);
 
         let merged = merge_rescan(previous, fresh);
-        assert!(merged.library.notebook(NotebookId(77)).is_some(), "the outside change is visible");
-        assert!(merged.record_for(&a).unwrap().favorite, "the earlier favorite is still there");
+        assert!(
+            merged.library.notebook(NotebookId(77)).is_some(),
+            "the outside change is visible"
+        );
+        assert!(
+            merged.record_for(&a).unwrap().favorite,
+            "the earlier favorite is still there"
+        );
         assert_eq!(merged.stamp, current);
     }
 
@@ -618,7 +723,11 @@ mod tests {
         let folder = scratch.folder();
         let entries = |count: usize| -> Vec<NoteEntry> {
             (0..count)
-                .map(|index| NoteEntry { path: PathBuf::from(format!("f{index}.md")), size: 0, mtime: 0 })
+                .map(|index| NoteEntry {
+                    path: PathBuf::from(format!("f{index}.md")),
+                    size: 0,
+                    mtime: 0,
+                })
                 .collect()
         };
         let state = |notes: Vec<NoteEntry>, truncated: bool| LibraryState {
@@ -660,7 +769,12 @@ mod tests {
         assert_eq!(state.notes.len(), 1);
         let mut ids = IdSource::new(1, 2);
         let target = state.note_ref(&mut ids, &a);
-        state.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+        state
+            .apply(PendingOp::SetFavorite {
+                note: target,
+                value: true,
+            })
+            .unwrap();
         let b = scratch.folder().join("b.md");
         state.rename_note(&a, &b);
         assert_eq!(state.notes[0].path, PathBuf::from("b.md"));

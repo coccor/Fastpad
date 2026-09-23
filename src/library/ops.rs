@@ -9,22 +9,72 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PendingOp {
-    CreateNotebook { id: NotebookId, name: String, now: u64 },
-    RenameNotebook { id: NotebookId, name: String, now: u64 },
-    SetNotebookColor { id: NotebookId, color: Option<NotebookColor>, now: u64 },
-    MoveNotebook { id: NotebookId, index: usize },
-    DeleteNotebook { id: NotebookId },
-    SetNoteNotebook { note: NoteRef, notebook: Option<NotebookId> },
-    SetFavorite { note: NoteRef, value: bool },
-    SetPinned { note: NoteRef, value: bool },
-    AddTag { note: NoteRef, tag: TagId, name: String },
-    RemoveTag { note: NoteRef, tag: TagId },
-    RenameTag { id: TagId, name: String },
-    RemoveTagEverywhere { id: TagId },
-    Relocate { note: NoteRef, path: PathBuf },
-    SetFingerprint { note: NoteRef, size: u64, hash: u64 },
-    SetDeleted { note: NoteRef, value: bool },
-    Drop { id: NoteId },
+    CreateNotebook {
+        id: NotebookId,
+        name: String,
+        now: u64,
+    },
+    RenameNotebook {
+        id: NotebookId,
+        name: String,
+        now: u64,
+    },
+    SetNotebookColor {
+        id: NotebookId,
+        color: Option<NotebookColor>,
+        now: u64,
+    },
+    MoveNotebook {
+        id: NotebookId,
+        index: usize,
+    },
+    DeleteNotebook {
+        id: NotebookId,
+    },
+    SetNoteNotebook {
+        note: NoteRef,
+        notebook: Option<NotebookId>,
+    },
+    SetFavorite {
+        note: NoteRef,
+        value: bool,
+    },
+    SetPinned {
+        note: NoteRef,
+        value: bool,
+    },
+    AddTag {
+        note: NoteRef,
+        tag: TagId,
+        name: String,
+    },
+    RemoveTag {
+        note: NoteRef,
+        tag: TagId,
+    },
+    RenameTag {
+        id: TagId,
+        name: String,
+    },
+    RemoveTagEverywhere {
+        id: TagId,
+    },
+    Relocate {
+        note: NoteRef,
+        path: PathBuf,
+    },
+    SetFingerprint {
+        note: NoteRef,
+        size: u64,
+        hash: u64,
+    },
+    SetDeleted {
+        note: NoteRef,
+        value: bool,
+    },
+    Drop {
+        id: NoteId,
+    },
 }
 
 pub fn apply(library: &mut Library, op: &PendingOp) -> Result<(), LibraryError> {
@@ -69,7 +119,10 @@ pub fn apply(library: &mut Library, op: &PendingOp) -> Result<(), LibraryError> 
         PendingOp::RenameTag { id, name } => library.rename_tag(*id, name),
         PendingOp::RemoveTagEverywhere { id } => library.remove_tag_everywhere(*id).map(|_| ()),
         PendingOp::Relocate { note, path } => {
-            library.find_note_mut(note).ok_or(LibraryError::NotFound)?.path = path.clone();
+            library
+                .find_note_mut(note)
+                .ok_or(LibraryError::NotFound)?
+                .path = path.clone();
             Ok(())
         }
         PendingOp::SetFingerprint { note, size, hash } => {
@@ -79,7 +132,10 @@ pub fn apply(library: &mut Library, op: &PendingOp) -> Result<(), LibraryError> 
             Ok(())
         }
         PendingOp::SetDeleted { note, value } => {
-            library.find_note_mut(note).ok_or(LibraryError::NotFound)?.deleted = *value;
+            library
+                .find_note_mut(note)
+                .ok_or(LibraryError::NotFound)?
+                .deleted = *value;
             Ok(())
         }
         PendingOp::Drop { id } => {
@@ -100,25 +156,53 @@ mod tests {
     use crate::library::ids::{NoteId, NotebookId, TagId};
 
     fn note(id: u128, path: &str) -> NoteRef {
-        NoteRef { id: NoteId(id), path: path.into() }
+        NoteRef {
+            id: NoteId(id),
+            path: path.into(),
+        }
     }
 
     #[test]
     fn two_diverged_copies_merge_by_replay_without_losing_either_side() {
         // Break caught: a sync from another PC overwriting this PC's favorite, or the reverse.
         let mut base = Library::default();
-        apply(&mut base, &PendingOp::CreateNotebook { id: NotebookId(1), name: "Work".into(), now: 1 }).unwrap();
+        apply(
+            &mut base,
+            &PendingOp::CreateNotebook {
+                id: NotebookId(1),
+                name: "Work".into(),
+                now: 1,
+            },
+        )
+        .unwrap();
 
         let mut other_pc = base.clone();
-        apply(&mut other_pc, &PendingOp::SetNoteNotebook { note: note(7, "a.md"), notebook: Some(NotebookId(1)) }).unwrap();
+        apply(
+            &mut other_pc,
+            &PendingOp::SetNoteNotebook {
+                note: note(7, "a.md"),
+                notebook: Some(NotebookId(1)),
+            },
+        )
+        .unwrap();
 
         let ours = vec![
-            PendingOp::SetFavorite { note: note(8, "b.md"), value: true },
-            PendingOp::AddTag { note: note(8, "b.md"), tag: TagId(3), name: "idea".into() },
+            PendingOp::SetFavorite {
+                note: note(8, "b.md"),
+                value: true,
+            },
+            PendingOp::AddTag {
+                note: note(8, "b.md"),
+                tag: TagId(3),
+                name: "idea".into(),
+            },
         ];
         let mut merged = other_pc.clone();
         assert_eq!(replay(&mut merged, &ours), 0);
-        assert_eq!(merged.note(NoteId(7)).unwrap().notebook, Some(NotebookId(1)));
+        assert_eq!(
+            merged.note(NoteId(7)).unwrap().notebook,
+            Some(NotebookId(1))
+        );
         let b = merged.note(NoteId(8)).unwrap();
         assert!(b.favorite);
         assert_eq!(b.tags, vec![TagId(3)]);
@@ -127,10 +211,24 @@ mod tests {
     #[test]
     fn replaying_an_already_applied_log_changes_nothing() {
         let ops = vec![
-            PendingOp::CreateNotebook { id: NotebookId(1), name: "Work".into(), now: 1 },
-            PendingOp::SetNoteNotebook { note: note(7, "a.md"), notebook: Some(NotebookId(1)) },
-            PendingOp::AddTag { note: note(7, "a.md"), tag: TagId(2), name: "todo".into() },
-            PendingOp::SetPinned { note: note(7, "a.md"), value: true },
+            PendingOp::CreateNotebook {
+                id: NotebookId(1),
+                name: "Work".into(),
+                now: 1,
+            },
+            PendingOp::SetNoteNotebook {
+                note: note(7, "a.md"),
+                notebook: Some(NotebookId(1)),
+            },
+            PendingOp::AddTag {
+                note: note(7, "a.md"),
+                tag: TagId(2),
+                name: "todo".into(),
+            },
+            PendingOp::SetPinned {
+                note: note(7, "a.md"),
+                value: true,
+            },
         ];
         let mut once = Library::default();
         replay(&mut once, &ops);
@@ -145,9 +243,19 @@ mod tests {
         // notebook that no longer exists.
         let mut library = Library::default();
         let ops = vec![
-            PendingOp::SetNoteNotebook { note: note(7, "a.md"), notebook: Some(NotebookId(9)) },
-            PendingOp::RenameNotebook { id: NotebookId(9), name: "X".into(), now: 1 },
-            PendingOp::Relocate { note: note(8, "gone.md"), path: "moved.md".into() },
+            PendingOp::SetNoteNotebook {
+                note: note(7, "a.md"),
+                notebook: Some(NotebookId(9)),
+            },
+            PendingOp::RenameNotebook {
+                id: NotebookId(9),
+                name: "X".into(),
+                now: 1,
+            },
+            PendingOp::Relocate {
+                note: note(8, "gone.md"),
+                path: "moved.md".into(),
+            },
         ];
         assert_eq!(replay(&mut library, &ops), 3);
         assert!(library.notes.is_empty());
@@ -157,7 +265,15 @@ mod tests {
     fn adding_a_tag_reuses_a_same_named_tag_created_elsewhere() {
         let mut library = Library::default();
         library.create_tag(TagId(1), "idea").unwrap();
-        apply(&mut library, &PendingOp::AddTag { note: note(7, "a.md"), tag: TagId(2), name: "Idea".into() }).unwrap();
+        apply(
+            &mut library,
+            &PendingOp::AddTag {
+                note: note(7, "a.md"),
+                tag: TagId(2),
+                name: "Idea".into(),
+            },
+        )
+        .unwrap();
         assert_eq!(library.tags.len(), 1);
         assert_eq!(library.note(NoteId(7)).unwrap().tags, vec![TagId(1)]);
     }
@@ -165,10 +281,39 @@ mod tests {
     #[test]
     fn relocation_fingerprints_and_deletion_flags_need_an_existing_record() {
         let mut library = Library::default();
-        apply(&mut library, &PendingOp::SetFavorite { note: note(7, "a.md"), value: true }).unwrap();
-        apply(&mut library, &PendingOp::Relocate { note: note(7, "a.md"), path: "b.md".into() }).unwrap();
-        apply(&mut library, &PendingOp::SetFingerprint { note: note(7, "b.md"), size: 3, hash: 9 }).unwrap();
-        apply(&mut library, &PendingOp::SetDeleted { note: note(7, "b.md"), value: true }).unwrap();
+        apply(
+            &mut library,
+            &PendingOp::SetFavorite {
+                note: note(7, "a.md"),
+                value: true,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut library,
+            &PendingOp::Relocate {
+                note: note(7, "a.md"),
+                path: "b.md".into(),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut library,
+            &PendingOp::SetFingerprint {
+                note: note(7, "b.md"),
+                size: 3,
+                hash: 9,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut library,
+            &PendingOp::SetDeleted {
+                note: note(7, "b.md"),
+                value: true,
+            },
+        )
+        .unwrap();
         let record = library.note(NoteId(7)).unwrap();
         assert_eq!(record.path, std::path::PathBuf::from("b.md"));
         assert_eq!((record.size, record.hash, record.deleted), (3, 9, true));
