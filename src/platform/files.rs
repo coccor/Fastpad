@@ -6,7 +6,9 @@ use crate::platform::last_error;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
     SHFILEOPSTRUCTW, SHFileOperationW,
@@ -24,6 +26,18 @@ fn wide(path: &Path) -> Vec<u16> {
 pub fn rename_no_replace(old: &Path, new: &Path) -> Result<()> {
     let (old_wide, new_wide) = (wide(old), wide(new));
     if unsafe { MoveFileExW(old_wide.as_ptr(), new_wide.as_ptr(), 0) } == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Moves `from` to `to`, never over an existing file. Across volumes it copies and then deletes
+/// (`MOVEFILE_COPY_ALLOWED`). `MOVEFILE_WRITE_THROUGH` returns only once the copy is on disk, so
+/// the source is never deleted before the copy exists.
+pub fn move_file(from: &Path, to: &Path) -> Result<()> {
+    let (from_wide, to_wide) = (wide(from), wide(to));
+    let flags = MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH;
+    if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) } == 0 {
         return Err(last_error());
     }
     Ok(())
@@ -123,6 +137,29 @@ mod tests {
         let dir = scratch("recycle-directory");
         assert!(recycle(std::ptr::null_mut(), &dir).is_err());
         assert!(dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_file_never_replaces_the_target_and_lands_in_another_folder() {
+        // Break caught: a move onto a same-named note in the destination destroying that note, or
+        // a "move" that leaves the source behind.
+        let dir = scratch("move");
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::write(dir.join("a.md"), "a").unwrap();
+        std::fs::write(dir.join("other").join("b.md"), "b").unwrap();
+        assert!(move_file(&dir.join("a.md"), &dir.join("other").join("b.md")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other").join("b.md")).unwrap(),
+            "b"
+        );
+        assert!(dir.join("a.md").exists());
+        move_file(&dir.join("a.md"), &dir.join("other").join("a.md")).unwrap();
+        assert!(!dir.join("a.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other").join("a.md")).unwrap(),
+            "a"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

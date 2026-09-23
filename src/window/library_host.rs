@@ -65,6 +65,9 @@ pub(crate) struct LibraryHost {
     /// Bumped whenever `set_expanded` changes the expanded set, so the Notebook view knows its
     /// rows are stale without comparing the sets.
     expansion_revision: u64,
+    /// The note an open Move to notebook picker moves, and the notebooks it lists, in row order.
+    /// The row after the last is "Browse…".
+    pub(crate) shown_move: Option<(PathBuf, Vec<PathBuf>)>,
 }
 
 impl LibraryHost {
@@ -85,6 +88,7 @@ impl LibraryHost {
             folders_edited: false,
             check_request: 0,
             expansion_revision: 0,
+            shown_move: None,
         }
     }
 }
@@ -1189,6 +1193,57 @@ pub(crate) fn suggested_file_name(hwnd: HWND) -> String {
         .unwrap_or_else(|| "Untitled.md".to_owned())
 }
 
+/// Ctrl+N, the Notebook view's New note, and "New note here" (`folder`). The new untitled tab
+/// remembers where its first save goes: `folder`, else the folder of the sidebar's selected row,
+/// else the notebook root. With no notebook open it is a plain new tab.
+pub(crate) fn new_note_in(hwnd: HWND, folder: Option<PathBuf>) {
+    let destination = self::folder(hwnd).filter(|_| notes_mode(hwnd)).map(|root| {
+        folder
+            .or_else(|| super::notebook_view::selected_folder(hwnd))
+            .filter(|candidate| {
+                library::model::same_path(candidate, &root) || library::is_inside(&root, candidate)
+            })
+            .unwrap_or(root)
+    });
+    if let Err(error) = super::main_window::create_new_document(hwnd) {
+        push_notice(hwnd, format!("FastPad could not create a new tab: {error}"));
+        return;
+    }
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        if let Some(id) = app.tabs.active().map(|document| document.id)
+            && let Some(document) = app.tabs.document_mut(id)
+        {
+            document.save_folder = destination;
+        }
+    }
+    super::side_panel::refresh(hwnd);
+}
+
+/// Where tab `id`'s first save goes: its remembered folder while that is still a folder of the
+/// open notebook, else the notebook root (spec §6.7).
+fn save_folder_for(hwnd: HWND, id: crate::document::DocumentId) -> Option<PathBuf> {
+    let root = folder(hwnd)?;
+    let remembered = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .document(id)?
+            .save_folder
+            .clone()
+    });
+    Some(
+        remembered
+            .filter(|folder| library::is_inside(&root, folder) && folder.is_dir())
+            .unwrap_or(root),
+    )
+}
+
+/// The active tab's first-save folder, for the name box and the Save As dialog.
+pub(crate) fn first_save_folder(hwnd: HWND) -> Option<PathBuf> {
+    let id = active_untitled(hwnd)?;
+    save_folder_for(hwnd, id)
+}
+
 /// Ctrl+S: an untitled tab in notes mode is named in the name box; everything else as before.
 pub(crate) fn save_command(hwnd: HWND) {
     if notes_mode(hwnd)
@@ -1201,7 +1256,12 @@ pub(crate) fn save_command(hwnd: HWND) {
             return;
         }
         refresh_label(hwnd);
-        let suffix = format!("in {}", folder_display_name(hwnd));
+        let suffix = format!(
+            "in {}",
+            first_save_folder(hwnd)
+                .as_deref()
+                .map_or_else(|| folder_display_name(hwnd), notebook_name)
+        );
         open_name_box(
             hwnd,
             NamePurpose::FirstSave(id),
@@ -1358,7 +1418,7 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
 }
 
 fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
-    let Some(folder) = folder(hwnd) else {
+    let Some(folder) = save_folder_for(hwnd, id) else {
         return;
     };
     let language = unsafe { app_ptr(hwnd) }
@@ -1478,21 +1538,170 @@ fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
     }
 }
 
-/// Note: Delete: after a confirm, sends the file to the Recycle Bin and closes its tab. Any
-/// record stays, flagged deleted and marked missing, so the 30-day purge removes it.
+/// The Move to notebook picker's notebooks: favorites by name, then recent ones, never the open
+/// notebook and never twice.
+fn move_destinations(hwnd: HWND) -> Vec<PathBuf> {
+    let open = folder(hwnd);
+    let known = known_folders(hwnd, true);
+    let elsewhere = |candidate: &PathBuf| {
+        !open
+            .as_ref()
+            .is_some_and(|open| library::model::same_path(open, candidate))
+    };
+    let favorites: Vec<PathBuf> = known
+        .favorites
+        .iter()
+        .filter(|f| elsewhere(f))
+        .cloned()
+        .collect();
+    let mut named: Vec<(String, PathBuf)> = library::local::display_names(&favorites)
+        .into_iter()
+        .map(|(name, _)| name)
+        .zip(favorites)
+        .collect();
+    named.sort_by(|a, b| library::tree::natural_cmp(&a.0, &b.0));
+    let mut destinations: Vec<PathBuf> = named.into_iter().map(|(_, path)| path).collect();
+    for recent in known.folders {
+        if elsewhere(&recent)
+            && !destinations
+                .iter()
+                .any(|listed| library::model::same_path(listed, &recent))
+        {
+            destinations.push(recent);
+        }
+    }
+    destinations
+}
+
+/// Note: Move to notebook… (spec §6.6): picks another notebook, whose root receives the file.
+pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
+    if !folder(hwnd).is_some_and(|root| library::is_inside(&root, path)) {
+        push_notice(
+            hwnd,
+            "Only notes in the open notebook can be moved to another notebook.".to_owned(),
+        );
+        return;
+    }
+    let destinations = move_destinations(hwnd);
+    let mut items: Vec<String> = library::local::display_names(&destinations)
+        .into_iter()
+        .map(|(name, hint)| match hint {
+            Some(hint) => format!("{name} ({hint})"),
+            None => name,
+        })
+        .collect();
+    items.push("Browse…".to_owned());
+    host(hwnd, |host| {
+        host.shown_move = Some((path.to_path_buf(), destinations));
+    });
+    super::main_window::open_picker(
+        hwnd,
+        Picker {
+            kind: PickerKind::MoveToNotebook,
+            items,
+            create: None,
+        },
+    );
+}
+
+/// Moves `note` into `destination`'s root. A clash or a failure changes nothing and says so. The
+/// pin goes, because pins belong to a notebook, and an open tab follows the file.
+fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
+    let Some(file_name) = note.file_name() else {
+        return;
+    };
+    let target = destination.join(file_name);
+    let notebook = notebook_name(destination);
+    if library::model::same_path(&target, note) {
+        push_notice(
+            hwnd,
+            format!("{} is already in {notebook}.", title::note_title(note)),
+        );
+        return;
+    }
+    if target.exists() {
+        push_notice(
+            hwnd,
+            format!(
+                "{} already exists in {notebook}. Nothing was moved.",
+                file_name.to_string_lossy()
+            ),
+        );
+        return;
+    }
+    if let Err(error) = crate::platform::files::move_file(note, &target) {
+        push_notice(
+            hwnd,
+            format!(
+                "FastPad could not move {} to {notebook}: {error}",
+                note.display()
+            ),
+        );
+        return;
+    }
+    let stays_inside = folder(hwnd).is_some_and(|root| library::is_inside(&root, &target));
+    if stays_inside {
+        with_state(hwnd, |state| state.rename_note(note, &target));
+        schedule_write(hwnd);
+    } else {
+        let record = with_state(hwnd, |state| state.record_for(note).map(|r| r.id)).flatten();
+        if let Some(id) = record {
+            report(hwnd, apply_op(hwnd, |_, _| Some(PendingOp::Drop { id })));
+        }
+        with_state(hwnd, |state| state.remove_note(note));
+    }
+    rebind_open_tab(hwnd, note, target.clone());
+    push_notice(
+        hwnd,
+        format!("Moved {} to {notebook}.", title::note_title(&target)),
+    );
+    super::side_panel::refresh(hwnd);
+}
+
+/// Note: Reveal in Explorer, and the sidebar's Reveal entries.
+pub(crate) fn reveal(hwnd: HWND, path: &Path) {
+    if let Err(error) = crate::platform::shell::reveal_in_explorer(path) {
+        push_notice(
+            hwnd,
+            format!(
+                "FastPad could not show {} in Explorer: {error}",
+                path.display()
+            ),
+        );
+    }
+}
+
+/// Rename… from the sidebar. The note opens as a normal tab first, because the name box renames
+/// a tab, then the name box opens as for Note: Rename.
+pub(crate) fn rename_file(hwnd: HWND, path: &Path) {
+    if let Err(error) =
+        super::main_window::open_note(hwnd, path, super::main_window::OpenMode::Permanent, false)
+    {
+        super::main_window::report_open_failure(hwnd, path, &error);
+        return;
+    }
+    rename_note(hwnd);
+}
+
+/// Note: Delete, on the active tab's file.
 pub(crate) fn delete_note(hwnd: HWND) {
     let Some(path) = active_file(hwnd) else {
         return;
     };
-    let Some((id, dirty)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let active = unsafe { app.as_ref() }.tabs.active()?;
-        Some((active.id, active.dirty))
-    }) else {
-        return;
-    };
+    delete_file(hwnd, &path);
+}
+
+/// After a confirm, sends `path` to the Recycle Bin and closes its tab if it has one. Any record
+/// stays, flagged deleted and marked missing, so the 30-day purge removes it.
+pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
+    let tab = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        let id = tabs.find_stored_path(path)?;
+        Some((id, tabs.document(id)?.dirty))
+    });
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     // The tab's unsaved edits go with the file: they are not autosaved first.
-    let question = if dirty {
+    let question = if tab.is_some_and(|(_, dirty)| dirty) {
         format!("Move \u{201c}{name}\u{201d} to the Recycle Bin and discard unsaved changes?")
     } else {
         format!("Move \u{201c}{name}\u{201d} to the Recycle Bin?")
@@ -1504,7 +1713,7 @@ pub(crate) fn delete_note(hwnd: HWND) {
         return;
     };
     // The shell may show its own modal warning (a permanent delete), owned by this window.
-    let recycled = crate::platform::files::recycle(hwnd, &path);
+    let recycled = crate::platform::files::recycle(hwnd, path);
     if !identity.is_live_for(hwnd) {
         return;
     }
@@ -1516,21 +1725,23 @@ pub(crate) fn delete_note(hwnd: HWND) {
         return;
     }
     let now = library::now_unix();
-    let record = with_state(hwnd, |state| state.record_for(&path).map(|r| r.id)).flatten();
+    let record = with_state(hwnd, |state| state.record_for(path).map(|r| r.id)).flatten();
     if let Some(note_id) = record {
         report(
             hwnd,
             apply_op(hwnd, |state, ids| {
                 Some(PendingOp::SetDeleted {
-                    note: state.note_ref(ids, &path),
+                    note: state.note_ref(ids, path),
                     value: true,
                 })
             }),
         );
         with_state(hwnd, |state| state.local.set_missing(note_id, now));
     }
-    with_state(hwnd, |state| state.remove_note(&path));
-    super::main_window::close_document_without_prompt(hwnd, id);
+    with_state(hwnd, |state| state.remove_note(path));
+    if let Some((id, _)) = tab {
+        super::main_window::close_document_without_prompt(hwnd, id);
+    }
     super::side_panel::refresh(hwnd);
 }
 
@@ -1945,11 +2156,46 @@ pub(crate) fn take_last_pick() -> Option<(PickerKind, PickerChoice)> {
 pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
     #[cfg(test)]
     LAST_PICK.with(|last| *last.borrow_mut() = Some((kind, choice.clone())));
-    if let (PickerKind::RecentFolder, PickerChoice::Item(index)) = (kind, choice) {
-        let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
-        if let Some(folder) = shown.unwrap_or_default().get(index) {
-            open_listed_notebook(hwnd, folder);
+    match (kind, choice) {
+        (PickerKind::RecentFolder, PickerChoice::Item(index)) => {
+            let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
+            if let Some(folder) = shown.unwrap_or_default().get(index) {
+                open_listed_notebook(hwnd, folder);
+            }
         }
+        (PickerKind::MoveToNotebook, PickerChoice::Item(index)) => {
+            let Some((note, destinations)) = host(hwnd, |host| host.shown_move.take()).flatten()
+            else {
+                return;
+            };
+            let destination = match destinations.get(index) {
+                Some(folder) => folder.clone(),
+                // The row after the notebooks is "Browse…".
+                None if index == destinations.len() => {
+                    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+                        return;
+                    };
+                    let choice = crate::window::modal::choose_folder(hwnd);
+                    if !identity.is_live_for(hwnd) {
+                        return;
+                    }
+                    match choice {
+                        Ok(Some(folder)) => library::normalize_folder(&folder),
+                        Ok(None) => return,
+                        Err(error) => {
+                            push_notice(
+                                hwnd,
+                                format!("FastPad could not open the folder picker: {error}"),
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => return,
+            };
+            move_note_to(hwnd, &note, &destination);
+        }
+        _ => {}
     }
 }
 

@@ -26,11 +26,12 @@ use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_CONTROL, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, SendMessageW, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    GetClientRect, GetParent, SendMessageW, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN,
 };
 
 // Sizes at 96 DPI; everything is scaled with `panel::scale`.
@@ -1258,6 +1259,171 @@ fn run(hwnd: HWND, command: CommandId) {
     }
 }
 
+/// The selected note's absolute path while the panel has the keyboard focus, so palette and
+/// accelerator commands act on it rather than on the active tab (spec §6.3).
+pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
+    let root = super::library_host::folder(hwnd)?;
+    with_view(hwnd, |view| {
+        let focused =
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == view.panel;
+        match view.list.selected.map(|index| view.target(index)) {
+            Some(Target::Row(TreeRow {
+                kind: RowKind::Note(relative),
+                ..
+            })) if focused => Some(root.join(relative)),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+/// The folder a new note goes to (spec §6.7): a selected folder row's own folder, or a
+/// selected note's parent. `None` (the root) for an unsaved row or no selection.
+pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
+    let root = super::library_host::folder(hwnd)?;
+    let target = with_view(hwnd, |view| {
+        view.list.selected.map(|index| view.target(index))
+    })
+    .flatten()?;
+    match target {
+        Target::Row(TreeRow {
+            kind: RowKind::Folder(relative),
+            ..
+        }) => Some(root.join(relative)),
+        Target::Row(TreeRow {
+            kind: RowKind::Note(relative),
+            ..
+        }) => Some(root.join(relative).parent()?.to_path_buf()),
+        _ => None,
+    }
+}
+
+impl NotebookView {
+    /// Under row `index`, in main-window client coordinates, for a menu opened from the
+    /// keyboard.
+    fn row_menu_point(&self, index: usize) -> POINT {
+        let list = self.list_rect(self.client());
+        let rect = self.row_rect(list, index).unwrap_or(list);
+        self.to_main(POINT {
+            x: rect.left + scale(24, self.dpi()),
+            y: rect.bottom,
+        })
+    }
+}
+
+/// Row `index`'s context menu (spec §6.6), at `at` (main-window client coordinates) or under
+/// the row when opened from the keyboard. The chosen entry acts on that row, not the active
+/// tab. "Open in new tab" is `CommandId::Open` and "New note here" is `CommandId::New` here.
+pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
+    let Some((target, point)) = with_view(hwnd, |view| {
+        if view.mode != Mode::Tree {
+            return None;
+        }
+        view.select(index);
+        Some((
+            view.target(index),
+            at.unwrap_or_else(|| view.row_menu_point(index)),
+        ))
+    })
+    .flatten() else {
+        return;
+    };
+    let Target::Row(row) = target else {
+        return;
+    };
+    let Some(root) = super::library_host::folder(hwnd) else {
+        return;
+    };
+    match &row.kind {
+        RowKind::Note(relative) => {
+            let path = root.join(relative);
+            let entries = [
+                MenuEntry::command("Open in new tab", CommandId::Open),
+                MenuEntry::command(
+                    if row.pinned { "Unpin" } else { "Pin" },
+                    CommandId::NoteTogglePin,
+                ),
+                MenuEntry::Separator,
+                MenuEntry::command(
+                    "Move to notebook...\tCtrl+Shift+M",
+                    CommandId::NoteMoveToNotebook,
+                ),
+                MenuEntry::command("Rename...\tF2", CommandId::NoteRename),
+                MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
+                MenuEntry::Separator,
+                MenuEntry::command("Delete...\tDel", CommandId::NoteDelete),
+            ];
+            match super::menus::track_popup(hwnd, &entries, point) {
+                Some(CommandId::Open) => {
+                    if let Err(error) =
+                        super::main_window::open_note(hwnd, &path, OpenMode::Permanent, true)
+                    {
+                        super::main_window::report_open_failure(hwnd, &path, &error);
+                    }
+                }
+                Some(CommandId::NoteTogglePin) => super::library_host::toggle_pin(hwnd, &path),
+                Some(CommandId::NoteMoveToNotebook) => {
+                    super::library_host::move_to_notebook(hwnd, &path);
+                }
+                Some(CommandId::NoteRename) => {
+                    if super::library_host::ready_library(hwnd) {
+                        super::library_host::rename_file(hwnd, &path);
+                    }
+                }
+                Some(CommandId::NoteRevealInExplorer) => super::library_host::reveal(hwnd, &path),
+                Some(CommandId::NoteDelete) if super::library_host::ready_library(hwnd) => {
+                    super::library_host::delete_file(hwnd, &path);
+                }
+                _ => {}
+            }
+        }
+        RowKind::Folder(relative) => {
+            let path = root.join(relative);
+            let entries = [
+                MenuEntry::command("New note here", CommandId::New),
+                MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
+            ];
+            match super::menus::track_popup(hwnd, &entries, point) {
+                Some(CommandId::New) => super::library_host::new_note_in(hwnd, Some(path)),
+                Some(CommandId::NoteRevealInExplorer) => super::library_host::reveal(hwnd, &path),
+                _ => {}
+            }
+        }
+        RowKind::Unsaved(key) => {
+            let entries = [MenuEntry::command("Close tab", CommandId::CloseTab)];
+            if super::menus::track_popup(hwnd, &entries, point) == Some(CommandId::CloseTab)
+                && super::main_window::activate_document_by_id(hwnd, DocumentId(*key))
+            {
+                run(hwnd, CommandId::CloseTab);
+            }
+        }
+    }
+}
+
+/// `WM_CONTEXTMENU`: from a right-click (screen coordinates) or from Shift+F10 or the
+/// context-menu key (`lparam` of -1, for the selected row).
+fn context_menu(hwnd: HWND, lparam: LPARAM) {
+    let keyboard = lparam as u32 == u32::MAX;
+    let target = with_view(hwnd, |view| {
+        if keyboard {
+            return view.list.selected.map(|index| (index, None));
+        }
+        let (x, y) = point_of(lparam);
+        let mut client = POINT { x, y };
+        unsafe {
+            ScreenToClient(view.panel, &mut client);
+        }
+        match view.hit_test(client.x, client.y) {
+            Hit::Row { index, .. } => Some((index, Some(view.to_main(client)))),
+            _ => None,
+        }
+    })
+    .flatten();
+    if let Some((index, at)) = target {
+        open_context_menu(hwnd, index, at);
+    }
+}
+
 /// The panel's input while the Notebook view is shown (`side_panel::view_mouse` and `view_key`).
 /// `None` leaves the message to `DefWindowProcW`. The panel handles its resize edge itself.
 pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
@@ -1313,6 +1479,10 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
                     view.select(index);
                 }
             });
+            Some(0)
+        }
+        WM_CONTEXTMENU => {
+            context_menu(hwnd, lparam);
             Some(0)
         }
         WM_KEYDOWN => key_down(hwnd, wparam as u16).then_some(0),
@@ -1496,12 +1666,18 @@ fn more_menu(hwnd: HWND) {
     }) else {
         return;
     };
-    let entries = [MenuEntry::command(
-        "Close notebook",
-        CommandId::CloseNotebook,
-    )];
-    if let Some(command) = super::menus::track_popup(hwnd, &entries, at) {
-        run(hwnd, command);
+    let entries = [
+        MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
+        MenuEntry::command("Close notebook", CommandId::CloseNotebook),
+    ];
+    match super::menus::track_popup(hwnd, &entries, at) {
+        Some(CommandId::NoteRevealInExplorer) => {
+            if let Some(root) = super::library_host::folder(hwnd) {
+                super::library_host::reveal(hwnd, &root);
+            }
+        }
+        Some(command) => run(hwnd, command),
+        None => {}
     }
 }
 
@@ -1525,7 +1701,7 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         return true;
     }
     let Some(selected) = with_view(hwnd, |view| view.list.selected).flatten() else {
-        return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT);
+        return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
     match key {
         VK_RETURN => {
@@ -1544,6 +1720,28 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         }
         VK_LEFT => {
             left(hwnd, selected);
+            true
+        }
+        VK_F2 | VK_DELETE => {
+            let note = with_view(hwnd, |view| match view.target(selected) {
+                Target::Row(TreeRow {
+                    kind: RowKind::Note(relative),
+                    ..
+                }) => Some(relative),
+                _ => None,
+            })
+            .flatten();
+            if let Some(relative) = note
+                && let Some(root) = super::library_host::folder(hwnd)
+                && super::library_host::ready_library(hwnd)
+            {
+                let path = root.join(relative);
+                if key == VK_F2 {
+                    super::library_host::rename_file(hwnd, &path);
+                } else {
+                    super::library_host::delete_file(hwnd, &path);
+                }
+            }
             true
         }
         _ => false,

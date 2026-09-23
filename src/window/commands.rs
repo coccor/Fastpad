@@ -75,6 +75,7 @@ pub enum CommandId {
     ShowFavoritesView = 179,
     CloseNotebook = 180,
     ToggleNotebookFavorite = 181,
+    NoteRevealInExplorer = 182,
 }
 
 impl CommandId {
@@ -154,7 +155,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 73] = [
+        const COMMANDS: [CommandId; 74] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -228,6 +229,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::ShowFavoritesView,
             CommandId::CloseNotebook,
             CommandId::ToggleNotebookFavorite,
+            CommandId::NoteRevealInExplorer,
         ];
         COMMANDS
             .into_iter()
@@ -343,6 +345,15 @@ mod tests {
         );
         assert!(!CommandId::CloseNotebook.needs_document());
         assert!(!CommandId::ToggleNotebookFavorite.needs_document());
+    }
+
+    #[test]
+    fn reveal_in_explorer_has_a_stable_value() {
+        assert_eq!(
+            CommandId::try_from(182),
+            Ok(CommandId::NoteRevealInExplorer)
+        );
+        assert!(CommandId::NoteRevealInExplorer.needs_document());
     }
 
     #[test]

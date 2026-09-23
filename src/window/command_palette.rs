@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 61] = [
+pub(crate) const ENTRIES: [PaletteEntry; 63] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -70,6 +70,8 @@ pub(crate) const ENTRIES: [PaletteEntry; 61] = [
     entry("Note: Reload from disk", CommandId::NoteReloadFromDisk),
     entry("Note: Keep my version", CommandId::NoteKeepMine),
     entry("Note: Toggle pin", CommandId::NoteTogglePin),
+    entry("Note: Move to notebook...", CommandId::NoteMoveToNotebook),
+    entry("Note: Reveal in Explorer", CommandId::NoteRevealInExplorer),
     entry("Note: Rename...", CommandId::NoteRename),
     entry("Note: Delete", CommandId::NoteDelete),
     entry("Edit: Undo", CommandId::Undo),
@@ -191,6 +193,7 @@ pub(crate) fn filter_entries(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PickerKind {
     RecentFolder,
+    MoveToNotebook,
 }
 
 /// A list of runtime items shown in the palette instead of commands.
@@ -946,12 +949,10 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.command == command)
                 .count();
-            // Moving a note's file has no palette row until it moves the file.
             let expected = usize::from(
                 command.tab_index().is_none()
                     && command != CommandId::CommandPalette
-                    && command != CommandId::MarkdownPreviewCycle
-                    && command != CommandId::NoteMoveToNotebook,
+                    && command != CommandId::MarkdownPreviewCycle,
             );
             assert_eq!(listed, expected, "{command:?}");
         }

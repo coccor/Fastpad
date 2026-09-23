@@ -1788,11 +1788,7 @@ fn execute_command(hwnd: HWND, command: CommandId) {
                 }
             }
         }
-        CommandId::New => {
-            if let Err(error) = create_new_document(hwnd) {
-                push_notice(hwnd, format!("FastPad could not create a new tab: {error}"));
-            }
-        }
+        CommandId::New => crate::window::library_host::new_note_in(hwnd, None),
         CommandId::CloseTab => close_active_document(hwnd),
         CommandId::CloseAllTabs => close_all_documents(hwnd),
         CommandId::Save => crate::window::library_host::save_command(hwnd),
@@ -1876,20 +1872,40 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
         CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
         CommandId::NoteTogglePin => {
-            if let Some(path) = crate::window::library_host::active_file(hwnd) {
+            if let Some(path) = crate::window::notebook_view::focused_note(hwnd)
+                .or_else(|| crate::window::library_host::active_file(hwnd))
+            {
                 crate::window::library_host::toggle_pin(hwnd, &path);
             }
         }
-        // No palette row or shortcut reaches this until moving a note's file is wired in.
-        CommandId::NoteMoveToNotebook => {}
+        CommandId::NoteMoveToNotebook => {
+            if let Some(path) = crate::window::notebook_view::focused_note(hwnd)
+                .or_else(|| crate::window::library_host::active_file(hwnd))
+            {
+                crate::window::library_host::move_to_notebook(hwnd, &path);
+            }
+        }
+        CommandId::NoteRevealInExplorer => {
+            if let Some(path) = crate::window::notebook_view::focused_note(hwnd)
+                .or_else(|| crate::window::library_host::active_file(hwnd))
+            {
+                crate::window::library_host::reveal(hwnd, &path);
+            }
+        }
         CommandId::NoteRename => {
             if crate::window::library_host::ready_library(hwnd) {
-                crate::window::library_host::rename_note(hwnd);
+                match crate::window::notebook_view::focused_note(hwnd) {
+                    Some(path) => crate::window::library_host::rename_file(hwnd, &path),
+                    None => crate::window::library_host::rename_note(hwnd),
+                }
             }
         }
         CommandId::NoteDelete => {
             if crate::window::library_host::ready_library(hwnd) {
-                crate::window::library_host::delete_note(hwnd);
+                match crate::window::notebook_view::focused_note(hwnd) {
+                    Some(path) => crate::window::library_host::delete_file(hwnd, &path),
+                    None => crate::window::library_host::delete_note(hwnd),
+                }
             }
         }
         CommandId::CloseNotebook => crate::window::library_host::close_notebook(hwnd),
@@ -2808,7 +2824,7 @@ fn tab_double_click(hwnd: HWND, index: usize) -> bool {
     double
 }
 
-fn create_new_document(hwnd: HWND) -> Result<()> {
+pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
     let identity = unsafe { window_identity(hwnd) }.ok_or(crate::FastPadError::Invariant(
         "main window app state was not available",
     ))?;
@@ -3126,7 +3142,7 @@ pub(super) fn save_active_document_as(hwnd: HWND) -> bool {
         // With no notebook open this is notes mode off's Save As.
         None if notes_mode && crate::window::library_host::folder(hwnd).is_some() => (
             crate::window::library_host::suggested_file_name(hwnd),
-            crate::window::library_host::folder(hwnd),
+            crate::window::library_host::first_save_folder(hwnd),
         ),
         None => ("Untitled.txt".to_owned(), None),
     };
@@ -10077,5 +10093,252 @@ mod tests {
         let expanded = crate::window::library_host::expanded(window.hwnd);
         assert!(expanded.contains(&std::path::PathBuf::from("sub")));
         assert!(expanded.contains(&std::path::PathBuf::from(r"sub\deep")));
+    }
+
+    fn write_notebooks(
+        data: &std::path::Path,
+        folders: Vec<std::path::PathBuf>,
+        favorites: Vec<std::path::PathBuf>,
+    ) {
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(data),
+            &crate::library::local::RecentFolders {
+                folders,
+                favorites,
+                closed: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn moving_a_note_to_another_notebook_moves_the_file_drops_its_pin_and_its_tab_follows() {
+        // Break caught: a move that copies without deleting, a pin record left pointing at a file
+        // that left the notebook, or a tab still on the old path, where autosave would recreate it.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("move-a");
+        let second = LibraryScratch::new("move-b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let a = open_note(&window, &first, "a.md", "a");
+        crate::window::library_host::toggle_pin(window.hwnd, &a);
+        write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+
+        execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+
+        let moved = second.folder().join("a.md");
+        assert!(!a.exists());
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "a");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(moved.as_path())
+        );
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(!state.is_pinned(&a));
+            assert!(state.record_for(&a).is_none());
+            assert!(
+                !state
+                    .notes
+                    .iter()
+                    .any(|note| note.path == std::path::Path::new("a.md"))
+            );
+        });
+        editor.set_text("b").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::NotEligible,
+            "a plain file outside the notebook now"
+        );
+    }
+
+    #[test]
+    fn a_move_onto_an_existing_name_changes_nothing_and_says_why() {
+        // Break caught: MoveFileExW's replace flag, or a fallback copy, overwriting the other
+        // notebook's note of the same name.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("move-clash-a");
+        let second = LibraryScratch::new("move-clash-b");
+        let theirs = second.note("a.md", "theirs");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let a = open_note(&window, &first, "a.md", "mine");
+        write_notebooks(&first.data(), vec![second.folder()], vec![]);
+
+        crate::window::library_host::move_to_notebook(window.hwnd, &a);
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path())
+        );
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("already exists"))
+        );
+    }
+
+    #[test]
+    fn move_offers_favorites_by_name_then_recent_never_the_open_one_then_browse() {
+        // Break caught: the open notebook offered as a destination, a notebook listed twice, or
+        // Browse… not reachable.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("move-list");
+        let third = LibraryScratch::new("move-browse");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let a = open_note(&window, &first, "a.md", "a");
+        let (zeta, alpha, beta) = (
+            first.root.join("Zeta"),
+            first.root.join("alpha"),
+            first.root.join("beta"),
+        );
+        write_notebooks(
+            &first.data(),
+            vec![first.folder(), beta.clone(), alpha.clone()],
+            vec![zeta.clone(), alpha.clone(), first.folder()],
+        );
+
+        crate::window::library_host::move_to_notebook(window.hwnd, &a);
+        let (note, destinations) = app_mut(window.hwnd).library.shown_move.clone().unwrap();
+        assert_eq!(note, a);
+        assert_eq!(destinations, vec![alpha, zeta, beta]);
+
+        crate::window::answer_next_folder_dialog({
+            let folder = third.folder();
+            move |_| Some(folder)
+        });
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::MoveToNotebook,
+            crate::window::command_palette::PickerChoice::Item(3),
+        );
+        assert!(third.folder().join("a.md").exists());
+    }
+
+    #[test]
+    fn a_new_note_saves_into_the_folder_selected_when_it_was_created_or_the_root_if_that_is_gone() {
+        // Break caught: Ctrl+N with a subfolder selected saving into the notebook root anyway, or
+        // a first save failing because the remembered folder was deleted meanwhile.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("new-note-folder");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), true);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Note(r"sub\b.md".into()));
+
+        execute_command(window.hwnd, CommandId::New);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().save_folder,
+            Some(scratch.folder().join("sub"))
+        );
+        editor.set_text("Idea").unwrap();
+        execute_command(window.hwnd, CommandId::Save);
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert!(scratch.folder().join(r"sub\Idea.md").exists());
+
+        let gone = scratch.folder().join("gone");
+        crate::window::library_host::new_note_in(window.hwnd, Some(gone));
+        editor.set_text("Other").unwrap();
+        execute_command(window.hwnd, CommandId::Save);
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert!(scratch.folder().join("Other.md").exists());
+    }
+
+    #[test]
+    fn the_context_menu_acts_on_its_row_not_the_active_tab() {
+        // Break caught: Pin from a row's menu pinning the active tab's note instead, "New note
+        // here" ignoring the folder, or Close tab on an unsaved row closing another tab.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("context-menu");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note("b.md", "b");
+        scratch.note(r"sub\c.md", "c");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        let a = open_note(&window, &scratch, "a.md", "a");
+        let menu = |kind: &RowKind, answer: CommandId| {
+            crate::window::menus::answer_next_popup_menu(move |_| Some(answer));
+            let index = row_of(window.hwnd, kind);
+            crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+        };
+
+        menu(&RowKind::Note("b.md".into()), CommandId::NoteTogglePin);
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(state.is_pinned(&scratch.folder().join("b.md")));
+            assert!(!state.is_pinned(&a));
+        });
+
+        menu(&RowKind::Folder("sub".into()), CommandId::New);
+        let untitled = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(untitled.save_folder, Some(scratch.folder().join("sub")));
+        let untitled = untitled.id;
+
+        let before = super::tab_count(window.hwnd);
+        menu(&RowKind::Unsaved(untitled.0), CommandId::CloseTab);
+        assert_eq!(super::tab_count(window.hwnd), before - 1);
+        assert!(app_mut(window.hwnd).tabs.document(untitled).is_none());
+
+        menu(
+            &RowKind::Folder("sub".into()),
+            CommandId::NoteRevealInExplorer,
+        );
+        execute_command(window.hwnd, CommandId::NoteRevealInExplorer);
+        assert_eq!(
+            crate::platform::shell::take_revealed(),
+            vec![scratch.folder().join("sub"), a.clone()]
+        );
+    }
+
+    #[test]
+    fn f2_on_a_note_row_that_is_not_open_opens_it_and_the_rename_box() {
+        // Break caught: F2 in the tree renaming the active tab's note instead of the selected one,
+        // or doing nothing because the name box needs a tab.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("tree-f2");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        select_row(window.hwnd, &RowKind::Note("b.md".into()));
+
+        assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(b.as_path()));
+        assert!(!active.preview);
+        let id = active.id;
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(
+            name_box.purpose(),
+            Some(&crate::window::name_box::NamePurpose::RenameNote(id))
+        );
     }
 }

@@ -89,6 +89,9 @@ pub struct Document {
     /// The preview tab (spec §6.4): opened by a single click in the sidebar and replaced in
     /// place by the next one. Never dirty: the first edit makes it a normal tab.
     pub preview: bool,
+    /// Where this untitled note's first save goes (spec §6.7): the folder selected in the
+    /// sidebar when it was created. `None` means the notebook root.
+    pub save_folder: Option<PathBuf>,
 }
 
 impl PartialEq for Document {
@@ -126,6 +129,7 @@ impl Document {
             disk_stamp: None,
             autosave_paused: false,
             preview: false,
+            save_folder: None,
         }
     }
 

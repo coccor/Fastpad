@@ -29,12 +29,13 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 46] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 47] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
         accelerator(FCONTROL, b'O', CommandId::Open),
         accelerator(FCONTROL | FSHIFT, b'O', CommandId::OpenFolder),
+        accelerator(FCONTROL | FSHIFT, b'M', CommandId::NoteMoveToNotebook),
         accelerator(FCONTROL, b'S', CommandId::Save),
         accelerator(FCONTROL | FSHIFT, b'S', CommandId::SaveAs),
         accelerator(FCONTROL, b'F', CommandId::Find),
@@ -553,7 +554,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 46);
+        assert_eq!(specs.len(), 47);
     }
 
     #[test]
