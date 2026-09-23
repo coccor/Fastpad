@@ -1620,6 +1620,7 @@ fn refresh_tabs(hwnd: HWND) {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
     crate::window::preview_host::sync_visibility(hwnd);
+    crate::window::library_host::refresh_label(hwnd);
 }
 
 fn execute_command(hwnd: HWND, command: CommandId) {
@@ -1730,6 +1731,11 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             let enabled = unsafe { app_ptr(hwnd) }
                 .is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode);
             crate::window::library_host::notes_mode_changed(hwnd, enabled);
+            if enabled {
+                crate::window::library_host::refresh_label(hwnd);
+            } else {
+                crate::window::library_host::clear_labels(hwnd);
+            }
             push_notice(
                 hwnd,
                 crate::window::library_host::notes_mode_notice(enabled).to_owned(),
@@ -3953,6 +3959,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
             }
         }
         if text_change {
+            crate::window::library_host::text_changed(hwnd, modification.position.max(0) as usize);
             crate::window::preview_host::record_edit(hwnd, modification);
         }
         return;
@@ -3977,6 +3984,15 @@ pub(crate) fn invalidate_title_strip(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+}
+
+/// Refreshes the retained tab-view snapshot after a document's title-affecting field (e.g. its
+/// untitled label) changed in place, and repaints the title strip.
+pub(crate) fn refresh_tab_view(hwnd: HWND) {
+    if let Some(app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_ref() }.tabs.refresh_view();
+    }
+    invalidate_title_strip(hwnd);
 }
 
 fn ensure_accessibility(hwnd: HWND) -> *mut c_void {
@@ -4373,7 +4389,8 @@ mod tests {
 
         assert_eq!(window_text(), "Untitled - FastPad");
         editor.set_text("dirty").unwrap();
-        assert_eq!(window_text(), "Untitled * - FastPad");
+        // Notes mode is on by default, so the untitled tab picks up "dirty" as its label.
+        assert_eq!(window_text(), "dirty * - FastPad");
         assert_eq!(super::window_title(None), "FastPad");
     }
 
@@ -5084,6 +5101,25 @@ mod tests {
                 .contains(&crate::window::library_host::notes_mode_notice(false).to_owned())
         );
         super::save_settings_to(None);
+    }
+
+    #[test]
+    fn an_untitled_tab_is_labelled_by_its_first_line_as_you_type() {
+        // Break caught: every untitled tab reading "Untitled", or the label recomputed on every
+        // keystroke far below the first line.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("\n## Meeting notes\nbody").unwrap();
+        pump_posted_messages(window.hwnd);
+        let title = || app_mut(window.hwnd).tabs.active().unwrap().title();
+        assert_eq!(title(), "Meeting notes *");
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().label_watch, 1);
+
+        app_mut(window.hwnd).settings.notes_mode = false;
+        crate::window::library_host::clear_labels(window.hwnd);
+        assert_eq!(title(), "Untitled *");
     }
 
     #[test]
@@ -6403,7 +6439,9 @@ mod tests {
             assert_eq!(documents[1].path.as_deref(), Some(notes.as_path()));
             assert!(!documents[1].dirty);
             assert_eq!(documents[2].path, None);
-            assert_eq!(documents[2].title(), "Untitled *");
+            // Notes mode is on by default: this restored tab was briefly active while its
+            // document loaded, and its untitled label was picked up from its first line.
+            assert_eq!(documents[2].title(), "scratch words *");
             assert_eq!(app.tabs.active_index(), 0);
         }
         assert_eq!(editor.text().unwrap(), "unsaved draft");

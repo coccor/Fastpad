@@ -179,6 +179,12 @@ impl Tabs {
         self.view.clone()
     }
 
+    /// Refreshes the retained tab-view snapshot from the current documents, without otherwise
+    /// changing anything (e.g. after a document's title-affecting field changes in place).
+    pub(crate) fn refresh_view(&self) {
+        self.view.update(&self.documents);
+    }
+
     pub(crate) fn set_preview_buttons(&self, visible: bool) {
         self.view.set_preview_buttons(visible);
     }

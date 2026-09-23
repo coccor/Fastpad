@@ -2,6 +2,7 @@
 //! folder commands, first-save naming, autosave, and the organizing commands.
 
 use super::main_window::{app_ptr, push_notice, window_identity};
+use crate::library::title;
 use crate::library::{self, LibraryState, Metadata, ids::IdSource};
 use crate::window::command_palette::{Picker, PickerChoice, PickerKind};
 use std::path::{Path, PathBuf};
@@ -491,6 +492,77 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
         host.generation = host.generation.wrapping_add(1);
         host.scanning = false;
     });
+}
+
+/// Recomputes the active untitled tab's label from its first lines.
+pub(crate) fn refresh_label(hwnd: HWND) {
+    if !notes_mode(hwnd) {
+        return;
+    }
+    let changed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let Some(editor) = app.editor.as_ref() else {
+            return false;
+        };
+        let Some(active) = app.tabs.active() else {
+            return false;
+        };
+        if active.path.is_some() {
+            return false;
+        }
+        let id = active.id;
+        let count = editor
+            .line_count()
+            .unwrap_or(0)
+            .min(title::LABEL_SCAN_LINES);
+        let lines: Vec<String> = (0..count)
+            .map(|line| editor.line_text(line).unwrap_or_default())
+            .collect();
+        let label = title::untitled_label(lines.iter().map(String::as_str));
+        let Some(document) = app.tabs.document_mut(id) else {
+            return false;
+        };
+        document.label_watch = label.watch_through;
+        if document.untitled_label == label.text {
+            return false;
+        }
+        document.untitled_label = label.text;
+        true
+    });
+    if changed {
+        super::main_window::refresh_tab_view(hwnd);
+    }
+}
+
+/// `SCN_MODIFIED`: only edits at or above the label's line can change it.
+pub(crate) fn text_changed(hwnd: HWND, position: usize) {
+    let relevant = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        let app = unsafe { app.as_ref() };
+        let (Some(editor), Some(active)) = (app.editor.as_ref(), app.tabs.active()) else {
+            return false;
+        };
+        active.path.is_none()
+            && editor
+                .line_from_position(position)
+                .is_ok_and(|line| line <= active.label_watch)
+    });
+    if relevant {
+        refresh_label(hwnd);
+    }
+}
+
+/// Notes mode turned off: untitled tabs go back to "Untitled".
+pub(crate) fn clear_labels(hwnd: HWND) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        let ids: Vec<_> = app.tabs.documents().map(|document| document.id).collect();
+        for id in ids {
+            if let Some(document) = app.tabs.document_mut(id) {
+                document.untitled_label = None;
+            }
+        }
+    }
+    super::main_window::refresh_tab_view(hwnd);
 }
 
 #[cfg(test)]
