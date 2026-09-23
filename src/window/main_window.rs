@@ -2516,6 +2516,8 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
             "main window was destroyed during file open",
         ));
     }
+    // Read before the load: a change that lands during it then still pauses the next autosave.
+    let stamp = crate::library::disk_stamp(path);
     // All fallible disk/decode/text validation occurs before touching active state.
     let loaded = crate::file::loader::load(path)?;
     // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer: the file is unsupported.
@@ -2615,7 +2617,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     // Population suppressed SCN_MODIFIED, and a reused tab keeps its document id.
     crate::window::preview_host::document_reloaded(hwnd);
     refresh_tabs(hwnd);
-    crate::window::library_host::document_loaded(hwnd);
+    crate::window::library_host::document_loaded(hwnd, stamp);
     Ok(())
 }
 
@@ -2965,7 +2967,12 @@ pub(super) fn complete_save(
     identity: &WindowIdentity,
     new_path: Option<std::path::PathBuf>,
 ) -> bool {
-    save_active_to(hwnd, identity, new_path, false) == SaveOutcome::Saved
+    save_active_to(hwnd, identity, new_path, false, true) == SaveOutcome::Saved
+}
+
+/// Plain Save for autosave: a failure pushes no generic notice, because the caller names the note.
+pub(super) fn complete_autosave(hwnd: HWND, identity: &WindowIdentity) -> bool {
+    save_active_to(hwnd, identity, None, false, false) == SaveOutcome::Saved
 }
 
 /// The first save of an untitled tab under a name picked in the name box. Never replaces a file:
@@ -2976,13 +2983,14 @@ pub(super) fn complete_first_save(
     identity: &WindowIdentity,
     path: std::path::PathBuf,
 ) -> SaveOutcome {
-    save_active_to(hwnd, identity, Some(path), true)
+    save_active_to(hwnd, identity, Some(path), true, true)
 }
 
 /// Shared tail of plain Save and Save As. `new_path` is `Some` only for Save As: the active
 /// document's path is renamed (and checked against other open tabs' canonical paths) before the
 /// write. Plain Save (`new_path: None`) writes to the document's existing path unchanged.
-/// `create_new` refuses to replace an existing file (`SaveOutcome::NameTaken`).
+/// `create_new` refuses to replace an existing file (`SaveOutcome::NameTaken`). `report_failure`
+/// pushes the generic "could not save" notice when the write fails.
 ///
 /// For Save As, every failure after a successful rename (missing editor, a failed
 /// `editor.text()` read, or a failed `save_atomic`) reverts the tab's path back to whatever it
@@ -2993,6 +3001,7 @@ fn save_active_to(
     identity: &WindowIdentity,
     new_path: Option<std::path::PathBuf>,
     create_new: bool,
+    report_failure: bool,
 ) -> SaveOutcome {
     let is_save_as = new_path.is_some();
     let mut original_path: Option<std::path::PathBuf> = None;
@@ -3070,6 +3079,9 @@ fn save_active_to(
             }
             if create_new && crate::file::saver::is_already_exists(&error) {
                 return SaveOutcome::NameTaken;
+            }
+            if !report_failure {
+                return SaveOutcome::Failed;
             }
             push_notice(
                 hwnd,
@@ -7705,7 +7717,12 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, "again").unwrap();
         editor.set_text("mine for real").unwrap();
-        crate::window::library_host::autosave_active(window.hwnd);
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::Paused
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "again");
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
         execute_command(window.hwnd, CommandId::NoteKeepMine);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine for real");
     }
@@ -7804,6 +7821,163 @@ mod tests {
         pump_until(window.hwnd, || {
             std::fs::read_to_string(&path).is_ok_and(|text| text == "xone")
         });
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn a_note_whose_file_was_deleted_and_has_no_stamp_is_not_recreated() {
+        // Break caught: a restored tab re-creating a note the user deleted on another PC.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("no-stamp-deleted");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "on disk");
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        app_mut(window.hwnd)
+            .tabs
+            .document_mut(id)
+            .unwrap()
+            .disk_stamp = None;
+        std::fs::remove_file(&path).unwrap();
+        editor.set_text("restored").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::Paused
+        );
+        assert!(!path.exists());
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn a_folder_whose_state_has_not_loaded_is_not_autosaved() {
+        // Break caught: a folder with autosave turned off being autosaved while it (re)loads.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("state-loading");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "one");
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        assert!(
+            !app_mut(window.hwnd)
+                .library
+                .state
+                .as_ref()
+                .unwrap()
+                .local
+                .autosave
+        );
+        app_mut(window.hwnd).library.state = None;
+        editor.set_text("two").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::NotEligible
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn keep_my_version_on_an_untitled_tab_does_nothing() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("keep-untitled");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("draft").unwrap();
+        let before = notices(window.hwnd).len();
+        execute_command(window.hwnd, CommandId::NoteKeepMine);
+        assert_eq!(notices(window.hwnd).len(), before);
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert!(active.path.is_none() && active.dirty);
+    }
+
+    #[test]
+    fn a_failed_autosave_names_the_note_once_and_keeps_the_tab_dirty() {
+        // Break caught: a failed write marking the note clean, or two notices for one failure.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("autosave-fails");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "one");
+        editor.set_text("two").unwrap();
+        // A file held open without sharing makes the atomic replace fail; its stamp is unchanged.
+        use std::os::windows::fs::OpenOptionsExt;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let before = notices(window.hwnd).len();
+        let outcome = crate::window::library_host::autosave_active(window.hwnd);
+        drop(lock);
+        assert_eq!(outcome, crate::window::library_host::Autosave::Failed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+        let added = &notices(window.hwnd)[before..];
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].starts_with("Autosave failed for "), "{added:?}");
+    }
+
+    #[test]
+    fn closing_the_window_autosaves_every_eligible_note_and_keeps_the_active_tab() {
+        // Break caught: a close leaving a second dirty note unsaved, saving a file outside the
+        // folder or a paused note, or leaving the session on whichever tab saved last.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("autosave-all");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let a = open_note(&window, &scratch, "a.md", "a");
+        // Off while the tabs are made dirty, so switching between them does not save them.
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        editor.set_text("a2").unwrap();
+        let b = scratch.note("b.md", "b");
+        super::open_path(window.hwnd, &b).unwrap();
+        editor.set_text("b2").unwrap();
+        let paused = scratch.note("p.md", "p");
+        super::open_path(window.hwnd, &paused).unwrap();
+        editor.set_text("p2").unwrap();
+        let paused_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        app_mut(window.hwnd)
+            .tabs
+            .document_mut(paused_id)
+            .unwrap()
+            .autosave_paused = true;
+        let outside = scratch.root.join("outside.md");
+        std::fs::write(&outside, "x").unwrap();
+        super::open_path(window.hwnd, &outside).unwrap();
+        editor.set_text("x2").unwrap();
+        let outside_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+
+        crate::window::library_host::autosave_all(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a2");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b2");
+        assert_eq!(std::fs::read_to_string(&paused).unwrap(), "p");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
+        let app = app_mut(window.hwnd);
+        let dirty = |path: &std::path::Path| {
+            app.tabs
+                .documents()
+                .find(|document| document.path.as_deref() == Some(path))
+                .unwrap()
+                .dirty
+        };
+        assert!(!dirty(&a) && !dirty(&b));
+        assert!(dirty(&paused) && dirty(&outside));
+        assert_eq!(app.tabs.active().unwrap().id, outside_id);
+    }
+
+    #[test]
+    fn switching_to_another_app_autosaves_the_active_note() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("deactivate");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "one");
+        editor.set_text("two").unwrap();
+        crate::window::library_host::activation_changed(window.hwnd, false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
         assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
     }
 }

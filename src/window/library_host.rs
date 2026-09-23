@@ -822,7 +822,10 @@ pub(crate) fn name_box_browse(hwnd: HWND) {
 
 fn folder_autosave(hwnd: HWND) -> bool {
     host(hwnd, |host| {
-        host.state.as_ref().is_none_or(|state| state.local.autosave)
+        // Until the folder's state has loaded, its autosave setting is unknown: do not save.
+        host.state
+            .as_ref()
+            .is_some_and(|state| state.local.autosave)
     })
     .unwrap_or(false)
 }
@@ -867,12 +870,9 @@ pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
     let known =
         unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.active()?.disk_stamp);
     let now = library::disk_stamp(&path);
-    // No known stamp (a tab restored from a snapshot) while a file is on disk: FastPad cannot
-    // tell whether that file changed, so it is treated as changed.
-    let changed = match known {
-        Some(_) => known != now,
-        None => now.is_some(),
-    };
+    // No known stamp (a tab restored from a snapshot): FastPad cannot tell whether the file
+    // changed, or was deleted on purpose, so it is treated as changed and never re-created.
+    let changed = known.is_none() || known != now;
     if changed {
         if let Some(mut app) = unsafe { app_ptr(hwnd) } {
             let app = unsafe { app.as_mut() };
@@ -894,7 +894,8 @@ pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return Autosave::Failed;
     };
-    if super::main_window::complete_save(hwnd, &identity, None) {
+    // Quiet: on failure the named notice below replaces the generic save-failure one.
+    if super::main_window::complete_autosave(hwnd, &identity) {
         Autosave::Saved
     } else {
         if identity.is_live_for(hwnd) {
@@ -1031,17 +1032,28 @@ pub(crate) fn keep_mine(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    // An untitled tab has no file on disk to keep its text over.
+    let has_path = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .active()
+            .is_some_and(|d| d.path.is_some())
+    });
+    if !has_path {
+        return;
+    }
     let _ = super::main_window::complete_save(hwnd, &identity, None);
 }
 
-/// After a file is opened into a tab: remember its disk stamp, and a note among recent notes.
-pub(crate) fn document_loaded(hwnd: HWND) {
+/// After a file is opened into a tab: remember its disk stamp, read before the load so a change
+/// landing during it still pauses the next autosave, and a note among recent notes.
+pub(crate) fn document_loaded(hwnd: HWND, stamp: Option<library::DiskStamp>) {
     let path = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let id = app.tabs.active()?.id;
         let document = app.tabs.document_mut(id)?;
         let path = document.path.clone()?;
-        document.disk_stamp = library::disk_stamp(&path);
+        document.disk_stamp = stamp;
         Some(path)
     });
     if let Some(path) = path
