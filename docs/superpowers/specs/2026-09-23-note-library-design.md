@@ -3,6 +3,14 @@
 Status: Approved design  
 Date: 23 September 2026
 
+> **Partly superseded** by `2026-09-23-note-sidebar-design.md` (sub-project 2):
+> - a notebook is now the open folder;
+> - notebooks-as-labels, tags and note favorites are removed;
+> - `library.ini` version 2 keeps pins only;
+> - Favorites and Recent list notebooks.
+>
+> See §3 of that spec for the full list.
+
 ## 1. Purpose
 
 FastPad is getting notebooks, tags, Favorites, Recent, search and note links, following the product spec "FastPad Left Sidebar and Notebook Model" (draft, 22 September 2026). That work is split into four sub-projects, each with its own spec, plan and implementation:
