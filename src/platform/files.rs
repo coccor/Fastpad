@@ -128,7 +128,7 @@ mod tests {
         let documents = crate::platform::paths::documents_dir().unwrap();
         assert!(documents.is_dir());
         assert_eq!(
-            crate::platform::paths::default_notes_folder().unwrap(),
+            crate::platform::paths::notes_folder_in(&documents),
             documents.join("FastPad")
         );
     }
