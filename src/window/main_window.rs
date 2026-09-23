@@ -11046,4 +11046,181 @@ mod tests {
             (table.release)(provider);
         }
     }
+
+    #[test]
+    fn pinning_a_note_that_is_not_first_raises_reorder_and_state_change() {
+        // Break caught: a pin re-sorting the selected row to the top at the same count, so screen
+        // readers hear only a new selection: no state change and no reorder of its siblings.
+        use crate::window::sidebar_accessibility::take_raised;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EVENT_OBJECT_REORDER, EVENT_OBJECT_SELECTION, EVENT_OBJECT_STATECHANGE,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("pin-msaa");
+        scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+        let kind = RowKind::Note(crate::library::record_path(&scratch.folder(), &b));
+        let before = row_of(window.hwnd, &kind);
+        assert!(before > 0, "{:?}", notebook_view(window.hwnd).rows);
+        notebook_view(window.hwnd).list.selected = Some(before);
+        let source = &crate::window::side_panel::PANEL_ACCESSIBLE;
+        let count = (source.count)(panel);
+        take_raised();
+
+        crate::window::library_host::toggle_pin(window.hwnd, &b);
+
+        let after = row_of(window.hwnd, &kind);
+        assert!(after < before, "the pinned note moves up");
+        assert_eq!((source.count)(panel), count, "the same number of children");
+        let id = (source.current)(panel).unwrap() as i32 + 1;
+        let raised = take_raised()
+            .into_iter()
+            .filter(|&(hwnd, _, _)| hwnd == panel as usize)
+            .map(|(_, event, child)| (event, child))
+            .collect::<Vec<_>>();
+        assert!(raised.contains(&(EVENT_OBJECT_REORDER, 0)), "{raised:?}");
+        assert!(raised.contains(&(EVENT_OBJECT_SELECTION, id)), "{raised:?}");
+        assert!(
+            raised.contains(&(EVENT_OBJECT_STATECHANGE, id)),
+            "{raised:?}"
+        );
+        assert!(
+            (source.item)(panel, id as usize - 1)
+                .unwrap()
+                .name
+                .ends_with(", pinned")
+        );
+    }
+
+    #[test]
+    fn arrowing_through_recent_notebooks_selects_and_announces_them() {
+        // Break caught: the no-notebook state's RECENT list reporting no selection, so arrowing
+        // through it raises no events and no item is ever STATE_SYSTEM_SELECTED.
+        use crate::window::sidebar_accessibility::{STATE_FOCUSED, STATE_SELECTED, take_raised};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DOWN;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EVENT_OBJECT_FOCUS, EVENT_OBJECT_SELECTION, WM_KEYDOWN,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("recent-msaa-a");
+        let other = LibraryScratch::new("recent-msaa-b");
+        scratch.note("a.md", "a");
+        let window = shown_window();
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(&scratch.data()),
+            &crate::library::local::RecentFolders {
+                folders: vec![scratch.folder(), other.folder()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
+        let recent = notebook_view(window.hwnd).recent.clone();
+        assert!(recent.len() >= 2, "{recent:?}");
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            true,
+        );
+        let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+        assert_eq!(focused(), panel);
+        let source = &crate::window::side_panel::PANEL_ACCESSIBLE;
+        let buttons = (source.count)(panel) - recent.len();
+
+        for _ in 0..2 {
+            take_raised();
+            unsafe {
+                SendMessageW(panel, WM_KEYDOWN, VK_DOWN as usize, 0);
+            }
+            let selected = notebook_view(window.hwnd).list.selected.unwrap();
+            let id = (buttons + selected) as i32 + 1;
+            assert_eq!((source.current)(panel), Some(buttons + selected));
+            let raised = take_raised();
+            let panel_id = panel as usize;
+            assert!(
+                raised.contains(&(panel_id, EVENT_OBJECT_SELECTION, id)),
+                "{raised:?}"
+            );
+            assert!(
+                raised.contains(&(panel_id, EVENT_OBJECT_FOCUS, id)),
+                "{raised:?}"
+            );
+            let item = (source.item)(panel, id as usize - 1).unwrap();
+            assert_ne!(item.state & STATE_SELECTED, 0, "{item:?}");
+            assert_ne!(item.state & STATE_FOCUSED, 0, "{item:?}");
+            assert_eq!(
+                item.name,
+                notebook_view(window.hwnd).recent_name(selected),
+                "indexed by list position"
+            );
+        }
+        assert_eq!(notebook_view(window.hwnd).list.selected, Some(1));
+    }
+
+    #[test]
+    fn a_query_from_another_thread_is_answered_on_the_window_thread() {
+        // Break caught: an MSAA client's RPC thread reading App directly, or its marshalled query
+        // rejected by the pointer check meant for foreign senders.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+        let expected = crate::window::side_panel::accessible_item_count(panel);
+        assert!(expected > 0);
+        let provider = crate::window::sidebar_accessibility::create_for_test(
+            panel,
+            &crate::window::side_panel::PANEL_ACCESSIBLE,
+        ) as usize;
+        let worker = std::thread::spawn(move || {
+            let provider = provider as *mut std::ffi::c_void;
+            let table = &crate::window::sidebar_accessibility::SIDEBAR_VTABLE;
+            let mut count = 0;
+            unsafe {
+                assert_eq!(
+                    (table.get_acc_child_count)(provider, &mut count),
+                    windows_sys::Win32::Foundation::S_OK
+                );
+                (table.release)(provider);
+            }
+            count
+        });
+        // Messages sent from the worker are delivered while this thread peeks.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !worker.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the query was never answered"
+            );
+            let mut message = windows_sys::Win32::UI::WindowsAndMessaging::MSG::default();
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                    &mut message,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    windows_sys::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+                );
+            }
+        }
+        assert_eq!(worker.join().unwrap() as usize, expected);
+    }
 }

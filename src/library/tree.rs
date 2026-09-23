@@ -22,7 +22,7 @@ pub struct UnsavedEntry {
     pub label: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RowKind {
     Unsaved(u64),
     Folder(PathBuf),

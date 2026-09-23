@@ -116,6 +116,8 @@ pub(crate) struct FavoritesView {
     header_hover: bool,
     /// While the scroll thumb is dragged: how far below its top it was grabbed.
     thumb_grab: Option<i32>,
+    /// Bumped whenever the rows change order (`AccessibleView::accessible_generation`).
+    order: u64,
 }
 
 impl FavoritesView {
@@ -127,6 +129,7 @@ impl FavoritesView {
             list,
             header_hover: false,
             thumb_grab: None,
+            order: 0,
         }
     }
 
@@ -137,6 +140,14 @@ impl FavoritesView {
         let kept = previous
             .and_then(|index| self.rows.get(index))
             .map(|row| row.folder.clone());
+        let reordered = rows.len() != self.rows.len()
+            || rows
+                .iter()
+                .zip(&self.rows)
+                .any(|(new, old)| !same_path(&new.folder, &old.folder));
+        if reordered {
+            self.order = self.order.wrapping_add(1);
+        }
         self.rows = rows;
         self.list.row_height = scale(ROW_AT_96_DPI, dpi);
         self.list.set_count(self.rows.len() + 1);
@@ -765,6 +776,18 @@ impl crate::window::sidebar_accessibility::AccessibleView for FavoritesView {
             let area = self.list_area(client, dpi);
             self.list.select(row, area.bottom - area.top);
         }
+    }
+
+    /// Favorites by folder. The header button and the footer have none: they never move.
+    fn accessible_identity(&self, index: usize, _client: RECT, _dpi: u32) -> Option<u64> {
+        let favorite = self.rows.get(index.checked_sub(1)?)?;
+        Some(crate::window::sidebar_accessibility::identity_of(
+            &favorite.folder,
+        ))
+    }
+
+    fn accessible_generation(&self) -> u64 {
+        self.order
     }
 }
 

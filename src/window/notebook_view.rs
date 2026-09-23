@@ -377,6 +377,9 @@ pub(crate) struct NotebookView {
     tracking_leave: bool,
     /// What the rows were last built from (`None` before the first rebuild).
     built: Option<RebuildKey>,
+    /// Bumped whenever a rebuild changes the rows' order or the RECENT list, so screen readers
+    /// hear a reorder even at the same count (`AccessibleView::accessible_generation`).
+    order: u64,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -532,6 +535,7 @@ impl NotebookView {
             thumb_grab: None,
             tracking_leave: false,
             built: None,
+            order: 0,
             #[cfg(test)]
             rebuilds: 0,
         }
@@ -625,6 +629,17 @@ impl NotebookView {
             .then(|| self.rows.get(self.list.top).map(|row| row.kind.clone()))
             .flatten();
         let (old_selected, old_top) = (self.list.selected, self.list.top);
+        let reordered = reset
+            || snapshot.recent != self.recent
+            || snapshot.rows.len() != self.rows.len()
+            || snapshot
+                .rows
+                .iter()
+                .zip(&self.rows)
+                .any(|(new, old)| new.kind != old.kind);
+        if reordered {
+            self.order = self.order.wrapping_add(1);
+        }
         self.mode = snapshot.mode;
         self.name = snapshot
             .root
@@ -1054,23 +1069,13 @@ impl NotebookView {
         buttons
     }
 
-    /// The no-notebook state's RECENT rows from the first one in view, with their names (and the
-    /// parent-folder hint on a name clash). Empty in every other state.
-    pub(crate) fn recent_rows(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
-        if self.mode != Mode::NoNotebook {
-            return Vec::new();
+    /// RECENT notebook `index`'s accessible name, with the parent-folder hint on a name clash.
+    pub(crate) fn recent_name(&self, index: usize) -> String {
+        match self.recent_names.get(index) {
+            Some((name, Some(hint))) => format!("{name}, {hint}"),
+            Some((name, None)) => name.clone(),
+            None => String::new(),
         }
-        let list = state_layout(body_rect(client, dpi), dpi).list;
-        (0..self.recent.len())
-            .filter_map(|index| {
-                let rect = self.row_rect(list, index)?;
-                let name = match self.recent_names.get(index)? {
-                    (name, Some(hint)) => format!("{name}, {hint}"),
-                    (name, None) => name.clone(),
-                };
-                Some((name, rect))
-            })
-            .collect()
     }
 }
 
@@ -1797,7 +1802,7 @@ fn typed(hwnd: HWND, ch: char) {
 impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
     /// Push buttons first, then the RECENT notebooks (no-notebook state), then the tree rows.
     fn accessible_count(&self, client: RECT, dpi: u32) -> usize {
-        self.buttons(client, dpi).len() + self.recent_rows(client, dpi).len() + self.rows().len()
+        self.buttons(client, dpi).len() + self.recent.len() + self.rows().len()
     }
 
     fn accessible_item(
@@ -1813,11 +1818,18 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
             return Some(button_item(name, false, false, *rect));
         }
         let index = index - buttons.len();
-        let recent = self.recent_rows(client, dpi);
-        if let Some((name, rect)) = recent.get(index) {
-            return Some(list_item(name, false, false, *rect, true));
+        if index < self.recent.len() {
+            // The no-notebook list holds the RECENT rows, indexed by list position.
+            let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
+            return Some(list_item(
+                &self.recent_name(index),
+                self.list().selected == Some(index),
+                focused,
+                rect,
+                visible,
+            ));
         }
-        let index = index - recent.len();
+        let index = index - self.recent.len();
         let row = self.rows().get(index)?;
         let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
         Some(tree_item(
@@ -1840,39 +1852,55 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         if let Some(index) = buttons.iter().position(|(_, rect)| inside(rect)) {
             return Some(index);
         }
-        let recent = self.recent_rows(client, dpi);
-        if let Some(index) = recent.iter().position(|(_, rect)| inside(rect)) {
-            return Some(buttons.len() + index);
-        }
         let area = self.list_area(client, dpi);
         if !inside(&area) {
             return None;
         }
-        self.list()
-            .row_at(point.y - area.top)
-            .filter(|&row| row < self.rows().len())
-            .map(|row| buttons.len() + recent.len() + row)
+        let row = self.list().row_at(point.y - area.top)?;
+        if self.mode == Mode::NoNotebook {
+            (row < self.recent.len()).then_some(buttons.len() + row)
+        } else {
+            (row < self.rows().len()).then_some(buttons.len() + self.recent.len() + row)
+        }
     }
 
     fn accessible_current(&self, client: RECT, dpi: u32) -> Option<usize> {
-        let offset = self.buttons(client, dpi).len() + self.recent_rows(client, dpi).len();
+        let buttons = self.buttons(client, dpi).len();
+        let selected = self.list().selected?;
         // In the no-notebook state the list's selection is a RECENT row, not a tree row.
-        self.list()
-            .selected
-            .filter(|&row| row < self.rows().len())
-            .map(|row| offset + row)
+        if self.mode == Mode::NoNotebook {
+            (selected < self.recent.len()).then_some(buttons + selected)
+        } else {
+            (selected < self.rows().len()).then_some(buttons + self.recent.len() + selected)
+        }
     }
 
     fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
-        let offset = self.buttons(client, dpi).len() + self.recent_rows(client, dpi).len();
-        let Some(row) = index
-            .checked_sub(offset)
-            .filter(|&row| row < self.rows().len())
-        else {
+        let buttons = self.buttons(client, dpi).len();
+        let (offset, rows) = if self.mode == Mode::NoNotebook {
+            (buttons, self.recent.len())
+        } else {
+            (buttons + self.recent.len(), self.rows().len())
+        };
+        let Some(row) = index.checked_sub(offset).filter(|&row| row < rows) else {
             return;
         };
         let area = self.list_area(client, dpi);
         self.list_mut().select(row, area.bottom - area.top);
+    }
+
+    fn accessible_identity(&self, index: usize, client: RECT, dpi: u32) -> Option<u64> {
+        use crate::window::sidebar_accessibility::identity_of;
+        let index = index.checked_sub(self.buttons(client, dpi).len())?;
+        if let Some(folder) = self.recent.get(index) {
+            return Some(identity_of(folder));
+        }
+        let row = self.rows().get(index - self.recent.len())?;
+        Some(identity_of(&row.kind))
+    }
+
+    fn accessible_generation(&self) -> u64 {
+        self.order
     }
 }
 

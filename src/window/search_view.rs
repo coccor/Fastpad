@@ -118,6 +118,8 @@ pub(crate) struct SearchView {
     placeholder: String,
     /// While the scroll thumb is dragged: how far below its top it was grabbed.
     thumb_grab: Option<i32>,
+    /// Bumped whenever the results change (`AccessibleView::accessible_generation`).
+    order: u64,
 }
 
 impl SearchView {
@@ -144,6 +146,7 @@ impl SearchView {
             list: RowListState::new(scale(ROW_AT_96_DPI, dpi)),
             placeholder: placeholder(None),
             thumb_grab: None,
+            order: 0,
         })
     }
 
@@ -182,12 +185,16 @@ impl SearchView {
     /// Recomputes the results for `query`, with the first one selected.
     fn filter(&mut self, query: &str, client: RECT, dpi: u32) {
         self.query = query.to_owned();
-        self.results = match &self.notes {
+        let results = match &self.notes {
             Some(notes) if !query.trim().is_empty() => {
                 name_search::search(notes, query, RESULT_LIMIT)
             }
             _ => Vec::new(),
         };
+        if results != self.results {
+            self.order = self.order.wrapping_add(1);
+        }
+        self.results = results;
         let area = self.list_area(client, dpi);
         self.list.row_height = scale(ROW_AT_96_DPI, dpi);
         self.list.set_count(self.results.len());
@@ -892,6 +899,16 @@ impl crate::window::sidebar_accessibility::AccessibleView for SearchView {
             let area = self.list_area(client, dpi);
             self.list.select(index, area.bottom - area.top);
         }
+    }
+
+    fn accessible_identity(&self, index: usize, _client: RECT, _dpi: u32) -> Option<u64> {
+        self.results
+            .get(index)
+            .map(|result| crate::window::sidebar_accessibility::identity_of(&result.path))
+    }
+
+    fn accessible_generation(&self) -> u64 {
+        self.order
     }
 }
 

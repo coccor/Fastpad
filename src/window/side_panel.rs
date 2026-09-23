@@ -676,6 +676,22 @@ fn accessible_select(panel: HWND, index: usize) {
     }
 }
 
+fn accessible_identity(panel: HWND, index: usize) -> Option<u64> {
+    with_accessible_view(panel, |view, client, dpi, _| {
+        view.accessible_identity(index, client, dpi)
+    })
+    .flatten()
+}
+
+/// The shown view's order generation, told apart per view: switching views reorders too.
+fn accessible_generation(panel: HWND) -> u64 {
+    let main = unsafe { GetParent(panel) };
+    let view = current_view(main) as u64;
+    let generation =
+        with_accessible_view(panel, |view, _, _, _| view.accessible_generation()).unwrap_or(0);
+    generation.wrapping_mul(4).wrapping_add(view)
+}
+
 /// A child's default action: a click on its center, after scrolling it into view.
 fn accessible_activate(panel: HWND, index: usize) {
     let Some(mut item) = accessible_item(panel, index) else {
@@ -699,6 +715,8 @@ pub(crate) static PANEL_ACCESSIBLE: AccessibleSource = AccessibleSource {
     current: accessible_current,
     select: accessible_select,
     activate: accessible_activate,
+    identity: accessible_identity,
+    generation: accessible_generation,
 };
 
 thread_local! {

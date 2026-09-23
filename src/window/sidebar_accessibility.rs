@@ -96,6 +96,17 @@ pub(crate) struct AccessibleSource {
     pub select: fn(HWND, usize),
     /// A child's default action.
     pub activate: fn(HWND, usize),
+    /// A cheap identity of child `index` (a hash of its row or path) that survives a re-sort,
+    /// or `None` for children with no identity of their own.
+    pub identity: fn(HWND, usize) -> Option<u64>,
+    /// Changes whenever the children's order does, even at the same count.
+    pub generation: fn(HWND) -> u64,
+}
+
+/// A hash of `value`, as an `AccessibleSource::identity`.
+pub(crate) fn identity_of(value: &impl std::hash::Hash) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(value)
 }
 
 /// A view's children as MSAA sees them. Every method gets the panel's client rectangle and DPI.
@@ -111,6 +122,14 @@ pub(crate) trait AccessibleView {
     fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize>;
     fn accessible_current(&self, client: RECT, dpi: u32) -> Option<usize>;
     fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32);
+    /// See `AccessibleSource::identity`.
+    fn accessible_identity(&self, _index: usize, _client: RECT, _dpi: u32) -> Option<u64> {
+        None
+    }
+    /// See `AccessibleSource::generation`.
+    fn accessible_generation(&self) -> u64 {
+        0
+    }
 }
 
 pub(crate) fn button_item(name: &str, pressed: bool, focused: bool, rect: RECT) -> AccessibleItem {
@@ -241,6 +260,9 @@ pub(crate) struct AccessibleMark {
     pub state: u32,
     pub name: String,
     pub count: usize,
+    /// The current child's `AccessibleSource::identity`.
+    pub identity: Option<u64>,
+    pub generation: u64,
 }
 
 impl AccessibleMark {
@@ -255,6 +277,8 @@ impl AccessibleMark {
                 .map_or(0, |item| item.state & !(STATE_FOCUSED | STATE_OFFSCREEN)),
             name: item.map(|item| item.name).unwrap_or_default(),
             count: (source.count)(hwnd),
+            identity: current.and_then(|index| (source.identity)(hwnd, index)),
+            generation: (source.generation)(hwnd),
         }
     }
 }
@@ -266,21 +290,30 @@ pub(crate) fn events_between(
     focused: bool,
 ) -> Vec<(u32, i32)> {
     let mut events = Vec::new();
-    if before.count != after.count {
+    // A re-sort at the same count still gives every moved sibling a new child ID.
+    if before.count != after.count || before.generation != after.generation {
         events.push((EVENT_OBJECT_REORDER, 0));
     }
     let Some(current) = after.current else {
         return events;
     };
     let id = current as i32 + 1;
-    if before.current != after.current {
+    // The same item is current: by identity where the children have one, else by index.
+    let same_item = match (before.identity, after.identity) {
+        (Some(before_identity), Some(after_identity)) => before_identity == after_identity,
+        (None, None) => before.current == after.current,
+        _ => false,
+    };
+    if before.current != after.current || !same_item {
         events.push((EVENT_OBJECT_SELECTION, id));
         if focused {
             events.push((EVENT_OBJECT_FOCUS, id));
         }
-    } else {
-        // A pin changes only the name (", pinned"), but screen readers listen for it as a state
-        // change (spec §10), so a renamed current child raises both.
+    }
+    if same_item {
+        // A pin changes only the name (", pinned"), and usually moves the row, but screen
+        // readers listen for it as a state change (spec §10), so a renamed current child raises
+        // both, in place or at its new ID.
         if before.state != after.state || before.name != after.name {
             events.push((EVENT_OBJECT_STATECHANGE, id));
         }
@@ -291,8 +324,22 @@ pub(crate) fn events_between(
     events
 }
 
+#[cfg(test)]
+thread_local! {
+    static RAISED: std::cell::RefCell<Vec<(usize, u32, i32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The (window, event, child ID) triples raised on this thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_raised() -> Vec<(usize, u32, i32)> {
+    RAISED.with(|raised| std::mem::take(&mut *raised.borrow_mut()))
+}
+
 pub(crate) fn raise(hwnd: HWND, events: &[(u32, i32)]) {
     for &(event, child) in events {
+        #[cfg(test)]
+        RAISED.with(|raised| raised.borrow_mut().push((hwnd as usize, event, child)));
         unsafe {
             NotifyWinEvent(event, hwnd, OBJID_CLIENT, child);
         }
@@ -408,10 +455,38 @@ fn evaluate(source: &AccessibleSource, hwnd: HWND, query: Query) -> Answer {
 }
 
 /// The window procedure's `WM_FASTPAD_SIDEBAR_ACCESSIBLE` handler.
+///
+/// `lparam` is trusted only while it is in `LIVE_CALLS`: any window (another process, or a reused
+/// handle) can send this message number with anything in `lparam`. Returns 0 for an unknown one.
 pub(crate) unsafe fn answer(hwnd: HWND, lparam: LPARAM) -> LRESULT {
-    let call = unsafe { &mut *(lparam as *mut Call) };
-    call.answer = Some(evaluate(call.source, hwnd, call.query));
+    let address = lparam as usize;
+    // A registered call's sender is blocked in `SendMessageW` until it unregisters, so it is
+    // live while registered. Read and write it only under the lock that unregistering takes.
+    let request = {
+        let live = live_calls();
+        if !live.contains(&address) {
+            return 0;
+        }
+        let call = unsafe { &*(address as *const Call) };
+        (call.source, call.query)
+    };
+    // Evaluated without the lock: it reads App, and a nested query must not deadlock.
+    let result = evaluate(request.0, hwnd, request.1);
+    let live = live_calls();
+    if !live.contains(&address) {
+        return 0;
+    }
+    unsafe { (*(address as *mut Call)).answer = Some(result) };
     1
+}
+
+/// The `Call`s whose senders are waiting in `ask`, by address.
+static LIVE_CALLS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn live_calls() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    LIVE_CALLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The window procedure's `WM_FASTPAD_SIDEBAR_ACTION` handler.
@@ -450,13 +525,21 @@ fn ask(item: &SidebarAccessible, query: Query) -> Answer {
         query,
         answer: None,
     };
+    let address = &raw mut call as usize;
+    live_calls().push(address);
     unsafe {
         SendMessageW(
             item.hwnd,
             WM_FASTPAD_SIDEBAR_ACCESSIBLE,
             0,
-            &mut call as *mut Call as LPARAM,
+            address as LPARAM,
         );
+    }
+    {
+        let mut live = live_calls();
+        if let Some(position) = live.iter().position(|&entry| entry == address) {
+            live.swap_remove(position);
+        }
     }
     // A destroyed window answers nothing: report no children.
     call.answer.unwrap_or(match query {
@@ -878,6 +961,12 @@ mod tests {
     }
     fn fake_select(_: HWND, _: usize) {}
     fn fake_activate(_: HWND, _: usize) {}
+    fn fake_identity(_: HWND, _: usize) -> Option<u64> {
+        None
+    }
+    fn fake_generation(_: HWND) -> u64 {
+        0
+    }
 
     static FAKE: AccessibleSource = AccessibleSource {
         container: fake_container,
@@ -887,6 +976,8 @@ mod tests {
         current: fake_current,
         select: fake_select,
         activate: fake_activate,
+        identity: fake_identity,
+        generation: fake_generation,
     };
 
     fn read_bstr(value: BSTR) -> String {
@@ -1091,6 +1182,7 @@ mod tests {
             state,
             name: name.to_owned(),
             count,
+            ..AccessibleMark::default()
         };
         assert_eq!(
             events_between(&mark(Some(1), 0, "a", 5), &mark(Some(2), 0, "b", 5), true),
@@ -1117,6 +1209,53 @@ mod tests {
             vec![(EVENT_OBJECT_STATECHANGE, 1), (EVENT_OBJECT_NAMECHANGE, 1)]
         );
         assert!(events_between(&mark(None, 0, "", 0), &mark(None, 0, "", 0), true).is_empty());
+    }
+
+    #[test]
+    fn a_pin_that_re_sorts_the_row_raises_reorder_selection_and_state_change() {
+        // Break caught: pinning a note that is not first moves it to the top at the same count,
+        // announcing only a new selection, with no state change and no reorder of its siblings.
+        let before = AccessibleMark {
+            current: Some(3),
+            name: "b".to_owned(),
+            count: 5,
+            identity: Some(7),
+            generation: 1,
+            ..AccessibleMark::default()
+        };
+        let after = AccessibleMark {
+            current: Some(0),
+            name: "b, pinned".to_owned(),
+            generation: 2,
+            ..before.clone()
+        };
+        assert_eq!(
+            events_between(&before, &after, true),
+            vec![
+                (EVENT_OBJECT_REORDER, 0),
+                (EVENT_OBJECT_SELECTION, 1),
+                (EVENT_OBJECT_FOCUS, 1),
+                (EVENT_OBJECT_STATECHANGE, 1),
+                (EVENT_OBJECT_NAMECHANGE, 1),
+            ]
+        );
+        // Another row now at the same index is a new selection, not a state change.
+        let other = AccessibleMark {
+            identity: Some(8),
+            ..before.clone()
+        };
+        assert_eq!(
+            events_between(&before, &other, false),
+            vec![(EVENT_OBJECT_SELECTION, 4)]
+        );
+    }
+
+    #[test]
+    fn a_query_message_with_an_unknown_pointer_is_ignored() {
+        // Break caught: any process sending WM_APP + 0x60 with a junk lParam crashing FastPad by
+        // having it written through as a `Call`.
+        assert_eq!(unsafe { answer(std::ptr::null_mut(), 0x10) }, 0);
+        assert_eq!(unsafe { answer(std::ptr::null_mut(), -1) }, 0);
     }
 
     #[test]

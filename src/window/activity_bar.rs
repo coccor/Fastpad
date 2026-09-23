@@ -414,6 +414,9 @@ pub(crate) static BAR_ACCESSIBLE: AccessibleSource = AccessibleSource {
     current: bar_current,
     select: bar_select,
     activate: bar_activate,
+    // Four fixed buttons: the index is the identity, and the order never changes.
+    identity: |_, _| None,
+    generation: |_| 0,
 };
 
 /// `WM_SETFOCUS` and `WM_KILLFOCUS`. Gaining the focus starts on the active view's button.
