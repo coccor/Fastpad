@@ -5,3 +5,4 @@
 pub mod ids;
 pub mod model;
 pub mod ops;
+pub mod store;
