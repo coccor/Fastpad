@@ -1,6 +1,6 @@
 # Note Sidebar Design
 
-**Status:** Draft for review
+**Status:** Approved design
 **Sub-project:** 2 of 4 (sidebar and note list), stacked on the note library (`feat/note-library`, PR #9)
 **Builds on:** `docs/superpowers/specs/2026-09-23-note-library-design.md` ("the library spec")
 
@@ -343,3 +343,35 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 - Text search in the Search view (sub-project 3).
 - Links and backlinks (sub-project 4), which may bring back a use for note-level metadata.
 - Drag and drop in the tree, and folder management in the tree.
+
+## 16. Implementation notes
+
+- **The search box's placeholder is painted, not a cue banner.** FastPad has no ComCtl32 v6
+  manifest, so `EM_SETCUEBANNER` shows nothing. The Search view paints "Search <notebook>" the
+  way the find bar paints "Find".
+- **Settings lists tab width too.** The Settings button's palette holds the font size, word
+  wrap, line numbers, theme, session restore, notes mode, folder autosave and tab width
+  commands.
+- **F6 is two commands,** `FocusNextPane` (183) and `FocusPreviousPane` (184), bound in the
+  accelerator table and kept out of the palette.
+- **MSAA reads the panel one child at a time** (`accessible_item_count` and `accessible_item`),
+  so a 10,000-row tree never builds 10,000 names per call. Queries from screen-reader threads
+  are sent to the UI thread. A default action is a click on the child's center, after scrolling
+  it into view, so it does exactly what the mouse does.
+- **Outline items report their level** as the MSAA value, as tree views do.
+- **`fastpad.ini` is read before the window exists.** `bootstrap::run` reads it once, so the
+  activity bar and panel paint their saved view and width in the first frame, and
+  `WM_FASTPAD_LOAD_SETTINGS` only applies it and reports its warnings.
+- **A favorite opens asynchronously.** The Favorites view shows the Notebook view once the
+  worker has found the folder, so a missing favorite changes nothing, the view included.
+- **Name search lowercases on each call, with no cached lower-case copy** (a deviation from
+  §11). The binding requirement is §12's 5 ms per keystroke, and the `library-scan` bench's
+  `name_search_ms` gate (under 5 ms) enforces it; a cache would cost memory for no measured gain.
+- **The panel's accessible name uses the activity bar's wording,** "Notebook: <name>", from one
+  shared source, so the bar and the panel never disagree.
+- **Loading a notebook also reveals and selects the active tab's note** in the tree, as a tab
+  switch does (§6.1), so the first view after `LIBRARY_READY` already shows where you are.
+- **A move onto a path another tab already holds is refused** with a notice, like a rename onto
+  it, because that tab's autosave would otherwise re-create or overwrite the moved note (§13).
+- **A late answer about a notebook is dropped** when the user has opened, closed or checked
+  another notebook since, so a slow drive can never undo a later choice.

@@ -69,3 +69,19 @@ Deviations from the design spec, recorded without a ruling:
 
 - The image cache is keyed by path only, not by path and modification time. An image edited while
   its document is shown keeps the decoded pixels; it refreshes when the preview is reopened.
+
+## Note sidebar
+
+`library-scan` also times the sidebar's pure work over the generated notebook (the median of
+five runs each):
+- `tree_build_ms`: `NoteTree::build` over every note. The target is under 20 ms for 10,000 notes.
+- `tree_rows_expanded_ms`: flattening with every folder expanded (500 notes per folder). The
+  target is under 16 ms.
+- `name_search_ms`: one Search-view keystroke over every name. The target is under 5 ms.
+
+`--enforce-reference` fails the run when any of them reaches its target.
+
+Startup with the sidebar is measured with `--notes-folder DIR --sidebar-view notebook` against
+the same folder with `--sidebar-view none`, and compared with `fastpad-bench compare`. No
+milestone may regress, and the idle private working set with a 10,000-note notebook may grow by
+at most 1 MB over the `feat/note-library` build with the same folder.

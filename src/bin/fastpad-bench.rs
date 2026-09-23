@@ -14,6 +14,7 @@ enum Action {
         enforce_reference: bool,
         launch_file: Option<PathBuf>,
         notes_folder: Option<PathBuf>,
+        sidebar_view: Option<String>,
     },
     Compare {
         baseline: PathBuf,
@@ -27,7 +28,8 @@ enum Action {
 }
 
 const USAGE: &str = "usage: fastpad-bench [--runs N] [--warmup N] [--output FILE] [--launch-file FILE] \
-                     [--notes-folder DIR] [--enforce-reference]\n       \
+                     [--notes-folder DIR] [--sidebar-view notebook|search|favorites|none] \
+                     [--enforce-reference]\n       \
                      fastpad-bench compare BASELINE.jsonl CANDIDATE.jsonl\n       \
                      fastpad-bench library-scan DIR [--count N] [--enforce-reference]";
 
@@ -56,13 +58,15 @@ where
     let mut enforce_reference = false;
     let mut launch_file = None;
     let mut notes_folder = None;
+    let mut sidebar_view = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index]
             .to_str()
             .ok_or_else(|| "benchmark options must be valid Unicode".to_owned())?;
         match flag {
-            "--runs" | "--warmup" | "--output" | "--launch-file" | "--notes-folder" => {
+            "--runs" | "--warmup" | "--output" | "--launch-file" | "--notes-folder"
+            | "--sidebar-view" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| format!("missing value for {flag}"))?;
@@ -72,6 +76,18 @@ where
                     "--output" => output = PathBuf::from(value),
                     "--launch-file" => launch_file = Some(PathBuf::from(value)),
                     "--notes-folder" => notes_folder = Some(PathBuf::from(value)),
+                    "--sidebar-view" => {
+                        let view = value
+                            .to_str()
+                            .filter(|view| {
+                                matches!(*view, "notebook" | "search" | "favorites" | "none")
+                            })
+                            .ok_or_else(|| {
+                                "--sidebar-view must be notebook, search, favorites or none"
+                                    .to_owned()
+                            })?;
+                        sidebar_view = Some(view.to_owned());
+                    }
                     _ => unreachable!(),
                 }
                 index += 2;
@@ -95,6 +111,7 @@ where
         enforce_reference,
         launch_file,
         notes_folder,
+        sidebar_view,
     })
 }
 
@@ -234,6 +251,7 @@ fn run_main() -> Result<i32, String> {
             enforce_reference,
             launch_file,
             notes_folder,
+            sidebar_view,
         } => run_distribution(
             runs,
             warmup,
@@ -241,6 +259,7 @@ fn run_main() -> Result<i32, String> {
             enforce_reference,
             launch_file.as_deref(),
             notes_folder.as_deref(),
+            sidebar_view.as_deref(),
         ),
         Action::Compare {
             baseline,
@@ -261,6 +280,7 @@ fn run_distribution(
     enforce_reference: bool,
     launch_file: Option<&Path>,
     notes_folder: Option<&Path>,
+    sidebar_view: Option<&str>,
 ) -> Result<i32, String> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -274,7 +294,7 @@ fn run_distribution(
     let mut records = Vec::with_capacity(runs);
 
     for index in 0..warmup + runs {
-        let record = run_once(launch_file, notes_folder)?;
+        let record = run_once(launch_file, notes_folder, sidebar_view)?;
         if index >= warmup {
             use std::io::Write;
             writeln!(writer, "{}", record_to_json_line(&record))
@@ -304,11 +324,15 @@ fn run_distribution(
     Ok(0)
 }
 
-/// Favorite records written into a generated library, spread evenly over its notes.
-const LIBRARY_SCAN_FAVORITES: usize = 200;
+/// Pinned records written into a generated library, spread evenly over its notes.
+const LIBRARY_SCAN_PINS: usize = 200;
 const LIBRARY_SCAN_WARM_LOADS: usize = 5;
 /// The warm-load median must stay below this on the reference machine.
 const LIBRARY_SCAN_REFERENCE_MS: f64 = 500.0;
+/// Spec §12 targets on the reference machine.
+const TREE_BUILD_REFERENCE_MS: f64 = 20.0;
+const TREE_ROWS_REFERENCE_MS: f64 = 16.0;
+const NAME_SEARCH_REFERENCE_MS: f64 = 5.0;
 
 /// Times one cold and several warm `library::load` calls of `folder`, first generating `count`
 /// notes and a `library.ini` into it when asked.
@@ -355,15 +379,78 @@ fn run_library_scan(
         })
         .sum::<usize>();
 
+    let paths = state
+        .notes
+        .iter()
+        .map(|note| note.path.clone())
+        .collect::<Vec<_>>();
+    let pinned = state
+        .library
+        .notes
+        .iter()
+        .filter(|record| record.pinned)
+        .map(|record| record.path.clone())
+        .collect::<Vec<_>>();
+    let tree_build_ms = median_ms(|| {
+        std::hint::black_box(fastpad::library::tree::NoteTree::build(&paths, &pinned));
+    });
+    let tree = fastpad::library::tree::NoteTree::build(&paths, &pinned);
+    // Every folder expanded: the fixture's folders hold 500 notes each.
+    let tree_rows_expanded_ms = median_ms(|| {
+        std::hint::black_box(tree.rows(&|_| true, &[]));
+    });
+    let name_search_ms = median_ms(|| {
+        std::hint::black_box(fastpad::library::name_search::search(
+            &paths, "note 12", 500,
+        ));
+    });
+
     println!("notes={}", state.notes.len());
     println!("cold_ms={cold_ms:.1}");
     println!("warm_median_ms={warm_median_ms:.1}");
     println!("index_bytes~{index_bytes}");
-    if enforce_reference && warm_median_ms >= LIBRARY_SCAN_REFERENCE_MS {
-        eprintln!("reference threshold failed: library-scan warm median={warm_median_ms:.1}ms");
-        return Ok(2);
+    println!("tree_build_ms={tree_build_ms:.2}");
+    println!("tree_rows_expanded_ms={tree_rows_expanded_ms:.2}");
+    println!("name_search_ms={name_search_ms:.2}");
+    if enforce_reference {
+        let failures = [
+            (
+                "library-scan warm median",
+                warm_median_ms,
+                LIBRARY_SCAN_REFERENCE_MS,
+            ),
+            ("tree build", tree_build_ms, TREE_BUILD_REFERENCE_MS),
+            (
+                "tree rows, all expanded",
+                tree_rows_expanded_ms,
+                TREE_ROWS_REFERENCE_MS,
+            ),
+            ("name search", name_search_ms, NAME_SEARCH_REFERENCE_MS),
+        ]
+        .into_iter()
+        .filter(|(_, measured, limit)| measured >= limit)
+        .collect::<Vec<_>>();
+        for (what, measured, limit) in &failures {
+            eprintln!("reference threshold failed: {what}={measured:.2}ms (limit {limit}ms)");
+        }
+        if !failures.is_empty() {
+            return Ok(2);
+        }
     }
     Ok(0)
+}
+
+/// The median of five timings of `work`, in milliseconds.
+fn median_ms(mut work: impl FnMut()) -> f64 {
+    let mut times = (0..LIBRARY_SCAN_WARM_LOADS)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            work();
+            started.elapsed().as_secs_f64() * 1_000.0
+        })
+        .collect::<Vec<_>>();
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
 }
 
 /// Writes `count` notes as `batch{i / 500}\note{i}.md`, about 200 bytes each, and a
@@ -394,9 +481,9 @@ fn create_library_fixture(folder: &Path, count: usize) -> Result<(), String> {
 
     let mut library = Library::default();
     let mut ids = IdSource::new(fastpad::library::now_unix(), std::process::id());
-    let favorites = LIBRARY_SCAN_FAVORITES.min(count);
-    for favorite in 0..favorites {
-        let index = favorite * count / favorites;
+    let pins = LIBRARY_SCAN_PINS.min(count);
+    for pin in 0..pins {
+        let index = pin * count / pins;
         let note = NoteRef {
             id: NoteId(ids.next()),
             path: relative(index),
@@ -567,6 +654,7 @@ fn record_from_json(value: &serde_json::Value) -> Result<BenchmarkRecord, String
 fn run_once(
     _launch_file: Option<&Path>,
     _notes_folder: Option<&Path>,
+    _sidebar_view: Option<&str>,
 ) -> Result<BenchmarkRecord, String> {
     Err("the startup benchmark requires Windows".to_owned())
 }
@@ -696,6 +784,7 @@ impl Drop for ProcThreadAttributeList {
 fn run_once(
     launch_file: Option<&Path>,
     notes_folder: Option<&Path>,
+    sidebar_view: Option<&str>,
 ) -> Result<BenchmarkRecord, String> {
     use fastpad::perf::protocol::{
         BENCHMARK_INPUT_CHAR, BENCHMARK_SHARED_FRAME_LEN, EVENT_HANDLE_ENV, MAPPING_HANDLE_ENV,
@@ -736,6 +825,7 @@ fn run_once(
     // and never carries a session manifest from one run into the next.
     let local_app_data = ScratchLocalAppData::create(&unique)?;
     local_app_data.seed_notes_folder(notes_folder)?;
+    local_app_data.seed_sidebar_view(sidebar_view)?;
     let mapping_name = wide_null(&format!("Local\\FastPadBenchMapping-{unique}"));
     let event_name = wide_null(&format!("Local\\FastPadBenchEvent-{unique}"));
     let security = SECURITY_ATTRIBUTES {
@@ -1002,6 +1092,17 @@ impl ScratchLocalAppData {
         };
         let path = fastpad::library::local::folders_file(&self.0.join("FastPad"));
         std::fs::write(&path, recent.encode())
+            .map_err(|error| format!("could not write {}: {error}", path.display()))
+    }
+
+    /// Writes `FastPad\fastpad.ini` with `sidebar_view=VIEW`, so a run can measure startup
+    /// with the panel open or closed. Without a view the scratch profile keeps the default.
+    fn seed_sidebar_view(&self, view: Option<&str>) -> Result<(), String> {
+        let Some(view) = view else {
+            return Ok(());
+        };
+        let path = self.0.join("FastPad").join("fastpad.ini");
+        std::fs::write(&path, format!("sidebar_view={view}\r\n"))
             .map_err(|error| format!("could not write {}: {error}", path.display()))
     }
 }
@@ -1560,6 +1661,18 @@ mod tests {
     }
 
     #[test]
+    fn command_line_supports_the_sidebar_view() {
+        // Break caught: a mistyped view silently measuring the default layout, or the flag
+        // swallowing the next option.
+        assert!(matches!(
+            parse_args(["--notes-folder", r"C:\n", "--sidebar-view", "none"]).unwrap(),
+            Action::Run { sidebar_view: Some(view), .. } if view == "none"
+        ));
+        assert!(parse_args(["--sidebar-view", "tree"]).is_err());
+        assert!(parse_args(["--sidebar-view"]).is_err());
+    }
+
+    #[test]
     fn command_line_supports_run_and_compare_modes() {
         // Break caught: interpreting compare paths as run options, or silently ignoring explicit
         // warmup/output/reference settings, runs the wrong benchmark workload.
@@ -1581,6 +1694,7 @@ mod tests {
                 enforce_reference: true,
                 launch_file: None,
                 notes_folder: None,
+                sidebar_view: None,
             }
         );
         assert!(matches!(

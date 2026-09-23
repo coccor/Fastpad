@@ -96,17 +96,24 @@ typing. Both panes scroll together.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
 
-### Notes and folders
+### Notes and notebooks
 
-Open any folder with **Ctrl+Shift+O** and it becomes your note library. Ctrl+N gives you a new
-note, labelled by its first line as you type. The first Ctrl+S asks for its name inline and saves
-it into the folder; files already inside the folder save themselves from then on.
+Open any folder with **Ctrl+Shift+O** and it becomes your notebook. The sidebar on the left
+shows it as a tree: folders as they are on disk, pinned notes first. Click a note to open it
+in a preview tab that the next click replaces. Double-click it, or start typing, to keep it.
+Hover a note to pin it.
 
-Notebooks, tags, favorites and pins live in the command palette for now, and are stored in
-`.fastpad\library.ini` inside the folder, so they travel with it wherever it goes. Nothing is
-written into a folder until you organize something in it.
+- **Ctrl+N** gives you a new note, labelled by its first line as you type. The first Ctrl+S asks
+  for its name inline and saves it into the notebook. Notes in the notebook save themselves
+  from then on.
+- **Ctrl+K** searches note names. Star a notebook to keep it in **Favorites**, and switch
+  between notebooks from there.
+- **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
+  Everything is reachable from the keyboard and exposed to screen readers.
 
-Turn it all off with `notes_mode=false` in `fastpad.ini`.
+Pins are stored in `.fastpad\library.ini` inside the notebook, so they travel with it. Nothing
+is written into a folder until you pin something. Turn it all off with `notes_mode=false` in
+`fastpad.ini`.
 
 ### JSON you can trust
 
@@ -128,7 +135,8 @@ in a new window.
 <img src="docs/images/command-palette.png" alt="The command palette filtering theme commands" width="800">
 
 **Ctrl+Shift+P** and start typing. Switch theme, toggle word wrap or line numbers, change font size
-or tab width, all without leaving the keyboard. Every change is saved instantly.
+or tab width, all without leaving the keyboard. Every change is saved instantly. The
+**Settings** button at the bottom of the sidebar opens the palette with just the settings.
 
 ### Themes that match your desk
 
@@ -173,7 +181,9 @@ before closing again.
 | Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Ctrl+1` … `Ctrl+9` |
 | Left-to-right text | `Ctrl+L` | | Right-to-left text | `Ctrl+R` |
-| Open folder | `Ctrl+Shift+O` | | | |
+| Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` |
+| Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+K` |
+| Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |
 
 ## Make it yours
 
@@ -191,6 +201,8 @@ line in a notification and applies the rest.
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
+| `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
 
 Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
 
