@@ -10,6 +10,7 @@ pub mod ops;
 pub mod reconcile;
 pub mod scan;
 pub mod store;
+pub mod text_search;
 pub mod title;
 pub mod tree;
 

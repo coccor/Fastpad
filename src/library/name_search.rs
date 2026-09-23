@@ -79,7 +79,8 @@ where
         .collect()
 }
 
-fn folder_of(path: &Path) -> String {
+/// The folder `path` is in, relative to the notebook and joined with `\`; `""` at the root.
+pub(super) fn folder_of(path: &Path) -> String {
     path.parent()
         .map(|parent| {
             parent
