@@ -5,6 +5,7 @@ use super::main_window::{app_ptr, push_notice, window_identity};
 use crate::library::title;
 use crate::library::{self, LibraryState, Metadata, ids::IdSource};
 use crate::window::command_palette::{Picker, PickerChoice, PickerKind};
+use crate::window::name_box::{NameBox, NamePurpose};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
@@ -563,6 +564,203 @@ pub(crate) fn clear_labels(hwnd: HWND) {
         }
     }
     super::main_window::refresh_tab_view(hwnd);
+}
+
+fn active_untitled(hwnd: HWND) -> Option<crate::document::DocumentId> {
+    unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let active = unsafe { app.as_ref() }.tabs.active()?;
+        active.path.is_none().then_some(active.id)
+    })
+}
+
+/// "<sanitized label>.<extension for the tab's language>".
+pub(crate) fn suggested_file_name(hwnd: HWND) -> String {
+    unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            let active = unsafe { app.as_ref() }.tabs.active()?;
+            let stem = title::sanitize_stem(active.untitled_label.as_deref().unwrap_or("Untitled"));
+            Some(format!(
+                "{stem}.{}",
+                title::default_extension(active.language)
+            ))
+        })
+        .unwrap_or_else(|| "Untitled.md".to_owned())
+}
+
+/// Ctrl+S: an untitled tab in notes mode is named in the name box; everything else as before.
+pub(crate) fn save_command(hwnd: HWND) {
+    if notes_mode(hwnd)
+        && folder(hwnd).is_some()
+        && let Some(id) = active_untitled(hwnd)
+    {
+        refresh_label(hwnd);
+        let suffix = format!("in {}", folder_display_name(hwnd));
+        open_name_box(
+            hwnd,
+            NamePurpose::FirstSave(id),
+            &suggested_file_name(hwnd),
+            suffix,
+            true,
+        );
+        return;
+    }
+    let _ = super::main_window::save_active_document(hwnd);
+}
+
+pub(crate) fn save_as_command(hwnd: HWND) {
+    if notes_mode(hwnd) && folder(hwnd).is_some() && active_untitled(hwnd).is_some() {
+        save_command(hwnd);
+        return;
+    }
+    let _ = super::main_window::save_active_document_as(hwnd);
+}
+
+fn folder_display_name(hwnd: HWND) -> String {
+    folder(hwnd)
+        .and_then(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "the notes folder".to_owned())
+}
+
+pub(crate) fn open_name_box(
+    hwnd: HWND,
+    purpose: NamePurpose,
+    text: &str,
+    suffix: String,
+    browse: bool,
+) {
+    super::main_window::close_find_bar(hwnd);
+    let colors = super::main_window::current_palette(hwnd);
+    let shown = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.name_box.is_none() {
+            app.name_box = NameBox::create(hwnd).ok();
+        }
+        match app.name_box.as_mut() {
+            Some(name_box) => {
+                name_box.show(purpose, text, suffix, browse, colors);
+                true
+            }
+            None => false,
+        }
+    });
+    if !shown {
+        push_notice(hwnd, "FastPad could not show the name box.".to_owned());
+        return;
+    }
+    super::main_window::layout_editor_and_find_bar(hwnd);
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(name_box) = unsafe { app.as_ref() }.name_box.as_ref()
+    {
+        name_box.focus();
+    }
+}
+
+pub(crate) fn close_name_box(hwnd: HWND) {
+    let hidden = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        unsafe { app.as_mut() }
+            .name_box
+            .as_mut()
+            .is_some_and(|name_box| {
+                let was = name_box.is_visible();
+                name_box.hide();
+                was
+            })
+    });
+    if hidden {
+        super::main_window::layout_editor_and_find_bar(hwnd);
+        super::main_window::focus_content(hwnd);
+    }
+}
+
+fn name_box_state(hwnd: HWND) -> Option<(NamePurpose, String)> {
+    unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
+        Some((name_box.purpose()?.clone(), name_box.text()))
+    })
+}
+
+fn name_box_error(hwnd: HWND, error: String) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) }
+        && let Some(name_box) = unsafe { app.as_mut() }.name_box.as_mut()
+    {
+        name_box.set_error(Some(error));
+    }
+}
+
+/// Enter or Save in the name box.
+pub(crate) fn name_box_submit(hwnd: HWND) {
+    let Some((purpose, text)) = name_box_state(hwnd) else {
+        return;
+    };
+    match purpose {
+        NamePurpose::FirstSave(id) => submit_first_save(hwnd, id, &text),
+        // Tasks 19 and 20 add the other purposes.
+        _ => close_name_box(hwnd),
+    }
+}
+
+fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
+    let Some(folder) = folder(hwnd) else {
+        return;
+    };
+    let language = unsafe { app_ptr(hwnd) }
+        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.document(id)?.language))
+        .unwrap_or(crate::document::Language::Markdown);
+    let (stem, extension) = title::split_typed_name(text, title::default_extension(language));
+    let name = format!("{stem}.{extension}");
+    let target = folder.join(&name);
+    if target.exists() {
+        let free = title::free_name(&stem, &extension, |candidate| {
+            folder.join(candidate).exists()
+        });
+        name_box_error(hwnd, format!("{name} already exists. Try {free}."));
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(&folder) {
+        name_box_error(
+            hwnd,
+            format!("FastPad could not create {}: {error}", folder.display()),
+        );
+        return;
+    }
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    if !super::main_window::activate_document_by_id(hwnd, id) {
+        return;
+    }
+    if super::main_window::complete_save(hwnd, &identity, Some(target))
+        && identity.is_live_for(hwnd)
+    {
+        close_name_box(hwnd);
+    }
+}
+
+/// Browse… in the name box: the system Save As dialog, starting in the folder.
+pub(crate) fn name_box_browse(hwnd: HWND) {
+    let Some((NamePurpose::FirstSave(id), _)) = name_box_state(hwnd) else {
+        return;
+    };
+    close_name_box(hwnd);
+    if super::main_window::activate_document_by_id(hwnd, id) {
+        let _ = super::main_window::save_active_document_as(hwnd);
+    }
+}
+
+/// After any successful save: remember the file's disk stamp and index it if it is a note.
+pub(crate) fn document_saved(hwnd: HWND) {
+    let path = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let id = app.tabs.active()?.id;
+        let document = app.tabs.document_mut(id)?;
+        let path = document.path.clone()?;
+        document.disk_stamp = library::disk_stamp(&path);
+        document.autosave_paused = false;
+        Some(path)
+    });
+    if let Some(path) = path {
+        with_state(hwnd, |state| state.add_note(&path));
+    }
 }
 
 #[cfg(test)]

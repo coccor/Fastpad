@@ -30,19 +30,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F10, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE, GWL_STYLE,
-    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCAPTION, IsWindow, IsWindowVisible,
-    IsZoomed, KillTimer, LoadIconW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage,
-    QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE,
-    SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW,
-    WHEEL_DELTA, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT,
-    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    BN_CLICKED, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE,
+    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCAPTION, IsWindow,
+    IsWindowVisible, IsZoomed, KillTimer, LoadIconW, MoveWindow, OBJID_CLIENT, PostMessageW,
+    PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE,
+    SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    UnregisterClassW, WHEEL_DELTA, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
+    WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY,
+    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
@@ -489,6 +489,19 @@ unsafe extern "system" fn main_window_proc(
                     .map(|bar| bar.control_color(wparam as HDC) as LRESULT)
             })
             .unwrap_or(0),
+        WM_CTLCOLOREDIT | WM_CTLCOLORBTN if name_box_owns(hwnd, lparam as HWND) => {
+            unsafe { app_ptr(hwnd) }
+                .and_then(|app| {
+                    let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
+                    let dc = wparam as HDC;
+                    Some(if message == WM_CTLCOLORBTN {
+                        name_box.button_color(dc)
+                    } else {
+                        name_box.control_color(dc)
+                    } as LRESULT)
+                })
+                .unwrap_or(0)
+        }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX if command_palette_owns(hwnd, lparam as HWND) => {
             with_command_palette(hwnd, |palette| {
                 palette.control_color(wparam as HDC, lparam as HWND) as LRESULT
@@ -501,6 +514,21 @@ unsafe extern "system" fn main_window_proc(
                 with_command_palette(hwnd, |palette| palette.draw_item(item));
             }
             1
+        }
+        // The name box's own buttons; their IDs are not command IDs.
+        WM_COMMAND if lparam != 0 && name_box_owns(hwnd, lparam as HWND) => {
+            if ((wparam >> 16) & 0xffff) as u32 == BN_CLICKED {
+                match (wparam & 0xffff) as u16 {
+                    crate::window::name_box::NAME_BOX_SAVE_ID => {
+                        crate::window::library_host::name_box_submit(hwnd)
+                    }
+                    crate::window::name_box::NAME_BOX_BROWSE_ID => {
+                        crate::window::library_host::name_box_browse(hwnd)
+                    }
+                    _ => {}
+                }
+            }
+            0
         }
         WM_COMMAND => {
             if let Ok(command) = CommandId::try_from((wparam & 0xffff) as u16) {
@@ -975,7 +1003,17 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
             bar.is_visible().then(|| find_bar::find_bar_height(dpi))
         })
         .unwrap_or(0);
-    let content_top = title_height + find_bar_height;
+    // Opening either bar closes the other, so at most one of the two bands is ever reserved.
+    let name_box_height = unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
+            name_box.layout(width, title_height + find_bar_height, dpi, font);
+            name_box
+                .is_visible()
+                .then(|| crate::window::name_box::name_box_height(dpi))
+        })
+        .unwrap_or(0);
+    let content_top = title_height + find_bar_height + name_box_height;
     let status_height = status_bar_height(hwnd);
     let area = RECT {
         left: 0,
@@ -1047,11 +1085,40 @@ pub(crate) fn close_find_bar(hwnd: HWND) {
         return;
     }
     layout_editor_and_find_bar(hwnd);
+    focus_content(hwnd);
+}
+
+/// Returns the keyboard focus to the content area.
+pub(crate) fn focus_content(hwnd: HWND) {
     if let Some(target) = content_focus_target(hwnd) {
         unsafe {
             SetFocus(target);
         }
     }
+}
+
+/// The colors the find bar and the name box are shown in.
+pub(crate) fn current_palette(hwnd: HWND) -> Palette {
+    title_chrome(hwnd).0
+}
+
+/// The height of the visible find bar or name box band above the editor, or 0.
+fn bar_band_height(hwnd: HWND) -> i32 {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    unsafe { app_ptr(hwnd) }.map_or(0, |app| {
+        let app = unsafe { app.as_ref() };
+        let find = app
+            .find_bar
+            .as_ref()
+            .filter(|bar| bar.is_visible())
+            .map_or(0, |_| find_bar::find_bar_height(dpi));
+        let name = app
+            .name_box
+            .as_ref()
+            .filter(|name_box| name_box.is_visible())
+            .map_or(0, |_| crate::window::name_box::name_box_height(dpi));
+        find + name
+    })
 }
 
 /// Where keyboard focus belongs in the content area: the preview while it replaces the editor in
@@ -1061,25 +1128,12 @@ fn content_focus_target(hwnd: HWND) -> Option<HWND> {
 }
 
 /// Overlays the palette at the top of the editor, even with no tab open (New and Open stay
-/// available then), below a visible find bar so both stay usable.
+/// available then), below a visible find bar or name box so both stay usable.
 fn layout_command_palette(hwnd: HWND) {
     if !with_command_palette(hwnd, CommandPalette::is_visible).unwrap_or(false) {
         return;
     }
-    let find_bar_height = unsafe { app_ptr(hwnd) }
-        .and_then(|app| {
-            unsafe { app.as_ref() }
-                .find_bar
-                .as_ref()?
-                .is_visible()
-                .then_some(())
-        })
-        .map_or(0, |()| {
-            find_bar::find_bar_height(
-                unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96),
-            )
-        });
-    let top = title_layout(hwnd).height + menu_band_height(hwnd) + find_bar_height;
+    let top = title_layout(hwnd).height + menu_band_height(hwnd) + bar_band_height(hwnd);
     let mut rect = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut rect);
@@ -1227,9 +1281,10 @@ fn refilter_command_palette(hwnd: HWND) {
     layout_command_palette(hwnd);
 }
 
-/// `WM_PAINT` for a palette or find bar panel.
+/// `WM_PAINT` for a palette, find bar or name box panel.
 pub(crate) fn paint_panel(hwnd: HWND, panel: HWND) {
-    let glyph_font = title_chrome(hwnd).1.glyph();
+    let fonts = title_chrome(hwnd).1;
+    let (glyph_font, text_font) = (fonts.glyph(), fonts.text());
     let painted = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         let app = unsafe { app.as_ref() };
         if let Some(palette) = app.command_palette.as_ref().filter(|p| p.owns(panel)) {
@@ -1237,6 +1292,9 @@ pub(crate) fn paint_panel(hwnd: HWND, panel: HWND) {
             true
         } else if let Some(bar) = app.find_bar.as_ref().filter(|bar| bar.owns(panel)) {
             bar.paint_panel(panel, glyph_font);
+            true
+        } else if let Some(name_box) = app.name_box.as_ref().filter(|n| n.owns(panel)) {
+            name_box.paint_panel(panel, text_font);
             true
         } else {
             false
@@ -1312,6 +1370,15 @@ pub(crate) fn paint_find_placeholder(hwnd: HWND, edit: HWND) -> bool {
             .find_bar
             .as_ref()
             .is_some_and(|bar| bar.paint_placeholder(edit))
+    })
+}
+
+fn name_box_owns(hwnd: HWND, control: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .name_box
+            .as_ref()
+            .is_some_and(|name_box| name_box.owns(control))
     })
 }
 
@@ -1616,6 +1683,18 @@ fn refresh_tabs(hwnd: HWND) {
             }
         }
     }
+    // A name box for a tab that closed has nothing left to name.
+    let orphaned = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        let app = unsafe { app.as_ref() };
+        app.name_box
+            .as_ref()
+            .filter(|name_box| name_box.is_visible())
+            .and_then(|name_box| name_box.purpose()?.document())
+            .is_some_and(|id| app.tabs.document(id).is_none())
+    });
+    if orphaned {
+        crate::window::library_host::close_name_box(hwnd);
+    }
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
@@ -1667,12 +1746,8 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         }
         CommandId::CloseTab => close_active_document(hwnd),
         CommandId::CloseAllTabs => close_all_documents(hwnd),
-        CommandId::Save => {
-            let _ = save_active_document(hwnd);
-        }
-        CommandId::SaveAs => {
-            let _ = save_active_document_as(hwnd);
-        }
+        CommandId::Save => crate::window::library_host::save_command(hwnd),
+        CommandId::SaveAs => crate::window::library_host::save_as_command(hwnd),
         CommandId::Undo => with_editor(hwnd, |editor| {
             let _ = editor.undo();
         }),
@@ -2072,6 +2147,9 @@ fn apply_theme(hwnd: HWND) {
             if let Some(bar) = app.find_bar.as_mut() {
                 bar.set_colors(palette);
             }
+            if let Some(name_box) = app.name_box.as_mut() {
+                name_box.set_colors(palette);
+            }
             if let Some(command_palette) = app.command_palette.as_mut() {
                 command_palette.set_colors(palette);
             }
@@ -2099,6 +2177,9 @@ fn apply_theme(hwnd: HWND) {
         let app = unsafe { app.as_ref() };
         if let Some(bar) = app.find_bar.as_ref() {
             bar.invalidate();
+        }
+        if let Some(name_box) = app.name_box.as_ref() {
+            name_box.invalidate();
         }
         if let Some(command_palette) = app.command_palette.as_ref() {
             command_palette.invalidate();
@@ -2733,7 +2814,7 @@ fn save_reviewed_document(hwnd: HWND, id: DocumentId) -> bool {
 }
 
 /// Makes `id` the active document, or reports false when it no longer exists.
-fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
+pub(super) fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
     let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         if app.tabs.active().is_some_and(|active| active.id == id) {
@@ -2749,7 +2830,7 @@ fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
     }
 }
 
-fn save_active_document(hwnd: HWND) -> bool {
+pub(super) fn save_active_document(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
@@ -2762,11 +2843,11 @@ fn save_active_document(hwnd: HWND) -> bool {
     }
 }
 
-fn save_active_document_as(hwnd: HWND) -> bool {
+pub(super) fn save_active_document_as(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
-    let Some((target, suggested)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((target, named)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
         let document = app.tabs.active()?;
         Some((
@@ -2775,14 +2856,15 @@ fn save_active_document_as(hwnd: HWND) -> bool {
                 .path
                 .as_deref()
                 .and_then(std::path::Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled.txt".to_owned()),
+                .map(|name| name.to_string_lossy().into_owned()),
         ))
     }) else {
         return false;
     };
+    let suggested = named.unwrap_or_else(|| crate::window::library_host::suggested_file_name(hwnd));
+    let folder = crate::window::library_host::folder(hwnd);
     // Modal Show reenters the window procedure. Only an owned identity crosses it.
-    let selection = crate::window::modal::choose_save_path(hwnd, &suggested, None);
+    let selection = crate::window::modal::choose_save_path(hwnd, &suggested, folder.as_deref());
     if !identity.is_live_for(hwnd) {
         return false;
     }
@@ -2831,7 +2913,7 @@ pub(crate) fn save_path_as(hwnd: HWND, path: &std::path::Path) {
 /// `editor.text()` read, or a failed `save_atomic`) reverts the tab's path back to whatever it
 /// held before this call: a failed write must never leave the tab claiming a path nothing was
 /// actually written to, orphaning it from the path it was last genuinely saved at.
-fn complete_save(
+pub(super) fn complete_save(
     hwnd: HWND,
     identity: &WindowIdentity,
     new_path: Option<std::path::PathBuf>,
@@ -2896,6 +2978,9 @@ fn complete_save(
                     PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
                 }
                 invalidate_title_strip(hwnd);
+            }
+            if identity.is_live_for(hwnd) {
+                crate::window::library_host::document_saved(hwnd);
             }
             true
         }
@@ -7190,5 +7275,127 @@ mod tests {
         );
         assert!(!scratch.path().join("session.ini").exists());
         app_mut(window.hwnd).session_restore = None;
+    }
+
+    fn type_into_name_box(hwnd: HWND, text: &str) {
+        let edit = app_mut(hwnd).name_box.as_ref().unwrap().edit_hwnd();
+        let wide = crate::platform::wide_null(text);
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr()) };
+    }
+
+    #[test]
+    fn the_first_save_of_an_untitled_note_asks_for_a_name_in_the_folder_prefilled_from_its_label() {
+        // Break caught: Ctrl+S on a new note opening the system dialog in some random folder, or
+        // saving without letting the user confirm the name.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("first-save");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("Meeting: notes?\nbody").unwrap();
+        pump_posted_messages(window.hwnd);
+
+        execute_command(window.hwnd, CommandId::Save);
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(name_box.text(), "Meeting notes.md");
+
+        crate::window::library_host::name_box_submit(window.hwnd);
+        let saved = scratch.folder().join("Meeting notes.md");
+        assert_eq!(
+            std::fs::read_to_string(&saved).unwrap(),
+            "Meeting: notes?\nbody"
+        );
+        assert!(!app_mut(window.hwnd).name_box.as_ref().unwrap().is_visible());
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(saved.as_path())
+        );
+        assert!(
+            app_mut(window.hwnd)
+                .library
+                .state
+                .as_ref()
+                .unwrap()
+                .notes
+                .iter()
+                .any(|n| n.path == std::path::Path::new("Meeting notes.md"))
+        );
+        assert!(
+            app_mut(window.hwnd)
+                .tabs
+                .active()
+                .unwrap()
+                .disk_stamp
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_name_that_already_exists_is_refused_with_a_suggestion() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("clash");
+        scratch.note("Plan.md", "old");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("Plan").unwrap();
+        execute_command(window.hwnd, CommandId::Save);
+        type_into_name_box(window.hwnd, "plan.MD");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("Plan.md")).unwrap(),
+            "old"
+        );
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(
+            name_box.error(),
+            Some("plan.MD already exists. Try plan 2.MD.")
+        );
+    }
+
+    #[test]
+    fn browse_and_the_close_prompt_use_the_save_dialog_starting_with_the_suggested_name() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("browse");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("Ideas").unwrap();
+        assert_eq!(
+            crate::window::library_host::suggested_file_name(window.hwnd),
+            "Ideas.md"
+        );
+        let elsewhere = scratch.root.join("elsewhere.md");
+        crate::window::answer_next_save_dialog({
+            let elsewhere = elsewhere.clone();
+            move |_| Some(elsewhere)
+        });
+        execute_command(window.hwnd, CommandId::Save);
+        crate::window::library_host::name_box_browse(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "Ideas");
+    }
+
+    #[test]
+    fn with_notes_mode_off_save_uses_the_dialog_as_before() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("mode-off-save");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        app_mut(window.hwnd).settings.notes_mode = false;
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("x").unwrap();
+        let target = scratch.root.join("x.txt");
+        crate::window::answer_next_save_dialog({
+            let target = target.clone();
+            move |_| Some(target)
+        });
+        execute_command(window.hwnd, CommandId::Save);
+        assert!(target.exists());
+        assert!(app_mut(window.hwnd).name_box.is_none());
     }
 }

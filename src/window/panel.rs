@@ -1,4 +1,5 @@
-//! A painted child window that hosts native controls for the command palette and the find bar.
+//! A painted child window that hosts native controls for the command palette, the find bar and
+//! the name box.
 //! It draws its own background through the main window (which owns both widgets) and passes its
 //! controls' notifications on to the main window unchanged, so they are handled exactly as if the
 //! controls were the main window's own children.
@@ -16,8 +17,9 @@ use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, RegisterClassW,
-    SendMessageW, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    SendMessageW, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DRAWITEM,
+    WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS,
 };
 
 pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
@@ -114,7 +116,7 @@ unsafe extern "system" fn panel_proc(
             super::main_window::panel_pointer(main, hwnd, message, lparam);
             0
         }
-        WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {
+        WM_COMMAND | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {
             SendMessageW(main, message, wparam, lparam)
         },
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
@@ -126,10 +128,6 @@ pub(crate) fn create_child(parent: HWND, class: &[u16], style: u32) -> crate::Re
 }
 
 /// Like `create_child`, but with a control ID so `WM_COMMAND` can tell the child apart.
-#[allow(
-    dead_code,
-    reason = "consumed by the Task 17 folder tree / library panel controls, not yet wired"
-)]
 pub(crate) fn create_child_with_id(
     parent: HWND,
     class: &[u16],

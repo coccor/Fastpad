@@ -48,6 +48,7 @@ pub struct App {
     /// Where focus returns when menu mode ends; the frame holds it meanwhile for the key handling.
     pub(crate) menu_return_focus: HWND,
     pub(crate) find_bar: Option<FindBar>,
+    pub(crate) name_box: Option<crate::window::name_box::NameBox>,
     pub(crate) command_palette: Option<CommandPalette>,
     pub(crate) preview: crate::window::preview_host::PreviewHost,
     pub(crate) language_manager: Option<LanguageManager>,
@@ -103,6 +104,7 @@ impl App {
             menu_mode: None,
             menu_return_focus: std::ptr::null_mut(),
             find_bar: None,
+            name_box: None,
             command_palette: None,
             preview: Default::default(),
             language_manager: None,

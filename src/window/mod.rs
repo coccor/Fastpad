@@ -8,6 +8,7 @@ pub(crate) mod menu_band;
 pub(crate) mod menus;
 mod messages;
 pub(crate) mod modal;
+pub(crate) mod name_box;
 pub mod notification;
 pub mod palette;
 pub(crate) mod panel;
