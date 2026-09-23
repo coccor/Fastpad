@@ -1,0 +1,334 @@
+# Note Search Design
+
+**Status:** Approved design, pending review of this document
+**Sub-project:** 3 of the notebook feature, delivered as two stacked PRs:
+- **3a, text search** (`feat/note-search`, stacked on `feat/note-sidebar`, PR #10)
+- **3b, replace across notes** (`feat/note-replace`, stacked on 3a)
+
+**Builds on:** `docs/superpowers/specs/2026-09-23-note-sidebar-design.md` ("the sidebar spec"), which built on `2026-09-23-note-library-design.md`.
+
+**Followed by:** Ctrl+P quick open by note name (its own small PR, stacked on 3b), then links and backlinks (sub-project 4).
+
+## 1. Purpose
+
+The sidebar's Search view matches note names. This sub-project turns it into a VS Code-style search of the text of every note in the open notebook:
+- **3a** adds the search, with the match case, whole word and regular expression options, shared with the editor's find bar.
+- **3b** adds replacing across notes.
+
+Finding a note by name moves to Ctrl+P, a separate PR, so the Search view no longer matches names at all.
+
+The main uses:
+- **Finding the note:** you type a phrase you remember, see which notes contain it, and open one.
+- **Finding the place:** opening a result puts the query in the find bar, so F3 steps through every match in that note.
+
+## 2. Goals and non-goals
+
+### Goals
+- Search the text of every note in the open notebook as you type. Results stream in, and typing never blocks.
+- Show one result row per matching note, with a snippet of the first matching line.
+- Offer match case, whole word and regex toggles, in both the Search view and the find bar.
+- Ctrl+Shift+F shows Search. A single-line selection in the editor fills the box.
+- Opening a result hands the query and its options to the find bar and selects the first match.
+- **3b:** Ctrl+Shift+H replaces across notes. Open tabs change in the editor, where Ctrl+Z undoes it. Closed notes are written in place, with a conflict check and a confirmation first.
+- No index, no cache and no memory kept between searches. Nothing is added to startup.
+
+### Non-goals
+- Name matching in the Search view. That becomes Ctrl+P, a separate PR, which reuses `library::name_search`.
+- Include and exclude globs, or searching outside the open notebook.
+- A persistent or in-memory text index. §14 records when one would be justified.
+- Listing every matching line per note. The find bar covers stepping through matches.
+- Preserve-case replace and multi-line replace previews.
+- Saving the search options to `fastpad.ini`. They last for the session.
+
+## 3. Decisions made during design
+
+| Question | Decision |
+|---|---|
+| What is a result? | One row per note: the name, its folder, and a snippet of the first match (option C). Opening it seeds the find bar. |
+| Multi-word queries | Exact phrase: a substring, or a regex when regex is on. There is no "all the words anywhere" mode. |
+| How text is searched | The files are read for each query on a worker thread. There is no index. |
+| Name matches in Search | Removed. Ctrl+P (a separate PR) finds notes by name. |
+| Options | Match case, whole word and regex, like VS Code, in both Search and the find bar. |
+| Replace | Ctrl+Shift+H, a separate PR (3b) stacked on 3a. One spec covers both. |
+| Search shortcut | Ctrl+Shift+F. Format JSON moves to Shift+Alt+F. Ctrl+K is removed. |
+| Selection on Ctrl+Shift+F | A single-line selection replaces the box's text. |
+
+## 3a — Text search
+
+## 4. The Search view
+
+```
+┌ SEARCH ─────────────────────────┐
+│ [invoice march      Aa ab .* ]  │
+│ 3 notes                         │
+│ 📄 Q1 budget   work             │
+│    …paid the invoice march 3…   │
+│ 📄 Todo                         │
+│    …send invoice March to Ana   │
+│ Searching… 4,120 of 9,800       │
+└─────────────────────────────────┘
+```
+
+- **The search box**
+  - Its placeholder is "Search text in <notebook>". It is focused when the view opens.
+  - Three toggle buttons sit inside the right end of the field:
+    - **Match case** (`Aa`, Alt+C)
+    - **Match whole word** (`ab` underlined, Alt+W)
+    - **Use regular expression** (`.*`, Alt+R)
+  - Each toggle shows its state with the accent color and a filled background. Each has a tooltip that includes its shortcut, and each is exposed to screen readers as a check button.
+  - The Alt shortcuts work only while focus is in the box or the results. They are handled before the menu band's mnemonics.
+- **Summary line:** under the box, it reads "N notes" (or "500+ notes" at the cap, §7). With nothing typed it's empty. When the search finishes with no matches it reads "No notes match."
+- **Pattern errors:** an invalid regex shows its error in the error color instead of the summary, for example "Unclosed group". The previous results stay and nothing runs. A pattern that can match empty text is rejected with "The pattern matches empty text."
+- **Result rows** are two lines tall and all the same height, so `row_list` is unchanged.
+  - Line 1 is the file icon, the note name, and its folder relative to the notebook in dim text (empty at the root).
+  - Line 2 is the snippet, with the first match on that line drawn in bold.
+- **Order:** results are in natural name order, then by folder with the root first, then by path, the same key as `name_search`'s tie-breaks. They are placed in sorted order as they arrive. The selection and scroll position are kept by path, so rows arriving never change what Enter opens.
+- **Status line** at the bottom of the list area:
+  - While the search runs: "Searching… N of M", where N counts notes processed, including skipped ones.
+  - When it finishes with skipped notes: "N notes weren't searched". Its tooltip lists the counts by reason (online only, larger than 4 MB, couldn't be read, not text).
+  - When it finishes with nothing skipped, the line is hidden.
+- **Keys:**
+  - Down arrow moves from the box into the results.
+  - Enter or a click opens the note, following the preview-tab rules (sidebar spec §6.4).
+  - Esc in the box clears it. If it's already empty, Esc returns focus to the editor.
+- **The query:**
+  - It stays until the notebook changes or you clear it.
+  - Text search starts at 2 characters. With 1, the view shows "Type at least 2 characters."
+  - The regex rule is the same: at least 2 characters of pattern.
+- **With no notebook open:** "Open a notebook to search it." The box and the toggles still work, so the options can be set.
+
+## 5. Keyboard entry points and commands
+
+- **Ctrl+Shift+F** (`ShowSearchView`) shows the sidebar and the Search view, focuses the box and selects its text.
+  - If the active editor has a non-empty selection within one line, that text replaces the box's text and the search runs at once, with no debounce. With regex on, the text is escaped (`regex::escape`) first.
+  - A selection spanning lines is ignored, and the box keeps its text.
+- **Format JSON** moves from Ctrl+Shift+F to **Shift+Alt+F**. The menu label and palette row change to match.
+- **Ctrl+K no longer shows Search.** Its accelerator is removed.
+- **Palette:** "View: Show search" shows Ctrl+Shift+F. New palette rows cover the options, "Search: Toggle match case", "Search: Toggle whole word" and "Search: Toggle regular expression", with no accelerators. They toggle the Search view's options.
+- **With notes mode off,** Ctrl+Shift+F and Ctrl+Shift+H do nothing, as with the other sidebar commands (`CommandId::is_sidebar()`).
+
+## 6. Matching
+
+- **The phrase** is the query as typed, including its spaces. It is not trimmed, so a search for "` foo`" finds a leading space. A query that is entirely white space doesn't run.
+- **Plain mode**
+  - It searches for the substring.
+  - Without match case, both sides are folded one character at a time with `char::to_lowercase` when that gives a single character, and to themselves otherwise. Match offsets then map back to the original text one character for one. The folding is Unicode-aware for characters that fold to a single character (É/é, Ж/ж). Special cases like `ß` aren't treated as `ss`.
+- **Whole word**
+  - A match counts only if the characters just before and just after it are not word characters. Word characters are alphanumerics and `_`, by `char::is_alphanumeric`.
+  - In regex mode, the pattern is wrapped as `\b(?:…)\b`.
+- **Regex mode**
+  - It uses the `regex` crate, pinned as `=1.13.1` (the version already in the cargo registry), default features. The pattern is compiled with `RegexBuilder` and `case_insensitive(!case)`, using the crate's default size limit.
+  - The crate runs in linear time, so there is no catastrophic backtracking.
+- **Lines**
+  - Matching is per line: lines are split at `\n`, and a trailing `\r` is removed first. A match never spans lines.
+  - In regex mode, a pattern containing `\n` (literally, or the escape `\n`) is matched against the whole text instead.
+- **Empty matches** are rejected when the pattern is compiled, by testing whether it matches `""`.
+- **The same `Matcher`** is used by the Search worker and by 3b's replace. The find bar keeps Scintilla (§8).
+
+## 7. Search execution
+
+**The worker loop.** A search runs on a new `std::thread` per query and stops at the first of:
+- it has visited every note;
+- the cancel flag is set;
+- 500 notes have matched (the cap).
+
+For each note, in the library's note-list order:
+
+1. Skip the note, counting it by reason, if it is:
+   - `online_only` (it is never opened, so a search never recalls it);
+   - larger than **4 MB** (4,194,304 bytes, by the scan's size);
+   - not decodable by `file::encoding::decode` ("not text");
+   - unreadable, for any other I/O error.
+2. **Get the text:**
+   - If the path is in the overlay map (see Overlays below), use that text.
+   - Otherwise `std::fs::read` the note and `encoding::decode` it.
+3. **Find the first match.**
+   - If there is one, build the snippet: the matching line, cut to at most **40 characters before** the match and **80 characters after it**, measured in characters. An ellipsis `…` marks each cut, and leading white space is removed.
+   - The result is `TextHit { path, name, folder, snippet, highlight: Range<usize> }`, where `highlight` is a byte range within `snippet`.
+4. **Send a batch** to the UI when it holds 50 hits, or when 50 ms have passed since the last one, and when the search finishes. Each batch also carries the progress counts (visited, total, skipped by reason).
+5. Check the cancel flag between notes.
+
+**Overlays.**
+- When a search starts, the UI thread copies the text of every **dirty** tab whose path is inside the notebook, into `HashMap<PathBuf, String>` keyed by the path relative to the notebook.
+- Clean tabs are not copied, because the file on disk is the same text.
+- An untitled tab doesn't belong to the notebook and isn't searched.
+
+**The note list.**
+- It is copied at the start as `Vec<SearchNote { path, size, online_only }>`, about 1 MB for 10,000 notes.
+- The worker owns it and frees it at the end.
+- Nothing is kept between searches.
+
+**Narrowing.** In plain mode with the same options, if the new query contains the previous query, and the previous search finished without being cancelled or capped, the new search visits only the previous hits.
+
+**Scheduling: `src/window/text_search_host.rs`, owned by the window.**
+- It owns the current search: a generation number, an `Arc<AtomicBool>` cancel flag, and the 150 ms debounce timer (`SetTimer` on the panel, with the timer ID in `ids.rs`).
+- **Starting a search:**
+  - A keystroke in the box, or a toggle change, cancels the running search and restarts the debounce.
+  - When the timer fires, the host builds the overlays and the note copy, bumps the generation, and spawns the worker.
+  - A toggle change, or text arriving from Ctrl+Shift+F, starts the search at once, with no debounce.
+- **The worker posts** `WM_FASTPAD_TEXT_SEARCH_BATCH = WM_APP + 13` with a boxed `SearchBatch { generation, hits, progress, done }`.
+  - The handler frees the box, and drops the batch if its generation isn't the current one.
+  - If posting fails because the window is gone, the worker frees the box itself, as `spawn_load` does.
+- **Cancellation:** a new query, a notebook change or close, and window destruction all set the cancel flag.
+- **A library change** (`LIBRARY_READY`, or a save that adds or removes a note):
+  - If the Search view is showing a query, it runs again.
+  - If the view is hidden, the results are marked stale and run again when the view shows, as the sidebar spec's §16 note says.
+  - A save of a note that is already listed doesn't re-run the search.
+- **UI-thread work per batch:** a binary-search insert into the sorted result `Vec`, then one `InvalidateRect` if a visible row, the summary or the status changed. There is no disk access, and no step that grows with the notebook.
+
+## 8. The find bar
+
+- It gets the same three toggles, drawn and exposed the same way as in the Search box, with Alt+C, Alt+W and Alt+R while focus is in the find bar.
+- Scintilla still does the searching:
+
+  | Option | Scintilla flag |
+  |---|---|
+  | Match case | `SCFIND_MATCHCASE` |
+  | Whole word | `SCFIND_WHOLEWORD` |
+  | Regex | `SCFIND_REGEXP | SCFIND_CXX11REGEX` |
+
+  The flags are passed wherever `search_flags` is used today. This covers find next and previous, the match highlight and replace all in the editor.
+- **Regex dialect:** the find bar uses Scintilla's C++11 regex (ECMAScript), and Search uses Rust's `regex`. They agree on ordinary patterns: classes, `\d \w \s`, `^ $`, alternation, groups and quantifiers. They differ on things like lookaround, which Rust rejects and ECMAScript accepts. This is accepted, and documented here. An invalid pattern in the find bar shows the find bar's existing "no match" state.
+- **Opening a Search result:**
+  - The find bar opens in Find mode with the Search query and **Search's options**, which then become the find bar's options.
+  - It selects the first match at or after the start of the document, and scrolls it into view.
+  - Focus goes to the editor, so F3 and Shift+F3 step through the matches straight away.
+  - This works the same for preview and normal tabs.
+- **Options between the two:** each surface keeps its own options for the session. Only opening a result copies Search's options into the find bar.
+
+## 9. Code layout (3a)
+
+- **`src/search/mod.rs`, `src/search/matcher.rs`** (new, pure)
+  - `MatchOptions { case: bool, whole_word: bool, regex: bool }`
+  - `Matcher::new(&str, MatchOptions) -> Result<Matcher, PatternError>`
+  - `Matcher::first_in(&str) -> Option<Range<usize>>`
+  - `Matcher::find_iter`, used by 3b
+  - `PatternError` implements `Display` with the message shown under the box.
+- **`src/search/snippet.rs`** (new, pure): cutting the line and computing the highlight range.
+- **`src/library/text_search.rs`** (new, no Win32): `SearchNote`, `TextHit`, `SearchBatch`, `Progress`, `SkipReason`, and `run(notebook, notes, overlays, matcher, narrow, cancel, sink)`. It is tested over a scratch folder.
+- **`src/window/text_search_host.rs`** (new): the debounce, generation, spawning, the batch message and overlays. This keeps `library_host.rs` from growing past its current 2,200 lines.
+- **`src/window/search_view.rs`**
+  - It stops using `name_search`.
+  - It gets two-line rows, the toggle buttons in the field, the summary line, the pattern error and the status line.
+  - Its toggle buttons and summary are added to the panel's accessible children.
+- **`src/window/find_bar.rs`**: the toggle buttons, the flags, and `show_with(query, options)`.
+- **`src/window/menus.rs` and `commands.rs`**: Ctrl+Shift+F, Shift+Alt+F, Ctrl+K removed, and the three palette rows.
+- **`Cargo.toml`**: `regex = "=1.13.1"`.
+- **`src/library/name_search.rs`** stays for Ctrl+P. It keeps its unit tests and the `library-scan` bench's `name_search_ms` case, which keep it compiled and warning-free; nothing else changes in it.
+
+## 10. Accessibility (3a)
+
+- The toggles are check buttons (`ROLE_SYSTEM_CHECKBUTTON`, with the `STATE_SYSTEM_CHECKED` state), named "Match case", "Match whole word" and "Use regular expression".
+- Each result's accessible name is "<name>, <folder>: <snippet>".
+- The summary line and the status line send `EVENT_OBJECT_NAMECHANGE` when their text changes, at most once per second while a search runs.
+- This also closes the sidebar PR's known limitation: the search box itself becomes one of the panel's accessible children.
+
+## 3b — Replace across notes
+
+## 11. The replace UI
+
+- **Ctrl+Shift+H** (`ReplaceInNotes`) shows Search with the replace field open, and focuses the replace field. A chevron button left of the search box opens and closes the replace field, as in VS Code. Ctrl+Shift+F leaves the field as it is.
+- **The replace field** has the placeholder "Replace". In regex mode, `$1`, `${name}` and `$$` expand, using `regex::Captures::expand`. In plain mode the text is literal.
+- **Replace all** is a button at the right of the replace field, and Ctrl+Alt+Enter while focus is in either field. It replaces in every result. It's disabled while a search is running, and when there are no results.
+- **Per-row replace:** hovering over or selecting a result shows a replace button on the row. It replaces in that note only, and the row then disappears.
+- **Confirmation** (`modal::confirm`):
+  - Replace all asks "Replace N matches in M notes with "<text>"?". If any of those notes aren't open, the prompt adds "Notes that aren't open are saved and can't be undone."
+  - A per-row replace asks only if the note isn't open.
+  - N is counted exactly with `find_iter` on the worker before the prompt. It's a quick second pass over the result notes only.
+- **After replacing,** the query runs again, so the results show what still matches.
+
+## 12. How replace writes
+
+- **Open tabs** (clean or dirty):
+  - The replacement is applied in the editor as one undo action (`SCI_BEGINUNDOACTION` and `SCI_ENDUNDOACTION`), by replacing each match's range from the end of the document backwards.
+  - The ranges come from `Matcher` on the tab's current text, so they are the same as Search's.
+  - The tab becomes dirty and is **not saved**. Autosave handles it as it would any edit.
+- **Closed notes:**
+  - They are written on a worker, one at a time.
+  - Read the bytes and check the stamp (size and last-write time) against what the search read. The search worker records each hit's stamp in `TextHit`.
+  - Decode the text, replace every match, and encode it back with the file's original `Encoding`, including its BOM. Line endings are kept because the text was never normalised.
+  - Write with `file::saver::save_atomic`.
+  - **A stamp mismatch** skips the note and counts it as "changed since the search".
+  - **A write failure** skips the note and counts it with its error.
+  - **An online-only note** is never a hit, so it is never written.
+- **The report** afterwards is a notification: "Replaced N matches in M notes." It also names any notes that were skipped, for example "2 notes were skipped because they changed since the search", with the note names in the details.
+- **The library** hears about the writes as it does about any external change, through its rescan and reconcile. The writes are also marked FastPad's own, so they don't show as outside changes to tabs.
+
+## 13. Code layout (3b)
+
+- **`src/library/text_replace.rs`** (new, no Win32): `plan_replacements` counts matches, and `apply(notebook, targets, matcher, replacement, cancel) -> ReplaceReport` writes the files.
+- **`src/window/text_search_host.rs`**: running the replace, applying it to open tabs, and the report.
+- **`src/window/search_view.rs`**: the chevron, the replace field, the Replace all button and the per-row button.
+- **`commands.rs`, `menus.rs`**: `ReplaceInNotes` (Ctrl+Shift+H), and the palette row "Search: Replace in notes".
+
+## 14. Performance
+
+- **Startup:** there is no change. The search box, toggles and host state are created only when the Search view first shows a notebook, as today. `regex` is compiled only when a regex search runs.
+- **Typing:** a keystroke costs only the EDIT's own work and a timer reset. Nothing runs until the 150 ms debounce ends.
+- **Search**, with 10,000 notes of about 4 KB each and a warm OS cache, on the reference i5-4590:
+  - the first batch posted in **under 50 ms**;
+  - the whole search in **under 400 ms**.
+  - A cold cache or a network share is slower. Streaming keeps the first results early.
+- **UI thread:** handling one batch takes **under 2 ms**.
+- **Memory:** idle working set growth is **at most 0.5 MB** over the sidebar branch. During a search, memory is bounded by the note copy (about 1 MB), one file's text, the overlays, and 500 hits.
+- **Exe size:** the `regex` crate may add at most **1.5 MB** to the release exe. It is measured with the size bench and recorded in §16.
+- **When an index would be justified:** if the warm full search exceeds 400 ms on the reference machine for 10,000 notes, or users hit the cold case often. The worker interface (`run` with a sink) allows an index behind it later.
+- **Bench:** the `library-scan` bench gains `text_search_first_batch_ms`, `text_search_full_ms` and `text_search_batch_ui_ms`, over a generated 10,000-note notebook.
+
+## 15. Errors and edge cases
+
+- **The notebook is still loading:** the query waits and runs on `LIBRARY_READY`. The view shows "Loading…".
+- **A notebook change or close:** the search is cancelled, the results clear, and the query clears (sidebar spec §8).
+- **A tab gets dirty after the search started:** that search used the start-time text. The next keystroke or library change runs the search again. A result opened by then still lands correctly, because the find bar searches the live text.
+- **A note is deleted or renamed between search and open:** opening follows the existing missing-file path, which shows a notice and runs the search again.
+- **Very long lines:** the snippet is cut before painting, so painting never measures a long line.
+- **Many matches in one note** cost nothing extra: only the first match is found in 3a. 3b's count pass is limited to the result notes.
+- **FastPad closes during a search or replace:**
+  - The cancel flag is set when the window is destroyed.
+  - A replace in progress finishes the file it is writing. `save_atomic` writes a temporary file and renames it, so a file is never half-written. It then stops.
+- **Regex with a `\n`** is matched on the whole text. The snippet is the first line of the match.
+
+## 16. Testing
+
+- **Unit tests (pure):**
+  - `Matcher` for all eight option combinations.
+  - Folding for Unicode letters with a single-character lowercase.
+  - Whole word with `_`, digits and punctuation at both ends.
+  - Regex errors, and rejecting patterns that match empty text.
+  - Per-line matching, and whole-text matching for patterns with `\n`.
+  - Mapping offsets back after folding.
+  - Snippet cutting at both ends, leading white space, and multi-byte characters at the cut.
+- **`text_search::run` over a scratch folder:**
+  - Overlays take priority over the disk.
+  - Online-only, oversized, binary and unreadable files are counted.
+  - Cancelling stops the search promptly.
+  - Narrowing visits only the previous hits.
+  - The 500 cap marks the search as capped.
+  - Batches go out at 50 hits and at the 50 ms mark.
+  - Stamps are recorded.
+- **Window tests (`--test-threads=1`):**
+  - Ctrl+Shift+F with a single-line selection, a multi-line selection, and none.
+  - Typing and the debounce give sorted results. The selection is kept by path while batches arrive.
+  - Toggles by click, by Alt+C, Alt+W and Alt+R, and from the palette.
+  - The pattern-error line.
+  - Opening a result gives the find bar the query and options, selects the first match, and F3 moves on.
+  - Format JSON on Shift+Alt+F. Ctrl+K no longer does anything.
+  - With notes mode off, Ctrl+Shift+F does nothing.
+- **End-to-end tests** run the real exe with a scratch profile and a scratch notes folder: search, open, F3.
+- **3b:**
+  - Replace in an open tab, then undo it with a single Ctrl+Z.
+  - A closed note keeps its encoding and BOM (UTF-8, UTF-8 with BOM, UTF-16 LE) and its CRLF or LF line endings.
+  - A stamp mismatch skips the note and reports it.
+  - Declining the confirmation writes nothing.
+  - `$1` expansion.
+  - The per-row replace.
+  - A replace-all end-to-end test.
+- **Manual:**
+  - Narrator on the toggles, the results and the status line.
+  - High contrast.
+  - 150% and 200% scaling.
+- **All tests** use scratch profiles and scratch folders. None touch the real `%LOCALAPPDATA%\FastPad` or Documents.
+
+## 17. Implementation notes
+
+(Reserved for deviations recorded during implementation, as in the sidebar spec §16.)
