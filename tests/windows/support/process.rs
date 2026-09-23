@@ -320,6 +320,39 @@ pub fn wait_and_dismiss_dialog(process_id: u32, timeout: Duration) -> TestResult
     }
 }
 
+/// Waits for a dialog (window class `"#32770"`) over `process_id`'s windows, such as the Save As
+/// dialog, and cancels it with `IDCANCEL`. Returns once the dialog window is gone.
+#[cfg(windows)]
+pub fn wait_and_cancel_dialog(process_id: u32, timeout: Duration) -> TestResult<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDCANCEL;
+    let deadline = Deadline::after(timeout);
+    let mut cancelled: Option<HWND> = None;
+    loop {
+        if let Some(dialog) = cancelled
+            && unsafe { IsWindow(dialog) } == 0
+        {
+            return Ok(());
+        }
+        // Posted until it closes: a dialog still being built can drop an early IDCANCEL.
+        if let Some(dialog) = match cancelled {
+            Some(dialog) => Some(dialog),
+            None => find_unsaved_changes_dialog(process_id)?,
+        } {
+            unsafe {
+                PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
+            }
+            cancelled = Some(dialog);
+        }
+        if deadline.expired() {
+            return Err(match cancelled {
+                Some(_) => "timed out waiting for a cancelled dialog to close".into(),
+                None => "timed out waiting for a dialog to appear".into(),
+            });
+        }
+        deadline.sleep_step();
+    }
+}
+
 #[cfg(windows)]
 pub fn wait_for_process_exit(process_id: u32, timeout: Duration) -> TestResult<()> {
     let raw = unsafe {

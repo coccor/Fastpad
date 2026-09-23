@@ -13,12 +13,23 @@ enum Action {
         output: PathBuf,
         enforce_reference: bool,
         launch_file: Option<PathBuf>,
+        notes_folder: Option<PathBuf>,
     },
     Compare {
         baseline: PathBuf,
         candidate: PathBuf,
     },
+    LibraryScan {
+        folder: PathBuf,
+        count: Option<usize>,
+        enforce_reference: bool,
+    },
 }
+
+const USAGE: &str = "usage: fastpad-bench [--runs N] [--warmup N] [--output FILE] [--launch-file FILE] \
+                     [--notes-folder DIR] [--enforce-reference]\n       \
+                     fastpad-bench compare BASELINE.jsonl CANDIDATE.jsonl\n       \
+                     fastpad-bench library-scan DIR [--count N] [--enforce-reference]";
 
 fn parse_args<I, S>(args: I) -> Result<Action, String>
 where
@@ -35,19 +46,23 @@ where
             candidate: PathBuf::from(&args[2]),
         });
     }
+    if args.first().and_then(|arg| arg.to_str()) == Some("library-scan") {
+        return parse_library_scan(&args[1..]);
+    }
 
     let mut runs = 100_usize;
     let mut warmup = 10_usize;
     let mut output = PathBuf::from("benchmarks/latest.jsonl");
     let mut enforce_reference = false;
     let mut launch_file = None;
+    let mut notes_folder = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index]
             .to_str()
             .ok_or_else(|| "benchmark options must be valid Unicode".to_owned())?;
         match flag {
-            "--runs" | "--warmup" | "--output" | "--launch-file" => {
+            "--runs" | "--warmup" | "--output" | "--launch-file" | "--notes-folder" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| format!("missing value for {flag}"))?;
@@ -56,6 +71,7 @@ where
                     "--warmup" => warmup = parse_count(value, flag)?,
                     "--output" => output = PathBuf::from(value),
                     "--launch-file" => launch_file = Some(PathBuf::from(value)),
+                    "--notes-folder" => notes_folder = Some(PathBuf::from(value)),
                     _ => unreachable!(),
                 }
                 index += 2;
@@ -64,7 +80,9 @@ where
                 enforce_reference = true;
                 index += 1;
             }
-            _ => return Err(format!("unknown benchmark option: {flag}")),
+            _ => {
+                return Err(format!("unknown benchmark option: {flag}\n{USAGE}"));
+            }
         }
     }
     if runs == 0 {
@@ -76,6 +94,41 @@ where
         output,
         enforce_reference,
         launch_file,
+        notes_folder,
+    })
+}
+
+/// `library-scan DIR [--count N] [--enforce-reference]`, after the action name.
+fn parse_library_scan(args: &[OsString]) -> Result<Action, String> {
+    let (folder, options) = args.split_first().ok_or_else(|| USAGE.to_owned())?;
+    let mut count = None;
+    let mut enforce_reference = false;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].to_str() {
+            Some("--count") => {
+                let value = options
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --count".to_owned())?;
+                count = Some(parse_count(value, "--count")?);
+                index += 2;
+            }
+            Some("--enforce-reference") => {
+                enforce_reference = true;
+                index += 1;
+            }
+            _ => {
+                return Err(format!(
+                    "unknown library-scan option: {}\n{USAGE}",
+                    options[index].to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(Action::LibraryScan {
+        folder: PathBuf::from(folder),
+        count,
+        enforce_reference,
     })
 }
 
@@ -180,17 +233,24 @@ fn run_main() -> Result<i32, String> {
             output,
             enforce_reference,
             launch_file,
+            notes_folder,
         } => run_distribution(
             runs,
             warmup,
             &output,
             enforce_reference,
             launch_file.as_deref(),
+            notes_folder.as_deref(),
         ),
         Action::Compare {
             baseline,
             candidate,
         } => compare_distributions(&baseline, &candidate),
+        Action::LibraryScan {
+            folder,
+            count,
+            enforce_reference,
+        } => run_library_scan(&folder, count, enforce_reference),
     }
 }
 
@@ -200,6 +260,7 @@ fn run_distribution(
     output: &Path,
     enforce_reference: bool,
     launch_file: Option<&Path>,
+    notes_folder: Option<&Path>,
 ) -> Result<i32, String> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -213,7 +274,7 @@ fn run_distribution(
     let mut records = Vec::with_capacity(runs);
 
     for index in 0..warmup + runs {
-        let record = run_once(launch_file)?;
+        let record = run_once(launch_file, notes_folder)?;
         if index >= warmup {
             use std::io::Write;
             writeln!(writer, "{}", record_to_json_line(&record))
@@ -241,6 +302,127 @@ fn run_distribution(
         return Ok(2);
     }
     Ok(0)
+}
+
+/// Favorite records written into a generated library, spread evenly over its notes.
+const LIBRARY_SCAN_FAVORITES: usize = 200;
+const LIBRARY_SCAN_WARM_LOADS: usize = 5;
+/// The warm-load median must stay below this on the reference machine.
+const LIBRARY_SCAN_REFERENCE_MS: f64 = 500.0;
+
+/// Times one cold and several warm `library::load` calls of `folder`, first generating `count`
+/// notes and a `library.ini` into it when asked.
+fn run_library_scan(
+    folder: &Path,
+    count: Option<usize>,
+    enforce_reference: bool,
+) -> Result<i32, String> {
+    if let Some(count) = count {
+        create_library_fixture(folder, count)?;
+    }
+    let local = ScratchFile(
+        std::env::temp_dir().join(format!("fastpad-bench-library-{}.ini", std::process::id())),
+    );
+    let _ = std::fs::remove_file(&local.0);
+
+    let load = || {
+        let started = std::time::Instant::now();
+        let state = fastpad::library::load(folder, &local.0, fastpad::library::now_unix())
+            .map_err(|error| format!("could not load {}: {error}", folder.display()))?;
+        Ok::<_, String>((state, started.elapsed().as_secs_f64() * 1_000.0))
+    };
+    let (state, cold_ms) = load()?;
+    // What the window does after installing a load, so the warm loads find the per-PC cache.
+    fastpad::library::write_local(&state);
+    let mut warm_ms = Vec::with_capacity(LIBRARY_SCAN_WARM_LOADS);
+    for _ in 0..LIBRARY_SCAN_WARM_LOADS {
+        warm_ms.push(load()?.1);
+    }
+    warm_ms.sort_by(f64::total_cmp);
+    let warm_median_ms = warm_ms[warm_ms.len() / 2];
+    let index_bytes = state
+        .notes
+        .iter()
+        .map(|note| {
+            note.path.as_os_str().len() * 2 + std::mem::size_of::<fastpad::library::NoteEntry>()
+        })
+        .sum::<usize>();
+
+    println!("notes={}", state.notes.len());
+    println!("cold_ms={cold_ms:.1}");
+    println!("warm_median_ms={warm_median_ms:.1}");
+    println!("index_bytes~{index_bytes}");
+    if enforce_reference && warm_median_ms >= LIBRARY_SCAN_REFERENCE_MS {
+        eprintln!("reference threshold failed: library-scan warm median={warm_median_ms:.1}ms");
+        return Ok(2);
+    }
+    Ok(0)
+}
+
+/// Writes `count` notes as `batch{i / 500}\note{i}.md`, about 200 bytes each, and a
+/// `.fastpad\library.ini` with favorite records spread across them.
+fn create_library_fixture(folder: &Path, count: usize) -> Result<(), String> {
+    use fastpad::library::ids::{IdSource, NoteId, fnv1a};
+    use fastpad::library::model::{Library, NoteRef};
+    use fastpad::library::ops::{PendingOp, apply};
+
+    let relative = |index: usize| PathBuf::from(format!(r"batch{}\note{index}.md", index / 500));
+    let text = |index: usize| {
+        let mut text = format!("# Note {index}\r\n\r\n");
+        while text.len() < 200 {
+            text.push_str("The quick brown fox jumps over the lazy dog. ");
+        }
+        text.truncate(200);
+        text
+    };
+    for index in 0..count {
+        let path = folder.join(relative(index));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(&path, text(index))
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    }
+
+    let mut library = Library::default();
+    let mut ids = IdSource::new(fastpad::library::now_unix(), std::process::id());
+    let favorites = LIBRARY_SCAN_FAVORITES.min(count);
+    for favorite in 0..favorites {
+        let index = favorite * count / favorites;
+        let note = NoteRef {
+            id: NoteId(ids.next()),
+            path: relative(index),
+        };
+        let content = text(index);
+        for op in [
+            PendingOp::SetFavorite {
+                note: note.clone(),
+                value: true,
+            },
+            PendingOp::SetFingerprint {
+                note,
+                size: content.len() as u64,
+                hash: fnv1a(content.as_bytes()),
+            },
+        ] {
+            apply(&mut library, &op)
+                .map_err(|error| format!("could not build library.ini: {error}"))?;
+        }
+    }
+    let path = fastpad::library::store::library_file(folder);
+    fastpad::library::store::write(&path, &library)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    Ok(())
+}
+
+/// A scratch file removed on drop, including on an early `?` return.
+struct ScratchFile(PathBuf);
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn print_distribution(records: &[BenchmarkRecord]) {
@@ -375,7 +557,10 @@ fn record_from_json(value: &serde_json::Value) -> Result<BenchmarkRecord, String
 }
 
 #[cfg(not(windows))]
-fn run_once(_launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
+fn run_once(
+    _launch_file: Option<&Path>,
+    _notes_folder: Option<&Path>,
+) -> Result<BenchmarkRecord, String> {
     Err("the startup benchmark requires Windows".to_owned())
 }
 
@@ -501,7 +686,10 @@ impl Drop for ProcThreadAttributeList {
 }
 
 #[cfg(windows)]
-fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
+fn run_once(
+    launch_file: Option<&Path>,
+    notes_folder: Option<&Path>,
+) -> Result<BenchmarkRecord, String> {
     use fastpad::perf::protocol::{
         BENCHMARK_INPUT_CHAR, BENCHMARK_SHARED_FRAME_LEN, EVENT_HANDLE_ENV, MAPPING_HANDLE_ENV,
         QPC_ORIGIN_ENV,
@@ -540,6 +728,9 @@ fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
     // Each run gets its own scratch profile so the benchmark never reads or writes real user data
     // and never carries a session manifest from one run into the next.
     let local_app_data = ScratchLocalAppData::create(&unique)?;
+    if let Some(folder) = notes_folder {
+        local_app_data.remember_notes_folder(folder)?;
+    }
     let mapping_name = wide_null(&format!("Local\\FastPadBenchMapping-{unique}"));
     let event_name = wide_null(&format!("Local\\FastPadBenchEvent-{unique}"));
     let security = SECURITY_ATTRIBUTES {
@@ -784,6 +975,18 @@ impl ScratchLocalAppData {
 
     fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// Writes `FastPad\folders.ini` naming `folder`, so the launch opens it as its library.
+    fn remember_notes_folder(&self, folder: &Path) -> Result<(), String> {
+        let folder = std::path::absolute(folder)
+            .map_err(|error| format!("could not resolve {}: {error}", folder.display()))?;
+        let recent = fastpad::library::local::RecentFolders {
+            folders: vec![folder],
+        };
+        let path = fastpad::library::local::folders_file(&self.0.join("FastPad"));
+        std::fs::write(&path, recent.encode())
+            .map_err(|error| format!("could not write {}: {error}", path.display()))
     }
 }
 
@@ -1361,6 +1564,7 @@ mod tests {
                 output: PathBuf::from("sample.jsonl"),
                 enforce_reference: true,
                 launch_file: None,
+                notes_folder: None,
             }
         );
         assert!(matches!(
@@ -1374,6 +1578,42 @@ mod tests {
                 candidate: PathBuf::from("candidate.jsonl"),
             }
         );
+    }
+
+    #[test]
+    fn command_line_supports_the_notes_folder_and_library_scan() {
+        // Break caught: dropping --notes-folder measures TTI without a library, or reading the
+        // library-scan folder as a run option benchmarks the wrong thing.
+        assert!(matches!(
+            parse_args(["--runs", "3", "--notes-folder", r"C:\notes"]).unwrap(),
+            Action::Run { runs: 3, notes_folder: Some(path), .. } if path == std::path::Path::new(r"C:\notes")
+        ));
+        assert_eq!(
+            parse_args(["library-scan", r"C:\notes"]).unwrap(),
+            Action::LibraryScan {
+                folder: PathBuf::from(r"C:\notes"),
+                count: None,
+                enforce_reference: false,
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "library-scan",
+                r"C:\notes",
+                "--count",
+                "10000",
+                "--enforce-reference"
+            ])
+            .unwrap(),
+            Action::LibraryScan {
+                folder: PathBuf::from(r"C:\notes"),
+                count: Some(10_000),
+                enforce_reference: true,
+            }
+        );
+        assert!(parse_args(["library-scan"]).is_err());
+        assert!(parse_args(["library-scan", r"C:\notes", "--count"]).is_err());
+        assert!(parse_args(["library-scan", r"C:\notes", "--runs", "3"]).is_err());
     }
 
     #[test]
