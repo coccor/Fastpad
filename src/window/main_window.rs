@@ -5835,6 +5835,17 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_reads_multi_byte_utf8_lines_without_their_line_endings() {
+        // Break caught: a byte-length-based line reader splitting or corrupting a multi-byte
+        // UTF-8 character at the line boundary instead of returning the line whole.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("h\u{e9}llo \u{1f600}\r\nsecond").unwrap();
+        assert_eq!(editor.line_text(0).unwrap(), "h\u{e9}llo \u{1f600}");
+    }
+
+    #[test]
     fn create_context_drops_untransferred_value_on_pre_window_failure() {
         // Break caught: bootstrap manually reclaiming a create-time App allocation is unsafe once
         // ownership can also transfer through WM_NCCREATE.

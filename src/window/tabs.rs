@@ -403,19 +403,20 @@ impl Tabs {
         self.active().map(|document| &document.handle)
     }
 
-    /// Renames the active document's path, e.g. after a successful Save As write. Rejects the
-    /// rename if `path` canonicalizes to the same file another open tab already owns, preserving
-    /// Task 9's one-native-document-per-canonical-path invariant. A `path` that does not yet exist
-    /// on disk (the common brand-new Save As destination) cannot collide with any already-open
-    /// document, so it is accepted without a canonicalization check.
-    pub(crate) fn set_active_path(&mut self, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
-        let active = self.active_index();
-        if active >= self.documents.len() {
-            return Err(DuplicateDocumentPath(path));
-        }
+    /// Rejects `path` if it canonicalizes to the same file another open tab (any document other
+    /// than the one at `exclude`) already owns, preserving Task 9's
+    /// one-native-document-per-canonical-path invariant. A `path` that does not yet exist on disk
+    /// (the common brand-new Save As destination) cannot collide with any already-open document,
+    /// so it is returned unchanged without a canonicalization check. Shared by `set_active_path`
+    /// and `rebind_path`.
+    fn reject_path_collision(
+        &self,
+        exclude: usize,
+        path: PathBuf,
+    ) -> Result<PathBuf, DuplicateDocumentPath> {
         if let Ok(candidate) = canonical_key(&path) {
             let collides = self.documents.iter().enumerate().any(|(index, existing)| {
-                index != active
+                index != exclude
                     && existing
                         .path
                         .as_deref()
@@ -426,32 +427,32 @@ impl Tabs {
                 return Err(DuplicateDocumentPath(candidate));
             }
         }
+        Ok(path)
+    }
+
+    /// Renames the active document's path, e.g. after a successful Save As write. Rejects the
+    /// rename if `path` canonicalizes to the same file another open tab already owns; see
+    /// `reject_path_collision`.
+    pub(crate) fn set_active_path(&mut self, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
+        let active = self.active_index();
+        if active >= self.documents.len() {
+            return Err(DuplicateDocumentPath(path));
+        }
+        let path = self.reject_path_collision(active, path)?;
         self.documents[active].path = Some(path);
         self.view.update(&self.documents);
         Ok(())
     }
 
     /// Rebinds `id`'s path, e.g. after a note is renamed on disk or moved between folders.
-    /// Rejects the path if it canonicalizes to the same file another open tab already owns
-    /// (mirroring `set_active_path`'s one-native-document-per-canonical-path invariant), and
-    /// updates the tab view so the tab strip and accessibility see the new title.
+    /// Rejects the path if it canonicalizes to the same file another open tab already owns; see
+    /// `reject_path_collision`. Updates the tab view so the tab strip and accessibility see the
+    /// new title.
     pub fn rebind_path(&mut self, id: DocumentId, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
         let Some(index) = self.documents.iter().position(|document| document.id == id) else {
             return Err(DuplicateDocumentPath(path));
         };
-        if let Ok(candidate) = canonical_key(&path) {
-            let collides = self.documents.iter().enumerate().any(|(other, existing)| {
-                other != index
-                    && existing
-                        .path
-                        .as_deref()
-                        .and_then(|existing_path| canonical_key(existing_path).ok())
-                        .is_some_and(|existing_candidate| existing_candidate == candidate)
-            });
-            if collides {
-                return Err(DuplicateDocumentPath(candidate));
-            }
-        }
+        let path = self.reject_path_collision(index, path)?;
         self.documents[index].path = Some(path);
         self.view.update(&self.documents);
         Ok(())
