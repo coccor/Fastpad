@@ -1,4 +1,4 @@
-use super::defaults::default_settings;
+use super::defaults::{clamp_sidebar_width, default_settings};
 use crate::Result;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +24,37 @@ impl ThemePreference {
     }
 }
 
+/// Which view the side panel shows. `Hidden` means the panel is closed; the activity bar still
+/// shows while notes mode is on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SidebarView {
+    #[default]
+    Notebook,
+    Search,
+    Favorites,
+    Hidden,
+}
+
+impl SidebarView {
+    const ALL: [Self; 4] = [Self::Notebook, Self::Search, Self::Favorites, Self::Hidden];
+
+    /// The `sidebar_view=` value that parses back to this view.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Notebook => "notebook",
+            Self::Search => "search",
+            Self::Favorites => "favorites",
+            Self::Hidden => "none",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|view| value.eq_ignore_ascii_case(view.token()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub font_face: String,
@@ -38,6 +69,11 @@ pub struct Settings {
     /// Whether an open folder is treated as a note library (sidebar data, autosave, first-save
     /// naming).
     pub notes_mode: bool,
+    /// The side panel's view, or `Hidden` when it is closed. Saved when the view changes.
+    pub sidebar_view: SidebarView,
+    /// The side panel's width in 96-DPI pixels, within `MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH`.
+    /// Saved when a resize drag ends.
+    pub sidebar_width: u16,
 }
 
 impl Settings {
@@ -72,6 +108,12 @@ impl Settings {
         if let Some(notes_mode) = delta.notes_mode {
             self.notes_mode = notes_mode;
         }
+        if let Some(sidebar_view) = delta.sidebar_view {
+            self.sidebar_view = sidebar_view;
+        }
+        if let Some(sidebar_width) = delta.sidebar_width {
+            self.sidebar_width = sidebar_width;
+        }
     }
 }
 
@@ -99,16 +141,20 @@ pub struct SettingsDelta {
     pub recovery_interval_seconds: Option<u32>,
     pub restore_session: Option<bool>,
     pub notes_mode: Option<bool>,
+    pub sidebar_view: Option<SidebarView>,
+    pub sidebar_width: Option<u16>,
     pub warnings: Vec<SettingWarning>,
 }
 
 /// Parses a hand-written, tolerant `.ini`-style settings source: one `key=value` pair per line: ASCII
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
-/// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, and `notes_mode` are
-/// recognized. Every line is handled independently: a line with an unknown key, a value that fails
-/// to parse, or no `=` at all records one `SettingWarning` and is otherwise skipped — it never
-/// discards, and is never affected by, any other line's outcome.
+/// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
+/// `sidebar_view` and `sidebar_width` are recognized. `sidebar_view` is `notebook`, `search`,
+/// `favorites` or `none` (any case); `sidebar_width` is an unsigned integer in 96-DPI pixels,
+/// pulled into 180–480 when it is outside. Every line is handled independently: a line with an
+/// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
+/// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
     let mut delta = SettingsDelta::default();
     // An editor that saves fastpad.ini with a UTF-8 BOM must not hide its first setting.
@@ -171,6 +217,15 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         "notes_mode" => match parse_bool(value) {
             Some(notes_mode) => delta.notes_mode = Some(notes_mode),
             None => warn(delta, line_number, key, value),
+        },
+        "sidebar_view" => match SidebarView::parse(value) {
+            Some(view) => delta.sidebar_view = Some(view),
+            None => warn(delta, line_number, key, value),
+        },
+        // A hand-edited width outside the range is pulled into it rather than rejected.
+        "sidebar_width" => match value.parse::<u16>() {
+            Ok(width) => delta.sidebar_width = Some(clamp_sidebar_width(width)),
+            Err(_) => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
             line: line_number,
@@ -597,6 +652,75 @@ mod tests {
         let (settings, warnings) = load_from_path(&path);
         assert_eq!(settings, default_settings());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn sidebar_view_accepts_its_four_tokens_and_warns_on_anything_else() {
+        // Break caught: a hand-edited "sidebar_view=Search" ignored, or a typo silently closing
+        // the panel.
+        for (value, view) in [
+            ("notebook", SidebarView::Notebook),
+            ("Search", SidebarView::Search),
+            ("FAVORITES", SidebarView::Favorites),
+            ("none", SidebarView::Hidden),
+        ] {
+            assert_eq!(
+                parse(&format!("sidebar_view={value}")).sidebar_view,
+                Some(view)
+            );
+        }
+        let delta = parse("sidebar_view=hidden");
+        assert_eq!(delta.sidebar_view, None);
+        assert_eq!(delta.warnings.len(), 1);
+    }
+
+    #[test]
+    fn every_sidebar_view_writes_the_token_that_parses_back_to_it() {
+        for view in [
+            SidebarView::Notebook,
+            SidebarView::Search,
+            SidebarView::Favorites,
+            SidebarView::Hidden,
+        ] {
+            assert_eq!(
+                parse(&format!("sidebar_view={}", view.token())).sidebar_view,
+                Some(view)
+            );
+        }
+        assert_eq!(SidebarView::Hidden.token(), "none");
+    }
+
+    #[test]
+    fn sidebar_width_is_pulled_into_its_range_and_warns_when_not_a_number() {
+        // Break caught: a hand-edited sidebar_width=5000 leaving no room for the editor, 0
+        // hiding a panel that reads as open, or a typo discarding the other settings.
+        assert_eq!(parse("sidebar_width=300").sidebar_width, Some(300));
+        assert_eq!(parse("sidebar_width=0").sidebar_width, Some(180));
+        let wide = parse("sidebar_width=5000");
+        assert_eq!(wide.sidebar_width, Some(480));
+        assert!(wide.warnings.is_empty());
+        let delta = parse("sidebar_width=-20\nsidebar_width=wide\nfont_size=12");
+        assert_eq!(delta.sidebar_width, None);
+        assert_eq!(delta.warnings.len(), 2);
+        assert_eq!(delta.font_size, Some(12));
+    }
+
+    #[test]
+    fn sidebar_settings_default_to_the_notebook_view_at_260_pixels_and_apply_from_a_delta() {
+        let mut settings = default_settings();
+        assert_eq!(settings.sidebar_view, SidebarView::Notebook);
+        assert_eq!(settings.sidebar_width, 260);
+        settings.apply_delta(&parse("sidebar_view=none\nsidebar_width=200"));
+        assert_eq!(
+            (settings.sidebar_view, settings.sidebar_width),
+            (SidebarView::Hidden, 200)
+        );
+        settings.apply_delta(&parse("font_size=12"));
+        assert_eq!(
+            settings.sidebar_view,
+            SidebarView::Hidden,
+            "absent keys keep theirs"
+        );
     }
 
     #[test]
