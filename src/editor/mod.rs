@@ -1,3 +1,4 @@
+pub mod file_drop;
 pub mod input_filter;
 pub mod scintilla;
 pub mod scintilla_constants;

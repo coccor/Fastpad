@@ -30,6 +30,8 @@ pub(crate) struct LibraryHost {
     )]
     pub(crate) ids: IdSource,
     notified: Option<PathBuf>,
+    /// The folders the open recent-folder picker lists, in its row order.
+    shown_recent_folders: Vec<PathBuf>,
 }
 
 impl LibraryHost {
@@ -44,6 +46,7 @@ impl LibraryHost {
             inactive_since: None,
             ids: IdSource::new(process_start, std::process::id()),
             notified: None,
+            shown_recent_folders: Vec::new(),
         }
     }
 }
@@ -308,22 +311,24 @@ pub(crate) fn schedule_write(hwnd: HWND) {
 
 /// Writes pending metadata now (timer, folder switch, close).
 pub(crate) fn flush_now(hwnd: HWND) {
-    unsafe {
-        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
-    }
-    let Some(result) = with_state(hwnd, |state| {
-        let result = library::flush(state);
-        library::write_local(state);
-        result
-    }) else {
-        return;
-    };
-    if let Err(error) = result {
+    if let Err(error) = try_flush(hwnd) {
         push_notice(
             hwnd,
             format!("FastPad could not save this folder's notebooks and tags: {error}"),
         );
     }
+}
+
+fn try_flush(hwnd: HWND) -> crate::Result<()> {
+    unsafe {
+        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
+    }
+    with_state(hwnd, |state| {
+        let result = library::flush(state);
+        library::write_local(state);
+        result.map(|_| ())
+    })
+    .unwrap_or(Ok(()))
 }
 
 /// Opens `path` as the library, flushing the current one first. Open tabs stay open.
@@ -343,7 +348,17 @@ pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
         push_notice(hwnd, format!("{} is not a folder.", path.display()));
         return;
     }
-    flush_now(hwnd);
+    // Switching would drop the unsaved notebooks and tags, so a failed write keeps the old folder.
+    if let Err(error) = try_flush(hwnd) {
+        schedule_write(hwnd);
+        push_notice(
+            hwnd,
+            format!(
+                "FastPad kept this folder open because it could not save its notebooks and tags: {error}"
+            ),
+        );
+        return;
+    }
     host(hwnd, |host| {
         host.state = None;
         host.folder = Some(path.clone());
@@ -388,31 +403,58 @@ pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
         );
         return;
     }
+    let items = folders.iter().map(|f| f.display().to_string()).collect();
+    host(hwnd, |host| host.shown_recent_folders = folders);
     super::main_window::open_picker(
         hwnd,
         Picker {
             kind: PickerKind::RecentFolder,
-            items: folders.iter().map(|f| f.display().to_string()).collect(),
+            items,
             create: None,
         },
     );
 }
 
-/// Dropped folders open as the library (the last one wins); dropped files open as tabs.
-pub(crate) fn files_dropped(hwnd: HWND, drop: windows_sys::Win32::UI::Shell::HDROP) {
-    use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW};
-    let count = unsafe { DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0) };
-    let mut paths = Vec::new();
-    for index in 0..count {
-        let length = unsafe { DragQueryFileW(drop, index, std::ptr::null_mut(), 0) } as usize;
-        let mut buffer = vec![0_u16; length + 1];
-        unsafe { DragQueryFileW(drop, index, buffer.as_mut_ptr(), buffer.len() as u32) };
-        buffer.truncate(length);
-        paths.push(PathBuf::from(
-            <std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&buffer),
-        ));
+/// Scintilla's own OLE drop target refuses files and wins over `WM_DROPFILES`, so the editor gets
+/// a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`. Runs in `BUILD_CHROME`.
+pub(crate) fn accept_editor_file_drops(hwnd: HWND) {
+    let Some(editor) = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.editor.as_ref().map(|e| e.hwnd()))
+    else {
+        return;
+    };
+    let target = hwnd as isize;
+    // Text drag-and-drop still works without the wrapper; only file drops on the editor are lost.
+    let _ = crate::editor::file_drop::accept_file_drops(editor, move |paths| {
+        let payload = Box::into_raw(Box::new(paths));
+        if unsafe {
+            PostMessageW(
+                target as HWND,
+                crate::window::WM_FASTPAD_FILES_DROPPED,
+                0,
+                payload as isize,
+            )
+        } == 0
+        {
+            drop(unsafe { Box::from_raw(payload) });
+        }
+    });
+}
+
+/// `WM_FASTPAD_FILES_DROPPED`: frees the posted paths and opens them. A drop that lands while a
+/// modal dialog runs is ignored, as `WM_DROPFILES` is for a disabled window.
+pub(crate) fn editor_files_dropped(hwnd: HWND, lparam: LPARAM) {
+    if lparam == 0 {
+        return;
     }
-    unsafe { DragFinish(drop) };
+    let paths = *unsafe { Box::from_raw(lparam as *mut Vec<PathBuf>) };
+    if !super::modal::modal_active(hwnd) {
+        files_dropped(hwnd, paths);
+    }
+}
+
+/// Dropped folders open as the library (the last one wins); dropped files open as tabs.
+pub(crate) fn files_dropped(hwnd: HWND, paths: Vec<PathBuf>) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
@@ -427,7 +469,9 @@ pub(crate) fn files_dropped(hwnd: HWND, drop: windows_sys::Win32::UI::Shell::HDR
             super::main_window::report_open_failure(hwnd, &path, &error);
         }
     }
-    if let Some(folder) = folder {
+    if let Some(folder) = folder
+        && identity.is_live_for(hwnd)
+    {
         open_folder(hwnd, &folder);
     }
 }
@@ -487,7 +531,8 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
     )]
     match (kind, choice) {
         (PickerKind::RecentFolder, PickerChoice::Item(index)) => {
-            if let Some(folder) = recent_folders(hwnd).get(index) {
+            let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
+            if let Some(folder) = shown.unwrap_or_default().get(index) {
                 open_folder(hwnd, folder);
             }
         }

@@ -14,6 +14,9 @@ pub const WM_FASTPAD_RESTORE_SESSION: u32 = WM_APP + 8;
 pub const WM_FASTPAD_OPEN_LIBRARY: u32 = WM_APP + 9;
 // Not part of the deferred chain: the library worker's result, as a `Box` the receiver frees.
 pub const WM_FASTPAD_LIBRARY_READY: u32 = WM_APP + 10;
+// Not part of the deferred chain: files dropped on the editor, as a `Box<Vec<PathBuf>>` the
+// receiver frees. Posted so the drag source is not kept waiting while the files open.
+pub const WM_FASTPAD_FILES_DROPPED: u32 = WM_APP + 11;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.

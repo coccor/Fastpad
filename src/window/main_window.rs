@@ -244,10 +244,10 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_DROPFILES => {
-            crate::window::library_host::files_dropped(
-                hwnd,
-                wparam as windows_sys::Win32::UI::Shell::HDROP,
-            );
+            let drop = wparam as windows_sys::Win32::UI::Shell::HDROP;
+            let paths = crate::platform::win32::dropped_paths(drop);
+            unsafe { windows_sys::Win32::UI::Shell::DragFinish(drop) };
+            crate::window::library_host::files_dropped(hwnd, paths);
             0
         }
         WM_ACTIVATEAPP => {
@@ -593,6 +593,10 @@ unsafe extern "system" fn main_window_proc(
             // The worker's boxed result: handled at once, since a held message would lose it.
             if message == crate::window::WM_FASTPAD_LIBRARY_READY {
                 crate::window::library_host::library_ready(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_FILES_DROPPED {
+                crate::window::library_host::editor_files_dropped(hwnd, lparam);
                 return 0;
             }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
@@ -2008,6 +2012,7 @@ fn build_chrome(hwnd: HWND) {
         windows_sys::Win32::UI::Shell::DragAcceptFiles(hwnd, 1);
         InvalidateRect(hwnd, std::ptr::null(), 1);
     }
+    crate::window::library_host::accept_editor_file_drops(hwnd);
 }
 
 /// Re-queries the system theme after chrome exists and restyles the editor only on a real change.
@@ -6785,6 +6790,131 @@ mod tests {
                 .any(|n| n.contains("is not a folder"))
         );
         assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    }
+
+    #[test]
+    fn a_failed_flush_keeps_the_current_folder_open() {
+        // Break caught: switching folders after library.ini could not be written, which drops
+        // the unsaved notebooks and tags with the old state.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("flushfail-a");
+        let second = LibraryScratch::new("flushfail-b");
+        let a = first.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        first.install(window.hwnd);
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            let mut ids = crate::library::ids::IdSource::new(1, 1);
+            let target = state.note_ref(&mut ids, &a);
+            state
+                .apply(crate::library::ops::PendingOp::SetPinned {
+                    note: target,
+                    value: true,
+                })
+                .unwrap();
+        });
+        // A file where the .fastpad directory belongs makes the write fail.
+        std::fs::write(first.folder().join(".fastpad"), "not a directory").unwrap();
+
+        crate::window::library_host::open_folder(window.hwnd, &second.folder());
+
+        assert_eq!(
+            crate::window::library_host::folder(window.hwnd),
+            Some(first.folder())
+        );
+        assert!(app_mut(window.hwnd).library.state.is_some());
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("kept this folder open")),
+            "{:?}",
+            notices(window.hwnd)
+        );
+        let recent = crate::library::local::read_folders(&crate::library::local::folders_file(
+            &first.data(),
+        ));
+        assert!(!recent.folders.contains(&second.folder()));
+    }
+
+    #[test]
+    fn a_recent_folder_pick_opens_the_row_that_was_shown() {
+        // Break caught: resolving the chosen row against folders.ini re-read after the picker
+        // opened, which opens a different folder when another window changed the list.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("recent-a");
+        let second = LibraryScratch::new("recent-b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        let folders_file = crate::library::local::folders_file(&first.data());
+        let write = |order: Vec<std::path::PathBuf>| {
+            crate::library::local::write_folders(
+                &folders_file,
+                &crate::library::local::RecentFolders { folders: order },
+            )
+            .unwrap();
+        };
+        write(vec![first.folder(), second.folder()]);
+        execute_command(window.hwnd, CommandId::OpenRecentFolder);
+        write(vec![second.folder(), first.folder()]);
+
+        crate::window::library_host::picked(
+            window.hwnd,
+            crate::window::command_palette::PickerKind::RecentFolder,
+            crate::window::command_palette::PickerChoice::Item(0),
+        );
+
+        assert_eq!(
+            crate::window::library_host::folder(window.hwnd),
+            Some(first.folder())
+        );
+        pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    }
+
+    #[test]
+    fn a_launch_argument_naming_a_folder_is_not_reported_as_a_failed_open() {
+        // Break caught: `fastpad D:\Notes` opening the folder as the library and then also
+        // trying to open it as a file, which reports "could not open".
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("launch-dir");
+        let mut app = make_app();
+        app.launch.request = crate::launch::LaunchRequest::Open(scratch.folder().into_os_string());
+        let window = ProductionWindow::new(app);
+        let _editor = install_test_editor(&window);
+        let tabs = super::tab_count(window.hwnd);
+
+        unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0) };
+
+        assert!(
+            !notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("could not open")),
+            "{:?}",
+            notices(window.hwnd)
+        );
+        assert_eq!(super::tab_count(window.hwnd), tabs);
+    }
+
+    #[test]
+    fn files_dropped_on_the_editor_reach_the_drop_handler() {
+        // Break caught: Scintilla's own OLE drop target refusing Explorer's files, so a drop on
+        // the editor (most of the window) did nothing.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editor-drop");
+        let note = scratch.note("dropped.md", "dropped");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        crate::window::library_host::accept_editor_file_drops(window.hwnd);
+
+        let effects =
+            crate::editor::file_drop::test_support::drag_and_drop(editor.hwnd(), &[&note]);
+
+        assert_eq!(
+            effects,
+            [windows_sys::Win32::System::Ole::DROPEFFECT_COPY; 3]
+        );
+        pump_until(window.hwnd, || editor.text().unwrap() == "dropped");
     }
 
     #[test]
