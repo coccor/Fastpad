@@ -6,5 +6,6 @@ pub mod ids;
 pub mod local;
 pub mod model;
 pub mod ops;
+pub mod scan;
 pub mod store;
 pub mod title;
