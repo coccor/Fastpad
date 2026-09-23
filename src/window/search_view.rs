@@ -846,6 +846,55 @@ pub(crate) fn edit_hwnd(hwnd: HWND) -> Option<HWND> {
     with_view(hwnd, |view| view.edit)
 }
 
+impl crate::window::sidebar_accessibility::AccessibleView for SearchView {
+    /// One list item per result. The search box is a real `Edit` with its own MSAA object.
+    fn accessible_count(&self, _client: RECT, _dpi: u32) -> usize {
+        self.results.len()
+    }
+
+    fn accessible_item(
+        &self,
+        index: usize,
+        client: RECT,
+        dpi: u32,
+        focused: bool,
+    ) -> Option<crate::window::sidebar_accessibility::AccessibleItem> {
+        let result = self.results.get(index)?;
+        let (rect, visible) = crate::window::sidebar_accessibility::row_rect(
+            self.list_area(client, dpi),
+            &self.list,
+            index,
+        );
+        let name = if result.folder.is_empty() {
+            result.name.clone()
+        } else {
+            format!("{}, {}", result.name, result.folder)
+        };
+        Some(crate::window::sidebar_accessibility::list_item(
+            &name,
+            self.list.selected == Some(index),
+            focused,
+            rect,
+            visible,
+        ))
+    }
+
+    fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
+        self.row_under(point, client, dpi)
+    }
+
+    fn accessible_current(&self, _client: RECT, _dpi: u32) -> Option<usize> {
+        self.list.selected
+    }
+
+    fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
+        if index < self.results.len() {
+            let area = self.list_area(client, dpi);
+            self.list.select(index, area.bottom - area.top);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LOADING, NO_MATCH, NO_NOTEBOOK, placeholder, status_text};

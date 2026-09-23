@@ -1016,8 +1016,7 @@ impl NotebookView {
     }
 }
 
-/// What Task 13's MSAA provider reads of the view.
-#[allow(dead_code, reason = "Task 13's MSAA provider is the first reader")]
+/// What the MSAA provider reads of the view.
 impl NotebookView {
     pub(crate) fn rows(&self) -> &[TreeRow] {
         &self.rows
@@ -1793,6 +1792,88 @@ fn typed(hwnd: HWND, ch: char) {
             view.select(index);
         }
     });
+}
+
+impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
+    /// Push buttons first, then the RECENT notebooks (no-notebook state), then the tree rows.
+    fn accessible_count(&self, client: RECT, dpi: u32) -> usize {
+        self.buttons(client, dpi).len() + self.recent_rows(client, dpi).len() + self.rows().len()
+    }
+
+    fn accessible_item(
+        &self,
+        index: usize,
+        client: RECT,
+        dpi: u32,
+        focused: bool,
+    ) -> Option<crate::window::sidebar_accessibility::AccessibleItem> {
+        use crate::window::sidebar_accessibility::{button_item, list_item, row_rect, tree_item};
+        let buttons = self.buttons(client, dpi);
+        if let Some((name, rect)) = buttons.get(index) {
+            return Some(button_item(name, false, false, *rect));
+        }
+        let index = index - buttons.len();
+        let recent = self.recent_rows(client, dpi);
+        if let Some((name, rect)) = recent.get(index) {
+            return Some(list_item(name, false, false, *rect, true));
+        }
+        let index = index - recent.len();
+        let row = self.rows().get(index)?;
+        let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
+        Some(tree_item(
+            row,
+            self.list().selected == Some(index),
+            focused,
+            rect,
+            visible,
+        ))
+    }
+
+    fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
+        let inside = |rect: &RECT| {
+            point.x >= rect.left
+                && point.x < rect.right
+                && point.y >= rect.top
+                && point.y < rect.bottom
+        };
+        let buttons = self.buttons(client, dpi);
+        if let Some(index) = buttons.iter().position(|(_, rect)| inside(rect)) {
+            return Some(index);
+        }
+        let recent = self.recent_rows(client, dpi);
+        if let Some(index) = recent.iter().position(|(_, rect)| inside(rect)) {
+            return Some(buttons.len() + index);
+        }
+        let area = self.list_area(client, dpi);
+        if !inside(&area) {
+            return None;
+        }
+        self.list()
+            .row_at(point.y - area.top)
+            .filter(|&row| row < self.rows().len())
+            .map(|row| buttons.len() + recent.len() + row)
+    }
+
+    fn accessible_current(&self, client: RECT, dpi: u32) -> Option<usize> {
+        let offset = self.buttons(client, dpi).len() + self.recent_rows(client, dpi).len();
+        // In the no-notebook state the list's selection is a RECENT row, not a tree row.
+        self.list()
+            .selected
+            .filter(|&row| row < self.rows().len())
+            .map(|row| offset + row)
+    }
+
+    fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
+        let offset = self.buttons(client, dpi).len() + self.recent_rows(client, dpi).len();
+        let Some(row) = index
+            .checked_sub(offset)
+            .filter(|&row| row < self.rows().len())
+        else {
+            return;
+        };
+        let area = self.list_area(client, dpi);
+        self.list_mut().select(row, area.bottom - area.top);
+    }
 }
 
 #[cfg(test)]

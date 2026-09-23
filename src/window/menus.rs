@@ -8,7 +8,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3,
+    VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_F6, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3,
     VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_MINUS,
     VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 47] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 49] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -79,6 +79,8 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 47] {
         accelerator(FCONTROL | FSHIFT, b'E', CommandId::ShowNotebookView),
         accelerator(FCONTROL, b'K', CommandId::ShowSearchView),
         accelerator(FALT, b'Z', CommandId::ToggleWordWrap),
+        virtual_key(0, VK_F6, CommandId::FocusNextPane),
+        virtual_key(FSHIFT, VK_F6, CommandId::FocusPreviousPane),
     ]
 }
 
@@ -554,7 +556,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 47);
+        assert_eq!(specs.len(), 49);
     }
 
     #[test]

@@ -1131,6 +1131,81 @@ pub(crate) fn focus_content(hwnd: HWND) {
     }
 }
 
+/// The three parts F6 moves between, in tab order (spec §10).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FocusPart {
+    ActivityBar,
+    Panel,
+    Editor,
+}
+
+/// The part after `current`, skipping a closed panel and, with notes mode off, the sidebar.
+pub(crate) fn next_focus_part(
+    current: FocusPart,
+    backwards: bool,
+    sidebar: bool,
+    panel_open: bool,
+) -> FocusPart {
+    let parts: &[FocusPart] = match (sidebar, panel_open) {
+        (false, _) => &[FocusPart::Editor],
+        (true, false) => &[FocusPart::ActivityBar, FocusPart::Editor],
+        (true, true) => &[FocusPart::ActivityBar, FocusPart::Panel, FocusPart::Editor],
+    };
+    let index = parts
+        .iter()
+        .position(|part| *part == current)
+        .unwrap_or(parts.len() - 1);
+    let next = if backwards {
+        (index + parts.len() - 1) % parts.len()
+    } else {
+        (index + 1) % parts.len()
+    };
+    parts[next]
+}
+
+/// The editor, or the frame while no tab is open.
+pub(crate) fn return_focus_to_editor(hwnd: HWND) {
+    if tab_count(hwnd) > 0 {
+        focus_content(hwnd);
+    } else {
+        unsafe {
+            SetFocus(hwnd);
+        }
+    }
+}
+
+/// F6 and Shift+F6: activity bar, panel, editor.
+pub(crate) fn cycle_focus(hwnd: HWND, backwards: bool) {
+    use crate::config::SidebarView;
+    use crate::window::side_panel;
+    let windows = side_panel::windows(hwnd);
+    let panel_open = windows.is_some() && side_panel::current_view(hwnd) != SidebarView::Hidden;
+    let focus = unsafe { GetFocus() };
+    let current = match windows {
+        Some((bar, _)) if focus == bar => FocusPart::ActivityBar,
+        Some((_, panel))
+            if focus == panel
+                || unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsChild(panel, focus)
+                } != 0 =>
+        {
+            FocusPart::Panel
+        }
+        _ => FocusPart::Editor,
+    };
+    match next_focus_part(current, backwards, windows.is_some(), panel_open) {
+        FocusPart::ActivityBar => {
+            if let Some((bar, _)) = windows {
+                unsafe {
+                    SetFocus(bar);
+                }
+            }
+        }
+        FocusPart::Panel => side_panel::show_view(hwnd, side_panel::current_view(hwnd), true),
+        FocusPart::Editor => return_focus_to_editor(hwnd),
+    }
+}
+
 /// The colors the find bar and the name box are shown in.
 pub(crate) fn current_palette(hwnd: HWND) -> Palette {
     title_chrome(hwnd).0
@@ -2034,6 +2109,8 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             crate::window::preview_host::run_command(hwnd, command)
         }
         CommandId::ToggleSidebar => crate::window::side_panel::toggle(hwnd),
+        CommandId::FocusNextPane => cycle_focus(hwnd, false),
+        CommandId::FocusPreviousPane => cycle_focus(hwnd, true),
         CommandId::ShowNotebookView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, true)
         }
@@ -10752,5 +10829,221 @@ mod tests {
         execute_command(window.hwnd, CommandId::CommandPalette);
         let shown = with_command_palette(window.hwnd, |palette| palette.shown().len()).unwrap();
         assert!(shown > crate::window::command_palette::SETTINGS_COMMANDS.len());
+    }
+
+    #[test]
+    fn f6_order_skips_a_closed_panel_and_a_missing_sidebar() {
+        // Break caught: F6 landing in a hidden panel, or getting stuck when notes mode is off.
+        use super::{FocusPart, next_focus_part};
+        assert_eq!(
+            next_focus_part(FocusPart::Editor, false, true, true),
+            FocusPart::ActivityBar
+        );
+        assert_eq!(
+            next_focus_part(FocusPart::ActivityBar, false, true, true),
+            FocusPart::Panel
+        );
+        assert_eq!(
+            next_focus_part(FocusPart::Panel, false, true, true),
+            FocusPart::Editor
+        );
+        assert_eq!(
+            next_focus_part(FocusPart::ActivityBar, true, true, true),
+            FocusPart::Editor
+        );
+        assert_eq!(
+            next_focus_part(FocusPart::ActivityBar, false, true, false),
+            FocusPart::Editor
+        );
+        assert_eq!(
+            next_focus_part(FocusPart::Editor, false, false, false),
+            FocusPart::Editor
+        );
+    }
+
+    fn focused() -> HWND {
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() }
+    }
+
+    fn shown_window() -> ProductionWindow {
+        let window = ProductionWindow::new(make_app());
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                window.hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+            );
+        }
+        window
+    }
+
+    #[test]
+    fn f6_cycles_activity_bar_panel_and_editor_and_shift_f6_goes_back() {
+        // Break caught: F6 doing nothing, skipping the panel, or leaving the focus in a closed
+        // panel.
+        let _scintilla = load_native_scintilla();
+        let window = shown_window();
+        let _editor = install_test_editor(&window);
+        let (bar, panel) = crate::window::side_panel::windows(window.hwnd).unwrap();
+        use crate::config::SidebarView;
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+        super::return_focus_to_editor(window.hwnd);
+        let editor = focused();
+
+        execute_command(window.hwnd, CommandId::FocusNextPane);
+        assert_eq!(focused(), bar);
+        execute_command(window.hwnd, CommandId::FocusNextPane);
+        assert_eq!(focused(), panel);
+        execute_command(window.hwnd, CommandId::FocusNextPane);
+        assert_eq!(focused(), editor);
+        execute_command(window.hwnd, CommandId::FocusPreviousPane);
+        assert_eq!(focused(), panel);
+
+        crate::window::side_panel::toggle(window.hwnd);
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            SidebarView::Hidden
+        );
+        super::return_focus_to_editor(window.hwnd);
+        execute_command(window.hwnd, CommandId::FocusNextPane);
+        assert_eq!(focused(), bar);
+        execute_command(window.hwnd, CommandId::FocusNextPane);
+        assert_eq!(focused(), editor, "a closed panel is skipped");
+    }
+
+    #[test]
+    fn escape_in_the_panel_returns_the_focus_to_the_editor() {
+        // Break caught: Esc in the tree leaving the keyboard stuck in the sidebar.
+        let _scintilla = load_native_scintilla();
+        let window = shown_window();
+        let _editor = install_test_editor(&window);
+        super::return_focus_to_editor(window.hwnd);
+        let editor = focused();
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            true,
+        );
+        let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+        assert_eq!(focused(), panel);
+        unsafe {
+            SendMessageW(
+                panel,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE as usize,
+                0,
+            );
+        }
+        assert_eq!(focused(), editor);
+    }
+
+    #[test]
+    fn the_activity_bar_moves_with_arrows_and_presses_with_enter() {
+        // Break caught: activity-bar buttons reachable only with the mouse, or their pressed
+        // state not following the shown view.
+        let _scintilla = load_native_scintilla();
+        let window = shown_window();
+        let _editor = install_test_editor(&window);
+        use crate::config::SidebarView;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_DOWN, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+        let bar = crate::window::side_panel::windows(window.hwnd).unwrap().0;
+        unsafe {
+            SetFocus(bar);
+        }
+        assert_eq!(crate::window::side_panel::bar_focus(window.hwnd), 0);
+        let items = crate::window::activity_bar::accessible_items(bar);
+        assert_eq!(items.len(), 4);
+        assert_ne!(
+            items[0].state & crate::window::sidebar_accessibility::STATE_PRESSED,
+            0
+        );
+        assert_ne!(
+            items[0].state & crate::window::sidebar_accessibility::STATE_FOCUSED,
+            0
+        );
+        assert_eq!(items[3].name, "Settings");
+
+        unsafe {
+            SendMessageW(bar, WM_KEYDOWN, VK_DOWN as usize, 0);
+        }
+        assert_eq!(crate::window::side_panel::bar_focus(window.hwnd), 1);
+        unsafe {
+            SendMessageW(bar, WM_KEYDOWN, VK_RETURN as usize, 0);
+        }
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            SidebarView::Search
+        );
+        let items = crate::window::activity_bar::accessible_items(bar);
+        assert_ne!(
+            items[1].state & crate::window::sidebar_accessibility::STATE_PRESSED,
+            0
+        );
+        assert_eq!(
+            items[0].state & crate::window::sidebar_accessibility::STATE_PRESSED,
+            0
+        );
+    }
+
+    #[test]
+    fn the_panel_exposes_the_tree_as_an_outline_with_pinned_and_folder_states() {
+        // Break caught: the tree invisible to screen readers, the child count not matching the
+        // visible rows, or a pin and a collapsed folder not reported.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("tree-msaa");
+        let a = scratch.note("a.md", "a");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::library_host::toggle_pin(window.hwnd, &a);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+        let count = crate::window::side_panel::accessible_item_count(panel);
+        let items = (0..count)
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), count);
+        let rows = items
+            .iter()
+            .filter(|item| {
+                item.role == windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM
+                    && !item.name.ends_with(", unsaved")
+            })
+            .collect::<Vec<_>>();
+        // The window's untitled tab is an unsaved row, left out above. "sub" is collapsed, so b
+        // is not a row: pinned a first, then the folder.
+        assert_eq!(rows.len(), 2, "{items:?}");
+        assert_eq!(rows[0].name, "a, pinned");
+        assert_eq!(rows[1].name, "sub");
+        assert_ne!(
+            rows[1].state & crate::window::sidebar_accessibility::STATE_COLLAPSED,
+            0
+        );
+
+        let provider = crate::window::sidebar_accessibility::create_for_test(
+            panel,
+            &crate::window::side_panel::PANEL_ACCESSIBLE,
+        );
+        let table = &crate::window::sidebar_accessibility::SIDEBAR_VTABLE;
+        use crate::window::accessibility::{RawVariant, VariantValue};
+        unsafe {
+            let mut children = 0;
+            (table.get_acc_child_count)(provider, &mut children);
+            assert_eq!(children as usize, count);
+            let mut role = RawVariant::empty();
+            (table.get_acc_role)(provider, RawVariant::integer(0), &mut role);
+            assert_eq!(
+                role.child_id(),
+                Some(windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINE as i32)
+            );
+            (table.release)(provider);
+        }
     }
 }

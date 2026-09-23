@@ -6,6 +6,7 @@
 use super::side_panel::{self, draw_text, paint_buffered, point_of, with_bar_state};
 use crate::config::SidebarView;
 use crate::window::panel::{fill, scale};
+use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSource, button_item};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, InvalidateRect, ScreenToClient,
@@ -16,8 +17,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetClientRect, GetParent, HTTRANSPARENT, WM_CAPTURECHANGED, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT,
+    DefWindowProcW, GetClientRect, GetParent, HTTRANSPARENT, OBJID_CLIENT, WM_CAPTURECHANGED,
+    WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS,
 };
 
 /// Segoe MDL2 Assets glyphs: Library, Search, FavoriteStar, Setting.
@@ -166,6 +168,21 @@ unsafe extern "system" fn bar_proc(
             0
         }
         WM_ERASEBKGND => 1,
+        WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => unsafe {
+            sidebar_accessibility::object_result(bar, &BAR_ACCESSIBLE, wparam)
+        },
+        sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACCESSIBLE => unsafe {
+            sidebar_accessibility::answer(bar, lparam)
+        },
+        sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACTION => {
+            sidebar_accessibility::run_action(bar, &BAR_ACCESSIBLE, wparam, lparam);
+            0
+        }
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            focus_changed(bar, message == WM_SETFOCUS);
+            0
+        }
+        WM_KEYDOWN if key_down(bar, wparam as u16) => 0,
         // Above the first button the main window's caption hit test applies.
         WM_NCHITTEST => {
             let (x, y) = point_of(lparam);
@@ -292,7 +309,174 @@ fn paint(main: HWND, bar: HWND) {
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
+        paint_keyboard_focus(bar, dc);
     });
+}
+
+/// The four buttons as MSAA children, in `button_rects` order.
+pub(crate) fn bar_items(
+    rects: [RECT; 4],
+    view: SidebarView,
+    notebook: Option<&str>,
+    focused: Option<usize>,
+) -> Vec<AccessibleItem> {
+    ActivityButton::ALL
+        .into_iter()
+        .map(|button| {
+            let name = if button == ActivityButton::Notebook {
+                notebook_label(notebook)
+            } else {
+                button.label().to_owned()
+            };
+            button_item(
+                &name,
+                button.view() == Some(view),
+                focused == Some(button.index()),
+                rects[button.index()],
+            )
+        })
+        .collect()
+}
+
+fn bar_geometry(bar: HWND) -> (RECT, u32) {
+    let mut client = RECT::default();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(bar, &mut client);
+    }
+    (
+        client,
+        unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(bar) }.max(96),
+    )
+}
+
+pub(crate) fn accessible_items(bar: HWND) -> Vec<AccessibleItem> {
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
+    let (client, dpi) = bar_geometry(bar);
+    let notebook =
+        super::library_host::folder(main).map(|folder| super::library_host::notebook_name(&folder));
+    let focused = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == bar;
+    bar_items(
+        button_rects(client, dpi),
+        super::side_panel::current_view(main),
+        notebook.as_deref(),
+        focused.then(|| super::side_panel::bar_focus(main)),
+    )
+}
+
+fn bar_container(_: HWND) -> (String, u32) {
+    (
+        "Activity bar".to_owned(),
+        windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_TOOLBAR,
+    )
+}
+
+fn bar_count(_: HWND) -> usize {
+    4
+}
+
+fn bar_item(bar: HWND, index: usize) -> Option<AccessibleItem> {
+    accessible_items(bar).into_iter().nth(index)
+}
+
+fn bar_hit(bar: HWND, point: POINT) -> Option<usize> {
+    let (client, dpi) = bar_geometry(bar);
+    button_rects(client, dpi).iter().position(|rect| {
+        point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+    })
+}
+
+fn bar_current(bar: HWND) -> Option<usize> {
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
+    Some(super::side_panel::bar_focus(main))
+}
+
+fn bar_select(bar: HWND, index: usize) {
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
+    super::side_panel::set_bar_focus(main, index);
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::InvalidateRect(bar, std::ptr::null(), 0);
+    }
+}
+
+/// Presses button `index` exactly as a click does.
+fn bar_activate(bar: HWND, index: usize) {
+    let (client, dpi) = bar_geometry(bar);
+    if let Some(rect) = button_rects(client, dpi).get(index) {
+        sidebar_accessibility::click_item(bar, *rect);
+    }
+}
+
+pub(crate) static BAR_ACCESSIBLE: AccessibleSource = AccessibleSource {
+    container: bar_container,
+    count: bar_count,
+    item: bar_item,
+    hit: bar_hit,
+    current: bar_current,
+    select: bar_select,
+    activate: bar_activate,
+};
+
+/// `WM_SETFOCUS` and `WM_KILLFOCUS`. Gaining the focus starts on the active view's button.
+pub(crate) fn focus_changed(bar: HWND, gained: bool) {
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
+    if gained {
+        let index =
+            super::side_panel::view_button(super::side_panel::current_view(main)).unwrap_or(0);
+        super::side_panel::set_bar_focus(main, index);
+        sidebar_accessibility::notify(
+            windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_FOCUS,
+            bar,
+            Some(index),
+        );
+    }
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::InvalidateRect(bar, std::ptr::null(), 0);
+    }
+}
+
+/// `WM_KEYDOWN` on the bar: Up and Down move, Home and End jump, Enter and Space press.
+pub(crate) fn key_down(bar: HWND, key: u16) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_DOWN, VK_END, VK_HOME, VK_RETURN, VK_SPACE, VK_UP,
+    };
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
+    let focus = super::side_panel::bar_focus(main);
+    let next = match key {
+        VK_UP => focus.saturating_sub(1),
+        VK_DOWN => (focus + 1).min(3),
+        VK_HOME => 0,
+        VK_END => 3,
+        VK_RETURN | VK_SPACE => {
+            bar_activate(bar, focus);
+            return true;
+        }
+        _ => return false,
+    };
+    if next != focus {
+        bar_select(bar, next);
+        sidebar_accessibility::notify(
+            windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_FOCUS,
+            bar,
+            Some(next),
+        );
+    }
+    true
+}
+
+/// Draws the keyboard focus rectangle. Call it last in the bar's `WM_PAINT`, before `EndPaint`.
+pub(crate) fn paint_keyboard_focus(bar: HWND, hdc: windows_sys::Win32::Graphics::Gdi::HDC) {
+    if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } != bar {
+        return;
+    }
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
+    let (client, dpi) = bar_geometry(bar);
+    let rect = crate::window::panel::inset(
+        button_rects(client, dpi)[super::side_panel::bar_focus(main)],
+        crate::window::panel::scale(3, dpi),
+    );
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::DrawFocusRect(hdc, &rect);
+    }
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ pub(crate) mod preview_host;
 pub(crate) mod row_list;
 pub(crate) mod search_view;
 pub(crate) mod side_panel;
+pub(crate) mod sidebar_accessibility;
 pub mod status;
 pub mod tabs;
 pub mod titlebar;

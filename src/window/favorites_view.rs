@@ -700,6 +700,74 @@ pub(crate) fn shown_rows(hwnd: HWND) -> Vec<FavoriteRow> {
     with_view(hwnd, |view| view.rows.clone()).unwrap_or_default()
 }
 
+impl crate::window::sidebar_accessibility::AccessibleView for FavoritesView {
+    /// The header button, one item per favorite, then the footer row.
+    fn accessible_count(&self, _client: RECT, _dpi: u32) -> usize {
+        1 + self.rows.len() + 1
+    }
+
+    fn accessible_item(
+        &self,
+        index: usize,
+        client: RECT,
+        dpi: u32,
+        focused: bool,
+    ) -> Option<crate::window::sidebar_accessibility::AccessibleItem> {
+        use crate::window::sidebar_accessibility::{button_item, list_item, row_rect};
+        if index == 0 {
+            return Some(button_item(
+                OPEN_NOTEBOOK,
+                false,
+                false,
+                Self::header_button(client, dpi),
+            ));
+        }
+        let row = index - 1;
+        if row > self.rows.len() {
+            return None;
+        }
+        let (rect, visible) = row_rect(self.list_area(client, dpi), &self.list, row);
+        let selected = self.list.selected == Some(row);
+        let name = match self.rows.get(row) {
+            Some(favorite) => {
+                let mut name = favorite.name.clone();
+                if let Some(hint) = &favorite.hint {
+                    name.push_str(", ");
+                    name.push_str(hint);
+                }
+                if favorite.open {
+                    name.push_str(", open");
+                }
+                name
+            }
+            None => OPEN_NOTEBOOK.to_owned(),
+        };
+        Some(list_item(&name, selected, focused, rect, visible))
+    }
+
+    fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
+        if inside(Self::header_button(client, dpi), point) {
+            return Some(0);
+        }
+        let area = self.list_area(client, dpi);
+        if !inside(area, point) {
+            return None;
+        }
+        self.list.row_at(point.y - area.top).map(|row| row + 1)
+    }
+
+    fn accessible_current(&self, _client: RECT, _dpi: u32) -> Option<usize> {
+        self.list.selected.map(|row| row + 1)
+    }
+
+    fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
+        if let Some(row) = index.checked_sub(1).filter(|&row| row <= self.rows.len()) {
+            let area = self.list_area(client, dpi);
+            self.list.select(row, area.bottom - area.top);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FavoriteAction, FavoritesView, KeyResult, favorite_rows};

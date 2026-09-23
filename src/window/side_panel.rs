@@ -9,8 +9,8 @@
 
 use super::activity_bar::{self, ActivityButton, BarState};
 use super::main_window::{
-    app_ptr, change_setting, current_palette, focus_content, invalidate_title_strip,
-    layout_editor_and_find_bar, push_notice, tab_count, ui_fonts,
+    app_ptr, change_setting, current_palette, invalidate_title_strip, layout_editor_and_find_bar,
+    push_notice, return_focus_to_editor, ui_fonts,
 };
 use super::tooltip::Tooltip;
 use crate::config::SidebarView;
@@ -18,6 +18,9 @@ use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDE
 use crate::platform::wide_null;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill, scale};
+use crate::window::sidebar_accessibility::{
+    self, AccessibleItem, AccessibleMark, AccessibleSource, AccessibleView,
+};
 use crate::window::titlebar::create_ui_font;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -32,17 +35,17 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus,
+    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, DefWindowProcW, DestroyWindow, EN_CHANGE, GWL_STYLE, GetClientRect, GetCursorPos,
     GetParent, GetWindowLongPtrW, HTTRANSPARENT, IDC_ARROW, IDC_SIZEWE, IsChild, LoadCursorW,
-    RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetWindowPos,
-    ShowWindow, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFOCUS, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_VISIBLE,
+    OBJID_CLIENT, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor,
+    SetWindowPos, ShowWindow, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
+    WM_CTLCOLOREDIT, WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WNDCLASSW, WNDPROC, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 /// Sizes at 96 DPI, scaled with `panel::scale`.
@@ -114,6 +117,8 @@ pub(crate) struct Sidebar {
     pub(crate) panel: HWND,
     pub(crate) tooltip: Option<Tooltip>,
     pub(crate) bar_state: BarState,
+    /// The activity-bar button the keyboard is on (`bar_focus`).
+    pub(crate) bar_focus: usize,
     /// The Notebook view's rows, selection and hover.
     pub(crate) notebook: crate::window::notebook_view::NotebookView,
     pub(crate) favorites: crate::window::favorites_view::FavoritesView,
@@ -347,6 +352,7 @@ pub(crate) fn create(hwnd: HWND) -> crate::Result<Sidebar> {
         panel,
         tooltip: Tooltip::create(bar),
         bar_state: BarState::default(),
+        bar_focus: 0,
         notebook: crate::window::notebook_view::NotebookView::new(panel),
         favorites: crate::window::favorites_view::FavoritesView::new(dpi),
         search,
@@ -374,7 +380,7 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
             unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.sidebar.take());
         if let Some(sidebar) = sidebar {
             if focus_is_in(sidebar.panel) || focus_is_in(sidebar.bar) {
-                return_focus(hwnd);
+                return_focus_to_editor(hwnd);
             }
             destroy_windows(&sidebar);
         }
@@ -435,7 +441,7 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
         }
     } else {
         if focus_is_in(panel) {
-            return_focus(hwnd);
+            return_focus_to_editor(hwnd);
         }
         unsafe { ShowWindow(panel, SW_HIDE) };
     }
@@ -443,9 +449,8 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
     crate::window::search_view::layout(hwnd);
 }
 
-/// Shows `view`, or closes the panel for `Hidden`, and saves it as `sidebar_view`. `focus` moves
-/// the keyboard focus into the panel, or into the search box for Search.
-pub(crate) fn show_view(hwnd: HWND, view: SidebarView, focus: bool) {
+/// `show_view` without its win events.
+fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
     let Some(panel) = with_sidebar(hwnd, |sidebar| {
         if view != SidebarView::Hidden {
             sidebar.last_view = view;
@@ -455,7 +460,7 @@ pub(crate) fn show_view(hwnd: HWND, view: SidebarView, focus: bool) {
         return;
     };
     if view == SidebarView::Hidden && focus_is_in(panel) {
-        return_focus(hwnd);
+        return_focus_to_editor(hwnd);
     }
     change_setting(hwnd, |settings| {
         (settings.sidebar_view != view).then(|| {
@@ -479,8 +484,8 @@ pub(crate) fn show_view(hwnd: HWND, view: SidebarView, focus: bool) {
     }
 }
 
-/// Ctrl+B: closes the panel, or reopens the last view.
-pub(crate) fn toggle(hwnd: HWND) {
+/// `toggle` without its win events.
+fn toggle_now(hwnd: HWND) {
     let Some(last) = with_sidebar(hwnd, |sidebar| sidebar.last_view) else {
         return;
     };
@@ -489,12 +494,11 @@ pub(crate) fn toggle(hwnd: HWND) {
     } else {
         SidebarView::Hidden
     };
-    show_view(hwnd, next, false);
+    show_view_now(hwnd, next, false);
 }
 
-/// The library changed: rebuilds the Notebook view's rows from `LibraryState.tree` (no disk),
-/// re-reads the notebook name for the Notebook tooltip, and repaints.
-pub(crate) fn refresh(hwnd: HWND) {
+/// `refresh` without its win events.
+fn refresh_now(hwnd: HWND) {
     let Some((bar, panel)) = windows(hwnd) else {
         return;
     };
@@ -508,14 +512,62 @@ pub(crate) fn refresh(hwnd: HWND) {
     }
 }
 
-/// The active tab changed (`main_window::refresh_tabs` calls it): the Notebook view selects the
-/// active note's row and expands its folders.
-pub(crate) fn active_tab_changed(hwnd: HWND) {
+/// `active_tab_changed` without its win events.
+fn active_tab_changed_now(hwnd: HWND) {
     let Some((_, panel)) = windows(hwnd) else {
         return;
     };
     crate::window::notebook_view::active_tab_changed(hwnd);
     unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+}
+
+/// Shows `view`, or closes the panel for `Hidden`, and saves it as `sidebar_view`. `focus` moves
+/// the keyboard focus into the panel, or into the search box for Search. Raises the win events
+/// for the panel's current child and the activity bar's pressed buttons.
+pub(crate) fn show_view(hwnd: HWND, view: SidebarView, focus: bool) {
+    let before = current_view(hwnd);
+    with_accessible_events(hwnd, || show_view_now(hwnd, view, focus));
+    bar_views_changed(hwnd, before);
+}
+
+/// Ctrl+B: closes the panel, or reopens the last view.
+pub(crate) fn toggle(hwnd: HWND) {
+    let before = current_view(hwnd);
+    with_accessible_events(hwnd, || toggle_now(hwnd));
+    bar_views_changed(hwnd, before);
+}
+
+/// Tells screen readers which activity-bar buttons' pressed state changed.
+fn bar_views_changed(hwnd: HWND, before: SidebarView) {
+    let after = current_view(hwnd);
+    let Some((bar, _)) = windows(hwnd) else {
+        return;
+    };
+    if before == after {
+        return;
+    }
+    for index in [view_button(before), view_button(after)]
+        .into_iter()
+        .flatten()
+    {
+        sidebar_accessibility::notify(
+            windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_STATECHANGE,
+            bar,
+            Some(index),
+        );
+    }
+}
+
+/// The library changed: rebuilds the Notebook view's rows from `LibraryState.tree` (no disk),
+/// re-reads the notebook name for the Notebook tooltip, and repaints.
+pub(crate) fn refresh(hwnd: HWND) {
+    with_accessible_events(hwnd, || refresh_now(hwnd));
+}
+
+/// The active tab changed (`main_window::refresh_tabs` calls it): the Notebook view selects the
+/// active note's row and expands its folders.
+pub(crate) fn active_tab_changed(hwnd: HWND) {
+    with_accessible_events(hwnd, || active_tab_changed_now(hwnd));
 }
 
 fn update_tools(hwnd: HWND) {
@@ -541,18 +593,187 @@ fn update_tools(hwnd: HWND) {
     }
 }
 
+/// Runs `f` on the view the panel shows, with its client rectangle, DPI and focus.
+fn with_accessible_view<R>(
+    panel: HWND,
+    f: impl FnOnce(&mut dyn AccessibleView, RECT, u32, bool) -> R,
+) -> Option<R> {
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(panel) };
+    let view = current_view(main);
+    let mut client = RECT::default();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(panel, &mut client);
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(panel) }.max(96);
+    let focused = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == panel;
+    let mut app = unsafe { super::main_window::app_ptr(main) }?;
+    let sidebar = unsafe { app.as_mut() }.sidebar.as_mut()?;
+    match view {
+        SidebarView::Notebook => Some(f(&mut sidebar.notebook, client, dpi, focused)),
+        SidebarView::Search => Some(f(&mut sidebar.search, client, dpi, focused)),
+        SidebarView::Favorites => Some(f(&mut sidebar.favorites, client, dpi, focused)),
+        SidebarView::Hidden => None,
+    }
+}
+
+/// How many MSAA children the panel has: one per header button and visible (flattened) row.
+pub(crate) fn accessible_item_count(panel: HWND) -> usize {
+    with_accessible_view(panel, |view, client, dpi, _| {
+        view.accessible_count(client, dpi)
+    })
+    .unwrap_or(0)
+}
+
+/// The panel's MSAA child `index` (0-based), built on its own.
+pub(crate) fn accessible_item(panel: HWND, index: usize) -> Option<AccessibleItem> {
+    with_accessible_view(panel, |view, client, dpi, focused| {
+        view.accessible_item(index, client, dpi, focused)
+    })
+    .flatten()
+}
+
+fn accessible_container(panel: HWND) -> (String, u32) {
+    use windows_sys::Win32::UI::Accessibility::{
+        ROLE_SYSTEM_LIST, ROLE_SYSTEM_OUTLINE, ROLE_SYSTEM_PANE,
+    };
+    let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(panel) };
+    match current_view(main) {
+        SidebarView::Notebook => {
+            // The same "Notebook: <name>" the activity bar's Notebook button reads.
+            let name = super::library_host::folder(main)
+                .map(|folder| super::library_host::notebook_name(&folder));
+            (
+                activity_bar::notebook_label(name.as_deref()),
+                ROLE_SYSTEM_OUTLINE,
+            )
+        }
+        SidebarView::Search => ("Search results".to_owned(), ROLE_SYSTEM_LIST),
+        SidebarView::Favorites => ("Favorite notebooks".to_owned(), ROLE_SYSTEM_LIST),
+        SidebarView::Hidden => ("Side panel".to_owned(), ROLE_SYSTEM_PANE),
+    }
+}
+
+fn accessible_hit(panel: HWND, point: POINT) -> Option<usize> {
+    with_accessible_view(panel, |view, client, dpi, _| {
+        view.accessible_hit(point, client, dpi)
+    })
+    .flatten()
+}
+
+fn accessible_current(panel: HWND) -> Option<usize> {
+    with_accessible_view(panel, |view, client, dpi, _| {
+        view.accessible_current(client, dpi)
+    })
+    .flatten()
+}
+
+fn accessible_select(panel: HWND, index: usize) {
+    with_accessible_view(panel, |view, client, dpi, _| {
+        view.accessible_select(index, client, dpi)
+    });
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::InvalidateRect(panel, std::ptr::null(), 0);
+    }
+}
+
+/// A child's default action: a click on its center, after scrolling it into view.
+fn accessible_activate(panel: HWND, index: usize) {
+    let Some(mut item) = accessible_item(panel, index) else {
+        return;
+    };
+    if item.state & sidebar_accessibility::STATE_OFFSCREEN != 0 {
+        accessible_select(panel, index);
+        let Some(shown) = accessible_item(panel, index) else {
+            return;
+        };
+        item = shown;
+    }
+    sidebar_accessibility::click_item(panel, item.rect);
+}
+
+pub(crate) static PANEL_ACCESSIBLE: AccessibleSource = AccessibleSource {
+    container: accessible_container,
+    count: accessible_item_count,
+    item: accessible_item,
+    hit: accessible_hit,
+    current: accessible_current,
+    select: accessible_select,
+    activate: accessible_activate,
+};
+
+thread_local! {
+    static ANNOUNCING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears `ANNOUNCING` however the change returns.
+struct Announcing;
+
+impl Drop for Announcing {
+    fn drop(&mut self) {
+        ANNOUNCING.set(false);
+    }
+}
+
+/// Runs `change` and raises the win events for what it did to the panel's current child (spec
+/// §10). Nested calls run `change` alone, so one input raises one set of events.
+pub(crate) fn with_accessible_events<R>(hwnd: HWND, change: impl FnOnce() -> R) -> R {
+    let Some((_, panel)) = windows(hwnd) else {
+        return change();
+    };
+    if ANNOUNCING.get() {
+        return change();
+    }
+    ANNOUNCING.set(true);
+    let guard = Announcing;
+    let before = AccessibleMark::read(panel, &PANEL_ACCESSIBLE);
+    let result = change();
+    let after = AccessibleMark::read(panel, &PANEL_ACCESSIBLE);
+    drop(guard);
+    let focused = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == panel;
+    sidebar_accessibility::raise(
+        panel,
+        &sidebar_accessibility::events_between(&before, &after, focused),
+    );
+    result
+}
+
+pub(crate) fn announcing() -> bool {
+    ANNOUNCING.get()
+}
+
+/// The activity-bar button the keyboard is on (0 Notebook, 1 Search, 2 Favorites, 3 Settings).
+pub(crate) fn bar_focus(hwnd: HWND) -> usize {
+    unsafe { super::main_window::app_ptr(hwnd) }
+        .and_then(|app| {
+            unsafe { app.as_ref() }
+                .sidebar
+                .as_ref()
+                .map(|s| s.bar_focus)
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) fn set_bar_focus(hwnd: HWND, index: usize) {
+    if let Some(mut app) = unsafe { super::main_window::app_ptr(hwnd) }
+        && let Some(sidebar) = unsafe { app.as_mut() }.sidebar.as_mut()
+    {
+        sidebar.bar_focus = index.min(3);
+    }
+}
+
+/// The activity-bar button of a view.
+pub(crate) fn view_button(view: SidebarView) -> Option<usize> {
+    match view {
+        SidebarView::Notebook => Some(0),
+        SidebarView::Search => Some(1),
+        SidebarView::Favorites => Some(2),
+        SidebarView::Hidden => None,
+    }
+}
+
 fn focus_is_in(window: HWND) -> bool {
     let focus = unsafe { GetFocus() };
     !focus.is_null() && (focus == window || unsafe { IsChild(window, focus) } != 0)
-}
-
-/// Focus leaving the sidebar goes to the content, or to the frame while no tab is open.
-fn return_focus(hwnd: HWND) {
-    if tab_count(hwnd) > 0 {
-        focus_content(hwnd);
-    } else {
-        unsafe { SetFocus(hwnd) };
-    }
 }
 
 /// The window's own visible bit; the main window may be hidden (tests) or minimized.
@@ -644,6 +865,22 @@ unsafe extern "system" fn panel_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let main = unsafe { GetParent(panel) };
+    if matches!(
+        message,
+        WM_KEYDOWN
+            | WM_CHAR
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_MOUSEWHEEL
+            | WM_COMMAND
+            | sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACTION
+    ) && !announcing()
+    {
+        return with_accessible_events(main, || unsafe {
+            panel_proc(panel, message, wparam, lparam)
+        });
+    }
     match message {
         WM_PAINT => {
             paint_panel(main, panel);
@@ -651,6 +888,22 @@ unsafe extern "system" fn panel_proc(
         }
         WM_ERASEBKGND => 1,
         WM_NCHITTEST => panel_hit_test(main, panel, wparam, lparam),
+        WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => unsafe {
+            sidebar_accessibility::object_result(panel, &PANEL_ACCESSIBLE, wparam)
+        },
+        sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACCESSIBLE => unsafe {
+            sidebar_accessibility::answer(panel, lparam)
+        },
+        sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACTION => {
+            sidebar_accessibility::run_action(panel, &PANEL_ACCESSIBLE, wparam, lparam);
+            0
+        }
+        // Esc anywhere in the panel returns to the editor (spec §10). The search box's own Esc
+        // is handled in its subclass.
+        WM_KEYDOWN if wparam as u16 == VK_ESCAPE => {
+            return_focus_to_editor(main);
+            0
+        }
         WM_SETCURSOR if resizing(main) || pointer_over_grip(panel) => {
             unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_SIZEWE)) };
             1

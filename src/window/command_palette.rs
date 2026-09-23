@@ -1010,7 +1010,9 @@ mod tests {
             let expected = usize::from(
                 command.tab_index().is_none()
                     && command != CommandId::CommandPalette
-                    && command != CommandId::MarkdownPreviewCycle,
+                    && command != CommandId::MarkdownPreviewCycle
+                    && command != CommandId::FocusNextPane
+                    && command != CommandId::FocusPreviousPane,
             );
             assert_eq!(listed, expected, "{command:?}");
         }

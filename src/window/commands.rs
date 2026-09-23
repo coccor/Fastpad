@@ -76,6 +76,8 @@ pub enum CommandId {
     CloseNotebook = 180,
     ToggleNotebookFavorite = 181,
     NoteRevealInExplorer = 182,
+    FocusNextPane = 183,
+    FocusPreviousPane = 184,
 }
 
 impl CommandId {
@@ -115,6 +117,8 @@ impl CommandId {
                 | Self::ShowFavoritesView
                 | Self::CloseNotebook
                 | Self::ToggleNotebookFavorite
+                | Self::FocusNextPane
+                | Self::FocusPreviousPane
         )
     }
 
@@ -155,7 +159,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 74] = [
+        const COMMANDS: [CommandId; 76] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -230,6 +234,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::CloseNotebook,
             CommandId::ToggleNotebookFavorite,
             CommandId::NoteRevealInExplorer,
+            CommandId::FocusNextPane,
+            CommandId::FocusPreviousPane,
         ];
         COMMANDS
             .into_iter()
@@ -291,6 +297,9 @@ mod tests {
         assert_eq!(CommandId::try_from(159), Ok(CommandId::OpenRecentFolder));
         assert!(!CommandId::OpenFolder.needs_document());
         assert!(!CommandId::OpenRecentFolder.needs_document());
+        assert_eq!(CommandId::try_from(183), Ok(CommandId::FocusNextPane));
+        assert_eq!(CommandId::try_from(184), Ok(CommandId::FocusPreviousPane));
+        assert!(!CommandId::FocusNextPane.needs_document());
         assert_eq!(
             CommandId::try_from(160),
             Ok(CommandId::ToggleFolderAutosave)
