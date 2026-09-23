@@ -10,12 +10,14 @@ pub mod reconcile;
 pub mod scan;
 pub mod store;
 pub mod title;
+pub mod tree;
 
 use crate::Result;
 use ids::IdSource;
 use local::LocalState;
 use model::{Library, LibraryError, NoteRecord, NoteRef, same_path};
 use ops::PendingOp;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use store::{FileStamp, ReadOutcome};
 
@@ -56,6 +58,9 @@ pub struct LibraryState {
     pub stamp: Option<FileStamp>,
     pub local: LocalState,
     pub notes: Vec<NoteEntry>,
+    /// The notes as the sidebar's folder tree. Built with the scan on the worker; every later
+    /// change to `notes` or to a pin updates it in place.
+    pub tree: tree::NoteTree,
     pub truncated: bool,
     pub pending: Vec<PendingOp>,
     pub relocated: Vec<(PathBuf, PathBuf)>,
@@ -105,6 +110,36 @@ pub fn normalize_folder(folder: &Path) -> PathBuf {
         .unwrap_or_else(|_| folder.to_path_buf())
         .components()
         .collect()
+}
+
+/// The notes a tree shows as pinned: pinned records that are not flagged deleted.
+fn pinned_paths(library: &Library) -> Vec<PathBuf> {
+    library
+        .notes
+        .iter()
+        .filter(|record| record.pinned && !record.deleted && !record.path.is_absolute())
+        .map(|record| record.path.clone())
+        .collect()
+}
+
+fn pin_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+/// Brings the tree's pins from `before` to `after` without a rebuild.
+fn sync_pins(tree: &mut tree::NoteTree, before: &[PathBuf], after: &[PathBuf]) {
+    let before_keys: HashSet<String> = before.iter().map(|path| pin_key(path)).collect();
+    let after_keys: HashSet<String> = after.iter().map(|path| pin_key(path)).collect();
+    for path in after {
+        if !before_keys.contains(&pin_key(path)) {
+            tree.set_pinned(path, true);
+        }
+    }
+    for path in before {
+        if !after_keys.contains(&pin_key(path)) {
+            tree.set_pinned(path, false);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,21 +220,25 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
     if local_source.as_deref() != Some(encoded.as_str()) {
         let _ = local::write_text_in_order(local_path, &encoded, local::next_write());
     }
+    let notes: Vec<NoteEntry> = scan
+        .entries
+        .iter()
+        .map(|entry| NoteEntry {
+            path: entry.path.clone(),
+            size: entry.size,
+            mtime: entry.mtime,
+        })
+        .collect();
+    let paths: Vec<PathBuf> = notes.iter().map(|note| note.path.clone()).collect();
+    let tree = tree::NoteTree::build(&paths, &pinned_paths(&library));
     Ok(LibraryState {
         folder: folder.to_path_buf(),
         local_path: local_path.to_path_buf(),
         library,
         metadata,
         stamp,
-        notes: scan
-            .entries
-            .iter()
-            .map(|entry| NoteEntry {
-                path: entry.path.clone(),
-                size: entry.size,
-                mtime: entry.mtime,
-            })
-            .collect(),
+        notes,
+        tree,
         truncated: scan.truncated,
         pending: reconciled.ops,
         relocated: reconciled.relocated,
@@ -217,6 +256,7 @@ pub fn flush(state: &mut LibraryState) -> Result<Flushed> {
     }
     let path = store::library_file(&state.folder);
     if store::stamp(&path) != state.stamp {
+        let before = pinned_paths(&state.library);
         let mut fresh = match store::read(&path) {
             ReadOutcome::Loaded(library, stamp) => {
                 state.stamp = Some(stamp);
@@ -237,6 +277,8 @@ pub fn flush(state: &mut LibraryState) -> Result<Flushed> {
         };
         ops::replay(&mut fresh, &state.pending);
         state.library = fresh;
+        // Another PC's pins arrived with the re-read.
+        sync_pins(&mut state.tree, &before, &pinned_paths(&state.library));
     }
     state.library.prune();
     if state.stamp.is_none() && state.library == Library::default() {
@@ -298,6 +340,8 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         ..
     } = previous;
     let mut fresh = fresh;
+    // The rescan built its tree from these pins; what the merge changes is applied to it below.
+    let built_pins = pinned_paths(&fresh.library);
     fresh.notes = merge_notes(&fresh.folder, std::mem::take(&mut fresh.notes), &touched);
     if fresh.truncated {
         // A truncated scan's own list is already capped at the limit; touched entries that
@@ -315,31 +359,49 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         fresh.metadata = previous_metadata;
         fresh.stamp = previous_stamp;
         fresh.pending = previous_pending;
-        return fresh;
+    } else {
+        // A stamp mismatch alone does not say which side is current: the live library may have
+        // flushed while the rescan was reading (previous is current and belongs on disk), or the
+        // file may have changed outside FastPad while it was inactive, e.g. another PC's sync
+        // (the rescan's own read is current). One more stamp, taken now, tells them apart.
+        let previous_is_current = previous_metadata == Metadata::Ready
+            && fresh.metadata == Metadata::Ready
+            && previous_stamp != fresh.stamp
+            && store::stamp(&store::library_file(&fresh.folder)) == previous_stamp;
+
+        if previous_is_current {
+            let mut library = previous_library;
+            ops::replay(&mut library, &fresh.pending);
+            fresh.library = library;
+            fresh.stamp = previous_stamp;
+        } else if fresh.metadata == Metadata::Ready {
+            ops::replay(&mut fresh.library, &previous_pending);
+        }
+
+        let mut pending = std::mem::take(&mut fresh.pending);
+        pending.extend(previous_pending);
+        fresh.pending = pending;
     }
-
-    // A stamp mismatch alone does not say which side is current: the live library may have
-    // flushed while the rescan was reading (previous is current and belongs on disk), or the
-    // file may have changed outside FastPad while it was inactive, e.g. another PC's sync
-    // (the rescan's own read is current). One more stamp, taken now, tells them apart.
-    let previous_is_current = previous_metadata == Metadata::Ready
-        && fresh.metadata == Metadata::Ready
-        && previous_stamp != fresh.stamp
-        && store::stamp(&store::library_file(&fresh.folder)) == previous_stamp;
-
-    if previous_is_current {
-        let mut library = previous_library;
-        ops::replay(&mut library, &fresh.pending);
-        fresh.library = library;
-        fresh.stamp = previous_stamp;
-    } else if fresh.metadata == Metadata::Ready {
-        ops::replay(&mut fresh.library, &previous_pending);
-    }
-
-    let mut pending = fresh.pending;
-    pending.extend(previous_pending);
-    fresh.pending = pending;
+    update_merged_tree(&mut fresh, &touched, &built_pins);
     fresh
+}
+
+/// Brings the rescan's tree up to the merged notes and pins. Only the paths FastPad touched while
+/// the rescan ran can differ from the notes it was built from, and only a pin the merge changed
+/// can differ from its pins, so this runs on the UI thread at the cost of those few paths.
+fn update_merged_tree(state: &mut LibraryState, touched: &[PathBuf], built_pins: &[PathBuf]) {
+    let pins = pinned_paths(&state.library);
+    let pinned: HashSet<String> = pins.iter().map(|path| pin_key(path)).collect();
+    for path in touched {
+        if state.notes.iter().any(|note| same_path(&note.path, path)) {
+            state
+                .tree
+                .insert_note(path, pinned.contains(&pin_key(path)));
+        } else {
+            state.tree.remove_note(path);
+        }
+    }
+    sync_pins(&mut state.tree, built_pins, &pins);
 }
 
 impl LibraryState {
@@ -364,15 +426,26 @@ impl LibraryState {
         NoteRef { id, path: stored }
     }
 
-    /// Applies `op` to the live library and keeps it for the next write.
+    /// Applies `op` to the live library and keeps it for the next write. A pin change moves the
+    /// note's row in the tree.
     pub fn apply(&mut self, op: PendingOp) -> std::result::Result<(), LibraryError> {
         ops::apply(&mut self.library, &op)?;
+        if let PendingOp::SetPinned { note, value } = &op {
+            let path = self
+                .library
+                .note(note.id)
+                .or_else(|| self.library.note_by_path(&note.path))
+                .map(|record| record.path.clone());
+            if let Some(path) = path {
+                self.tree.set_pinned(&path, *value);
+            }
+        }
         self.pending.push(op);
         Ok(())
     }
 
-    /// Adds a file FastPad just saved to the index, if it is a note inside the folder. Updates
-    /// the entry in place when the note is already indexed.
+    /// Adds a file FastPad just saved to the index and the tree, if it is a note inside the
+    /// folder. Updates the entry in place when the note is already indexed.
     pub fn add_note(&mut self, path: &Path) {
         let Some(relative) = strip_folder(&self.folder, path) else {
             return;
@@ -395,6 +468,8 @@ impl LibraryState {
             existing.size = size;
             existing.mtime = mtime;
         } else {
+            let pinned = self.is_pinned(&relative);
+            self.tree.insert_note(&relative, pinned);
             self.notes.push(NoteEntry {
                 path: relative,
                 size,
@@ -408,15 +483,15 @@ impl LibraryState {
             return;
         };
         self.notes.retain(|note| !same_path(&note.path, &stored));
+        self.tree.remove_note(&stored);
         self.touched.push(stored);
     }
 
-    /// Follows a rename FastPad made: the index and any record.
+    /// Follows a rename FastPad made: the record, the index and the tree. The record moves first,
+    /// so the entry added for the new name finds its pin.
     pub fn rename_note(&mut self, old: &Path, new: &Path) {
         let old_stored = record_path(&self.folder, old);
         let new_stored = record_path(&self.folder, new);
-        self.remove_note(old);
-        self.add_note(new);
         if let Some(record) = self.library.note_by_path(&old_stored) {
             let note = NoteRef {
                 id: record.id,
@@ -427,6 +502,8 @@ impl LibraryState {
                 path: new_stored,
             });
         }
+        self.remove_note(old);
+        self.add_note(new);
     }
 }
 
@@ -821,6 +898,7 @@ mod tests {
     }
 
     fn bare_state(scratch: &Scratch, notes: Vec<NoteEntry>, truncated: bool) -> LibraryState {
+        let paths: Vec<PathBuf> = notes.iter().map(|note| note.path.clone()).collect();
         LibraryState {
             folder: scratch.folder(),
             local_path: scratch.local(),
@@ -828,6 +906,7 @@ mod tests {
             metadata: Metadata::Ready,
             stamp: None,
             local: LocalState::new(scratch.folder()),
+            tree: tree::NoteTree::build(&paths, &[]),
             notes,
             truncated,
             pending: Vec::new(),
@@ -1079,5 +1158,136 @@ mod tests {
             "{written:?}"
         );
         assert!(written.ends_with("|b.md\r\n"), "{written:?}");
+    }
+
+    fn tree_rows(tree: &tree::NoteTree) -> Vec<tree::TreeRow> {
+        tree.rows(&|_| true, &[])
+    }
+
+    /// What a fresh build of the state's notes and pins shows.
+    fn rebuilt_rows(state: &LibraryState) -> Vec<tree::TreeRow> {
+        let paths: Vec<PathBuf> = state.notes.iter().map(|note| note.path.clone()).collect();
+        tree_rows(&tree::NoteTree::build(
+            &paths,
+            &pinned_paths(&state.library),
+        ))
+    }
+
+    #[test]
+    fn the_tree_follows_the_index_and_the_pins() {
+        // Break caught: the sidebar tree drifting from the notes index after a save, a pin, a
+        // rename or a delete, so a row opens a file that is gone or a pin shows on the wrong note.
+        let scratch = Scratch::new("tree-follows");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        std::fs::write(scratch.folder().join("a.md"), "a").unwrap();
+        std::fs::write(scratch.folder().join(r"sub\b.md"), "b").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        assert_eq!(state.tree.note_count(), 2);
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+
+        let c = scratch.folder().join("c.md");
+        std::fs::write(&c, "c").unwrap();
+        state.add_note(&c);
+        state.add_note(&c);
+        assert_eq!(state.tree.note_count(), 3);
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+
+        let target = state.note_ref(&mut ids, &c);
+        state
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        assert!(
+            tree_rows(&state.tree)[0].pinned,
+            "a pinned note sorts first"
+        );
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+
+        let renamed = scratch.folder().join(r"sub\z.md");
+        std::fs::rename(&c, &renamed).unwrap();
+        state.rename_note(&c, &renamed);
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+        assert!(
+            tree_rows(&state.tree).iter().any(
+                |row| row.pinned && row.kind == tree::RowKind::Note(PathBuf::from(r"sub\z.md"))
+            ),
+            "the pin follows the rename"
+        );
+
+        state.remove_note(&renamed);
+        state.remove_note(&scratch.folder().join(r"sub\b.md"));
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+        assert!(
+            !tree_rows(&state.tree)
+                .iter()
+                .any(|row| matches!(row.kind, tree::RowKind::Folder(_))),
+            "an emptied folder goes"
+        );
+    }
+
+    #[test]
+    fn merging_a_rescan_leaves_the_tree_equal_to_a_rebuild() {
+        // Break caught: the merged state keeping the rescan's tree, which misses a note saved or
+        // a pin set while the rescan ran.
+        let scratch = Scratch::new("tree-merge");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+        let b = scratch.folder().join("b.md");
+        std::fs::write(&b, "b").unwrap();
+        previous.add_note(&b);
+        let target = previous.note_ref(&mut ids, &a);
+        previous
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        let merged = merge_rescan(previous, fresh);
+        assert_eq!(merged.tree.note_count(), 2);
+        assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
+        assert!(tree_rows(&merged.tree)[0].pinned);
+    }
+
+    #[test]
+    fn a_flush_that_rereads_another_pcs_pins_updates_the_tree() {
+        // Break caught: a pin synced from another PC reaching library.ini and the live library
+        // but never the tree, so the row stays unpinned until the next rescan.
+        let scratch = Scratch::new("tree-flush");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(scratch.folder().join("b.md"), "b").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let target = state.note_ref(&mut ids, &a);
+        state
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        let path = store::library_file(&scratch.folder());
+        let mut other = Library::default();
+        other
+            .resolve_note(&NoteRef {
+                id: NoteId(77),
+                path: "b.md".into(),
+            })
+            .pinned = true;
+        store::write(&path, &other).unwrap();
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+        assert_eq!(
+            tree_rows(&state.tree)
+                .iter()
+                .filter(|row| row.pinned)
+                .count(),
+            2
+        );
     }
 }
