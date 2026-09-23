@@ -185,16 +185,73 @@ pub fn write_local(state: &LibraryState) {
     let _ = local::write(&state.local_path, &state.local);
 }
 
-/// Installs a rescan's result without losing what changed while it ran.
-pub fn merge_rescan(previous: LibraryState, mut fresh: LibraryState) -> LibraryState {
-    if fresh.metadata == Metadata::Ready {
-        ops::replay(&mut fresh.library, &previous.pending);
+/// The notes list for a merged state: an entry whose path is in both lists comes from `fresh`;
+/// an entry only in one of the two lists (the index changed during the rescan: a save, a rename,
+/// a remove) is kept, restamped from disk, only if the file still exists.
+fn merge_notes(folder: &Path, previous: Vec<NoteEntry>, fresh: Vec<NoteEntry>) -> Vec<NoteEntry> {
+    let key = |note: &NoteEntry| note.path.to_string_lossy().to_lowercase();
+    let previous_keys: std::collections::HashSet<String> = previous.iter().map(key).collect();
+    let fresh_keys: std::collections::HashSet<String> = fresh.iter().map(key).collect();
+
+    let mut merged = Vec::new();
+    let mut differing = Vec::new();
+    for note in fresh {
+        if previous_keys.contains(&key(&note)) {
+            merged.push(note);
+        } else {
+            differing.push(note);
+        }
     }
-    let mut pending = previous.pending;
-    pending.append(&mut fresh.pending);
+    for note in previous {
+        if !fresh_keys.contains(&key(&note)) {
+            differing.push(note);
+        }
+    }
+    for note in differing {
+        if let Some(stamp) = store::stamp(&folder.join(&note.path)) {
+            merged.push(NoteEntry { path: note.path, size: stamp.size, mtime: stamp.modified });
+        }
+    }
+    merged
+}
+
+/// Installs a rescan's result without losing what changed while it ran.
+pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState {
+    let LibraryState {
+        library: previous_library,
+        metadata: previous_metadata,
+        stamp: previous_stamp,
+        notes: previous_notes,
+        pending: previous_pending,
+        local: previous_local,
+        ..
+    } = previous;
+    let mut fresh = fresh;
+
+    // The live library (what the UI has shown and already flushed) always wins over a rescan's
+    // snapshot of a since-changed file: replaying the rescan's own reconcile ops on top of it
+    // keeps both what was flushed and what the rescan found, instead of reverting to the state
+    // the rescan read the file in.
+    if previous_metadata == Metadata::Ready
+        && fresh.metadata == Metadata::Ready
+        && previous_stamp != fresh.stamp
+    {
+        let mut library = previous_library;
+        ops::replay(&mut library, &fresh.pending);
+        fresh.library = library;
+        fresh.stamp = previous_stamp;
+    } else if fresh.metadata == Metadata::Ready {
+        ops::replay(&mut fresh.library, &previous_pending);
+    }
+
+    let mut pending = fresh.pending;
+    pending.extend(previous_pending);
     fresh.pending = pending;
-    fresh.local.merge_recent(&previous.local);
-    fresh.local.autosave = previous.local.autosave;
+
+    fresh.notes = merge_notes(&fresh.folder, previous_notes, fresh.notes);
+
+    fresh.local.merge_recent(&previous_local);
+    fresh.local.autosave = previous_local.autosave;
     fresh
 }
 
@@ -220,7 +277,8 @@ impl LibraryState {
         Ok(())
     }
 
-    /// Adds a file FastPad just saved to the index, if it is a note inside the folder.
+    /// Adds a file FastPad just saved to the index, if it is a note inside the folder. Updates
+    /// the entry in place when the note is already indexed.
     pub fn add_note(&mut self, path: &Path) {
         let Some(relative) = strip_folder(&self.folder, path) else {
             return;
@@ -228,11 +286,18 @@ impl LibraryState {
         let is_note = relative
             .extension()
             .is_some_and(|ext| title::is_note_extension(&ext.to_string_lossy()));
-        if !is_note || self.notes.iter().any(|note| same_path(&note.path, &relative)) {
+        if !is_note {
             return;
         }
-        let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-        self.notes.push(NoteEntry { path: relative, size, mtime: 0 });
+        let stamp = store::stamp(path);
+        let size = stamp.map_or(0, |stamp| stamp.size);
+        let mtime = stamp.map_or(0, |stamp| stamp.modified);
+        if let Some(existing) = self.notes.iter_mut().find(|note| same_path(&note.path, &relative)) {
+            existing.size = size;
+            existing.mtime = mtime;
+        } else {
+            self.notes.push(NoteEntry { path: relative, size, mtime });
+        }
     }
 
     pub fn remove_note(&mut self, path: &Path) {
@@ -369,6 +434,28 @@ mod tests {
     }
 
     #[test]
+    fn flush_refuses_to_overwrite_a_library_file_replaced_by_an_unreadable_one() {
+        // Break caught: a flush re-reading the file mid-write, finding it replaced by something
+        // this FastPad cannot parse, and writing over it anyway.
+        let scratch = Scratch::new("flush-unreadable");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let target = state.note_ref(&mut ids, &a);
+        state.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+
+        // Another process replaces library.ini with a file from a newer, unreadable version.
+        let path = store::library_file(&scratch.folder());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "version=9\r\nnote=future\r\n").unwrap();
+
+        assert!(flush(&mut state).is_err());
+        assert_eq!(state.metadata, Metadata::Unreadable);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version=9\r\nnote=future\r\n");
+    }
+
+    #[test]
     fn a_rescan_keeps_changes_made_while_it_ran() {
         let scratch = Scratch::new("rescan");
         let a = scratch.folder().join("a.md");
@@ -383,6 +470,62 @@ mod tests {
         assert!(merged.record_for(&a).unwrap().pinned);
         assert_eq!(merged.pending.len(), 1);
         assert_eq!(merged.local.recent[0].0, 150);
+    }
+
+    #[test]
+    fn a_rescan_does_not_revert_a_favorite_already_flushed_while_it_ran() {
+        // Break caught: merge_rescan replaying an empty pending list onto the rescan's own
+        // (stale) snapshot of the library and installing the rescan's stamp, silently reverting
+        // a change the live library had already flushed to disk before the merge happened.
+        let scratch = Scratch::new("rescan-flush");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+        let target = previous.note_ref(&mut ids, &a);
+        previous.apply(PendingOp::SetFavorite { note: target, value: true }).unwrap();
+        assert!(flush(&mut previous).unwrap());
+
+        let mut merged = merge_rescan(previous, fresh);
+        assert!(merged.record_for(&a).unwrap().favorite, "the flushed favorite is still visible");
+        assert!(!flush(&mut merged).unwrap(), "nothing pending: the flush is a no-op");
+        let reloaded = load(&scratch.folder(), &scratch.local(), 102).unwrap();
+        assert!(reloaded.record_for(&a).unwrap().favorite, "the flush did not revert it");
+    }
+
+    #[test]
+    fn merging_notes_keeps_index_edits_made_during_the_rescan() {
+        // Break caught: merge_rescan taking fresh.notes verbatim, losing a note added or a
+        // rename made through the live index while a background rescan was still running.
+        let scratch = Scratch::new("rescan-notes");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let old = scratch.folder().join("old.md");
+        std::fs::write(&old, "x").unwrap();
+
+        let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+
+        // A note saved through FastPad while the rescan was running: only in `previous`'s index.
+        let b = scratch.folder().join("b.md");
+        std::fs::write(&b, "b").unwrap();
+        previous.add_note(&b);
+
+        // A rename made through FastPad: `fresh` still has the old name (the file no longer
+        // exists there), `previous` has the new one.
+        let renamed = scratch.folder().join("renamed.md");
+        std::fs::rename(&old, &renamed).unwrap();
+        previous.rename_note(&old, &renamed);
+
+        let merged = merge_rescan(previous, fresh);
+        let paths: std::collections::HashSet<_> =
+            merged.notes.iter().map(|note| note.path.to_string_lossy().to_lowercase()).collect();
+        assert!(paths.contains("a.md"));
+        assert!(paths.contains("b.md"), "a note added during the rescan survives");
+        assert!(paths.contains("renamed.md"), "a rename made during the rescan survives");
+        assert!(!paths.contains("old.md"), "the old name is gone from disk and is not kept from fresh");
+        assert_eq!(merged.notes.len(), 3);
     }
 
     #[test]
