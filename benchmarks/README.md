@@ -84,4 +84,7 @@ five runs each):
 Startup with the sidebar is measured with `--notes-folder DIR --sidebar-view notebook` against
 the same folder with `--sidebar-view none`, and compared with `fastpad-bench compare`. No
 milestone may regress, and the idle private working set with a 10,000-note notebook may grow by
-at most 1 MB over the `feat/note-library` build with the same folder.
+at most 1 MB over the `feat/note-library` build with the same notes. Generate that build's
+folder with its own `library-scan DIR --count 10000`: the sidebar build writes a version 2
+`library.ini`, which the library build reports as damaged and never rewrites. Run the two builds
+back to back, in pairs, because the machine drifts between runs.

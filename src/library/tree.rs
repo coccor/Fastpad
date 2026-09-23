@@ -56,19 +56,32 @@ struct Folder {
     folders: Vec<Folder>,
     /// Pinned notes first, each group sorted by `note_order`.
     notes: Vec<Note>,
+    /// The notes' file names back to back, as `OsStr::as_encoded_bytes` gives them. A note holds
+    /// its range, so a notebook of 10,000 notes costs a few buffers, not 10,000 allocations.
+    names: Vec<u8>,
+    /// Bytes of `names` that no note uses any more. `compact` drops them once they are half.
+    unused: usize,
 }
 
-#[derive(Debug)]
+/// One note of a folder: its file name (with its extension) is `Folder::names[start..start+len]`.
+#[derive(Clone, Copy, Debug)]
 struct Note {
-    /// The file name, with its extension.
-    file_name: OsString,
+    start: u32,
+    len: u16,
     pinned: bool,
 }
 
-impl Note {
-    fn name(&self) -> Cow<'_, str> {
-        self.file_name.to_string_lossy()
-    }
+/// `note`'s file name in `names`.
+fn file_name<'a>(names: &'a [u8], note: &Note) -> &'a OsStr {
+    let start = note.start as usize;
+    let bytes = &names[start..start + usize::from(note.len)];
+    // SAFETY: `Folder::push_name` stored these bytes whole from `OsStr::as_encoded_bytes` in
+    // this process, and every range a note holds is exactly one of them.
+    unsafe { OsStr::from_encoded_bytes_unchecked(bytes) }
+}
+
+fn note_name<'a>(names: &'a [u8], note: &Note) -> Cow<'a, str> {
+    file_name(names, note).to_string_lossy()
 }
 
 /// Compares names the way people read them: case-insensitive, with digit runs compared as
@@ -141,11 +154,11 @@ fn note_loose(a: &str, b: &str) -> Ordering {
     natural_cmp(stem_a, stem_b).then_with(|| natural_cmp(extension_a, extension_b))
 }
 
-fn note_order(a: &Note, b: &Note) -> Ordering {
+fn note_order(names: &[u8], a: &Note, b: &Note) -> Ordering {
     b.pinned
         .cmp(&a.pinned)
-        .then_with(|| note_loose(&a.name(), &b.name()))
-        .then_with(|| a.file_name.cmp(&b.file_name))
+        .then_with(|| note_loose(&note_name(names, a), &note_name(names, b)))
+        .then_with(|| file_name(names, a).cmp(file_name(names, b)))
 }
 
 fn folder_order(a: &Folder, b: &Folder) -> Ordering {
@@ -154,7 +167,7 @@ fn folder_order(a: &Folder, b: &Folder) -> Ordering {
 }
 
 /// The folder names and the file name of a plain relative path; `None` for anything else (an
-/// absolute or rooted path, `.` or `..`, or no file name).
+/// absolute or rooted path, `.` or `..`, no file name, or one longer than any file name can be).
 fn split_path(path: &Path) -> Option<(Vec<&OsStr>, &OsStr)> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -164,6 +177,7 @@ fn split_path(path: &Path) -> Option<(Vec<&OsStr>, &OsStr)> {
         }
     }
     let file_name = parts.pop()?;
+    u16::try_from(file_name.as_encoded_bytes().len()).ok()?;
     Some((parts, file_name))
 }
 
@@ -221,14 +235,16 @@ impl Folder {
 
     /// The note named `name` (ignoring case), by binary search in each pin group.
     fn find_note(&self, name: &str) -> Option<usize> {
+        let names = &self.names[..];
         let split = self.pinned_count();
         for (offset, group) in [(0, &self.notes[..split]), (split, &self.notes[split..])] {
-            let start =
-                group.partition_point(|note| note_loose(&note.name(), name) == Ordering::Less);
+            let start = group.partition_point(|note| {
+                note_loose(&note_name(names, note), name) == Ordering::Less
+            });
             let found = group[start..]
                 .iter()
-                .take_while(|note| note_loose(&note.name(), name) == Ordering::Equal)
-                .position(|note| eq_ignore_case(&note.name(), name));
+                .take_while(|note| note_loose(&note_name(names, note), name) == Ordering::Equal)
+                .position(|note| eq_ignore_case(&note_name(names, note), name));
             if let Some(found) = found {
                 return Some(offset + start + found);
             }
@@ -236,43 +252,145 @@ impl Folder {
         None
     }
 
-    fn insert_note(&mut self, note: Note) {
+    /// Stores `file_name` in `names` and returns its note, unplaced. `None` for a name longer
+    /// than any file name can be.
+    fn push_name(&mut self, file_name: &OsStr, pinned: bool) -> Option<Note> {
+        let bytes = file_name.as_encoded_bytes();
+        let len = u16::try_from(bytes.len()).ok()?;
+        let start = u32::try_from(self.names.len()).ok()?;
+        self.names.extend_from_slice(bytes);
+        Some(Note { start, len, pinned })
+    }
+
+    /// Adds a note in its place. `note` comes from `push_name` or from `take_note`.
+    fn place_note(&mut self, note: Note) {
+        let names = &self.names[..];
         let index = self
             .notes
-            .partition_point(|existing| note_order(existing, &note) == Ordering::Less);
+            .partition_point(|existing| note_order(names, existing, &note) == Ordering::Less);
         self.notes.insert(index, note);
     }
 
-    fn finish(&mut self) {
+    /// Takes the note at `index` out of the order; its name stays in `names`.
+    fn take_note(&mut self, index: usize) -> Note {
+        self.notes.remove(index)
+    }
+
+    /// Removes the note at `index` and its name.
+    fn remove_note_at(&mut self, index: usize) {
+        let note = self.notes.remove(index);
+        self.unused += usize::from(note.len);
+        if self.unused * 2 > self.names.len() {
+            self.compact();
+        }
+    }
+
+    /// Rewrites `names` with only the names notes use.
+    fn compact(&mut self) {
+        let mut names = Vec::with_capacity(self.names.len() - self.unused);
+        for note in &mut self.notes {
+            let start = note.start as usize;
+            let bytes = &self.names[start..start + usize::from(note.len)];
+            // At most the old length, which fit.
+            note.start = names.len() as u32;
+            names.extend_from_slice(bytes);
+        }
+        self.names = names;
+        self.unused = 0;
+    }
+
+    /// Sorts what `NoteTree::build` gathered and drops second spellings. Returns how many notes
+    /// were dropped.
+    fn finish(&mut self) -> usize {
         self.folders.sort_by(folder_order);
-        self.notes.sort_by(note_order);
+        let names = &self.names[..];
+        self.notes.sort_by(|a, b| note_order(names, a, b));
+        let dropped = self.drop_second_spellings();
+        self.notes.shrink_to_fit();
+        if self.unused > 0 {
+            self.compact();
+        }
+        self.names.shrink_to_fit();
+        dropped
+    }
+
+    /// A note given twice in different letter case keeps the spelling given first. Both spellings
+    /// have the same pin and sort next to each other; the one given first has the lower `start`.
+    fn drop_second_spellings(&mut self) -> usize {
+        let names = &self.names[..];
+        let notes = &self.notes;
+        let mut dropped = vec![false; notes.len()];
+        let mut run = 0;
+        for end in 1..=notes.len() {
+            if end < notes.len()
+                && notes[end].pinned == notes[run].pinned
+                && note_loose(
+                    &note_name(names, &notes[end]),
+                    &note_name(names, &notes[run]),
+                ) == Ordering::Equal
+            {
+                continue;
+            }
+            for kept in run..end {
+                if dropped[kept] {
+                    continue;
+                }
+                let key = note_name(names, &notes[kept]).to_lowercase();
+                for other in run..end {
+                    if other != kept
+                        && !dropped[other]
+                        && notes[other].start > notes[kept].start
+                        && note_name(names, &notes[other]).to_lowercase() == key
+                    {
+                        dropped[other] = true;
+                    }
+                }
+            }
+            run = end;
+        }
+        let count = dropped.iter().filter(|&&gone| gone).count();
+        if count > 0 {
+            let mut index = 0;
+            let mut unused = 0;
+            self.notes.retain(|note| {
+                let keep = !dropped[index];
+                index += 1;
+                if !keep {
+                    unused += usize::from(note.len);
+                }
+                keep
+            });
+            self.unused += unused;
+        }
+        count
     }
 }
 
 impl NoteTree {
     /// The tree of `notes`, with the ones in `pinned` pinned. Both are relative to the notebook;
     /// a path that is not a plain relative path is skipped, and a second spelling of one note
-    /// (another letter case) is dropped.
-    pub fn build(notes: &[PathBuf], pinned: &[PathBuf]) -> NoteTree {
+    /// (another letter case) is dropped. `notes` is only read: the library builds its tree
+    /// straight from its own note list.
+    pub fn build<'a, P>(notes: impl IntoIterator<Item = &'a P>, pinned: &[PathBuf]) -> NoteTree
+    where
+        P: AsRef<Path> + ?Sized + 'a,
+    {
         let pinned: HashSet<String> = pinned.iter().map(|path| path_key(path)).collect();
         // Folders live in an arena keyed by lower-case relative path, so each note finds its
         // folder in one lookup however many folders there are; they are nested once, at the end.
         let mut arena = vec![Folder::default()];
         let mut parents = vec![0_usize];
         let mut by_key: HashMap<String, usize> = HashMap::new();
-        let mut seen = HashSet::new();
         let mut count = 0;
+        let mut folder_key = String::new();
         for path in notes {
+            let path = path.as_ref();
             let Some((folders, file_name)) = split_path(path) else {
                 continue;
             };
-            let key = path_key(path);
-            let is_pinned = pinned.contains(&key);
-            if !seen.insert(key) {
-                continue;
-            }
+            let is_pinned = !pinned.is_empty() && pinned.contains(&path_key(path));
             let mut current = 0;
-            let mut folder_key = String::new();
+            folder_key.clear();
             for part in folders {
                 if !folder_key.is_empty() {
                     folder_key.push('\\');
@@ -291,11 +409,11 @@ impl NoteTree {
                     }
                 };
             }
-            arena[current].notes.push(Note {
-                file_name: file_name.to_os_string(),
-                pinned: is_pinned,
-            });
-            count += 1;
+            let folder = &mut arena[current];
+            if let Some(note) = folder.push_name(file_name, is_pinned) {
+                folder.notes.push(note);
+                count += 1;
+            }
         }
         // Every folder comes after its parent in the arena, so taking them from the end nests
         // each one before its parent is taken.
@@ -303,11 +421,11 @@ impl NoteTree {
             let (Some(mut folder), Some(parent)) = (arena.pop(), parents.pop()) else {
                 break;
             };
-            folder.finish();
+            count -= folder.finish();
             arena[parent].folders.push(folder);
         }
         let mut root = arena.pop().unwrap_or_default();
-        root.finish();
+        count -= root.finish();
         NoteTree { root, count }
     }
 
@@ -325,11 +443,10 @@ impl NoteTree {
         for part in folders {
             folder = folder.child_or_insert(part);
         }
-        folder.insert_note(Note {
-            file_name: file_name.to_os_string(),
-            pinned,
-        });
-        self.count += 1;
+        if let Some(note) = folder.push_name(file_name, pinned) {
+            folder.place_note(note);
+            self.count += 1;
+        }
     }
 
     /// Removes a note, and every folder that holds nothing after it. Unknown paths do nothing.
@@ -344,7 +461,7 @@ impl NoteTree {
         let Some(index) = folder.find_note(&file_name.to_string_lossy()) else {
             return;
         };
-        folder.notes.remove(index);
+        folder.remove_note_at(index);
         self.count -= 1;
         // Deepest first: each folder left holding nothing goes, up to the first that keeps
         // something.
@@ -380,9 +497,9 @@ impl NoteTree {
         if folder.notes[index].pinned == pinned {
             return;
         }
-        let mut note = folder.notes.remove(index);
+        let mut note = folder.take_note(index);
         note.pinned = pinned;
-        folder.insert_note(note);
+        folder.place_note(note);
     }
 
     /// The visible rows: `unsaved` first, then the root's contents, and inside each folder that
@@ -492,9 +609,9 @@ fn push_notes(rows: &mut Vec<TreeRow>, folder: &Folder, path: &Path, depth: u16,
         &folder.notes[split..]
     };
     rows.extend(notes.iter().map(|note| TreeRow {
-        kind: RowKind::Note(path.join(&note.file_name)),
+        kind: RowKind::Note(path.join(file_name(&folder.names, note))),
         depth,
-        name: split_name(&note.name()).0.to_owned(),
+        name: split_name(&note_name(&folder.names, note)).0.to_owned(),
         pinned: note.pinned,
         expanded: false,
     }));
@@ -904,5 +1021,56 @@ mod tests {
         tree.insert_note(Path::new(r"\rooted.md"), false);
         assert_eq!(outline(&tree.rows(&all, &[])), ["ok"]);
         assert_eq!(tree.note_count(), 1);
+    }
+
+    #[test]
+    fn a_second_spelling_given_to_build_keeps_the_one_given_first() {
+        // Break caught: the compact name store sorting away the input order, so the spelling
+        // kept (or the count) depends on which one sorts first.
+        let tree = build(
+            &["x.md", "X.md", r"Sub\B.md", r"sub\b.md", "x.md", "*.md"],
+            &["X.MD"],
+        );
+        assert_eq!(outline(&tree.rows(&all, &[])), ["x*", "Sub/", "  B", "*"]);
+        assert_eq!(tree.note_count(), 3);
+    }
+
+    #[test]
+    fn names_stay_right_when_removals_compact_their_store() {
+        // Break caught: a note pointing into the old name buffer after a compaction, showing
+        // another note's name or a torn one.
+        let all_notes: Vec<PathBuf> = (0..100)
+            .map(|index| PathBuf::from(format!(r"f\Note {index}.md")))
+            .collect();
+        let mut tree = NoteTree::build(&all_notes, &[]);
+        for path in all_notes.iter().filter(|path| {
+            let name = path.to_string_lossy();
+            !name.ends_with("7.md")
+        }) {
+            tree.remove_note(path);
+        }
+        tree.insert_note(Path::new(r"f\Later.md"), true);
+        tree.set_pinned(Path::new(r"f\Note 17.md"), true);
+        let mut kept: Vec<PathBuf> = all_notes
+            .iter()
+            .filter(|path| path.to_string_lossy().ends_with("7.md"))
+            .cloned()
+            .collect();
+        kept.push(PathBuf::from(r"f\Later.md"));
+        let fresh = NoteTree::build(
+            &kept,
+            &[PathBuf::from(r"f\Later.md"), PathBuf::from(r"f\Note 17.md")],
+        );
+        assert_eq!(tree.rows(&all, &[]), fresh.rows(&all, &[]));
+        assert_eq!(tree.note_count(), 11);
+    }
+
+    #[test]
+    fn a_name_no_file_can_have_is_refused_without_leaving_its_folder() {
+        let long = PathBuf::from("f").join("n".repeat(70_000));
+        let mut tree = NoteTree::build(std::slice::from_ref(&long), &[]);
+        tree.insert_note(&long, false);
+        assert!(tree.rows(&all, &[]).is_empty());
+        assert_eq!(tree.note_count(), 0);
     }
 }

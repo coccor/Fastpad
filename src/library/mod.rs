@@ -230,8 +230,12 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
             mtime: entry.mtime,
         })
         .collect();
-    let paths: Vec<PathBuf> = notes.iter().map(|note| note.path.clone()).collect();
-    let tree = tree::NoteTree::build(&paths, &pinned_paths(&library));
+    // Built from the note list itself: a copy of 10,000 paths would outlive the scan as freed
+    // heap in the idle working set.
+    let tree = tree::NoteTree::build(
+        notes.iter().map(|note| note.path.as_path()),
+        &pinned_paths(&library),
+    );
     Ok(LibraryState {
         folder: folder.to_path_buf(),
         local_path: local_path.to_path_buf(),

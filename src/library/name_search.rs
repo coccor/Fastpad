@@ -21,7 +21,7 @@ struct Candidate<'a> {
     inside: bool,
     name: String,
     folder: String,
-    path: &'a PathBuf,
+    path: &'a Path,
 }
 
 /// Prefix matches first, then by name, then by folder (the root first), then by exact path.
@@ -34,13 +34,21 @@ fn rank(a: &Candidate<'_>, b: &Candidate<'_>) -> Ordering {
 }
 
 /// The notes whose name contains `query` (trimmed, ignoring case), best first, at most `limit`.
-pub fn search(notes: &[PathBuf], query: &str, limit: usize) -> Vec<NameMatch> {
+pub fn search<'a, P>(
+    notes: impl IntoIterator<Item = &'a P>,
+    query: &str,
+    limit: usize,
+) -> Vec<NameMatch>
+where
+    P: AsRef<Path> + ?Sized + 'a,
+{
     let query = query.trim().to_lowercase();
     if query.is_empty() || limit == 0 {
         return Vec::new();
     }
     let mut found: Vec<Candidate<'_>> = Vec::new();
     for path in notes {
+        let path = path.as_ref();
         let Some(stem) = path.file_stem() else {
             continue;
         };
@@ -64,7 +72,7 @@ pub fn search(notes: &[PathBuf], query: &str, limit: usize) -> Vec<NameMatch> {
     found
         .into_iter()
         .map(|candidate| NameMatch {
-            path: candidate.path.clone(),
+            path: candidate.path.to_path_buf(),
             name: candidate.name,
             folder: candidate.folder,
         })

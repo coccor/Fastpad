@@ -929,7 +929,7 @@ where
         record_milestone(hwnd, Milestone::EditorCreated)?;
     }
     // The sidebar comes with the window, before first paint, from the settings bootstrap read.
-    crate::window::side_panel::notes_mode_changed(hwnd, notes_mode_enabled(hwnd));
+    crate::window::side_panel::create_for_first_frame(hwnd, notes_mode_enabled(hwnd));
     Ok(editor_hwnd)
 }
 
@@ -2301,16 +2301,29 @@ fn apply_loaded_settings(
     settings: crate::config::Settings,
     warnings: Vec<crate::config::SettingWarning>,
 ) {
+    let mut sidebar_changed = true;
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_mut() };
+        let sidebar = |settings: &crate::config::Settings| {
+            (
+                settings.notes_mode,
+                settings.sidebar_view,
+                settings.sidebar_width,
+            )
+        };
+        // Settings `bootstrap::run` preloaded already made the sidebar the first frame shows.
+        sidebar_changed = sidebar(&app.settings) != sidebar(&settings)
+            || app.sidebar.is_some() != settings.notes_mode;
         app.settings = settings;
         for warning in &warnings {
             app.notifications.push(settings_warning_message(warning));
         }
     }
     apply_editor_settings(hwnd);
-    let notes_mode = notes_mode_enabled(hwnd);
-    crate::window::side_panel::notes_mode_changed(hwnd, notes_mode);
+    if sidebar_changed {
+        let notes_mode = notes_mode_enabled(hwnd);
+        crate::window::side_panel::notes_mode_changed(hwnd, notes_mode);
+    }
 }
 
 fn settings_warning_message(warning: &crate::config::SettingWarning) -> String {
@@ -6490,6 +6503,8 @@ mod tests {
             super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
         }
         .unwrap();
+        // What the first WM_SIZE does once `bootstrap::run` shows the window.
+        super::layout_editor_and_find_bar(window.hwnd);
         unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
             .editor
             .clone()
@@ -6502,6 +6517,18 @@ mod tests {
             .as_ref()
             .expect("notes mode shows the sidebar");
         (sidebar.bar, sidebar.panel)
+    }
+
+    /// Moves the pointer onto the activity bar, which makes its tooltip.
+    fn hover_bar(bar: HWND) {
+        unsafe {
+            SendMessageW(
+                bar,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+                0,
+                client_lparam(10, 60),
+            );
+        }
     }
 
     fn client_lparam(x: i32, y: i32) -> super::LPARAM {
@@ -6627,6 +6654,7 @@ mod tests {
         app_mut(window.hwnd).settings.notes_mode = true;
         crate::window::side_panel::notes_mode_changed(window.hwnd, true);
         let (bar, _) = sidebar_windows(window.hwnd);
+        hover_bar(bar);
         let tip = app_mut(window.hwnd)
             .sidebar
             .as_ref()
@@ -6668,6 +6696,16 @@ mod tests {
         assert_eq!(super::title_layout(window.hwnd).tab(0).left, left);
         assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
         assert_eq!(client_size(editor.hwnd()).0, width - left);
+        // Nothing before the pointer needs the tooltip, so the first frame goes without it.
+        assert!(
+            app_mut(window.hwnd)
+                .sidebar
+                .as_ref()
+                .unwrap()
+                .tooltip
+                .is_none()
+        );
+        hover_bar(bar);
         assert_eq!(
             app_mut(window.hwnd)
                 .sidebar
@@ -10728,6 +10766,46 @@ mod tests {
         assert_eq!(
             unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit) },
             0
+        );
+    }
+
+    #[test]
+    fn a_hidden_search_view_searches_again_only_once_it_shows() {
+        // Break caught: every library refresh re-running a query nobody sees, or the results
+        // staying stale when the Search view comes back.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-stale");
+        scratch.note("plan.md", "p");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        use crate::config::SidebarView;
+        // The box is made when the Search view first shows, not with the sidebar.
+        assert!(crate::window::search_view::edit_hwnd(window.hwnd).is_none());
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
+        assert!(crate::window::search_view::edit_hwnd(window.hwnd).is_some());
+        type_into_search(window.hwnd, "pl");
+        assert_eq!(
+            crate::window::search_view::shown_results(window.hwnd).len(),
+            1
+        );
+
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+        let added = scratch.note("planning.md", "q");
+        crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+        crate::window::side_panel::refresh(window.hwnd);
+        assert_eq!(
+            crate::window::search_view::shown_results(window.hwnd).len(),
+            1,
+            "a hidden Search view is not searched again"
+        );
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
+        assert_eq!(
+            crate::window::search_view::shown_results(window.hwnd),
+            vec![
+                ("plan".to_owned(), String::new()),
+                ("planning".to_owned(), String::new())
+            ]
         );
     }
 

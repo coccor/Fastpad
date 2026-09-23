@@ -115,7 +115,10 @@ impl UiFonts {
 pub(crate) struct Sidebar {
     pub(crate) bar: HWND,
     pub(crate) panel: HWND,
+    /// The activity bar's tooltip, made when the pointer first moves over the bar.
     pub(crate) tooltip: Option<Tooltip>,
+    /// The tooltip could not be made; it is not tried again.
+    tooltip_failed: bool,
     pub(crate) bar_state: BarState,
     /// The activity-bar button the keyboard is on (`bar_focus`).
     pub(crate) bar_focus: usize,
@@ -321,6 +324,9 @@ pub(crate) fn left_edge(hwnd: HWND) -> i32 {
     activity + panel
 }
 
+/// The activity bar and the panel with their state. Only what the first frame paints is made
+/// here: the tooltip waits for the pointer (`bar_pointer_moved`) and the search box for the
+/// Search view (`search_view::layout`), so the sidebar adds little before first paint.
 pub(crate) fn create(hwnd: HWND) -> crate::Result<Sidebar> {
     let bar = create_child(
         hwnd,
@@ -337,34 +343,24 @@ pub(crate) fn create(hwnd: HWND) -> crate::Result<Sidebar> {
         }
     };
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-    let search = match crate::window::search_view::SearchView::create(panel, dpi) {
-        Ok(search) => search,
-        Err(error) => {
-            unsafe {
-                DestroyWindow(panel);
-                DestroyWindow(bar);
-            }
-            return Err(error);
-        }
-    };
     Ok(Sidebar {
         bar,
         panel,
-        tooltip: Tooltip::create(bar),
+        tooltip: None,
+        tooltip_failed: false,
         bar_state: BarState::default(),
         bar_focus: 0,
         notebook: crate::window::notebook_view::NotebookView::new(panel),
         favorites: crate::window::favorites_view::FavoritesView::new(dpi),
-        search,
+        search: crate::window::search_view::SearchView::new(panel, dpi),
         last_view: SidebarView::Notebook,
         drag_width: None,
         fonts: None,
     })
 }
 
-/// Creates or destroys the sidebar to match notes mode, then lays the window out again. It also
-/// runs once `fastpad.ini` has been applied, to pick up the saved view.
-pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
+/// Creates or destroys the sidebar to match notes mode, without laying the window out.
+fn sync_presence(hwnd: HWND, enabled: bool) {
     let present =
         unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.sidebar.is_some());
     if enabled && !present {
@@ -394,8 +390,21 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
             sidebar.last_view = view;
         }
     }
+}
+
+/// Creates or destroys the sidebar to match notes mode, then lays the window out again. It also
+/// runs once `fastpad.ini` has been applied, when that changed the notes mode or the sidebar.
+pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
+    sync_presence(hwnd, enabled);
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
+}
+
+/// The sidebar for the window's first frame, made from the settings `bootstrap::run` read. It is
+/// not laid out here: the first `WM_SIZE`, when `bootstrap::run` shows the window, lays it out
+/// with everything else, before anything paints.
+pub(crate) fn create_for_first_frame(hwnd: HWND, enabled: bool) {
+    sync_presence(hwnd, enabled);
 }
 
 /// Destroys the sidebar's windows. The tooltips are owned by the main window, not the bar or the
@@ -568,6 +577,38 @@ pub(crate) fn refresh(hwnd: HWND) {
 /// active note's row and expands its folders.
 pub(crate) fn active_tab_changed(hwnd: HWND) {
     with_accessible_events(hwnd, || active_tab_changed_now(hwnd));
+}
+
+/// The pointer moved over the activity bar (`message` is the bar's mouse message). The first
+/// move makes the bar's tooltip, which nothing before it needs, and hands it that move.
+pub(crate) fn bar_pointer_moved(
+    hwnd: HWND,
+    bar: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) {
+    let wanted = with_sidebar(hwnd, |sidebar| {
+        sidebar.tooltip.is_none() && !sidebar.tooltip_failed
+    })
+    .unwrap_or(false);
+    if !wanted {
+        return;
+    }
+    // Made with nothing of the App borrowed: creating the control sends messages.
+    let tooltip = Tooltip::create(bar);
+    let kept = with_sidebar(hwnd, |sidebar| {
+        sidebar.tooltip = tooltip;
+        sidebar.tooltip_failed = tooltip.is_none();
+    });
+    match (tooltip, kept) {
+        (Some(tooltip), Some(())) => {
+            update_tools(hwnd);
+            tooltip.relay(message, wparam, lparam);
+        }
+        (Some(tooltip), None) => tooltip.destroy(),
+        _ => {}
+    }
 }
 
 fn update_tools(hwnd: HWND) {

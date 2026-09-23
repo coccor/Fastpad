@@ -195,6 +195,7 @@ unsafe extern "system" fn bar_proc(
             }
         }
         WM_MOUSEMOVE => {
+            side_panel::bar_pointer_moved(main, bar, message, wparam, lparam);
             let (x, y) = point_of(lparam);
             hover(main, bar, button_at(&rects_for(bar), x, y));
             0

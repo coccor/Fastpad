@@ -4,15 +4,15 @@
 //! calls `Tooltip::destroy` too.
 
 use crate::platform::wide_null;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASS, TTF_SUBCLASS,
-    TTM_ADDTOOLW, TTM_DELTOOLW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+    TTM_ADDTOOLW, TTM_DELTOOLW, TTM_RELAYEVENT, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DestroyWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SendMessageW, SetWindowPos, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, DestroyWindow, GetCursorPos, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, WS_EX_TOPMOST, WS_POPUP,
 };
 
 /// FastPad has no comctl32 v6 manifest. The v5 control rejects the full `TTTOOLINFOW` size, and
@@ -100,6 +100,24 @@ impl Tooltip {
                 0,
                 &mut info as *mut TTTOOLINFOW as LPARAM,
             );
+        }
+    }
+
+    /// Hands the control a mouse message of `owner` that its subclass did not see: the one that
+    /// made it, so the first hover starts the tip's timer like any later one.
+    pub(crate) fn relay(&self, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        let mut point = POINT::default();
+        unsafe { GetCursorPos(&mut point) };
+        let msg = MSG {
+            hwnd: self.owner,
+            message,
+            wParam: wparam,
+            lParam: lparam,
+            pt: point,
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(self.hwnd, TTM_RELAYEVENT, 0, &msg as *const MSG as LPARAM);
         }
     }
 

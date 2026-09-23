@@ -361,7 +361,27 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 - **Outline items report their level** as the MSAA value, as tree views do.
 - **`fastpad.ini` is read before the window exists.** `bootstrap::run` reads it once, so the
   activity bar and panel paint their saved view and width in the first frame, and
-  `WM_FASTPAD_LOAD_SETTINGS` only applies it and reports its warnings.
+  `WM_FASTPAD_LOAD_SETTINGS` only applies it and reports its warnings. It re-lays the sidebar
+  out only when what it applies differs from what the first frame used. The read itself costs
+  about 0.15 ms, so the plan's fallback (reading it after first paint) was not needed.
+- **Only the bar and the panel windows are made before first paint.** The window's first
+  `WM_SIZE`, when `bootstrap::run` shows it, lays them out; nothing else does before then. The
+  activity bar's tooltip (and with it `InitCommonControlsEx`) is made the first time the pointer
+  moves over the bar, and that move is relayed to it. The search box is made the first time the
+  Search view shows a notebook. Measured with Task 14's method (`--runs 30 --warmup 5`, a 10,000
+  note notebook, `feat/note-library` on its own version 1 fixture, three back-to-back pairs), the
+  sidebar build with the Notebook view open showed no `compare` regression, and its p50s were
+  about 0.5 to 1.0 ms later for first input and 0.6 to 2.0 ms later for first paint. Before this
+  they were about 3 ms and 2.5 ms later. What remains is making the two windows and laying out
+  and painting them in the first frame.
+- **The tree stores each folder's note names in one buffer.** A note is 8 bytes (a range and
+  its pin), and the tree is built straight from the library's note list, not from a copy of it.
+  A second spelling of one note is dropped per folder, after sorting, keeping the spelling given
+  first. With these changes the idle working set with a 10,000-note notebook grew by 0.56 to
+  0.65 MB over `feat/note-library` (it was 1.5 MB).
+- **Search runs over the library's own note list** and keeps no copy of it. A library change
+  while the Search view is hidden only marks its results stale; the query runs again when the
+  view shows.
 - **A favorite opens asynchronously.** The Favorites view shows the Notebook view once the
   worker has found the folder, so a missing favorite changes nothing, the view included.
 - **Name search lowercases on each call, with no cached lower-case copy** (a deviation from

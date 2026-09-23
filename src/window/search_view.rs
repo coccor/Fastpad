@@ -102,16 +102,19 @@ fn window_text(hwnd: HWND) -> String {
 
 #[derive(Debug)]
 pub(crate) struct SearchView {
-    edit: HWND,
+    panel: HWND,
+    /// The search box, made the first time the Search view shows a notebook (`layout`).
+    edit: Option<HWND>,
+    /// Making the box failed and was reported; it is not tried again.
+    edit_failed: bool,
     brush: HBRUSH,
     colors: Palette,
     notebook: Option<PathBuf>,
     /// The library's state has loaded, so an empty result list means no match.
     loaded: bool,
-    /// The notebook's note paths, relative to it. They are copied from the library on the first
-    /// search after a change and dropped when the library changes, so an idle Search view holds
-    /// nothing.
-    notes: Option<Vec<PathBuf>>,
+    /// The library changed while the view was hidden: the query runs again when it shows. The
+    /// search runs over the library's own note list, so the view never holds a copy of it.
+    stale: bool,
     pub(crate) query: String,
     pub(crate) results: Vec<NameMatch>,
     pub(crate) list: RowListState,
@@ -123,31 +126,25 @@ pub(crate) struct SearchView {
 }
 
 impl SearchView {
-    /// Creates the hidden search box inside `panel`.
-    pub(crate) fn create(panel: HWND, dpi: u32) -> crate::Result<Self> {
-        let edit = create_child(panel, &wide_null("Edit"), WS_CHILD | ES_AUTOHSCROLL as u32)?;
-        if unsafe { SetWindowSubclass(edit, Some(search_edit_proc), SEARCH_HOOK_ID, 0) } == 0 {
-            let error = last_error();
-            unsafe {
-                DestroyWindow(edit);
-            }
-            return Err(error);
-        }
+    /// The view for `panel`. Its search box waits until the view first shows a notebook.
+    pub(crate) fn new(panel: HWND, dpi: u32) -> Self {
         let colors = Palette::neutral();
-        Ok(Self {
-            edit,
+        Self {
+            panel,
+            edit: None,
+            edit_failed: false,
             brush: unsafe { CreateSolidBrush(colors.editor_background) },
             colors,
             notebook: None,
             loaded: false,
-            notes: None,
+            stale: false,
             query: String::new(),
             results: Vec::new(),
             list: RowListState::new(scale(ROW_AT_96_DPI, dpi)),
             placeholder: placeholder(None),
             thumb_grab: None,
             order: 0,
-        })
+        }
     }
 
     /// The painted search field, border included.
@@ -182,15 +179,9 @@ impl SearchView {
         self.colors = colors;
     }
 
-    /// Recomputes the results for `query`, with the first one selected.
-    fn filter(&mut self, query: &str, client: RECT, dpi: u32) {
+    /// Shows `results`, found for `query`, with the first one selected.
+    fn set_results(&mut self, query: &str, results: Vec<NameMatch>, client: RECT, dpi: u32) {
         self.query = query.to_owned();
-        let results = match &self.notes {
-            Some(notes) if !query.trim().is_empty() => {
-                name_search::search(notes, query, RESULT_LIMIT)
-            }
-            _ => Vec::new(),
-        };
         if results != self.results {
             self.order = self.order.wrapping_add(1);
         }
@@ -375,35 +366,34 @@ fn point(lparam: LPARAM) -> POINT {
 
 /// `EN_CHANGE` from the box: re-runs the search.
 pub(crate) fn query_changed(hwnd: HWND) {
-    let Some(edit) = with_view(hwnd, |view| view.edit) else {
+    let Some(edit) = with_view(hwnd, |view| view.edit).flatten() else {
         return;
     };
     let query = window_text(edit);
-    let needs_notes =
-        !query.trim().is_empty() && with_view(hwnd, |view| view.notes.is_none()).unwrap_or(false);
-    if needs_notes {
-        let notes = library_host::with_state(hwnd, |state| {
-            state
-                .notes
-                .iter()
-                .map(|note| note.path.clone())
-                .collect::<Vec<_>>()
-        });
-        with_view(hwnd, |view| {
-            view.loaded = notes.is_some();
-            if notes.is_some() {
-                view.notes = notes;
-            }
-        });
-    }
+    // Searched in place in the library's note list: the view keeps no copy of it.
+    let found = library_host::with_state(hwnd, |state| {
+        if query.trim().is_empty() {
+            Vec::new()
+        } else {
+            name_search::search(
+                state.notes.iter().map(|note| note.path.as_path()),
+                &query,
+                RESULT_LIMIT,
+            )
+        }
+    });
     let panel = unsafe { GetParent(edit) };
     let (client, dpi) = geometry(panel);
-    with_view(hwnd, |view| view.filter(&query, client, dpi));
+    with_view(hwnd, |view| {
+        view.loaded = found.is_some();
+        view.stale = false;
+        view.set_results(&query, found.unwrap_or_default(), client, dpi);
+    });
     invalidate(panel);
 }
 
 /// Part of `side_panel::refresh`. A new notebook clears the query. The same notebook re-runs it
-/// against the changed note list.
+/// against the changed note list, or, while the view is hidden, once it shows again.
 pub(crate) fn library_changed(hwnd: HWND) {
     let notebook = library_host::folder(hwnd);
     let loaded = library_host::with_state(hwnd, |_| ()).is_some();
@@ -413,7 +403,6 @@ pub(crate) fn library_changed(hwnd: HWND) {
             (None, None) => false,
             _ => true,
         };
-        view.notes = None;
         view.loaded = loaded;
         if changed {
             view.notebook = notebook.clone();
@@ -425,22 +414,74 @@ pub(crate) fn library_changed(hwnd: HWND) {
     };
     if changed {
         // Clearing the box sends EN_CHANGE, which empties the results.
-        let empty = wide_null("");
-        unsafe {
-            SetWindowTextW(edit, empty.as_ptr());
-            InvalidateRect(edit, std::ptr::null(), 1);
+        if let Some(edit) = edit {
+            let empty = wide_null("");
+            unsafe {
+                SetWindowTextW(edit, empty.as_ptr());
+                InvalidateRect(edit, std::ptr::null(), 1);
+            }
         }
         layout(hwnd);
-    } else {
+    } else if side_panel::current_view(hwnd) == SidebarView::Search {
         query_changed(hwnd);
+    } else {
+        with_view(hwnd, |view| view.stale = true);
     }
 }
 
-/// Places the box in the header and shows it while the Search view shows a notebook. Part of
-/// `side_panel::layout`, and run whenever the view or the notebook changes.
+/// The search box, made now if the view has none yet. A failure is reported once.
+fn ensure_edit(hwnd: HWND) -> Option<HWND> {
+    let (panel, edit, failed) = with_view(hwnd, |view| (view.panel, view.edit, view.edit_failed))?;
+    if edit.is_some() || failed {
+        return edit;
+    }
+    // Made with nothing of the App borrowed: creating the Edit sends messages to the panel.
+    match create_edit(panel) {
+        Ok(edit) => {
+            if with_view(hwnd, |view| view.edit = Some(edit)).is_none() {
+                unsafe { DestroyWindow(edit) };
+                return None;
+            }
+            Some(edit)
+        }
+        Err(error) => {
+            with_view(hwnd, |view| view.edit_failed = true);
+            super::main_window::push_notice(
+                hwnd,
+                format!("FastPad could not show the search box: {error}"),
+            );
+            None
+        }
+    }
+}
+
+/// A hidden search box inside `panel`.
+fn create_edit(panel: HWND) -> crate::Result<HWND> {
+    let edit = create_child(panel, &wide_null("Edit"), WS_CHILD | ES_AUTOHSCROLL as u32)?;
+    if unsafe { SetWindowSubclass(edit, Some(search_edit_proc), SEARCH_HOOK_ID, 0) } == 0 {
+        let error = last_error();
+        unsafe {
+            DestroyWindow(edit);
+        }
+        return Err(error);
+    }
+    Ok(edit)
+}
+
+/// Places the box in the header and shows it while the Search view shows a notebook, making it
+/// the first time. Part of `side_panel::layout`, and run whenever the view or the notebook
+/// changes.
 pub(crate) fn layout(hwnd: HWND) {
-    let Some((edit, has_notebook)) = with_view(hwnd, |view| (view.edit, view.notebook.is_some()))
-    else {
+    let Some(has_notebook) = with_view(hwnd, |view| view.notebook.is_some()) else {
+        return;
+    };
+    let show = has_notebook && side_panel::current_view(hwnd) == SidebarView::Search;
+    let edit = if show {
+        ensure_edit(hwnd)
+    } else {
+        with_view(hwnd, |view| view.edit).flatten()
+    };
+    let Some(edit) = edit else {
         return;
     };
     let panel = unsafe { GetParent(edit) };
@@ -468,7 +509,6 @@ pub(crate) fn layout(hwnd: HWND) {
     with_view(hwnd, |view| {
         view.list.row_height = scale(ROW_AT_96_DPI, dpi)
     });
-    let show = has_notebook && side_panel::current_view(hwnd) == SidebarView::Search;
     if show {
         unsafe {
             ShowWindow(edit, SW_SHOWNA);
@@ -489,29 +529,37 @@ fn hide_box(edit: HWND) {
     }
 }
 
-/// `side_panel::show_view` switched to Search. `focus` puts the caret in the box (Ctrl+K).
+/// `side_panel::show_view` switched to Search. `focus` puts the caret in the box (Ctrl+K). A
+/// library change while the view was hidden runs the query again now.
 pub(crate) fn shown(hwnd: HWND, focus: bool) {
     layout(hwnd);
-    let Some((edit, has_notebook)) = with_view(hwnd, |view| (view.edit, view.notebook.is_some()))
-    else {
+    if with_view(hwnd, |view| std::mem::take(&mut view.stale)).unwrap_or(false) {
+        query_changed(hwnd);
+    }
+    let Some((panel, edit, has_notebook)) = with_view(hwnd, |view| {
+        (view.panel, view.edit, view.notebook.is_some())
+    }) else {
         return;
     };
     if !focus {
         return;
     }
     unsafe {
-        if has_notebook {
-            SetFocus(edit);
-            SendMessageW(edit, EM_SETSEL, 0, -1);
-        } else {
-            SetFocus(GetParent(edit));
+        match edit {
+            Some(edit) if has_notebook => {
+                SetFocus(edit);
+                SendMessageW(edit, EM_SETSEL, 0, -1);
+            }
+            _ => {
+                SetFocus(panel);
+            }
         }
     }
 }
 
 /// `side_panel::show_view` switched away from Search. The query stays.
 pub(crate) fn hidden(hwnd: HWND) {
-    if let Some(edit) = with_view(hwnd, |view| view.edit) {
+    if let Some(edit) = with_view(hwnd, |view| view.edit).flatten() {
         hide_box(edit);
     }
 }
@@ -701,7 +749,7 @@ pub(crate) fn handle(
             })
             .unwrap_or(true);
             if key == VK_UP && at_top {
-                if let Some(edit) = with_view(hwnd, |view| view.edit) {
+                if let Some(edit) = with_view(hwnd, |view| view.edit).flatten() {
                     unsafe {
                         SetFocus(edit);
                     }
@@ -718,7 +766,7 @@ pub(crate) fn handle(
         }
         // Typing in the list goes on in the box.
         WM_CHAR if (wparam as u32) >= 0x20 && wparam as u32 != 0x7f => {
-            let edit = with_view(hwnd, |view| view.edit)?;
+            let edit = with_view(hwnd, |view| view.edit).flatten()?;
             unsafe {
                 SetFocus(edit);
                 SendMessageW(edit, WM_CHAR, wparam, lparam);
@@ -850,7 +898,7 @@ pub(crate) fn status(hwnd: HWND) -> Option<&'static str> {
 
 #[cfg(test)]
 pub(crate) fn edit_hwnd(hwnd: HWND) -> Option<HWND> {
-    with_view(hwnd, |view| view.edit)
+    with_view(hwnd, |view| view.edit).flatten()
 }
 
 impl crate::window::sidebar_accessibility::AccessibleView for SearchView {
