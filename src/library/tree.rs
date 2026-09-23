@@ -475,6 +475,7 @@ impl NoteTree {
     }
 
     /// Moves `old`'s row to `new`, keeping its pin. Does nothing when `old` is not in the tree.
+    #[cfg(test)]
     pub fn rename_note(&mut self, old: &Path, new: &Path) {
         if let Some(pinned) = self.note_pinned(old) {
             self.remove_note(old);
@@ -579,6 +580,7 @@ impl NoteTree {
         folder
     }
 
+    #[cfg(test)]
     fn note_pinned(&self, path: &Path) -> Option<bool> {
         let (folders, file_name) = split_path(path)?;
         let mut folder = &self.root;

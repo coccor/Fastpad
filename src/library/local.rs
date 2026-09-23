@@ -439,6 +439,21 @@ mod tests {
     }
 
     #[test]
+    fn unknown_lines_in_a_local_file_are_ignored() {
+        // Break caught: a line FastPad does not know (a key a later build adds, or one a hand
+        // edit left) making the whole file unreadable, which throws away the scan cache, the
+        // expanded folders and the notebook's autosave switch.
+        let text = "version=1\r\nfolder=D:\\Notes\r\nautosave=false\r\nfuture=x|y\r\n\
+                    no equals sign\r\nexpanded=sub\r\n\
+                    missing=5|00000000000000000000000000000009\r\n";
+        let state = LocalState::parse(text, Path::new(r"D:\Notes")).unwrap();
+        assert!(!state.autosave);
+        assert_eq!(state.expanded, [PathBuf::from("sub")]);
+        assert_eq!(state.missing, [(5, NoteId(9))]);
+        assert!(!state.encode().contains("future="));
+    }
+
+    #[test]
     fn expanded_folders_are_kept_once_ignoring_case_and_collapse_away() {
         // Break caught: expanding a folder twice writing two lines, or collapsing `Sub` leaving
         // `sub` expanded.

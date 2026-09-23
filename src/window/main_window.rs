@@ -9420,7 +9420,11 @@ mod tests {
         execute_command(window.hwnd, CommandId::NoteTogglePin);
         crate::window::library_host::flush_now(window.hwnd);
         assert_eq!(std::fs::read_to_string(&ini).unwrap(), "version=99\r\n");
-        assert!(notices(window.hwnd).iter().any(|n| n.contains("read-only")));
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("can't be read, so pins are off until it is fixed or removed"))
+        );
     }
 
     #[test]

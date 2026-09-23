@@ -29,6 +29,9 @@ use windows_sys::core::{BSTR, GUID, HRESULT};
 
 static LIBRARY_TEST_LOCK: Mutex<()> = Mutex::new(());
 const WAIT: Duration = Duration::from_secs(5);
+/// For the steps that wait on a rescan, a rebind and then a one-second autosave in turn: under
+/// the full suite's load that chain can outlast `WAIT`.
+const RESCAN_CHAIN_WAIT: Duration = Duration::from_secs(15);
 
 /// A scratch `LOCALAPPDATA` (`<root>`, with `FastPad\` inside) and a notes folder beside it.
 struct Scratch {
@@ -103,7 +106,11 @@ fn command(hwnd: HWND, command: CommandId) {
 }
 
 fn wait_until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Deadline::after(WAIT);
+    wait_within(WAIT, what, done);
+}
+
+fn wait_within(wait: Duration, what: &str, done: impl Fn() -> bool) {
+    let deadline = Deadline::after(wait);
     while !done() {
         assert!(!deadline.expired(), "timed out waiting for {what}");
         deadline.sleep_step();
@@ -119,6 +126,14 @@ fn wait_for_library(data: &Scratch) {
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// The main window's text: "<active tab's title> - FastPad".
+fn window_text(hwnd: HWND) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let mut text = [0_u16; 260];
+    let length = unsafe { GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32) };
+    String::from_utf16_lossy(&text[..length.max(0) as usize])
 }
 
 /// Types `text` into a document that already holds text (`send_text` waits for the whole
@@ -485,7 +500,7 @@ fn a_note_keeps_its_pin_after_being_renamed_in_explorer() {
     unsafe {
         PostMessageW(hwnd, WM_ACTIVATEAPP, 1, 0);
     }
-    wait_until("the record to follow the rename", || {
+    wait_within(RESCAN_CHAIN_WAIT, "the record to follow the rename", || {
         read(&data.library_ini()).ends_with("|b.md\r\n")
     });
     let library = read(&data.library_ini());
@@ -502,11 +517,17 @@ fn a_note_keeps_its_pin_after_being_renamed_in_explorer() {
         "the pin must follow the rename: {renamed:?}"
     );
     // The open tab followed too: its next autosave lands in b.md and never re-creates a.md.
+    // Waiting for the rebind first makes sure the edit below is autosaved under the new name.
+    wait_within(RESCAN_CHAIN_WAIT, "the tab to follow the rename", || {
+        window_text(hwnd) == "b.md - FastPad"
+    });
     let moved = data.folder().join("b.md");
     type_more(editor, "z");
-    wait_until("the tab to autosave into the renamed file", || {
-        scintilla_text(editor).is_ok_and(|t| t.len() == 2 && read(&moved) == t)
-    });
+    wait_within(
+        RESCAN_CHAIN_WAIT,
+        "the tab to autosave into the renamed file",
+        || scintilla_text(editor).is_ok_and(|t| t.len() == 2 && read(&moved) == t),
+    );
     assert!(!note.exists(), "the old name must not be re-created");
     close(process, hwnd);
 }

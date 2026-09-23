@@ -2210,7 +2210,7 @@ pub(crate) fn notes_mode_notice(enabled: bool) -> &'static str {
     }
 }
 
-const READ_ONLY: &str = "This notebook's .fastpad\\library.ini is damaged or from a newer FastPad, so pins are read-only.";
+const READ_ONLY: &str = "This notebook's .fastpad\\library.ini can't be read, so pins are off until it is fixed or removed.";
 const BUSY: &str = "This notebook's .fastpad\\library.ini is in use by another program. FastPad reads it again when you come back to the window.";
 
 /// True when organizing can proceed; otherwise explains why not.
