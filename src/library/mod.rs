@@ -7,3 +7,4 @@ pub mod local;
 pub mod model;
 pub mod ops;
 pub mod store;
+pub mod title;
