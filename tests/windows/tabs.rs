@@ -90,7 +90,8 @@ fn retained_accessibility_provider_tracks_current_tabs_and_rejects_removed_tab()
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
     send_text(editor, "second")?;
     assert_eq!(accessible.child_count()?, 6);
-    assert_eq!(accessible.name(2)?, "Untitled *");
+    // Notes mode is on by default: the new tab is labelled by its first line.
+    assert_eq!(accessible.name(2)?, "second *");
 
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0) };
