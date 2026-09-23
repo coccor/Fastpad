@@ -61,6 +61,9 @@ pub enum CommandId {
     ToggleNotesMode,
     OpenFolder,
     OpenRecentFolder,
+    ToggleFolderAutosave,
+    NoteReloadFromDisk,
+    NoteKeepMine,
 }
 
 impl CommandId {
@@ -93,6 +96,7 @@ impl CommandId {
                 | Self::ToggleNotesMode
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
+                | Self::ToggleFolderAutosave
         )
     }
 
@@ -122,7 +126,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 60] = [
+        const COMMANDS: [CommandId; 63] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -183,6 +187,9 @@ impl TryFrom<u16> for CommandId {
             CommandId::ToggleNotesMode,
             CommandId::OpenFolder,
             CommandId::OpenRecentFolder,
+            CommandId::ToggleFolderAutosave,
+            CommandId::NoteReloadFromDisk,
+            CommandId::NoteKeepMine,
         ];
         COMMANDS
             .into_iter()
@@ -244,6 +251,15 @@ mod tests {
         assert_eq!(CommandId::try_from(159), Ok(CommandId::OpenRecentFolder));
         assert!(!CommandId::OpenFolder.needs_document());
         assert!(!CommandId::OpenRecentFolder.needs_document());
+        assert_eq!(
+            CommandId::try_from(160),
+            Ok(CommandId::ToggleFolderAutosave)
+        );
+        assert_eq!(CommandId::try_from(161), Ok(CommandId::NoteReloadFromDisk));
+        assert_eq!(CommandId::try_from(162), Ok(CommandId::NoteKeepMine));
+        assert!(!CommandId::ToggleFolderAutosave.needs_document());
+        assert!(CommandId::NoteReloadFromDisk.needs_document());
+        assert!(CommandId::NoteKeepMine.needs_document());
     }
 
     #[test]

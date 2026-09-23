@@ -208,6 +208,7 @@ unsafe extern "system" fn main_window_proc(
             }
             // A launch forwarded just before the review must be handled, not lost with the window.
             drain_ipc_requests(hwnd);
+            crate::window::library_host::autosave_all(hwnd);
             if !save_session_for_close(hwnd) {
                 let Some(discarded) = review_dirty_documents(hwnd) else {
                     return 0;
@@ -227,6 +228,7 @@ unsafe extern "system" fn main_window_proc(
                 KillTimer(hwnd, crate::recovery::RECOVERY_TIMER_ID);
                 KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
                 KillTimer(hwnd, crate::window::library_host::LIBRARY_WRITE_TIMER_ID);
+                KillTimer(hwnd, crate::window::library_host::AUTOSAVE_TIMER_ID);
                 PostQuitMessage(0);
             }
             0
@@ -241,6 +243,10 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_TIMER if wparam == crate::window::library_host::LIBRARY_WRITE_TIMER_ID => {
             crate::window::library_host::flush_now(hwnd);
+            0
+        }
+        WM_TIMER if wparam == crate::window::library_host::AUTOSAVE_TIMER_ID => {
+            crate::window::library_host::autosave_active(hwnd);
             0
         }
         WM_DROPFILES => {
@@ -1812,6 +1818,11 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         }
         CommandId::OpenFolder => crate::window::library_host::choose_and_open_folder(hwnd),
         CommandId::OpenRecentFolder => crate::window::library_host::open_recent_folder_picker(hwnd),
+        CommandId::ToggleFolderAutosave => {
+            crate::window::library_host::toggle_folder_autosave(hwnd);
+        }
+        CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
+        CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
         CommandId::FontSizeIncrease => {
             set_font_size(hwnd, |size| {
                 size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
@@ -1956,7 +1967,7 @@ pub(crate) fn save_settings_to(path: Option<std::path::PathBuf>) {
     TEST_SETTINGS_PATH.with(|slot| *slot.borrow_mut() = path);
 }
 
-fn file_population_active(hwnd: HWND) -> bool {
+pub(super) fn file_population_active(hwnd: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.populating_file)
 }
 
@@ -2498,6 +2509,13 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
         };
     }
 
+    // The tab being left saves first; a failed or paused autosave leaves it dirty and open.
+    crate::window::library_host::autosave_active(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed during file open",
+        ));
+    }
     // All fallible disk/decode/text validation occurs before touching active state.
     let loaded = crate::file::loader::load(path)?;
     // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer: the file is unsupported.
@@ -2597,6 +2615,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     // Population suppressed SCN_MODIFIED, and a reused tab keeps its document id.
     crate::window::preview_host::document_reloaded(hwnd);
     refresh_tabs(hwnd);
+    crate::window::library_host::document_loaded(hwnd);
     Ok(())
 }
 
@@ -2604,6 +2623,12 @@ fn create_new_document(hwnd: HWND) -> Result<()> {
     let identity = unsafe { window_identity(hwnd) }.ok_or(crate::FastPadError::Invariant(
         "main window app state was not available",
     ))?;
+    crate::window::library_host::autosave_active(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed while creating a document",
+        ));
+    }
     let (editor, id, recovery_id) = {
         let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
             return Err(crate::FastPadError::Invariant(
@@ -2675,11 +2700,24 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
+    let leaving = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        (app.tabs.view().snapshot().revision == revision)
+            .then(|| app.tabs.active().is_some_and(|active| active.id != id))
+    });
+    let Some(leaving) = leaving else {
+        return false;
+    };
+    // Saving the tab being left bumps the view revision itself, so the caller's revision is
+    // checked before it; afterwards `activate` still refuses an `id` that has gone.
+    if leaving {
+        crate::window::library_host::autosave_active(hwnd);
+        if !identity.is_live_for(hwnd) {
+            return false;
+        }
+    }
     let target = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        if app.tabs.view().snapshot().revision != revision {
-            return None;
-        }
         let editor = app.editor.clone()?;
         app.tabs.activate(id).ok()?;
         Some((editor, app.tabs.active_handle()?.clone()))
@@ -2710,6 +2748,11 @@ fn close_active_document(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    // A saved note is clean now and closes without a prompt; paused or failed ones still ask.
+    crate::window::library_host::autosave_active(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
     let snapshot = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         let review = app.tabs.active_close_review()?;
@@ -3833,7 +3876,7 @@ fn open_snapshot_tab(
 }
 
 /// A successful save supersedes both the document's own snapshot and any recovery source.
-fn remove_saved_document_snapshots(hwnd: HWND) {
+pub(super) fn remove_saved_document_snapshots(hwnd: HWND) {
     let files = unsafe { app_ptr(hwnd) }.map(|mut app| {
         let app = unsafe { app.as_mut() };
         let own = app.recovery_root.as_deref().map(|root| {
@@ -4085,6 +4128,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         }
         if text_change {
             crate::window::library_host::text_changed(hwnd, modification.position.max(0) as usize);
+            crate::window::library_host::schedule_autosave(hwnd);
             crate::window::preview_host::record_edit(hwnd, modification);
         }
         return;
@@ -7596,5 +7640,170 @@ mod tests {
             "Device"
         );
         assert!(!name_box_visible(window.hwnd));
+    }
+
+    fn open_note(
+        window: &ProductionWindow,
+        scratch: &LibraryScratch,
+        name: &str,
+        text: &str,
+    ) -> std::path::PathBuf {
+        let path = scratch.note(name, text);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &path).unwrap();
+        pump_posted_messages(window.hwnd);
+        path
+    }
+
+    #[test]
+    fn a_note_inside_the_folder_autosaves_and_closing_it_never_prompts() {
+        // Break caught: a notes-folder file still asking "Save changes?" or losing edits on close.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("autosave");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "one");
+        editor.set_text("two").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::Saved
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+
+        editor.set_text("three").unwrap();
+        super::close_active_document(window.hwnd); // no answer_next_close_prompt: a prompt would fail the test
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three");
+    }
+
+    #[test]
+    fn a_file_changed_on_disk_pauses_autosave_until_the_user_chooses() {
+        // Break caught: autosave silently overwriting an edit OneDrive just synced from another PC.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("guard");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "one");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "from the other PC").unwrap();
+        editor.set_text("mine").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::Paused
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "from the other PC");
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("changed on disk"))
+        );
+
+        execute_command(window.hwnd, CommandId::NoteReloadFromDisk);
+        assert_eq!(editor.text().unwrap(), "from the other PC");
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().autosave_paused);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "again").unwrap();
+        editor.set_text("mine for real").unwrap();
+        crate::window::library_host::autosave_active(window.hwnd);
+        execute_command(window.hwnd, CommandId::NoteKeepMine);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine for real");
+    }
+
+    #[test]
+    fn files_outside_the_folder_and_folders_with_autosave_off_are_not_autosaved() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("not-eligible");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let outside = scratch.root.join("outside.md");
+        std::fs::write(&outside, "x").unwrap();
+        super::open_path(window.hwnd, &outside).unwrap();
+        editor.set_text("y").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::NotEligible
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
+
+        let inside = open_note(&window, &scratch, "b.md", "b");
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        editor.set_text("c").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::NotEligible
+        );
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "b");
+        assert!(
+            !app_mut(window.hwnd)
+                .library
+                .state
+                .as_ref()
+                .unwrap()
+                .local
+                .autosave
+        );
+    }
+
+    #[test]
+    fn switching_tabs_autosaves_the_tab_being_left() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("switch-save");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let a = open_note(&window, &scratch, "a.md", "a");
+        let b = scratch.note("b.md", "b");
+        super::open_path(window.hwnd, &b).unwrap();
+        editor.set_text("b2").unwrap();
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b2");
+        editor.set_text("a2").unwrap();
+        super::create_new_document(window.hwnd).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "a2",
+            "a new tab also leaves the old one"
+        );
+    }
+
+    #[test]
+    fn a_note_with_no_known_disk_stamp_pauses_instead_of_overwriting() {
+        // Break caught: a tab restored from a snapshot autosaving over a file that changed while
+        // FastPad was closed, because it has no stamp to compare against.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("no-stamp");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "on disk");
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        app_mut(window.hwnd)
+            .tabs
+            .document_mut(id)
+            .unwrap()
+            .disk_stamp = None;
+        editor.set_text("restored").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::Paused
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "on disk");
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn a_single_edit_autosaves_once_the_idle_timer_fires() {
+        // Break caught: the first keystroke after a save not arming the timer, because the edit
+        // notification arrives before the tab is marked dirty.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("idle-timer");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "one");
+        editor.replace_target(0..0, "x").unwrap();
+        pump_until(window.hwnd, || {
+            std::fs::read_to_string(&path).is_ok_and(|text| text == "xone")
+        });
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
     }
 }
