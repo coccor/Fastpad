@@ -450,16 +450,17 @@ impl LibraryState {
     }
 
     /// Adds a file FastPad just saved to the index and the tree, if it is a note inside the
-    /// folder. Updates the entry in place when the note is already indexed.
-    pub fn add_note(&mut self, path: &Path) {
+    /// folder. Updates the entry in place when the note is already indexed. Returns whether it
+    /// added a new entry, so the tree gained a row.
+    pub fn add_note(&mut self, path: &Path) -> bool {
         let Some(relative) = strip_folder(&self.folder, path) else {
-            return;
+            return false;
         };
         let is_note = relative
             .extension()
             .is_some_and(|ext| title::is_note_extension(&ext.to_string_lossy()));
         if !is_note {
-            return;
+            return false;
         }
         self.touched.push(relative.clone());
         let stamp = store::stamp(path);
@@ -472,6 +473,7 @@ impl LibraryState {
         {
             existing.size = size;
             existing.mtime = mtime;
+            false
         } else {
             let pinned = self.is_pinned(&relative);
             self.tree.insert_note(&relative, pinned);
@@ -480,6 +482,7 @@ impl LibraryState {
                 size,
                 mtime,
             });
+            true
         }
     }
 
@@ -508,7 +511,7 @@ impl LibraryState {
             });
         }
         self.remove_note(old);
-        self.add_note(new);
+        let _ = self.add_note(new);
     }
 }
 
@@ -1084,9 +1087,12 @@ mod tests {
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         let a = scratch.folder().join("a.md");
         std::fs::write(&a, "a").unwrap();
-        state.add_note(&a);
-        state.add_note(&a);
-        state.add_note(Path::new(r"C:\elsewhere\x.md"));
+        assert!(state.add_note(&a), "a new note is inserted");
+        assert!(
+            !state.add_note(&a),
+            "saving it again only updates its entry"
+        );
+        assert!(!state.add_note(Path::new(r"C:\elsewhere\x.md")));
         assert_eq!(state.notes.len(), 1);
         let mut ids = IdSource::new(1, 2);
         let target = state.note_ref(&mut ids, &a);

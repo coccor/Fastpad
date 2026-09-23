@@ -179,20 +179,38 @@ impl SearchView {
         self.colors = colors;
     }
 
-    /// Shows `results`, found for `query`, with the first one selected.
+    /// Shows `results`, found for `query`. A new query selects the first result. The same query
+    /// run again (the library changed) keeps the selected result and the scroll position by
+    /// path, as the Notebook view does; only a selection that is gone falls back to the first.
     fn set_results(&mut self, query: &str, results: Vec<NameMatch>, client: RECT, dpi: u32) {
+        let same_query = self.query == query;
+        let path_at = |index: Option<usize>| {
+            index
+                .and_then(|index| self.results.get(index))
+                .map(|result| result.path.clone())
+        };
+        let (selected, top) = if same_query {
+            (path_at(self.list.selected), path_at(Some(self.list.top)))
+        } else {
+            (None, None)
+        };
         self.query = query.to_owned();
         if results != self.results {
             self.order = self.order.wrapping_add(1);
         }
         self.results = results;
+        let find = |path: Option<PathBuf>| {
+            let path = path?;
+            self.results.iter().position(|result| result.path == path)
+        };
+        let (selected, top) = (find(selected), find(top));
         let area = self.list_area(client, dpi);
         self.list.row_height = scale(ROW_AT_96_DPI, dpi);
         self.list.set_count(self.results.len());
-        self.list.top = 0;
+        self.list.top = top.unwrap_or(0);
         self.list.selected = None;
         if !self.results.is_empty() {
-            self.list.select(0, height(area));
+            self.list.select(selected.unwrap_or(0), height(area));
         }
     }
 

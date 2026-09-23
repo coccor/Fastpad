@@ -10809,6 +10809,69 @@ mod tests {
         );
     }
 
+    fn search_selected(hwnd: HWND) -> Option<usize> {
+        app_mut(hwnd).sidebar.as_ref().unwrap().search.list.selected
+    }
+
+    #[test]
+    fn saving_a_listed_note_keeps_the_search_selection_and_does_not_rebuild_the_tree() {
+        // Break caught: every save (autosave included) rebuilding the sidebar and snapping the
+        // Search selection back to the first result while the user browses the list.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-save-keeps");
+        scratch.note("plan.md", "p");
+        let planning = scratch.note("planning.md", "q");
+        scratch.note("plans.md", "r");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        use crate::config::SidebarView;
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
+        type_into_search(window.hwnd, "plan");
+        let results = crate::window::search_view::shown_results(window.hwnd);
+        assert_eq!(results.len(), 3);
+        let index = results
+            .iter()
+            .position(|(name, _)| name == "planning")
+            .unwrap();
+        assert_ne!(index, 0);
+        app_mut(window.hwnd)
+            .sidebar
+            .as_mut()
+            .unwrap()
+            .search
+            .list
+            .selected = Some(index);
+        super::open_path(window.hwnd, &planning).unwrap();
+        pump_posted_messages(window.hwnd);
+        let rebuilds = notebook_view(window.hwnd).rebuilds;
+
+        editor.set_text("edited").unwrap();
+        assert!(super::save_active_document(window.hwnd));
+        assert_eq!(std::fs::read_to_string(&planning).unwrap(), "edited");
+        assert_eq!(
+            search_selected(window.hwnd),
+            Some(index),
+            "kept by the save"
+        );
+        assert_eq!(
+            notebook_view(window.hwnd).rebuilds,
+            rebuilds,
+            "a save of a listed note changes no row"
+        );
+
+        // A library refresh runs the same query again, and the selection stays by path.
+        crate::window::side_panel::refresh(window.hwnd);
+        assert_eq!(
+            search_selected(window.hwnd),
+            Some(index),
+            "kept by a re-run"
+        );
+        // A new query starts at the top.
+        type_into_search(window.hwnd, "pla");
+        assert_eq!(search_selected(window.hwnd), Some(0));
+    }
+
     #[test]
     fn with_no_notebook_the_search_view_says_to_open_one() {
         // Break caught: an empty Search view with a live box that searches nothing.

@@ -1169,6 +1169,14 @@ fn active_target(hwnd: HWND) -> Option<RowKind> {
     }
 }
 
+/// Whether something the rows are built from, besides the library itself, changed since the
+/// last rebuild: another notebook, its state arriving, a folder expanded or collapsed, or an
+/// untitled tab added, closed, relabelled or saved. Cheap: no flattening.
+pub(crate) fn stale(hwnd: HWND) -> bool {
+    let key = rebuild_key(hwnd);
+    with_view(hwnd, |view| view.built.as_ref() != Some(&key)).unwrap_or(false)
+}
+
 /// Every tab switch: the active note's row is selected and its folders expand (remembered per
 /// PC), without moving the keyboard focus (spec §6.1). The tree is flattened again only when
 /// something the rows depend on changed (a folder newly expanded, an untitled tab added, closed
@@ -1180,9 +1188,7 @@ pub(crate) fn active_tab_changed(hwnd: HWND) {
             super::library_host::set_expanded(hwnd, &folder, true);
         }
     }
-    let key = rebuild_key(hwnd);
-    let stale = with_view(hwnd, |view| view.built.as_ref() != Some(&key)).unwrap_or(false);
-    if stale {
+    if stale(hwnd) {
         rebuild(hwnd);
     }
     with_view(hwnd, |view| {

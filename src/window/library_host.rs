@@ -2077,24 +2077,36 @@ pub(crate) fn document_loaded(hwnd: HWND, stamp: Option<library::DiskStamp>) {
     }
 }
 
-/// After any successful save: remember the file's disk stamp and index it if it is a note.
+/// After any successful save: remember the file's disk stamp and index it if it is a note. The
+/// sidebar is rebuilt only when the save changed its rows: a new note in the index, or an
+/// untitled tab that is no longer untitled. A save of a note already listed leaves the rows,
+/// and the Search view's selection, alone.
 pub(crate) fn document_saved(hwnd: HWND) {
-    let path = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+    let saved = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let id = app.tabs.active()?.id;
         // A saved preview is kept: the next click must not replace it.
-        app.tabs.promote(id);
+        let promoted = app.tabs.promote(id);
         let document = app.tabs.document_mut(id)?;
-        let path = document.path.clone()?;
-        document.disk_stamp = library::disk_stamp(&path);
-        document.autosave_paused = false;
-        Some(path)
+        let path = document.path.clone();
+        if let Some(path) = &path {
+            document.disk_stamp = library::disk_stamp(path);
+            document.autosave_paused = false;
+        }
+        Some((path, promoted))
     });
-    if let Some(path) = path {
-        with_state(hwnd, |state| state.add_note(&path));
-    }
+    let (path, promoted) = saved.unwrap_or((None, false));
+    let inserted = path
+        .and_then(|path| with_state(hwnd, |state| state.add_note(&path)))
+        .unwrap_or(false);
     close_stale_name_box(hwnd);
-    super::side_panel::refresh(hwnd);
+    if inserted || super::notebook_view::stale(hwnd) {
+        super::side_panel::refresh(hwnd);
+    }
+    if promoted {
+        // The tab's name is no longer italic.
+        super::main_window::invalidate_title_strip(hwnd);
+    }
 }
 
 #[cfg(test)]
