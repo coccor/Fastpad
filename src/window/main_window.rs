@@ -636,6 +636,10 @@ unsafe extern "system" fn main_window_proc(
                 crate::window::library_host::editor_files_dropped(hwnd, lparam);
                 return 0;
             }
+            if message == crate::window::WM_FASTPAD_NOTEBOOK_CHECKED {
+                crate::window::library_host::notebook_checked(hwnd, lparam);
+                return 0;
+            }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
             // IPC drain wait for it to end so they cannot change the document it acts on.
             if (message == crate::window::WM_FASTPAD_IPC_REQUEST
@@ -1876,6 +1880,10 @@ fn execute_command(hwnd: HWND, command: CommandId) {
                 crate::window::library_host::delete_note(hwnd);
             }
         }
+        CommandId::CloseNotebook => crate::window::library_host::close_notebook(hwnd),
+        CommandId::ToggleNotebookFavorite => {
+            crate::window::library_host::toggle_notebook_favorite(hwnd);
+        }
         CommandId::FontSizeIncrease => {
             set_font_size(hwnd, |size| {
                 size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
@@ -2529,7 +2537,7 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
                     push_notice(
                         hwnd,
                         format!(
-                            "{} is a folder. Turn on notes mode to open folders.",
+                            "{} is a folder. Turn on notes mode to open it as a notebook.",
                             path.display()
                         ),
                     );
@@ -3021,7 +3029,8 @@ pub(super) fn save_active_document_as(hwnd: HWND) -> bool {
     // other Save As keeps the dialog's usual suggestion and starting folder.
     let (suggested, folder) = match named {
         Some(name) => (name, None),
-        None if notes_mode => (
+        // With no notebook open this is notes mode off's Save As.
+        None if notes_mode && crate::window::library_host::folder(hwnd).is_some() => (
             crate::window::library_host::suggested_file_name(hwnd),
             crate::window::library_host::folder(hwnd),
         ),
@@ -7659,7 +7668,7 @@ mod tests {
         assert!(
             notices(window.hwnd)
                 .iter()
-                .any(|n| n.contains("kept this folder open")),
+                .any(|n| n.contains("kept this notebook open")),
             "{:?}",
             notices(window.hwnd)
         );
@@ -7700,10 +7709,9 @@ mod tests {
             crate::window::command_palette::PickerChoice::Item(0),
         );
 
-        assert_eq!(
-            crate::window::library_host::folder(window.hwnd),
-            Some(first.folder())
-        );
+        pump_until(window.hwnd, || {
+            crate::window::library_host::folder(window.hwnd) == Some(first.folder())
+        });
         pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
     }
 
@@ -8281,6 +8289,198 @@ mod tests {
         super::open_path(window.hwnd, &path).unwrap();
         pump_posted_messages(window.hwnd);
         path
+    }
+
+    #[test]
+    fn closing_the_notebook_saves_its_notes_keeps_the_tabs_and_is_remembered_as_closed() {
+        // Break caught: Close notebook dropping a dirty note's edits, closing its tab, or leaving
+        // folders.ini without open=none so the next start reopens the notebook anyway.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("close-notebook");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(&scratch.data()),
+            &crate::library::local::RecentFolders {
+                folders: vec![scratch.folder()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = open_note(&window, &scratch, "a.md", "one");
+        editor.set_text("two").unwrap();
+
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(super::tab_count(window.hwnd), 1);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+        assert!(app_mut(window.hwnd).library.state.is_none());
+        let folders = crate::library::local::read_folders(&crate::library::local::folders_file(
+            &scratch.data(),
+        ));
+        assert!(folders.closed);
+        assert!(
+            folders.folders.contains(&scratch.folder()),
+            "it stays in the recent list"
+        );
+        // The tab is a plain file now: an edit is not autosaved.
+        editor.set_text("three").unwrap();
+        assert_eq!(
+            crate::window::library_host::autosave_active(window.hwnd),
+            crate::window::library_host::Autosave::NotEligible
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+    }
+
+    #[test]
+    fn with_no_notebook_open_ctrl_s_uses_the_save_dialog_like_notes_mode_off() {
+        // Break caught: after Close notebook, Ctrl+S on a new tab opening the name box for a notebook
+        // that is gone, or the Save As dialog starting in the closed notebook under the tab's label.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("no-notebook-save");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+        execute_command(window.hwnd, CommandId::New);
+        editor.set_text("Plan\nbody").unwrap();
+        let target = scratch.root.join("plan.txt");
+        crate::window::answer_next_save_dialog({
+            let target = target.clone();
+            move |_| Some(target)
+        });
+
+        execute_command(window.hwnd, CommandId::Save);
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "Plan\nbody");
+        assert!(
+            app_mut(window.hwnd)
+                .name_box
+                .as_ref()
+                .is_none_or(|name_box| !name_box.is_visible())
+        );
+        assert_eq!(
+            crate::window::modal::take_last_save_request(),
+            Some(("Untitled.txt".to_owned(), None))
+        );
+    }
+
+    #[test]
+    fn the_notebook_favorite_toggles_in_folders_ini_and_the_cached_lists() {
+        // Break caught: a star that changes the sidebar but not folders.ini (lost at restart), or
+        // favorite lists that read folders.ini on every sidebar paint.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("favorite-notebook");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        let file = crate::library::local::folders_file(&scratch.data());
+
+        execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+        assert!(crate::window::library_host::is_favorite(window.hwnd));
+        assert_eq!(
+            crate::window::library_host::favorites(window.hwnd),
+            vec![scratch.folder()]
+        );
+        assert!(crate::library::local::read_folders(&file).is_favorite(&scratch.folder()));
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("to favorite notebooks"))
+        );
+
+        execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+        assert!(!crate::window::library_host::is_favorite(window.hwnd));
+        assert!(!crate::library::local::read_folders(&file).is_favorite(&scratch.folder()));
+
+        execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+        crate::window::library_host::remove_favorite(window.hwnd, &scratch.folder());
+        assert!(crate::window::library_host::favorites(window.hwnd).is_empty());
+        assert!(!crate::library::local::read_folders(&file).is_favorite(&scratch.folder()));
+
+        // Listing answers from the cache: a file changed behind FastPad's back is not re-read.
+        execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+        crate::library::local::write_folders(
+            &file,
+            &crate::library::local::RecentFolders::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::window::library_host::favorites(window.hwnd),
+            vec![scratch.folder()]
+        );
+    }
+
+    #[test]
+    fn opening_a_listed_notebook_that_is_missing_says_so_and_changes_nothing() {
+        // Break caught: a click on an offline favorite unloading the open notebook first, checking
+        // the drive on the UI thread, or falling back to Documents\FastPad the way startup does.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("listed-missing");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        let missing = scratch.root.join("gone");
+        let checks = crate::library::folder_checks();
+
+        crate::window::library_host::open_listed_notebook(window.hwnd, &missing);
+        assert_eq!(
+            crate::library::folder_checks(),
+            checks,
+            "checked on the worker"
+        );
+        pump_until(window.hwnd, || {
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("is not available"))
+        });
+
+        assert_eq!(
+            crate::window::library_host::folder(window.hwnd),
+            Some(scratch.folder())
+        );
+        assert!(app_mut(window.hwnd).library.state.is_some());
+        let folders = crate::library::local::read_folders(&crate::library::local::folders_file(
+            &scratch.data(),
+        ));
+        assert!(!folders.folders.contains(&missing));
+    }
+
+    #[test]
+    fn opening_a_listed_notebook_switches_once_the_worker_finds_it() {
+        // Break caught: an explicit open that switches before the check lands (so a missing folder
+        // would already have unloaded the notebook), or never switches at all.
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("listed-a");
+        let second = LibraryScratch::new("listed-b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        first.install(window.hwnd);
+
+        crate::window::library_host::open_listed_notebook(window.hwnd, &second.folder());
+        assert_eq!(
+            crate::window::library_host::folder(window.hwnd),
+            Some(first.folder()),
+            "nothing changes before the check lands"
+        );
+        pump_until(window.hwnd, || {
+            crate::window::library_host::folder(window.hwnd) == Some(second.folder())
+        });
+        pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+        assert_eq!(
+            crate::window::library_host::recent_notebooks(window.hwnd).first(),
+            Some(&second.folder())
+        );
     }
 
     #[test]
@@ -9061,7 +9261,7 @@ mod tests {
         assert!(
             notices(window.hwnd)
                 .iter()
-                .any(|n| n.contains("could not find the folder")),
+                .any(|n| n.contains("could not find the notebook")),
             "{:?}",
             notices(window.hwnd)
         );

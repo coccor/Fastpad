@@ -73,6 +73,8 @@ pub enum CommandId {
     ShowNotebookView = 177,
     ShowSearchView = 178,
     ShowFavoritesView = 179,
+    CloseNotebook = 180,
+    ToggleNotebookFavorite = 181,
 }
 
 impl CommandId {
@@ -110,6 +112,8 @@ impl CommandId {
                 | Self::ShowNotebookView
                 | Self::ShowSearchView
                 | Self::ShowFavoritesView
+                | Self::CloseNotebook
+                | Self::ToggleNotebookFavorite
         )
     }
 
@@ -150,7 +154,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 71] = [
+        const COMMANDS: [CommandId; 73] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -222,6 +226,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::ShowNotebookView,
             CommandId::ShowSearchView,
             CommandId::ShowFavoritesView,
+            CommandId::CloseNotebook,
+            CommandId::ToggleNotebookFavorite,
         ];
         COMMANDS
             .into_iter()
@@ -325,6 +331,18 @@ mod tests {
             assert!(command.is_sidebar());
         }
         assert!(!CommandId::Save.is_sidebar());
+    }
+
+    #[test]
+    fn notebook_commands_have_stable_values_and_need_no_document() {
+        // Break caught: Close notebook greyed out, or silently ignored, while no tab is open.
+        assert_eq!(CommandId::try_from(180), Ok(CommandId::CloseNotebook));
+        assert_eq!(
+            CommandId::try_from(181),
+            Ok(CommandId::ToggleNotebookFavorite)
+        );
+        assert!(!CommandId::CloseNotebook.needs_document());
+        assert!(!CommandId::ToggleNotebookFavorite.needs_document());
     }
 
     #[test]

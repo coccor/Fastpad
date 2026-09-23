@@ -54,6 +54,11 @@ pub(crate) struct LibraryHost {
     notified: Option<PathBuf>,
     /// The folders the open recent-folder picker lists, in its row order.
     shown_recent_folders: Vec<PathBuf>,
+    /// `folders.ini` as last read or written, so the sidebar lists recent and favorite notebooks
+    /// without reading the disk. `None` until the startup step or a first change fills it.
+    folders: Option<library::local::RecentFolders>,
+    /// The user changed `folders.ini` since startup, so the startup worker's copy is older.
+    folders_edited: bool,
 }
 
 impl LibraryHost {
@@ -70,6 +75,8 @@ impl LibraryHost {
             ids: IdSource::new(process_start, std::process::id()),
             notified: None,
             shown_recent_folders: Vec::new(),
+            folders: None,
+            folders_edited: false,
         }
     }
 }
@@ -83,6 +90,8 @@ struct Loaded {
     /// The last session closed its notebook and the command line named no folder: nothing was
     /// opened, on purpose.
     closed: bool,
+    /// `folders.ini` as the startup worker read it, after any change it made itself.
+    folders: Option<library::local::RecentFolders>,
 }
 
 /// The startup candidates, checked on the worker so an offline drive cannot stall the UI thread.
@@ -141,7 +150,7 @@ fn resolve_startup(startup: Startup) -> (Option<PathBuf>, Option<String>) {
             return (Some(remembered), None);
         }
         notice = Some(format!(
-            "FastPad could not find the folder {}. Using Documents\\FastPad instead.",
+            "FastPad could not find the notebook {}. Using Documents\\FastPad instead.",
             remembered.display()
         ));
     }
@@ -177,8 +186,10 @@ pub(crate) fn open_library_step(hwnd: HWND) {
             crate::launch::LaunchRequest::New => None,
         });
     let recent = library::local::read_folders(&library::local::folders_file(&data));
+    host(hwnd, |host| host.folders = Some(recent.clone()));
     if recent.closed && launch.is_none() {
         host(hwnd, |host| host.folder = None);
+        super::side_panel::refresh(hwnd);
         return;
     }
     let remembered = if recent.closed {
@@ -239,12 +250,15 @@ fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
     };
     let target = hwnd as isize;
     std::thread::spawn(move || {
+        let read_folders = startup.is_some();
         let closed = startup.as_ref().is_some_and(|startup| startup.closed);
         let (folder, notice) = match startup {
             Some(startup) => resolve_startup(startup),
             None => (folder, None),
         };
         let opens_nothing = closed && folder.is_none();
+        let folders = read_folders
+            .then(|| library::local::read_folders(&library::local::folders_file(&data)));
         let (folder, result) = match folder {
             Some(folder) => {
                 let local_path = library::local::local_file(&data, &folder);
@@ -263,6 +277,7 @@ fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
             result,
             notice,
             closed: opens_nothing,
+            folders,
         }));
         if unsafe {
             PostMessageW(
@@ -286,6 +301,7 @@ pub(crate) fn test_ready_payload(generation: u64, result: Result<LibraryState, S
         result,
         notice: None,
         closed: false,
+        folders: None,
     })) as LPARAM
 }
 
@@ -311,16 +327,26 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
         result,
         notice,
         closed,
+        folders,
         ..
     } = *loaded;
     if let Some(notice) = notice {
         push_notice(hwnd, notice);
+    }
+    // A change the user made while the worker ran is newer than what the worker read.
+    if let Some(folders) = folders {
+        host(hwnd, |host| {
+            if !host.folders_edited {
+                host.folders = Some(folders);
+            }
+        });
     }
     if closed {
         // The path on the command line was not a folder, and the last session closed its
         // notebook: none is open.
         host(hwnd, |host| host.folder = None);
         super::main_window::invalidate_title_strip(hwnd);
+        super::side_panel::refresh(hwnd);
         return;
     }
     // At startup the worker decides which folder exists; the UI thread only assumed one.
@@ -341,13 +367,16 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
     }
     match result {
         Ok(fresh) => install(hwnd, fresh),
-        Err(error) => push_notice(
-            hwnd,
-            format!(
-                "FastPad could not load the folder {}: {error}",
-                folder.display()
-            ),
-        ),
+        Err(error) => {
+            push_notice(
+                hwnd,
+                format!(
+                    "FastPad could not load the notebook {}: {error}",
+                    folder.display()
+                ),
+            );
+            super::side_panel::refresh(hwnd);
+        }
     }
     if host(hwnd, |host| std::mem::take(&mut host.rescan_requested)).unwrap_or(false) {
         start_load(hwnd);
@@ -385,7 +414,8 @@ fn install(hwnd: HWND, fresh: LibraryState) {
     if first_time && truncated {
         push_notice(
             hwnd,
-            "This folder has more than 10,000 notes. FastPad indexed the first 10,000.".to_owned(),
+            "This notebook has more than 10,000 notes. FastPad indexed the first 10,000."
+                .to_owned(),
         );
     }
     if first_time && unreadable {
@@ -405,6 +435,7 @@ fn install(hwnd: HWND, fresh: LibraryState) {
             force: rewrite,
         },
     );
+    super::side_panel::refresh(hwnd);
 }
 
 #[derive(Clone, Copy)]
@@ -539,7 +570,7 @@ fn flush_reporting(hwnd: HWND, wait: bool) {
         Ok(_) => {}
         Err(error) => push_notice(
             hwnd,
-            format!("FastPad could not save this folder's pins: {error}"),
+            format!("FastPad could not save this notebook's pins: {error}"),
         ),
     }
 }
@@ -553,14 +584,11 @@ fn try_flush(hwnd: HWND, wait: bool) -> crate::Result<library::Flushed> {
     result
 }
 
-/// Opens `path` as the library, flushing the current one first. Open tabs stay open.
+/// Opens `path` as the notebook, flushing the current one first. Open tabs stay open. The folder
+/// was just chosen in a dialog, dropped or named by a launch, so it is checked here.
 pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
     if !notes_mode(hwnd) {
-        push_notice(
-            hwnd,
-            "Notes mode is off. Turn it on with Notes: Toggle notes mode to open folders."
-                .to_owned(),
-        );
+        push_notice(hwnd, NOTES_MODE_OFF.to_owned());
         return;
     }
     let path = library::normalize_folder(path);
@@ -568,15 +596,24 @@ pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
         push_notice(hwnd, format!("{} is not a folder.", path.display()));
         return;
     }
+    open_checked_folder(hwnd, path);
+}
+
+const NOTES_MODE_OFF: &str =
+    "Notes mode is off. Turn it on with Notes: Toggle notes mode to open notebooks.";
+
+/// Saves the dirty notes of the notebook that is about to be replaced or closed, while autosave
+/// still applies to them, and flushes its pending pins. Losing the notebook now would drop the
+/// unsaved pins, so a failed write keeps it open: this schedules a retry, reports it and returns
+/// false. `false` also means the window went away meanwhile.
+fn save_before_leaving(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return;
+        return false;
     };
-    // The old folder's dirty notes are saved while autosave still applies to them.
     autosave_all(hwnd);
     if !identity.is_live_for(hwnd) {
-        return;
+        return false;
     }
-    // Switching would drop the unsaved pins, so a failed write keeps the old folder.
     let failure = match try_flush(hwnd, false) {
         Ok(library::Flushed::Busy) => Some("its library.ini is in use by another program".into()),
         Ok(_) => None,
@@ -586,19 +623,101 @@ pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
         schedule_write(hwnd);
         push_notice(
             hwnd,
-            format!("FastPad kept this folder open because it could not save its pins: {error}"),
+            format!("FastPad kept this notebook open because it could not save its pins: {error}"),
         );
+        return false;
+    }
+    true
+}
+
+/// The switch itself, once `path` is known to exist.
+fn open_checked_folder(hwnd: HWND, path: PathBuf) {
+    if !notes_mode(hwnd) {
+        push_notice(hwnd, NOTES_MODE_OFF.to_owned());
+        return;
+    }
+    if !save_before_leaving(hwnd) {
         return;
     }
     host(hwnd, |host| {
         host.state = None;
         host.folder = Some(path.clone());
     });
-    if let Some(data) = data_dir(hwnd) {
-        remember_folder(&data, &path);
-    }
+    update_folders(hwnd, |folders| folders.push(path.clone()));
     start_load(hwnd);
     super::main_window::invalidate_title_strip(hwnd);
+    super::side_panel::refresh(hwnd);
+}
+
+/// What the existence worker found for a notebook picked from a list.
+struct NotebookChecked {
+    folder: PathBuf,
+    exists: bool,
+    /// Show the Notebook view once the notebook is open, with the focus in it for `Some(true)`.
+    /// Task 12's Favorites view asks for it.
+    show_notebook: Option<bool>,
+}
+
+/// Opens a notebook picked from a list (recent, favorites, the no-notebook panel). Such an entry
+/// may be on an offline drive, so it is checked on a worker. If it is missing, a notice says so
+/// and nothing changes. Unlike startup, nothing falls back to `Documents\FastPad`.
+pub(crate) fn open_listed_notebook(hwnd: HWND, folder: &Path) {
+    check_listed_notebook(hwnd, folder, None);
+}
+
+fn check_listed_notebook(hwnd: HWND, folder: &Path, show_notebook: Option<bool>) {
+    if !notes_mode(hwnd) {
+        push_notice(hwnd, NOTES_MODE_OFF.to_owned());
+        return;
+    }
+    let folder = library::normalize_folder(folder);
+    let target = hwnd as isize;
+    std::thread::spawn(move || {
+        let exists = library::folder_exists(&folder);
+        let payload = Box::into_raw(Box::new(NotebookChecked {
+            folder,
+            exists,
+            show_notebook,
+        }));
+        if unsafe {
+            PostMessageW(
+                target as HWND,
+                crate::window::WM_FASTPAD_NOTEBOOK_CHECKED,
+                0,
+                payload as isize,
+            )
+        } == 0
+        {
+            drop(unsafe { Box::from_raw(payload) });
+        }
+    });
+}
+
+/// `WM_FASTPAD_NOTEBOOK_CHECKED`: frees the worker's answer and switches if the folder exists.
+/// An answer that lands during a modal dialog is dropped, as a click there could not happen.
+pub(crate) fn notebook_checked(hwnd: HWND, lparam: LPARAM) {
+    if lparam == 0 {
+        return;
+    }
+    let checked = *unsafe { Box::from_raw(lparam as *mut NotebookChecked) };
+    if super::modal::modal_active(hwnd) {
+        return;
+    }
+    if !checked.exists {
+        push_notice(
+            hwnd,
+            format!("{} is not available.", checked.folder.display()),
+        );
+        return;
+    }
+    let already_open =
+        folder(hwnd).is_some_and(|open| library::model::same_path(&open, &checked.folder));
+    if !already_open {
+        open_checked_folder(hwnd, checked.folder);
+    }
+    if let Some(focus) = checked.show_notebook {
+        super::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, focus);
+    }
 }
 
 pub(crate) fn choose_and_open_folder(hwnd: HWND) {
@@ -619,18 +738,147 @@ pub(crate) fn choose_and_open_folder(hwnd: HWND) {
     }
 }
 
-fn recent_folders(hwnd: HWND) -> Vec<PathBuf> {
-    data_dir(hwnd)
-        .map(|data| library::local::read_folders(&library::local::folders_file(&data)).folders)
-        .unwrap_or_default()
+/// The cached `folders.ini`. `read_if_unknown` reads the file when nothing is cached yet: only
+/// for something the user just asked for (a picker), never for painting.
+fn known_folders(hwnd: HWND, read_if_unknown: bool) -> library::local::RecentFolders {
+    if let Some(folders) = host(hwnd, |host| host.folders.clone()).flatten() {
+        return folders;
+    }
+    if !read_if_unknown {
+        return library::local::RecentFolders::default();
+    }
+    let Some(data) = data_dir(hwnd) else {
+        return library::local::RecentFolders::default();
+    };
+    let folders = library::local::read_folders(&library::local::folders_file(&data));
+    host(hwnd, |host| host.folders = Some(folders.clone()));
+    folders
+}
+
+/// Re-reads `folders.ini` (another window may have changed it), applies `change`, writes it and
+/// caches the result. A write failure is reported; the cache still shows the change.
+fn update_folders<R>(
+    hwnd: HWND,
+    change: impl FnOnce(&mut library::local::RecentFolders) -> R,
+) -> Option<R> {
+    let data = data_dir(hwnd)?;
+    let path = library::local::folders_file(&data);
+    let mut folders = library::local::read_folders(&path);
+    let result = change(&mut folders);
+    if let Err(error) = library::local::write_folders(&path, &folders) {
+        push_notice(
+            hwnd,
+            format!("FastPad could not save {}: {error}", path.display()),
+        );
+    }
+    host(hwnd, |host| {
+        host.folders = Some(folders);
+        host.folders_edited = true;
+    });
+    Some(result)
+}
+
+/// A notebook's display name: its folder's name.
+pub(crate) fn notebook_name(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.display().to_string())
+}
+
+/// Favorite notebooks in `folders.ini` order (the Favorites view sorts them by name).
+#[allow(dead_code, reason = "read from Task 12's Favorites view on")]
+pub(crate) fn favorites(hwnd: HWND) -> Vec<PathBuf> {
+    known_folders(hwnd, false).favorites
+}
+
+/// Recent notebooks, most recent first.
+#[allow(dead_code, reason = "read from Task 10's no-notebook Notebook view on")]
+pub(crate) fn recent_notebooks(hwnd: HWND) -> Vec<PathBuf> {
+    known_folders(hwnd, false).folders
+}
+
+/// Whether the open notebook is a favorite.
+#[allow(dead_code, reason = "read from Task 10's Notebook view star on")]
+pub(crate) fn is_favorite(hwnd: HWND) -> bool {
+    folder(hwnd).is_some_and(|open| known_folders(hwnd, false).is_favorite(&open))
+}
+
+/// Notebook: Toggle favorite, and the Notebook view's star.
+pub(crate) fn toggle_notebook_favorite(hwnd: HWND) {
+    let Some(open) = folder(hwnd) else {
+        push_notice(hwnd, "Open a notebook first.".to_owned());
+        return;
+    };
+    let Some((was, now)) = update_folders(hwnd, |folders| {
+        let was = folders.is_favorite(&open);
+        (was, folders.toggle_favorite(&open))
+    }) else {
+        return;
+    };
+    let name = notebook_name(&open);
+    let notice = match (was, now) {
+        (false, true) => format!("Added {name} to favorite notebooks."),
+        (true, false) => format!("Removed {name} from favorite notebooks."),
+        // At the cap, `toggle_favorite` leaves the list alone and returns false.
+        _ => "You can keep up to 50 favorite notebooks.".to_owned(),
+    };
+    push_notice(hwnd, notice);
+    super::side_panel::refresh(hwnd);
+}
+
+/// Removes `folder` from the favorites; nothing happens if it is not one.
+#[allow(dead_code, reason = "called from Task 12's Favorites view on")]
+pub(crate) fn remove_favorite(hwnd: HWND, folder: &Path) {
+    let removed = update_folders(hwnd, |folders| {
+        folders.is_favorite(folder) && !folders.toggle_favorite(folder)
+    })
+    .unwrap_or(false);
+    if removed {
+        super::side_panel::refresh(hwnd);
+    }
+}
+
+/// Notebook: Close. Saves the notebook's dirty notes while autosave still applies, writes its
+/// pending pins and unloads it. Tabs stay open as plain files, and the next start opens no
+/// notebook (`open=none`).
+pub(crate) fn close_notebook(hwnd: HWND) {
+    let Some(open) = folder(hwnd) else {
+        push_notice(hwnd, "No notebook is open.".to_owned());
+        return;
+    };
+    if !save_before_leaving(hwnd) {
+        return;
+    }
+    // A first-save name box would save into the notebook that is going away.
+    close_name_box(hwnd);
+    unsafe {
+        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
+        KillTimer(hwnd, AUTOSAVE_TIMER_ID);
+    }
+    host(hwnd, |host| {
+        host.state = None;
+        host.folder = None;
+        // A load or rescan still running for the closed notebook is ignored when it lands.
+        host.generation = host.generation.wrapping_add(1);
+        host.scanning = false;
+        host.rescan_requested = false;
+    });
+    update_folders(hwnd, |folders| folders.set_closed(true));
+    push_notice(
+        hwnd,
+        format!("Closed the notebook {}.", notebook_name(&open)),
+    );
+    super::main_window::invalidate_title_strip(hwnd);
+    super::side_panel::refresh(hwnd);
 }
 
 pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
-    let folders = recent_folders(hwnd);
+    let folders = known_folders(hwnd, true).folders;
     if folders.is_empty() {
         push_notice(
             hwnd,
-            "No recent folders yet. Use File: Open folder.".to_owned(),
+            "No recent notebooks yet. Use File: Open notebook.".to_owned(),
         );
         return;
     }
@@ -911,7 +1159,7 @@ pub(crate) fn save_as_command(hwnd: HWND) {
 fn folder_display_name(hwnd: HWND) -> String {
     folder(hwnd)
         .and_then(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "the notes folder".to_owned())
+        .unwrap_or_else(|| "the notebook".to_owned())
 }
 
 pub(crate) fn open_name_box(
@@ -1157,6 +1405,7 @@ fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
     schedule_write(hwnd);
     close_name_box(hwnd);
     super::main_window::invalidate_title_strip(hwnd);
+    super::side_panel::refresh(hwnd);
     // The extension may have changed, and with it the language.
     unsafe {
         PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
@@ -1216,6 +1465,7 @@ pub(crate) fn delete_note(hwnd: HWND) {
     }
     with_state(hwnd, |state| state.remove_note(&path));
     super::main_window::close_document_without_prompt(hwnd, id);
+    super::side_panel::refresh(hwnd);
 }
 
 /// Browse… in the name box: the system Save As dialog, starting in the folder.
@@ -1368,7 +1618,7 @@ pub(crate) fn toggle_folder_autosave(hwnd: HWND) {
         state.local.autosave = !state.local.autosave;
         state.local.autosave
     }) else {
-        push_notice(hwnd, "Loading folder…".to_owned());
+        push_notice(hwnd, "Loading notebook…".to_owned());
         return;
     };
     save_local(
@@ -1386,9 +1636,9 @@ pub(crate) fn toggle_folder_autosave(hwnd: HWND) {
     push_notice(
         hwnd,
         if enabled {
-            "Autosave is on for this folder.".to_owned()
+            "Autosave is on for this notebook.".to_owned()
         } else {
-            "Autosave is off for this folder. Use Ctrl+S to save.".to_owned()
+            "Autosave is off for this notebook. Use Ctrl+S to save.".to_owned()
         },
     );
 }
@@ -1489,6 +1739,7 @@ pub(crate) fn document_saved(hwnd: HWND) {
         with_state(hwnd, |state| state.add_note(&path));
     }
     close_stale_name_box(hwnd);
+    super::side_panel::refresh(hwnd);
 }
 
 #[cfg(test)]
@@ -1502,14 +1753,14 @@ pub(crate) fn install_for_test(hwnd: HWND, state: LibraryState) {
 
 pub(crate) fn notes_mode_notice(enabled: bool) -> &'static str {
     if enabled {
-        "Notes mode is on. The open folder is your note library."
+        "Notes mode is on. The open notebook is your note library."
     } else {
         "Notes mode is off. FastPad works as a plain file editor."
     }
 }
 
-const READ_ONLY: &str = "This folder's .fastpad\\library.ini is damaged or from a newer FastPad, so pins are read-only.";
-const BUSY: &str = "This folder's .fastpad\\library.ini is in use by another program. FastPad reads it again when you come back to the window.";
+const READ_ONLY: &str = "This notebook's .fastpad\\library.ini is damaged or from a newer FastPad, so pins are read-only.";
+const BUSY: &str = "This notebook's .fastpad\\library.ini is in use by another program. FastPad reads it again when you come back to the window.";
 
 /// True when organizing can proceed; otherwise explains why not.
 pub(crate) fn ready_library(hwnd: HWND) -> bool {
@@ -1525,9 +1776,9 @@ pub(crate) fn ready_library(hwnd: HWND) -> bool {
         }
         None => {
             let notice = if folder(hwnd).is_some() {
-                "Loading folder…"
+                "Loading notebook…"
             } else {
-                "Open a folder first."
+                "Open a notebook first."
             };
             push_notice(hwnd, notice.to_owned());
             false
@@ -1608,6 +1859,7 @@ pub(crate) fn toggle_pin(hwnd: HWND, path: &Path) {
         hwnd,
         if now_on { "Pinned." } else { "Unpinned." }.to_owned(),
     );
+    super::side_panel::refresh(hwnd);
 }
 
 #[cfg(test)]
@@ -1621,17 +1873,15 @@ pub(crate) fn take_last_pick() -> Option<(PickerKind, PickerChoice)> {
     LAST_PICK.with(|last| last.borrow_mut().take())
 }
 
-/// A picker row was chosen. The recent-folder picker is the only one; its row opens the folder
-/// that row showed, even if `folders.ini` changed meanwhile.
+/// A picker row was chosen. Every kind resolves the row against what that picker showed.
 pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
     #[cfg(test)]
     LAST_PICK.with(|last| *last.borrow_mut() = Some((kind, choice.clone())));
-    let (PickerKind::RecentFolder, PickerChoice::Item(index)) = (kind, choice) else {
-        return;
-    };
-    let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
-    if let Some(folder) = shown.unwrap_or_default().get(index) {
-        open_folder(hwnd, folder);
+    if let (PickerKind::RecentFolder, PickerChoice::Item(index)) = (kind, choice) {
+        let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
+        if let Some(folder) = shown.unwrap_or_default().get(index) {
+            open_listed_notebook(hwnd, folder);
+        }
     }
 }
 

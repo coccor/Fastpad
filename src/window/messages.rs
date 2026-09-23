@@ -17,6 +17,9 @@ pub const WM_FASTPAD_LIBRARY_READY: u32 = WM_APP + 10;
 // Not part of the deferred chain: files dropped on the editor, as a `Box<Vec<PathBuf>>` the
 // receiver frees. Posted so the drag source is not kept waiting while the files open.
 pub const WM_FASTPAD_FILES_DROPPED: u32 = WM_APP + 11;
+// Not part of the deferred chain: whether a notebook picked from a list exists, checked on a
+// worker because an offline drive can stall, as a `Box` the receiver frees.
+pub const WM_FASTPAD_NOTEBOOK_CHECKED: u32 = WM_APP + 12;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.

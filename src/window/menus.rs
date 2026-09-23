@@ -143,7 +143,7 @@ impl MenuBar {
             let file = create_popup(&[
                 MenuEntry::command("&New\tCtrl+N", CommandId::New),
                 MenuEntry::command("&Open...\tCtrl+O", CommandId::Open),
-                MenuEntry::command("Open &Folder...\tCtrl+Shift+O", CommandId::OpenFolder),
+                MenuEntry::command("Open &Notebook...\tCtrl+Shift+O", CommandId::OpenFolder),
                 MenuEntry::command("&Save\tCtrl+S", CommandId::Save),
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
                 MenuEntry::command("&Close tab", CommandId::CloseTab),
