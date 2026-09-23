@@ -3,6 +3,7 @@
 //! the progress so far. No Win32 and no window.
 
 use super::name_search::folder_of;
+use super::path_key;
 use super::tree::natural_cmp;
 use crate::file::encoding;
 use crate::search::{Matcher, Snippet, first_snippet};
@@ -205,11 +206,6 @@ enum Searched {
     Hit(TextHit),
     NoMatch,
     Skipped(SkipReason),
-}
-
-/// How overlay keys and note paths are compared: `same_path`'s rule, ignoring case.
-fn path_key(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase()
 }
 
 fn search_note(

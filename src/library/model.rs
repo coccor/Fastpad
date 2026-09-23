@@ -56,8 +56,7 @@ impl std::fmt::Display for LibraryError {
 
 /// NTFS compares names ignoring case, so the library does too.
 pub fn same_path(left: &Path, right: &Path) -> bool {
-    left.as_os_str().to_string_lossy().to_lowercase()
-        == right.as_os_str().to_string_lossy().to_lowercase()
+    super::path_key(left) == super::path_key(right)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

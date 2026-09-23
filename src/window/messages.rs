@@ -20,6 +20,9 @@ pub const WM_FASTPAD_FILES_DROPPED: u32 = WM_APP + 11;
 // Not part of the deferred chain: whether a notebook picked from a list exists, checked on a
 // worker because an offline drive can stall, as a `Box` the receiver frees.
 pub const WM_FASTPAD_NOTEBOOK_CHECKED: u32 = WM_APP + 12;
+// Not part of the deferred chain: a text search worker's batch of hits, as a `Box` the receiver
+// frees. A post that fails because the window is gone is freed on the worker.
+pub const WM_FASTPAD_TEXT_SEARCH_BATCH: u32 = WM_APP + 13;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.

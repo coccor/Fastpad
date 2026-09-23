@@ -22,6 +22,7 @@ pub(crate) mod side_panel;
 pub(crate) mod sidebar_accessibility;
 pub mod status;
 pub mod tabs;
+pub(crate) mod text_search_host;
 pub mod titlebar;
 pub(crate) mod tooltip;
 
@@ -45,7 +46,7 @@ pub use messages::{
     WM_FASTPAD_PREVIEW_ESCAPE, WM_FASTPAD_PREVIEW_HOVER, WM_FASTPAD_PREVIEW_IMAGE,
     WM_FASTPAD_PREVIEW_LINK, WM_FASTPAD_PREVIEW_PARSED, WM_FASTPAD_PREVIEW_REFRESH,
     WM_FASTPAD_PREVIEW_SCROLLED, WM_FASTPAD_RECOVERY, WM_FASTPAD_RESTORE_SESSION,
-    WM_FASTPAD_START_IPC,
+    WM_FASTPAD_START_IPC, WM_FASTPAD_TEXT_SEARCH_BATCH,
 };
 #[cfg(test)]
 #[allow(

@@ -224,6 +224,8 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_DESTROY => {
+            // A running text search stops reading: its posts would fail from here on anyway.
+            crate::window::text_search_host::cancel(hwnd);
             unsafe {
                 KillTimer(hwnd, crate::recovery::RECOVERY_TIMER_ID);
                 KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
@@ -247,6 +249,10 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_TIMER if wparam == crate::window::library_host::AUTOSAVE_TIMER_ID => {
             crate::window::library_host::autosave_active(hwnd);
+            0
+        }
+        WM_TIMER if wparam == crate::window::text_search_host::TEXT_SEARCH_TIMER_ID => {
+            crate::window::text_search_host::timer(hwnd);
             0
         }
         WM_DROPFILES => {
@@ -647,6 +653,10 @@ unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_NOTEBOOK_CHECKED {
                 crate::window::library_host::notebook_checked(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_TEXT_SEARCH_BATCH {
+                crate::window::text_search_host::batch_arrived(hwnd, lparam);
                 return 0;
             }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
@@ -3732,6 +3742,33 @@ fn read_inactive_text(
     }
     restored?;
     text
+}
+
+/// The text of tab `id` as the editor has it, for the Search view's overlays. A background tab is
+/// swapped into the editor and back (`read_inactive_text`). `None` without an editor or that tab,
+/// for a background tab while a file is being populated (the swap would end the population), or
+/// when Scintilla can't be read. Call it with nothing of the App borrowed.
+pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
+    let identity = unsafe { window_identity(hwnd) }?;
+    let (editor, inactive) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.editor.clone()?;
+        let active = app.tabs.active()?;
+        let target = app.tabs.document(id)?;
+        if target.id == active.id {
+            return Some((editor, None));
+        }
+        if app.populating_file {
+            return None;
+        }
+        Some((editor, Some((target.handle.clone(), active.handle.clone()))))
+    })?;
+    match inactive {
+        None => editor.text().ok(),
+        Some((target, active)) => {
+            read_inactive_text(hwnd, &identity, &editor, &target, &active).ok()
+        }
+    }
 }
 
 fn set_file_population(hwnd: HWND, active: bool) {
@@ -10956,35 +10993,112 @@ mod tests {
     fn type_into_search(hwnd: HWND, text: &str) {
         let edit = crate::window::search_view::edit_hwnd(hwnd).unwrap();
         let wide = crate::platform::wide_null(text);
-        // The Edit sends EN_CHANGE to the panel, which re-runs the search synchronously.
+        // The Edit sends EN_CHANGE to the panel, which restarts the 150 ms debounce.
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
         }
     }
 
+    fn search_state(hwnd: HWND) -> crate::window::search_view::SearchState {
+        crate::window::search_view::search_state(hwnd)
+    }
+
+    fn search_generation(hwnd: HWND) -> u64 {
+        crate::window::text_search_host::generation(hwnd)
+    }
+
+    /// Waits until a search that began after generation `after` has finished.
+    fn wait_for_search(hwnd: HWND, after: u64) {
+        pump_until(hwnd, || {
+            search_generation(hwnd) != after
+                && matches!(
+                    search_state(hwnd),
+                    crate::window::search_view::SearchState::Done { .. }
+                )
+        });
+    }
+
+    /// Types `text` into the Search box and waits past the debounce for its search to finish.
+    fn search_for(hwnd: HWND, text: &str) {
+        type_into_search(hwnd, text);
+        wait_for_search(hwnd, search_generation(hwnd));
+    }
+
+    /// How many notes the finished search visited.
+    fn searched_total(hwnd: HWND) -> usize {
+        match search_state(hwnd) {
+            crate::window::search_view::SearchState::Done { progress, .. } => progress.total,
+            other => panic!("the search has not finished: {other:?}"),
+        }
+    }
+
+    fn search_rows(hwnd: HWND) -> Vec<(String, String)> {
+        crate::window::search_view::shown_results(hwnd)
+    }
+
+    fn search_row(name: &str, snippet: &str) -> (String, String) {
+        (name.to_owned(), snippet.to_owned())
+    }
+
+    fn search_selected(hwnd: HWND) -> Option<usize> {
+        app_mut(hwnd).sidebar.as_ref().unwrap().search.list.selected
+    }
+
+    fn selected_name(hwnd: HWND) -> Option<String> {
+        let index = search_selected(hwnd)?;
+        search_rows(hwnd).get(index).map(|(name, _)| name.clone())
+    }
+
+    fn stray_hit(name: &str) -> crate::library::text_search::TextHit {
+        crate::library::text_search::TextHit {
+            path: PathBuf::from(format!("{name}.md")),
+            name: name.to_owned(),
+            folder: String::new(),
+            snippet: crate::search::Snippet {
+                text: format!("{name} needle"),
+                highlight: name.len() + 1..name.len() + 7,
+            },
+            stamp: None,
+        }
+    }
+
     #[test]
-    fn the_search_view_matches_names_shows_folders_and_opens_the_preview_tab() {
-        // Break caught: search over full paths instead of names, results without their folder,
-        // or Enter opening a normal tab instead of the preview tab.
+    fn the_search_view_finds_note_text_shows_folders_and_opens_the_preview_tab() {
+        // Break caught: a search over names instead of text, results without their folder, or
+        // Enter opening a normal tab instead of the preview tab.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("search-view");
-        scratch.note("Alpha.md", "a");
-        scratch.note("beta.md", "b");
+        scratch.note("Alpha.md", "the alpha plan");
+        scratch.note("beta.md", "nothing here");
+        scratch.note("gamma.md", "Alphabet soup");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
-        scratch.note(r"sub\alphabet.md", "c");
+        scratch.note(r"sub\notes.md", "  alpha, indented");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         scratch.install(window.hwnd);
         crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
         assert_eq!(crate::window::search_view::status(window.hwnd), None);
 
-        type_into_search(window.hwnd, "alp");
+        search_for(window.hwnd, "alpha");
         assert_eq!(
-            crate::window::search_view::shown_results(window.hwnd),
+            search_rows(window.hwnd),
             vec![
-                ("Alpha".to_owned(), String::new()),
-                ("alphabet".to_owned(), "sub".to_owned())
+                search_row("Alpha", "the alpha plan"),
+                search_row("gamma", "Alphabet soup"),
+                search_row("notes", "alpha, indented"),
             ]
+        );
+        let results = &app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .search
+            .results;
+        assert_eq!(results[0].folder, "");
+        assert_eq!(results[2].folder, "sub");
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some(("3 notes".to_owned(), false))
         );
         crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
         let active = app_mut(window.hwnd).tabs.active().unwrap();
@@ -10995,42 +11109,52 @@ mod tests {
         let active_id = active.id;
         assert_eq!(app_mut(window.hwnd).tabs.preview_id(), Some(active_id));
 
-        type_into_search(window.hwnd, "zzz");
+        search_for(window.hwnd, "zzz");
         assert_eq!(
-            crate::window::search_view::status(window.hwnd),
-            Some(crate::window::search_view::NO_MATCH)
+            crate::window::search_view::summary(window.hwnd),
+            Some((crate::window::search_view::NO_MATCH.to_owned(), false))
         );
     }
 
     #[test]
     fn the_search_query_survives_a_view_switch_but_not_a_notebook_switch() {
         // Break caught: the query lost whenever another view is shown, or kept (with results
-        // from the old notebook) after a different notebook opens.
+        // from the old notebook, or its search still reading) after a different notebook opens.
         let _scintilla = load_native_scintilla();
         let first = LibraryScratch::new("search-keep-a");
-        first.note("plan.md", "p");
+        first.note("plan.md", "the plan");
         let second = LibraryScratch::new("search-keep-b");
-        second.note("other.md", "o");
+        second.note("other.md", "the plan too");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         first.install(window.hwnd);
         use crate::config::SidebarView;
         crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
-        type_into_search(window.hwnd, "pl");
+        search_for(window.hwnd, "plan");
         crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
         crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
-        assert_eq!(
-            crate::window::search_view::shown_results(window.hwnd).len(),
-            1
-        );
+        assert_eq!(search_rows(window.hwnd).len(), 1);
 
+        crate::window::text_search_host::run_now(window.hwnd);
+        let flag = crate::window::text_search_host::cancel_flag(window.hwnd).unwrap();
         second.install(window.hwnd);
-        assert!(crate::window::search_view::shown_results(window.hwnd).is_empty());
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the notebook change cancelled it"
+        );
+        assert!(search_rows(window.hwnd).is_empty());
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Idle
+        );
         let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
         assert_eq!(
             unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit) },
             0
         );
+        // A late batch of the cancelled search shows nothing.
+        pump_posted_messages(window.hwnd);
+        assert!(search_rows(window.hwnd).is_empty());
     }
 
     #[test]
@@ -11039,7 +11163,7 @@ mod tests {
         // staying stale when the Search view comes back.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("search-stale");
-        scratch.note("plan.md", "p");
+        scratch.note("plan.md", "plan");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         scratch.install(window.hwnd);
@@ -11048,51 +11172,47 @@ mod tests {
         assert!(crate::window::search_view::edit_hwnd(window.hwnd).is_none());
         crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
         assert!(crate::window::search_view::edit_hwnd(window.hwnd).is_some());
-        type_into_search(window.hwnd, "pl");
-        assert_eq!(
-            crate::window::search_view::shown_results(window.hwnd).len(),
-            1
-        );
+        search_for(window.hwnd, "pl");
+        assert_eq!(search_rows(window.hwnd).len(), 1);
 
         crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
-        let added = scratch.note("planning.md", "q");
+        let added = scratch.note("planning.md", "planning");
         crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+        let before = search_generation(window.hwnd);
         crate::window::side_panel::refresh(window.hwnd);
         assert_eq!(
-            crate::window::search_view::shown_results(window.hwnd).len(),
-            1,
+            search_generation(window.hwnd),
+            before,
             "a hidden Search view is not searched again"
         );
+        assert_eq!(search_rows(window.hwnd).len(), 1);
         crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
+        wait_for_search(window.hwnd, before);
         assert_eq!(
-            crate::window::search_view::shown_results(window.hwnd),
+            search_rows(window.hwnd),
             vec![
-                ("plan".to_owned(), String::new()),
-                ("planning".to_owned(), String::new())
+                search_row("plan", "plan"),
+                search_row("planning", "planning")
             ]
         );
     }
 
-    fn search_selected(hwnd: HWND) -> Option<usize> {
-        app_mut(hwnd).sidebar.as_ref().unwrap().search.list.selected
-    }
-
     #[test]
     fn saving_a_listed_note_keeps_the_search_selection_and_does_not_rebuild_the_tree() {
-        // Break caught: every save (autosave included) rebuilding the sidebar and snapping the
-        // Search selection back to the first result while the user browses the list.
+        // Break caught: every save (autosave included) rebuilding the sidebar, re-running the
+        // search, or snapping the Search selection back to the first result.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("search-save-keeps");
-        scratch.note("plan.md", "p");
-        let planning = scratch.note("planning.md", "q");
-        scratch.note("plans.md", "r");
+        scratch.note("plan.md", "plan a");
+        let planning = scratch.note("planning.md", "plan b");
+        scratch.note("plans.md", "plan c");
         let window = ProductionWindow::new(make_app());
         let editor = install_test_editor(&window);
         scratch.install(window.hwnd);
         use crate::config::SidebarView;
         crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
-        type_into_search(window.hwnd, "plan");
-        let results = crate::window::search_view::shown_results(window.hwnd);
+        search_for(window.hwnd, "plan");
+        let results = search_rows(window.hwnd);
         assert_eq!(results.len(), 3);
         let index = results
             .iter()
@@ -11109,10 +11229,11 @@ mod tests {
         super::open_path(window.hwnd, &planning).unwrap();
         pump_posted_messages(window.hwnd);
         let rebuilds = notebook_view(window.hwnd).rebuilds;
+        let searches = search_generation(window.hwnd);
 
-        editor.set_text("edited").unwrap();
+        editor.set_text("edited plan").unwrap();
         assert!(super::save_active_document(window.hwnd));
-        assert_eq!(std::fs::read_to_string(&planning).unwrap(), "edited");
+        assert_eq!(std::fs::read_to_string(&planning).unwrap(), "edited plan");
         assert_eq!(
             search_selected(window.hwnd),
             Some(index),
@@ -11123,17 +11244,405 @@ mod tests {
             rebuilds,
             "a save of a listed note changes no row"
         );
-
-        // A library refresh runs the same query again, and the selection stays by path.
+        // A refresh with the same notes runs nothing (spec §7).
         crate::window::side_panel::refresh(window.hwnd);
+        assert_eq!(search_generation(window.hwnd), searches, "no search re-ran");
+
+        // The same query run again keeps the selection by path.
+        let before = search_generation(window.hwnd);
+        crate::window::text_search_host::run_now(window.hwnd);
+        wait_for_search(window.hwnd, before);
         assert_eq!(
             search_selected(window.hwnd),
             Some(index),
             "kept by a re-run"
         );
-        // A new query starts at the top.
-        type_into_search(window.hwnd, "pla");
-        assert_eq!(search_selected(window.hwnd), Some(0));
+        // A new query selects the same note again once it arrives.
+        search_for(window.hwnd, "pla");
+        assert_eq!(selected_name(window.hwnd).as_deref(), Some("planning"));
+    }
+
+    #[test]
+    fn typing_waits_for_the_debounce_and_gives_sorted_results_with_the_selection_kept_by_path() {
+        // Break caught: a search per keystroke, results in the order the worker found them, or
+        // results arriving above the selected row moving the selection to another note.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-debounce");
+        scratch.note("c10.md", "needle");
+        scratch.note("b.md", "a needle here");
+        scratch.note("c9.md", "needle");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\b.md", "needle too");
+        scratch.note("d.md", "no match");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+
+        type_into_search(window.hwnd, "needle");
+        // The keystroke only restarted the timer: nothing has run yet.
+        assert!(search_rows(window.hwnd).is_empty());
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Idle
+        );
+        assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+        wait_for_search(window.hwnd, search_generation(window.hwnd));
+        assert_eq!(
+            search_rows(window.hwnd),
+            vec![
+                search_row("b", "a needle here"),
+                search_row("b", "needle too"),
+                search_row("c9", "needle"),
+                search_row("c10", "needle"),
+            ]
+        );
+        let folders = app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .search
+            .results
+            .iter()
+            .map(|result| result.folder.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(folders, ["", "sub", "", ""]);
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some(("4 notes".to_owned(), false))
+        );
+
+        // c9 is selected; a new note that sorts first arrives with the re-run.
+        app_mut(window.hwnd)
+            .sidebar
+            .as_mut()
+            .unwrap()
+            .search
+            .list
+            .selected = Some(2);
+        let added = scratch.note("a.md", "needle first");
+        crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+        let before = search_generation(window.hwnd);
+        crate::window::side_panel::refresh(window.hwnd);
+        wait_for_search(window.hwnd, before);
+        assert_eq!(search_rows(window.hwnd)[0], search_row("a", "needle first"));
+        assert_eq!(selected_name(window.hwnd).as_deref(), Some("c9"));
+        assert_eq!(search_selected(window.hwnd), Some(3));
+    }
+
+    #[test]
+    fn a_batch_from_an_older_generation_is_dropped() {
+        // Break caught: a slow batch from the previous query landing after the new one began, so
+        // the list flickers back to rows the new query never matched.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-generation");
+        scratch.note("a.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "needle");
+        let shown = vec![search_row("a", "needle")];
+        assert_eq!(search_rows(window.hwnd), shown);
+
+        let current = search_generation(window.hwnd);
+        let stale = crate::window::text_search_host::test_batch(
+            current.wrapping_sub(1),
+            vec![stray_hit("old")],
+            None,
+        );
+        crate::window::text_search_host::batch_arrived(window.hwnd, stale);
+        assert_eq!(
+            search_rows(window.hwnd),
+            shown,
+            "dropped when handled directly"
+        );
+        let stale = crate::window::text_search_host::test_batch(
+            current.wrapping_sub(1),
+            vec![stray_hit("older")],
+            Some(crate::library::text_search::RunEnd::Completed),
+        );
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                window.hwnd,
+                crate::window::WM_FASTPAD_TEXT_SEARCH_BATCH,
+                0,
+                stale,
+            );
+        }
+        pump_posted_messages(window.hwnd);
+        assert_eq!(
+            search_rows(window.hwnd),
+            shown,
+            "and when it comes through the queue"
+        );
+
+        // A keystroke cancels the running search, so its late batches are stale too.
+        type_into_search(window.hwnd, "needles");
+        let late =
+            crate::window::text_search_host::test_batch(current, vec![stray_hit("late")], None);
+        crate::window::text_search_host::batch_arrived(window.hwnd, late);
+        assert_eq!(search_rows(window.hwnd), shown);
+        // The current generation's batch is the one that shows.
+        let now = crate::window::text_search_host::test_batch(
+            search_generation(window.hwnd),
+            vec![stray_hit("b")],
+            None,
+        );
+        crate::window::text_search_host::batch_arrived(window.hwnd, now);
+        assert_eq!(search_rows(window.hwnd).len(), 2);
+    }
+
+    #[test]
+    fn a_dirty_tab_is_searched_as_the_editor_has_it() {
+        // Break caught: the search reading an open note from disk, so a phrase typed only in the
+        // editor is missed and a phrase deleted in the editor is still found, for the active tab
+        // or a tab in the background; or reading a background tab leaving it in the editor.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-dirty");
+        let a = scratch.note("a.md", "kept on disk only");
+        let b = scratch.note("b.md", "plain b");
+        scratch.note("c.md", "plain c");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        // No autosave may write the edits: opening `b` would save `a`, the tab being left.
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &a).unwrap();
+        pump_posted_messages(window.hwnd);
+        editor.set_text("typed in the editor only").unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        editor.set_text("b typed too").unwrap();
+        let dirty = app_mut(window.hwnd)
+            .tabs
+            .documents()
+            .filter(|document| document.dirty)
+            .count();
+        assert_eq!(dirty, 2);
+
+        let overlays =
+            crate::window::text_search_host::dirty_overlays(window.hwnd, &scratch.folder());
+        assert_eq!(overlays.len(), 2);
+        assert_eq!(
+            overlays
+                .get(std::path::Path::new("a.md"))
+                .map(String::as_str),
+            Some("typed in the editor only"),
+            "a background tab"
+        );
+        assert_eq!(
+            overlays
+                .get(std::path::Path::new("b.md"))
+                .map(String::as_str),
+            Some("b typed too"),
+            "the active tab"
+        );
+        assert_eq!(
+            editor.text().unwrap(),
+            "b typed too",
+            "the active tab is back"
+        );
+
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "editor only");
+        assert_eq!(
+            search_rows(window.hwnd),
+            vec![search_row("a", "typed in the editor only")]
+        );
+        search_for(window.hwnd, "on disk");
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some((crate::window::search_view::NO_MATCH.to_owned(), false))
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "kept on disk only");
+    }
+
+    #[test]
+    fn a_longer_plain_query_searches_only_the_previous_hits() {
+        // Break caught: every keystroke re-reading the whole notebook, or narrowing kept after a
+        // change of options.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-narrow");
+        scratch.note("a.md", "needle");
+        scratch.note("b.md", "needles");
+        scratch.note("c.md", "other");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "need");
+        assert_eq!(searched_total(window.hwnd), 3);
+        search_for(window.hwnd, "needl");
+        assert_eq!(
+            searched_total(window.hwnd),
+            2,
+            "only the notes \"need\" found"
+        );
+        assert_eq!(search_rows(window.hwnd).len(), 2);
+        let before = search_generation(window.hwnd);
+        crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Case);
+        wait_for_search(window.hwnd, before);
+        assert_eq!(
+            searched_total(window.hwnd),
+            3,
+            "new options search everything"
+        );
+    }
+
+    #[test]
+    fn an_invalid_regex_shows_its_error_keeps_the_results_and_runs_nothing() {
+        // Break caught: a regex typo blanking the list, running a search anyway, or showing no
+        // reason.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-bad-regex");
+        scratch.note("a.md", "ab here");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "ab");
+        let before = search_generation(window.hwnd);
+        crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+        wait_for_search(window.hwnd, before);
+        assert!(crate::window::search_view::options(window.hwnd).regex);
+        assert_eq!(search_rows(window.hwnd).len(), 1);
+
+        type_into_search(window.hwnd, "(ab");
+        pump_until(window.hwnd, || {
+            matches!(
+                search_state(window.hwnd),
+                crate::window::search_view::SearchState::PatternError(_)
+            )
+        });
+        let (message, error) = crate::window::search_view::summary(window.hwnd).unwrap();
+        assert!(error, "shown as an error");
+        assert!(!message.is_empty());
+        assert_eq!(
+            search_rows(window.hwnd).len(),
+            1,
+            "the previous results stay"
+        );
+        assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+
+        search_for(window.hwnd, "(ab)");
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some(("1 note".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn one_character_says_type_at_least_two_and_clears_the_results() {
+        // Break caught: a one-letter query reading the whole notebook, or the last query's rows
+        // left under a query they don't match.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-short");
+        scratch.note("a.md", "ab");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "ab");
+        assert_eq!(search_rows(window.hwnd).len(), 1);
+
+        type_into_search(window.hwnd, "a");
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::TooShort
+        );
+        assert!(search_rows(window.hwnd).is_empty());
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some((crate::window::search_view::TOO_SHORT.to_owned(), false))
+        );
+        assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+        type_into_search(window.hwnd, "  ");
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Idle
+        );
+        assert_eq!(crate::window::search_view::summary(window.hwnd), None);
+        // Run directly (as a toggle or Ctrl+Shift+F would), a query of spaces still runs nothing.
+        let before = search_generation(window.hwnd);
+        crate::window::text_search_host::run_now(window.hwnd);
+        assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Idle
+        );
+        pump_posted_messages(window.hwnd);
+        assert_ne!(search_generation(window.hwnd), before, "it only cancelled");
+        assert!(search_rows(window.hwnd).is_empty());
+    }
+
+    #[test]
+    fn show_with_query_fills_the_box_escapes_it_for_regex_and_runs_at_once() {
+        // Break caught: Ctrl+Shift+F's selection waiting out the debounce, or "1+1" searched as
+        // a regex (one or more 1s, then 1) when regex is on.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-prefill");
+        scratch.note("a.md", "costs 1+1 here");
+        scratch.note("b.md", "costs 11 here");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        let before = search_generation(window.hwnd);
+        crate::window::search_view::show_with_query(window.hwnd, "1+1");
+        assert!(
+            matches!(
+                search_state(window.hwnd),
+                crate::window::search_view::SearchState::Running(_)
+                    | crate::window::search_view::SearchState::Done { .. }
+            ),
+            "running without the debounce"
+        );
+        wait_for_search(window.hwnd, before);
+        assert_eq!(
+            search_rows(window.hwnd),
+            vec![search_row("a", "costs 1+1 here")]
+        );
+
+        let before = search_generation(window.hwnd);
+        crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+        wait_for_search(window.hwnd, before);
+        let before = search_generation(window.hwnd);
+        crate::window::search_view::show_with_query(window.hwnd, "1+1");
+        wait_for_search(window.hwnd, before);
+        let (query, options) = crate::window::search_view::current_query(window.hwnd).unwrap();
+        assert!(options.regex);
+        assert_eq!(query, r"1\+1");
+        assert_eq!(
+            crate::window::search_view::run_query(window.hwnd),
+            Some((query, options)),
+            "the results are for the escaped query, with regex on"
+        );
+        assert_eq!(
+            search_rows(window.hwnd),
+            vec![search_row("a", "costs 1+1 here")]
+        );
+    }
+
+    #[test]
+    fn closing_the_window_cancels_a_running_search() {
+        // Break caught: a worker reading a large notebook on after its window closed.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-destroy");
+        for index in 0..200 {
+            scratch.note(&format!("n{index}.md"), "needle");
+        }
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        type_into_search(window.hwnd, "needle");
+        crate::window::text_search_host::run_now(window.hwnd);
+        let flag = crate::window::text_search_host::cancel_flag(window.hwnd).expect("running");
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+        assert!(flag.load(Ordering::Relaxed));
     }
 
     #[test]

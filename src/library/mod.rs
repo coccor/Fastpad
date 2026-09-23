@@ -127,21 +127,22 @@ fn pinned_paths(library: &Library) -> Vec<PathBuf> {
         .collect()
 }
 
-fn pin_key(path: &Path) -> String {
+/// A note path as a key that compares ignoring case: the rule of `model::same_path`.
+pub(crate) fn path_key(path: &Path) -> String {
     path.to_string_lossy().to_lowercase()
 }
 
 /// Brings the tree's pins from `before` to `after` without a rebuild.
 fn sync_pins(tree: &mut tree::NoteTree, before: &[PathBuf], after: &[PathBuf]) {
-    let before_keys: HashSet<String> = before.iter().map(|path| pin_key(path)).collect();
-    let after_keys: HashSet<String> = after.iter().map(|path| pin_key(path)).collect();
+    let before_keys: HashSet<String> = before.iter().map(|path| path_key(path)).collect();
+    let after_keys: HashSet<String> = after.iter().map(|path| path_key(path)).collect();
     for path in after {
-        if !before_keys.contains(&pin_key(path)) {
+        if !before_keys.contains(&path_key(path)) {
             tree.set_pinned(path, true);
         }
     }
     for path in before {
-        if !after_keys.contains(&pin_key(path)) {
+        if !after_keys.contains(&path_key(path)) {
             tree.set_pinned(path, false);
         }
     }
@@ -407,12 +408,12 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
 /// can differ from its pins, so this runs on the UI thread at the cost of those few paths.
 fn update_merged_tree(state: &mut LibraryState, touched: &[PathBuf], built_pins: &[PathBuf]) {
     let pins = pinned_paths(&state.library);
-    let pinned: HashSet<String> = pins.iter().map(|path| pin_key(path)).collect();
+    let pinned: HashSet<String> = pins.iter().map(|path| path_key(path)).collect();
     for path in touched {
         if state.notes.iter().any(|note| same_path(&note.path, path)) {
             state
                 .tree
-                .insert_note(path, pinned.contains(&pin_key(path)));
+                .insert_note(path, pinned.contains(&path_key(path)));
         } else {
             state.tree.remove_note(path);
         }

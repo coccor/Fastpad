@@ -87,6 +87,8 @@ pub struct App {
     pub(crate) last_snapshot_duration: Option<std::time::Duration>,
     pub(crate) last_snapshot_attempt: Option<DocumentId>,
     pub(crate) library: crate::window::library_host::LibraryHost,
+    /// The Search view's text search: its debounce, generation, cancel flag and narrowing record.
+    pub(crate) text_search: crate::window::text_search_host::TextSearchHost,
     /// The activity bar and side panel; present only in notes mode.
     pub(crate) sidebar: Option<crate::window::side_panel::Sidebar>,
     /// The warnings of the `fastpad.ini` that `bootstrap::run` read into `settings` before the
@@ -154,6 +156,7 @@ impl App {
             last_snapshot_attempt: None,
             next_document_id: 2,
             library: crate::window::library_host::LibraryHost::new(process_start),
+            text_search: Default::default(),
             sidebar: None,
             preloaded_settings_warnings: None,
             palette_note_target: None,

@@ -481,6 +481,8 @@ fn install(hwnd: HWND, fresh: LibraryState) {
             force: rewrite,
         },
     );
+    // A load or rescan may have seen outside edits: the Search view's query runs again.
+    crate::window::text_search_host::notes_reloaded(hwnd);
     super::side_panel::refresh(hwnd);
     // A notebook's first load reveals the (restored) active note: its row is selected and its
     // folders expand (spec §6.1). A rescan leaves the user's selection where it was.
@@ -1107,6 +1109,8 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     unsafe {
         KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
     }
+    // The Search view goes with the sidebar: its search stops and its record is dropped.
+    crate::window::text_search_host::forget(hwnd);
     host(hwnd, |host| {
         host.state = None;
         host.folder = None;
