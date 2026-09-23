@@ -118,10 +118,6 @@ pub(super) fn choose_open_path(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
     crate::window::commands::choose_open_path(hwnd)
 }
 
-#[allow(
-    dead_code,
-    reason = "consumed by the Task 15 Open Folder command, not yet wired"
-)]
 pub(crate) fn choose_folder(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
     let _modal = ModalScope::enter(hwnd);
     #[cfg(test)]

@@ -29,11 +29,12 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 42] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 43] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
         accelerator(FCONTROL, b'O', CommandId::Open),
+        accelerator(FCONTROL | FSHIFT, b'O', CommandId::OpenFolder),
         accelerator(FCONTROL, b'S', CommandId::Save),
         accelerator(FCONTROL | FSHIFT, b'S', CommandId::SaveAs),
         accelerator(FCONTROL, b'F', CommandId::Find),
@@ -139,6 +140,7 @@ impl MenuBar {
             let file = create_popup(&[
                 MenuEntry::command("&New\tCtrl+N", CommandId::New),
                 MenuEntry::command("&Open...\tCtrl+O", CommandId::Open),
+                MenuEntry::command("Open &Folder...\tCtrl+Shift+O", CommandId::OpenFolder),
                 MenuEntry::command("&Save\tCtrl+S", CommandId::Save),
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
                 MenuEntry::command("&Close tab", CommandId::CloseTab),
@@ -540,7 +542,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 42);
+        assert_eq!(specs.len(), 43);
     }
 
     #[test]

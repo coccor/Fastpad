@@ -44,9 +44,11 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 47] = [
+pub(crate) const ENTRIES: [PaletteEntry; 49] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
+    entry("File: Open folder...", CommandId::OpenFolder),
+    entry("File: Open recent folder...", CommandId::OpenRecentFolder),
     entry("File: Save", CommandId::Save),
     entry("File: Save as...", CommandId::SaveAs),
     entry("File: Close tab", CommandId::CloseTab),
@@ -170,7 +172,7 @@ pub(crate) fn filter_entries(
 /// What a picker is choosing; decides what `library_host::picked` does with the choice.
 #[allow(
     dead_code,
-    reason = "constructed by open_picker's callers in Tasks 15 and 19"
+    reason = "the organizing pickers of Task 19 construct the remaining kinds"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PickerKind {

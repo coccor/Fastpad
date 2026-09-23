@@ -10,12 +10,14 @@ pub const HEADER_BYTES: usize = FRAME_MAGIC.len() + 1 + 4;
 const COMMAND_OPEN: u8 = 1;
 const COMMAND_NEW: u8 = 2;
 const COMMAND_ACTIVATE: u8 = 3;
+const COMMAND_OPEN_FOLDER: u8 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IpcRequest {
     Open(PathBuf),
     New,
     Activate,
+    OpenFolder(PathBuf),
 }
 
 pub fn encode_frame(request: &IpcRequest) -> Result<Vec<u8>> {
@@ -23,6 +25,7 @@ pub fn encode_frame(request: &IpcRequest) -> Result<Vec<u8>> {
         IpcRequest::Open(path) => (COMMAND_OPEN, encode_path(path)?),
         IpcRequest::New => (COMMAND_NEW, Vec::new()),
         IpcRequest::Activate => (COMMAND_ACTIVATE, Vec::new()),
+        IpcRequest::OpenFolder(path) => (COMMAND_OPEN_FOLDER, encode_path(path)?),
     };
     if HEADER_BYTES + payload.len() > MAX_FRAME_BYTES {
         return Err(FastPadError::Ipc("frame exceeds 64 KiB"));
@@ -59,6 +62,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<IpcRequest> {
         }
         COMMAND_NEW => Ok(IpcRequest::New),
         COMMAND_ACTIVATE => Ok(IpcRequest::Activate),
+        COMMAND_OPEN_FOLDER => decode_path(payload).map(IpcRequest::OpenFolder),
         _ => Err(FastPadError::Ipc("unknown command")),
     }
 }
@@ -194,6 +198,15 @@ mod tests {
         assert!(frame.len() <= MAX_FRAME_BYTES);
         assert_eq!(decode_frame(&frame).unwrap(), IpcRequest::Open(fits));
         assert!(encode_frame(&IpcRequest::Open(PathBuf::from("a".repeat(units + 1)))).is_err());
+    }
+
+    #[test]
+    fn open_folder_frames_carry_the_path_like_open() {
+        let request = IpcRequest::OpenFolder(PathBuf::from(r"D:\Notes"));
+        let frame = encode_frame(&request).unwrap();
+        assert_eq!(frame[FRAME_MAGIC.len()], 4);
+        assert_eq!(decode_frame(&frame).unwrap(), request);
+        assert!(encode_frame(&IpcRequest::OpenFolder(PathBuf::new())).is_err());
     }
 
     #[test]

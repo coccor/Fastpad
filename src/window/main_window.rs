@@ -37,13 +37,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW,
     WHEEL_DELTA, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DWMCOLORIZATIONCOLORCHANGED,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE,
-    WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
-    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT,
+    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -241,6 +241,13 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_TIMER if wparam == crate::window::library_host::LIBRARY_WRITE_TIMER_ID => {
             crate::window::library_host::flush_now(hwnd);
+            0
+        }
+        WM_DROPFILES => {
+            crate::window::library_host::files_dropped(
+                hwnd,
+                wparam as windows_sys::Win32::UI::Shell::HDROP,
+            );
             0
         }
         WM_ACTIVATEAPP => {
@@ -1123,10 +1130,6 @@ fn open_command_palette(hwnd: HWND) {
 
 /// Opens the palette in picker mode: it lists `picker`'s items instead of commands, and the
 /// choice made on Enter goes to `library_host::picked` instead of running a command.
-#[allow(
-    dead_code,
-    reason = "called by the organizing commands Tasks 15 and 19 add"
-)]
 pub(crate) fn open_picker(hwnd: HWND, picker: command_palette::Picker) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
@@ -1728,6 +1731,8 @@ fn execute_command(hwnd: HWND, command: CommandId) {
                 crate::window::library_host::notes_mode_notice(enabled).to_owned(),
             );
         }
+        CommandId::OpenFolder => crate::window::library_host::choose_and_open_folder(hwnd),
+        CommandId::OpenRecentFolder => crate::window::library_host::open_recent_folder_picker(hwnd),
         CommandId::FontSizeIncrease => {
             set_font_size(hwnd, |size| {
                 size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
@@ -2000,6 +2005,7 @@ fn build_chrome(hwnd: HWND) {
     apply_theme(hwnd);
     layout_editor_and_find_bar(hwnd);
     unsafe {
+        windows_sys::Win32::UI::Shell::DragAcceptFiles(hwnd, 1);
         InvalidateRect(hwnd, std::ptr::null(), 1);
     }
 }
@@ -2335,13 +2341,29 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
     match request {
         crate::launch::LaunchRequest::Open(path) => {
             let path = std::path::Path::new(&path);
-            match App::open_path(hwnd, path) {
-                Ok(()) => return 0,
-                Err(error) => {
-                    report_open_failure(hwnd, path, &error);
-                    // The requested-file unit is finished either way; the milestone stays honest.
-                    unsafe {
-                        let _ = record_milestone(hwnd, Milestone::FileLoaded);
+            if path.is_dir() {
+                // OPEN_LIBRARY already opened it as the folder.
+                if !notes_mode_enabled(hwnd) {
+                    push_notice(
+                        hwnd,
+                        format!(
+                            "{} is a folder. Turn on notes mode to open folders.",
+                            path.display()
+                        ),
+                    );
+                }
+                unsafe {
+                    let _ = record_milestone(hwnd, Milestone::FileLoaded);
+                }
+            } else {
+                match App::open_path(hwnd, path) {
+                    Ok(()) => return 0,
+                    Err(error) => {
+                        report_open_failure(hwnd, path, &error);
+                        // The requested-file unit is finished either way; the milestone stays honest.
+                        unsafe {
+                            let _ = record_milestone(hwnd, Milestone::FileLoaded);
+                        }
                     }
                 }
             }
@@ -2356,6 +2378,10 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
         }
     }
     0
+}
+
+fn notes_mode_enabled(hwnd: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode)
 }
 
 pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
@@ -3532,6 +3558,9 @@ fn open_ipc_requests(hwnd: HWND) -> LRESULT {
             }
             crate::ipc::IpcRequest::New => execute_command(hwnd, CommandId::New),
             crate::ipc::IpcRequest::Activate => {}
+            crate::ipc::IpcRequest::OpenFolder(path) => {
+                crate::window::library_host::open_folder(hwnd, &path)
+            }
         }
         if identity.is_live_for(hwnd) {
             bring_to_foreground(hwnd);
@@ -6696,6 +6725,66 @@ mod tests {
             pump_posted_messages(hwnd);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_tabs() {
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("switch-a");
+        let second = LibraryScratch::new("switch-b");
+        let a = first.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(first.data());
+        first.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            let mut ids = crate::library::ids::IdSource::new(1, 1);
+            let target = state.note_ref(&mut ids, &a);
+            state
+                .apply(crate::library::ops::PendingOp::SetPinned {
+                    note: target,
+                    value: true,
+                })
+                .unwrap();
+        });
+
+        crate::window::answer_next_folder_dialog({
+            let folder = second.folder();
+            move |_| Some(folder)
+        });
+        execute_command(window.hwnd, CommandId::OpenFolder);
+
+        assert!(
+            crate::library::store::library_file(&first.folder()).exists(),
+            "old folder flushed"
+        );
+        assert_eq!(
+            crate::window::library_host::folder(window.hwnd),
+            Some(second.folder())
+        );
+        let recent = crate::library::local::read_folders(&crate::library::local::folders_file(
+            &first.data(),
+        ));
+        assert_eq!(recent.folders.first(), Some(&second.folder()));
+        assert_eq!(super::tab_count(window.hwnd), 1, "open tabs stay open");
+        pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    }
+
+    #[test]
+    fn opening_a_path_that_is_not_a_folder_explains_why() {
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        crate::window::library_host::open_folder(
+            window.hwnd,
+            std::path::Path::new(r"Z:\no\such\folder"),
+        );
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("is not a folder"))
+        );
+        assert_eq!(crate::window::library_host::folder(window.hwnd), None);
     }
 
     #[test]

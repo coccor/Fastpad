@@ -1,9 +1,9 @@
 //! Window wiring for the note library: the deferred load, rescans, debounced metadata writes,
 //! folder commands, first-save naming, autosave, and the organizing commands.
 
-use super::main_window::{app_ptr, push_notice};
+use super::main_window::{app_ptr, push_notice, window_identity};
 use crate::library::{self, LibraryState, Metadata, ids::IdSource};
-use crate::window::command_palette::{PickerChoice, PickerKind};
+use crate::window::command_palette::{Picker, PickerChoice, PickerKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
@@ -326,6 +326,112 @@ pub(crate) fn flush_now(hwnd: HWND) {
     }
 }
 
+/// Opens `path` as the library, flushing the current one first. Open tabs stay open.
+pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
+    if !notes_mode(hwnd) {
+        push_notice(
+            hwnd,
+            "Notes mode is off. Turn it on with Notes: Toggle notes mode to open folders."
+                .to_owned(),
+        );
+        return;
+    }
+    let Ok(path) = std::path::absolute(path) else {
+        return;
+    };
+    if !path.is_dir() {
+        push_notice(hwnd, format!("{} is not a folder.", path.display()));
+        return;
+    }
+    flush_now(hwnd);
+    host(hwnd, |host| {
+        host.state = None;
+        host.folder = Some(path.clone());
+    });
+    if let Some(data) = data_dir(hwnd) {
+        remember_folder(&data, &path);
+    }
+    start_load(hwnd);
+    super::main_window::invalidate_title_strip(hwnd);
+}
+
+pub(crate) fn choose_and_open_folder(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let choice = crate::window::modal::choose_folder(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    match choice {
+        Ok(Some(path)) => open_folder(hwnd, &path),
+        Ok(None) => {}
+        Err(error) => push_notice(
+            hwnd,
+            format!("FastPad could not open the folder picker: {error}"),
+        ),
+    }
+}
+
+fn recent_folders(hwnd: HWND) -> Vec<PathBuf> {
+    data_dir(hwnd)
+        .map(|data| library::local::read_folders(&library::local::folders_file(&data)).folders)
+        .unwrap_or_default()
+}
+
+pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
+    let folders = recent_folders(hwnd);
+    if folders.is_empty() {
+        push_notice(
+            hwnd,
+            "No recent folders yet. Use File: Open folder.".to_owned(),
+        );
+        return;
+    }
+    super::main_window::open_picker(
+        hwnd,
+        Picker {
+            kind: PickerKind::RecentFolder,
+            items: folders.iter().map(|f| f.display().to_string()).collect(),
+            create: None,
+        },
+    );
+}
+
+/// Dropped folders open as the library (the last one wins); dropped files open as tabs.
+pub(crate) fn files_dropped(hwnd: HWND, drop: windows_sys::Win32::UI::Shell::HDROP) {
+    use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW};
+    let count = unsafe { DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0) };
+    let mut paths = Vec::new();
+    for index in 0..count {
+        let length = unsafe { DragQueryFileW(drop, index, std::ptr::null_mut(), 0) } as usize;
+        let mut buffer = vec![0_u16; length + 1];
+        unsafe { DragQueryFileW(drop, index, buffer.as_mut_ptr(), buffer.len() as u32) };
+        buffer.truncate(length);
+        paths.push(PathBuf::from(
+            <std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&buffer),
+        ));
+    }
+    unsafe { DragFinish(drop) };
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let mut folder = None;
+    for path in paths {
+        if !identity.is_live_for(hwnd) {
+            return;
+        }
+        if path.is_dir() {
+            folder = Some(path);
+        } else if let Err(error) = super::main_window::open_path(hwnd, &path) {
+            super::main_window::report_open_failure(hwnd, &path, &error);
+        }
+    }
+    if let Some(folder) = folder {
+        open_folder(hwnd, &folder);
+    }
+}
+
 /// Notes mode was toggled: load the last folder, or flush and forget the library.
 pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     if enabled {
@@ -375,5 +481,16 @@ pub(crate) fn take_last_pick() -> Option<(PickerKind, PickerChoice)> {
 pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
     #[cfg(test)]
     LAST_PICK.with(|last| *last.borrow_mut() = Some((kind, choice.clone())));
-    let _ = (hwnd, kind, choice);
+    #[expect(
+        clippy::single_match,
+        reason = "Task 19 adds one arm per organizing picker"
+    )]
+    match (kind, choice) {
+        (PickerKind::RecentFolder, PickerChoice::Item(index)) => {
+            if let Some(folder) = recent_folders(hwnd).get(index) {
+                open_folder(hwnd, folder);
+            }
+        }
+        _ => {}
+    }
 }

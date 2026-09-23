@@ -59,6 +59,8 @@ pub enum CommandId {
     MarkdownPreviewClose,
     ToggleRestoreSession,
     ToggleNotesMode,
+    OpenFolder,
+    OpenRecentFolder,
 }
 
 impl CommandId {
@@ -89,6 +91,8 @@ impl CommandId {
                 | Self::ThemeCatppuccinMocha
                 | Self::ToggleRestoreSession
                 | Self::ToggleNotesMode
+                | Self::OpenFolder
+                | Self::OpenRecentFolder
         )
     }
 
@@ -118,7 +122,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 58] = [
+        const COMMANDS: [CommandId; 60] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -177,6 +181,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownPreviewClose,
             CommandId::ToggleRestoreSession,
             CommandId::ToggleNotesMode,
+            CommandId::OpenFolder,
+            CommandId::OpenRecentFolder,
         ];
         COMMANDS
             .into_iter()
@@ -191,10 +197,6 @@ pub(crate) fn choose_open_path(
     crate::platform::dialogs::show_open_dialog(owner)
 }
 
-#[allow(
-    dead_code,
-    reason = "consumed by the Task 15 Open Folder command, not yet wired"
-)]
 pub(crate) fn choose_folder_path(
     owner: windows_sys::Win32::Foundation::HWND,
 ) -> crate::Result<Option<std::path::PathBuf>> {
@@ -238,6 +240,10 @@ mod tests {
         assert!(!CommandId::ToggleRestoreSession.needs_document());
         assert_eq!(CommandId::try_from(157), Ok(CommandId::ToggleNotesMode));
         assert!(!CommandId::ToggleNotesMode.needs_document());
+        assert_eq!(CommandId::try_from(158), Ok(CommandId::OpenFolder));
+        assert_eq!(CommandId::try_from(159), Ok(CommandId::OpenRecentFolder));
+        assert!(!CommandId::OpenFolder.needs_document());
+        assert!(!CommandId::OpenRecentFolder.needs_document());
     }
 
     #[test]

@@ -57,11 +57,20 @@ fn create_instance_mutex(names: &InstanceNames) -> Result<Option<OwnedHandle>> {
     Ok((!existed).then_some(mutex))
 }
 
-/// Resolves a relative path against this process's current directory without touching the disk.
+/// Resolves a relative path against this process's current directory, and forwards a path that
+/// names an existing directory as `OpenFolder`.
 pub fn ipc_request_for(request: &LaunchRequest) -> Result<IpcRequest> {
     match request {
         LaunchRequest::New => Ok(IpcRequest::New),
-        LaunchRequest::Open(path) => Ok(IpcRequest::Open(std::path::absolute(path)?)),
+        LaunchRequest::Open(path) => {
+            let path = std::path::absolute(path)?;
+            // A second launch naming a folder opens it as the library of the running window.
+            if path.is_dir() {
+                Ok(IpcRequest::OpenFolder(path))
+            } else {
+                Ok(IpcRequest::Open(path))
+            }
+        }
     }
 }
 
@@ -167,6 +176,18 @@ mod tests {
         assert_eq!(
             ipc_request_for(&LaunchRequest::Open(absolute.clone().into_os_string())).unwrap(),
             IpcRequest::Open(absolute)
+        );
+    }
+
+    #[test]
+    fn a_directory_argument_is_forwarded_as_open_folder() {
+        // Break caught: `fastpad D:\Notes` from a second launch trying to open the folder as a file.
+        let dir = std::env::temp_dir();
+        let request =
+            ipc_request_for(&crate::LaunchRequest::Open(dir.clone().into_os_string())).unwrap();
+        assert_eq!(
+            request,
+            crate::ipc::IpcRequest::OpenFolder(std::path::absolute(&dir).unwrap())
         );
     }
 
