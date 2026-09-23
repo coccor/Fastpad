@@ -216,6 +216,22 @@ impl Tabs {
             .map(|document| document.id)
     }
 
+    /// The tab whose stored path names `path`, compared as absolute paths ignoring case, without
+    /// touching the disk: unlike `find_path`, it finds a tab whose file no longer exists (renamed
+    /// or moved outside FastPad).
+    pub(crate) fn find_stored_path(&self, path: &Path) -> Option<DocumentId> {
+        let key = lexical_key(path);
+        self.documents
+            .iter()
+            .find(|document| {
+                document
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| lexical_key(p) == key)
+            })
+            .map(|document| document.id)
+    }
+
     pub(crate) fn replace_active_untitled(&mut self, document: Document) -> Option<Document> {
         let index = self.active_index();
         let active = self.documents.get_mut(index)?;
@@ -528,6 +544,15 @@ fn canonical_key(path: &Path) -> Result<PathBuf, DuplicateDocumentPath> {
     {
         Ok(canonical)
     }
+}
+
+fn lexical_key(path: &Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .to_lowercase()
 }
 
 fn validate_unique_paths(documents: &[Document]) -> Result<(), DuplicateDocumentPath> {

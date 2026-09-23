@@ -244,6 +244,13 @@ fn a_note_keeps_its_favorite_after_being_renamed_in_explorer() {
         renamed.contains("|f|"),
         "the favorite must follow the rename: {renamed:?}"
     );
+    // The open tab followed too: its next autosave lands in b.md and never re-creates a.md.
+    let moved = data.folder().join("b.md");
+    type_more(editor, "z");
+    wait_until("the tab to autosave into the renamed file", || {
+        scintilla_text(editor).is_ok_and(|t| t.len() == 2 && read(&moved) == t)
+    });
+    assert!(!note.exists(), "the old name must not be re-created");
     close(process, hwnd);
 }
 

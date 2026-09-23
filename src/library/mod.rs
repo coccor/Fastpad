@@ -24,6 +24,20 @@ pub enum Metadata {
     Ready,
     /// `library.ini` is damaged or from a newer FastPad: organizing is off and it is never written.
     Unreadable,
+    /// `library.ini` could not be read this time (for example OneDrive held it open). Organizing
+    /// waits for the next rescan, which reads it again; nothing is written meanwhile.
+    Busy,
+}
+
+/// What `flush` did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Flushed {
+    Wrote,
+    /// Nothing to write, or nothing may be written (the metadata is not ready).
+    Nothing,
+    /// `library.ini` changed on disk and could not be re-read right now. The pending operations
+    /// are kept; try again later.
+    Busy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +59,12 @@ pub struct LibraryState {
     pub truncated: bool,
     pub pending: Vec<PendingOp>,
     pub relocated: Vec<(PathBuf, PathBuf)>,
+    /// Paths (as records store them) FastPad itself added, removed or renamed in `notes` since
+    /// the running rescan started. Only these are re-checked when its result is merged.
+    pub touched: Vec<PathBuf>,
+    /// The recent list, autosave switch and missing times as the local file last written holds
+    /// them, so the UI thread rewrites that file only when one of them changed.
+    pub written_local: local::Conveniences,
 }
 
 pub fn now_unix() -> u64 {
@@ -76,6 +96,35 @@ fn strip_folder(folder: &Path, path: &Path) -> Option<PathBuf> {
 /// How a record stores `path`: relative inside `folder` (compared ignoring case), else absolute.
 pub fn record_path(folder: &Path, path: &Path) -> PathBuf {
     strip_folder(folder, path).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// One spelling per folder: absolute, without a trailing separator or `.` components, so
+/// `D:\Notes\` and `D:\Notes` key the same local state and recent-list entry. Touches no disk.
+pub fn normalize_folder(folder: &Path) -> PathBuf {
+    std::path::absolute(folder)
+        .unwrap_or_else(|_| folder.to_path_buf())
+        .components()
+        .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FOLDER_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many folder existence checks this thread has made, so tests can prove the UI thread
+/// makes none at startup.
+#[cfg(test)]
+pub fn folder_checks() -> usize {
+    FOLDER_CHECKS.with(std::cell::Cell::get)
+}
+
+/// Whether `folder` is an existing directory. It can block for a long time on an offline network
+/// drive, so it belongs on a worker thread.
+pub fn folder_exists(folder: &Path) -> bool {
+    #[cfg(test)]
+    FOLDER_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    folder.is_dir()
 }
 
 pub fn is_inside(folder: &Path, path: &Path) -> bool {
@@ -116,8 +165,9 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
             Metadata::Unreadable,
             store::stamp(&library_path),
         ),
+        ReadOutcome::Busy => (Library::default(), Metadata::Busy, None),
     };
-    let mut local = local::read(local_path, folder);
+    let (mut local, local_source) = local::read_with_source(local_path, folder);
     let scan = if folder.is_dir() {
         scan::scan(folder, scan::NOTE_LIMIT)?
     } else {
@@ -130,13 +180,17 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
     } else {
         reconcile::Reconciled::default()
     };
+    // Written here, on the worker, so the UI thread never encodes the scan cache.
+    let encoded = local.encode();
+    if local_source.as_deref() != Some(encoded.as_str()) {
+        let _ = local::write_text_in_order(local_path, &encoded, local::next_write());
+    }
     Ok(LibraryState {
         folder: folder.to_path_buf(),
         local_path: local_path.to_path_buf(),
         library,
         metadata,
         stamp,
-        local,
         notes: scan
             .entries
             .iter()
@@ -149,14 +203,17 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
         truncated: scan.truncated,
         pending: reconciled.ops,
         relocated: reconciled.relocated,
+        touched: Vec::new(),
+        written_local: local.conveniences(),
+        local,
     })
 }
 
 /// Writes pending operations to `library.ini`. If the file changed on disk since it was read,
-/// it is re-read and the pending operations are replayed on top first. Returns whether it wrote.
-pub fn flush(state: &mut LibraryState) -> Result<bool> {
-    if state.metadata == Metadata::Unreadable || state.pending.is_empty() {
-        return Ok(false);
+/// it is re-read and the pending operations are replayed on top first.
+pub fn flush(state: &mut LibraryState) -> Result<Flushed> {
+    if state.metadata != Metadata::Ready || state.pending.is_empty() {
+        return Ok(Flushed::Nothing);
     }
     let path = store::library_file(&state.folder);
     if store::stamp(&path) != state.stamp {
@@ -175,6 +232,8 @@ pub fn flush(state: &mut LibraryState) -> Result<bool> {
                     "library.ini was replaced by a file this FastPad cannot read",
                 ));
             }
+            // Keeps the pending operations and the library as they are.
+            ReadOutcome::Busy => return Ok(Flushed::Busy),
         };
         ops::replay(&mut fresh, &state.pending);
         state.library = fresh;
@@ -182,44 +241,43 @@ pub fn flush(state: &mut LibraryState) -> Result<bool> {
     state.library.prune();
     if state.stamp.is_none() && state.library == Library::default() {
         state.pending.clear();
-        return Ok(false);
+        return Ok(Flushed::Nothing);
     }
     state.stamp = Some(store::write(&path, &state.library)?);
     state.pending.clear();
-    Ok(true)
+    Ok(Flushed::Wrote)
 }
 
-/// Saves the per-PC state. Failures are ignored: it only holds caches and conveniences.
-pub fn write_local(state: &LibraryState) {
-    let _ = local::write(&state.local_path, &state.local);
+/// The per-PC state to write, when its recent list, autosave switch or missing times changed
+/// since the local file was last written; it is then counted as written. The scan cache alone
+/// never needs a write here: the worker wrote it with the scan.
+pub fn take_local_changes(state: &mut LibraryState) -> Option<LocalState> {
+    let current = state.local.conveniences();
+    if current == state.written_local {
+        return None;
+    }
+    state.written_local = current;
+    Some(state.local.clone())
 }
 
-/// The notes list for a merged state: an entry whose path is in both lists comes from `fresh`;
-/// an entry only in one of the two lists (the index changed during the rescan: a save, a rename,
-/// a remove) is kept, restamped from disk, only if the file still exists.
-fn merge_notes(folder: &Path, previous: Vec<NoteEntry>, fresh: Vec<NoteEntry>) -> Vec<NoteEntry> {
-    let key = |note: &NoteEntry| note.path.to_string_lossy().to_lowercase();
-    let previous_keys: std::collections::HashSet<String> = previous.iter().map(key).collect();
-    let fresh_keys: std::collections::HashSet<String> = fresh.iter().map(key).collect();
-
-    let mut merged = Vec::new();
-    let mut differing = Vec::new();
-    for note in fresh {
-        if previous_keys.contains(&key(&note)) {
-            merged.push(note);
-        } else {
-            differing.push(note);
+/// The notes list for a merged state: the rescan's own list, with every path FastPad touched
+/// while it ran (a save, a rename, a remove) re-checked on disk. Entries only in the rescan are
+/// already proven by it, and entries only in the old list that FastPad did not touch are gone,
+/// so a bulk change made outside FastPad costs no extra stat at all.
+fn merge_notes(folder: &Path, fresh: Vec<NoteEntry>, touched: &[PathBuf]) -> Vec<NoteEntry> {
+    let mut merged = fresh;
+    let mut seen = std::collections::HashSet::new();
+    for path in touched {
+        if !seen.insert(path.to_string_lossy().to_lowercase()) {
+            continue;
         }
-    }
-    for note in previous {
-        if !fresh_keys.contains(&key(&note)) {
-            differing.push(note);
-        }
-    }
-    for note in differing {
-        if let Some(stamp) = store::stamp(&folder.join(&note.path)) {
+        merged.retain(|note| !same_path(&note.path, path));
+        let is_note = path
+            .extension()
+            .is_some_and(|ext| title::is_note_extension(&ext.to_string_lossy()));
+        if is_note && let Some(stamp) = store::stamp(&folder.join(path)) {
             merged.push(NoteEntry {
-                path: note.path,
+                path: path.clone(),
                 size: stamp.size,
                 mtime: filetime_ticks(stamp.modified),
             });
@@ -234,12 +292,30 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         library: previous_library,
         metadata: previous_metadata,
         stamp: previous_stamp,
-        notes: previous_notes,
         pending: previous_pending,
         local: previous_local,
+        touched,
         ..
     } = previous;
     let mut fresh = fresh;
+    fresh.notes = merge_notes(&fresh.folder, std::mem::take(&mut fresh.notes), &touched);
+    if fresh.truncated {
+        // A truncated scan's own list is already capped at the limit; touched entries that
+        // survived the merge must not push it past that.
+        fresh.notes.truncate(scan::NOTE_LIMIT);
+    }
+    fresh.local.merge_recent(&previous_local);
+    fresh.local.autosave = previous_local.autosave;
+
+    if fresh.metadata == Metadata::Busy {
+        // The rescan could not read library.ini: what the live state knows still stands, and the
+        // next rescan reads it again.
+        fresh.library = previous_library;
+        fresh.metadata = previous_metadata;
+        fresh.stamp = previous_stamp;
+        fresh.pending = previous_pending;
+        return fresh;
+    }
 
     // A stamp mismatch alone does not say which side is current: the live library may have
     // flushed while the rescan was reading (previous is current and belongs on disk), or the
@@ -262,16 +338,6 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
     let mut pending = fresh.pending;
     pending.extend(previous_pending);
     fresh.pending = pending;
-
-    fresh.notes = merge_notes(&fresh.folder, previous_notes, fresh.notes);
-    if fresh.truncated {
-        // A truncated scan's own list is already capped at the limit; previous-only entries
-        // that survived the merge must not push it past that.
-        fresh.notes.truncate(scan::NOTE_LIMIT);
-    }
-
-    fresh.local.merge_recent(&previous_local);
-    fresh.local.autosave = previous_local.autosave;
     fresh
 }
 
@@ -309,6 +375,7 @@ impl LibraryState {
         if !is_note {
             return;
         }
+        self.touched.push(relative.clone());
         let stamp = store::stamp(path);
         let size = stamp.map_or(0, |stamp| stamp.size);
         let mtime = stamp.map_or(0, |stamp| filetime_ticks(stamp.modified));
@@ -329,8 +396,11 @@ impl LibraryState {
     }
 
     pub fn remove_note(&mut self, path: &Path) {
-        let stored = record_path(&self.folder, path);
+        let Some(stored) = strip_folder(&self.folder, path) else {
+            return;
+        };
         self.notes.retain(|note| !same_path(&note.path, &stored));
+        self.touched.push(stored);
     }
 
     /// Follows a rename FastPad made: the index, the recent list and any record.
@@ -408,7 +478,7 @@ mod tests {
         std::fs::write(scratch.folder().join("a.md"), "a").unwrap();
         let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
         assert_eq!(state.notes.len(), 1);
-        assert!(!flush(&mut state).unwrap());
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Nothing);
         assert!(!scratch.folder().join(".fastpad").exists());
     }
 
@@ -426,7 +496,7 @@ mod tests {
                 value: true,
             })
             .unwrap();
-        assert!(flush(&mut state).unwrap());
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
         assert!(state.pending.is_empty());
         let reloaded = load(&scratch.folder(), &scratch.local(), 101).unwrap();
         assert!(reloaded.record_for(&note).unwrap().favorite);
@@ -495,7 +565,7 @@ mod tests {
             note: target,
             value: true,
         });
-        assert!(!flush(&mut state).unwrap());
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Nothing);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "version=9\r\nnote=future\r\n"
@@ -572,7 +642,7 @@ mod tests {
                 value: true,
             })
             .unwrap();
-        assert!(flush(&mut previous).unwrap());
+        assert_eq!(flush(&mut previous).unwrap(), Flushed::Wrote);
 
         let mut merged = merge_rescan(previous, fresh);
         assert!(
@@ -580,7 +650,7 @@ mod tests {
             "the flushed favorite is still visible"
         );
         assert!(
-            !flush(&mut merged).unwrap(),
+            flush(&mut merged).unwrap() == Flushed::Nothing,
             "nothing pending: the flush is a no-op"
         );
         let reloaded = load(&scratch.folder(), &scratch.local(), 102).unwrap();
@@ -655,7 +725,7 @@ mod tests {
                 value: true,
             })
             .unwrap();
-        assert!(flush(&mut setup).unwrap());
+        assert_eq!(flush(&mut setup).unwrap(), Flushed::Wrote);
 
         let previous = load(&scratch.folder(), &scratch.local(), 101).unwrap();
         assert!(previous.stamp.is_some());
@@ -717,36 +787,188 @@ mod tests {
 
     #[test]
     fn a_truncated_rescan_caps_the_merged_notes_list_at_the_scan_limit() {
-        // Break caught: previous-only entries surviving the notes merge and pushing a truncated
-        // scan's list past the limit it was supposed to be capped at.
+        // Break caught: notes saved during the rescan surviving the notes merge and pushing a
+        // truncated scan's list past the limit it was supposed to be capped at.
         let scratch = Scratch::new("rescan-cap");
-        let folder = scratch.folder();
-        let entries = |count: usize| -> Vec<NoteEntry> {
-            (0..count)
-                .map(|index| NoteEntry {
-                    path: PathBuf::from(format!("f{index}.md")),
-                    size: 0,
-                    mtime: 0,
-                })
-                .collect()
-        };
-        let state = |notes: Vec<NoteEntry>, truncated: bool| LibraryState {
-            folder: folder.clone(),
+        let mut previous = bare_state(&scratch, entries(0), false);
+        for index in 0..5 {
+            let saved = scratch.folder().join(format!("saved{index}.md"));
+            std::fs::write(&saved, "x").unwrap();
+            previous.add_note(&saved);
+        }
+        let fresh = bare_state(&scratch, entries(scan::NOTE_LIMIT), true);
+        let merged = merge_rescan(previous, fresh);
+        assert_eq!(merged.notes.len(), scan::NOTE_LIMIT);
+    }
+
+    /// `count` index entries that exist only in memory.
+    fn entries(count: usize) -> Vec<NoteEntry> {
+        (0..count)
+            .map(|index| NoteEntry {
+                path: PathBuf::from(format!("f{index}.md")),
+                size: 0,
+                mtime: 0,
+            })
+            .collect()
+    }
+
+    fn bare_state(scratch: &Scratch, notes: Vec<NoteEntry>, truncated: bool) -> LibraryState {
+        LibraryState {
+            folder: scratch.folder(),
             local_path: scratch.local(),
             library: Library::default(),
             metadata: Metadata::Ready,
             stamp: None,
-            local: LocalState::new(folder.clone()),
+            local: LocalState::new(scratch.folder()),
             notes,
             truncated,
             pending: Vec::new(),
             relocated: Vec::new(),
-        };
-        // Identical lists: every entry is common to both, so none needs to exist on disk.
-        let previous = state(entries(scan::NOTE_LIMIT + 5), false);
-        let fresh = state(entries(scan::NOTE_LIMIT + 5), true);
+            touched: Vec::new(),
+            written_local: local::Conveniences::default(),
+        }
+    }
+
+    #[test]
+    fn a_bulk_change_made_outside_fastpad_costs_no_stat_when_a_rescan_is_merged() {
+        // Break caught: the merge stat-ing every path that differs between the old index and the
+        // rescan, on the UI thread, so deleting a few thousand notes in Explorer froze FastPad.
+        let scratch = Scratch::new("rescan-bulk");
+        let previous = bare_state(&scratch, entries(2_000), false);
+        let fresh = bare_state(&scratch, entries(0), false);
+        let before = store::stats_taken();
         let merged = merge_rescan(previous, fresh);
-        assert_eq!(merged.notes.len(), scan::NOTE_LIMIT);
+        assert_eq!(store::stats_taken() - before, 0);
+        assert!(merged.notes.is_empty(), "the rescan proved them gone");
+    }
+
+    #[test]
+    fn a_rescan_that_cannot_read_the_library_file_keeps_the_live_library_and_is_not_unreadable() {
+        // Break caught: a sharing violation while OneDrive synced library.ini turning organizing
+        // off, or a rescan that met one replacing the live notebooks with an empty library.
+        use std::os::windows::fs::OpenOptionsExt;
+        let scratch = Scratch::new("busy-load");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let target = previous.note_ref(&mut ids, &a);
+        previous
+            .apply(PendingOp::SetFavorite {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        assert_eq!(flush(&mut previous).unwrap(), Flushed::Wrote);
+
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(store::library_file(&scratch.folder()))
+            .unwrap();
+        let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+        drop(lock);
+        assert_eq!(fresh.metadata, Metadata::Busy);
+        let merged = merge_rescan(previous, fresh);
+        assert_eq!(merged.metadata, Metadata::Ready);
+        assert!(merged.record_for(&a).unwrap().favorite);
+    }
+
+    #[test]
+    fn a_flush_that_meets_a_busy_library_file_keeps_its_operations_for_a_retry() {
+        // Break caught: a flush that could not re-read a synced library.ini dropping the pending
+        // operations or marking the library unreadable.
+        use std::os::windows::fs::OpenOptionsExt;
+        let scratch = Scratch::new("busy-flush");
+        let a = scratch.folder().join("a.md");
+        std::fs::write(&a, "a").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let target = state.note_ref(&mut ids, &a);
+        state
+            .apply(PendingOp::SetFavorite {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        // Another PC's sync creates the file, so the flush must re-read it, while it is held open.
+        let path = store::library_file(&scratch.folder());
+        let mut other = Library::default();
+        other.create_notebook(NotebookId(77), "Synced", 5).unwrap();
+        store::write(&path, &other).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let busy = flush(&mut state).unwrap();
+        drop(lock);
+        assert_eq!(busy, Flushed::Busy);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.metadata, Metadata::Ready);
+
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
+        let reloaded = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+        assert!(reloaded.library.notebook(NotebookId(77)).is_some());
+        assert!(reloaded.record_for(&a).unwrap().favorite);
+    }
+
+    #[test]
+    fn the_load_writes_the_local_file_and_only_convenience_changes_need_another_write() {
+        // Break caught: the UI thread encoding and writing the whole scan cache on every rescan
+        // and every metadata flush, or the worker rewriting an unchanged local file.
+        let scratch = Scratch::new("local-writes");
+        std::fs::write(scratch.folder().join("a.md"), "a").unwrap();
+        let mut state = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let written = std::fs::read_to_string(scratch.local()).unwrap();
+        assert!(written.contains("|a.md\r\n"), "{written:?}");
+        let modified = std::fs::metadata(scratch.local())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _unchanged = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+        assert_eq!(
+            std::fs::metadata(scratch.local())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified,
+            "an unchanged local file is not rewritten"
+        );
+
+        assert!(take_local_changes(&mut state).is_none());
+        state.local.files.clear();
+        assert!(
+            take_local_changes(&mut state).is_none(),
+            "the scan cache alone"
+        );
+        state.local.note_opened(Path::new("a.md"), 150);
+        let changed = take_local_changes(&mut state).expect("a recent change is written");
+        assert_eq!(changed.recent[0].0, 150);
+        assert!(take_local_changes(&mut state).is_none());
+    }
+
+    #[test]
+    fn folder_spellings_normalize_to_one() {
+        // Break caught: `D:\Notes\` and `D:\Notes` keying two local states and two recent rows.
+        assert_eq!(
+            normalize_folder(Path::new(r"D:\Notes\")),
+            PathBuf::from(r"D:\Notes")
+        );
+        assert_eq!(
+            normalize_folder(Path::new(r"D:\Notes\.\")),
+            PathBuf::from(r"D:\Notes")
+        );
+        assert_eq!(normalize_folder(Path::new(r"D:\")), PathBuf::from(r"D:\"));
+        assert_eq!(
+            local::folder_key(Path::new(r"D:\Notes\")),
+            local::folder_key(Path::new(r"d:\notes"))
+        );
+        let mut recent = local::RecentFolders::default();
+        recent.push(PathBuf::from(r"D:\Notes\"));
+        recent.push(PathBuf::from(r"D:\Notes"));
+        assert_eq!(recent.folders, [PathBuf::from(r"D:\Notes")]);
     }
 
     #[test]

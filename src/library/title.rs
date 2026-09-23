@@ -104,14 +104,45 @@ pub fn split_typed_name(input: &str, default_extension: &str) -> (String, String
     (sanitize_stem(input), default_extension.to_owned())
 }
 
-/// `stem.extension`, or `stem N.extension` with the first free N from 2.
+/// Splits a name typed to rename a file whose extension is `current` (`None`: it has none).
+/// The file keeps its kind unless the user types another one:
+/// - a name ending in `.<current>` (any case) splits there, so `script.py` stays `script.py`;
+/// - otherwise a typed note extension is taken, so `plan.txt` renames `plan.md` to a `.txt`;
+/// - otherwise the current extension is kept, and an extensionless file stays extensionless.
+pub fn split_rename(input: &str, current: Option<&str>) -> (String, Option<String>) {
+    let input = input.trim();
+    if let Some(current) = current.filter(|current| !current.is_empty())
+        && let Some((stem, extension)) = input.rsplit_once('.')
+        && extension.eq_ignore_ascii_case(current)
+    {
+        return (sanitize_stem(stem), Some(extension.to_owned()));
+    }
+    if let Some((stem, extension)) = input.rsplit_once('.')
+        && is_note_extension(extension)
+    {
+        return (sanitize_stem(stem), Some(extension.to_owned()));
+    }
+    (sanitize_stem(input), current.map(str::to_owned))
+}
+
+/// `stem.extension`, or just `stem` for an empty extension.
+pub fn file_name(stem: &str, extension: &str) -> String {
+    if extension.is_empty() {
+        stem.to_owned()
+    } else {
+        format!("{stem}.{extension}")
+    }
+}
+
+/// `stem.extension`, or `stem N.extension` with the first free N from 2. An empty extension
+/// names an extensionless file.
 pub fn free_name(stem: &str, extension: &str, exists: impl Fn(&str) -> bool) -> String {
-    let first = format!("{stem}.{extension}");
+    let first = file_name(stem, extension);
     if !exists(&first) {
         return first;
     }
     (2..10_000)
-        .map(|number| format!("{stem} {number}.{extension}"))
+        .map(|number| file_name(&format!("{stem} {number}"), extension))
         .find(|candidate| !exists(candidate))
         .unwrap_or(first)
 }
@@ -192,6 +223,48 @@ mod tests {
         );
         assert_eq!(default_extension(Language::Json), "json");
         assert_eq!(default_extension(Language::PlainText), "md");
+    }
+
+    #[test]
+    fn a_first_save_keeps_a_typed_extension_only_when_it_is_a_note_extension() {
+        // Deliberate (spec §14): "v1.2 plan" and "build.ps1" are both one name on a first save.
+        assert_eq!(
+            split_typed_name("build.ps1", "md"),
+            ("build.ps1".into(), "md".into())
+        );
+    }
+
+    #[test]
+    fn a_rename_keeps_the_files_own_extension_unless_another_is_typed() {
+        // Break caught: renaming script.py prefilled as "script.py" becoming script.py.py, or an
+        // extensionless file gaining ".md", so Enter on the unchanged name renamed the file.
+        assert_eq!(
+            split_rename("script.py", Some("py")),
+            ("script".into(), Some("py".into()))
+        );
+        assert_eq!(
+            split_rename("Script.PY", Some("py")),
+            ("Script".into(), Some("PY".into()))
+        );
+        assert_eq!(
+            split_rename("tool", Some("py")),
+            ("tool".into(), Some("py".into()))
+        );
+        assert_eq!(
+            split_rename("notes.txt", Some("py")),
+            ("notes".into(), Some("txt".into()))
+        );
+        assert_eq!(split_rename("README", None), ("README".into(), None));
+        assert_eq!(split_rename("v1.2 plan", None), ("v1.2 plan".into(), None));
+        assert_eq!(
+            split_rename("README.md", None),
+            ("README".into(), Some("md".into()))
+        );
+        assert_eq!(
+            split_rename("v1.2 plan", Some("md")),
+            ("v1.2 plan".into(), Some("md".into()))
+        );
+        assert_eq!(free_name("README", "", |name| name == "README"), "README 2");
     }
 
     #[test]

@@ -132,12 +132,10 @@ pub(crate) fn choose_folder(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
 }
 
 /// OK/Cancel warning. Returns whether the user chose OK.
-#[allow(
-    dead_code,
-    reason = "consumed by the Task 18/20 delete and reload-conflict prompts, not yet wired"
-)]
 pub(crate) fn confirm(hwnd: HWND, text: &str) -> bool {
     let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    LAST_CONFIRM.with(|last| *last.borrow_mut() = Some(text.to_owned()));
     #[cfg(test)]
     if let Some(answer) = CONFIRM_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return answer(hwnd);
@@ -169,6 +167,17 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static LAST_SAVE_REQUEST: std::cell::RefCell<Option<(String, Option<PathBuf>)>> =
         const { std::cell::RefCell::new(None) };
+    static LAST_CONFIRM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The question the last confirm asked.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn take_last_confirm() -> Option<String> {
+    LAST_CONFIRM.with(|last| last.borrow_mut().take())
 }
 
 /// The suggested name and starting folder the last Save As dialog was opened with.

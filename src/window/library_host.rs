@@ -18,6 +18,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTi
 pub(crate) const LIBRARY_WRITE_TIMER_ID: usize = 0x4650_4C57;
 pub(crate) const RESCAN_AFTER: Duration = Duration::from_secs(5);
 const WRITE_DELAY_MS: u32 = 500;
+/// How soon a write retries after `library.ini` could not be re-read (held open by a sync).
+const BUSY_RETRY_MS: u32 = 2_000;
+const CLOSE_BUSY_RETRIES: usize = 3;
 pub(crate) const AUTOSAVE_TIMER_ID: usize = 0x4650_4153;
 pub(crate) const AUTOSAVE_DELAY_MS: u32 = 1_000;
 
@@ -44,6 +47,9 @@ pub(crate) struct LibraryHost {
     pub(crate) generation: u64,
     pub(crate) scanning: bool,
     pub(crate) rescan_requested: bool,
+    /// The UI thread wrote the local file while a scan ran, possibly with the old scan cache, so
+    /// the merge that follows writes it again.
+    local_written_during_scan: bool,
     pub(crate) inactive_since: Option<Instant>,
     /// IDs for new notes, notebooks and tags.
     pub(crate) ids: IdSource,
@@ -73,6 +79,7 @@ impl LibraryHost {
             generation: 0,
             scanning: false,
             rescan_requested: false,
+            local_written_during_scan: false,
             inactive_since: None,
             ids: IdSource::new(process_start, std::process::id()),
             notified: None,
@@ -87,6 +94,17 @@ struct Loaded {
     generation: u64,
     folder: PathBuf,
     result: Result<LibraryState, String>,
+    /// Why the worker opened a different folder than the one the UI thread expected.
+    notice: Option<String>,
+}
+
+/// The startup candidates, checked on the worker so an offline drive cannot stall the UI thread.
+struct Startup {
+    /// A path named on the command line, which may be a file.
+    launch: Option<PathBuf>,
+    /// The most recent folder from `folders.ini`.
+    remembered: Option<PathBuf>,
+    data: PathBuf,
 }
 
 fn host<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryHost) -> R) -> Option<R> {
@@ -115,35 +133,30 @@ fn data_dir(hwnd: HWND) -> Option<PathBuf> {
     .flatten()
 }
 
-/// The folder to open at startup: a directory named on the command line, else the most recent
-/// folder that still exists, else `Documents\FastPad`.
-fn startup_folder(hwnd: HWND, data: &Path) -> Option<PathBuf> {
-    let launch_dir =
-        unsafe { app_ptr(hwnd) }.and_then(|app| match &unsafe { app.as_ref() }.launch.request {
-            crate::launch::LaunchRequest::Open(path) => {
-                let path = std::path::absolute(path).ok()?;
-                path.is_dir().then_some(path)
-            }
-            crate::launch::LaunchRequest::New => None,
-        });
-    if let Some(path) = launch_dir {
-        remember_folder(data, &path);
-        return Some(path);
+/// On the worker: the folder to open at startup, a directory named on the command line, else the
+/// most recent folder if it still exists, else `Documents\FastPad`; and a notice when the most
+/// recent folder is gone.
+fn resolve_startup(startup: Startup) -> (Option<PathBuf>, Option<String>) {
+    if let Some(launch) = startup.launch
+        && library::folder_exists(&launch)
+    {
+        remember_folder(&startup.data, &launch);
+        return (Some(launch), None);
     }
-    let recent = library::local::read_folders(&library::local::folders_file(data));
-    if let Some(first) = recent.folders.first() {
-        if first.is_dir() {
-            return Some(first.clone());
+    let mut notice = None;
+    if let Some(remembered) = startup.remembered {
+        if library::folder_exists(&remembered) {
+            return (Some(remembered), None);
         }
-        push_notice(
-            hwnd,
-            format!(
-                "FastPad could not find the folder {}. Using Documents\\FastPad instead.",
-                first.display()
-            ),
-        );
+        notice = Some(format!(
+            "FastPad could not find the folder {}. Using Documents\\FastPad instead.",
+            remembered.display()
+        ));
     }
-    crate::platform::paths::default_notes_folder().ok()
+    let fallback = crate::platform::paths::default_notes_folder()
+        .ok()
+        .map(|folder| library::normalize_folder(&folder));
+    (fallback, notice)
 }
 
 pub(crate) fn remember_folder(data: &Path, folder: &Path) {
@@ -153,7 +166,9 @@ pub(crate) fn remember_folder(data: &Path, folder: &Path) {
     let _ = library::local::write_folders(&path, &recent);
 }
 
-/// `WM_FASTPAD_OPEN_LIBRARY`: picks the folder and starts the worker. Reads only `folders.ini`.
+/// `WM_FASTPAD_OPEN_LIBRARY`: starts the worker on the startup folder. Reads only `folders.ini`:
+/// whether the folder (or a command-line path) exists is checked on the worker, which may open a
+/// different folder than the one assumed here.
 pub(crate) fn open_library_step(hwnd: HWND) {
     if !notes_mode(hwnd) {
         return;
@@ -161,36 +176,83 @@ pub(crate) fn open_library_step(hwnd: HWND) {
     let Some(data) = data_dir(hwnd) else {
         return;
     };
-    let Some(folder) = startup_folder(hwnd, &data) else {
-        return;
-    };
-    host(hwnd, |host| host.folder = Some(folder));
-    start_load(hwnd);
+    let launch =
+        unsafe { app_ptr(hwnd) }.and_then(|app| match &unsafe { app.as_ref() }.launch.request {
+            crate::launch::LaunchRequest::Open(path) => {
+                Some(library::normalize_folder(Path::new(path)))
+            }
+            crate::launch::LaunchRequest::New => None,
+        });
+    let remembered = library::local::read_folders(&library::local::folders_file(&data))
+        .folders
+        .first()
+        .map(|folder| library::normalize_folder(folder));
+    // Until the worker has checked, the name box saves into the folder that usually wins.
+    let assumed = remembered.clone().or_else(|| {
+        crate::platform::paths::default_notes_folder()
+            .ok()
+            .map(|folder| library::normalize_folder(&folder))
+    });
+    host(hwnd, |host| host.folder = assumed);
+    spawn_load(
+        hwnd,
+        Some(Startup {
+            launch,
+            remembered,
+            data,
+        }),
+    );
 }
 
 pub(crate) fn start_load(hwnd: HWND) {
+    spawn_load(hwnd, None);
+}
+
+fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
     let Some(data) = data_dir(hwnd) else {
         return;
     };
     let Some((folder, generation)) = host(hwnd, |host| {
-        let folder = host.folder.clone()?;
+        let folder = host.folder.clone();
+        if folder.is_none() && startup.is_none() {
+            return None;
+        }
         host.generation = host.generation.wrapping_add(1);
         host.scanning = true;
         host.rescan_requested = false;
+        host.local_written_during_scan = false;
+        // The merge re-checks only what FastPad changes in the index from here on.
+        if let Some(state) = host.state.as_mut() {
+            state.touched.clear();
+        }
         Some((folder, host.generation))
     })
     .flatten() else {
         return;
     };
-    let local_path = library::local::local_file(&data, &folder);
     let target = hwnd as isize;
     std::thread::spawn(move || {
-        let result = library::load(&folder, &local_path, library::now_unix())
-            .map_err(|error| error.to_string());
+        let (folder, notice) = match startup {
+            Some(startup) => resolve_startup(startup),
+            None => (folder, None),
+        };
+        let (folder, result) = match folder {
+            Some(folder) => {
+                let local_path = library::local::local_file(&data, &folder);
+                let result = library::load(&folder, &local_path, library::now_unix())
+                    .map_err(|error| error.to_string());
+                (folder, result)
+            }
+            None => (
+                PathBuf::new(),
+                Err("the Documents folder could not be found".to_owned()),
+            ),
+        };
         let payload = Box::into_raw(Box::new(Loaded {
             generation,
             folder,
             result,
+            notice,
         }));
         if unsafe {
             PostMessageW(
@@ -212,6 +274,7 @@ pub(crate) fn test_ready_payload(generation: u64, result: Result<LibraryState, S
         generation,
         folder: PathBuf::new(),
         result,
+        notice: None,
     })) as LPARAM
 }
 
@@ -232,7 +295,31 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
     if !current {
         return;
     }
-    let Loaded { folder, result, .. } = *loaded;
+    let Loaded {
+        folder,
+        result,
+        notice,
+        ..
+    } = *loaded;
+    if let Some(notice) = notice {
+        push_notice(hwnd, notice);
+    }
+    // At startup the worker decides which folder exists; the UI thread only assumed one.
+    let moved = !folder.as_os_str().is_empty()
+        && host(hwnd, |host| {
+            let moved = !host
+                .folder
+                .as_ref()
+                .is_some_and(|f| library::model::same_path(f, &folder));
+            if moved {
+                host.folder = Some(folder.clone());
+            }
+            moved
+        })
+        .unwrap_or(false);
+    if moved {
+        super::main_window::invalidate_title_strip(hwnd);
+    }
     match result {
         Ok(fresh) => install(hwnd, fresh),
         Err(error) => push_notice(
@@ -288,17 +375,79 @@ fn install(hwnd: HWND, fresh: LibraryState) {
     if has_pending {
         schedule_write(hwnd);
     }
-    with_state(hwnd, |state| library::write_local(state));
+    let rewrite = host(hwnd, |host| {
+        std::mem::take(&mut host.local_written_during_scan)
+    })
+    .unwrap_or(false);
+    save_local(
+        hwnd,
+        LocalWrite {
+            wait: false,
+            force: rewrite,
+        },
+    );
 }
 
-/// A note moved outside FastPad: an open tab for it follows the file.
+#[derive(Clone, Copy)]
+struct LocalWrite {
+    /// Write on this thread: at window close, a writer thread might not finish before the exit.
+    wait: bool,
+    /// Write even if the conveniences did not change (the file may hold an old scan cache).
+    force: bool,
+}
+
+/// Writes the per-PC local file when its recent list, autosave switch or missing times changed.
+/// It also carries the scan cache (about 1 MB for 10,000 notes), so it is encoded and written on
+/// a one-off writer thread from a snapshot: cloning the state is cheap next to encoding it and
+/// syncing the write. `local::write_in_order` keeps an older snapshot from landing last.
+fn save_local(hwnd: HWND, how: LocalWrite) {
+    let job = with_state(hwnd, |state| {
+        let local = library::take_local_changes(state)
+            .or_else(|| how.force.then(|| state.local.clone()))?;
+        Some((state.local_path.clone(), local))
+    })
+    .flatten();
+    let Some((path, local)) = job else {
+        return;
+    };
+    host(hwnd, |host| {
+        if host.scanning {
+            host.local_written_during_scan = true;
+        }
+    });
+    let order = library::local::next_write();
+    // In-process tests write inline, so what they assert is on disk when they look.
+    if how.wait || cfg!(test) {
+        let _ = library::local::write_in_order(&path, &local, order);
+    } else {
+        std::thread::spawn(move || {
+            let _ = library::local::write_in_order(&path, &local, order);
+        });
+    }
+}
+
+/// A note moved outside FastPad: an open tab for it follows the file. The old path is gone, so
+/// the tab is found by its stored path, not through the disk. A move leaves the content alone,
+/// so when the new file's stamp is the one the tab knows, autosave carries on (or resumes, if it
+/// paused when the old file vanished); otherwise the tab keeps what it knew, and its next
+/// autosave pauses on the changed file.
 fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) {
+    let stamp = library::disk_stamp(&new);
     let changed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let app = unsafe { app.as_mut() };
-        match app.tabs.find_path(old) {
-            Some(id) => app.tabs.rebind_path(id, new).is_ok(),
-            None => false,
+        let Some(id) = app.tabs.find_stored_path(old) else {
+            return false;
+        };
+        if app.tabs.rebind_path(id, new).is_err() {
+            return false;
         }
+        if let Some(document) = app.tabs.document_mut(id)
+            && document.disk_stamp.is_some()
+            && document.disk_stamp == stamp
+        {
+            document.autosave_paused = false;
+        }
+        true
     });
     if changed {
         super::main_window::invalidate_title_strip(hwnd);
@@ -342,26 +491,47 @@ pub(crate) fn schedule_write(hwnd: HWND) {
     }
 }
 
-/// Writes pending metadata now (timer, folder switch, close).
+/// Writes pending metadata now (the debounce timer; tests).
 pub(crate) fn flush_now(hwnd: HWND) {
-    if let Err(error) = try_flush(hwnd) {
-        push_notice(
+    flush_reporting(hwnd, false);
+}
+
+/// Writes pending metadata and the local file on this thread, before the window closes. A
+/// `library.ini` held open by a sync gets a few short retries, since there is no later.
+pub(crate) fn flush_before_close(hwnd: HWND) {
+    for _ in 0..CLOSE_BUSY_RETRIES {
+        if !matches!(try_flush(hwnd, true), Ok(library::Flushed::Busy)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    flush_reporting(hwnd, true);
+}
+
+fn flush_reporting(hwnd: HWND, wait: bool) {
+    match try_flush(hwnd, wait) {
+        Ok(library::Flushed::Busy) => {
+            // OneDrive (or another PC's FastPad) has library.ini open: keep the operations and
+            // try again shortly, without a notice for what is usually a brief sync.
+            unsafe {
+                SetTimer(hwnd, LIBRARY_WRITE_TIMER_ID, BUSY_RETRY_MS, None);
+            }
+        }
+        Ok(_) => {}
+        Err(error) => push_notice(
             hwnd,
             format!("FastPad could not save this folder's notebooks and tags: {error}"),
-        );
+        ),
     }
 }
 
-fn try_flush(hwnd: HWND) -> crate::Result<()> {
+fn try_flush(hwnd: HWND, wait: bool) -> crate::Result<library::Flushed> {
     unsafe {
         KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
     }
-    with_state(hwnd, |state| {
-        let result = library::flush(state);
-        library::write_local(state);
-        result.map(|_| ())
-    })
-    .unwrap_or(Ok(()))
+    let result = with_state(hwnd, library::flush).unwrap_or(Ok(library::Flushed::Nothing));
+    save_local(hwnd, LocalWrite { wait, force: false });
+    result
 }
 
 /// Opens `path` as the library, flushing the current one first. Open tabs stay open.
@@ -374,15 +544,26 @@ pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
         );
         return;
     }
-    let Ok(path) = std::path::absolute(path) else {
-        return;
-    };
+    let path = library::normalize_folder(path);
     if !path.is_dir() {
         push_notice(hwnd, format!("{} is not a folder.", path.display()));
         return;
     }
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    // The old folder's dirty notes are saved while autosave still applies to them.
+    autosave_all(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
     // Switching would drop the unsaved notebooks and tags, so a failed write keeps the old folder.
-    if let Err(error) = try_flush(hwnd) {
+    let failure = match try_flush(hwnd, false) {
+        Ok(library::Flushed::Busy) => Some("its library.ini is in use by another program".into()),
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(error) = failure {
         schedule_write(hwnd);
         push_notice(
             hwnd,
@@ -517,7 +698,30 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
         }
         return;
     }
-    flush_now(hwnd);
+    // A name box left open would do nothing on Enter once the library is gone.
+    close_name_box(hwnd);
+    // The setting change applies either way: the user asked for it. The pending operations are
+    // tried twice, and a loss is said out loud.
+    let flushed = (0..2).any(|_| {
+        matches!(
+            try_flush(hwnd, false),
+            Ok(library::Flushed::Wrote | library::Flushed::Nothing)
+        )
+    });
+    let folder = folder(hwnd);
+    let lost = !flushed && with_state(hwnd, |state| !state.pending.is_empty()).unwrap_or(false);
+    if lost && let Some(folder) = folder {
+        push_notice(
+            hwnd,
+            format!(
+                "Metadata changes could not be written to {}",
+                crate::library::store::library_file(&folder).display()
+            ),
+        );
+    }
+    unsafe {
+        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
+    }
     host(hwnd, |host| {
         host.state = None;
         host.folder = None;
@@ -526,11 +730,10 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     });
 }
 
-/// Recomputes the active untitled tab's label from its first lines.
+/// Recomputes the active untitled tab's label from its first lines. It is kept with notes mode
+/// off too (only edits near the top recompute it), and shown only with notes mode on.
 pub(crate) fn refresh_label(hwnd: HWND) {
-    if !notes_mode(hwnd) {
-        return;
-    }
+    let shown = notes_mode(hwnd);
     let changed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let app = unsafe { app.as_mut() };
         let Some(editor) = app.editor.as_ref() else {
@@ -555,15 +758,52 @@ pub(crate) fn refresh_label(hwnd: HWND) {
             return false;
         };
         document.label_watch = label.watch_through;
-        if document.untitled_label == label.text {
+        document.first_line_label = label.text;
+        if !shown || document.untitled_label == document.first_line_label {
             return false;
         }
-        document.untitled_label = label.text;
+        document.untitled_label = document.first_line_label.clone();
         true
     });
     if changed {
         super::main_window::refresh_tab_view(hwnd);
     }
+}
+
+/// The label a restored or recovered untitled document's text gives, set before it is shown.
+pub(crate) fn label_restored_document(
+    hwnd: HWND,
+    document: &mut crate::document::Document,
+    text: &str,
+) {
+    if document.path.is_some() {
+        return;
+    }
+    let label = title::untitled_label(text.lines());
+    document.label_watch = label.watch_through;
+    document.first_line_label = label.text;
+    if notes_mode(hwnd) {
+        document.untitled_label = document.first_line_label.clone();
+    }
+}
+
+/// Notes mode turned on: every untitled tab shows its label, without switching tabs.
+pub(crate) fn show_labels(hwnd: HWND) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        let ids: Vec<_> = app
+            .tabs
+            .documents()
+            .filter(|document| document.path.is_none())
+            .map(|document| document.id)
+            .collect();
+        for id in ids {
+            if let Some(document) = app.tabs.document_mut(id) {
+                document.untitled_label = document.first_line_label.clone();
+            }
+        }
+    }
+    super::main_window::refresh_tab_view(hwnd);
 }
 
 /// `SCN_MODIFIED`: only edits at or above the label's line can change it.
@@ -768,7 +1008,10 @@ fn name_box_error(hwnd: HWND, error: String) {
 /// "<name> already exists. Try <first free name>."
 fn name_taken_error(folder: &Path, stem: &str, extension: &str) -> String {
     let free = title::free_name(stem, extension, |candidate| folder.join(candidate).exists());
-    format!("{stem}.{extension} already exists. Try {free}.")
+    format!(
+        "{} already exists. Try {free}.",
+        title::file_name(stem, extension)
+    )
 }
 
 /// Enter or Save in the name box.
@@ -918,12 +1161,10 @@ fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
         close_name_box(hwnd);
         return;
     };
-    let current_extension = old
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "md".into());
-    let (stem, extension) = title::split_typed_name(text, &current_extension);
-    let new = old.with_file_name(format!("{stem}.{extension}"));
+    let current_extension = old.extension().map(|e| e.to_string_lossy().into_owned());
+    let (stem, extension) = title::split_rename(text, current_extension.as_deref());
+    let extension = extension.unwrap_or_default();
+    let new = old.with_file_name(title::file_name(&stem, &extension));
     if new == old {
         close_name_box(hwnd);
         return;
@@ -973,19 +1214,31 @@ pub(crate) fn delete_note(hwnd: HWND) {
     let Some(path) = active_file(hwnd) else {
         return;
     };
-    let Some(id) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
-    else {
+    let Some((id, dirty)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let active = unsafe { app.as_ref() }.tabs.active()?;
+        Some((active.id, active.dirty))
+    }) else {
         return;
     };
-    let question = format!(
-        "Move \u{201c}{}\u{201d} to the Recycle Bin?",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    );
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // The tab's unsaved edits go with the file: they are not autosaved first.
+    let question = if dirty {
+        format!("Move \u{201c}{name}\u{201d} to the Recycle Bin and discard unsaved changes?")
+    } else {
+        format!("Move \u{201c}{name}\u{201d} to the Recycle Bin?")
+    };
     if !confirmed(hwnd, &question) {
         return;
     }
-    if let Err(error) = crate::platform::files::recycle(&path) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    // The shell may show its own modal warning (a permanent delete), owned by this window.
+    let recycled = crate::platform::files::recycle(hwnd, &path);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    if let Err(error) = recycled {
         push_notice(
             hwnd,
             format!("FastPad could not delete {}: {error}", path.display()),
@@ -1158,12 +1411,18 @@ pub(crate) fn autosave_all(hwnd: HWND) {
 pub(crate) fn toggle_folder_autosave(hwnd: HWND) {
     let Some(enabled) = with_state(hwnd, |state| {
         state.local.autosave = !state.local.autosave;
-        library::write_local(state);
         state.local.autosave
     }) else {
         push_notice(hwnd, "Loading folder…".to_owned());
         return;
     };
+    save_local(
+        hwnd,
+        LocalWrite {
+            wait: false,
+            force: false,
+        },
+    );
     if !enabled {
         unsafe {
             KillTimer(hwnd, AUTOSAVE_TIMER_ID);
@@ -1302,6 +1561,7 @@ pub(crate) fn notes_mode_notice(enabled: bool) -> &'static str {
 }
 
 const READ_ONLY: &str = "This folder's .fastpad\\library.ini is damaged or from a newer FastPad, so notebooks and tags are read-only.";
+const BUSY: &str = "This folder's .fastpad\\library.ini is in use by another program. FastPad reads it again when you come back to the window.";
 
 /// True when organizing can proceed; otherwise explains why not.
 pub(crate) fn ready_library(hwnd: HWND) -> bool {
@@ -1309,6 +1569,10 @@ pub(crate) fn ready_library(hwnd: HWND) -> bool {
         Some(Metadata::Ready) => true,
         Some(Metadata::Unreadable) => {
             push_notice(hwnd, READ_ONLY.to_owned());
+            false
+        }
+        Some(Metadata::Busy) => {
+            push_notice(hwnd, BUSY.to_owned());
             false
         }
         None => {

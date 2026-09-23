@@ -339,9 +339,8 @@ fn run_library_scan(
             .map_err(|error| format!("could not load {}: {error}", folder.display()))?;
         Ok::<_, String>((state, started.elapsed().as_secs_f64() * 1_000.0))
     };
+    // The load writes the per-PC cache itself, so the warm loads find it.
     let (state, cold_ms) = load()?;
-    // What the window does after installing a load, so the warm loads find the per-PC cache.
-    fastpad::library::write_local(&state);
     let mut warm_ms = Vec::with_capacity(LIBRARY_SCAN_WARM_LOADS);
     for _ in 0..LIBRARY_SCAN_WARM_LOADS {
         warm_ms.push(load()?.1);

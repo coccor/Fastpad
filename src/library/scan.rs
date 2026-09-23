@@ -100,23 +100,27 @@ pub fn scan(folder: &Path, limit: usize) -> Result<Scan> {
             }
             let mut offset = 0_usize;
             loop {
-                // Entries are packed back to back; NextEntryOffset is 8-byte aligned.
+                // Entries are packed back to back; NextEntryOffset is 8-byte aligned. FileName runs
+                // past the end of the struct, so it is reached through a raw pointer into the
+                // buffer, never through a reference to the struct (whose bounds end at FileName[1]).
                 let entry = unsafe {
-                    &*(buffer
+                    buffer
                         .as_ptr()
                         .cast::<u8>()
                         .add(offset)
-                        .cast::<FILE_ID_BOTH_DIR_INFO>())
+                        .cast::<FILE_ID_BOTH_DIR_INFO>()
                 };
                 let name = unsafe {
                     std::slice::from_raw_parts(
-                        std::ptr::addr_of!(entry.FileName).cast::<u16>(),
-                        (entry.FileNameLength / 2) as usize,
+                        std::ptr::addr_of!((*entry).FileName).cast::<u16>(),
+                        ((*entry).FileNameLength / 2) as usize,
                     )
                 };
                 let name = std::ffi::OsString::from_wide(name)
                     .to_string_lossy()
                     .into_owned();
+                // SAFETY: the fixed-size part of the entry lies inside the buffer.
+                let entry = unsafe { &*entry };
                 let attributes = entry.FileAttributes;
                 let skipped_attributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
                 if name != "." && name != ".." && attributes & skipped_attributes == 0 {

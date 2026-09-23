@@ -31,7 +31,20 @@ pub struct FileStamp {
     pub modified: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many stamps this thread has taken, so tests can prove a path does no disk access.
+#[cfg(test)]
+pub fn stats_taken() -> usize {
+    STATS.with(std::cell::Cell::get)
+}
+
 pub fn stamp(path: &Path) -> Option<FileStamp> {
+    #[cfg(test)]
+    STATS.with(|stats| stats.set(stats.get() + 1));
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata
         .modified()
@@ -207,22 +220,44 @@ fn parse_note(value: &str) -> Option<NoteRecord> {
 pub enum ReadOutcome {
     Absent,
     Loaded(Library, FileStamp),
+    /// Read, but damaged or from a newer FastPad: never overwritten.
     Unreadable,
+    /// Could not be read right now (a sharing violation while OneDrive syncs it, or it kept
+    /// changing during the read). Nothing is known about its contents; try again later.
+    Busy,
 }
 
+/// How many times a read that raced a write is retried before it is reported as busy.
+const READ_ATTEMPTS: usize = 3;
+
 pub fn read(path: &Path) -> ReadOutcome {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Absent,
-        Err(_) => return ReadOutcome::Unreadable,
-    };
-    let Some(stamp) = stamp(path) else {
-        return ReadOutcome::Unreadable;
-    };
-    match std::str::from_utf8(&bytes).ok().and_then(parse) {
-        Some(library) => ReadOutcome::Loaded(library, stamp),
-        None => ReadOutcome::Unreadable,
+    read_via(path, |path| std::fs::read(path))
+}
+
+fn read_via(
+    path: &Path,
+    mut read_bytes: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+) -> ReadOutcome {
+    for _ in 0..READ_ATTEMPTS {
+        // A stamp on both sides of the read proves the bytes belong to that stamp.
+        let before = stamp(path);
+        let bytes = match read_bytes(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ReadOutcome::Absent;
+            }
+            Err(_) => return ReadOutcome::Busy,
+        };
+        let after = stamp(path);
+        let Some(stamp) = after.filter(|_| before == after) else {
+            continue;
+        };
+        return match std::str::from_utf8(&bytes).ok().and_then(parse) {
+            Some(library) => ReadOutcome::Loaded(library, stamp),
+            None => ReadOutcome::Unreadable,
+        };
     }
+    ReadOutcome::Busy
 }
 
 pub fn write(path: &Path, library: &Library) -> Result<FileStamp> {
@@ -339,6 +374,62 @@ mod tests {
         assert!(matches!(read(&path), ReadOutcome::Unreadable));
         std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
         assert!(matches!(read(&path), ReadOutcome::Unreadable));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_held_open_by_another_process_reads_as_busy_not_unreadable() {
+        // Break caught: a sharing violation while OneDrive syncs library.ini being taken for a
+        // damaged file, which turns organizing off for the whole session.
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("fastpad-store-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = library_file(&dir);
+        write(&path, &sample()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(read(&path), ReadOutcome::Busy));
+        drop(lock);
+        assert!(matches!(read(&path), ReadOutcome::Loaded(..)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_races_a_write_is_retried_and_never_pairs_old_bytes_with_a_new_stamp() {
+        // Break caught: the stamp taken after the bytes, so a sync landing mid-read left FastPad
+        // holding the old library under the new file's stamp, and the next flush wrote over the
+        // synced change without re-reading it.
+        let dir = std::env::temp_dir().join(format!("fastpad-store-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = library_file(&dir);
+        write(&path, &Library::default()).unwrap();
+        let mut calls = 0;
+        let outcome = read_via(&path, |path| {
+            calls += 1;
+            let bytes = std::fs::read(path);
+            if calls == 1 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                write(path, &sample()).unwrap();
+            }
+            bytes
+        });
+        match outcome {
+            ReadOutcome::Loaded(library, stamp) => {
+                assert_eq!(calls, 2);
+                assert_eq!(library, sample());
+                assert_eq!(Some(stamp), super::stamp(&path));
+            }
+            _ => panic!("expected the retried read to load"),
+        }
+        let always_changing = read_via(&path, |path| {
+            let bytes = std::fs::read(path);
+            std::fs::write(path, format!("{}x", std::fs::read_to_string(path).unwrap())).unwrap();
+            bytes
+        });
+        assert!(matches!(always_changing, ReadOutcome::Busy));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

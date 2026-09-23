@@ -30,7 +30,23 @@ pub struct LocalState {
     pub files: Vec<CachedFile>,
 }
 
+/// Everything in the local file except the scan cache: what the UI thread changes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Conveniences {
+    pub autosave: bool,
+    pub recent: Vec<(u64, PathBuf)>,
+    pub missing: Vec<(u64, NoteId)>,
+}
+
 impl LocalState {
+    pub fn conveniences(&self) -> Conveniences {
+        Conveniences {
+            autosave: self.autosave,
+            recent: self.recent.clone(),
+            missing: self.missing.clone(),
+        }
+    }
+
     pub fn new(folder: PathBuf) -> Self {
         Self {
             folder,
@@ -99,7 +115,13 @@ impl LocalState {
                 _ => {}
             }
         }
-        if version != Some(VERSION) || !stored_folder.is_some_and(|f| same_path(&f, folder)) {
+        let same_folder = stored_folder.is_some_and(|stored| {
+            same_path(
+                &super::normalize_folder(&stored),
+                &super::normalize_folder(folder),
+            )
+        });
+        if version != Some(VERSION) || !same_folder {
             return None;
         }
         state.folder = folder.to_path_buf();
@@ -175,7 +197,9 @@ fn parse_file(value: &str) -> Option<CachedFile> {
     })
 }
 
+/// The same key for every spelling of one folder (letter case, a trailing separator).
 pub fn folder_key(folder: &Path) -> String {
+    let folder = super::normalize_folder(folder);
     format!(
         "{:016x}",
         fnv1a(folder.to_string_lossy().to_lowercase().as_bytes())
@@ -189,17 +213,61 @@ pub fn local_file(data_dir: &Path, folder: &Path) -> PathBuf {
 }
 
 pub fn read(path: &Path, folder: &Path) -> LocalState {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|source| LocalState::parse(&source, folder))
-        .unwrap_or_else(|| LocalState::new(folder.to_path_buf()))
+    read_with_source(path, folder).0
+}
+
+/// The state, and the file's text when it could be read, so a writer can skip an unchanged file.
+pub fn read_with_source(path: &Path, folder: &Path) -> (LocalState, Option<String>) {
+    let source = std::fs::read_to_string(path).ok();
+    let state = source
+        .as_deref()
+        .and_then(|source| LocalState::parse(source, folder))
+        .unwrap_or_else(|| LocalState::new(folder.to_path_buf()));
+    (state, source)
 }
 
 pub fn write(path: &Path, state: &LocalState) -> Result<()> {
+    write_text(path, &state.encode())
+}
+
+fn write_text(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::file::saver::save_atomic(path, state.encode().as_bytes())
+    crate::file::saver::save_atomic(path, text.as_bytes())
+}
+
+static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Per local file, the newest write that landed. Writes come from the scan worker and from
+/// one-off writer threads, so an older one finishing last must not win.
+static LANDED: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// A number for a write about to be handed off: a later number means newer content.
+pub fn next_write() -> u64 {
+    NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Writes `text` unless a write numbered after `order` already landed for `path`. Writes to one
+/// path are serialized.
+pub fn write_text_in_order(path: &Path, text: &str, order: u64) -> Result<()> {
+    let mut landed = LANDED.lock().unwrap_or_else(|error| error.into_inner());
+    let index = match landed.iter().position(|(p, _)| same_path(p, path)) {
+        Some(index) => index,
+        None => {
+            landed.push((path.to_path_buf(), 0));
+            landed.len() - 1
+        }
+    };
+    if landed[index].1 > order {
+        return Ok(());
+    }
+    write_text(path, text)?;
+    landed[index].1 = order;
+    Ok(())
+}
+
+pub fn write_in_order(path: &Path, state: &LocalState, order: u64) -> Result<()> {
+    write_text_in_order(path, &state.encode(), order)
 }
 
 /// `folders.ini`: recent folders, most recent first. The first one opens at startup.
@@ -236,8 +304,9 @@ impl RecentFolders {
     }
 
     pub fn push(&mut self, folder: PathBuf) {
+        let folder = super::normalize_folder(&folder);
         self.folders
-            .retain(|existing| !same_path(existing, &folder));
+            .retain(|existing| !same_path(&super::normalize_folder(existing), &folder));
         self.folders.insert(0, folder);
         self.folders.truncate(FOLDER_LIMIT);
     }

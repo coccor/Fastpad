@@ -77,6 +77,9 @@ pub struct Document {
     /// Label taken from an untitled tab's first non-blank scanned line (see `library::title`),
     /// shown in place of the bare "Untitled" title until the tab is saved or renamed.
     pub untitled_label: Option<String>,
+    /// The label an untitled tab's first line gives, kept up to date whether or not notes mode
+    /// shows it, so turning notes mode on labels every tab without reading its text again.
+    pub first_line_label: Option<String>,
     /// How many lines of this untitled tab's text have already been scanned for its label.
     pub label_watch: usize,
     /// Size and write time last observed on disk, to notice edits made outside FastPad.
@@ -115,6 +118,7 @@ impl Document {
             recovery_generation: None,
             recovery_origin: None,
             untitled_label: None,
+            first_line_label: None,
             label_watch: crate::library::title::LABEL_SCAN_LINES - 1,
             disk_stamp: None,
             autosave_paused: false,

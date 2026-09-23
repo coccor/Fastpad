@@ -5,6 +5,7 @@ use crate::Result;
 use crate::platform::last_error;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -31,8 +32,9 @@ pub fn rename_no_replace(old: &Path, new: &Path) -> Result<()> {
 /// Sends one file to the Recycle Bin without any shell UI, except a warning if the file cannot be
 /// recycled (a network share, the bin disabled, over quota, ...) and would be deleted outright
 /// instead: `FOF_NOCONFIRMATION` alone would auto-answer that "delete permanently?" prompt with
-/// Yes, silently destroying the file rather than recycling it.
-pub fn recycle(path: &Path) -> Result<()> {
+/// Yes, silently destroying the file rather than recycling it. `owner` owns that warning, so it is
+/// modal to the window instead of floating free of it.
+pub fn recycle(owner: HWND, path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err(crate::FastPadError::Invariant(
             "recycle requires an absolute path",
@@ -47,6 +49,7 @@ pub fn recycle(path: &Path) -> Result<()> {
     let mut from = wide(path);
     from.push(0);
     let mut operation: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
+    operation.hwnd = owner;
     operation.wFunc = FO_DELETE;
     operation.pFrom = from.as_ptr();
     operation.fFlags =
@@ -94,9 +97,9 @@ mod tests {
         let dir = scratch("recycle");
         let path = dir.join("gone.md");
         std::fs::write(&path, "x").unwrap();
-        recycle(&path).unwrap();
+        recycle(std::ptr::null_mut(), &path).unwrap();
         assert!(!path.exists());
-        assert!(recycle(&dir.join("never-existed.md")).is_err());
+        assert!(recycle(std::ptr::null_mut(), &dir.join("never-existed.md")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -108,7 +111,7 @@ mod tests {
         let dir = scratch("recycle-relative");
         let path = dir.join("keep.md");
         std::fs::write(&path, "x").unwrap();
-        assert!(recycle(std::path::Path::new("keep.md")).is_err());
+        assert!(recycle(std::ptr::null_mut(), std::path::Path::new("keep.md")).is_err());
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -118,7 +121,7 @@ mod tests {
         // Break caught: recycle's contract is one file; SHFileOperationW would happily recycle a
         // whole directory tree if `is_file` were relaxed back to `exists`.
         let dir = scratch("recycle-directory");
-        assert!(recycle(&dir).is_err());
+        assert!(recycle(std::ptr::null_mut(), &dir).is_err());
         assert!(dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
