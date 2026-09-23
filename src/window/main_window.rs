@@ -5820,6 +5820,21 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_reads_single_lines_without_their_line_endings() {
+        // Break caught: a line reader that keeps the CR/LF, misreads Scintilla's line count, or
+        // panics instead of returning empty text past the last line.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("first\r\nsecond\nthird").unwrap();
+        assert_eq!(editor.line_count().unwrap(), 3);
+        assert_eq!(editor.line_text(0).unwrap(), "first");
+        assert_eq!(editor.line_text(1).unwrap(), "second");
+        assert_eq!(editor.line_text(2).unwrap(), "third");
+        assert_eq!(editor.line_text(9).unwrap(), "");
+    }
+
+    #[test]
     fn create_context_drops_untransferred_value_on_pre_window_failure() {
         // Break caught: bootstrap manually reclaiming a create-time App allocation is unsafe once
         // ownership can also transfer through WM_NCCREATE.

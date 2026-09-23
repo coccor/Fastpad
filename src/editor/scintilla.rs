@@ -20,8 +20,8 @@ use crate::editor::scintilla_constants::{
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
 use crate::editor::scintilla_constants::{
     SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCOLUMN, SCI_GETCURRENTPOS,
-    SCI_GETFIRSTVISIBLELINE, SCI_GETRANGEPOINTER, SCI_LINEFROMPOSITION, SCI_SETFIRSTVISIBLELINE,
-    SCI_VISIBLEFROMDOCLINE,
+    SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER, SCI_LINEFROMPOSITION,
+    SCI_LINELENGTH, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
 };
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
@@ -366,6 +366,42 @@ impl Editor {
 
     #[cfg(not(windows))]
     pub fn line_from_position(&self, _position: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    #[cfg(windows)]
+    pub fn line_count(&self) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_GETLINECOUNT, 0, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn line_count(&self) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// The text of `line` without its CR/LF, or empty past the last line.
+    #[cfg(windows)]
+    pub fn line_text(&self, line: usize) -> Result<String> {
+        if line >= self.line_count()? {
+            return Ok(String::new());
+        }
+        let length = self
+            .endpoint
+            .send_direct_checked(SCI_LINELENGTH, line, 0)?
+            .max(0) as usize;
+        let mut buffer = vec![0_u8; length + 1];
+        self.endpoint
+            .send_direct_checked(SCI_GETLINE, line, buffer.as_mut_ptr() as isize)?;
+        buffer.truncate(length);
+        let text = String::from_utf8_lossy(&buffer);
+        Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    #[cfg(not(windows))]
+    pub fn line_text(&self, _line: usize) -> Result<String> {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 

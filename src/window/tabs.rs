@@ -192,6 +192,10 @@ impl Tabs {
         self.documents.iter().find(|document| document.id == id)
     }
 
+    pub fn document_mut(&mut self, id: DocumentId) -> Option<&mut Document> {
+        self.documents.iter_mut().find(|document| document.id == id)
+    }
+
     pub(crate) fn find_path(&self, path: &Path) -> Option<DocumentId> {
         let key = canonical_key(path).ok()?;
         self.documents
@@ -423,6 +427,32 @@ impl Tabs {
             }
         }
         self.documents[active].path = Some(path);
+        self.view.update(&self.documents);
+        Ok(())
+    }
+
+    /// Rebinds `id`'s path, e.g. after a note is renamed on disk or moved between folders.
+    /// Rejects the path if it canonicalizes to the same file another open tab already owns
+    /// (mirroring `set_active_path`'s one-native-document-per-canonical-path invariant), and
+    /// updates the tab view so the tab strip and accessibility see the new title.
+    pub fn rebind_path(&mut self, id: DocumentId, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
+        let Some(index) = self.documents.iter().position(|document| document.id == id) else {
+            return Err(DuplicateDocumentPath(path));
+        };
+        if let Ok(candidate) = canonical_key(&path) {
+            let collides = self.documents.iter().enumerate().any(|(other, existing)| {
+                other != index
+                    && existing
+                        .path
+                        .as_deref()
+                        .and_then(|existing_path| canonical_key(existing_path).ok())
+                        .is_some_and(|existing_candidate| existing_candidate == candidate)
+            });
+            if collides {
+                return Err(DuplicateDocumentPath(candidate));
+            }
+        }
+        self.documents[index].path = Some(path);
         self.view.update(&self.documents);
         Ok(())
     }
@@ -667,6 +697,45 @@ mod tests {
         let alternate = root.join(".").join("other.txt");
         assert!(tabs.set_active_path(alternate).is_err());
         assert_eq!(tabs.active().unwrap().path, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebinding_a_path_rejects_one_another_tab_has() {
+        // Break caught: rebinding a document's path (e.g. after a note rename) can create two
+        // tabs that own the same canonical path, breaking Task 9's invariant, or can fail to
+        // update the tab view so the title strip shows a stale name.
+        let root = std::env::temp_dir().join(format!(
+            "fastpad-task13-rebind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path_a = root.join("a.md");
+        let path_b = root.join("b.md");
+        let path_c = root.join("c.md");
+        fs::write(&path_a, b"a").unwrap();
+        fs::write(&path_b, b"b").unwrap();
+        fs::write(&path_c, b"c").unwrap();
+
+        let mut first = document(1);
+        first.path = Some(path_a);
+        let mut second = document(2);
+        second.path = Some(path_b.clone());
+        let mut tabs = Tabs::from_documents([first, second]).unwrap();
+
+        assert!(tabs.rebind_path(DocumentId(1), path_b).is_err());
+        tabs.rebind_path(DocumentId(1), path_c.clone()).unwrap();
+        assert_eq!(
+            tabs.document(DocumentId(1)).unwrap().path.as_deref(),
+            Some(path_c.as_path())
+        );
+        tabs.document_mut(DocumentId(2)).unwrap().autosave_paused = true;
+        assert!(tabs.document(DocumentId(2)).unwrap().autosave_paused);
+
         fs::remove_dir_all(root).unwrap();
     }
 }
