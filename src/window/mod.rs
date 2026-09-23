@@ -14,6 +14,7 @@ pub mod notification;
 pub mod palette;
 pub(crate) mod panel;
 pub(crate) mod preview_host;
+pub(crate) mod row_list;
 pub(crate) mod side_panel;
 pub mod status;
 pub mod tabs;
