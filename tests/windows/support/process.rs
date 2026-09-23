@@ -61,6 +61,7 @@ pub fn seed_scratch_notes_folder(local_app_data: &std::path::Path) -> TestResult
     std::fs::create_dir_all(&data)?;
     let recent = fastpad::library::local::RecentFolders {
         folders: vec![notes],
+        ..Default::default()
     };
     std::fs::write(&folders, recent.encode())?;
     Ok(())

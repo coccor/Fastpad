@@ -243,9 +243,6 @@ pub fn reconcile(
             path: entry.path.clone(),
         })
         .collect();
-    for (old, new) in &result.relocated {
-        local.rename_path(old, new);
-    }
     local.missing.retain(|(_, id)| library.note(*id).is_some());
     result
 }

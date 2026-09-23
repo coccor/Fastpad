@@ -7120,7 +7120,10 @@ mod tests {
         let write = |order: Vec<std::path::PathBuf>| {
             crate::library::local::write_folders(
                 &folders_file,
-                &crate::library::local::RecentFolders { folders: order },
+                &crate::library::local::RecentFolders {
+                    folders: order,
+                    ..Default::default()
+                },
             )
             .unwrap();
         };
@@ -8425,29 +8428,40 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_flush_leaves_the_local_file_alone_and_a_recent_change_writes_it() {
-        // Break caught: every 500 ms metadata flush and every rescan re-encoding and rewriting
-        // the whole per-PC local file (with its scan cache) on the UI thread.
+    fn a_metadata_flush_leaves_the_local_file_alone_and_an_expansion_change_writes_it() {
+        // Break caught: every 500 ms metadata flush, every rescan or every opened note
+        // re-encoding and rewriting the whole per-PC local file (with its scan cache) on the UI
+        // thread.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("local-untouched");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         open_note(&window, &scratch, "a.md", "a");
-        // Opening the note changed the recent list: that flush writes the local file once.
         crate::window::library_host::flush_now(window.hwnd);
         let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
-        assert!(std::fs::read_to_string(&local).unwrap().contains("recent="));
+        assert!(local.exists(), "the load wrote it");
         std::fs::remove_file(&local).unwrap();
+
+        let b = scratch.note("b.md", "b");
+        super::open_path(window.hwnd, &b).unwrap();
+        crate::window::library_host::flush_now(window.hwnd);
+        assert!(!local.exists(), "opening a note changes nothing local");
 
         execute_command(window.hwnd, CommandId::NoteTogglePin);
         crate::window::library_host::flush_now(window.hwnd);
         assert!(crate::library::store::library_file(&scratch.folder()).exists());
         assert!(!local.exists(), "only library.ini changed");
 
-        let b = scratch.note("b.md", "b");
-        super::open_path(window.hwnd, &b).unwrap();
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            state.local.set_expanded(std::path::Path::new("sub"), true);
+        });
         crate::window::library_host::flush_now(window.hwnd);
-        assert!(local.exists(), "a recent-list change is written");
+        assert!(
+            std::fs::read_to_string(&local)
+                .unwrap()
+                .contains("expanded=sub\r\n"),
+            "an expansion change is written"
+        );
     }
 
     #[test]
@@ -8488,6 +8502,31 @@ mod tests {
             "{:?}",
             notices(window.hwnd)
         );
+    }
+
+    #[test]
+    fn a_session_that_ended_with_no_notebook_open_opens_none_at_startup() {
+        // Break caught: open=none ignored, so a closed notebook came back at the next start, or
+        // a worker started (and stat-ed a folder) to find out there was nothing to open.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("startup-closed");
+        let mut folders = crate::library::local::RecentFolders::default();
+        folders.push(scratch.folder());
+        folders.set_closed(true);
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(&scratch.data()),
+            &folders,
+        )
+        .unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+
+        let before = crate::library::folder_checks();
+        crate::window::library_host::open_library_step(window.hwnd);
+        assert_eq!(crate::library::folder_checks(), before);
+        assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+        assert!(!app_mut(window.hwnd).library.scanning, "no worker starts");
     }
 
     #[test]

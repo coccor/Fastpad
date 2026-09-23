@@ -998,6 +998,7 @@ impl ScratchLocalAppData {
         };
         let recent = fastpad::library::local::RecentFolders {
             folders: vec![folder],
+            ..Default::default()
         };
         let path = fastpad::library::local::folders_file(&self.0.join("FastPad"));
         std::fs::write(&path, recent.encode())

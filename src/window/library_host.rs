@@ -80,14 +80,19 @@ struct Loaded {
     result: Result<LibraryState, String>,
     /// Why the worker opened a different folder than the one the UI thread expected.
     notice: Option<String>,
+    /// The last session closed its notebook and the command line named no folder: nothing was
+    /// opened, on purpose.
+    closed: bool,
 }
 
 /// The startup candidates, checked on the worker so an offline drive cannot stall the UI thread.
 struct Startup {
     /// A path named on the command line, which may be a file.
     launch: Option<PathBuf>,
-    /// The most recent folder from `folders.ini`.
+    /// The most recent folder from `folders.ini`, unless the last session closed its notebook.
     remembered: Option<PathBuf>,
+    /// `open=none`: the last session ended with no notebook open.
+    closed: bool,
     data: PathBuf,
 }
 
@@ -117,15 +122,18 @@ fn data_dir(hwnd: HWND) -> Option<PathBuf> {
     .flatten()
 }
 
-/// On the worker: the folder to open at startup, a directory named on the command line, else the
-/// most recent folder if it still exists, else `Documents\FastPad`; and a notice when the most
-/// recent folder is gone.
+/// On the worker: the folder to open at startup, a directory named on the command line, else
+/// nothing when the last session closed its notebook, else the most recent folder if it still
+/// exists, else `Documents\FastPad`; and a notice when the most recent folder is gone.
 fn resolve_startup(startup: Startup) -> (Option<PathBuf>, Option<String>) {
     if let Some(launch) = startup.launch
         && library::folder_exists(&launch)
     {
         remember_folder(&startup.data, &launch);
         return (Some(launch), None);
+    }
+    if startup.closed {
+        return (None, None);
     }
     let mut notice = None;
     if let Some(remembered) = startup.remembered {
@@ -152,7 +160,8 @@ pub(crate) fn remember_folder(data: &Path, folder: &Path) {
 
 /// `WM_FASTPAD_OPEN_LIBRARY`: starts the worker on the startup folder. Reads only `folders.ini`:
 /// whether the folder (or a command-line path) exists is checked on the worker, which may open a
-/// different folder than the one assumed here.
+/// different folder than the one assumed here. After a session that closed its notebook, with no
+/// path on the command line, nothing opens and no worker starts.
 pub(crate) fn open_library_step(hwnd: HWND) {
     if !notes_mode(hwnd) {
         return;
@@ -167,22 +176,36 @@ pub(crate) fn open_library_step(hwnd: HWND) {
             }
             crate::launch::LaunchRequest::New => None,
         });
-    let remembered = library::local::read_folders(&library::local::folders_file(&data))
-        .folders
-        .first()
-        .map(|folder| library::normalize_folder(folder));
+    let recent = library::local::read_folders(&library::local::folders_file(&data));
+    if recent.closed && launch.is_none() {
+        host(hwnd, |host| host.folder = None);
+        return;
+    }
+    let remembered = if recent.closed {
+        None
+    } else {
+        recent
+            .folders
+            .first()
+            .map(|folder| library::normalize_folder(folder))
+    };
     // Until the worker has checked, the name box saves into the folder that usually wins.
-    let assumed = remembered.clone().or_else(|| {
-        crate::platform::paths::default_notes_folder()
-            .ok()
-            .map(|folder| library::normalize_folder(&folder))
-    });
+    let assumed = if recent.closed {
+        None
+    } else {
+        remembered.clone().or_else(|| {
+            crate::platform::paths::default_notes_folder()
+                .ok()
+                .map(|folder| library::normalize_folder(&folder))
+        })
+    };
     host(hwnd, |host| host.folder = assumed);
     spawn_load(
         hwnd,
         Some(Startup {
             launch,
             remembered,
+            closed: recent.closed,
             data,
         }),
     );
@@ -216,10 +239,12 @@ fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
     };
     let target = hwnd as isize;
     std::thread::spawn(move || {
+        let closed = startup.as_ref().is_some_and(|startup| startup.closed);
         let (folder, notice) = match startup {
             Some(startup) => resolve_startup(startup),
             None => (folder, None),
         };
+        let opens_nothing = closed && folder.is_none();
         let (folder, result) = match folder {
             Some(folder) => {
                 let local_path = library::local::local_file(&data, &folder);
@@ -237,6 +262,7 @@ fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
             folder,
             result,
             notice,
+            closed: opens_nothing,
         }));
         if unsafe {
             PostMessageW(
@@ -259,6 +285,7 @@ pub(crate) fn test_ready_payload(generation: u64, result: Result<LibraryState, S
         folder: PathBuf::new(),
         result,
         notice: None,
+        closed: false,
     })) as LPARAM
 }
 
@@ -283,10 +310,18 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
         folder,
         result,
         notice,
+        closed,
         ..
     } = *loaded;
     if let Some(notice) = notice {
         push_notice(hwnd, notice);
+    }
+    if closed {
+        // The path on the command line was not a folder, and the last session closed its
+        // notebook: none is open.
+        host(hwnd, |host| host.folder = None);
+        super::main_window::invalidate_title_strip(hwnd);
+        return;
     }
     // At startup the worker decides which folder exists; the UI thread only assumed one.
     let moved = !folder.as_os_str().is_empty()
@@ -380,7 +415,7 @@ struct LocalWrite {
     force: bool,
 }
 
-/// Writes the per-PC local file when its recent list, autosave switch or missing times changed.
+/// Writes the per-PC local file when its expanded folders, autosave switch or missing times changed.
 /// It also carries the scan cache (about 1 MB for 10,000 notes), so it is encoded and written on
 /// a one-off writer thread from a snapshot: cloning the state is cheap next to encoding it and
 /// syncing the write. `local::write_in_order` keeps an older snapshot from landing last.
@@ -1426,23 +1461,16 @@ pub(crate) fn keep_mine(hwnd: HWND) {
 }
 
 /// After a file is opened into a tab: remember its disk stamp, read before the load so a change
-/// landing during it still pauses the next autosave, and a note among recent notes.
+/// landing during it still pauses the next autosave.
 pub(crate) fn document_loaded(hwnd: HWND, stamp: Option<library::DiskStamp>) {
-    let path = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_mut() };
-        let id = app.tabs.active()?.id;
-        let document = app.tabs.document_mut(id)?;
-        let path = document.path.clone()?;
-        document.disk_stamp = stamp;
-        Some(path)
-    });
-    if let Some(path) = path
-        && folder(hwnd).is_some_and(|folder| library::is_inside(&folder, &path))
-    {
-        with_state(hwnd, |state| {
-            let record = library::record_path(&state.folder, &path);
-            state.local.note_opened(&record, library::now_unix());
-        });
+        if let Some(id) = app.tabs.active().map(|document| document.id)
+            && let Some(document) = app.tabs.document_mut(id)
+            && document.path.is_some()
+        {
+            document.disk_stamp = stamp;
+        }
     }
 }
 
@@ -1604,5 +1632,69 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
     let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
     if let Some(folder) = shown.unwrap_or_default().get(index) {
         open_folder(hwnd, folder);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "fastpad-host-startup-{label}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("data")).unwrap();
+            std::fs::create_dir_all(root.join("notes")).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_session_that_closed_its_notebook_opens_none_and_checks_no_folder() {
+        // Break caught: startup reopening the last notebook, or falling back to
+        // Documents\FastPad, after the user closed it.
+        let scratch = Scratch::new("closed");
+        let before = library::folder_checks();
+        let resolved = resolve_startup(Startup {
+            launch: None,
+            remembered: None,
+            closed: true,
+            data: scratch.0.join("data"),
+        });
+        assert_eq!(resolved, (None, None));
+        assert_eq!(library::folder_checks(), before);
+    }
+
+    #[test]
+    fn a_folder_on_the_command_line_opens_after_a_close_and_clears_it() {
+        // Break caught: `fastpad.exe D:\Notes` refused after a close, or leaving open=none so the
+        // next plain start opens nothing again.
+        let scratch = Scratch::new("closed-launch");
+        let data = scratch.0.join("data");
+        let mut folders = library::local::RecentFolders::default();
+        folders.set_closed(true);
+        library::local::write_folders(&library::local::folders_file(&data), &folders).unwrap();
+        let notes = library::normalize_folder(&scratch.0.join("notes"));
+        let (folder, notice) = resolve_startup(Startup {
+            launch: Some(notes.clone()),
+            remembered: None,
+            closed: true,
+            data: data.clone(),
+        });
+        assert_eq!((folder, notice), (Some(notes.clone()), None));
+        let saved = library::local::read_folders(&library::local::folders_file(&data));
+        assert!(!saved.closed);
+        assert_eq!(saved.folders, [notes]);
     }
 }

@@ -38,6 +38,7 @@ impl Scratch {
         let scratch = Self { root };
         let recent = fastpad::library::local::RecentFolders {
             folders: vec![scratch.folder()],
+            ..Default::default()
         };
         std::fs::write(
             fastpad::library::local::folders_file(&scratch.data()),

@@ -62,8 +62,8 @@ pub struct LibraryState {
     /// Paths (as records store them) FastPad itself added, removed or renamed in `notes` since
     /// the running rescan started. Only these are re-checked when its result is merged.
     pub touched: Vec<PathBuf>,
-    /// The recent list, autosave switch and missing times as the local file last written holds
-    /// them, so the UI thread rewrites that file only when one of them changed.
+    /// The expanded folders, autosave switch and missing times as the local file last written
+    /// holds them, so the UI thread rewrites that file only when one of them changed.
     pub written_local: local::Conveniences,
 }
 
@@ -248,7 +248,7 @@ pub fn flush(state: &mut LibraryState) -> Result<Flushed> {
     Ok(Flushed::Wrote)
 }
 
-/// The per-PC state to write, when its recent list, autosave switch or missing times changed
+/// The per-PC state to write, when its expanded folders, autosave switch or missing times changed
 /// since the local file was last written; it is then counted as written. The scan cache alone
 /// never needs a write here: the worker wrote it with the scan.
 pub fn take_local_changes(state: &mut LibraryState) -> Option<LocalState> {
@@ -304,8 +304,9 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         // survived the merge must not push it past that.
         fresh.notes.truncate(scan::NOTE_LIMIT);
     }
-    fresh.local.merge_recent(&previous_local);
+    // The UI thread owns these conveniences: what it set while the rescan ran wins.
     fresh.local.autosave = previous_local.autosave;
+    fresh.local.expanded = previous_local.expanded;
 
     if fresh.metadata == Metadata::Busy {
         // The rescan could not read library.ini: what the live state knows still stands, and the
@@ -410,13 +411,12 @@ impl LibraryState {
         self.touched.push(stored);
     }
 
-    /// Follows a rename FastPad made: the index, the recent list and any record.
+    /// Follows a rename FastPad made: the index and any record.
     pub fn rename_note(&mut self, old: &Path, new: &Path) {
         let old_stored = record_path(&self.folder, old);
         let new_stored = record_path(&self.folder, new);
         self.remove_note(old);
         self.add_note(new);
-        self.local.rename_path(&old_stored, &new_stored);
         if let Some(record) = self.library.note_by_path(&old_stored) {
             let note = NoteRef {
                 id: record.id,
@@ -632,11 +632,11 @@ mod tests {
                 value: true,
             })
             .unwrap();
-        previous.local.note_opened(Path::new("a.md"), 150);
+        previous.local.set_expanded(Path::new("sub"), true);
         let merged = merge_rescan(previous, fresh);
         assert!(merged.record_for(&a).unwrap().pinned);
         assert_eq!(merged.pending.len(), 1);
-        assert_eq!(merged.local.recent[0].0, 150);
+        assert!(merged.local.is_expanded(Path::new("SUB")));
     }
 
     #[test]
@@ -958,9 +958,9 @@ mod tests {
             take_local_changes(&mut state).is_none(),
             "the scan cache alone"
         );
-        state.local.note_opened(Path::new("a.md"), 150);
-        let changed = take_local_changes(&mut state).expect("a recent change is written");
-        assert_eq!(changed.recent[0].0, 150);
+        state.local.set_expanded(Path::new("sub"), true);
+        let changed = take_local_changes(&mut state).expect("an expansion change is written");
+        assert_eq!(changed.expanded, [PathBuf::from("sub")]);
         assert!(take_local_changes(&mut state).is_none());
     }
 
