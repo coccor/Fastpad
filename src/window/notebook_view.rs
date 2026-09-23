@@ -25,8 +25,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetParent, SendMessageW, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
@@ -792,14 +792,6 @@ impl NotebookView {
         }
     }
 
-    fn tooltip(&mut self) -> Option<&Tooltip> {
-        if self.tooltip.is_none() && !self.tooltip_failed {
-            self.tooltip = Tooltip::create(self.panel);
-            self.tooltip_failed = self.tooltip.is_none();
-        }
-        self.tooltip.as_ref()
-    }
-
     /// The hovered row's tip: a truncated note name in full, or a recent notebook's path.
     fn row_tip(&mut self, fonts: UiFonts) -> (RECT, String) {
         let none = (RECT::default(), String::new());
@@ -835,9 +827,10 @@ impl NotebookView {
         }
     }
 
-    /// `fonts` measures whether the hovered name is cut off. A tool with an empty text is
-    /// removed, so a hidden button shows no tip.
-    fn update_tooltips(&mut self, fonts: UiFonts) {
+    /// Every tool's ID, rectangle and text, for `apply_tooltips`. `fonts` measures whether the
+    /// hovered name is cut off. A tool with an empty text is removed, so a hidden button shows
+    /// no tip.
+    fn tooltip_tools(&mut self, fonts: UiFonts) -> Vec<(usize, RECT, String)> {
         let area = self.client();
         let header = header_layout(area, self.dpi());
         let title = self
@@ -852,19 +845,18 @@ impl NotebookView {
         };
         let buttons_shown = self.mode != Mode::NoNotebook;
         let (row_rect, row_text) = self.row_tip(fonts);
-        let Some(tooltip) = self.tooltip() else {
-            return;
-        };
-        tooltip.set_tool(TOOL_TITLE, header.title, &title);
+        let mut tools = vec![(TOOL_TITLE, header.title, title)];
         for (button, rect) in header.buttons {
             let (id, text) = match button {
                 HeaderButton::Favorite => (TOOL_FAVORITE, favorite),
                 HeaderButton::NewNote => (TOOL_NEW, "New note"),
                 HeaderButton::More => (TOOL_MORE, "More actions"),
             };
-            tooltip.set_tool(id, rect, if buttons_shown { text } else { "" });
+            let text = if buttons_shown { text } else { "" };
+            tools.push((id, rect, text.to_owned()));
         }
-        tooltip.set_tool(TOOL_ROW, row_rect, &row_text);
+        tools.push((TOOL_ROW, row_rect, row_text));
+        tools
     }
 
     fn paint(&mut self, paint: &ViewPaint) {
@@ -1255,8 +1247,7 @@ fn run(hwnd: HWND, command: CommandId) {
 pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
     let root = super::library_host::folder(hwnd)?;
     with_view(hwnd, |view| {
-        let focused =
-            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == view.panel;
+        let focused = unsafe { GetFocus() } == view.panel;
         match view.list.selected.map(|index| view.target(index)) {
             Some(Target::Row(TreeRow {
                 kind: RowKind::Note(relative),
@@ -1446,13 +1437,12 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             Some(0)
         }
         WM_LBUTTONUP => {
-            with_view(hwnd, |view| {
-                if view.thumb_grab.take().is_some() {
-                    unsafe {
-                        ReleaseCapture();
-                    }
+            // Released after the borrow ends: ReleaseCapture sends WM_CAPTURECHANGED here.
+            if with_view(hwnd, |view| view.thumb_grab.take().is_some()).unwrap_or(false) {
+                unsafe {
+                    ReleaseCapture();
                 }
-            });
+            }
             Some(0)
         }
         WM_CAPTURECHANGED => {
@@ -1462,10 +1452,8 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_RBUTTONDOWN => {
             // Selects the row; DefWindowProc turns the button-up into WM_CONTEXTMENU.
             let (x, y) = point_of(lparam);
+            focus_panel(hwnd);
             with_view(hwnd, |view| {
-                unsafe {
-                    SetFocus(view.panel);
-                }
                 if let Hit::Row { index, .. } = view.hit_test(x, y) {
                     view.select(index);
                 }
@@ -1500,13 +1488,13 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
 fn mouse_move(hwnd: HWND, x: i32, y: i32) {
     // Read before the view is borrowed: `ui_fonts` borrows the App itself.
     let fonts = super::main_window::ui_fonts(hwnd);
-    with_view(hwnd, |view| {
+    let tools = with_view(hwnd, |view| {
         if let Some(grab) = view.thumb_grab {
             let list = view.list_rect(view.client());
             if view.list.drag_thumb(grab, y - list.top, height(list)) {
                 view.invalidate();
             }
-            return;
+            return None;
         }
         view.track_leave();
         let hit = view.hit_test(x, y);
@@ -1520,30 +1508,80 @@ fn mouse_move(hwnd: HWND, x: i32, y: i32) {
             view.hover_pin = pin;
             view.hover = hot;
             view.invalidate();
-            view.update_tooltips(fonts);
+            return Some(view.tooltip_tools(fonts));
         }
-    });
+        None
+    })
+    .flatten();
+    if let Some(tools) = tools {
+        apply_tooltips(hwnd, &tools);
+    }
+}
+
+/// Gives the tooltip `tools`, making the tooltip first if the view has none yet. Runs with
+/// nothing of the App borrowed: creating the control and adding tools send messages.
+fn apply_tooltips(hwnd: HWND, tools: &[(usize, RECT, String)]) {
+    let Some((existing, failed, panel)) =
+        with_view(hwnd, |view| (view.tooltip, view.tooltip_failed, view.panel))
+    else {
+        return;
+    };
+    let tooltip = match existing {
+        Some(tooltip) => tooltip,
+        None if failed => return,
+        None => {
+            let created = Tooltip::create(panel);
+            let kept = with_view(hwnd, |view| {
+                view.tooltip = created;
+                view.tooltip_failed = created.is_none();
+            });
+            match (created, kept) {
+                (Some(tooltip), Some(())) => tooltip,
+                (Some(tooltip), None) => {
+                    tooltip.destroy();
+                    return;
+                }
+                (None, _) => return,
+            }
+        }
+    };
+    for (id, rect, text) in tools {
+        tooltip.set_tool(*id, *rect, text);
+    }
+}
+
+/// Gives the panel the keyboard focus with nothing of the App borrowed: SetFocus sends
+/// WM_KILLFOCUS and WM_SETFOCUS, whose handlers borrow it again.
+fn focus_panel(hwnd: HWND) {
+    let Some(panel) = with_view(hwnd, |view| view.panel) else {
+        return;
+    };
+    unsafe {
+        if GetFocus() != panel {
+            SetFocus(panel);
+        }
+    }
 }
 
 fn left_down(hwnd: HWND, x: i32, y: i32) {
-    let Some(hit) = with_view(hwnd, |view| {
-        unsafe {
-            SetFocus(view.panel);
-        }
-        view.hit_test(x, y)
-    }) else {
+    focus_panel(hwnd);
+    let Some(hit) = with_view(hwnd, |view| view.hit_test(x, y)) else {
         return;
     };
     match hit {
         Hit::Header(button) => header_clicked(hwnd, button),
         Hit::StateButton => state_button(hwnd),
         Hit::Thumb(grab) => {
-            with_view(hwnd, |view| {
+            // Captured after the borrow ends: SetCapture sends WM_CAPTURECHANGED to the window
+            // that held the capture before.
+            if let Some(panel) = with_view(hwnd, |view| {
                 view.thumb_grab = Some(grab);
+                view.panel
+            }) {
                 unsafe {
-                    SetCapture(view.panel);
+                    SetCapture(panel);
                 }
-            });
+            }
         }
         Hit::Row { index, part } => {
             with_view(hwnd, |view| view.select(index));
