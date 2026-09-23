@@ -1263,7 +1263,8 @@ pub(crate) fn new_note_in(hwnd: HWND, folder: Option<PathBuf>) {
             document.save_folder = destination;
         }
     }
-    super::side_panel::refresh(hwnd);
+    // `create_new_document` already showed the new unsaved row: its tab switch rebuilt the
+    // Notebook view's rows and selected it (`side_panel::active_tab_changed`).
 }
 
 /// Where tab `id`'s first save goes: its remembered folder while that is still a folder of the

@@ -477,8 +477,9 @@ fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
             ("sidebar_view", view.token().to_owned())
         })
     });
-    // A hidden view's rows may be stale.
-    if view == SidebarView::Notebook {
+    // Library changes rebuild the rows whatever the view, so only what they are built from
+    // besides the library (the tabs, the expansion) can have moved on while it was hidden.
+    if view == SidebarView::Notebook && crate::window::notebook_view::stale(hwnd) {
         crate::window::notebook_view::rebuild(hwnd);
     }
     layout_editor_and_find_bar(hwnd);

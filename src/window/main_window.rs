@@ -2176,12 +2176,15 @@ pub(crate) fn change_setting(
     };
     let theme_changed = unsafe { app_ptr(hwnd) }
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
+    // The sidebar's view and width change only the layout, which their callers redo; the editor
+    // and the Markdown preview are not restyled for them.
+    let sidebar_only = matches!(key, "sidebar_view" | "sidebar_width");
     if theme_changed {
         apply_theme(hwnd);
         unsafe {
             InvalidateRect(hwnd, std::ptr::null(), 1);
         }
-    } else {
+    } else if !sidebar_only {
         apply_editor_settings(hwnd);
     }
     if let Err(error) = save_setting(key, &value) {
@@ -2334,10 +2337,24 @@ fn settings_warning_message(warning: &crate::config::SettingWarning) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static EDITOR_SETTINGS_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has applied the editor settings, for the tests that check a
+/// sidebar change does not.
+#[cfg(test)]
+fn editor_settings_applied() -> usize {
+    EDITOR_SETTINGS_APPLIED.with(std::cell::Cell::get)
+}
+
 /// Also recolors the line numbers: this runs after every lexer change, whose style reset gives
 /// the gutter full-contrast text. Before chrome exists the neutral palette matches Scintilla's own
 /// black-on-white defaults.
 fn apply_editor_settings(hwnd: HWND) {
+    #[cfg(test)]
+    EDITOR_SETTINGS_APPLIED.with(|count| count.set(count.get() + 1));
     let Some((editor, settings, palette)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
         let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
@@ -10338,7 +10355,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::New);
         let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
         let after_new = notebook_view(window.hwnd).rebuilds;
-        assert!(after_new > before);
+        assert_eq!(after_new, before + 1, "Ctrl+N flattens the tree once");
         editor.set_text("Groceries").unwrap();
         pump_posted_messages(window.hwnd);
         let row = row_of(window.hwnd, &RowKind::Unsaved(untitled.0));
@@ -10350,6 +10367,39 @@ mod tests {
             after_new,
             "the renamed row's label is part of the key, so switching away does not rebuild"
         );
+    }
+
+    #[test]
+    fn switching_sidebar_views_saves_the_view_without_restyling_the_editor_or_reflattening() {
+        // Break caught: every view switch (and every panel resize) re-applying the editor
+        // settings, which lays the Markdown preview out again, or flattening an unchanged tree
+        // each time the Notebook view comes back.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-switch-cheap");
+        scratch.note("a.md", "a");
+        let settings = scratch.root.join("fastpad.ini");
+        super::save_settings_to(Some(settings.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        pump_posted_messages(window.hwnd);
+        let applied = super::editor_settings_applied();
+        let rebuilds = notebook_view(window.hwnd).rebuilds;
+        use crate::config::SidebarView;
+
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
+        crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+        super::save_settings_to(None);
+
+        assert_eq!(super::editor_settings_applied(), applied);
+        assert_eq!(notebook_view(window.hwnd).rebuilds, rebuilds);
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            SidebarView::Notebook
+        );
+        let saved = std::fs::read_to_string(&settings).unwrap();
+        assert!(saved.contains("sidebar_view=notebook"), "{saved}");
     }
 
     #[test]
