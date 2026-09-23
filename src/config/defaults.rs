@@ -12,10 +12,11 @@ pub const DEFAULT_LINE_NUMBERS: bool = true;
 pub const DEFAULT_THEME: ThemePreference = ThemePreference::System;
 pub const DEFAULT_RECOVERY_INTERVAL_SECONDS: u32 = 30;
 pub const DEFAULT_RESTORE_SESSION: bool = true;
+pub const DEFAULT_NOTES_MODE: bool = true;
 
 /// FastPad's compiled defaults: Consolas 11pt, 4-wide tabs, word wrap off, line numbers on, system
-/// theme, a 30-second crash-recovery interval, and session restore on. Every value a settings file
-/// does not (validly) specify keeps whatever `default_settings()` produced.
+/// theme, a 30-second crash-recovery interval, session restore on, and notes mode on. Every value a
+/// settings file does not (validly) specify keeps whatever `default_settings()` produced.
 pub fn default_settings() -> Settings {
     Settings {
         font_face: DEFAULT_FONT_FACE.to_owned(),
@@ -26,6 +27,7 @@ pub fn default_settings() -> Settings {
         theme: DEFAULT_THEME,
         recovery_interval_seconds: DEFAULT_RECOVERY_INTERVAL_SECONDS,
         restore_session: DEFAULT_RESTORE_SESSION,
+        notes_mode: DEFAULT_NOTES_MODE,
     }
 }
 
@@ -46,5 +48,6 @@ mod tests {
         assert_eq!(settings.theme, ThemePreference::System);
         assert_eq!(settings.recovery_interval_seconds, 30);
         assert!(settings.restore_session);
+        assert!(settings.notes_mode);
     }
 }

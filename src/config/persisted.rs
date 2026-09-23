@@ -35,6 +35,9 @@ pub struct Settings {
     pub recovery_interval_seconds: u32,
     /// Whether the primary window reopens the last session's tabs and closes without prompting.
     pub restore_session: bool,
+    /// Whether an open folder is treated as a note library (sidebar data, autosave, first-save
+    /// naming).
+    pub notes_mode: bool,
 }
 
 impl Settings {
@@ -66,6 +69,9 @@ impl Settings {
         if let Some(restore_session) = delta.restore_session {
             self.restore_session = restore_session;
         }
+        if let Some(notes_mode) = delta.notes_mode {
+            self.notes_mode = notes_mode;
+        }
     }
 }
 
@@ -92,16 +98,17 @@ pub struct SettingsDelta {
     pub theme: Option<ThemePreference>,
     pub recovery_interval_seconds: Option<u32>,
     pub restore_session: Option<bool>,
+    pub notes_mode: Option<bool>,
     pub warnings: Vec<SettingWarning>,
 }
 
 /// Parses a hand-written, tolerant `.ini`-style settings source: one `key=value` pair per line: ASCII
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
-/// `line_numbers`, `theme`, `recovery_interval_seconds`, and `restore_session` are recognized. Every
-/// line is handled independently: a line with an unknown key, a value that fails to parse, or no `=`
-/// at all records one `SettingWarning` and is otherwise skipped — it never discards, and is never
-/// affected by, any other line's outcome.
+/// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, and `notes_mode` are
+/// recognized. Every line is handled independently: a line with an unknown key, a value that fails
+/// to parse, or no `=` at all records one `SettingWarning` and is otherwise skipped — it never
+/// discards, and is never affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
     let mut delta = SettingsDelta::default();
     // An editor that saves fastpad.ini with a UTF-8 BOM must not hide its first setting.
@@ -159,6 +166,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "restore_session" => match parse_bool(value) {
             Some(restore_session) => delta.restore_session = Some(restore_session),
+            None => warn(delta, line_number, key, value),
+        },
+        "notes_mode" => match parse_bool(value) {
+            Some(notes_mode) => delta.notes_mode = Some(notes_mode),
             None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
@@ -463,6 +474,21 @@ mod tests {
         let mut settings = default_settings();
         settings.apply_delta(&parse("restore_session=0"));
         assert!(!settings.restore_session);
+    }
+
+    #[test]
+    fn notes_mode_accepts_the_boolean_spellings_and_defaults_on() {
+        // Break caught: notes mode that cannot be turned off from fastpad.ini, or that starts off.
+        assert!(crate::config::default_settings().notes_mode);
+        for (value, expected) in [("off", false), ("0", false), ("yes", true), ("TRUE", true)] {
+            assert_eq!(
+                parse(&format!("notes_mode={value}")).notes_mode,
+                Some(expected)
+            );
+        }
+        let delta = parse("notes_mode=maybe");
+        assert_eq!(delta.notes_mode, None);
+        assert_eq!(delta.warnings.len(), 1);
     }
 
     #[test]

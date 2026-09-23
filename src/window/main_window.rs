@@ -1630,6 +1630,18 @@ fn execute_command(hwnd: HWND, command: CommandId) {
                 .is_some_and(|app| unsafe { app.as_ref() }.settings.restore_session);
             push_notice(hwnd, crate::session::toggle_notice(enabled).to_owned());
         }
+        CommandId::ToggleNotesMode => {
+            change_setting(hwnd, |settings| {
+                settings.notes_mode = !settings.notes_mode;
+                Some(("notes_mode", settings.notes_mode.to_string()))
+            });
+            let enabled = unsafe { app_ptr(hwnd) }
+                .is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode);
+            push_notice(
+                hwnd,
+                crate::window::library_host::notes_mode_notice(enabled).to_owned(),
+            );
+        }
         CommandId::FontSizeIncrease => {
             set_font_size(hwnd, |size| {
                 size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
@@ -4899,6 +4911,28 @@ mod tests {
                 .iter()
                 .any(|notice| notice.message == crate::session::toggle_notice(false))
         );
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn notes_mode_toggle_saves_only_its_line_and_says_so() {
+        // Break caught: a toggle lost on restart, or one that rewrites the rest of fastpad.ini.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("notes-toggle");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::ToggleNotesMode);
+        assert!(!app_mut(window.hwnd).settings.notes_mode);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nnotes_mode=false\r\n"
+        );
+        assert!(notices(window.hwnd).contains(
+            &crate::window::library_host::notes_mode_notice(false).to_owned()
+        ));
         super::save_settings_to(None);
     }
 

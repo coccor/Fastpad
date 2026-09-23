@@ -58,6 +58,7 @@ pub enum CommandId {
     MarkdownPreviewFull,
     MarkdownPreviewClose,
     ToggleRestoreSession,
+    ToggleNotesMode,
 }
 
 impl CommandId {
@@ -87,6 +88,7 @@ impl CommandId {
                 | Self::ThemeCatppuccinMacchiato
                 | Self::ThemeCatppuccinMocha
                 | Self::ToggleRestoreSession
+                | Self::ToggleNotesMode
         )
     }
 
@@ -116,7 +118,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 57] = [
+        const COMMANDS: [CommandId; 58] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -174,6 +176,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownPreviewFull,
             CommandId::MarkdownPreviewClose,
             CommandId::ToggleRestoreSession,
+            CommandId::ToggleNotesMode,
         ];
         COMMANDS
             .into_iter()
@@ -222,6 +225,8 @@ mod tests {
             Ok(CommandId::ToggleRestoreSession)
         );
         assert!(!CommandId::ToggleRestoreSession.needs_document());
+        assert_eq!(CommandId::try_from(157), Ok(CommandId::ToggleNotesMode));
+        assert!(!CommandId::ToggleNotesMode.needs_document());
     }
 
     #[test]
