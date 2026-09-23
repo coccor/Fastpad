@@ -1,9 +1,13 @@
 //! Keeps records attached to their files. Scan results are matched against records in order:
-//! path (ignoring case), then the cached file ID (a rename or move in Explorer), then size and
-//! content hash (a copy or sync). Anything else is missing; after 30 days missing it is dropped.
+//! path (ignoring case); then the cached file ID (a rename or move in Explorer), checked for
+//! every still-unmatched record before fingerprint matching is tried; then size and content
+//! hash, restricted to files that are new since the last scan (a copy or sync). Anything still
+//! unmatched is missing; after 30 days missing it is dropped. A truncated scan never marks
+//! records missing or purges them, since a file past the scan limit is not really gone.
+//! Only operations that actually applied are kept in the result.
 
 use super::local::{CachedFile, LocalState};
-use super::model::{Library, NoteRef};
+use super::model::{Library, NoteRecord, NoteRef};
 use super::ops::{PendingOp, apply};
 use super::scan::Scan;
 use std::collections::HashMap;
@@ -23,6 +27,36 @@ fn key(path: &Path) -> String {
     path.to_string_lossy().to_lowercase()
 }
 
+/// Applies `op`; only on success is it kept in `ops`.
+fn apply_op(library: &mut Library, ops: &mut Vec<PendingOp>, op: PendingOp) -> bool {
+    if apply(library, &op).is_ok() {
+        ops.push(op);
+        true
+    } else {
+        false
+    }
+}
+
+/// Records a match found outside the path step (file ID or fingerprint): relocates the record,
+/// and restores it if it was flagged deleted. Only ops that applied are reflected in `result`.
+fn relocate(
+    library: &mut Library,
+    local: &mut LocalState,
+    result: &mut Reconciled,
+    record: &NoteRecord,
+    path: PathBuf,
+) {
+    let note = NoteRef { id: record.id, path: record.path.clone() };
+    local.clear_missing(record.id);
+    let op = PendingOp::Relocate { note: note.clone(), path: path.clone() };
+    if apply_op(library, &mut result.ops, op) {
+        result.relocated.push((record.path.clone(), path));
+    }
+    if record.deleted {
+        apply_op(library, &mut result.ops, PendingOp::SetDeleted { note, value: false });
+    }
+}
+
 pub fn reconcile(
     library: &mut Library,
     local: &mut LocalState,
@@ -37,28 +71,34 @@ pub fn reconcile(
         .enumerate()
         .map(|(index, entry)| (key(&entry.path), index))
         .collect();
+    // The scan cache as of the previous scan. A path already in it is not "new".
     let cache: HashMap<String, CachedFile> =
         local.files.iter().map(|file| (key(&file.path), file.clone())).collect();
+    let is_new = |index: usize| !cache.contains_key(&key(&scan.entries[index].path));
     let mut claimed = vec![false; scan.entries.len()];
     let mut hashes: HashMap<usize, Option<u64>> = HashMap::new();
-    let mut unmatched = Vec::new();
 
-    // 1. Path.
-    for record in library.notes.iter().filter(|record| !record.path.is_absolute()) {
-        let note = NoteRef { id: record.id, path: record.path.clone() };
-        let Some(&index) = by_path.get(&key(&record.path)) else {
-            unmatched.push(note);
+    // 1. Path (ignoring case). A record whose path is already claimed by an earlier record
+    // (two records collapsing onto the same case-insensitive path) is treated as unmatched.
+    let mut unmatched = Vec::new();
+    for record in library.notes.clone().into_iter().filter(|record| !record.path.is_absolute()) {
+        let index = by_path.get(&key(&record.path)).copied().filter(|&index| !claimed[index]);
+        let Some(index) = index else {
+            unmatched.push(record);
             continue;
         };
         claimed[index] = true;
+        let note = NoteRef { id: record.id, path: record.path.clone() };
         let entry = &scan.entries[index];
         local.clear_missing(record.id);
         if record.path != entry.path {
-            result.ops.push(PendingOp::Relocate { note: note.clone(), path: entry.path.clone() });
-            result.relocated.push((record.path.clone(), entry.path.clone()));
+            let op = PendingOp::Relocate { note: note.clone(), path: entry.path.clone() };
+            if apply_op(library, &mut result.ops, op) {
+                result.relocated.push((record.path.clone(), entry.path.clone()));
+            }
         }
         if record.deleted {
-            result.ops.push(PendingOp::SetDeleted { note: note.clone(), value: false });
+            apply_op(library, &mut result.ops, PendingOp::SetDeleted { note: note.clone(), value: false });
         }
         let changed = cache
             .get(&key(&entry.path))
@@ -70,59 +110,69 @@ pub fn reconcile(
             && let Some(value) = *hashes.entry(index).or_insert_with(|| hash(&entry.path))
             && (value != record.hash || entry.size != record.size)
         {
-            result.ops.push(PendingOp::SetFingerprint { note, size: entry.size, hash: value });
+            apply_op(library, &mut result.ops, PendingOp::SetFingerprint { note, size: entry.size, hash: value });
         }
     }
 
-    // 2. File ID, then 3. fingerprint, then 4. missing.
-    for note in unmatched {
-        let Some(record) = library.note(note.id).cloned() else {
-            continue;
-        };
+    // 2. File ID: a full pass over every unmatched record, against new files only, before any
+    // record falls back to fingerprint matching.
+    let mut still_unmatched = Vec::new();
+    for record in unmatched {
         let by_id = cache
             .get(&key(&record.path))
             .filter(|cached| cached.file_id != 0 && cached.volume == scan.volume)
             .and_then(|cached| {
-                (0..scan.entries.len())
-                    .find(|&index| !claimed[index] && scan.entries[index].file_id == cached.file_id)
+                (0..scan.entries.len()).find(|&index| {
+                    !claimed[index] && is_new(index) && scan.entries[index].file_id == cached.file_id
+                })
             });
-        let found = by_id.or_else(|| {
-            if record.size == 0 || record.size > HASH_LIMIT {
-                return None;
+        match by_id {
+            Some(index) => {
+                claimed[index] = true;
+                relocate(library, local, &mut result, &record, scan.entries[index].path.clone());
             }
+            None => still_unmatched.push(record),
+        }
+    }
+
+    // 3. Fingerprint: only records still unmatched after the file-ID pass, only against new files.
+    let mut missing = Vec::new();
+    for record in still_unmatched {
+        let found = if record.size == 0 || record.size > HASH_LIMIT {
+            None
+        } else {
             (0..scan.entries.len()).find(|&index| {
                 let entry = &scan.entries[index];
                 !claimed[index]
+                    && is_new(index)
                     && !entry.online_only
                     && entry.size == record.size
                     && *hashes.entry(index).or_insert_with(|| hash(&entry.path)) == Some(record.hash)
             })
-        });
+        };
         match found {
             Some(index) => {
                 claimed[index] = true;
-                let path = scan.entries[index].path.clone();
-                local.clear_missing(record.id);
-                result.ops.push(PendingOp::Relocate { note: note.clone(), path: path.clone() });
-                if record.deleted {
-                    result.ops.push(PendingOp::SetDeleted { note, value: false });
-                }
-                result.relocated.push((record.path.clone(), path));
+                relocate(library, local, &mut result, &record, scan.entries[index].path.clone());
             }
-            None => {
-                local.set_missing(record.id, now);
-                let since = local.missing_since(record.id).unwrap_or(now);
-                if now.saturating_sub(since) >= PURGE_AFTER_SECS {
-                    result.ops.push(PendingOp::Drop { id: record.id });
-                    local.clear_missing(record.id);
-                }
+            None => missing.push(record),
+        }
+    }
+
+    // 4. Missing. Skipped entirely for a truncated scan: a file past the scan limit is not
+    // really gone, so it must not be marked missing or purged.
+    if !scan.truncated {
+        for record in missing {
+            local.set_missing(record.id, now);
+            let since = local.missing_since(record.id).unwrap_or(now);
+            if now.saturating_sub(since) >= PURGE_AFTER_SECS
+                && apply_op(library, &mut result.ops, PendingOp::Drop { id: record.id })
+            {
+                local.clear_missing(record.id);
             }
         }
     }
 
-    for op in &result.ops {
-        let _ = apply(library, op);
-    }
     local.files = scan
         .entries
         .iter()
@@ -340,5 +390,72 @@ mod tests {
         let result = fixture.run(100);
         assert!(result.ops.is_empty());
         assert_eq!(fixture.local.missing_since(NoteId(1)), None);
+    }
+
+    #[test]
+    fn file_id_matching_runs_to_completion_before_fingerprint_matching_is_tried() {
+        // Break caught: an unmatched record with no usable cache entry falling back to
+        // fingerprint matching and stealing a file that a later record would have claimed by
+        // file ID.
+        let mut fixture = Fixture::new(
+            vec![record(1, "a.md", 3, 9), record(2, "b.md", 3, 9)],
+            vec![cached("b.md", 3, 55)],
+            vec![entry("c.md", 3, 55)],
+        );
+        fixture.hashes.insert("c.md".into(), 9);
+        fixture.run(100);
+        assert_eq!(fixture.path_of(2), Some(PathBuf::from("c.md")), "B keeps its file-ID match");
+        assert_eq!(fixture.path_of(1), Some(PathBuf::from("a.md")), "A is not relocated");
+        assert_eq!(fixture.local.missing_since(NoteId(1)), Some(100), "A goes missing instead");
+    }
+
+    #[test]
+    fn the_fingerprint_step_only_matches_files_new_since_the_last_scan() {
+        // Break caught: a long-standing file matching a now-missing record's fingerprint by
+        // coincidence and stealing that record, merely because it was still unclaimed.
+        let mut fixture = Fixture::new(
+            vec![record(1, "a.md", 3, 9)],
+            vec![cached("b.md", 3, 70)],
+            vec![entry("b.md", 3, 70)],
+        );
+        fixture.hashes.insert("b.md".into(), 9);
+        fixture.run(100);
+        assert_eq!(fixture.path_of(1), Some(PathBuf::from("a.md")), "b.md already existed, so it cannot match");
+        assert_eq!(fixture.local.missing_since(NoteId(1)), Some(100));
+        assert!(fixture.hashed.is_empty(), "a file that is not new is never hashed");
+    }
+
+    #[test]
+    fn a_truncated_scan_never_marks_records_missing_or_purges_them() {
+        let mut fixture = Fixture::new(vec![record(1, "gone.md", 3, 9)], vec![], vec![]);
+        fixture.scan.truncated = true;
+        fixture.run(1_000);
+        assert_eq!(fixture.local.missing_since(NoteId(1)), None, "a truncated scan never marks missing");
+        fixture.local.set_missing(NoteId(1), 1_000);
+        let result = fixture.run(1_000 + PURGE_AFTER_SECS);
+        assert!(fixture.library.note(NoteId(1)).is_some(), "a truncated scan never purges");
+        assert!(result.ops.is_empty());
+    }
+
+    #[test]
+    fn a_second_record_matching_an_already_claimed_path_goes_missing_instead() {
+        // Break caught: two records collapsing onto the same case-insensitive path both being
+        // treated as matched, leaving the library with two records pointing at one file.
+        let mut fixture = Fixture::new(
+            vec![record(1, "plan.md", 3, 9), record(2, "PLAN.MD", 3, 9)],
+            vec![],
+            vec![entry("Plan.md", 3, 5)],
+        );
+        fixture.run(100);
+        let matched = [1_u128, 2]
+            .into_iter()
+            .filter(|&id| fixture.path_of(id) == Some(PathBuf::from("Plan.md")))
+            .count();
+        assert_eq!(matched, 1, "exactly one record claims the file");
+        let missing = [NoteId(1), NoteId(2)]
+            .into_iter()
+            .filter(|&id| fixture.local.missing_since(id).is_some())
+            .count();
+        assert_eq!(missing, 1, "the other record goes missing");
     }
 }
