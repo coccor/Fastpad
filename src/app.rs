@@ -65,6 +65,9 @@ pub struct App {
     pub(crate) populating_file: bool,
     pub(crate) modal_depth: u32,
     pub(crate) held_messages: Vec<u32>,
+    /// The last tab click (its document and message time), so a second click on the same tab
+    /// within the double-click time keeps a preview tab. The class has no `CS_DBLCLKS`.
+    pub(crate) last_tab_click: Option<(crate::document::DocumentId, u32)>,
     identity: WindowIdentity,
     first_paint_completed: bool,
     deferred_start_pending: bool,
@@ -125,6 +128,7 @@ impl App {
             populating_file: false,
             modal_depth: 0,
             held_messages: Vec::new(),
+            last_tab_click: None,
             identity: WindowIdentity {
                 state: Rc::new(Cell::new(WindowIdentityState::Unbound)),
             },

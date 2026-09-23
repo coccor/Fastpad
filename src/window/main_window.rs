@@ -263,7 +263,7 @@ unsafe extern "system" fn main_window_proc(
         WM_PAINT => {
             sync_window_title(hwnd);
             let paint_title_strip = |hwnd, _, _, _| {
-                let (titles, active, scroll, empty) = tab_snapshot(hwnd);
+                let (titles, active, scroll, empty, preview_tab) = tab_snapshot(hwnd);
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
@@ -274,6 +274,7 @@ unsafe extern "system" fn main_window_proc(
                         &crate::window::titlebar::TitlePaint {
                             titles: &title_refs,
                             active,
+                            preview_tab,
                             scroll,
                             empty_hint: empty.then_some(EMPTY_TABS_HINT),
                             status: status.as_ref(),
@@ -465,7 +466,15 @@ unsafe extern "system" fn main_window_proc(
                     activate_tab(hwnd, index);
                     execute_command(hwnd, CommandId::CloseTab);
                 }
-                crate::window::titlebar::HitTarget::Tab(index) => activate_tab(hwnd, index),
+                crate::window::titlebar::HitTarget::Tab(index) => {
+                    activate_tab(hwnd, index);
+                    if tab_double_click(hwnd, index)
+                        && let Some(id) = unsafe { app_ptr(hwnd) }
+                            .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+                    {
+                        promote_tab(hwnd, id);
+                    }
+                }
                 target @ (crate::window::titlebar::HitTarget::PreviewSide
                 | crate::window::titlebar::HitTarget::PreviewFull) => {
                     crate::window::preview_host::click_button(hwnd, target)
@@ -1595,7 +1604,7 @@ fn sync_window_title(hwnd: HWND) {
     }
 }
 
-fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool) {
+fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool, Option<usize>) {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
             let app = unsafe { app.as_ref() };
@@ -1604,9 +1613,10 @@ fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool) {
                 app.tabs.active_index(),
                 app.tabs.scroll_offset(),
                 app.editor.is_some() && app.tabs.is_empty(),
+                app.tabs.documents().position(|document| document.preview),
             )
         })
-        .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false))
+        .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false, None))
 }
 
 /// Scrolls the tabs when the wheel turns over the tab strip; reports whether it was over it.
@@ -2575,6 +2585,10 @@ fn notes_mode_enabled(hwnd: HWND) -> bool {
 }
 
 pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
+    open_path_placed(hwnd, path, false)
+}
+
+fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result<()> {
     let identity = unsafe { window_identity(hwnd) }.ok_or(crate::FastPadError::Invariant(
         "main window app state was not available",
     ))?;
@@ -2616,7 +2630,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer: the file is unsupported.
     std::ffi::CString::new(loaded.text.as_str())
         .map_err(|_| crate::FastPadError::UnsupportedEncoding)?;
-    let (editor, candidate_ids) = {
+    let (editor, candidate_ids, replace_preview) = {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
         ))?;
@@ -2625,12 +2639,15 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
             .editor
             .clone()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
+        // A preview goes where the preview tab is. Without one it is placed like any new tab,
+        // reusing an empty start tab.
+        let replace_preview = preview && app.tabs.preview_id().is_some();
         let candidate_ids = app
             .tabs
             .active()
-            .filter(|active| !active.dirty && active.path.is_none())
+            .filter(|active| !replace_preview && !active.dirty && active.path.is_none())
             .map(|active| (active.id, active.recovery_id));
-        (editor, candidate_ids)
+        (editor, candidate_ids, replace_preview)
     };
     // With no tab open this is the hidden placeholder document.
     let previous = editor.current_document()?;
@@ -2655,6 +2672,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
     document.path = Some(loaded.path);
     document.encoding = loaded.encoding;
+    document.preview = preview;
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed during file open",
@@ -2679,7 +2697,10 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
         let app = unsafe { app.as_mut() };
         app.populating_file = false;
         result?;
-        if reuse {
+        if replace_preview {
+            // The old preview is never dirty, so dropping it loses nothing.
+            (Ok(()), app.tabs.replace_preview(document))
+        } else if reuse {
             let retired = app.tabs.replace_active_untitled(document);
             let commit = if retired.is_some() {
                 Ok(())
@@ -2712,6 +2733,86 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     refresh_tabs(hwnd);
     crate::window::library_host::document_loaded(hwnd, stamp);
     Ok(())
+}
+
+/// How `open_note` places a note that is not open yet.
+// Task 10 is the first non-test caller of `open_note`/`OpenMode`; it removes these attributes.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the sidebar opens notes through it from Task 10")
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpenMode {
+    /// In the preview tab, replaced in place by the next preview.
+    Preview,
+    /// In a normal tab. An open preview of the same note becomes normal.
+    Permanent,
+}
+
+/// Opens `path` from the sidebar (spec §6.4). An already-open note is switched to, and a
+/// `Permanent` open keeps it. Otherwise `Preview` replaces the preview tab in place and
+/// `Permanent` opens a normal tab. `focus_editor` then moves the keyboard focus to the editor.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the sidebar opens notes through it from Task 10")
+)]
+pub(crate) fn open_note(
+    hwnd: HWND,
+    path: &std::path::Path,
+    mode: OpenMode,
+    focus_editor: bool,
+) -> Result<()> {
+    let open = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.find_stored_path(path));
+    match open {
+        Some(id) => {
+            if !activate_document_by_id(hwnd, id) {
+                return Err(crate::FastPadError::Invariant(
+                    "the note's tab could not be activated",
+                ));
+            }
+            unsafe {
+                PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
+            }
+            if mode == OpenMode::Permanent {
+                promote_tab(hwnd, id);
+            }
+        }
+        None => open_path_placed(hwnd, path, mode == OpenMode::Preview)?,
+    }
+    if focus_editor {
+        focus_content(hwnd);
+    }
+    Ok(())
+}
+
+/// Makes `id` a normal tab and repaints its label.
+fn promote_tab(hwnd: HWND, id: DocumentId) {
+    let promoted =
+        unsafe { app_ptr(hwnd) }.is_some_and(|mut app| unsafe { app.as_mut() }.tabs.promote(id));
+    if promoted {
+        invalidate_title_strip(hwnd);
+    }
+}
+
+/// Whether this click on tab `index` is the second of a double-click.
+fn tab_double_click(hwnd: HWND, index: usize) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
+    let now = unsafe { GetMessageTime() } as u32;
+    let limit = unsafe { GetDoubleClickTime() };
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return false;
+    };
+    let app = unsafe { app.as_mut() };
+    let Some(id) = app.tabs.view().snapshot().tabs.get(index).map(|tab| tab.id) else {
+        return false;
+    };
+    let double = app
+        .last_tab_click
+        .is_some_and(|(last, at)| last == id && now.wrapping_sub(at) <= limit);
+    app.last_tab_click = if double { None } else { Some((id, now)) };
+    double
 }
 
 fn create_new_document(hwnd: HWND) -> Result<()> {
@@ -4256,14 +4357,18 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         let text_changes = crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
             | crate::editor::scintilla_constants::SC_MOD_DELETETEXT;
         let text_change = modification.modification_type & text_changes as i32 != 0;
+        let mut promoted = false;
         if text_change && let Some(mut app) = unsafe { app_ptr(hwnd) } {
             let app = unsafe { app.as_mut() };
-            app.tabs.note_active_text_change();
+            promoted = app.tabs.note_active_text_change();
             if modification.lines_added != 0
                 && let Some(editor) = app.editor.as_ref()
             {
                 let _ = editor.refresh_line_numbers();
             }
+        }
+        if promoted {
+            invalidate_title_strip(hwnd);
         }
         if text_change {
             crate::window::library_host::text_changed(hwnd, modification.position.max(0) as usize);
@@ -7571,6 +7676,169 @@ mod tests {
             pump_posted_messages(hwnd);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    fn tab_paths(hwnd: HWND) -> Vec<Option<std::path::PathBuf>> {
+        app_mut(hwnd)
+            .tabs
+            .documents()
+            .map(|document| document.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_first_edit_promotes_the_preview_so_a_later_click_opens_a_new_preview() {
+        // Break caught: a click replacing a preview the user had started typing into, which drops
+        // their text, or the edit not promoting so the tab keeps being replaced.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("preview-edit");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        // Autosave (unrelated to preview promotion) would otherwise clean `a` the moment `b` is
+        // opened, since opening a file autosaves the tab being left; see
+        // `switching_tabs_autosaves_the_tab_being_left`.
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+        assert_eq!(
+            tab_paths(window.hwnd),
+            [Some(a.clone())],
+            "the empty start tab is reused"
+        );
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+
+        editor.set_text("a, edited").unwrap();
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+        assert_eq!(tab_paths(window.hwnd), [Some(a.clone()), Some(b.clone())]);
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+        let a_tab = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+        assert!(app_mut(window.hwnd).tabs.document(a_tab).unwrap().dirty);
+    }
+
+    #[test]
+    fn a_second_preview_replaces_the_first_in_place_keeping_its_tab_index() {
+        // Break caught: the replacement landing at the end of the strip, or a normal tab being
+        // replaced instead of the preview.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("preview-replace");
+        let x = scratch.note("x.md", "x");
+        let a = scratch.note("a.md", "a");
+        let y = scratch.note("y.md", "y");
+        let b = scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &x).unwrap();
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+        super::open_path(window.hwnd, &y).unwrap();
+
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+
+        assert_eq!(tab_paths(window.hwnd), [Some(x), Some(b), Some(y)]);
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+    }
+
+    #[test]
+    fn opening_an_already_open_note_switches_to_its_tab() {
+        // Break caught: a click on an open note replacing the preview with a second tab for the
+        // same file, or doing nothing.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("preview-open");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+
+        assert_eq!(super::tab_count(window.hwnd), 2);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path())
+        );
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+    }
+
+    #[test]
+    fn a_permanent_open_a_save_or_a_tab_double_click_keeps_the_preview() {
+        // Break caught: Ctrl+Enter or a double-click opening a second tab for a note already in the
+        // preview, or a saved preview still being replaced by the next click.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("preview-keep");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let c = scratch.note("c.md", "c");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+        super::open_note(window.hwnd, &a, super::OpenMode::Permanent, false).unwrap();
+        assert_eq!(super::tab_count(window.hwnd), 1);
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+        crate::window::library_host::document_saved(window.hwnd);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.preview_id(),
+            None,
+            "a save promotes"
+        );
+
+        super::open_note(window.hwnd, &c, super::OpenMode::Preview, false).unwrap();
+        let index = app_mut(window.hwnd).tabs.active_index();
+        let center = super::title_layout(window.hwnd).tab(index).center();
+        let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
+        // Both clicks carry the same message time, well inside the double-click time.
+        for _ in 0..2 {
+            unsafe {
+                SendMessageW(
+                    window.hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+                    0,
+                    pack(center.x, center.y),
+                );
+            }
+        }
+        assert_eq!(
+            app_mut(window.hwnd).tabs.preview_id(),
+            None,
+            "a double-click promotes"
+        );
+        assert_eq!(super::tab_count(window.hwnd), 3);
+    }
+
+    #[test]
+    fn a_preview_tab_is_kept_by_the_session_and_comes_back_as_a_normal_tab() {
+        // Break caught: the session skipping the preview tab, so it vanishes at restart, or the
+        // restored tab still being a preview that the next click silently replaces.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("preview-session");
+        let a = scratch.note("a.md", "a");
+        let recovery = RecoveryScratch::new("preview-session");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+
+        let session = super::build_session(window.hwnd, recovery.path()).unwrap();
+        assert_eq!(session.entries.len(), 1);
+        assert!(matches!(&session.entries[0].source, SessionSource::File(path) if *path == a));
+
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        super::close_document_without_prompt(window.hwnd, id);
+        super::restore_session_entry(window.hwnd, &session.entries[0]).unwrap();
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
     }
 
     #[test]

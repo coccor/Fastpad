@@ -86,6 +86,9 @@ pub struct Document {
     pub disk_stamp: Option<crate::library::DiskStamp>,
     /// Autosave is suspended for this document (e.g. after an on-disk conflict is detected).
     pub autosave_paused: bool,
+    /// The preview tab (spec §6.4): opened by a single click in the sidebar and replaced in
+    /// place by the next one. Never dirty: the first edit makes it a normal tab.
+    pub preview: bool,
 }
 
 impl PartialEq for Document {
@@ -122,6 +125,7 @@ impl Document {
             label_watch: crate::library::title::LABEL_SCAN_LINES - 1,
             disk_stamp: None,
             autosave_paused: false,
+            preview: false,
         }
     }
 

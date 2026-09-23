@@ -526,6 +526,7 @@ pub(crate) fn invalidate_strip(hwnd: HWND) {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TitleFontHandles {
     text: HFONT,
+    italic: HFONT,
     glyph: HFONT,
 }
 
@@ -533,6 +534,7 @@ impl Default for TitleFontHandles {
     fn default() -> Self {
         Self {
             text: std::ptr::null_mut(),
+            italic: std::ptr::null_mut(),
             glyph: std::ptr::null_mut(),
         }
     }
@@ -551,6 +553,7 @@ impl TitleFonts {
             dpi,
             handles: TitleFontHandles {
                 text: create_font(scale(12, dpi), "Segoe UI"),
+                italic: create_ui_font(scale(12, dpi), "Segoe UI", FW_NORMAL as i32, true),
                 glyph: create_font(scale(10, dpi), "Segoe MDL2 Assets"),
             },
         }
@@ -575,11 +578,20 @@ impl TitleFontHandles {
     pub(crate) fn glyph(&self) -> HFONT {
         self.glyph
     }
+
+    /// The preview tab's label font; the plain text font until it exists.
+    pub(crate) fn italic(&self) -> HFONT {
+        if self.italic.is_null() {
+            self.text
+        } else {
+            self.italic
+        }
+    }
 }
 
 impl Drop for TitleFonts {
     fn drop(&mut self) {
-        for font in [self.handles.text, self.handles.glyph] {
+        for font in [self.handles.text, self.handles.italic, self.handles.glyph] {
             if !font.is_null() {
                 unsafe {
                     DeleteObject(font);
@@ -625,6 +637,8 @@ pub(crate) fn strip_height(dpi: u32) -> i32 {
 pub(crate) struct TitlePaint<'a> {
     pub titles: &'a [&'a str],
     pub active: usize,
+    /// The preview tab's index; its label is drawn in italics.
+    pub preview_tab: Option<usize>,
     pub scroll: i32,
     /// Shown in place of the hidden editor while no tab is open.
     pub empty_hint: Option<&'a str>,
@@ -855,7 +869,14 @@ unsafe fn draw_strip(
         let close_hovered = pointer.hovered == Some(HitTarget::CloseTab(index));
         unsafe {
             fill(dc, tab, background);
-            select_font(dc, input.fonts.text);
+            select_font(
+                dc,
+                if input.preview_tab == Some(index) {
+                    input.fonts.italic()
+                } else {
+                    input.fonts.text
+                },
+            );
             SetTextColor(dc, foreground);
             draw_text(
                 dc,

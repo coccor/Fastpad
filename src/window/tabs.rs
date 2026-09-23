@@ -69,6 +69,8 @@ pub(crate) struct TabViewSnapshot {
 pub(crate) struct TabViewTab {
     pub(crate) id: DocumentId,
     pub(crate) title: String,
+    /// Painted in italics.
+    pub(crate) preview: bool,
 }
 
 #[derive(Debug)]
@@ -121,6 +123,7 @@ fn view_tabs(documents: &[Document]) -> Vec<TabViewTab> {
         .map(|document| TabViewTab {
             id: document.id,
             title: document.title(),
+            preview: document.preview,
         })
         .collect()
 }
@@ -426,11 +429,65 @@ impl Tabs {
         self.documents.get_mut(active)?.recovery_origin.take()
     }
 
-    pub(crate) fn note_active_text_change(&mut self) {
+    /// A text change in the active tab. The first one makes a preview tab normal, so replacing
+    /// the preview can never drop an edit; returns whether that happened.
+    pub(crate) fn note_active_text_change(&mut self) -> bool {
         let active = self.active_index();
-        if let Some(document) = self.documents.get_mut(active) {
-            document.generation = document.generation.saturating_add(1);
+        let Some(document) = self.documents.get_mut(active) else {
+            return false;
+        };
+        document.generation = document.generation.saturating_add(1);
+        if !document.preview {
+            return false;
         }
+        document.preview = false;
+        self.view.update(&self.documents);
+        true
+    }
+
+    /// The preview tab, if one is open. There is at most one.
+    pub(crate) fn preview_id(&self) -> Option<DocumentId> {
+        self.documents
+            .iter()
+            .find(|document| document.preview)
+            .map(|document| document.id)
+    }
+
+    /// Puts `document` where the preview tab is, selects it and returns the document it replaced.
+    /// With no preview tab, `document` is added like any new tab and `None` is returned. The same
+    /// happens when the preview somehow has unsaved edits: it is kept as a normal tab. The caller
+    /// has already checked that `document`'s file is not open in another tab.
+    pub(crate) fn replace_preview(&mut self, document: Document) -> Option<Document> {
+        match self.documents.iter().position(|existing| existing.preview) {
+            Some(index) if !self.documents[index].dirty => {
+                let old = std::mem::replace(&mut self.documents[index], document);
+                self.selection.select(index, self.documents.len());
+                self.view.update(&self.documents);
+                Some(old)
+            }
+            edited => {
+                if let Some(index) = edited {
+                    self.documents[index].preview = false;
+                }
+                if self.push(document).is_err() {
+                    self.view.update(&self.documents);
+                }
+                None
+            }
+        }
+    }
+
+    /// Makes `id` a normal tab; returns whether it was the preview.
+    pub(crate) fn promote(&mut self, id: DocumentId) -> bool {
+        let Some(document) = self.document_mut(id) else {
+            return false;
+        };
+        if !document.preview {
+            return false;
+        }
+        document.preview = false;
+        self.view.update(&self.documents);
+        true
     }
 
     pub fn clear_for_shutdown(&mut self) {
@@ -610,6 +667,73 @@ mod tests {
 
     fn document(id: u64) -> Document {
         Document::test_fixture(DocumentId(id), false)
+    }
+
+    /// `push` canonicalizes paths through the disk, so these pure tests use untitled documents.
+    fn preview(id: u64) -> Document {
+        let mut document = document(id);
+        document.preview = true;
+        document
+    }
+
+    #[test]
+    fn replacing_the_preview_keeps_its_place_and_selects_it() {
+        // Break caught: a second preview appended at the end (the strip grows with every click),
+        // or replaced in place but left unselected.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(preview(2)).unwrap();
+        tabs.push(document(3)).unwrap();
+        assert_eq!(tabs.preview_id(), Some(DocumentId(2)));
+
+        let old = tabs.replace_preview(preview(4)).unwrap();
+        assert_eq!(old.id, DocumentId(2));
+        assert_eq!(
+            tabs.documents()
+                .map(|document| document.id)
+                .collect::<Vec<_>>(),
+            [DocumentId(1), DocumentId(4), DocumentId(3)]
+        );
+        assert_eq!(tabs.active_index(), 1);
+        assert_eq!(tabs.preview_id(), Some(DocumentId(4)));
+        assert!(tabs.view().snapshot().tabs[1].preview);
+    }
+
+    #[test]
+    fn a_dirty_preview_is_kept_as_a_normal_tab_and_the_new_one_is_added() {
+        // Break caught: a preview whose promotion was missed being replaced with its edits in it.
+        let mut tabs = Tabs::with_document(document(1));
+        let mut edited = preview(2);
+        edited.dirty = true;
+        tabs.push(edited).unwrap();
+
+        assert!(tabs.replace_preview(preview(3)).is_none());
+        assert_eq!(tabs.len(), 3);
+        assert!(!tabs.document(DocumentId(2)).unwrap().preview);
+        assert_eq!(tabs.preview_id(), Some(DocumentId(3)));
+        assert_eq!(tabs.active_index(), 2);
+    }
+
+    #[test]
+    fn with_no_preview_replace_preview_adds_a_tab() {
+        // Break caught: the first preview of a session silently dropped because there was nothing
+        // to replace.
+        let mut tabs = Tabs::with_document(document(1));
+        assert!(tabs.replace_preview(preview(2)).is_none());
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.preview_id(), Some(DocumentId(2)));
+    }
+
+    #[test]
+    fn the_first_edit_promotes_the_active_preview_once() {
+        // Break caught: typing into a preview leaving it a preview, so the next click replaces it.
+        let mut tabs = Tabs::with_document(preview(1));
+        assert!(tabs.note_active_text_change());
+        assert!(!tabs.note_active_text_change());
+        assert_eq!(tabs.preview_id(), None);
+        assert!(!tabs.promote(DocumentId(1)));
+        let mut tabs = Tabs::with_document(preview(1));
+        assert!(tabs.promote(DocumentId(1)));
+        assert!(!tabs.view().snapshot().tabs[0].preview);
     }
 
     #[test]

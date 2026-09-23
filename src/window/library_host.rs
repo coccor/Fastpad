@@ -1764,6 +1764,8 @@ pub(crate) fn document_saved(hwnd: HWND) {
     let path = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let id = app.tabs.active()?.id;
+        // A saved preview is kept: the next click must not replace it.
+        app.tabs.promote(id);
         let document = app.tabs.document_mut(id)?;
         let path = document.path.clone()?;
         document.disk_stamp = library::disk_stamp(&path);
