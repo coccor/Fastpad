@@ -2,8 +2,10 @@
 //! way VS Code's Ctrl+P matches files, and the `:<line>` suffix. Pure: no Win32 and no disk.
 
 use super::tree::natural_cmp;
+use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Components, Path, PathBuf};
 
 /// Every matched char.
 const PER_CHAR: u32 = 1;
@@ -34,10 +36,13 @@ impl QuickMatch {
     /// `path` as a row with nothing matched: how the open tabs are listed before anything is
     /// typed. `None` for a path with no file name.
     pub fn plain(path: &Path) -> Option<Self> {
+        let (components, name) = split(path)?;
+        let mut folder = String::new();
+        extend_joined(components, &mut folder);
         Some(Self {
             path: path.to_path_buf(),
-            name: path.file_stem()?.to_string_lossy().into_owned(),
-            folder: folder_of(path),
+            name: stem_of(name.to_string_lossy()).into_owned(),
+            folder,
             name_hits: Vec::new(),
             folder_hits: Vec::new(),
         })
@@ -61,6 +66,52 @@ pub fn split_line(query: &str) -> (&str, Option<u32>) {
         return (query, None);
     }
     (&query[..colon], Some(digits.parse().unwrap_or(u32::MAX)))
+}
+
+/// `path`'s parent components (root to leaf) and its last component's raw name, in one walk over
+/// `path`: `Scratch::score`, `folder_of` and `QuickMatch::plain` all start here instead of each
+/// walking `file_stem()`, `parent()` and `parent().components()` separately. `None` when the
+/// path's last component isn't a plain name (it ends in `..`, `.`, a root or a prefix) — the
+/// same case `Path::file_stem` treats as "no file name".
+fn split(path: &Path) -> Option<(Components<'_>, &OsStr)> {
+    let mut components = path.components();
+    match components.next_back()? {
+        Component::Normal(name) => Some((components, name)),
+        _ => None,
+    }
+}
+
+/// The file name's stem the way `Path::file_stem` defines it, run on the already-decoded name
+/// (`split`'s last component) so a note's path is parsed once instead of three times: the whole
+/// name when it has no `.`, or begins with the only `.` it has; otherwise the portion before the
+/// final `.`.
+fn stem_of(name: Cow<'_, str>) -> Cow<'_, str> {
+    match name {
+        Cow::Borrowed(text) => Cow::Borrowed(match text.rfind('.') {
+            Some(0) | None => text,
+            Some(dot) => &text[..dot],
+        }),
+        Cow::Owned(mut text) => {
+            if let Some(dot) = text.rfind('.')
+                && dot != 0
+            {
+                text.truncate(dot);
+            }
+            Cow::Owned(text)
+        }
+    }
+}
+
+/// Appends `components`' names to `out`, joined by `\`: how a folder is shown, and how the
+/// path-fallback target sees it ahead of the name. The one join written for both `folder_of` and
+/// the folder chars `Scratch::score` builds for a path-fallback match.
+fn extend_joined(components: Components<'_>, out: &mut impl Extend<char>) {
+    for (index, component) in components.enumerate() {
+        if index > 0 {
+            out.extend(std::iter::once('\\'));
+        }
+        out.extend(component.as_os_str().to_string_lossy().chars());
+    }
 }
 
 /// One char of a match target.
@@ -96,25 +147,50 @@ fn units(chars: impl IntoIterator<Item = char>, out: &mut Vec<Unit>) {
     }
 }
 
+/// Whether `term`'s folded letters all appear in `target`, in order (not necessarily
+/// contiguous), with no scoring. A cheap pre-check before the DP: when this fails, `align` would
+/// score 0 too (and when it holds, `align` always finds a positive-scoring alignment, since
+/// every matched char scores at least `PER_CHAR`), so most notes a query doesn't match are
+/// rejected without ever touching `score` or `from`.
+fn contains_in_order(term: &[char], target: &[Unit]) -> bool {
+    let mut letters = term.iter();
+    let Some(mut wanted) = letters.next() else {
+        return true;
+    };
+    for unit in target {
+        if unit.folded == *wanted {
+            match letters.next() {
+                Some(next) => wanted = next,
+                None => return true,
+            }
+        }
+    }
+    false
+}
+
 /// The best score of `term`'s letters, in order, in `target`, or 0 when they don't all appear.
 /// `score[j * n + i]` is the best score of the first `j + 1` letters with letter `j` on char `i`
 /// (0: impossible), and `from[j * n + i]` the char letter `j - 1` sits on then. With
-/// `positions`, also records where each letter of the best alignment landed.
+/// `positions`, also records where each letter of the best alignment landed; `from` is only
+/// written (and only worth clearing first) when `positions` asks for that backtrack.
 fn align(
     term: &[char],
     target: &[Unit],
     score: &mut Vec<u32>,
     from: &mut Vec<u32>,
-    positions: Option<&mut Vec<usize>>,
+    mut positions: Option<&mut Vec<usize>>,
 ) -> u32 {
     let (letters, n) = (term.len(), target.len());
-    if letters == 0 || letters > n {
+    if letters == 0 || letters > n || !contains_in_order(term, target) {
         return 0;
     }
+    let track = positions.is_some();
     score.clear();
     score.resize(letters * n, 0);
-    from.clear();
-    from.resize(letters * n, 0);
+    if track {
+        from.clear();
+        from.resize(letters * n, 0);
+    }
     for (j, &letter) in term.iter().enumerate() {
         // The best score of the previous letter on a char at least two before `i`, and where.
         let (mut before, mut before_at) = (0, 0);
@@ -146,7 +222,9 @@ fn align(
             };
             if previous > 0 {
                 score[j * n + i] = previous + own;
-                from[j * n + i] = at as u32;
+                if track {
+                    from[j * n + i] = at as u32;
+                }
             }
         }
     }
@@ -157,7 +235,7 @@ fn align(
         }
     }
     if best > 0
-        && let Some(positions) = positions
+        && let Some(positions) = positions.take()
     {
         positions.clear();
         positions.resize(letters, 0);
@@ -172,10 +250,13 @@ fn align(
     best
 }
 
-/// Buffers reused from note to note, so a keystroke doesn't allocate per note for matching.
+/// Buffers reused from note to note, so a keystroke doesn't allocate per note for matching. The
+/// name lives only for the duration of one `score` call (borrowed from the note's own path), so
+/// it needs no buffer here; the folder is built into `folder` only when a term actually needs
+/// the path fallback (spec §3.6: most notes fail on the name alone, and most of those never had
+/// a folder to search regardless).
 #[derive(Default)]
 struct Scratch {
-    name: Vec<char>,
     folder: Vec<char>,
     name_units: Vec<Unit>,
     path_units: Vec<Unit>,
@@ -185,30 +266,25 @@ struct Scratch {
 }
 
 impl Scratch {
-    /// Whether every term matched in the name, and the summed score; `None` when a term matches
-    /// neither the name nor `folder\name`. Leaves the note's name and folder chars in `name` and
-    /// `folder`. With `hits`, also collects the name's and the folder's matched chars.
-    fn score(
+    /// Whether every term matched in the name, the summed score, and the note's name (borrowed
+    /// from `path` when it decodes without a lossy copy) with its length in chars; `None` when a
+    /// term matches neither the name nor `folder\name`. With `hits`, also collects the name's
+    /// and the folder's matched chars.
+    fn score<'p>(
         &mut self,
         terms: &[Vec<char>],
-        path: &Path,
+        path: &'p Path,
         mut hits: Option<(&mut Vec<usize>, &mut Vec<usize>)>,
-    ) -> Option<(bool, u32)> {
-        let stem = path.file_stem()?;
-        self.name.clear();
-        self.name.extend(stem.to_string_lossy().chars());
+    ) -> Option<(bool, u32, Cow<'p, str>, usize)> {
+        let (folder_components, name) = split(path)?;
+        let mut folder_components = Some(folder_components);
+        let stem = stem_of(name.to_string_lossy());
+        units(stem.chars(), &mut self.name_units);
+        let name_len = self.name_units.len();
+
         self.folder.clear();
-        if let Some(parent) = path.parent() {
-            for (index, component) in parent.components().enumerate() {
-                if index > 0 {
-                    self.folder.push('\\');
-                }
-                self.folder
-                    .extend(component.as_os_str().to_string_lossy().chars());
-            }
-        }
-        units(self.name.iter().copied(), &mut self.name_units);
         let keep = hits.is_some();
+        let mut folder_ready = false;
         let mut path_ready = false;
         let (mut all_name, mut total) = (true, 0);
         for term in terms {
@@ -227,6 +303,13 @@ impl Scratch {
                 }
                 continue;
             }
+            // Only a term that fails on the name needs the folder at all.
+            if !folder_ready {
+                if let Some(components) = folder_components.take() {
+                    extend_joined(components, &mut self.folder);
+                }
+                folder_ready = true;
+            }
             if self.folder.is_empty() {
                 return None;
             }
@@ -236,7 +319,7 @@ impl Scratch {
                         .iter()
                         .copied()
                         .chain(std::iter::once('\\'))
-                        .chain(self.name.iter().copied()),
+                        .chain(stem.chars()),
                     &mut self.path_units,
                 );
                 path_ready = true;
@@ -272,7 +355,7 @@ impl Scratch {
                 list.dedup();
             }
         }
-        Some((all_name, total))
+        Some((all_name, total, stem, name_len))
     }
 }
 
@@ -282,20 +365,20 @@ struct Candidate<'a> {
     score: u32,
     /// The name's length in chars.
     name_len: usize,
-    name: String,
-    folder: String,
+    name: Cow<'a, str>,
     path: &'a Path,
 }
 
 /// Name matches first, then the higher score, the shorter name, natural name order, natural
-/// folder order (the root first) and the exact path (spec §3.3).
+/// folder order (the root first) and the exact path (spec §3.3). The folder is only joined into
+/// a string when a comparison actually reaches it, which for distinct names it rarely does.
 fn rank(a: &Candidate<'_>, b: &Candidate<'_>) -> Ordering {
     b.all_name
         .cmp(&a.all_name)
         .then_with(|| b.score.cmp(&a.score))
         .then_with(|| a.name_len.cmp(&b.name_len))
         .then_with(|| natural_cmp(&a.name, &b.name))
-        .then_with(|| natural_cmp(&a.folder, &b.folder))
+        .then_with(|| natural_cmp(&folder_of(a.path), &folder_of(b.path)))
         .then_with(|| a.path.cmp(b.path))
 }
 
@@ -320,15 +403,14 @@ where
     let mut found: Vec<Candidate<'_>> = Vec::new();
     for path in notes {
         let path = path.as_ref();
-        let Some((all_name, score)) = scratch.score(&terms, path, None) else {
+        let Some((all_name, score, name, name_len)) = scratch.score(&terms, path, None) else {
             continue;
         };
         found.push(Candidate {
             all_name,
             score,
-            name_len: scratch.name.len(),
-            name: scratch.name.iter().collect(),
-            folder: scratch.folder.iter().collect(),
+            name_len,
+            name,
             path,
         });
     }
@@ -350,8 +432,8 @@ where
             );
             QuickMatch {
                 path: candidate.path.to_path_buf(),
-                name: candidate.name,
-                folder: candidate.folder,
+                name: candidate.name.into_owned(),
+                folder: folder_of(candidate.path),
                 name_hits,
                 folder_hits,
             }
@@ -361,15 +443,12 @@ where
 
 /// The folder `path` is in, relative to the notebook and joined with `\`; `""` at the root.
 pub(super) fn folder_of(path: &Path) -> String {
-    path.parent()
-        .map(|parent| {
-            parent
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("\\")
-        })
-        .unwrap_or_default()
+    let Some((components, _)) = split(path) else {
+        return String::new();
+    };
+    let mut folder = String::new();
+    extend_joined(components, &mut folder);
+    folder
 }
 
 #[cfg(test)]
