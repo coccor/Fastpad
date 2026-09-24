@@ -495,6 +495,7 @@ fn draw_tree_row(
         RowKind::Unsaved(_) => {
             unsafe { draw_text(dc, GLYPH_NOTE, parts.icon, fonts.glyph, muted, CENTERED) };
         }
+        RowKind::Draft => {}
     }
     if matches!(row.kind, RowKind::Note(_)) {
         // Pinned is a filled glyph, never color alone (spec §10). Segoe's PinFill is only the
@@ -1549,6 +1550,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 run(hwnd, CommandId::CloseTab);
             }
         }
+        RowKind::Draft => {}
     }
 }
 
@@ -1843,6 +1845,7 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
                     super::main_window::focus_content(hwnd);
                 }
             }
+            RowKind::Draft => {}
         },
         Target::Truncated | Target::Nothing => {}
     }

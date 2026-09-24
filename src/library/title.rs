@@ -115,25 +115,50 @@ pub fn split_typed_name(input: &str, default_extension: &str) -> (String, String
     (sanitize_stem(input), default_extension.to_owned())
 }
 
+/// A new note's file name from what was typed in the Notebook tree (inline naming spec §4.1):
+/// `split_typed_name(input, "md")`, so `todo` is `todo.md` and `data.json` stays JSON, but
+/// `None` when the stem cleans to nothing, where `split_typed_name` would say "Untitled".
+pub fn new_note_name(input: &str) -> Option<String> {
+    let input = input.trim();
+    let (stem, extension) = match input.rsplit_once('.') {
+        Some((stem, extension)) if is_note_extension(extension) => (stem, extension),
+        _ => (input, "md"),
+    };
+    Some(file_name(&clean_stem(stem)?, extension))
+}
+
+/// The stem and extension `split_rename` takes from `input`, before the stem is cleaned.
+fn rename_parts<'a>(input: &'a str, current: Option<&'a str>) -> (&'a str, Option<&'a str>) {
+    let input = input.trim();
+    if let Some(current) = current.filter(|current| !current.is_empty())
+        && let Some((stem, extension)) = input.rsplit_once('.')
+        && extension.eq_ignore_ascii_case(current)
+    {
+        return (stem, Some(extension));
+    }
+    if let Some((stem, extension)) = input.rsplit_once('.')
+        && is_note_extension(extension)
+    {
+        return (stem, Some(extension));
+    }
+    (input, current)
+}
+
 /// Splits a name typed to rename a file whose extension is `current` (`None`: it has none).
 /// The file keeps its kind unless the user types another one:
 /// - a name ending in `.<current>` (any case) splits there, so `script.py` stays `script.py`;
 /// - otherwise a typed note extension is taken, so `plan.txt` renames `plan.md` to a `.txt`;
 /// - otherwise the current extension is kept, and an extensionless file stays extensionless.
 pub fn split_rename(input: &str, current: Option<&str>) -> (String, Option<String>) {
-    let input = input.trim();
-    if let Some(current) = current.filter(|current| !current.is_empty())
-        && let Some((stem, extension)) = input.rsplit_once('.')
-        && extension.eq_ignore_ascii_case(current)
-    {
-        return (sanitize_stem(stem), Some(extension.to_owned()));
-    }
-    if let Some((stem, extension)) = input.rsplit_once('.')
-        && is_note_extension(extension)
-    {
-        return (sanitize_stem(stem), Some(extension.to_owned()));
-    }
-    (sanitize_stem(input), current.map(str::to_owned))
+    let (stem, extension) = rename_parts(input, current);
+    (sanitize_stem(stem), extension.map(str::to_owned))
+}
+
+/// A renamed note's file name, split as `split_rename` splits it (inline naming spec §4.3), or
+/// `None` when the stem cleans to nothing, so the rename cancels.
+pub fn renamed_note_name(input: &str, current: Option<&str>) -> Option<String> {
+    let (stem, extension) = rename_parts(input, current);
+    Some(file_name(&clean_stem(stem)?, extension.unwrap_or("")))
 }
 
 /// `stem.extension`, or just `stem` for an empty extension.
@@ -295,6 +320,47 @@ mod tests {
         );
         assert!(is_note_extension("YML"));
         assert!(!is_note_extension("png"));
+    }
+
+    #[test]
+    fn a_new_note_name_defaults_to_markdown_keeps_a_note_extension_and_is_none_when_empty() {
+        // Break caught: `todo` saved without an extension, `data.json` turned into Markdown,
+        // `v1.2 plan` cut at its dot, a device name Windows refuses, or an empty field creating
+        // "Untitled.md" (inline naming spec §4.1).
+        assert_eq!(new_note_name("todo").as_deref(), Some("todo.md"));
+        assert_eq!(new_note_name("data.json").as_deref(), Some("data.json"));
+        assert_eq!(new_note_name("v1.2 plan").as_deref(), Some("v1.2 plan.md"));
+        assert_eq!(new_note_name("CON").as_deref(), Some("CON_.md"));
+        assert_eq!(new_note_name(" a/b: c? ").as_deref(), Some("ab c.md"));
+        for empty in ["", "   ", "...", ".json", "??"] {
+            assert_eq!(new_note_name(empty), None, "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn a_renamed_note_name_keeps_its_kind_and_is_none_when_the_stem_cleans_to_nothing() {
+        // Break caught: a rename to an empty name renaming the note "Untitled.md", or the
+        // inline rename splitting differently from the name bar's `split_rename`.
+        assert_eq!(
+            renamed_note_name("plan.txt", Some("md")).as_deref(),
+            Some("plan.txt")
+        );
+        assert_eq!(
+            renamed_note_name("script.py", Some("py")).as_deref(),
+            Some("script.py")
+        );
+        assert_eq!(
+            renamed_note_name("Plan", Some("md")).as_deref(),
+            Some("Plan.md")
+        );
+        assert_eq!(renamed_note_name("tool", None).as_deref(), Some("tool"));
+        for empty in ["", "  ", ".md", "..."] {
+            assert_eq!(renamed_note_name(empty, Some("md")), None, "{empty:?}");
+        }
+        assert_eq!(
+            split_rename("plan.txt", Some("md")),
+            ("plan".to_owned(), Some("txt".to_owned()))
+        );
     }
 
     #[test]

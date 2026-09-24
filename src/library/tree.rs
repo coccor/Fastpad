@@ -29,6 +29,9 @@ pub enum RowKind {
     Unsaved(u64),
     Folder(PathBuf),
     Note(PathBuf),
+    /// The Notebook view's row for a note or folder being named in the tree (inline naming spec
+    /// §3.1). The view puts it in; `rows` never builds one.
+    Draft,
 }
 
 /// One visible row.
@@ -798,6 +801,7 @@ pub fn row_index(rows: &[TreeRow], kind: &RowKind) -> Option<usize> {
         (RowKind::Folder(a), RowKind::Folder(b)) | (RowKind::Note(a), RowKind::Note(b)) => {
             same_row_path(a, b)
         }
+        (RowKind::Draft, RowKind::Draft) => true,
         _ => false,
     })
 }
@@ -864,6 +868,7 @@ mod tests {
                 let marker = match (&row.kind, row.pinned) {
                     (RowKind::Folder(_), _) => "/",
                     (RowKind::Unsaved(_), _) => "?",
+                    (RowKind::Draft, _) => "+",
                     (RowKind::Note(_), true) => "*",
                     (RowKind::Note(_), false) => "",
                 };
@@ -1305,6 +1310,21 @@ mod tests {
             [PathBuf::from("a"), PathBuf::from(r"a\b")]
         );
         assert!(ancestors(Path::new("top.md")).is_empty());
+    }
+
+    #[test]
+    fn a_draft_row_is_found_by_its_kind() {
+        // Break caught: the view losing its draft row after a rebuild because `row_index`
+        // never matches it.
+        let rows = vec![TreeRow {
+            kind: RowKind::Draft,
+            depth: 0,
+            name: String::new(),
+            pinned: false,
+            expanded: false,
+        }];
+        assert_eq!(row_index(&rows, &RowKind::Draft), Some(0));
+        assert_eq!(row_index(&rows, &RowKind::Unsaved(0)), None);
     }
 
     #[test]

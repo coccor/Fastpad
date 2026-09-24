@@ -5,6 +5,7 @@ pub mod commands;
 pub(crate) mod favorites_view;
 pub(crate) mod file_icons;
 pub mod find_bar;
+pub(crate) mod inline_name;
 pub(crate) mod library_host;
 mod main_window;
 pub(crate) mod menu_band;

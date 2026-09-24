@@ -1354,7 +1354,7 @@ fn folder_taken_error(name: &str) -> String {
 }
 
 /// A folder named like one the scan skips would vanish at the next rescan (scan §3.1).
-fn hidden_folder_error(name: &str) -> String {
+pub(crate) fn hidden_folder_error(name: &str) -> String {
     format!("FastPad hides folders named \u{201c}{name}\u{201d}. Choose another name.")
 }
 
