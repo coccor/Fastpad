@@ -4,6 +4,7 @@
 //! BOM and line endings. No Win32 and no window.
 
 use super::path_key;
+use super::store;
 use super::text_search::{self, MAX_NOTE_BYTES, Stamp};
 use crate::file::{encoding, saver};
 use crate::search::Matcher;
@@ -13,6 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 /// Why a note that couldn't be decoded wasn't written; the search never lists one.
 const NOT_TEXT: &str = "The note isn't UTF-8 or UTF-16 text.";
+/// Why a target whose path leaves the notebook (absolute, or with a `..`) is never read or
+/// written. Targets come from search hits, which never produce such a path, but `apply` and
+/// `count` are `pub` and must not trust that on their own.
+const OUTSIDE_NOTEBOOK: &str = "The note's path leaves the notebook.";
 
 /// A note to replace in.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +60,8 @@ pub struct ReplaceReport {
 /// - `overlays` holds dirty tabs' text by relative path, compared with `path_key`; an overlay's
 ///   text is counted instead of the disk's, as in search.
 /// - A note that can't be read or decoded, or is over `MAX_NOTE_BYTES`, counts 0.
+/// - A note whose path leaves the notebook (absolute, or with a `..`) counts 0 and is never
+///   opened.
 /// - A note with at least one match whose text came from disk (not an overlay) is a
 ///   `closed_notes` note: a replace can actually write to it.
 /// - `cancel` is read before each note. A cancelled count is partial; the caller drops it.
@@ -74,6 +81,9 @@ pub fn count(
     for target in targets {
         if cancel.load(Relaxed) {
             break;
+        }
+        if !store::is_notebook_path(&target.path) {
+            continue;
         }
         let (matches, from_disk) = match overlays.get(&path_key(&target.path)) {
             Some(text) => (matcher.find_iter(text).len(), false),
@@ -107,6 +117,8 @@ pub fn count(
 ///   The saved file's stamp is then read, here on the worker, and the note goes to `written`
 ///   with it. If that read fails (the note vanished in the moment after its save), its matches
 ///   still count but it is left out of `written`, so the library isn't told of it.
+/// - A note whose path leaves the notebook (absolute, or with a `..`) is never opened: it goes
+///   to `failed` before any read, the same as a note that can't be opened.
 /// - A note that can't be opened (deleted since the search, say), read, decoded or saved goes to
 ///   `failed` with the error, and nothing is written to it.
 /// - `cancel` is read before each note; a note already being written is finished, and the
@@ -172,6 +184,9 @@ fn replace_note(
     template: &str,
     bytes: &mut Vec<u8>,
 ) -> Result<Replaced, String> {
+    if !store::is_notebook_path(&target.path) {
+        return Err(OUTSIDE_NOTEBOOK.to_owned());
+    }
     let path = notebook.join(&target.path);
     let stamp = text_search::read_bytes(&path, bytes).map_err(|error| error.to_string())?;
     // A file over the limit is read only to `MAX_NOTE_BYTES + 1`, so its length never matches
@@ -196,10 +211,11 @@ fn replace_note(
 
 /// The note's text from disk, or `None` when it can't be read or decoded or is over the limit.
 /// Shares `text_search::read_bytes`, the same open + metadata + read a search does, rather than
-/// a second file-reading routine.
+/// a second file-reading routine. The size check is against the stamp (`read_bytes` leaves
+/// `bytes` empty for an over-the-limit file rather than reading it), not `bytes.len()`.
 fn disk_text(path: &Path, bytes: &mut Vec<u8>) -> Option<String> {
-    text_search::read_bytes(path, bytes).ok()?;
-    if bytes.len() as u64 > MAX_NOTE_BYTES {
+    let stamp = text_search::read_bytes(path, bytes).ok()?;
+    if stamp.size > MAX_NOTE_BYTES {
         return None;
     }
     encoding::decode(bytes).ok().map(|decoded| decoded.text)
@@ -492,5 +508,110 @@ mod tests {
             [(PathBuf::from("a.md"), stamp_of(&scratch.path("a.md")))]
         );
         assert!(report.changed.is_empty() && report.failed.is_empty());
+    }
+
+    #[test]
+    fn a_target_path_outside_the_notebook_is_never_touched() {
+        // Important 1: an absolute or `..`-escaping target path writing (or even reading) a file
+        // outside the notebook folder. `notebook.join` alone doesn't stop either: `join` with an
+        // absolute path discards `notebook`, and `..` walks back out of it.
+        let scratch = Scratch::new("outside");
+        let sibling = scratch.0.parent().unwrap().join(format!(
+            "fastpad-text-replace-sibling-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&sibling);
+        std::fs::create_dir_all(&sibling).unwrap();
+        let outside_file = sibling.join("outside.md");
+        std::fs::write(&outside_file, b"foo untouched").unwrap();
+        let outside_before = stamp_of(&outside_file);
+        let absolute = ReplaceTarget {
+            path: outside_file.clone(),
+            stamp: outside_before,
+        };
+        // Also escapes through the notebook itself: `..\<sibling folder name>\outside.md`
+        // resolves right back to `outside_file` once joined onto `scratch.0`.
+        let escaping = ReplaceTarget {
+            path: Path::new("..")
+                .join(sibling.file_name().unwrap())
+                .join("outside.md"),
+            stamp: outside_before,
+        };
+        let targets = [absolute, escaping];
+
+        let count_result = count(
+            &scratch.0,
+            &targets,
+            &HashMap::new(),
+            &plain("foo"),
+            &not_cancelled(),
+        );
+        let report = apply(&scratch.0, &targets, &plain("foo"), "bar", &not_cancelled());
+
+        assert_eq!(
+            count_result,
+            ReplaceCount::default(),
+            "counts 0, never opened"
+        );
+        assert_eq!(
+            std::fs::read(&outside_file).unwrap(),
+            b"foo untouched",
+            "never written"
+        );
+        assert_eq!(stamp_of(&outside_file), outside_before, "never even opened");
+        assert!(report.written.is_empty() && report.changed.is_empty());
+        assert_eq!(report.failed.len(), 2, "both targets are reported failed");
+        for (_, reason) in &report.failed {
+            assert!(!reason.is_empty(), "the error is named");
+        }
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    #[test]
+    fn a_target_that_isnt_text_is_failed_and_left_untouched() {
+        // Fix round 1, item 4: a binary target is reported in `failed`, not silently dropped or
+        // written with mangled bytes.
+        let scratch = Scratch::new("not-text");
+        let bytes = vec![0x80, 0x81, b'f', b'o', b'o'];
+        let target = scratch.note("binary.md", &bytes);
+
+        let report = apply(
+            &scratch.0,
+            &[target],
+            &plain("foo"),
+            "bar",
+            &not_cancelled(),
+        );
+
+        assert_eq!(scratch.read("binary.md"), bytes, "left untouched");
+        assert!(report.written.is_empty() && report.changed.is_empty());
+        assert_eq!(
+            report.failed,
+            [(PathBuf::from("binary.md"), NOT_TEXT.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_note_grown_past_the_limit_since_the_search_is_changed_not_written() {
+        // Fix round 1, item 4: the stamp mismatch catches a note that grew past MAX_NOTE_BYTES
+        // since the search read it, the reason for the size check `replace_note` runs before
+        // decoding. It is reported `changed`, not written and not crashed on.
+        let scratch = Scratch::new("grown-over-limit");
+        let target = scratch.note("grows.md", b"foo");
+        let mut grown = vec![b'x'; (MAX_NOTE_BYTES + 100) as usize];
+        grown.extend_from_slice(b" foo");
+        std::fs::write(scratch.path("grows.md"), &grown).unwrap();
+
+        let report = apply(
+            &scratch.0,
+            &[target],
+            &plain("foo"),
+            "bar",
+            &not_cancelled(),
+        );
+
+        assert_eq!(scratch.read("grows.md"), grown, "left untouched");
+        assert!(report.written.is_empty() && report.failed.is_empty());
+        assert_eq!(report.changed, [PathBuf::from("grows.md")]);
     }
 }

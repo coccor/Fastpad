@@ -378,20 +378,24 @@ fn search_note(
     })
 }
 
-/// Opens `path`, reads at most `MAX_NOTE_BYTES + 1` bytes into `bytes` (cleared first), and
-/// returns the stamp of the opened file. The search and the replace both read a note from disk
-/// this way, so a note nobody touched keeps the same stamp between the two.
+/// Opens `path` and takes its stamp; when the file is no larger than `MAX_NOTE_BYTES`, also
+/// reads at most `MAX_NOTE_BYTES + 1` bytes into `bytes` (cleared first, and left empty when the
+/// file is over the limit, so a huge file is never read). The search and the replace both read a
+/// note from disk this way, so a note nobody touched keeps the same stamp between the two.
 pub(super) fn read_bytes(path: &Path, bytes: &mut Vec<u8>) -> std::io::Result<Stamp> {
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     bytes.clear();
-    file.take(MAX_NOTE_BYTES + 1).read_to_end(bytes)?;
+    if metadata.len() <= MAX_NOTE_BYTES {
+        file.take(MAX_NOTE_BYTES + 1).read_to_end(bytes)?;
+    }
     Ok(Stamp::of(&metadata))
 }
 
 /// The note's text from disk and the stamp of what was read. An online-only note is never
-/// opened, so a search never recalls it; a note over the limit by the scan's size is not opened
-/// either, and one that grew past it since is not read past the limit.
+/// opened, so a search never recalls it; a note over the limit by the scan's size, or by the
+/// stamp taken when it was opened, is never read; one that grew past the limit during the read
+/// itself (the metadata was still small) is caught by the byte count instead.
 fn read_note(
     notebook: &Path,
     note: &SearchNote,
@@ -405,7 +409,7 @@ fn read_note(
     }
     let stamp =
         read_bytes(&notebook.join(&note.path), bytes).map_err(|_| SkipReason::Unreadable)?;
-    if bytes.len() as u64 > MAX_NOTE_BYTES {
+    if stamp.size > MAX_NOTE_BYTES || bytes.len() as u64 > MAX_NOTE_BYTES {
         return Err(SkipReason::TooLarge);
     }
     let decoded = encoding::decode(bytes).map_err(|_| SkipReason::NotText)?;

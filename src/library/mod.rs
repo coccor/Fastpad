@@ -505,16 +505,27 @@ impl LibraryState {
     /// Records a note FastPad just wrote outside the editor (a Search replace) from the stamp
     /// the writer took of the saved file, so the next rescan reads no outside change. It is the
     /// update `add_note` makes for a note already listed (size, time, `online_only` cleared, a
-    /// `touched` entry), with no disk access: the UI thread calls it for every written note.
-    /// Returns false, changing nothing, when `relative` isn't listed.
+    /// `touched` entry), with no disk access: the UI thread calls it for every written note. A
+    /// single note is found by a linear `same_path` scan, the same way `add_note` finds one,
+    /// rather than building the batch key map `record_written_all` needs. Returns false, changing
+    /// nothing, when `relative` isn't listed.
     pub fn record_written(&mut self, relative: &Path, stamp: text_search::Stamp) -> bool {
-        self.record_written_all(std::slice::from_ref(&(relative.to_path_buf(), stamp))) == 1
+        let Some(existing) = self
+            .notes
+            .iter_mut()
+            .find(|note| same_path(&note.path, relative))
+        else {
+            return false;
+        };
+        Self::apply_written(existing, stamp);
+        self.touched.push(relative.to_path_buf());
+        true
     }
 
     /// Records every note in `written` the way `record_written` records one, in a single pass
     /// over `notes` (a path key to index map, built once), so a batch of many written notes costs
-    /// one scan of the list instead of one per note. Returns how many of `written`'s paths were
-    /// listed (`record_written`'s bool, summed).
+    /// one scan of the list instead of one `same_path` scan per note. Returns how many of
+    /// `written`'s paths were listed.
     pub fn record_written_all(&mut self, written: &[(PathBuf, text_search::Stamp)]) -> usize {
         let index_of: HashMap<String, usize> = self
             .notes
@@ -527,15 +538,20 @@ impl LibraryState {
             let Some(&index) = index_of.get(&path_key(relative)) else {
                 continue;
             };
-            let existing = &mut self.notes[index];
-            existing.size = stamp.size;
-            existing.mtime = stamp.mtime;
-            // FastPad just wrote the file, so its data is on this PC.
-            existing.online_only = false;
+            Self::apply_written(&mut self.notes[index], *stamp);
             self.touched.push(relative.clone());
             recorded += 1;
         }
         recorded
+    }
+
+    /// The update a written note's entry gets, shared by `record_written` and
+    /// `record_written_all`: the new size and time, and `online_only` cleared, because FastPad
+    /// just wrote the file, so its data is on this PC.
+    fn apply_written(entry: &mut NoteEntry, stamp: text_search::Stamp) {
+        entry.size = stamp.size;
+        entry.mtime = stamp.mtime;
+        entry.online_only = false;
     }
 
     pub fn remove_note(&mut self, path: &Path) {

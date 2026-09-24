@@ -58,8 +58,9 @@ pub fn stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
-/// Whether a record path is a plain path inside the notebook: only normal components.
-fn is_notebook_path(path: &Path) -> bool {
+/// Whether a record path is a plain path inside the notebook: only normal components. Shared
+/// with `text_replace`, which rejects a target path that fails this before any read or write.
+pub(super) fn is_notebook_path(path: &Path) -> bool {
     path.components()
         .all(|component| matches!(component, Component::Normal(_)))
 }
