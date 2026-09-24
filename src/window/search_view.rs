@@ -112,13 +112,19 @@ fn button_color(enabled: bool, hover: bool, normal: u32, palette: &Palette) -> u
     }
 }
 
-/// A row's replace button's glyph color. On the focused selection a disabled button takes the
-/// row's dim text color, the selection's text color there, since the line-number color may have
-/// little contrast with the selection's background.
+/// A row's replace button's glyph color. On the focused selection the line-number color may have
+/// little contrast with the selection's background, so a disabled button there is the row's text
+/// color blended halfway into that background: dimmer than an enabled button, still legible. High
+/// contrast allows only system color pairs, so there it keeps the selection's text color (the
+/// line-number color is the window text, drawn for the window background, not the highlight).
 fn row_button_color(enabled: bool, hover: bool, look: RowLook, palette: &Palette) -> u32 {
     let foreground = row_foreground(look, palette);
     if !enabled && look.selected && look.focused {
-        foreground
+        if palette.high_contrast {
+            foreground
+        } else {
+            crate::catppuccin::blend(foreground, palette.selection_background, 128)
+        }
     } else {
         button_color(enabled, hover, foreground, palette)
     }
@@ -3271,14 +3277,36 @@ mod tests {
             );
         }
         let focused = look(true, false, true);
+        let enabled = row_button_color(true, false, focused, &palette);
+        let disabled = row_button_color(false, false, focused, &palette);
+        assert_eq!(enabled, 0x00AB_CDEF, "the selection's text color");
+        assert_ne!(disabled, enabled, "visibly dimmer than the enabled button");
         assert_eq!(
-            row_button_color(false, false, focused, &palette),
-            0x00AB_CDEF,
-            "the selection's text color"
+            disabled,
+            crate::catppuccin::blend(0x00AB_CDEF, palette.selection_background, 128),
+            "halfway into the selection"
         );
         assert_eq!(
             row_button_color(true, true, focused, &palette),
             palette.hover_foreground
+        );
+        // Every themed palette: the disabled button differs from the enabled one there.
+        for theme in crate::platform::theme::Theme::ALL {
+            let themed = Palette::for_theme(theme, false);
+            assert_ne!(
+                row_button_color(false, false, focused, &themed),
+                row_button_color(true, false, focused, &themed),
+                "{theme:?}"
+            );
+        }
+        // High contrast: no blend, only the system pair.
+        let system = Palette {
+            high_contrast: true,
+            ..palette
+        };
+        assert_eq!(
+            row_button_color(false, false, focused, &system),
+            0x00AB_CDEF
         );
     }
 

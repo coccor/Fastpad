@@ -38,6 +38,8 @@ pub struct Palette {
     pub error_foreground: u32,
     /// Whether the frame and editor scrollbars should request the dark system styling.
     pub dark_frame: bool,
+    /// The system's high-contrast colors: only system color pairs may be drawn, never a blend.
+    pub high_contrast: bool,
 }
 
 const CLOSE_HOVER: u32 = rgb(0xC4, 0x2B, 0x1C);
@@ -63,6 +65,7 @@ const LIGHT: Palette = Palette {
     strip_foreground: rgb(32, 32, 32),
     error_foreground: rgb(0xA1, 0x26, 0x0D),
     dark_frame: false,
+    high_contrast: false,
 };
 
 const DARK: Palette = Palette {
@@ -84,6 +87,7 @@ const DARK: Palette = Palette {
     strip_foreground: rgb(212, 212, 212),
     error_foreground: rgb(0xF4, 0x87, 0x71),
     dark_frame: true,
+    high_contrast: false,
 };
 
 /// Maps a Catppuccin flavor onto FastPad's UI roles per the Catppuccin style guide: `mantle`
@@ -108,6 +112,7 @@ const fn catppuccin(flavor: &Flavor, dark: bool) -> Palette {
         strip_foreground: flavor.text,
         error_foreground: flavor.red,
         dark_frame: dark,
+        high_contrast: false,
     }
 }
 
@@ -180,6 +185,7 @@ impl Palette {
             strip_foreground: color(COLOR_BTNTEXT),
             error_foreground: text,
             dark_frame: false,
+            high_contrast: true,
         }
     }
 }
