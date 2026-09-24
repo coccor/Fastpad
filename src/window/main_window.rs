@@ -17347,4 +17347,103 @@ mod tests {
         assert_eq!(super::tab_count(window.hwnd), 0);
         assert!(!name_box_visible(window.hwnd));
     }
+
+    #[test]
+    fn a_folder_rename_that_cannot_be_undone_stands_and_names_the_tab_left_behind() {
+        // Break caught: a failed undo swallowed, leaving the folder renamed on disk while the
+        // library still lists the old one and every tab points at a path that is gone.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-undo-fails");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let a = scratch.note(r"sub\a.md", "a");
+        let b = scratch.note(r"sub\b.md", "b");
+        let top = scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        super::open_path(window.hwnd, &top).unwrap();
+        let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+        let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
+        // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+        let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+        app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+            Some(scratch.folder().join(r"Moved\a.md"));
+        crate::window::library_host::fail_next_folder_rename_back();
+
+        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
+        type_into_name_box(window.hwnd, "Moved");
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        let moved = scratch.folder().join("Moved");
+        assert!(moved.join("b.md").exists());
+        assert!(!scratch.folder().join("sub").exists());
+        assert!(!name_box_visible(window.hwnd));
+        let tabs = &app_mut(window.hwnd).tabs;
+        assert_eq!(tabs.document(b_id).unwrap().path, Some(moved.join("b.md")));
+        assert_eq!(tabs.document(a_id).unwrap().path, Some(a.clone()));
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(state.is_folder(std::path::Path::new("Moved")));
+            assert!(!state.is_folder(std::path::Path::new("sub")));
+        });
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Folder("Moved".into()))
+        );
+        let expected = "FastPad could not undo renaming \u{201c}sub\u{201d} to \u{201c}Moved\u{201d}. \u{201c}a.md\u{201d} is still open at its old path.";
+        assert!(
+            notices(window.hwnd).iter().any(|notice| notice == expected),
+            "{:?}",
+            notices(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn palette_rename_with_a_folder_row_focused_opens_the_folder_rename_box() {
+        // Break caught: the palette's Note: Rename renaming the active tab's note while the user
+        // had a folder row focused, or renaming anything before Enter (spec §9).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("palette-folder-rename");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let active = scratch.note("active.md", "active");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &active).unwrap();
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Folder("sub".into()));
+        let (_, panel) = sidebar_windows(window.hwnd);
+        unsafe { SetFocus(panel) };
+        assert_eq!(unsafe { GetFocus() }, panel);
+
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let query = app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .query_hwnd();
+        let typed = crate::platform::wide_null("Note: Rename");
+        unsafe { SetWindowTextW(query, typed.as_ptr()) };
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(
+            name_box.purpose(),
+            Some(&crate::window::name_box::NamePurpose::RenameFolder(
+                "sub".into()
+            ))
+        );
+        assert_eq!(name_box.text(), "sub");
+        assert!(
+            scratch.folder().join("sub").is_dir(),
+            "nothing renamed before Enter"
+        );
+        assert!(active.exists());
+    }
 }

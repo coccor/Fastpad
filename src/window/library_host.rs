@@ -1496,7 +1496,8 @@ pub(crate) fn rename_folder(hwnd: HWND, relative: &Path) {
 
 /// Enter in the folder rename box: renames the folder with the one disk call, never onto
 /// another name, then rebinds the open tabs under it and follows it in the library. A tab that
-/// cannot follow undoes the whole rename.
+/// cannot follow undoes the whole rename; if the undo fails, the rename stands and a notice
+/// names the tabs left on their old paths.
 fn submit_rename_folder(hwnd: HWND, old: &Path, text: &str) {
     let Some(root) = folder(hwnd) else {
         close_name_box(hwnd);
@@ -1534,27 +1535,33 @@ fn submit_rename_folder(hwnd: HWND, old: &Path, text: &str) {
     }
     let tabs = tabs_under(hwnd, &old_path);
     let mut moved = Vec::with_capacity(tabs.len());
-    let mut failed = false;
+    let mut stuck = Vec::new();
     for (id, path, _) in tabs {
         let target = new_path.join(library::record_path(&old_path, &path));
         let rebound = unsafe { app_ptr(hwnd) }
             .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.rebind_path(id, target).is_ok());
-        if !rebound {
-            failed = true;
-            break;
+        if rebound {
+            moved.push((id, path));
+        } else {
+            stuck.push(path);
         }
-        moved.push((id, path));
     }
-    if failed {
-        // Undo, so the tabs and the disk agree: the tabs that moved go back, then the folder.
-        for (id, path) in moved.into_iter().rev() {
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
+    let mut undo_failed = None;
+    if !stuck.is_empty() {
+        // Undo, so the tabs and the disk agree: the folder goes back, then the tabs that moved.
+        if rename_folder_back(&new_path, &old_path).is_ok() {
+            for (id, path) in moved.into_iter().rev() {
+                if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                    let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
+                }
             }
+            name_box_error(hwnd, "Another tab already has that file open.".to_owned());
+            return;
         }
-        let _ = crate::platform::files::rename_no_replace(&new_path, &old_path);
-        name_box_error(hwnd, "Another tab already has that file open.".to_owned());
-        return;
+        // The disk is the truth: the rename stands, the tabs that moved keep their new paths,
+        // and the ones that could not follow are named.
+        let old_name = old.file_name().unwrap_or_default().to_string_lossy();
+        undo_failed = Some(rename_undo_failed_notice(&old_name, &name, &stuck));
     }
     with_state(hwnd, |state| state.rename_folder(old, &new));
     save_local(
@@ -1572,6 +1579,63 @@ fn submit_rename_folder(hwnd: HWND, old: &Path, text: &str) {
         super::notebook_view::select_row(hwnd, &RowKind::Folder(new.clone()));
     });
     super::notebook_view::focus_tree(hwnd);
+    if let Some(notice) = undo_failed {
+        push_notice(hwnd, notice);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_FOLDER_RENAME_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the next undo of a folder rename fail, as a locked folder would.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn fail_next_folder_rename_back() {
+    FAIL_NEXT_FOLDER_RENAME_BACK.with(|fail| fail.set(true));
+}
+
+/// Renames a folder back after a tab could not follow its rename.
+fn rename_folder_back(from: &Path, to: &Path) -> crate::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_FOLDER_RENAME_BACK.with(|fail| fail.replace(false)) {
+        return Err(crate::FastPadError::Invariant(
+            "rename back refused for a test",
+        ));
+    }
+    crate::platform::files::rename_no_replace(from, to)
+}
+
+/// The notice when a folder rename could not be undone after `stuck` (the tabs' old paths)
+/// could not follow it.
+fn rename_undo_failed_notice(old: &str, new: &str, stuck: &[PathBuf]) -> String {
+    let name = |path: &PathBuf| {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let still = match stuck {
+        [one] => format!(
+            "\u{201c}{}\u{201d} is still open at its old path.",
+            name(one)
+        ),
+        [first, rest @ ..] => format!(
+            "\u{201c}{}\u{201d} and {} more are still open at their old paths.",
+            name(first),
+            rest.len()
+        ),
+        [] => String::new(),
+    };
+    format!(
+        "FastPad could not undo renaming \u{201c}{old}\u{201d} to \u{201c}{new}\u{201d}. {still}"
+    )
+    .trim_end()
+    .to_owned()
 }
 
 /// The Delete confirmation for a folder named `name` holding `notes` listed notes, `dirty` of
@@ -2818,6 +2882,24 @@ mod tests {
         assert_eq!(
             delete_folder_question("Old", 3, 2),
             "Move \u{201c}Old\u{201d} and its 3 notes to the Recycle Bin?\n2 open notes have unsaved changes, which will be lost."
+        );
+    }
+
+    #[test]
+    fn the_failed_folder_rename_undo_notice_names_the_tabs_left_behind() {
+        // Break caught: a rename that could not be undone reported as a clash, or the tab left
+        // on its old path not named (Task 6 review).
+        let stuck = [
+            PathBuf::from(r"C:\n\sub\a.md"),
+            PathBuf::from(r"C:\n\sub\b.md"),
+        ];
+        assert_eq!(
+            rename_undo_failed_notice("sub", "Moved", &stuck[..1]),
+            "FastPad could not undo renaming \u{201c}sub\u{201d} to \u{201c}Moved\u{201d}. \u{201c}a.md\u{201d} is still open at its old path."
+        );
+        assert_eq!(
+            rename_undo_failed_notice("sub", "Moved", &stuck),
+            "FastPad could not undo renaming \u{201c}sub\u{201d} to \u{201c}Moved\u{201d}. \u{201c}a.md\u{201d} and 1 more are still open at their old paths."
         );
     }
 }

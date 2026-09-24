@@ -228,7 +228,8 @@
 - **The suffix** names the parent's own name (`in inner`, not `in outer\inner`), or the notebook at the root.
 - **The header** reads, left to right: the star, New note, New folder, "…".
 - **The empty state** ("No notes in <notebook> yet.") shows only when the notebook has no notes and no folders.
-- **Rename and Delete from the palette** still act on the active tab's note: the palette records a focused note row when it opens, not a folder row. F2, Del and the folder menu act on folders, and so do the commands run with a folder row focused.
+- **Rename and Delete from the palette** act on the row that had the focus when the palette opened: a focused folder row, else a focused note row, else the active tab's note. The palette gives the focus back to the panel before the command runs, so a focused folder row is what the command sees. F2, Del and the folder menu act on folders too.
+- **A rename that cannot be undone stands:** when a tab cannot follow a folder rename and renaming the folder back fails, the disk is the truth. The tabs that moved keep their new paths, the library follows the new name, the box closes, and a notice names the tab left behind: `FastPad could not undo renaming “<old>” to “<new>”. “<note>” is still open at its old path.`
 - **After a delete** the selection goes to the row that took the folder's index, set after the refresh, because closing the folder's tabs moves it to the new active note first.
 - **Icon contrast:** the weakest pair is Latte yellow on the Light theme's selection, about 1.7:1. A test keeps every icon colour at 1.5:1 or more on the selection, inactive selection, hover and panel backgrounds of every theme. In high contrast an icon takes the row's muted colour, which on a focused selected row is the selection text colour, as the other glyphs do.
 - **Palette placement:** `Notebook: New folder…` follows `Notebook: Toggle favorite` and is listed only while a notebook is open (or loading).
