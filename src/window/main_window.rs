@@ -12674,6 +12674,97 @@ mod tests {
     }
 
     #[test]
+    fn note_rename_on_a_recorded_row_that_left_the_library_renames_nothing() {
+        // Break caught: Note: Rename… on a focused note row that vanished before Enter opening
+        // the name bar on the active tab's file, one the user did not choose (spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-rename-gone");
+        let active = scratch.note("active.md", "active");
+        let row = scratch.note("row.md", "row");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &active).unwrap();
+        select_row(window.hwnd, &RowKind::Note("row.md".into()));
+        let (_, panel) = sidebar_windows(window.hwnd);
+        unsafe { SetFocus(panel) };
+        assert_eq!(unsafe { GetFocus() }, panel);
+
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let query = app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .query_hwnd();
+        let typed = crate::platform::wide_null("Note: Rename");
+        unsafe { SetWindowTextW(query, typed.as_ptr()) };
+        crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&row));
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+
+        assert!(!inline_open(window.hwnd));
+        assert!(
+            !app_mut(window.hwnd)
+                .name_box
+                .as_ref()
+                .is_some_and(|name_box| name_box.is_visible())
+        );
+        assert!(active.exists());
+        assert!(row.exists());
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(active.as_path())
+        );
+    }
+
+    #[test]
+    fn a_note_rename_whose_tab_cannot_follow_and_cannot_be_undone_stands() {
+        // Break caught: a failed undo swallowed, leaving the file renamed on disk while the
+        // library still lists the old name and the field claims nothing happened (spec §5.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-rename-undo-fails");
+        let a = scratch.note("a.md", "a");
+        let top = scratch.note("top.md", "t");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &top).unwrap();
+        // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+        let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+        app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+            Some(scratch.folder().join("c.md"));
+        crate::window::library_host::fail_next_note_rename_back();
+
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+        type_into_field(window.hwnd, "c");
+        field_key(window.hwnd, VK_RETURN);
+
+        assert!(!inline_open(window.hwnd));
+        assert!(!a.exists());
+        assert!(scratch.folder().join("c.md").exists());
+        assert!(
+            app_mut(window.hwnd).tabs.find_stored_path(&a).is_some(),
+            "a's tab is left on its old path"
+        );
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
+            assert!(
+                notes.contains(&std::path::PathBuf::from("c.md")),
+                "{notes:?}"
+            );
+            assert!(
+                !notes.contains(&std::path::PathBuf::from("a.md")),
+                "{notes:?}"
+            );
+        });
+        let expected = "FastPad could not undo renaming \u{201c}a.md\u{201d} to \u{201c}c.md\u{201d}. \u{201c}a.md\u{201d} is still open at its old path.";
+        assert!(
+            notices(window.hwnd).iter().any(|notice| notice == expected),
+            "{:?}",
+            notices(window.hwnd)
+        );
+    }
+
+    #[test]
     fn palette_commands_act_on_the_row_focused_when_the_palette_opened() {
         // Break caught: opening the palette moves focus to its query field, so by the time the
         // chosen command runs, a live focus check sees nothing on the panel and falls back to

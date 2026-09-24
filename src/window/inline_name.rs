@@ -759,8 +759,22 @@ pub(crate) fn rename(hwnd: HWND, row: &RowKind) {
 pub(crate) fn rename_note_at(hwnd: HWND, path: &Path) {
     match reveal(hwnd, path) {
         Some(relative) => start(hwnd, Purpose::RenameNote(relative)),
-        None => library_host::rename_note(hwnd),
+        // Only the active tab's file goes to the name bar: it renames the active tab, and any
+        // other note is not the one the user chose.
+        None if is_active_file(hwnd, path) => library_host::rename_note(hwnd),
+        None => {}
     }
+}
+
+/// Whether `path` is the active tab's file. No notice for an untitled tab.
+fn is_active_file(hwnd: HWND, path: &Path) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .active()
+            .and_then(|active| active.path.as_deref())
+            .is_some_and(|active| library::model::same_path(active, path))
+    })
 }
 
 /// Note: Rename… with no row focused: the active tab's note (spec §3.3).
@@ -1105,17 +1119,33 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
         fail(hwnd, how, error);
         return;
     }
+    let mut undo_failed = None;
     let rebound = match library_host::rebind_open_tab(hwnd, &old, new.clone()) {
         Ok(rebound) => rebound,
         Err(()) => {
             // Undo, so the tab and the disk agree.
-            let _ = crate::platform::files::rename_no_replace(&new, &old);
-            fail(
-                hwnd,
-                how,
-                "Another tab already has that file open.".to_owned(),
-            );
-            return;
+            if library_host::rename_note_back(&new, &old).is_ok() {
+                fail(
+                    hwnd,
+                    how,
+                    "Another tab already has that file open.".to_owned(),
+                );
+                return;
+            }
+            // The disk is the truth: the rename stands, and the tab left on the old path is
+            // named.
+            let name = |path: &Path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            undo_failed = Some(library_host::rename_undo_failed_notice(
+                &name(&old),
+                &name(&new),
+                std::slice::from_ref(&old),
+            ));
+            false
         }
     };
     with_state(hwnd, |state| state.rename_note(&old, &new));
@@ -1128,6 +1158,9 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
     });
     if how == How::Enter {
         notebook_view::focus_tree(hwnd);
+    }
+    if let Some(notice) = undo_failed {
+        push_notice(hwnd, notice);
     }
     if rebound {
         // The extension may have changed, and with it the language.

@@ -1442,6 +1442,32 @@ pub(crate) fn fail_next_folder_rename_back() {
     FAIL_NEXT_FOLDER_RENAME_BACK.with(|fail| fail.set(true));
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_NOTE_RENAME_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the next undo of a note rename fail, as a locked file would.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn fail_next_note_rename_back() {
+    FAIL_NEXT_NOTE_RENAME_BACK.with(|fail| fail.set(true));
+}
+
+/// Renames a note back after its tab could not follow its rename.
+pub(crate) fn rename_note_back(from: &Path, to: &Path) -> crate::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_NOTE_RENAME_BACK.with(|fail| fail.replace(false)) {
+        return Err(crate::FastPadError::Invariant(
+            "rename back refused for a test",
+        ));
+    }
+    crate::platform::files::rename_no_replace(from, to)
+}
+
 /// Renames a folder back after a tab could not follow its rename.
 pub(crate) fn rename_folder_back(from: &Path, to: &Path) -> crate::Result<()> {
     #[cfg(test)]
@@ -1453,8 +1479,8 @@ pub(crate) fn rename_folder_back(from: &Path, to: &Path) -> crate::Result<()> {
     crate::platform::files::rename_no_replace(from, to)
 }
 
-/// The notice when a folder rename could not be undone after `stuck` (the tabs' old paths)
-/// could not follow it.
+/// The notice when a folder or note rename could not be undone after `stuck` (the tabs' old
+/// paths) could not follow it.
 pub(crate) fn rename_undo_failed_notice(old: &str, new: &str, stuck: &[PathBuf]) -> String {
     let name = |path: &PathBuf| {
         path.file_name()
