@@ -62,6 +62,9 @@ pub struct App {
     pub(crate) logo_icon: Option<LogoIcon>,
     /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
     pub(crate) tab_thumb_grab: Option<i32>,
+    /// Between a middle-button press on a tab and its release: the tab's strip index and the
+    /// document it showed then (quick-open spec §5).
+    pub(crate) middle_press: Option<(usize, crate::document::DocumentId)>,
     pub(crate) dark_frame_applied: bool,
     pub(crate) notifications: NotificationCenter,
     pub(crate) launch_open_completed: bool,
@@ -135,6 +138,7 @@ impl App {
             title_pointer: PointerState::default(),
             logo_icon: None,
             tab_thumb_grab: None,
+            middle_press: None,
             dark_frame_applied: false,
             notifications: NotificationCenter::new(),
             launch_open_completed: false,

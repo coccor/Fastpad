@@ -949,9 +949,21 @@ unsafe extern "system" fn palette_control_proc(
                 super::main_window::close_command_palette(parent, true);
                 return 0;
             }
+            // Ctrl+W closes the palette here, not the tab behind it (quick-open spec §4);
+            // `main_window::translate_accelerator` leaves the key to this hook.
+            if key == u16::from(b'W')
+                && unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0
+                && unsafe { GetKeyState(i32::from(VK_MENU)) } >= 0
+            {
+                super::main_window::close_command_palette(parent, true);
+                return 0;
+            }
         }
-        // A single-line Edit beeps at Enter and Escape characters; both were handled on key down.
-        (PaletteControl::Query, WM_CHAR) if matches!(wparam as u16, 0x0d | 0x1b) => return 0,
+        // A single-line Edit beeps at Enter, Escape and Ctrl+W characters; all three were
+        // handled on key down.
+        (PaletteControl::Query, WM_CHAR) if matches!(wparam as u16, 0x0d | 0x1b | 0x17) => {
+            return 0;
+        }
         (PaletteControl::Query, WM_KILLFOCUS) => {
             let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
             if !super::main_window::command_palette_owns(parent, wparam as HWND) {
@@ -1009,6 +1021,16 @@ mod tests {
             .into_iter()
             .map(|entry| entry.label)
             .collect()
+    }
+
+    #[test]
+    fn close_tab_is_listed_with_ctrl_w() {
+        // Break caught: the palette's Close tab row still showing no shortcut after Ctrl+W.
+        assert_eq!(labels("close tab")[0], "File: Close tab");
+        assert_eq!(
+            shortcut_text(CommandId::CloseTab).as_deref(),
+            Some("Ctrl+W")
+        );
     }
 
     #[test]

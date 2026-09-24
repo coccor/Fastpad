@@ -411,6 +411,37 @@ impl Tabs {
         Ok(closed)
     }
 
+    /// Closes the clean tab `review` names without activating it (quick-open spec §5): the
+    /// active tab stays active and keeps its place in the activation order. `Stale` when that
+    /// tab has gone, is the active one or changed since `review`; `Unsaved` when it has unsaved
+    /// edits, which only the usual reviewed close may discard.
+    pub(crate) fn close_clean_background(
+        &mut self,
+        review: CloseReview,
+    ) -> Result<Document, CloseReviewError> {
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.id == review.id)
+        else {
+            return Err(CloseReviewError::Stale);
+        };
+        let active = self.active_index();
+        if index == active || self.documents[index].generation != review.generation {
+            return Err(CloseReviewError::Stale);
+        }
+        if self.documents[index].dirty {
+            return Err(CloseReviewError::Unsaved);
+        }
+        let closed = self.documents.remove(index);
+        if index < active {
+            self.selection.active.store(active - 1, Ordering::Release);
+        }
+        self.recent.retain(|recent| *recent != closed.id);
+        self.view.update(&self.documents);
+        Ok(closed)
+    }
+
     pub fn next_dirty_review(&self, reviewed: &[CloseReviewKey]) -> Option<CloseReview> {
         self.documents
             .iter()
@@ -735,6 +766,7 @@ impl Drop for Tabs {
 #[cfg(test)]
 mod tests {
     use super::Tabs;
+    use super::{CloseReview, CloseReviewError};
     use crate::document::{Document, DocumentId};
     use std::fs;
 
@@ -746,6 +778,48 @@ mod tests {
 
     fn document(id: u64) -> Document {
         Document::test_fixture(DocumentId(id), false)
+    }
+
+    #[test]
+    fn a_clean_background_tab_closes_where_it_is_and_the_active_tab_stays() {
+        // Break caught: a middle-click on another tab switching to it first (the editor flashes),
+        // closing the active tab instead, the active index left pointing one tab too far right,
+        // or a dirty tab closed without its prompt.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(document(2)).unwrap();
+        tabs.push(document(3)).unwrap();
+        let review = |tabs: &Tabs, id: u64| CloseReview {
+            id: DocumentId(id),
+            generation: tabs.document(DocumentId(id)).unwrap().generation,
+        };
+        let first = review(&tabs, 1);
+        let closed = tabs.close_clean_background(first).unwrap();
+        assert_eq!(closed.id, DocumentId(1));
+        assert_eq!(tabs.active().unwrap().id, DocumentId(3));
+        assert_eq!(tabs.active_index(), 1);
+        assert_eq!(order(&tabs), [3, 2]);
+        assert_eq!(tabs.view().snapshot().tabs.len(), 2);
+
+        let active = tabs.active_close_review().unwrap();
+        assert_eq!(
+            tabs.close_clean_background(active),
+            Err(CloseReviewError::Stale)
+        );
+        tabs.document_mut(DocumentId(2)).unwrap().dirty = true;
+        let dirty = review(&tabs, 2);
+        assert_eq!(
+            tabs.close_clean_background(dirty),
+            Err(CloseReviewError::Unsaved)
+        );
+        let stale = CloseReview {
+            generation: dirty.generation + 1,
+            ..dirty
+        };
+        assert_eq!(
+            tabs.close_clean_background(stale),
+            Err(CloseReviewError::Stale)
+        );
+        assert_eq!(tabs.len(), 2);
     }
 
     /// `push` canonicalizes paths through the disk, so these pure tests use untitled documents.

@@ -43,11 +43,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
     WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED,
     WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE,
-    WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
-    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT,
+    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -360,6 +360,10 @@ unsafe extern "system" fn main_window_proc(
         WM_MOUSELEAVE => {
             update_title_pointer(hwnd, |pointer| pointer.leave(false));
             crate::window::preview_host::button_hover(hwnd, None);
+            // A middle press whose release never reaches the strip must not close a tab later.
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                unsafe { app.as_mut() }.middle_press = None;
+            }
             0
         }
         WM_NCMOUSEMOVE => {
@@ -504,6 +508,35 @@ unsafe extern "system" fn main_window_proc(
                     crate::window::preview_host::click_button(hwnd, target)
                 }
                 _ => {}
+            }
+            0
+        }
+        // A middle-click closes the tab under the pointer (quick-open spec §5). Tabs answer
+        // HTCLIENT, so the button arrives here; the caption and the logo square are nonclient
+        // and keep the system's behavior.
+        WM_MBUTTONDOWN => {
+            let press = match client_title_target(hwnd, lparam) {
+                Some(HitTarget::Tab(index) | HitTarget::CloseTab(index)) => {
+                    tab_id_at(hwnd, index).map(|id| (index, id))
+                }
+                _ => None,
+            };
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                unsafe { app.as_mut() }.middle_press = press;
+            }
+            0
+        }
+        WM_MBUTTONUP => {
+            let press = unsafe { app_ptr(hwnd) }
+                .and_then(|mut app| unsafe { app.as_mut() }.middle_press.take());
+            // Only over the pressed tab, and only while it still shows the same document.
+            if let Some((index, id)) = press
+                && let Some(HitTarget::Tab(released) | HitTarget::CloseTab(released)) =
+                    client_title_target(hwnd, lparam)
+                && released == index
+                && tab_id_at(hwnd, index) == Some(id)
+            {
+                close_tab_at(hwnd, index);
             }
             0
         }
@@ -3574,6 +3607,46 @@ fn close_active_document(hwnd: HWND) {
     close_reviewed_document(hwnd, &identity, &editor, review, decision);
 }
 
+/// Closes the tab at strip `index` (quick-open spec §5). A clean tab that isn't the active one
+/// closes where it is, and the active tab stays. Any other tab is activated first, so a save
+/// prompt asks about the tab on screen, and is then closed as Close tab closes it.
+fn close_tab_at(hwnd: HWND, index: usize) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        let document = tabs.documents().nth(index)?;
+        let background = tabs.active().is_some_and(|active| active.id != document.id);
+        Some((
+            crate::window::tabs::CloseReview {
+                id: document.id,
+                generation: document.generation,
+            },
+            background && !document.dirty,
+        ))
+    });
+    let Some((review, clean_background)) = target else {
+        return;
+    };
+    if clean_background {
+        close_background_document(hwnd, &identity, review);
+    } else if activate_document_by_id(hwnd, review.id) && identity.is_live_for(hwnd) {
+        execute_command(hwnd, CommandId::CloseTab);
+    }
+}
+
+/// The document shown by tab `index` of the strip.
+fn tab_id_at(hwnd: HWND, index: usize) -> Option<DocumentId> {
+    unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .documents()
+            .nth(index)
+            .map(|document| document.id)
+    })
+}
+
 /// Closes `id` without asking, discarding any unsaved edits, e.g. once its file is deleted.
 pub(super) fn close_document_without_prompt(hwnd: HWND, id: DocumentId) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
@@ -3628,6 +3701,33 @@ fn close_reviewed_document(
     if let Some(active) = active {
         let _ = editor.use_document(&active);
     }
+    drop(closed);
+    crate::recovery::remove_snapshot_files(&snapshots);
+    if identity.is_live_for(hwnd) {
+        refresh_tabs(hwnd);
+    }
+}
+
+/// `close_reviewed_document` for a clean tab that isn't active: it closes where it is, its
+/// recovery snapshots go, and the editor keeps showing the active tab (no document swap).
+fn close_background_document(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    review: crate::window::tabs::CloseReview,
+) {
+    let closed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let closed = app.tabs.close_clean_background(review).ok()?;
+        let snapshots = app
+            .recovery_root
+            .as_deref()
+            .map(|root| crate::recovery::snapshots_removed_on_close(root, &closed, true))
+            .unwrap_or_default();
+        Some((closed, snapshots))
+    });
+    let Some((closed, snapshots)) = closed else {
+        return;
+    };
     drop(closed);
     crate::recovery::remove_snapshot_files(&snapshots);
     if identity.is_live_for(hwnd) {
@@ -5419,6 +5519,11 @@ pub(crate) unsafe fn translate_accelerator(
     {
         return true;
     }
+    // Ctrl+W in the palette's field closes the palette, not a tab (quick-open spec §4). The
+    // table would turn it into Close tab before the field's hook saw the key.
+    if palette_keeps_key(hwnd, message) {
+        return false;
+    }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .accelerators
@@ -5426,6 +5531,18 @@ pub(crate) unsafe fn translate_accelerator(
             .map(|table| table.raw())
     });
     accelerator.is_some_and(|accelerator| menus::translate_accelerator(accelerator, hwnd, message))
+}
+
+/// Ctrl+W (without Alt) aimed at one of the command palette's controls.
+fn palette_keeps_key(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    message.message == WM_KEYDOWN
+        && message.wParam == usize::from(b'W')
+        && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
+        && unsafe { GetKeyState(VK_MENU as i32) } >= 0
+        && command_palette_owns(hwnd, message.hwnd)
 }
 
 fn menu_activation_message(
@@ -5999,6 +6116,176 @@ mod tests {
         // The palette went back to command mode.
         execute_command(window.hwnd, CommandId::CommandPalette);
         assert!(with_command_palette(window.hwnd, |p| p.picker().is_none()).unwrap());
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_active_tab_and_in_the_palette_field_closes_the_palette() {
+        // Break caught (review focus 4): Ctrl+W dead, closing a background tab, or, typed in the
+        // palette's query field, closing the tab behind the palette (the accelerator table sees
+        // the key before the field's hook).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        execute_command(window.hwnd, CommandId::New);
+        execute_command(window.hwnd, CommandId::New);
+        let ids = || {
+            app_mut(window.hwnd)
+                .tabs
+                .documents()
+                .map(|document| document.id)
+                .collect::<Vec<_>>()
+        };
+        let &[first, second, _] = &ids()[..] else {
+            panic!("three tabs")
+        };
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let ctrl_w = |target: HWND| MSG {
+            hwnd: target,
+            message: WM_KEYDOWN,
+            wParam: usize::from(b'W'),
+            ..Default::default()
+        };
+
+        let closed =
+            unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl_w(editor.hwnd())) };
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let query = with_command_palette(window.hwnd, |palette| palette.query_hwnd()).unwrap();
+        let in_palette =
+            unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl_w(query)) };
+        unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(b'W'), 0) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+
+        assert!(closed, "Ctrl+W was not translated");
+        assert!(!in_palette, "the palette's field keeps Ctrl+W");
+        assert!(!with_command_palette(window.hwnd, |palette| palette.is_visible()).unwrap());
+        assert_eq!(ids(), [first, second], "only the active tab closed");
+    }
+
+    #[test]
+    fn a_middle_click_closes_a_clean_background_tab_and_keeps_the_active_one() {
+        // Break caught (review focus 3): a middle-click switching to the tab it closes, closing
+        // the active tab instead, a press on one tab and a release on another closing either, a
+        // release with no press closing anything, or a press kept after the pointer left.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HTCLIENT, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_NCHITTEST,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        execute_command(window.hwnd, CommandId::New);
+        let ids = || {
+            app_mut(window.hwnd)
+                .tabs
+                .documents()
+                .map(|document| document.id)
+                .collect::<Vec<_>>()
+        };
+        let &[first, second, third] = &ids()[..] else {
+            panic!("three tabs")
+        };
+        let center = |index: usize| super::title_layout(window.hwnd).tab(index).center();
+        let send = |message: u32, index: usize| {
+            let point = center(index);
+            unsafe { SendMessageW(window.hwnd, message, 0, client_lparam(point.x, point.y)) };
+        };
+        // Tabs answer HTCLIENT, so the middle button arrives as client WM_MBUTTON* (spec §5).
+        let tab = center(0);
+        assert_eq!(
+            unsafe {
+                SendMessageW(
+                    window.hwnd,
+                    WM_NCHITTEST,
+                    0,
+                    screen_lparam(window.hwnd, tab.x, tab.y),
+                )
+            },
+            HTCLIENT as isize
+        );
+
+        send(WM_MBUTTONDOWN, 0);
+        send(WM_MBUTTONUP, 1);
+        assert_eq!(ids(), [first, second, third], "released over another tab");
+        send(WM_MBUTTONUP, 0);
+        assert_eq!(ids(), [first, second, third], "a release with no press");
+        send(WM_MBUTTONDOWN, 0);
+        unsafe {
+            SendMessageW(
+                window.hwnd,
+                windows_sys::Win32::UI::Controls::WM_MOUSELEAVE,
+                0,
+                0,
+            )
+        };
+        send(WM_MBUTTONUP, 0);
+        assert_eq!(ids(), [first, second, third], "the pointer left in between");
+
+        send(WM_MBUTTONDOWN, 0);
+        send(WM_MBUTTONUP, 0);
+        assert_eq!(ids(), [second, third]);
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, third);
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+    }
+
+    #[test]
+    fn a_middle_click_on_a_dirty_background_tab_shows_it_and_asks_first() {
+        // Break caught: the save prompt asking about a tab that isn't on screen, a dirty tab
+        // closed without asking, or Cancel putting the previously active tab back.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDOWN, WM_MBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("unsaved").unwrap();
+        let dirty = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+        execute_command(window.hwnd, CommandId::New);
+        let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = asked.clone();
+        answer_next_close_prompt(move |hwnd| {
+            assert_eq!(
+                app_mut(hwnd).tabs.active().unwrap().id,
+                dirty,
+                "the prompt's tab is on screen"
+            );
+            seen.set(true);
+            CloseDecision::Cancel
+        });
+        let center = super::title_layout(window.hwnd).tab(0).center();
+
+        unsafe {
+            SendMessageW(
+                window.hwnd,
+                WM_MBUTTONDOWN,
+                0,
+                client_lparam(center.x, center.y),
+            );
+            SendMessageW(
+                window.hwnd,
+                WM_MBUTTONUP,
+                0,
+                client_lparam(center.x, center.y),
+            );
+        }
+
+        assert!(asked.get(), "no prompt");
+        assert_eq!(super::tab_count(window.hwnd), 2);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().id,
+            dirty,
+            "after Cancel it stays active"
+        );
+        answer_next_close_prompt(|_| CloseDecision::Discard);
+        super::close_tab_at(window.hwnd, 0);
+        assert_eq!(super::tab_count(window.hwnd), 1);
     }
 
     #[test]

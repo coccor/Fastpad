@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 52] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 53] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -38,6 +38,7 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 52] {
         accelerator(FCONTROL | FSHIFT, b'M', CommandId::NoteMoveToNotebook),
         accelerator(FCONTROL, b'S', CommandId::Save),
         accelerator(FCONTROL | FSHIFT, b'S', CommandId::SaveAs),
+        accelerator(FCONTROL, b'W', CommandId::CloseTab),
         accelerator(FCONTROL, b'F', CommandId::Find),
         accelerator(FCONTROL, b'H', CommandId::Replace),
         accelerator(FCONTROL | FSHIFT, b'H', CommandId::ReplaceInNotes),
@@ -152,7 +153,7 @@ impl MenuBar {
                 MenuEntry::command("Open &Notebook...\tCtrl+Shift+O", CommandId::OpenFolder),
                 MenuEntry::command("&Save\tCtrl+S", CommandId::Save),
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
-                MenuEntry::command("&Close tab", CommandId::CloseTab),
+                MenuEntry::command("&Close tab	Ctrl+W", CommandId::CloseTab),
                 MenuEntry::Separator,
                 MenuEntry::command(
                     "&Restore session on startup",
@@ -552,6 +553,17 @@ mod tests {
     use crate::window::commands::CommandId;
 
     #[test]
+    fn ctrl_w_closes_the_tab() {
+        // Break caught: Ctrl+W unbound, or bound to Close all tabs (quick-open spec §4).
+        use windows_sys::Win32::UI::WindowsAndMessaging::FCONTROL;
+        let bound = accelerator_specs()
+            .into_iter()
+            .find(|spec| spec.modifiers == FCONTROL && spec.key == u16::from(b'W'))
+            .map(|spec| spec.command);
+        assert_eq!(bound, Some(CommandId::CloseTab));
+    }
+
+    #[test]
     fn shortcut_and_menu_commands_share_command_ids() {
         let specs = accelerator_specs();
         assert!(specs.iter().any(|item| item.command == CommandId::New));
@@ -561,7 +573,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 52);
+        assert_eq!(specs.len(), 53);
     }
 
     #[test]
