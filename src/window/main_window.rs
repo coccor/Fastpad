@@ -1486,8 +1486,6 @@ fn show_command_palette(hwnd: HWND, subset: Option<&'static [CommandId]>) {
     }
     refilter_command_palette(hwnd);
     with_command_palette(hwnd, CommandPalette::focus_query);
-    // Leaving quick open with an empty field: the hint must go.
-    with_command_palette(hwnd, CommandPalette::invalidate);
 }
 
 /// Opens the palette in picker mode: it lists `picker`'s items instead of commands, and the
@@ -1580,8 +1578,6 @@ pub(crate) fn open_quick_open(hwnd: HWND) {
     }
     refilter_command_palette(hwnd);
     with_command_palette(hwnd, CommandPalette::focus_query);
-    // The field may have been empty already: the hint appears without an edit to trigger it.
-    with_command_palette(hwnd, CommandPalette::invalidate);
 }
 
 /// The quick-open rows for `query` and the row to select (spec §3.1–3.4). Only reads what is
@@ -6351,6 +6347,38 @@ mod tests {
         // The palette went back to command mode.
         execute_command(window.hwnd, CommandId::CommandPalette);
         assert!(with_command_palette(window.hwnd, |p| p.picker().is_none()).unwrap());
+    }
+
+    #[test]
+    fn another_picker_opened_over_quick_open_repaints_the_field_without_its_hint() {
+        // Break caught (review round 1): a picker opened from quick open's empty field (Move to
+        // notebook, Open recent notebook) skips clearing the query, so nothing repaints the
+        // field and it keeps showing "Go to note by name". Test windows are never shown, so
+        // the repaint is counted rather than read from the field's update region.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let palette = || app_mut(window.hwnd).command_palette.as_ref().unwrap();
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        assert!(palette().placeholder().is_some());
+        let repaints = palette().hint_repaints();
+
+        super::open_picker(
+            window.hwnd,
+            crate::window::command_palette::Picker {
+                kind: crate::window::command_palette::PickerKind::RecentFolder,
+                items: vec![r"D:\A".into()],
+                create: None,
+            },
+        );
+
+        assert_eq!(palette().placeholder(), None);
+        assert_eq!(palette().hint_repaints(), repaints + 1);
+        // Back to quick open, the hint returns; command mode, it goes again.
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        assert_eq!(palette().hint_repaints(), repaints + 2);
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        assert_eq!(palette().hint_repaints(), repaints + 3);
     }
 
     #[test]

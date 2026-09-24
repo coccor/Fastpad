@@ -448,6 +448,10 @@ pub(crate) struct CommandPalette {
     /// The list's font when the bold one was made, and the bold one; null until a quick-open
     /// row is first drawn.
     bold: Cell<(HFONT, HFONT)>,
+    /// How many times a mode switch marked the field for its hint to come or go, for
+    /// in-process tests (their windows are never shown, so they have no update region).
+    #[cfg(test)]
+    hint_repaints: usize,
 }
 
 impl CommandPalette {
@@ -495,6 +499,8 @@ impl CommandPalette {
             field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
             list_brush: unsafe { CreateSolidBrush(colors.strip_background) },
             bold: Cell::new((std::ptr::null_mut(), std::ptr::null_mut())),
+            #[cfg(test)]
+            hint_repaints: 0,
         })
     }
 
@@ -581,9 +587,21 @@ impl CommandPalette {
     /// Switches between command mode (`None`) and picker mode; also clears any rows from a
     /// previous filter, so a stale selection index can't leak into the new mode.
     pub(crate) fn set_picker(&mut self, picker: Option<Picker>) {
+        let hint = self.placeholder();
         self.picker = picker;
         self.picker_rows = Vec::new();
         self.picker_selected = None;
+        // An empty field repaints only on an edit, and switching modes may make none: the hint
+        // must come or go here. InvalidateRect only marks the region; it sends nothing.
+        if self.placeholder() != hint {
+            unsafe {
+                InvalidateRect(self.query_edit, std::ptr::null(), 1);
+            }
+            #[cfg(test)]
+            {
+                self.hint_repaints += 1;
+            }
+        }
     }
 
     pub(crate) fn picker(&self) -> Option<&Picker> {
@@ -1097,6 +1115,11 @@ impl CommandPalette {
             unsafe { SendMessageW(self.list, LB_GETTEXT, index, buffer.as_mut_ptr() as LPARAM) };
         buffer.truncate(usize::try_from(copied).unwrap_or(0));
         String::from_utf16_lossy(&buffer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hint_repaints(&self) -> usize {
+        self.hint_repaints
     }
 
     #[cfg(test)]
