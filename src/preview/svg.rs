@@ -296,7 +296,7 @@ mod tests {
             .all(|(actual, expected)| actual.abs_diff(expected) <= 8)
     }
 
-    const HEADER_ORANGE: [u8; 4] = [0x20, 0xB0, 0xFF, 0xFF];
+    const COVER_ORANGE: [u8; 4] = [0x20, 0xB0, 0xFF, 0xFF];
 
     /// The spec §7.3 spike: Direct2D must rasterize SVG into a WIC bitmap off the UI thread.
     #[test]
@@ -305,21 +305,23 @@ mod tests {
             .join()
             .unwrap()
             .unwrap();
-        assert_eq!((image.natural_width, image.natural_height), (256, 256));
-        assert_eq!((image.width, image.height), (96, 96));
-        // The header band (#FFB020) at (150, 72) of 256 px, below the binder rings.
-        let header = pixel(&image, 56, 27);
-        assert!(near(header, HEADER_ORANGE), "{header:?}");
-        // Outside the notepad the icon is transparent.
+        assert_eq!((image.natural_width, image.natural_height), (244, 256));
+        assert_eq!((image.width, image.height), (96, 100));
+        // The cover (#FFB020) at (219, 198) of 244 px wide, below and right of the bolt.
+        let cover = pixel(&image, 86, 78);
+        assert!(near(cover, COVER_ORANGE), "{cover:?}");
+        // Above the binder rings, left of the cover, the icon is transparent.
         assert_eq!(pixel(&image, 2, 2), [0, 0, 0, 0]);
     }
 
     #[test]
     fn use_elements_render_after_the_xlink_rewrite() {
         let image = decode_image(&icon(), 0).unwrap();
-        // A binder ring drawn through `<use href="#rings">` covers the header at (95, 50).
-        let ring = pixel(&image, 95, 50);
-        assert!(!near(ring, HEADER_ORANGE), "{ring:?}");
+        // Only a binder ring drawn through `<use href="#rings">` covers (20, 128), left of the cover.
+        let ring = pixel(&image, 20, 128);
+        assert!(near(ring, COVER_ORANGE), "{ring:?}");
+        // The notch around the ring stays transparent.
+        assert_eq!(pixel(&image, 71, 128), [0, 0, 0, 0]);
     }
 
     #[test]
