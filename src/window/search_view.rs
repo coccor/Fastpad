@@ -595,6 +595,17 @@ pub(crate) fn query_changed(hwnd: HWND) {
     let query = window_text(edit);
     if text_search_host::searchable(&query) {
         text_search_host::schedule(hwnd);
+        // "Type at least 2 characters." goes at once, not when the debounce ends.
+        let panel = with_view(hwnd, |view| {
+            (view.search == SearchState::TooShort).then(|| {
+                view.search = SearchState::Idle;
+                view.panel
+            })
+        })
+        .flatten();
+        if let Some(panel) = panel {
+            invalidate(panel);
+        }
         return;
     }
     text_search_host::cancel(hwnd);
@@ -1481,6 +1492,7 @@ mod tests {
                 skipped: [0; 4],
             },
             end,
+            skipped: Vec::new(),
         }
     }
 

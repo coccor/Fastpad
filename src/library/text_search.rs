@@ -147,6 +147,29 @@ pub fn run(
     )
 }
 
+/// `run`, also pushing the path of every note it skipped onto `skipped`, so a narrowed search
+/// can visit them again.
+pub fn run_noting_skipped(
+    notebook: &Path,
+    notes: &[SearchNote],
+    overlays: &HashMap<PathBuf, String>,
+    matcher: &Matcher,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(Vec<TextHit>, Progress),
+    skipped: &mut Vec<PathBuf>,
+) -> RunEnd {
+    search_all(
+        notebook,
+        notes,
+        overlays,
+        matcher,
+        cancel,
+        sink,
+        &mut Instant::now,
+        skipped,
+    )
+}
+
 /// `run` with the clock passed in, so tests can step time. The clock is read once at the start
 /// and once after each note.
 fn run_with_clock(
@@ -157,6 +180,32 @@ fn run_with_clock(
     cancel: &AtomicBool,
     sink: &mut dyn FnMut(Vec<TextHit>, Progress),
     clock: &mut dyn FnMut() -> Instant,
+) -> RunEnd {
+    search_all(
+        notebook,
+        notes,
+        overlays,
+        matcher,
+        cancel,
+        sink,
+        clock,
+        &mut Vec::new(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`run_noting_skipped`'s arguments plus the test clock"
+)]
+fn search_all(
+    notebook: &Path,
+    notes: &[SearchNote],
+    overlays: &HashMap<PathBuf, String>,
+    matcher: &Matcher,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(Vec<TextHit>, Progress),
+    clock: &mut dyn FnMut() -> Instant,
+    skipped: &mut Vec<PathBuf>,
 ) -> RunEnd {
     let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
     let overlays: Vec<(String, &str)> = overlays
@@ -182,7 +231,10 @@ fn run_with_clock(
                 hits += 1;
             }
             Searched::NoMatch => {}
-            Searched::Skipped(reason) => progress.skipped[reason.index()] += 1,
+            Searched::Skipped(reason) => {
+                progress.skipped[reason.index()] += 1;
+                skipped.push(note.path.clone());
+            }
         }
         progress.visited += 1;
         if hits == RESULT_CAP && progress.visited < progress.total {
@@ -639,6 +691,33 @@ mod tests {
             &mut frozen_clock(),
         );
         assert_eq!(end, RunEnd::Completed);
+    }
+
+    #[test]
+    fn the_notes_a_search_skips_are_named() {
+        // Break caught: a narrowed search visiting only the last hits, so a note the last search
+        // skipped drops out of the status line and a note unreadable for a moment is never tried
+        // again.
+        let scratch = Scratch::new("skipped");
+        let plain = scratch.file("plain.md", b"needle");
+        let mut cloud = scratch.file("cloud.md", b"needle");
+        cloud.online_only = true;
+        let missing = note("gone.md", 5);
+        let mut skipped = Vec::new();
+        let end = run_noting_skipped(
+            &scratch.0,
+            &[plain, cloud, missing],
+            &HashMap::new(),
+            &find("needle"),
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+            &mut skipped,
+        );
+        assert_eq!(end, RunEnd::Completed);
+        assert_eq!(
+            skipped,
+            [PathBuf::from("cloud.md"), PathBuf::from("gone.md")]
+        );
     }
 
     #[test]

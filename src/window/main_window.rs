@@ -3752,14 +3752,15 @@ pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
     let identity = unsafe { window_identity(hwnd) }?;
     let (editor, inactive) = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
+        // While a file is populated the editor may show a document that is not the active tab's.
+        if app.populating_file {
+            return None;
+        }
         let editor = app.editor.clone()?;
         let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
         if target.id == active.id {
             return Some((editor, None));
-        }
-        if app.populating_file {
-            return None;
         }
         Some((editor, Some((target.handle.clone(), active.handle.clone()))))
     })?;
@@ -11040,6 +11041,16 @@ mod tests {
         (name.to_owned(), snippet.to_owned())
     }
 
+    /// Pumps posted messages, timers included, for twice the debounce.
+    fn pump_past_debounce(hwnd: HWND) {
+        let wait = 2 * u64::from(crate::window::text_search_host::DEBOUNCE_MS);
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+        while std::time::Instant::now() < until {
+            pump_posted_messages(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn search_selected(hwnd: HWND) -> Option<usize> {
         app_mut(hwnd).sidebar.as_ref().unwrap().search.list.selected
     }
@@ -11180,6 +11191,8 @@ mod tests {
         crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
         let before = search_generation(window.hwnd);
         crate::window::side_panel::refresh(window.hwnd);
+        // Past the debounce, so a re-run wrongly scheduled would have started.
+        pump_past_debounce(window.hwnd);
         assert_eq!(
             search_generation(window.hwnd),
             before,
@@ -11246,6 +11259,9 @@ mod tests {
         );
         // A refresh with the same notes runs nothing (spec §7).
         crate::window::side_panel::refresh(window.hwnd);
+        // Past the debounce, so a re-run wrongly scheduled by the save or the refresh would have
+        // started.
+        pump_past_debounce(window.hwnd);
         assert_eq!(search_generation(window.hwnd), searches, "no search re-ran");
 
         // The same query run again keeps the selection by path.
@@ -11557,6 +11573,13 @@ mod tests {
             Some((crate::window::search_view::TOO_SHORT.to_owned(), false))
         );
         assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+        // A second character clears "Type at least 2 characters." at once, not after the debounce.
+        type_into_search(window.hwnd, "ab");
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Idle
+        );
+        assert_eq!(crate::window::search_view::summary(window.hwnd), None);
         type_into_search(window.hwnd, "  ");
         assert_eq!(
             search_state(window.hwnd),
@@ -11622,6 +11645,139 @@ mod tests {
             search_rows(window.hwnd),
             vec![search_row("a", "costs 1+1 here")]
         );
+    }
+
+    #[test]
+    fn a_rescan_during_a_search_keeps_its_end_from_narrowing_the_next_one() {
+        // Break caught: a search still running when a rescan installs recording its pre-rescan
+        // hits for narrowing, so the next longer query misses a note edited outside FastPad.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-rescan-narrow");
+        scratch.note("a.md", "needle");
+        scratch.note("b.md", "needles");
+        scratch.note("c.md", "other");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "need");
+        crate::window::text_search_host::run_now(window.hwnd);
+        // The rescan lands while that search runs; then its end arrives.
+        crate::window::text_search_host::notes_reloaded(window.hwnd);
+        let end = crate::window::text_search_host::test_batch(
+            search_generation(window.hwnd),
+            Vec::new(),
+            Some(crate::library::text_search::RunEnd::Completed),
+        );
+        crate::window::text_search_host::batch_arrived(window.hwnd, end);
+
+        type_into_search(window.hwnd, "needl");
+        let before = search_generation(window.hwnd);
+        crate::window::text_search_host::run_now(window.hwnd);
+        wait_for_search(window.hwnd, before);
+        assert_eq!(
+            searched_total(window.hwnd),
+            3,
+            "every note, not the old hits"
+        );
+    }
+
+    #[test]
+    fn a_save_of_a_listed_note_ends_narrowing() {
+        // Break caught: a longer query narrowed to the hits found before FastPad saved a new
+        // phrase into a clean note, so the note is never found.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-save-narrow");
+        let x = scratch.note("x.md", "nothing");
+        scratch.note("y.md", "foo bar");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "foo");
+        assert_eq!(search_rows(window.hwnd), vec![search_row("y", "foo bar")]);
+        super::open_path(window.hwnd, &x).unwrap();
+        pump_posted_messages(window.hwnd);
+        editor.set_text("food here").unwrap();
+        assert!(super::save_active_document(window.hwnd));
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+
+        search_for(window.hwnd, "food");
+        assert_eq!(search_rows(window.hwnd), vec![search_row("x", "food here")]);
+    }
+
+    #[test]
+    fn a_narrowed_search_still_counts_the_notes_the_last_one_skipped() {
+        // Break caught: narrowing to the last hits only, so "1 note wasn't searched" disappears
+        // and a note that couldn't be read is never tried again.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-narrow-skipped");
+        scratch.note("a.md", "needle");
+        scratch.note("b.md", "needles");
+        let cloud = scratch.note("c.md", "needle in the cloud");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let relative = crate::library::record_path(&scratch.folder(), &cloud);
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            for note in state.notes.iter_mut() {
+                note.online_only = note.path == relative;
+            }
+        });
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        let skipped = |hwnd| match search_state(hwnd) {
+            crate::window::search_view::SearchState::Done { progress, .. } => {
+                progress.skipped_total()
+            }
+            other => panic!("the search has not finished: {other:?}"),
+        };
+        search_for(window.hwnd, "need");
+        assert_eq!((searched_total(window.hwnd), skipped(window.hwnd)), (3, 1));
+        search_for(window.hwnd, "needl");
+        assert_eq!(
+            (searched_total(window.hwnd), skipped(window.hwnd)),
+            (3, 1),
+            "the two hits and the skipped note"
+        );
+    }
+
+    #[test]
+    fn the_debounce_waits_out_a_modal_loop_and_a_file_population() {
+        // Break caught: the timer firing inside a nested modal loop or while a file is being
+        // populated, and swapping editor documents under it to read the dirty tabs.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-modal");
+        scratch.note("a.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        type_into_search(window.hwnd, "needle");
+        let before = search_generation(window.hwnd);
+        crate::window::answer_next_confirm(|hwnd| {
+            crate::window::text_search_host::timer(hwnd);
+            true
+        });
+        assert!(crate::window::modal::confirm(window.hwnd, "Go on?"));
+        assert!(
+            crate::window::text_search_host::cancel_flag(window.hwnd).is_none(),
+            "nothing ran inside the modal loop"
+        );
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Idle
+        );
+
+        app_mut(window.hwnd).populating_file = true;
+        crate::window::text_search_host::timer(window.hwnd);
+        app_mut(window.hwnd).populating_file = false;
+        assert!(
+            crate::window::text_search_host::cancel_flag(window.hwnd).is_none(),
+            "nothing ran during the population"
+        );
+        // The timer is still armed: the search runs once both are over.
+        wait_for_search(window.hwnd, before);
+        assert_eq!(search_rows(window.hwnd), vec![search_row("a", "needle")]);
     }
 
     #[test]

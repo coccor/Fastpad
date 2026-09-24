@@ -33,6 +33,9 @@ pub(crate) struct SearchBatch {
     pub progress: Progress,
     /// `Some` only on the last batch of a run that was not cancelled.
     pub end: Option<RunEnd>,
+    /// The notes the run skipped (online only, too large, unreadable or not text), on the `end`
+    /// batch only. A narrowed search visits them again.
+    pub skipped: Vec<PathBuf>,
 }
 
 /// What the last completed search found, so a longer plain query visits only those notes.
@@ -40,10 +43,11 @@ pub(crate) struct SearchBatch {
 struct Narrowing {
     query: String,
     options: MatchOptions,
+    /// Its hits and the notes it skipped.
     paths: Vec<PathBuf>,
-    /// The `list_mark` of the note list it searched and the `overlay_mark` of the tab texts it
-    /// read. A note added or removed, or an edit in a dirty tab, makes the old hits unsafe.
-    list: u64,
+    /// The `note_mark` of the notes it searched and the `overlay_mark` of the tab texts it read.
+    /// A note added, removed or saved, or an edit in a dirty tab, makes the old hits unsafe.
+    notes: u64,
     overlays: u64,
 }
 
@@ -52,7 +56,7 @@ struct Narrowing {
 struct Running {
     query: String,
     options: MatchOptions,
-    list: u64,
+    notes: u64,
     overlays: u64,
 }
 
@@ -91,6 +95,20 @@ fn list_mark(notes: &[NoteEntry]) -> u64 {
     hasher.finish()
 }
 
+/// A strict mark of the notes, for narrowing: `list_mark` plus each note's size and time, so a
+/// save by FastPad (which may add the phrase a longer query looks for) ends narrowing.
+fn note_mark(notes: &[NoteEntry]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    notes.len().hash(&mut hasher);
+    for note in notes {
+        note.path.hash(&mut hasher);
+        note.online_only.hash(&mut hasher);
+        note.size.hash(&mut hasher);
+        note.mtime.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// A mark of the dirty tabs' texts, the same whatever order the map iterates in.
 fn overlay_mark(overlays: &HashMap<PathBuf, String>) -> u64 {
     overlays
@@ -122,17 +140,34 @@ pub(crate) fn schedule(hwnd: HWND) {
     }
 }
 
-/// `WM_TIMER` for `TEXT_SEARCH_TIMER_ID`: the debounce ended.
+/// `WM_TIMER` for `TEXT_SEARCH_TIMER_ID`: the debounce ended. Inside a nested modal loop or while
+/// a file is populated it does nothing and leaves the timer armed, so it tries again at the next
+/// tick: reading the dirty tabs swaps editor documents, which neither may see.
 pub(crate) fn timer(hwnd: HWND) {
+    if busy(hwnd) {
+        return;
+    }
     run_now(hwnd);
+}
+
+/// A modal loop runs or a file is being populated (the guard `snapshot_next_document` uses).
+fn busy(hwnd: HWND) -> bool {
+    super::main_window::file_population_active(hwnd) || super::modal::modal_active(hwnd)
 }
 
 /// Cancels, kills the timer, and starts the search for the view's query and options now. It does
 /// nothing for a query that is too short or all white space, with no notebook, or while the
 /// library loads (`LIBRARY_READY` runs it through `library_changed`). A bad pattern shows its
-/// error and runs nothing.
+/// error and runs nothing. Called inside a modal loop or while a file is populated, it waits for
+/// the debounce timer instead (`timer`).
 pub(crate) fn run_now(hwnd: HWND) {
     cancel(hwnd);
+    if busy(hwnd) {
+        unsafe {
+            SetTimer(hwnd, TEXT_SEARCH_TIMER_ID, DEBOUNCE_MS, None);
+        }
+        return;
+    }
     let Some((query, options)) = search_view::current_query(hwnd) else {
         return;
     };
@@ -159,10 +194,11 @@ pub(crate) fn run_now(hwnd: HWND) {
     let candidate = with_host(hwnd, |host| host.previous.clone())
         .flatten()
         .filter(|previous| narrows(previous, &query, options, overlays_mark));
-    let Some((notes, list)) = library_host::with_state(hwnd, |state| {
+    let Some((notes, list, marked)) = library_host::with_state(hwnd, |state| {
         let list = list_mark(&state.notes);
+        let marked = note_mark(&state.notes);
         let keep: Option<HashSet<String>> = candidate
-            .filter(|previous| previous.list == list)
+            .filter(|previous| previous.notes == marked)
             .map(|previous| previous.paths.iter().map(|path| path_key(path)).collect());
         let notes = state
             .notes
@@ -173,7 +209,7 @@ pub(crate) fn run_now(hwnd: HWND) {
             })
             .map(SearchNote::from)
             .collect::<Vec<_>>();
-        (notes, list)
+        (notes, list, marked)
     }) else {
         return;
     };
@@ -186,7 +222,7 @@ pub(crate) fn run_now(hwnd: HWND) {
         host.running = Some(Running {
             query: query.clone(),
             options,
-            list,
+            notes: marked,
             overlays: overlays_mark,
         });
         (host.generation, flag)
@@ -252,18 +288,29 @@ fn spawn(hwnd: HWND, job: Job) {
                 hits,
                 progress,
                 end: None,
+                skipped: Vec::new(),
             };
             if !post(batch) {
                 cancel.store(true, Ordering::Relaxed);
             }
         };
-        let end = text_search::run(&notebook, &notes, &overlays, &matcher, &cancel, &mut sink);
+        let mut skipped = Vec::new();
+        let end = text_search::run_noting_skipped(
+            &notebook,
+            &notes,
+            &overlays,
+            &matcher,
+            &cancel,
+            &mut sink,
+            &mut skipped,
+        );
         if end != RunEnd::Cancelled && !cancel.load(Ordering::Relaxed) {
             post(SearchBatch {
                 generation,
                 hits: Vec::new(),
                 progress: last,
                 end: Some(end),
+                skipped,
             });
         }
     });
@@ -275,17 +322,20 @@ pub(crate) fn batch_arrived(hwnd: HWND, lparam: LPARAM) {
     if lparam == 0 {
         return;
     }
-    let batch = *unsafe { Box::from_raw(lparam as *mut SearchBatch) };
+    let mut batch = *unsafe { Box::from_raw(lparam as *mut SearchBatch) };
     if with_host(hwnd, |host| host.generation) != Some(batch.generation) {
         return;
     }
     let end = batch.end;
+    let skipped = std::mem::take(&mut batch.skipped);
     search_view::apply_batch(hwnd, batch);
     let Some(end) = end else {
         return;
     };
     let paths = if end == RunEnd::Completed {
-        search_view::result_paths(hwnd)
+        let mut paths = search_view::result_paths(hwnd);
+        paths.extend(skipped);
+        paths
     } else {
         Vec::new()
     };
@@ -296,7 +346,7 @@ pub(crate) fn batch_arrived(hwnd: HWND, lparam: LPARAM) {
                 query: run.query,
                 options: run.options,
                 paths,
-                list: run.list,
+                notes: run.notes,
                 overlays: run.overlays,
             }),
             _ => None,
@@ -330,9 +380,11 @@ pub(crate) fn forget(hwnd: HWND) {
 
 /// The library was loaded or rescanned (`library_host::install`): the next library change runs
 /// the query again even if no note was added or removed, since the files may have changed.
+/// A search still running read the files before the rescan, so its end records no narrowing.
 pub(crate) fn notes_reloaded(hwnd: HWND) {
     with_host(hwnd, |host| {
         host.previous = None;
+        host.running = None;
         host.list = None;
     });
 }
@@ -405,12 +457,15 @@ pub(crate) fn test_batch(generation: u64, hits: Vec<TextHit>, end: Option<RunEnd
         hits,
         progress: Progress::default(),
         end,
+        skipped: Vec::new(),
     })) as LPARAM
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_QUERY_CHARS, Narrowing, list_mark, narrows, overlay_mark, searchable};
+    use super::{
+        MIN_QUERY_CHARS, Narrowing, list_mark, narrows, note_mark, overlay_mark, searchable,
+    };
     use crate::library::NoteEntry;
     use crate::search::MatchOptions;
     use std::collections::HashMap;
@@ -484,6 +539,22 @@ mod tests {
     }
 
     #[test]
+    fn the_note_mark_also_follows_sizes_and_times() {
+        // Break caught: narrowing kept after FastPad saved a new phrase into a listed note, which
+        // changes its size and time but not the list of paths.
+        let base = note_mark(&[note("a.md", false)]);
+        assert_eq!(base, note_mark(&[note("a.md", false)]));
+        let mut saved = note("a.md", false);
+        saved.size = 99;
+        assert_ne!(base, note_mark(std::slice::from_ref(&saved)), "a new size");
+        saved.size = 10;
+        saved.mtime = 7;
+        assert_ne!(base, note_mark(&[saved]), "a new time");
+        assert_ne!(base, note_mark(&[note("a.md", true)]), "online-only");
+        assert_ne!(base, note_mark(&[note("b.md", false)]), "another path");
+    }
+
+    #[test]
     fn narrowing_needs_a_longer_plain_query_with_the_same_options_and_tab_texts() {
         // Break caught: a whole-word or regex query narrowed to an earlier query's hits ("xfoo"
         // contains "foo", but "foo" is not a whole word in "xfoo"), a shorter query narrowed, or
@@ -493,7 +564,7 @@ mod tests {
             query: "foo".to_owned(),
             options: plain,
             paths: Vec::new(),
-            list: 1,
+            notes: 1,
             overlays: 2,
         };
         assert!(narrows(&previous, "foo", plain, 2), "the same query again");
