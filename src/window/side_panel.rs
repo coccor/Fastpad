@@ -480,6 +480,7 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
     }
     update_tools(hwnd);
     crate::window::search_view::layout(hwnd);
+    crate::window::inline_name::place(hwnd);
 }
 
 /// `show_view` without its win events.
@@ -1017,11 +1018,18 @@ unsafe extern "system" fn panel_proc(
             unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
             0
         }
-        // The search box's text changed (the search runs again), or the replace field's (its
-        // text is kept).
+        // The inline name field's text changed (its live check runs), the search box's (the
+        // search runs again), or the replace field's (its text is kept).
         WM_COMMAND if lparam != 0 && ((wparam >> 16) & 0xffff) as u32 == EN_CHANGE => {
-            crate::window::search_view::edit_changed(main, lparam as HWND);
+            if crate::window::inline_name::owns(main, lparam as HWND) {
+                crate::window::inline_name::changed(main);
+            } else {
+                crate::window::search_view::edit_changed(main, lparam as HWND);
+            }
             0
+        }
+        WM_CTLCOLOREDIT if crate::window::inline_name::owns(main, lparam as HWND) => {
+            crate::window::inline_name::control_color(main, wparam as HDC) as LRESULT
         }
         WM_CTLCOLOREDIT => {
             crate::window::search_view::control_color(main, wparam as HDC) as LRESULT

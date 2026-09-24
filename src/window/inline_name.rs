@@ -1,19 +1,39 @@
 //! Naming notes and folders in the Notebook tree (inline naming spec): an `EDIT` field over a
-//! row's name for New note, New folder and both renames. This half is pure: what the typed text
-//! names, the live checks against the names beside it, the rename selection, the draft row, and
-//! where the field and its message go. No Win32 calls and no disk.
+//! row's name for New note, New folder and both renames. The pure half comes first; the field,
+//! the edit it shows and the commits follow.
 #![cfg_attr(
     not(test),
     expect(dead_code, reason = "wired up task by task by the inline naming plan")
 )]
 
+use super::main_window::push_notice;
+use super::notebook_view::{self, NotebookView, with_view};
+use super::side_panel;
+use crate::config::SidebarView;
 use crate::library::title;
 use crate::library::tree::{self, RowKind, TreeRow};
+use crate::platform::{last_error, wide_null};
 use crate::window::file_icons::{FOLDER_ICON, FileIcon, file_icon};
-use crate::window::panel::scale;
+use crate::window::library_host::{self, with_state};
+use crate::window::palette::Palette;
+use crate::window::panel::{create_child, scale};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateSolidBrush, DeleteObject, HBRUSH, HDC, InvalidateRect, SetBkColor, SetTextColor,
+};
+use windows_sys::Win32::UI::Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETSEL};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN, VK_TAB,
+};
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyWindow, ES_AUTOHSCROLL, EVENT_OBJECT_DESCRIPTIONCHANGE, GWL_STYLE, GetParent,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SW_HIDE, SW_SHOWNA,
+    SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, WM_CHAR, WM_KEYDOWN, WM_NCDESTROY,
+    WM_SETFONT, WS_CHILD, WS_VISIBLE,
+};
 
 // Sizes at 96 DPI; everything is scaled with `panel::scale`.
 /// How far the frame starts before the row's name.
@@ -22,6 +42,7 @@ const FRAME_OUTSET: i32 = 3;
 const FRAME_INSET_Y: i32 = 2;
 /// Where the text starts inside the frame.
 const TEXT_INSET: i32 = 3;
+const FIELD_HOOK_ID: usize = 0x4650_494E;
 
 /// What the field names. Paths are relative to the notebook; a new item's is the folder it
 /// goes in, empty for the root.
@@ -304,6 +325,666 @@ pub(crate) fn message_rect(frame: RECT, list: RECT, height: i32) -> RECT {
         bottom: frame.top,
         ..frame
     }
+}
+
+/// How an edit is being committed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum How {
+    /// Enter in the field: a problem keeps the field open with its message (spec §5.2).
+    Enter,
+    /// Focus left the field for another FastPad window, a click in the tree, or another edit
+    /// starting (spec §3.4, §5.3): a problem closes the field with a notice, and nothing moves
+    /// the focus from where it went.
+    FocusLeft,
+}
+
+/// The edit the field shows.
+#[derive(Debug)]
+struct Edit {
+    purpose: Purpose,
+    /// The field's text as `EN_CHANGE` last reported it.
+    text: String,
+    /// The lowercased names listed beside the edited name (`sibling_names`), from the rows last
+    /// built.
+    siblings: HashSet<String>,
+    /// The message under the field: the live check's, or a failed Enter's.
+    problem: Option<String>,
+    /// The field's accessible name (spec §6).
+    accessible: String,
+    /// `problem` changed since screen readers last heard it.
+    announce: bool,
+    /// Focus left FastPad while the field had it: it goes back when the window is active again
+    /// (spec §5.3).
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "read by the focus handling (inline naming plan, Task 5)"
+        )
+    )]
+    refocus: bool,
+}
+
+impl Edit {
+    fn recheck(&mut self) {
+        let problem = check(&self.purpose, &self.text, &self.siblings);
+        self.show(problem);
+    }
+
+    fn show(&mut self, problem: Option<String>) {
+        if problem != self.problem {
+            self.problem = problem;
+            self.announce = true;
+        }
+    }
+}
+
+/// The Notebook view's inline name field and the one edit it shows, owned by `NotebookView`.
+#[derive(Debug)]
+pub(crate) struct InlineName {
+    /// The field, made on the first edit (spec §7), a child of the side panel.
+    field: Option<HWND>,
+    /// The field could not be made; it is not tried again.
+    failed: bool,
+    edit: Option<Edit>,
+    /// The edited row's index in the view's rows, from the last `fit`.
+    row: Option<usize>,
+    /// `row` is the draft row.
+    draft: bool,
+    /// The field font's text height, measured by `place`.
+    text_height: i32,
+    colors: Palette,
+    /// The field's background for `WM_CTLCOLOREDIT`, made on its first use.
+    brush: HBRUSH,
+}
+
+impl InlineName {
+    pub(crate) fn new() -> Self {
+        Self {
+            field: None,
+            failed: false,
+            edit: None,
+            row: None,
+            draft: false,
+            text_height: 0,
+            colors: Palette::neutral(),
+            brush: std::ptr::null_mut(),
+        }
+    }
+
+    fn begin(&mut self, purpose: Purpose, text: String, accessible: String) {
+        self.edit = Some(Edit {
+            purpose,
+            text,
+            siblings: HashSet::new(),
+            problem: None,
+            accessible,
+            announce: false,
+            refocus: false,
+        });
+        self.row = None;
+        self.draft = false;
+    }
+
+    /// Ends the open edit, if any; `place` hides the field afterwards, with nothing borrowed.
+    /// Returns whether there was one.
+    pub(crate) fn end(&mut self) -> bool {
+        self.row = None;
+        self.draft = false;
+        self.edit.take().is_some()
+    }
+
+    /// A New note or New folder edit is open: its draft row needs the tree.
+    pub(crate) fn wants_draft(&self) -> bool {
+        self.edit
+            .as_ref()
+            .is_some_and(|edit| edit.purpose.draft_parent().is_some())
+    }
+
+    /// Fits the edit to freshly built `rows` (spec §5.4): the draft row goes back in as the
+    /// first child of its folder, or the renamed row is found; the sibling names and the live
+    /// check follow the new rows. False, changing nothing, when the folder or the row is gone:
+    /// the caller ends the edit. True with no edit open.
+    pub(crate) fn fit(&mut self, rows: &mut Vec<TreeRow>) -> bool {
+        self.row = None;
+        self.draft = false;
+        let Some(edit) = self.edit.as_mut() else {
+            return true;
+        };
+        let Some(parent) = parent_row(rows, edit.purpose.parent()) else {
+            return false;
+        };
+        let row = match edit.purpose.own_row() {
+            Some(own) => tree::row_index(rows, &own),
+            None => insert_draft(rows, parent),
+        };
+        let Some(row) = row else {
+            return false;
+        };
+        edit.siblings = sibling_names(rows, parent, Some(row));
+        edit.recheck();
+        self.draft = edit.purpose.draft_parent().is_some();
+        self.row = Some(row);
+        true
+    }
+
+    pub(crate) fn row(&self) -> Option<usize> {
+        self.row
+    }
+
+    pub(crate) fn draft_at(&self) -> Option<usize> {
+        self.row.filter(|_| self.draft)
+    }
+
+    pub(crate) fn draft_icon(&self) -> FileIcon {
+        self.edit.as_ref().map_or(file_icon(Some("md")), |edit| {
+            draft_icon(&edit.purpose, &edit.text)
+        })
+    }
+
+    pub(crate) fn problem(&self) -> Option<&str> {
+        self.edit.as_ref()?.problem.as_deref()
+    }
+
+    pub(crate) fn text_height(&self) -> i32 {
+        self.text_height
+    }
+
+    /// Recolors for a theme change (the panel's paint calls it).
+    pub(crate) fn set_colors(&mut self, colors: Palette) {
+        if colors == self.colors {
+            return;
+        }
+        self.colors = colors;
+        if !self.brush.is_null() {
+            unsafe { DeleteObject(self.brush) };
+            self.brush = std::ptr::null_mut();
+        }
+    }
+
+    fn brush(&mut self) -> HBRUSH {
+        if self.brush.is_null() {
+            self.brush = unsafe { CreateSolidBrush(self.colors.editor_background) };
+        }
+        self.brush
+    }
+}
+
+impl Drop for InlineName {
+    fn drop(&mut self) {
+        if !self.brush.is_null() {
+            unsafe { DeleteObject(self.brush) };
+        }
+    }
+}
+
+fn with_inline<R>(hwnd: HWND, f: impl FnOnce(&mut InlineName) -> R) -> Option<R> {
+    with_view(hwnd, |view| f(&mut view.inline))
+}
+
+fn field_of(hwnd: HWND) -> Option<HWND> {
+    with_inline(hwnd, |inline| inline.field).flatten()
+}
+
+/// Whether an edit is open.
+pub(crate) fn is_open(hwnd: HWND) -> bool {
+    with_inline(hwnd, |inline| inline.edit.is_some()).unwrap_or(false)
+}
+
+/// Whether `control` is the field.
+pub(crate) fn owns(hwnd: HWND, control: HWND) -> bool {
+    !control.is_null() && with_inline(hwnd, |inline| inline.field == Some(control)).unwrap_or(false)
+}
+
+fn field_text(field: HWND) -> String {
+    unsafe {
+        let length = GetWindowTextLengthW(field);
+        if length <= 0 {
+            return String::new();
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(field, buffer.as_mut_ptr(), buffer.len() as i32);
+        buffer.truncate(copied.max(0) as usize);
+        String::from_utf16_lossy(&buffer)
+    }
+}
+
+fn set_field_text(field: HWND, text: &str) {
+    let wide = wide_null(text);
+    unsafe {
+        SetWindowTextW(field, wide.as_ptr());
+    }
+}
+
+/// The field, made now if the view has none yet. A failure is reported once.
+fn ensure_field(hwnd: HWND) -> Option<HWND> {
+    let (panel, field, failed) = with_view(hwnd, |view| {
+        (view.panel, view.inline.field, view.inline.failed)
+    })?;
+    if field.is_some() || failed {
+        return field;
+    }
+    // Made with nothing of the App borrowed: creating the Edit sends messages to the panel.
+    match create_field(panel) {
+        Ok(field) => {
+            if with_inline(hwnd, |inline| inline.field = Some(field)).is_none() {
+                unsafe { DestroyWindow(field) };
+                return None;
+            }
+            Some(field)
+        }
+        Err(error) => {
+            with_inline(hwnd, |inline| inline.failed = true);
+            push_notice(
+                hwnd,
+                format!("FastPad could not show the name field: {error}"),
+            );
+            None
+        }
+    }
+}
+
+/// A hidden single-line `Edit` inside `panel`, subclassed by `field_proc`.
+fn create_field(panel: HWND) -> crate::Result<HWND> {
+    let field = create_child(panel, &wide_null("Edit"), WS_CHILD | ES_AUTOHSCROLL as u32)?;
+    if unsafe { SetWindowSubclass(field, Some(field_proc), FIELD_HOOK_ID, 0) } == 0 {
+        let error = last_error();
+        unsafe {
+            DestroyWindow(field);
+        }
+        return Err(error);
+    }
+    Ok(field)
+}
+
+fn key_down(key: u16) -> bool {
+    let state = unsafe { GetKeyState(i32::from(key)) };
+    state < 0
+}
+
+/// The field's keys (spec §5.1): Enter commits, Esc cancels, Tab does nothing, Ctrl+A selects
+/// all and Ctrl+Backspace deletes the word before the caret. Everything else is the Edit's own.
+unsafe extern "system" fn field_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass_id: usize,
+    _ref_data: usize,
+) -> LRESULT {
+    if message == WM_NCDESTROY {
+        unsafe {
+            RemoveWindowSubclass(hwnd, Some(field_proc), subclass_id);
+            return DefSubclassProc(hwnd, message, wparam, lparam);
+        }
+    }
+    let main = unsafe { GetParent(GetParent(hwnd)) };
+    // A single-line Edit beeps at Enter, Escape and Tab, and types a box for Ctrl+A and
+    // Ctrl+Backspace: all are handled on key down.
+    if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b | 0x09 | 0x01 | 0x7f) {
+        return 0;
+    }
+    if message == WM_KEYDOWN {
+        let ctrl = key_down(VK_CONTROL) && !key_down(VK_MENU);
+        match wparam as u16 {
+            VK_RETURN => {
+                commit(main, How::Enter);
+                return 0;
+            }
+            VK_ESCAPE => {
+                cancel(main);
+                notebook_view::focus_tree(main);
+                return 0;
+            }
+            VK_TAB => return 0,
+            key if ctrl && key == u16::from(b'A') => {
+                unsafe { SendMessageW(hwnd, EM_SETSEL, 0, -1) };
+                return 0;
+            }
+            VK_BACK if ctrl => {
+                delete_word_before(hwnd);
+                return 0;
+            }
+            _ => {}
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+/// Ctrl+Backspace: deletes the selection, or back to `word_start`, as one undoable change.
+fn delete_word_before(field: HWND) {
+    let (mut start, mut end) = (0_u32, 0_u32);
+    unsafe {
+        SendMessageW(
+            field,
+            EM_GETSEL,
+            &mut start as *mut u32 as WPARAM,
+            &mut end as *mut u32 as LPARAM,
+        );
+    }
+    if start == end {
+        let text: Vec<u16> = field_text(field).encode_utf16().collect();
+        start = word_start(&text, end as usize) as u32;
+        unsafe { SendMessageW(field, EM_SETSEL, start as WPARAM, end as LPARAM) };
+    }
+    let empty = [0u16];
+    unsafe { SendMessageW(field, EM_REPLACESEL, 1, empty.as_ptr() as LPARAM) };
+}
+
+/// Starts an edit for `purpose` (spec §3): the one already open commits first (§3.4), the find
+/// bar and the name bar close, the Notebook view shows, a draft's folder expands, and the field
+/// takes the keyboard focus over its row. Nothing touches the disk.
+fn start(hwnd: HWND, purpose: Purpose) {
+    if !library_host::ready_library(hwnd) || side_panel::windows(hwnd).is_none() {
+        return;
+    }
+    commit(hwnd, How::FocusLeft);
+    super::main_window::close_find_bar(hwnd);
+    library_host::close_name_box(hwnd);
+    if side_panel::current_view(hwnd) != SidebarView::Notebook {
+        side_panel::show_view(hwnd, SidebarView::Notebook, false);
+    }
+    if let Some(parent) = purpose.draft_parent() {
+        let mut folders = tree::ancestors(parent);
+        if !parent.as_os_str().is_empty() {
+            folders.push(parent.to_path_buf());
+        }
+        for folder in folders {
+            library_host::set_expanded(hwnd, &folder, true);
+        }
+    }
+    let Some(field) = ensure_field(hwnd) else {
+        return;
+    };
+    let text = purpose.current_name().unwrap_or_default();
+    let (select_from, select_to) = rename_selection(&text, purpose.is_folder());
+    let notebook = library_host::folder(hwnd)
+        .map(|root| library_host::notebook_name(&root))
+        .unwrap_or_default();
+    let accessible = accessible_name(&purpose, &notebook);
+    with_inline(hwnd, |inline| {
+        inline.begin(purpose, text.clone(), accessible.clone())
+    });
+    side_panel::with_accessible_events(hwnd, || notebook_view::rebuild(hwnd));
+    // The rebuild found no folder or row for it.
+    if !is_open(hwnd) {
+        return;
+    }
+    with_view(hwnd, NotebookView::reveal_edit);
+    // Filled and focused with nothing of the App borrowed: the Edit sends EN_CHANGE to the
+    // panel, and SetFocus sends focus messages.
+    set_field_text(field, &text);
+    let _ = crate::platform::annotation::annotate(field, &accessible, "");
+    place(hwnd);
+    unsafe {
+        SetFocus(field);
+        SendMessageW(field, EM_SETSEL, select_from, select_to as LPARAM);
+    }
+}
+
+/// The folder a new item goes in, relative to the notebook (spec §3.1): `parent`, else the
+/// folder of the selected row, else the root. `None` for a path that is not a plain relative
+/// folder, so nothing is expanded or drafted outside the notebook.
+fn target_folder(hwnd: HWND, parent: Option<PathBuf>) -> Option<PathBuf> {
+    let parent = parent.unwrap_or_else(|| {
+        let root = library_host::folder(hwnd);
+        notebook_view::selected_folder(hwnd)
+            .zip(root)
+            .map(|(selected, root)| library_host::relative_folder(&root, &selected))
+            .unwrap_or_default()
+    });
+    (parent.as_os_str().is_empty() || tree::is_plain_relative_folder(&parent)).then_some(parent)
+}
+
+/// The header's New folder, "New folder here" (`parent`) and Notebook: New folder… (spec §3.2).
+pub(crate) fn new_folder(hwnd: HWND, parent: Option<PathBuf>) {
+    if let Some(parent) = target_folder(hwnd, parent) {
+        start(hwnd, Purpose::NewFolder(parent));
+    }
+}
+
+/// `EN_CHANGE` from the field: the live check runs on what is typed now, against the rows in
+/// memory (spec §4.4). No disk access.
+pub(crate) fn changed(hwnd: HWND) {
+    let Some(field) = field_of(hwnd) else {
+        return;
+    };
+    // Read with nothing of the App borrowed.
+    let text = field_text(field);
+    let panel = with_view(hwnd, |view| {
+        let edit = view.inline.edit.as_mut()?;
+        edit.text = text;
+        edit.recheck();
+        Some(view.panel)
+    })
+    .flatten();
+    if let Some(panel) = panel {
+        unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+    }
+    announce(hwnd);
+}
+
+/// Tells screen readers about a problem that appeared, changed or went (spec §6): the field's
+/// description, and `EVENT_OBJECT_DESCRIPTIONCHANGE`.
+fn announce(hwnd: HWND) {
+    let Some((field, name, description)) = with_inline(hwnd, |inline| {
+        let field = inline.field?;
+        let edit = inline.edit.as_mut()?;
+        std::mem::take(&mut edit.announce).then(|| {
+            (
+                field,
+                edit.accessible.clone(),
+                edit.problem.clone().unwrap_or_default(),
+            )
+        })
+    })
+    .flatten() else {
+        return;
+    };
+    let _ = crate::platform::annotation::annotate(field, &name, &description);
+    super::sidebar_accessibility::raise(field, &[(EVENT_OBJECT_DESCRIPTIONCHANGE, 0)]);
+}
+
+/// `WM_CTLCOLOREDIT` for the field.
+pub(crate) fn control_color(hwnd: HWND, dc: HDC) -> HBRUSH {
+    with_inline(hwnd, |inline| {
+        unsafe {
+            SetTextColor(dc, inline.colors.editor_foreground);
+            SetBkColor(dc, inline.colors.editor_background);
+        }
+        inline.brush()
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Moves the field over its row's name, clipped to the list (spec §5.4), or hides it: when no
+/// edit is open, when it has no row, or when the row is out of view. A field scrolled out of
+/// view keeps the focus and goes on editing; one whose edit ended hands the focus to the tree.
+/// Runs after every rebuild, scroll and layout, with nothing of the App borrowed.
+pub(crate) fn place(hwnd: HWND) {
+    let Some((field, editing)) = with_inline(hwnd, |inline| {
+        inline.field.map(|field| (field, inline.edit.is_some()))
+    })
+    .flatten() else {
+        return;
+    };
+    let font = super::main_window::ui_fonts(hwnd).text;
+    let text_height = crate::window::panel::text_height(field, font);
+    let layout = with_view(hwnd, |view| {
+        view.inline.text_height = text_height;
+        view.inline_layout()
+    })
+    .flatten();
+    unsafe {
+        match layout {
+            Some(layout) => {
+                if !font.is_null() {
+                    SendMessageW(field, WM_SETFONT, font as WPARAM, 0);
+                }
+                let edit = layout.edit;
+                MoveWindow(
+                    field,
+                    edit.left,
+                    edit.top,
+                    edit.right - edit.left,
+                    edit.bottom - edit.top,
+                    1,
+                );
+                ShowWindow(field, SW_SHOWNA);
+            }
+            None => {
+                let focused = GetFocus() == field;
+                if editing && focused {
+                    hide_keeping_focus(field);
+                } else {
+                    if focused {
+                        SetFocus(GetParent(field));
+                    }
+                    ShowWindow(field, SW_HIDE);
+                }
+            }
+        }
+    }
+    announce(hwnd);
+}
+
+/// Hides the focused field without taking its focus: `ShowWindow(SW_HIDE)` would move the
+/// focus to the panel, and the typing with it, while the field is only scrolled out of view
+/// (inline naming spec §5.4). It shrinks away first, so the panel repaints where it was, then
+/// turns invisible by its style alone; `ShowWindow` shows it again.
+unsafe fn hide_keeping_focus(field: HWND) {
+    unsafe {
+        MoveWindow(field, 0, 0, 0, 0, 1);
+        let style = GetWindowLongPtrW(field, GWL_STYLE);
+        SetWindowLongPtrW(field, GWL_STYLE, style & !(WS_VISIBLE as isize));
+    }
+}
+
+/// Ends the edit with no disk access; returns whether one was open.
+fn end(hwnd: HWND) -> bool {
+    with_inline(hwnd, InlineName::end).unwrap_or(false)
+}
+
+/// Cancels the open edit, if any: the draft row goes and the field hides (spec §5.1, §5.4).
+pub(crate) fn cancel(hwnd: HWND) {
+    if end(hwnd) {
+        side_panel::with_accessible_events(hwnd, || notebook_view::rebuild(hwnd));
+    }
+}
+
+/// An empty or unchanged name: the edit cancels without a message (spec §5.2). Enter returns
+/// the focus to the tree, as Esc does.
+fn cancelled(hwnd: HWND, how: How) {
+    cancel(hwnd);
+    if how == How::Enter {
+        notebook_view::focus_tree(hwnd);
+    }
+}
+
+/// A commit that cannot go ahead (spec §5.2, §5.3): after Enter the message shows under the
+/// field, which stays; after focus left, the field closes and the message is a notice.
+fn fail(hwnd: HWND, how: How, message: String) {
+    match how {
+        How::Enter => {
+            let panel = with_view(hwnd, |view| {
+                if let Some(edit) = view.inline.edit.as_mut() {
+                    edit.show(Some(message));
+                }
+                view.panel
+            });
+            if let Some(panel) = panel {
+                unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+            }
+            announce(hwnd);
+        }
+        How::FocusLeft => {
+            cancel(hwnd);
+            push_notice(hwnd, message);
+        }
+    }
+}
+
+/// Commits the open edit, if any (spec §5.2): refused while a problem shows, else the one disk
+/// call its purpose makes.
+pub(crate) fn commit(hwnd: HWND, how: How) {
+    let Some((purpose, problem, field)) = with_inline(hwnd, |inline| {
+        let edit = inline.edit.as_ref()?;
+        Some((edit.purpose.clone(), edit.problem.clone(), inline.field?))
+    })
+    .flatten() else {
+        return;
+    };
+    if let Some(problem) = problem {
+        fail(hwnd, how, problem);
+        return;
+    }
+    // Read with nothing of the App borrowed.
+    let text = field_text(field);
+    match purpose {
+        Purpose::NewFolder(parent) => commit_new_folder(hwnd, how, &parent, &text),
+        Purpose::NewNote(_) | Purpose::RenameNote(_) | Purpose::RenameFolder(_) => {
+            cancelled(hwnd, how);
+        }
+    }
+}
+
+/// New folder (spec §5.2): the folder is made with the one disk call, listed, and its row
+/// selected. After Enter the focus stays in the tree.
+fn commit_new_folder(hwnd: HWND, how: How, parent: &Path, text: &str) {
+    let Some(root) = library_host::folder(hwnd) else {
+        cancel(hwnd);
+        return;
+    };
+    let Some(name) = title::folder_name(text) else {
+        cancelled(hwnd, how);
+        return;
+    };
+    let relative = parent.join(&name);
+    // Defence in depth: the folder made must be a plain relative one inside the notebook.
+    if !tree::is_plain_relative_folder(&relative) {
+        cancel(hwnd);
+        return;
+    }
+    if let Err(error) = std::fs::create_dir(root.join(&relative)) {
+        // A file, or a folder the tree doesn't list, may already have the name.
+        let error = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            library_host::folder_taken_error(&name)
+        } else {
+            format!("FastPad could not create the folder: {error}")
+        };
+        fail(hwnd, how, error);
+        return;
+    }
+    with_state(hwnd, |state| state.add_folder(&relative));
+    for ancestor in tree::ancestors(&relative) {
+        library_host::set_expanded(hwnd, &ancestor, true);
+    }
+    end(hwnd);
+    side_panel::with_accessible_events(hwnd, || {
+        side_panel::refresh(hwnd);
+        notebook_view::select_row(hwnd, &RowKind::Folder(relative.clone()));
+    });
+    if how == How::Enter {
+        notebook_view::focus_tree(hwnd);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn field_hwnd(hwnd: HWND) -> Option<HWND> {
+    field_of(hwnd)
+}
+
+#[cfg(test)]
+pub(crate) fn purpose(hwnd: HWND) -> Option<Purpose> {
+    with_inline(hwnd, |inline| {
+        inline.edit.as_ref().map(|edit| edit.purpose.clone())
+    })
+    .flatten()
+}
+
+#[cfg(test)]
+pub(crate) fn problem(hwnd: HWND) -> Option<String> {
+    with_inline(hwnd, |inline| inline.problem().map(str::to_owned)).flatten()
 }
 
 #[cfg(test)]

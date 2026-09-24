@@ -1,3 +1,4 @@
+pub mod annotation;
 pub mod dialogs;
 pub mod files;
 pub mod handles;

@@ -9,9 +9,10 @@ use crate::document::{Document, DocumentId};
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
 use crate::window::commands::CommandId;
 use crate::window::file_icons::{FOLDER_ICON, FileIcon, IconFont, file_icon};
+use crate::window::inline_name::{FieldLayout, InlineName};
 use crate::window::menus::MenuEntry;
 use crate::window::palette::{FileIcons, Palette};
-use crate::window::panel::{fill, scale};
+use crate::window::panel::{fill, inset, scale};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::tooltip::Tooltip;
 use std::collections::HashSet;
@@ -19,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DT_WORDBREAK, GetDC, GetTextExtentPoint32W, HDC, HFONT, InvalidateRect, ReleaseDC,
-    ScreenToClient, SelectObject,
+    ClientToScreen, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK, DrawTextW, GetDC, GetTextExtentPoint32W, HDC, HFONT, InvalidateRect,
+    ReleaseDC, ScreenToClient, SelectObject,
 };
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -403,6 +404,8 @@ pub(crate) struct NotebookView {
     /// Bumped whenever a rebuild changes the rows' order or the RECENT list, so screen readers
     /// hear a reorder even at the same count (`AccessibleView::accessible_generation`).
     order: u64,
+    /// The inline name field and its edit (inline naming spec §3).
+    pub(crate) inline: InlineName,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -445,6 +448,7 @@ fn draw_tree_row(
     fonts: UiFonts,
     dpi: u32,
     pin_hot: bool,
+    editing: Option<FileIcon>,
 ) {
     let foreground = row_foreground(look, palette);
     let muted = if look.selected && look.focused {
@@ -495,7 +499,11 @@ fn draw_tree_row(
         RowKind::Unsaved(_) => {
             unsafe { draw_text(dc, GLYPH_NOTE, parts.icon, fonts.glyph, muted, CENTERED) };
         }
-        RowKind::Draft => {}
+        RowKind::Draft => {
+            if let Some(icon) = editing {
+                draw_icon(icon);
+            }
+        }
     }
     if matches!(row.kind, RowKind::Note(_)) {
         // Pinned is a filled glyph, never color alone (spec §10). Segoe's PinFill is only the
@@ -509,6 +517,10 @@ fn draw_tree_row(
             let color = if pin_hot { foreground } else { muted };
             unsafe { draw_text(dc, GLYPH_PIN, parts.pin, fonts.glyph, color, CENTERED) };
         }
+    }
+    // The field covers an edited row's name (inline naming spec §3.3).
+    if editing.is_some() {
+        return;
     }
     let font = if matches!(row.kind, RowKind::Unsaved(_)) {
         fonts.italic
@@ -577,6 +589,7 @@ impl NotebookView {
             tracking_leave: false,
             built: None,
             order: 0,
+            inline: InlineName::new(),
             #[cfg(test)]
             rebuilds: 0,
         }
@@ -633,6 +646,123 @@ impl NotebookView {
         })
     }
 
+    /// The inline field's layout in `area` (the panel's client rectangle) at `dpi`: over the
+    /// edited row's name, clipped to the list. `None` while nothing is edited or the row is out
+    /// of view.
+    fn inline_layout_in(&self, area: RECT, dpi: u32) -> Option<FieldLayout> {
+        if self.mode != Mode::Tree {
+            return None;
+        }
+        let index = self.inline.row()?;
+        let list = self.list_area(area, dpi);
+        let top = self.list.row_top(index)?;
+        let row = RECT {
+            left: list.left,
+            top: list.top + top,
+            right: list.right,
+            bottom: list.top + top + self.list.row_height,
+        };
+        crate::window::inline_name::field_layout(
+            row,
+            list,
+            self.rows.get(index)?.depth,
+            dpi,
+            self.inline.text_height(),
+        )
+    }
+
+    /// `inline_layout_in` for the panel as it is now (`inline_name::place`).
+    pub(crate) fn inline_layout(&self) -> Option<FieldLayout> {
+        self.inline_layout_in(self.client(), self.dpi())
+    }
+
+    /// Brings the edited row into view: a draft row scrolled to, a renamed row selected too
+    /// (inline naming spec §3.4).
+    pub(crate) fn reveal_edit(&mut self) {
+        let Some(index) = self.inline.row() else {
+            return;
+        };
+        let height = self.list_height();
+        if self.inline.draft_at().is_some() {
+            self.list.ensure_visible(index, height);
+        } else {
+            self.list.select(index, height);
+        }
+        self.invalidate();
+    }
+
+    /// Row `index`'s rectangle in panel coordinates, for tests that click a row.
+    #[cfg(test)]
+    pub(crate) fn row_rect_at(&self, index: usize) -> Option<RECT> {
+        self.row_rect(self.list_rect(self.client()), index)
+    }
+
+    /// The inline field's frame, in the accent colour or the error colour while a problem
+    /// shows, and the problem under the field, or above it without room below (inline naming
+    /// spec §4.4).
+    fn paint_inline(
+        &self,
+        dc: HDC,
+        layout: FieldLayout,
+        list: RECT,
+        palette: &Palette,
+        fonts: UiFonts,
+        dpi: u32,
+    ) {
+        let problem = self.inline.problem();
+        let outline = if problem.is_some() {
+            palette.error_foreground
+        } else {
+            palette.selection_background
+        };
+        unsafe {
+            fill(dc, layout.frame, outline);
+            fill(dc, inset(layout.frame, 1), palette.editor_background);
+        }
+        let Some(problem) = problem else {
+            return;
+        };
+        let pad = scale(4, dpi);
+        let text: Vec<u16> = problem.encode_utf16().collect();
+        let mut measured = RECT {
+            left: 0,
+            top: 0,
+            right: (layout.frame.right - layout.frame.left - 2 * pad).max(1),
+            bottom: 0,
+        };
+        unsafe {
+            let previous = SelectObject(dc, fonts.text);
+            DrawTextW(
+                dc,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut measured,
+                DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+            );
+            SelectObject(dc, previous);
+        }
+        let rect =
+            crate::window::inline_name::message_rect(layout.frame, list, measured.bottom + 2 * pad);
+        let inner = RECT {
+            left: rect.left + pad,
+            top: rect.top + pad,
+            right: rect.right - pad,
+            bottom: rect.bottom - pad,
+        };
+        unsafe {
+            fill(dc, rect, palette.error_foreground);
+            fill(dc, inset(rect, 1), palette.editor_background);
+            draw_text(
+                dc,
+                problem,
+                inner,
+                fonts.text,
+                palette.error_foreground,
+                DT_WORDBREAK | DT_NOPREFIX,
+            );
+        }
+    }
+
     fn target(&self, index: usize) -> Target {
         match self.mode {
             Mode::NoNotebook => self
@@ -655,7 +785,20 @@ impl NotebookView {
         self.invalidate();
     }
 
-    fn apply(&mut self, snapshot: Snapshot, names: Vec<(String, Option<String>)>) {
+    fn apply(&mut self, mut snapshot: Snapshot, names: Vec<(String, Option<String>)>) {
+        // A draft row needs the tree, even in a notebook with nothing listed yet (inline naming
+        // spec §3.1).
+        if snapshot.mode == Mode::Empty && self.inline.wants_draft() {
+            snapshot.mode = Mode::Tree;
+        }
+        // The edit ends with its notebook, when the tree goes, or when its folder or row is no
+        // longer listed (spec §5.4); `fit` puts the draft row back in.
+        if snapshot.root != self.root
+            || snapshot.mode != Mode::Tree
+            || !self.inline.fit(&mut snapshot.rows)
+        {
+            self.inline.end();
+        }
         let reset = snapshot.mode != self.mode || snapshot.root != self.root;
         if reset {
             self.list = RowListState::new(self.list.row_height);
@@ -1019,9 +1162,16 @@ impl NotebookView {
             Mode::Tree => {
                 // `row_list::paint` draws the rows in view and the scroll thumb.
                 let list = self.list_rect(area);
+                self.inline.set_colors(*palette);
                 let rows = &self.rows;
                 let hover_pin = self.hover_pin;
                 let icons = &paint.icons;
+                // The edited row leaves its name to the field; a draft row shows the icon for
+                // what is typed so far (inline naming spec §3.1, §3.3).
+                let edited = self
+                    .inline
+                    .row()
+                    .map(|index| (index, self.inline.draft_icon()));
                 row_list::paint(
                     dc,
                     list,
@@ -1029,6 +1179,8 @@ impl NotebookView {
                     palette,
                     focused,
                     &mut |dc, index, rect, look| {
+                        let editing =
+                            edited.and_then(|(edited, icon)| (edited == index).then_some(icon));
                         draw_tree_row(
                             dc,
                             rows.get(index),
@@ -1039,9 +1191,13 @@ impl NotebookView {
                             fonts,
                             dpi,
                             hover_pin && look.hover,
+                            editing,
                         );
                     },
                 );
+                if let Some(layout) = self.inline_layout_in(area, dpi) {
+                    self.paint_inline(dc, layout, list, palette, fonts, dpi);
+                }
             }
         }
     }
@@ -1120,6 +1276,28 @@ impl NotebookView {
         &self.rows
     }
 
+    /// The tree rows screen readers see: all but the draft row (inline naming spec §6).
+    fn accessible_rows(&self) -> usize {
+        self.rows.len() - usize::from(self.inline.draft_at().is_some())
+    }
+
+    /// The row that accessible tree row `index` stands for.
+    fn row_of_accessible(&self, index: usize) -> usize {
+        match self.inline.draft_at() {
+            Some(draft) if index >= draft => index + 1,
+            _ => index,
+        }
+    }
+
+    /// Row `index`'s accessible tree row; `None` for the draft row.
+    fn accessible_of_row(&self, index: usize) -> Option<usize> {
+        match self.inline.draft_at() {
+            Some(draft) if index == draft => None,
+            Some(draft) if index > draft => Some(index - 1),
+            _ => Some(index),
+        }
+    }
+
     pub(crate) fn list(&self) -> &RowListState {
         &self.list
     }
@@ -1178,7 +1356,7 @@ struct Snapshot {
     key: RebuildKey,
 }
 
-fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -> Option<R> {
+pub(crate) fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -> Option<R> {
     unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         unsafe { app.as_mut() }
             .sidebar
@@ -1251,6 +1429,8 @@ pub(crate) fn rebuild(hwnd: HWND) {
         view.apply(snapshot, names);
         view.invalidate();
     });
+    // The field follows its row, or goes with an edit the rebuild ended (inline naming spec §5.4).
+    super::inline_name::place(hwnd);
 }
 
 /// The row for the active tab: its note inside the open notebook, or its unsaved entry.
@@ -1298,6 +1478,7 @@ pub(crate) fn active_tab_changed(hwnd: HWND) {
         }
         view.invalidate();
     });
+    super::inline_name::place(hwnd);
 }
 
 /// An untitled tab's label changed (`library_host::refresh_label`): its row is renamed in place,
@@ -1402,14 +1583,17 @@ pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
 
 /// Selects the row showing `kind` and scrolls it into view; false when no row shows it.
 pub(crate) fn select_row(hwnd: HWND, kind: &RowKind) -> bool {
-    with_view(hwnd, |view| {
+    let selected = with_view(hwnd, |view| {
         let Some(index) = tree::row_index(&view.rows, kind) else {
             return false;
         };
         view.select(index);
         true
     })
-    .unwrap_or(false)
+    .unwrap_or(false);
+    // The field moves with its row (inline naming spec §5.4).
+    super::inline_name::place(hwnd);
+    selected
 }
 
 /// Gives the tree the keyboard focus, after a folder command closed its name box.
@@ -1435,6 +1619,7 @@ pub(crate) fn select_index(hwnd: HWND, index: usize) {
             view.select(index);
         }
     });
+    super::inline_name::place(hwnd);
 }
 
 impl NotebookView {
@@ -1530,7 +1715,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
             match super::menus::track_popup(hwnd, &entries, point) {
                 Some(CommandId::New) => super::library_host::new_note_in(hwnd, Some(path)),
                 Some(CommandId::NoteNewFolder) => {
-                    super::library_host::new_folder(hwnd, Some(relative.clone()));
+                    super::inline_name::new_folder(hwnd, Some(relative.clone()));
                 }
                 Some(CommandId::NoteRename) if super::library_host::ready_library(hwnd) => {
                     super::library_host::rename_folder(hwnd, relative);
@@ -1645,12 +1830,19 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_MOUSEWHEEL => {
             let delta = i32::from((wparam >> 16) as u16 as i16);
             let lines = row_list::wheel_lines();
-            with_view(hwnd, |view| {
+            let scrolled = with_view(hwnd, |view| {
                 let height = view.list_height();
-                if view.list.wheel(delta, lines, height) {
+                let scrolled = view.list.wheel(delta, lines, height);
+                if scrolled {
                     view.invalidate();
                 }
-            });
+                scrolled
+            })
+            .unwrap_or(false);
+            // The field moves with its row (inline naming spec §5.4).
+            if scrolled {
+                super::inline_name::place(hwnd);
+            }
             Some(0)
         }
         _ => None,
@@ -1660,13 +1852,14 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
 fn mouse_move(hwnd: HWND, x: i32, y: i32) {
     // Read before the view is borrowed: `ui_fonts` borrows the App itself.
     let fonts = super::main_window::ui_fonts(hwnd);
-    let tools = with_view(hwnd, |view| {
+    let (tools, scrolled) = with_view(hwnd, |view| {
         if let Some(grab) = view.thumb_grab {
             let list = view.list_rect(view.client());
-            if view.list.drag_thumb(grab, y - list.top, height(list)) {
+            let scrolled = view.list.drag_thumb(grab, y - list.top, height(list));
+            if scrolled {
                 view.invalidate();
             }
-            return None;
+            return (None, scrolled);
         }
         view.track_leave();
         let hit = view.hit_test(x, y);
@@ -1681,13 +1874,17 @@ fn mouse_move(hwnd: HWND, x: i32, y: i32) {
             view.hover_pin = pin;
             view.hover = hot;
             view.invalidate();
-            return Some(view.tooltip_tools(fonts));
+            return (Some(view.tooltip_tools(fonts)), false);
         }
-        None
+        (None, false)
     })
-    .flatten();
+    .unwrap_or((None, false));
     if let Some(tools) = tools {
         apply_tooltips(hwnd, &tools);
+    }
+    // The field moves with its row while the thumb is dragged (inline naming spec §5.4).
+    if scrolled {
+        super::inline_name::place(hwnd);
     }
 }
 
@@ -2023,9 +2220,10 @@ fn typed(hwnd: HWND, ch: char) {
 }
 
 impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
-    /// Push buttons first, then the RECENT notebooks (no-notebook state), then the tree rows.
+    /// Push buttons first, then the RECENT notebooks (no-notebook state), then the tree rows,
+    /// the draft row left out.
     fn accessible_count(&self, client: RECT, dpi: u32) -> usize {
-        self.buttons(client, dpi).len() + self.recent.len() + self.rows().len()
+        self.buttons(client, dpi).len() + self.recent.len() + self.accessible_rows()
     }
 
     fn accessible_item(
@@ -2052,7 +2250,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                 visible,
             ));
         }
-        let index = index - self.recent.len();
+        let index = self.row_of_accessible(index - self.recent.len());
         let row = self.rows().get(index)?;
         let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
         Some(tree_item(
@@ -2083,7 +2281,10 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         if self.mode == Mode::NoNotebook {
             (row < self.recent.len()).then_some(buttons.len() + row)
         } else {
-            (row < self.rows().len()).then_some(buttons.len() + self.recent.len() + row)
+            (row < self.rows().len())
+                .then(|| self.accessible_of_row(row))
+                .flatten()
+                .map(|row| buttons.len() + self.recent.len() + row)
         }
     }
 
@@ -2094,7 +2295,10 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         if self.mode == Mode::NoNotebook {
             (selected < self.recent.len()).then_some(buttons + selected)
         } else {
-            (selected < self.rows().len()).then_some(buttons + self.recent.len() + selected)
+            (selected < self.rows().len())
+                .then(|| self.accessible_of_row(selected))
+                .flatten()
+                .map(|row| buttons + self.recent.len() + row)
         }
     }
 
@@ -2103,10 +2307,15 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         let (offset, rows) = if self.mode == Mode::NoNotebook {
             (buttons, self.recent.len())
         } else {
-            (buttons + self.recent.len(), self.rows().len())
+            (buttons + self.recent.len(), self.accessible_rows())
         };
         let Some(row) = index.checked_sub(offset).filter(|&row| row < rows) else {
             return;
+        };
+        let row = if self.mode == Mode::NoNotebook {
+            row
+        } else {
+            self.row_of_accessible(row)
         };
         let area = self.list_area(client, dpi);
         self.list_mut().select(row, area.bottom - area.top);
@@ -2118,7 +2327,9 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         if let Some(folder) = self.recent.get(index) {
             return Some(identity_of(folder));
         }
-        let row = self.rows().get(index - self.recent.len())?;
+        let row = self
+            .rows()
+            .get(self.row_of_accessible(index - self.recent.len()))?;
         Some(identity_of(&row.kind))
     }
 

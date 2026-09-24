@@ -2497,7 +2497,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::FindPrevious => find_again(hwnd, true),
         CommandId::CommandPalette => open_command_palette(hwnd),
         CommandId::QuickOpen => open_quick_open(hwnd),
-        CommandId::NoteNewFolder => crate::window::library_host::new_folder(hwnd, None),
+        CommandId::NoteNewFolder => crate::window::inline_name::new_folder(hwnd, None),
         CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
         CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
@@ -11695,6 +11695,95 @@ mod tests {
         notebook_view(hwnd).list.selected = Some(index);
     }
 
+    /// A window with a sidebar showing `scratch`'s notebook in the Notebook view.
+    fn notebook_window(scratch: &LibraryScratch) -> (ProductionWindow, crate::editor::Editor) {
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        crate::window::notebook_view::rebuild(window.hwnd);
+        (window, editor)
+    }
+
+    fn inline_field(hwnd: HWND) -> HWND {
+        crate::window::inline_name::field_hwnd(hwnd).expect("the name field was made")
+    }
+
+    fn inline_open(hwnd: HWND) -> bool {
+        crate::window::inline_name::is_open(hwnd)
+    }
+
+    /// Types `text` into the name field as a paste would: the Edit sends EN_CHANGE to the panel.
+    fn type_into_field(hwnd: HWND, text: &str) {
+        let wide = crate::platform::wide_null(text);
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                inline_field(hwnd),
+                wide.as_ptr(),
+            )
+        };
+    }
+
+    fn field_key(hwnd: HWND, key: u16) {
+        unsafe {
+            SendMessageW(
+                inline_field(hwnd),
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                usize::from(key),
+                0,
+            )
+        };
+    }
+
+    fn field_text(hwnd: HWND) -> String {
+        let mut buffer = [0u16; 260];
+        let copied = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                inline_field(hwnd),
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+            )
+        };
+        String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+    }
+
+    fn field_selection(hwnd: HWND) -> (u32, u32) {
+        let (mut start, mut end) = (0_u32, 0_u32);
+        unsafe {
+            SendMessageW(
+                inline_field(hwnd),
+                windows_sys::Win32::UI::Controls::EM_GETSEL,
+                &mut start as *mut u32 as usize,
+                &mut end as *mut u32 as isize,
+            )
+        };
+        (start, end)
+    }
+
+    /// The draft row's index and depth, while one shows.
+    fn draft_row(hwnd: HWND) -> Option<(usize, u16)> {
+        let rows = &notebook_view(hwnd).rows;
+        rows.iter()
+            .position(|row| row.kind == RowKind::Draft)
+            .map(|index| (index, rows[index].depth))
+    }
+
+    /// The middle of the row showing `kind`, as a panel mouse message's `lParam`.
+    #[expect(
+        dead_code,
+        reason = "used by the click tests (inline naming plan, Task 5)"
+    )]
+    fn row_lparam(hwnd: HWND, kind: &RowKind) -> super::LPARAM {
+        let index = row_of(hwnd, kind);
+        let rect = notebook_view(hwnd).row_rect_at(index).unwrap();
+        client_lparam((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+    }
+
     fn rescan_and_wait(hwnd: HWND) {
         crate::window::library_host::request_rescan(hwnd);
         pump_until(hwnd, || !app_mut(hwnd).library.scanning);
@@ -16714,27 +16803,17 @@ mod tests {
     }
 
     #[test]
-    fn new_folder_from_the_header_creates_it_on_disk_and_selects_its_row() {
-        // Break caught: the header button opening nothing, a folder created before Enter or on
-        // Escape, a suggested name that is taken, or the new folder not selected in the tree.
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE};
-        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    fn new_folder_from_the_header_names_it_in_an_empty_draft_row_and_selects_the_new_row() {
+        // Break caught: the header button opening the name bar, a "New folder" prefill, a
+        // folder made before Enter or on Escape, the draft left behind, or the new folder not
+        // selected with the focus in the tree (inline naming spec §3.2, §5.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN};
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("new-folder-header");
-        std::fs::create_dir_all(scratch.folder().join("New folder")).unwrap();
+        let scratch = LibraryScratch::new("inline-new-folder");
         scratch.note("top.md", "t");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
-        crate::window::side_panel::show_view(
-            window.hwnd,
-            crate::config::SidebarView::Notebook,
-            false,
-        );
-        crate::window::notebook_view::rebuild(window.hwnd);
+        let (window, _editor) = notebook_window(&scratch);
         select_row(window.hwnd, &RowKind::Note("top.md".into()));
-        let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+        let panel = sidebar_windows(window.hwnd).1;
         let count = crate::window::side_panel::accessible_item_count(panel);
         assert!(
             (0..count)
@@ -16750,91 +16829,111 @@ mod tests {
         };
 
         press();
-        let edit = app_mut(window.hwnd).name_box.as_ref().unwrap().edit_hwnd();
-        unsafe { SendMessageW(edit, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
-        assert!(!name_box_visible(window.hwnd));
-        assert!(
-            !scratch.folder().join("New folder 2").exists(),
-            "Escape creates nothing"
-        );
-
-        press();
-        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
-        assert!(name_box.is_visible());
+        // The test editor's untitled tab keeps its row above the draft (spec §3.1).
+        assert_eq!(draft_row(window.hwnd), Some((1, 0)), "first at the root");
         assert_eq!(
-            name_box.purpose(),
-            Some(&crate::window::name_box::NamePurpose::NewFolder(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::NewFolder(
                 std::path::PathBuf::new()
             ))
         );
-        assert_eq!(name_box.text(), "New folder 2", "the first free name");
+        assert_eq!(field_text(window.hwnd), "", "the field starts empty");
+        assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
         assert!(
-            !scratch.folder().join("New folder 2").exists(),
+            !app_mut(window.hwnd)
+                .name_box
+                .as_ref()
+                .is_some_and(|name_box| name_box.is_visible())
+        );
+        type_into_field(window.hwnd, "Plans");
+        field_key(window.hwnd, VK_ESCAPE);
+        assert!(!inline_open(window.hwnd));
+        assert_eq!(
+            draft_row(window.hwnd),
+            None,
+            "Escape takes the draft row away"
+        );
+        assert!(
+            !scratch.folder().join("Plans").exists(),
+            "Escape creates nothing"
+        );
+        assert_eq!(unsafe { GetFocus() }, panel, "Escape returns to the tree");
+
+        press();
+        type_into_field(window.hwnd, "Plans");
+        assert!(
+            !scratch.folder().join("Plans").exists(),
             "nothing before Enter"
         );
-        crate::window::library_host::name_box_submit(window.hwnd);
+        field_key(window.hwnd, VK_RETURN);
 
-        assert!(!name_box_visible(window.hwnd));
-        assert!(scratch.folder().join("New folder 2").is_dir());
+        assert!(!inline_open(window.hwnd));
+        assert!(scratch.folder().join("Plans").is_dir());
+        assert_eq!(draft_row(window.hwnd), None);
         assert_eq!(
             selected_kind(window.hwnd),
-            Some(RowKind::Folder("New folder 2".into()))
+            Some(RowKind::Folder("Plans".into()))
         );
-        assert_eq!(
-            unsafe { GetFocus() },
-            panel,
-            "the focus returns to the tree"
-        );
+        assert_eq!(unsafe { GetFocus() }, panel, "the focus stays in the tree");
     }
 
     #[test]
-    fn new_folder_here_creates_it_inside_that_folder_expanded_and_refuses_a_taken_name() {
-        // Break caught: "New folder here" creating at the root, a clash with a note or a non-note
-        // file missed (or closing the box), or the new row hidden in a collapsed folder.
+    fn new_folder_here_drafts_inside_that_folder_and_a_taken_name_keeps_the_field_open() {
+        // Break caught: "New folder here" drafting at the root, the folder left collapsed, a
+        // name taken by a listed note missed while typing, Enter accepted over the message, or
+        // a clash with an unlisted file closing the field (spec §4.4, §5.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("new-folder-here");
+        let scratch = LibraryScratch::new("inline-new-folder-here");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
         scratch.note(r"sub\a.md", "a");
         std::fs::write(scratch.folder().join(r"sub\notes.bin"), "x").unwrap();
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), false);
         crate::window::notebook_view::rebuild(window.hwnd);
         let index = row_of(window.hwnd, &RowKind::Folder("sub".into()));
         crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteNewFolder));
         crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
 
-        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
         assert_eq!(
-            name_box.purpose(),
-            Some(&crate::window::name_box::NamePurpose::NewFolder(
-                "sub".into()
-            ))
+            draft_row(window.hwnd),
+            Some((index + 1, 1)),
+            "its first child"
         );
-        assert_eq!(name_box.text(), "New folder");
-        for taken in ["A.md", "notes.bin"] {
-            type_into_name_box(window.hwnd, taken);
-            crate::window::library_host::name_box_submit(window.hwnd);
-            let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
-            assert!(name_box.is_visible(), "{taken}");
-            assert_eq!(
-                name_box.error(),
-                Some(
-                    format!("A folder or file named \u{201c}{taken}\u{201d} already exists")
-                        .as_str()
-                )
-            );
-        }
-        type_into_name_box(window.hwnd, "Plans");
-        crate::window::library_host::name_box_submit(window.hwnd);
-
-        assert!(!name_box_visible(window.hwnd));
-        assert!(scratch.folder().join(r"sub\Plans").is_dir());
         assert!(
             crate::window::library_host::expanded(window.hwnd)
                 .contains(&std::path::PathBuf::from("sub"))
         );
+        type_into_field(window.hwnd, "A.md");
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
+            Some("A.md already exists here.")
+        );
+        field_key(window.hwnd, VK_RETURN);
+        assert!(
+            inline_open(window.hwnd),
+            "Enter is refused while a problem shows"
+        );
+        assert!(!scratch.folder().join(r"sub\A.md").is_dir());
+
+        type_into_field(window.hwnd, "notes.bin");
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd),
+            None,
+            "not listed"
+        );
+        field_key(window.hwnd, VK_RETURN);
+        assert!(inline_open(window.hwnd));
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
+            Some("A folder or file named \u{201c}notes.bin\u{201d} already exists")
+        );
+
+        type_into_field(window.hwnd, "Plans");
+        assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+        field_key(window.hwnd, VK_RETURN);
+        assert!(!inline_open(window.hwnd));
+        assert!(scratch.folder().join(r"sub\Plans").is_dir());
         assert_eq!(
             selected_kind(window.hwnd),
             Some(RowKind::Folder(r"sub\Plans".into()))
@@ -16842,58 +16941,54 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_folder_name_is_sanitized_and_empty_or_hidden_names_are_refused() {
-        // Break caught: a name Windows refuses failing with a path error, "..." creating
-        // "Untitled", or a .git or node_modules folder that the next rescan hides (spec §4.1).
+    fn a_typed_folder_name_is_sanitized_hidden_names_are_refused_and_an_empty_one_cancels() {
+        // Break caught: a name Windows refuses failing with a path error, "..." showing a
+        // message instead of cancelling, or a .git or node_modules folder that the next rescan
+        // hides (spec §4.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("new-folder-names");
+        let scratch = LibraryScratch::new("inline-folder-names");
         scratch.note("top.md", "t");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
+        let (window, _editor) = notebook_window(&scratch);
         let create = |typed: &str| {
-            crate::window::library_host::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
-            type_into_name_box(window.hwnd, typed);
-            crate::window::library_host::name_box_submit(window.hwnd);
-        };
-        let error = || {
-            app_mut(window.hwnd)
-                .name_box
-                .as_ref()
-                .unwrap()
-                .error()
-                .map(str::to_owned)
+            crate::window::inline_name::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
+            type_into_field(window.hwnd, typed);
+            field_key(window.hwnd, VK_RETURN);
         };
 
         create(" a/b: c?. ");
         assert!(scratch.folder().join("ab c").is_dir());
         create("CON");
         assert!(scratch.folder().join("CON_").is_dir());
-        assert!(!name_box_visible(window.hwnd));
+        assert!(!inline_open(window.hwnd));
 
         create("...");
-        assert!(name_box_visible(window.hwnd));
-        assert_eq!(error().as_deref(), Some("Type a folder name"));
+        assert!(
+            !inline_open(window.hwnd),
+            "nothing left of the name cancels"
+        );
+        assert_eq!(draft_row(window.hwnd), None);
+
         for hidden in [".git", "node_modules"] {
-            type_into_name_box(window.hwnd, hidden);
-            crate::window::library_host::name_box_submit(window.hwnd);
+            create(hidden);
+            assert!(inline_open(window.hwnd), "{hidden}");
             assert_eq!(
-                error(),
+                crate::window::inline_name::problem(window.hwnd),
                 Some(format!(
                     "FastPad hides folders named \u{201c}{hidden}\u{201d}. Choose another name."
                 ))
             );
             assert!(!scratch.folder().join(hidden).exists());
+            crate::window::inline_name::cancel(window.hwnd);
         }
     }
 
     #[test]
-    fn a_new_folder_box_survives_a_rescan_but_closes_when_its_parent_goes() {
-        // Break caught: a rescan closing the box (and the typed name) for nothing, a box left
-        // offering to create inside a folder deleted in Explorer, or one outliving its notebook.
+    fn a_new_folder_draft_survives_a_rescan_but_goes_with_its_folder_or_notebook() {
+        // Break caught: a rescan dropping the draft row and what was typed, a draft left in a
+        // folder deleted in Explorer, or one outliving its notebook (spec §5.4).
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("new-folder-rescan");
+        let scratch = LibraryScratch::new("inline-folder-rescan");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
         scratch.note(r"sub\a.md", "a");
         let window = ProductionWindow::new(make_app());
@@ -16901,29 +16996,202 @@ mod tests {
         ensure_sidebar(window.hwnd);
         app_mut(window.hwnd).library.data_dir = Some(scratch.data());
         scratch.install(window.hwnd);
-        crate::window::library_host::new_folder(window.hwnd, Some("sub".into()));
-        type_into_name_box(window.hwnd, "Typed");
-        super::create_new_document(window.hwnd).unwrap();
-        assert!(
-            name_box_visible(window.hwnd),
-            "a tab switch keeps a folder box"
-        );
+        crate::window::notebook_view::rebuild(window.hwnd);
+        crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+        type_into_field(window.hwnd, "Typed");
 
         rescan_and_wait(window.hwnd);
-        assert!(name_box_visible(window.hwnd));
-        assert_eq!(
-            app_mut(window.hwnd).name_box.as_ref().unwrap().text(),
-            "Typed"
-        );
+        assert!(inline_open(window.hwnd));
+        assert_eq!(field_text(window.hwnd), "Typed");
+        let sub = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+        assert_eq!(draft_row(window.hwnd), Some((sub + 1, 1)));
 
         std::fs::remove_dir_all(scratch.folder().join("sub")).unwrap();
         rescan_and_wait(window.hwnd);
-        assert!(!name_box_visible(window.hwnd));
+        assert!(!inline_open(window.hwnd));
+        assert_eq!(draft_row(window.hwnd), None);
 
-        crate::window::library_host::new_folder(window.hwnd, None);
-        assert!(name_box_visible(window.hwnd));
+        crate::window::inline_name::new_folder(window.hwnd, None);
+        assert!(inline_open(window.hwnd));
         crate::window::library_host::close_notebook(window.hwnd);
-        assert!(!name_box_visible(window.hwnd));
+        assert!(!inline_open(window.hwnd));
+    }
+
+    #[test]
+    fn the_field_sits_over_its_row_scrolls_with_it_and_is_left_out_of_the_tree_for_screen_readers()
+    {
+        // Break caught: the field drawn away from its row or over the header, left behind
+        // when the list scrolls, losing the typing when scrolled out of view, or the draft row
+        // read out as an empty tree item (spec §5.4, §6).
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongPtrW, GetWindowRect, WM_MOUSEWHEEL, WS_VISIBLE,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-placement");
+        for index in 0..80 {
+            scratch.note(&format!("n{index:02}.md"), "x");
+        }
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let names = || {
+            let count = crate::window::side_panel::accessible_item_count(panel);
+            (0..count)
+                .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+                .map(|item| item.name)
+                .collect::<Vec<_>>()
+        };
+        let before = names();
+        // The test window is never shown, so the field's own style says whether it shows.
+        let shown =
+            |field: HWND| (unsafe { GetWindowLongPtrW(field, GWL_STYLE) } as u32) & WS_VISIBLE != 0;
+
+        crate::window::inline_name::new_folder(window.hwnd, None);
+        let field = inline_field(window.hwnd);
+        assert_eq!(names(), before, "the draft row is no MSAA item");
+        assert!(shown(field));
+        let draft = draft_row(window.hwnd).unwrap().0;
+        let row = notebook_view(window.hwnd).row_rect_at(draft).unwrap();
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(field, &mut rect);
+            MapWindowPoints(
+                std::ptr::null_mut(),
+                panel,
+                &mut rect as *mut RECT as *mut POINT,
+                2,
+            );
+        }
+        assert!(
+            rect.top >= row.top && rect.bottom <= row.bottom,
+            "{}..{} in {}..{}",
+            rect.top,
+            rect.bottom,
+            row.top,
+            row.bottom
+        );
+
+        let down = ((-(120_i16 * 20)) as u16 as usize) << 16;
+        unsafe { SendMessageW(panel, WM_MOUSEWHEEL, down, 0) };
+        assert!(notebook_view(window.hwnd).list.top > 0, "the list scrolled");
+        assert!(!shown(field), "out of view, hidden");
+        assert_eq!(unsafe { GetFocus() }, field, "and still editing");
+        type_into_field(window.hwnd, "Kept");
+        let up = ((120_i16 * 20) as u16 as usize) << 16;
+        unsafe { SendMessageW(panel, WM_MOUSEWHEEL, up, 0) };
+        assert!(shown(field), "back in view");
+        assert_eq!(field_text(window.hwnd), "Kept");
+    }
+
+    #[test]
+    fn the_name_field_is_named_for_screen_readers_and_its_problem_is_its_description() {
+        // Break caught: a field a screen reader announces as a bare "edit", or a problem it
+        // never hears (spec §6).
+        use crate::window::accessibility::{
+            AccessibleVtable, IID_IACCESSIBLE, RawVariant, VariantValue,
+        };
+        use crate::window::sidebar_accessibility::take_raised;
+        use windows_sys::Win32::Foundation::{SysFreeString, SysStringLen};
+        use windows_sys::Win32::UI::Accessibility::AccessibleObjectFromWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EVENT_OBJECT_DESCRIPTIONCHANGE, OBJID_CLIENT,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-accessible");
+        std::fs::create_dir_all(scratch.folder().join(r"sub\Taken")).unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+        let field = inline_field(window.hwnd);
+        let read = |description: bool| -> String {
+            let com = unsafe {
+                windows_sys::Win32::System::Com::CoInitializeEx(
+                    std::ptr::null(),
+                    windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
+                )
+            };
+            let mut object = std::ptr::null_mut();
+            let result = unsafe {
+                AccessibleObjectFromWindow(
+                    field,
+                    OBJID_CLIENT as u32,
+                    &IID_IACCESSIBLE,
+                    &mut object,
+                )
+            };
+            assert!(result >= 0 && !object.is_null(), "{result:#x}");
+            let vtable = unsafe { &**(object as *const *const AccessibleVtable) };
+            let get = if description {
+                vtable.get_acc_description
+            } else {
+                vtable.get_acc_name
+            };
+            let mut text = std::ptr::null();
+            unsafe { get(object, RawVariant::integer(0), &mut text) };
+            let value = if text.is_null() {
+                String::new()
+            } else {
+                let units =
+                    unsafe { std::slice::from_raw_parts(text, SysStringLen(text) as usize) };
+                let value = String::from_utf16_lossy(units);
+                unsafe { SysFreeString(text) };
+                value
+            };
+            unsafe { (vtable.release)(object) };
+            if com >= 0 {
+                unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+            }
+            value
+        };
+        assert_eq!(read(false), "New folder name, in sub");
+
+        take_raised();
+        type_into_field(window.hwnd, "taken");
+        assert!(
+            take_raised().contains(&(field as usize, EVENT_OBJECT_DESCRIPTIONCHANGE, 0)),
+            "the problem is announced"
+        );
+        assert_eq!(read(true), "taken already exists here.");
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_name_and_ctrl_backspace_deletes_a_word_in_the_field() {
+        // Break caught: Ctrl+A doing nothing in the field, or Ctrl+Backspace typing a box
+        // character instead of deleting the word before the caret (spec §5.1).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_BACK, VK_CONTROL,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-keys");
+        scratch.note("top.md", "t");
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::inline_name::new_folder(window.hwnd, None);
+        type_into_field(window.hwnd, "my note.md");
+        let field = inline_field(window.hwnd);
+        unsafe { SendMessageW(field, windows_sys::Win32::UI::Controls::EM_SETSEL, 10, 10) };
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+
+        field_key(window.hwnd, VK_BACK);
+        unsafe { SendMessageW(field, WM_CHAR, 0x7f, 0) };
+        let after_backspace = field_text(window.hwnd);
+        field_key(window.hwnd, u16::from(b'A'));
+        unsafe { SendMessageW(field, WM_CHAR, 0x01, 0) };
+        let selection = field_selection(window.hwnd);
+        unsafe { SetKeyboardState(original.as_ptr()) };
+
+        assert_eq!(after_backspace, "my note.");
+        assert_eq!(selection, (0, 8));
+        assert_eq!(
+            field_text(window.hwnd),
+            "my note.",
+            "no control characters typed"
+        );
     }
 
     #[test]
@@ -17323,9 +17591,10 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_folder_that_holds_the_only_tab_and_the_name_box_target_warns_and_closes_both() {
+    fn deleting_a_folder_that_holds_the_only_tab_and_the_draft_target_warns_and_cancels_the_draft()
+    {
         // Break caught: unsaved edits discarded without a word, the last tab left on a deleted
-        // file, or a New folder box still offering to create inside a folder that is gone.
+        // file, or a draft still offering to create inside a folder that is gone (spec §5.4).
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("folder-delete-only-tab");
@@ -17336,9 +17605,9 @@ mod tests {
         let a = open_note(&window, &scratch, r"sub\a.md", "a");
         execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
         editor.set_text("unsaved").unwrap();
-        crate::window::library_host::new_folder(window.hwnd, Some("sub".into()));
-        assert!(name_box_visible(window.hwnd));
         crate::window::notebook_view::rebuild(window.hwnd);
+        crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+        assert!(inline_open(window.hwnd));
         select_row(window.hwnd, &RowKind::Folder("sub".into()));
         crate::window::modal::take_last_confirm();
         crate::window::answer_next_confirm(|_| true);
@@ -17356,7 +17625,8 @@ mod tests {
         );
         assert!(!a.exists());
         assert_eq!(super::tab_count(window.hwnd), 0);
-        assert!(!name_box_visible(window.hwnd));
+        assert!(!inline_open(window.hwnd));
+        assert_eq!(draft_row(window.hwnd), None);
     }
 
     #[test]
@@ -17426,7 +17696,8 @@ mod tests {
         crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(".."));
         submit(NamePurpose::RenameFolder("".into()), "Renamed");
         submit(NamePurpose::RenameFolder("..".into()), "Renamed");
-        submit(NamePurpose::NewFolder("..".into()), "Outside");
+        crate::window::inline_name::new_folder(window.hwnd, Some("..".into()));
+        assert!(!inline_open(window.hwnd), "no draft outside the notebook");
 
         assert_eq!(crate::window::modal::take_last_confirm(), None);
         assert!(scratch.folder().join(r"sub\a.md").exists());

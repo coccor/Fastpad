@@ -533,6 +533,21 @@ fn save_local(hwnd: HWND, how: LocalWrite) {
     }
 }
 
+/// `save_local` on a writer thread, for a change the user just made (a folder rename).
+#[expect(
+    dead_code,
+    reason = "used by the folder rename (inline naming plan, Task 4)"
+)]
+pub(crate) fn save_local_soon(hwnd: HWND) {
+    save_local(
+        hwnd,
+        LocalWrite {
+            wait: false,
+            force: false,
+        },
+    );
+}
+
 /// Expands or collapses `path`, a folder relative to the open notebook, and remembers it in the
 /// per-PC file. The write happens on a writer thread, and only when the set changed.
 pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
@@ -1345,11 +1360,10 @@ fn folder_display_name(hwnd: HWND) -> String {
         .unwrap_or_else(|| "the notebook".to_owned())
 }
 
-const NEW_FOLDER: &str = "New folder";
 const NO_FOLDER_NAME: &str = "Type a folder name";
 
 /// A new or renamed folder's name is taken by a folder or file (spec §4.1).
-fn folder_taken_error(name: &str) -> String {
+pub(crate) fn folder_taken_error(name: &str) -> String {
     format!("A folder or file named \u{201c}{name}\u{201d} already exists")
 }
 
@@ -1367,91 +1381,12 @@ fn folder_suffix(hwnd: HWND, parent: &Path) -> String {
 }
 
 /// `folder` (absolute, inside the notebook `root`) relative to it; empty for the root itself.
-fn relative_folder(root: &Path, folder: &Path) -> PathBuf {
+pub(crate) fn relative_folder(root: &Path, folder: &Path) -> PathBuf {
     if library::model::same_path(root, folder) {
         PathBuf::new()
     } else {
         library::record_path(root, folder)
     }
-}
-
-/// The Notebook view's New folder button, "New folder here" on a folder row (`parent`, relative
-/// to the notebook) and Notebook: New folder… (spec §4.1). The name box opens for a folder in
-/// `parent`, else in the selected row's folder, else at the root. Nothing is created before
-/// Enter.
-pub(crate) fn new_folder(hwnd: HWND, parent: Option<PathBuf>) {
-    if !ready_library(hwnd) {
-        return;
-    }
-    let Some(root) = folder(hwnd) else {
-        return;
-    };
-    let parent = parent.unwrap_or_else(|| {
-        super::notebook_view::selected_folder(hwnd)
-            .map(|selected| relative_folder(&root, &selected))
-            .unwrap_or_default()
-    });
-    let purpose = NamePurpose::NewFolder(parent.clone());
-    // New folder again while the box is open for the same folder keeps what was typed.
-    if name_box_purpose(hwnd) == Some(purpose.clone()) {
-        focus_name_box(hwnd);
-        return;
-    }
-    let name = with_state(hwnd, |state| {
-        title::free_name(NEW_FOLDER, "", |candidate| {
-            state.is_listed(&parent.join(candidate))
-        })
-    })
-    .unwrap_or_else(|| NEW_FOLDER.to_owned());
-    let suffix = folder_suffix(hwnd, &parent);
-    open_name_box(hwnd, purpose, &name, suffix, false);
-}
-
-/// Enter in the New folder box: creates the folder with the one disk call, then lists it,
-/// expands its parent, selects its row and gives the tree the focus.
-fn submit_new_folder(hwnd: HWND, parent: &Path, text: &str) {
-    let Some(root) = folder(hwnd) else {
-        close_name_box(hwnd);
-        return;
-    };
-    let Some(name) = title::folder_name(text) else {
-        name_box_error(hwnd, NO_FOLDER_NAME.to_owned());
-        return;
-    };
-    if library::scan::skip_directory(&name) {
-        name_box_error(hwnd, hidden_folder_error(&name));
-        return;
-    }
-    let relative = parent.join(&name);
-    // Defence in depth: the folder made must be a plain relative one inside the notebook.
-    if !library::tree::is_plain_relative_folder(&relative) {
-        close_name_box(hwnd);
-        return;
-    }
-    if with_state(hwnd, |state| state.is_listed(&relative)).unwrap_or(false) {
-        name_box_error(hwnd, folder_taken_error(&name));
-        return;
-    }
-    if let Err(error) = std::fs::create_dir(root.join(&relative)) {
-        // A file (or a folder the scan skips) may already have the name.
-        let error = if error.kind() == std::io::ErrorKind::AlreadyExists {
-            folder_taken_error(&name)
-        } else {
-            format!("FastPad could not create the folder: {error}")
-        };
-        name_box_error(hwnd, error);
-        return;
-    }
-    with_state(hwnd, |state| state.add_folder(&relative));
-    for ancestor in library::tree::ancestors(&relative) {
-        set_expanded(hwnd, &ancestor, true);
-    }
-    close_name_box(hwnd);
-    super::side_panel::with_accessible_events(hwnd, || {
-        super::side_panel::refresh(hwnd);
-        super::notebook_view::select_row(hwnd, &RowKind::Folder(relative.clone()));
-    });
-    super::notebook_view::focus_tree(hwnd);
 }
 
 /// After a folder rename on disk from `old` to `new` (both absolute): the untitled tabs whose
@@ -1902,13 +1837,10 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
     };
     match purpose {
         NamePurpose::FirstSave(id) => submit_first_save(hwnd, id, &text),
-        NamePurpose::RenameNote(_) | NamePurpose::NewFolder(_) | NamePurpose::RenameFolder(_)
-            if !ready_library(hwnd) =>
-        {
+        NamePurpose::RenameNote(_) | NamePurpose::RenameFolder(_) if !ready_library(hwnd) => {
             close_name_box(hwnd);
         }
         NamePurpose::RenameNote(id) => submit_rename(hwnd, id, &text),
-        NamePurpose::NewFolder(parent) => submit_new_folder(hwnd, &parent, &text),
         NamePurpose::RenameFolder(folder) => submit_rename_folder(hwnd, &folder, &text),
     }
 }
