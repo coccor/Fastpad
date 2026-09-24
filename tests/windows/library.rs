@@ -681,7 +681,7 @@ fn a_click_opens_a_preview_tab_a_second_click_replaces_it_and_a_double_click_kee
     wait_for_library(&data);
     let panel = find_child_by_class(hwnd, SIDE_PANEL_CLASS).unwrap();
 
-    click_child(panel, "a, Markdown");
+    click_child(panel, "a.md, Markdown");
     wait_until("a to open", || {
         scintilla_text(editor).is_ok_and(|t| t == "alpha")
     });
@@ -691,7 +691,7 @@ fn a_click_opens_a_preview_tab_a_second_click_replaces_it_and_a_double_click_kee
         .position(|t| t == "a.md")
         .expect("a preview tab");
 
-    click_child(panel, "b, Markdown");
+    click_child(panel, "b.md, Markdown");
     wait_until("b to replace a", || {
         scintilla_text(editor).is_ok_and(|t| t == "beta")
     });
@@ -700,8 +700,8 @@ fn a_click_opens_a_preview_tab_a_second_click_replaces_it_and_a_double_click_kee
     assert!(!replaced.iter().any(|t| t == "a.md"));
     assert_eq!(replaced.iter().position(|t| t == "b.md"), Some(slot));
 
-    double_click_child(panel, "b, Markdown");
-    click_child(panel, "c, Markdown");
+    double_click_child(panel, "b.md, Markdown");
+    click_child(panel, "c.md, Markdown");
     wait_until("c to open", || {
         scintilla_text(editor).is_ok_and(|t| t == "gamma")
     });
@@ -726,7 +726,7 @@ fn pinning_from_the_tree_writes_a_version_2_record_that_survives_a_restart() {
     let hwnd = process.wait_for_main_window(WAIT).unwrap();
     wait_for_library(&data);
     let panel = find_child_by_class(hwnd, SIDE_PANEL_CLASS).unwrap();
-    click_child(panel, "b, Markdown");
+    click_child(panel, "b.md, Markdown");
     // Ctrl+Shift+E moves the focus into the tree, on the active tab's row; the pin then acts on it.
     command(hwnd, CommandId::ShowNotebookView);
     command(hwnd, CommandId::NoteTogglePin);
@@ -738,7 +738,7 @@ fn pinning_from_the_tree_writes_a_version_2_record_that_survives_a_restart() {
                 .any(|l| l.starts_with("note=") && l.contains("|p|") && l.ends_with("|b.md"))
     });
     wait_until("the pinned row to sort first", || {
-        tree_rows(panel).first().map(String::as_str) == Some("b, Markdown, pinned")
+        tree_rows(panel).first().map(String::as_str) == Some("b.md, Markdown, pinned")
     });
     close(process, hwnd);
 
@@ -747,7 +747,7 @@ fn pinning_from_the_tree_writes_a_version_2_record_that_survives_a_restart() {
     let hwnd = process.wait_for_main_window(WAIT).unwrap();
     let panel = find_child_by_class(hwnd, SIDE_PANEL_CLASS).unwrap();
     wait_until("the pin to come back after a restart", || {
-        tree_rows(panel) == ["b, Markdown, pinned", "a, Markdown"]
+        tree_rows(panel) == ["b.md, Markdown, pinned", "a.md, Markdown"]
     });
     close(process, hwnd);
 }
@@ -782,7 +782,9 @@ fn a_favorite_notebook_opens_from_the_favorites_view() {
     wait_until("the other notebook to open", || {
         first_folder(&data).as_deref() == Some(other_line.as_str())
     });
-    wait_until("the tree to list c", || tree_rows(panel) == ["c, Markdown"]);
+    wait_until("the tree to list c", || {
+        tree_rows(panel) == ["c.md, Markdown"]
+    });
 
     command(hwnd, CommandId::ShowFavoritesView);
     click_child(panel, "notes");
@@ -791,7 +793,7 @@ fn a_favorite_notebook_opens_from_the_favorites_view() {
         first_folder(&data).as_deref() == Some(notes_line.as_str())
     });
     wait_until("the Notebook view to list a", || {
-        tree_rows(panel) == ["a, Markdown"]
+        tree_rows(panel) == ["a.md, Markdown"]
     });
     close(process, hwnd);
 }
@@ -854,14 +856,16 @@ fn moving_a_note_to_another_notebook_moves_the_file_and_its_tab_follows() {
     let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
     wait_for_library(&data);
     let panel = find_child_by_class(hwnd, SIDE_PANEL_CLASS).unwrap();
-    click_child(panel, "a, Markdown");
+    click_child(panel, "a.md, Markdown");
     wait_until("a to open", || {
         scintilla_text(editor).is_ok_and(|t| t == "alpha")
     });
 
     command(hwnd, CommandId::NoteMoveToNotebook);
+    // A click keeps focus in the tree, so the picker has it once neither the tree nor the editor
+    // does.
     wait_until("the picker to take focus", || {
-        focused_window(hwnd).is_ok_and(|f| f != editor)
+        focused_window(hwnd).is_ok_and(|f| f != editor && f != panel)
     });
     // The first row is the recent notebook that is not the open one.
     let field = focused_window(hwnd).unwrap();

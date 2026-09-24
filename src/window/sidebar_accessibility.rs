@@ -1235,13 +1235,16 @@ mod tests {
         assert_eq!(closed.value, "1");
 
         let pinned = tree_item(
-            &row(RowKind::Note(PathBuf::from("a.md")), "a", 1, true, false),
+            &row(RowKind::Note(PathBuf::from("a.md")), "a.md", 1, true, false),
             true,
             true,
             ROW,
             false,
         );
-        assert_eq!(pinned.name, "a, Markdown, pinned", "the type, then the pin");
+        assert_eq!(
+            pinned.name, "a.md, Markdown, pinned",
+            "the type, then the pin"
+        );
         assert_eq!(pinned.state & (STATE_EXPANDED | STATE_COLLAPSED), 0);
         assert_ne!(pinned.state & STATE_SELECTED, 0);
         assert_ne!(pinned.state & STATE_FOCUSED, 0);
@@ -1264,7 +1267,7 @@ mod tests {
         let csv = tree_item(
             &row(
                 RowKind::Note(PathBuf::from(r"Work\budget.CSV")),
-                "budget",
+                "budget.CSV",
                 1,
                 false,
                 false,
@@ -1274,11 +1277,11 @@ mod tests {
             ROW,
             true,
         );
-        assert_eq!(csv.name, "budget, CSV");
+        assert_eq!(csv.name, "budget.CSV, CSV");
         let markdown = tree_item(
             &row(
                 RowKind::Note(PathBuf::from("meeting notes.md")),
-                "meeting notes",
+                "meeting notes.md",
                 0,
                 false,
                 false,
@@ -1288,7 +1291,7 @@ mod tests {
             ROW,
             true,
         );
-        assert_eq!(markdown.name, "meeting notes, Markdown");
+        assert_eq!(markdown.name, "meeting notes.md, Markdown");
         assert_eq!(folder.name, "Work", "folder rows are unchanged");
     }
 

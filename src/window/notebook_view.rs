@@ -96,7 +96,7 @@ pub(crate) enum HeaderButton {
 /// How a note row is being opened (spec §6.4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Activation {
-    /// A mouse click: the preview tab, focus to the editor.
+    /// A mouse click: the preview tab, focus stays in the tree (F2 and Del act on the row).
     Click,
     /// Enter: the preview tab, focus stays in the tree for further browsing.
     Enter,
@@ -495,18 +495,12 @@ fn draw_tree_row(
         }
     }
     if matches!(row.kind, RowKind::Note(_)) {
-        // Pinned is a filled glyph, never color alone (spec §10).
+        // Pinned is a filled glyph, never color alone (spec §10). Segoe's PinFill is only the
+        // head's fill, with no needle: the outline pin is drawn over it to complete the shape.
         if row.pinned {
-            unsafe {
-                draw_text(
-                    dc,
-                    GLYPH_PINNED,
-                    parts.pin,
-                    fonts.glyph,
-                    foreground,
-                    CENTERED,
-                )
-            };
+            for glyph in [GLYPH_PINNED, GLYPH_PIN] {
+                unsafe { draw_text(dc, glyph, parts.pin, fonts.glyph, foreground, CENTERED) };
+            }
         } else if look.hover || look.selected {
             let color = if pin_hot { foreground } else { muted };
             unsafe { draw_text(dc, GLYPH_PIN, parts.pin, fonts.glyph, color, CENTERED) };
@@ -1830,8 +1824,9 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
                 };
                 let path = root.join(relative);
                 let (mode, focus) = match how {
-                    Activation::Click => (OpenMode::Preview, true),
-                    Activation::Enter => (OpenMode::Preview, false),
+                    // A click keeps the keyboard in the tree, as VS Code's explorer does, so F2
+                    // and Del act on the row just clicked.
+                    Activation::Click | Activation::Enter => (OpenMode::Preview, false),
                     Activation::Permanent => (OpenMode::Permanent, true),
                 };
                 if let Err(error) = super::main_window::open_note(hwnd, &path, mode, focus) {

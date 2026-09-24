@@ -115,7 +115,7 @@ This file is written with the library spec §14 mechanism (a copy of the state o
 ### 6.1 The tree
 
 - **Contents:** every note the scan found, arranged by folder. A folder appears only if it contains a note, at any depth. The scan's skip rules and its 10,000-note limit still apply, and a truncated scan shows a last row, "Showing the first 10,000 notes".
-- **Rows:** a note row is a file icon and the note's name (the filename without its extension, library spec §8.1). A folder row is a chevron, a folder icon and the folder's name. Rows are indented by depth.
+- **Rows:** a note row is a file icon and the note's file name, extension included, as VS Code shows it. A folder row is a chevron, a folder icon and the folder's name. Rows are indented by depth.
 - **Order within a folder:**
   1. Pinned notes, by name.
   2. Subfolders, by name.
@@ -145,7 +145,7 @@ Untitled tabs (Ctrl+N) appear first at the root, in italics, labeled from their 
 - **The preview tab becomes a normal tab** on a double-click of the row, Ctrl+Enter, "Open in new tab", a double-click on the tab, the first edit, or a save.
 - A preview tab is never dirty, since the first edit promotes it, so replacing it never discards changes.
 - Session restore brings the preview tab back as a normal tab.
-- Focus: a mouse click moves focus to the editor. Enter keeps focus in the tree, so arrow keys and Enter can browse. Ctrl+Enter opens a normal tab and moves focus to the editor.
+- Focus: a mouse click keeps focus in the tree, as VS Code's explorer does, so F2 and Del act on the clicked row; Enter does too, so arrow keys and Enter can browse. A double-click or Ctrl+Enter opens a normal tab and moves focus to the editor.
 
 ### 6.5 Header
 

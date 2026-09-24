@@ -6690,7 +6690,7 @@ mod tests {
             with_command_palette(window.hwnd, |p| p.query_text()).unwrap(),
             ""
         );
-        assert_eq!(quick_open_names(window.hwnd), ["b", "a"]);
+        assert_eq!(quick_open_names(window.hwnd), ["b.md", "a.md"]);
         assert_eq!(
             with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
             Some(1)
@@ -6717,7 +6717,7 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::QuickOpen);
         type_query(window.hwnd, "wk gmn");
-        assert_eq!(quick_open_names(window.hwnd), ["gamma notes"]);
+        assert_eq!(quick_open_names(window.hwnd), ["gamma notes.md"]);
         assert_eq!(
             with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
             Some(0)
@@ -6747,7 +6747,7 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::QuickOpen);
         type_query(window.hwnd, "lines:3");
-        assert_eq!(quick_open_names(window.hwnd), ["lines"]);
+        assert_eq!(quick_open_names(window.hwnd), ["lines.md"]);
         press_enter_in_palette(window.hwnd);
         assert_eq!(caret_line(), 2);
 
@@ -6851,10 +6851,10 @@ mod tests {
             with_command_palette(window.hwnd, |p| p.query_text()).unwrap(),
             "gam"
         );
-        assert_eq!(quick_open_names(window.hwnd), ["gamma"]);
+        assert_eq!(quick_open_names(window.hwnd), ["gamma.md"]);
 
         type_query(window.hwnd, "   ");
-        assert_eq!(quick_open_names(window.hwnd), ["beta", "alpha"]);
+        assert_eq!(quick_open_names(window.hwnd), ["beta.md", "alpha.md"]);
         assert_eq!(
             with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
             Some(1)
@@ -6877,7 +6877,7 @@ mod tests {
         super::open_path(window.hwnd, &b).unwrap();
 
         execute_command(window.hwnd, CommandId::QuickOpen);
-        assert_eq!(quick_open_names(window.hwnd), ["b", "a"]);
+        assert_eq!(quick_open_names(window.hwnd), ["b.md", "a.md"]);
         // The clean background tab (index 0, "a") closes the way a middle-click closes it: no
         // focus moves, so the palette stays open and must refresh its rows (spec §5).
         super::close_tab_at(window.hwnd, 0);
@@ -6885,7 +6885,7 @@ mod tests {
         assert!(palette_visible(window.hwnd), "the palette stayed open");
         assert_eq!(
             quick_open_names(window.hwnd),
-            ["b"],
+            ["b.md"],
             "the closed tab's row is gone"
         );
         press_enter_in_palette(window.hwnd);
@@ -6909,7 +6909,7 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::QuickOpen);
         type_query(window.hwnd, "gam");
-        assert_eq!(quick_open_names(window.hwnd), ["gamma"]);
+        assert_eq!(quick_open_names(window.hwnd), ["gamma.md"]);
         crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&gamma));
         std::fs::remove_file(&gamma).unwrap();
         press_enter_in_palette(window.hwnd);
@@ -6954,7 +6954,7 @@ mod tests {
         scratch.install(window.hwnd);
         execute_command(window.hwnd, CommandId::QuickOpen);
         type_query(window.hwnd, "wk gmn");
-        assert_eq!(palette().list_text(0), r"gamma notes, in work");
+        assert_eq!(palette().list_text(0), r"gamma notes.md, in work");
 
         let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
         let item = DRAWITEMSTRUCT {
@@ -11747,7 +11747,9 @@ mod tests {
     #[test]
     fn clicking_a_note_row_opens_the_preview_and_a_double_click_keeps_it() {
         // Break caught: a click opening a normal tab every time (tabs pile up), or a double-click
-        // opening a second tab instead of keeping the preview.
+        // opening a second tab instead of keeping the preview, or a click moving the keyboard to
+        // the editor so F2 and Del no longer reach the row just clicked.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("view-click");
         let a = scratch.note("a.md", "a");
@@ -11756,11 +11758,18 @@ mod tests {
         ensure_sidebar(window.hwnd);
         scratch.install(window.hwnd);
         let row = row_of(window.hwnd, &RowKind::Note("a.md".into()));
+        let (_, panel) = sidebar_windows(window.hwnd);
+        unsafe { SetFocus(panel) };
 
         crate::window::notebook_view::activate(window.hwnd, row, Activation::Click);
         let active = app_mut(window.hwnd).tabs.active().unwrap();
         assert_eq!(active.path.as_deref(), Some(a.as_path()));
         assert!(active.preview);
+        assert_eq!(
+            unsafe { GetFocus() },
+            panel,
+            "a click keeps focus in the tree"
+        );
 
         let row = row_of(window.hwnd, &RowKind::Note("a.md".into()));
         crate::window::notebook_view::activate(window.hwnd, row, Activation::Permanent);
@@ -15798,7 +15807,7 @@ mod tests {
         // The window's untitled tab is an unsaved row, left out above. "sub" is collapsed, so b
         // is not a row: pinned a first, then the folder.
         assert_eq!(rows.len(), 2, "{items:?}");
-        assert_eq!(rows[0].name, "a, Markdown, pinned");
+        assert_eq!(rows[0].name, "a.md, Markdown, pinned");
         assert_eq!(rows[1].name, "sub");
         assert_ne!(
             rows[1].state & crate::window::sidebar_accessibility::STATE_COLLAPSED,

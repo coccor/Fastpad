@@ -22,7 +22,7 @@ const NAME_MATCH: u32 = 20;
 pub struct QuickMatch {
     /// As given: relative to the notebook.
     pub path: PathBuf,
-    /// The file name without its extension, as the tree shows it.
+    /// The file name with its extension, as the tree shows it.
     pub name: String,
     /// The folder the note is in, relative to the notebook and joined with `\`; `""` at the root.
     pub folder: String,
@@ -41,7 +41,7 @@ impl QuickMatch {
         extend_joined(components, &mut folder);
         Some(Self {
             path: path.to_path_buf(),
-            name: stem_of(name.to_string_lossy()).into_owned(),
+            name: name.to_string_lossy().into_owned(),
             folder,
             name_hits: Vec::new(),
             folder_hits: Vec::new(),
@@ -70,35 +70,14 @@ pub fn split_line(query: &str) -> (&str, Option<u32>) {
 
 /// `path`'s parent components (root to leaf) and its last component's raw name, in one walk over
 /// `path`: `Scratch::score`, `folder_of` and `QuickMatch::plain` all start here instead of each
-/// walking `file_stem()`, `parent()` and `parent().components()` separately. `None` when the
+/// walking `file_name()`, `parent()` and `parent().components()` separately. `None` when the
 /// path's last component isn't a plain name (it ends in `..`, `.`, a root or a prefix) — the
-/// same case `Path::file_stem` treats as "no file name".
+/// same case `Path::file_name` treats as "no file name".
 fn split(path: &Path) -> Option<(Components<'_>, &OsStr)> {
     let mut components = path.components();
     match components.next_back()? {
         Component::Normal(name) => Some((components, name)),
         _ => None,
-    }
-}
-
-/// The file name's stem the way `Path::file_stem` defines it, run on the already-decoded name
-/// (`split`'s last component) so a note's path is parsed once instead of three times: the whole
-/// name when it has no `.`, or begins with the only `.` it has; otherwise the portion before the
-/// final `.`.
-fn stem_of(name: Cow<'_, str>) -> Cow<'_, str> {
-    match name {
-        Cow::Borrowed(text) => Cow::Borrowed(match text.rfind('.') {
-            Some(0) | None => text,
-            Some(dot) => &text[..dot],
-        }),
-        Cow::Owned(mut text) => {
-            if let Some(dot) = text.rfind('.')
-                && dot != 0
-            {
-                text.truncate(dot);
-            }
-            Cow::Owned(text)
-        }
     }
 }
 
@@ -278,8 +257,8 @@ impl Scratch {
     ) -> Option<(bool, u32, Cow<'p, str>, usize)> {
         let (folder_components, name) = split(path)?;
         let mut folder_components = Some(folder_components);
-        let stem = stem_of(name.to_string_lossy());
-        units(stem.chars(), &mut self.name_units);
+        let name = name.to_string_lossy();
+        units(name.chars(), &mut self.name_units);
         let name_len = self.name_units.len();
 
         self.folder.clear();
@@ -319,7 +298,7 @@ impl Scratch {
                         .iter()
                         .copied()
                         .chain(std::iter::once('\\'))
-                        .chain(stem.chars()),
+                        .chain(name.chars()),
                     &mut self.path_units,
                 );
                 path_ready = true;
@@ -355,7 +334,7 @@ impl Scratch {
                 list.dedup();
             }
         }
-        Some((all_name, total, stem, name_len))
+        Some((all_name, total, name, name_len))
     }
 }
 
@@ -466,16 +445,14 @@ mod tests {
     #[test]
     fn a_term_matches_when_its_letters_appear_in_order_ignoring_case() {
         // Break caught: a substring-only matcher ("nt" finding nothing in "note"), letters taken
-        // out of order ("tn" finding "note"), or the extension searched.
+        // out of order ("tn" finding "note"), or the extension left out of the name, as VS
+        // Code's Ctrl+P searches it.
         let notes = paths(&["note.md", "tone.md", "Readme"]);
-        assert_eq!(names(&search(&notes, "nt", 50)), ["note"]);
-        assert_eq!(names(&search(&notes, "NT", 50)), ["note"]);
-        assert_eq!(names(&search(&notes, "tn", 50)), ["tone"]);
+        assert_eq!(names(&search(&notes, "nt", 50)), ["note.md"]);
+        assert_eq!(names(&search(&notes, "NT", 50)), ["note.md"]);
+        assert_eq!(names(&search(&notes, "tn", 50)), ["tone.md"]);
         assert_eq!(names(&search(&notes, "rdm", 50)), ["Readme"]);
-        assert!(
-            search(&notes, "md", 50).is_empty(),
-            "the extension is not searched"
-        );
+        assert_eq!(names(&search(&notes, "md", 50)), ["note.md", "tone.md"]);
     }
 
     #[test]
@@ -489,7 +466,7 @@ mod tests {
             r"alpha\gamma beta.md",
         ]);
         let found = search(&notes, "al be", 50);
-        assert_eq!(names(&found), ["alpha beta", "gamma beta"]);
+        assert_eq!(names(&found), ["alpha beta.md", "gamma beta.md"]);
         assert_eq!(found[1].folder, "alpha");
         assert!(search(&notes, "   ", 50).is_empty());
         assert!(search(&notes, "al zz", 50).is_empty());
@@ -501,7 +478,7 @@ mod tests {
         // Break caught: "meet" listing every note of a folder called "meet" above the note whose
         // own name holds the letters.
         let notes = paths(&[r"meet\zz.md", "xmxexet.md"]);
-        assert_eq!(names(&search(&notes, "meet", 50)), ["xmxexet", "zz"]);
+        assert_eq!(names(&search(&notes, "meet", 50)), ["xmxexet.md", "zz.md"]);
     }
 
     #[test]
@@ -511,10 +488,13 @@ mod tests {
         let notes = paths(&["xaxbxc.md", "xxabcxx.md", "zz-a-b-c.md"]);
         assert_eq!(
             names(&search(&notes, "abc", 50)),
-            ["zz-a-b-c", "xxabcxx", "xaxbxc"]
+            ["zz-a-b-c.md", "xxabcxx.md", "xaxbxc.md"]
         );
         let camel = paths(&["xaxbxc.md", "zzAxBxCx.md"]);
-        assert_eq!(names(&search(&camel, "abc", 50)), ["zzAxBxCx", "xaxbxc"]);
+        assert_eq!(
+            names(&search(&camel, "abc", 50)),
+            ["zzAxBxCx.md", "xaxbxc.md"]
+        );
     }
 
     #[test]
@@ -544,10 +524,10 @@ mod tests {
             .collect();
         let found = search(&many, "n", 50);
         assert_eq!(found.len(), 50);
-        assert_eq!(found[0].name, "n0");
-        assert_eq!(found[9].name, "n9");
-        assert_eq!(found[10].name, "n10");
-        assert_eq!(found[49].name, "n49");
+        assert_eq!(found[0].name, "n0.md");
+        assert_eq!(found[9].name, "n9.md");
+        assert_eq!(found[10].name, "n10.md");
+        assert_eq!(found[49].name, "n49.md");
     }
 
     #[test]
@@ -572,7 +552,10 @@ mod tests {
         // Break caught: the open-tab rows shown before anything is typed losing their folder, or
         // carrying stale highlights.
         let plain = QuickMatch::plain(Path::new(r"a\b\x.md")).unwrap();
-        assert_eq!((plain.name.as_str(), plain.folder.as_str()), ("x", r"a\b"));
+        assert_eq!(
+            (plain.name.as_str(), plain.folder.as_str()),
+            ("x.md", r"a\b")
+        );
         assert!(plain.name_hits.is_empty() && plain.folder_hits.is_empty());
         assert_eq!(QuickMatch::plain(Path::new("x.md")).unwrap().folder, "");
     }
@@ -588,7 +571,7 @@ mod tests {
         let found = search(&notes, "nt 12", 50);
         let elapsed = started.elapsed();
         assert_eq!(found.len(), 50);
-        assert_eq!(found[0].name, "note12");
+        assert_eq!(found[0].name, "note12.md");
         assert_eq!(found[0].name_hits, [0, 2, 4, 5]);
         if !cfg!(debug_assertions) {
             assert!(

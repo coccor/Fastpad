@@ -47,7 +47,7 @@
 ### 3.3 Typing
 
 - **What's searched:** every note in `LibraryState.notes`, the list already in memory. No disk access.
-- **Each note is matched against** its name (the file stem, as the tree shows it) and its folder path relative to the notebook, joined with `\`.
+- **Each note is matched against** its name (the file name with its extension, as the tree shows it) and its folder path relative to the notebook, joined with `\`.
 - **Spaces** split the query into terms. Every term must match (AND), each scored on its own and summed.
 - A term matches when its letters appear in order, ignoring case, either:
   - in the name alone, which is a name match; or

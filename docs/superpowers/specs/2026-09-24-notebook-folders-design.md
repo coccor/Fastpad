@@ -161,7 +161,7 @@
 
 ### 5.4 Screen readers
 
-- A note row's accessible name adds its type: `budget, CSV`, or `meeting notes, Markdown`.
+- A note row's accessible name adds its type: `budget.csv, CSV`, or `meeting notes.md, Markdown`.
   - The type names: `Markdown`, `JSON`, `YAML`, `TOML`, `INI`, `config`, `CSV`, `XML`, `text`, `log`.
   - `cfg` and `conf` are `config`.
 - The existing `, pinned` and `, unsaved` suffixes come after the type.
