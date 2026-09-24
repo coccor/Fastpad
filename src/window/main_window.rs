@@ -226,6 +226,9 @@ unsafe extern "system" fn main_window_proc(
         WM_DESTROY => {
             // A running text search stops reading: its posts would fail from here on anyway.
             crate::window::text_search_host::cancel(hwnd);
+            // A replace stops too; a note being written is finished before the window goes.
+            crate::window::text_search_host::cancel_replace(hwnd);
+            crate::window::text_search_host::join_writers(hwnd);
             unsafe {
                 KillTimer(hwnd, crate::recovery::RECOVERY_TIMER_ID);
                 KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
@@ -253,6 +256,10 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_TIMER if wparam == crate::window::text_search_host::TEXT_SEARCH_TIMER_ID => {
             crate::window::text_search_host::timer(hwnd);
+            0
+        }
+        WM_TIMER if wparam == crate::window::text_search_host::REPLACE_TIMER_ID => {
+            crate::window::text_search_host::replace_timer(hwnd);
             0
         }
         WM_DROPFILES => {
@@ -668,6 +675,18 @@ unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_TEXT_SEARCH_BATCH {
                 crate::window::text_search_host::batch_arrived(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_REPLACE_COUNTED {
+                crate::window::text_search_host::replace_counted(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_REPLACE_WRITTEN {
+                crate::window::text_search_host::replace_written(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_REPLACE_RELOADED {
+                crate::window::text_search_host::replace_reloaded(hwnd, lparam);
                 return 0;
             }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
@@ -3993,25 +4012,27 @@ struct SnapshotJob {
     inactive: Option<(crate::editor::EditorDocument, crate::editor::EditorDocument)>,
 }
 
-/// Scintilla can only read the document shown in the view, so an inactive tab is swapped in and
-/// out with notifications suppressed, restoring the visible selection and scroll position.
-fn read_inactive_text(
+/// Scintilla can only read or change the document shown in the view, so an inactive tab is
+/// swapped in, `f` runs on it, and it is swapped out again, with notifications suppressed
+/// (`populating_file`), restoring the visible selection and scroll position.
+fn with_inactive_document<R>(
     hwnd: HWND,
     identity: &WindowIdentity,
     editor: &Editor,
     target: &crate::editor::EditorDocument,
     active: &crate::editor::EditorDocument,
-) -> Result<String> {
+    f: impl FnOnce(&Editor) -> Result<R>,
+) -> Result<R> {
     use crate::editor::scintilla_constants::{SCI_GETFIRSTVISIBLELINE, SCI_SETFIRSTVISIBLELINE};
     let selection = editor.selection();
     let first_line = unsafe { SendMessageW(editor.hwnd(), SCI_GETFIRSTVISIBLELINE, 0, 0) };
     set_file_population(hwnd, true);
-    let text = editor.use_document(target).and_then(|_| editor.text());
+    let value = editor.use_document(target).and_then(|_| f(editor));
     let restored = if identity.is_live_for(hwnd) {
         editor.use_document(active)
     } else {
         Err(crate::FastPadError::Invariant(
-            "main window was destroyed during a recovery snapshot",
+            "main window was destroyed while a background tab was swapped in",
         ))
     };
     if restored.is_ok() {
@@ -4031,7 +4052,18 @@ fn read_inactive_text(
         set_file_population(hwnd, false);
     }
     restored?;
-    text
+    value
+}
+
+/// An inactive tab's text (`with_inactive_document`).
+fn read_inactive_text(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    editor: &Editor,
+    target: &crate::editor::EditorDocument,
+    active: &crate::editor::EditorDocument,
+) -> Result<String> {
+    with_inactive_document(hwnd, identity, editor, target, active, Editor::text)
 }
 
 /// The text of tab `id` as the editor has it, for the Search view's overlays. A background tab is
@@ -4060,6 +4092,139 @@ pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
             read_inactive_text(hwnd, &identity, &editor, &target, &active).ok()
         }
     }
+}
+
+/// Replaces every match of `matcher` in tab `id`'s live text with `template` (expanded in regex
+/// mode), in the editor, as one undo action (note-search spec §12). The tab is not saved. The
+/// active tab's edit raises Scintilla's notifications as typing does. A background tab is
+/// swapped in (`with_inactive_document`, notifications suppressed) and then marked edited by
+/// hand (`Tabs::note_background_edit`). Returns how many matches were replaced, or `None`
+/// without an editor or that tab, while a file is being populated, or when Scintilla fails. Call
+/// it with nothing of the App borrowed.
+pub(crate) fn replace_in_document(
+    hwnd: HWND,
+    id: DocumentId,
+    matcher: &crate::search::Matcher,
+    template: &str,
+) -> Option<usize> {
+    let identity = unsafe { window_identity(hwnd) }?;
+    let (editor, inactive) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        // While a file is populated the editor may show a document that is not the active tab's.
+        if app.populating_file {
+            return None;
+        }
+        let editor = app.editor.clone()?;
+        let active = app.tabs.active()?;
+        let target = app.tabs.document(id)?;
+        if target.id == active.id {
+            return Some((editor, None));
+        }
+        Some((editor, Some((target.handle.clone(), active.handle.clone()))))
+    })?;
+    let replace = |editor: &Editor| -> Result<usize> {
+        let edits = editor.with_document_text(|text| matcher.replacements(text, template))?;
+        if edits.is_empty() {
+            return Ok(0);
+        }
+        editor.replace_ranges_with(&edits)
+    };
+    match inactive {
+        None => replace(&editor).ok(),
+        Some((target, active)) => {
+            let replaced =
+                with_inactive_document(hwnd, &identity, &editor, &target, &active, replace).ok()?;
+            if replaced > 0 && identity.is_live_for(hwnd) {
+                let changed = unsafe { app_ptr(hwnd) }
+                    .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.note_background_edit(id));
+                if changed {
+                    invalidate_title_strip(hwnd);
+                }
+            }
+            Some(replaced)
+        }
+    }
+}
+
+/// Shows `loaded` (read on a worker) in tab `id`, as a file open populates a tab: no undo
+/// history and no notifications, the tab left clean, and its encoding and disk stamp taken from
+/// the read. The caret and scroll position stay where they were, as far as the new text allows.
+/// Only a tab still open on `path` and still clean is changed: an edit since keeps its text, and
+/// its old disk stamp pauses its autosave. Returns whether the tab was reloaded. Call it with
+/// nothing of the App borrowed.
+pub(crate) fn reload_clean_document(
+    hwnd: HWND,
+    id: DocumentId,
+    path: &std::path::Path,
+    loaded: &crate::file::loader::LoadedFile,
+    stamp: Option<crate::library::DiskStamp>,
+) -> bool {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return false;
+    };
+    let Some((editor, inactive)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        if app.populating_file {
+            return None;
+        }
+        let editor = app.editor.clone()?;
+        let active = app.tabs.active()?;
+        let target = app.tabs.document(id)?;
+        if target.dirty || target.path.as_deref() != Some(path) {
+            return None;
+        }
+        if target.id == active.id {
+            return Some((editor, None));
+        }
+        Some((editor, Some((target.handle.clone(), active.handle.clone()))))
+    }) else {
+        return false;
+    };
+    let populate = |editor: &Editor| editor.populate_clean(&loaded.text);
+    let populated = match &inactive {
+        Some((target, active)) => {
+            with_inactive_document(hwnd, &identity, &editor, target, active, populate)
+        }
+        None => {
+            use crate::editor::scintilla_constants::{
+                SCI_GETFIRSTVISIBLELINE, SCI_SETFIRSTVISIBLELINE,
+            };
+            let selection = editor.selection();
+            let first_line = unsafe { SendMessageW(editor.hwnd(), SCI_GETFIRSTVISIBLELINE, 0, 0) };
+            set_file_population(hwnd, true);
+            let populated = populate(&editor);
+            if identity.is_live_for(hwnd) {
+                if let Ok(selection) = selection {
+                    let _ = editor.set_selection(selection);
+                }
+                unsafe {
+                    SendMessageW(
+                        editor.hwnd(),
+                        SCI_SETFIRSTVISIBLELINE,
+                        first_line as usize,
+                        0,
+                    );
+                }
+                set_file_population(hwnd, false);
+            }
+            populated
+        }
+    };
+    if populated.is_err() || !identity.is_live_for(hwnd) {
+        return false;
+    }
+    if let Some(mut app) = unsafe { app_ptr(hwnd) }
+        && let Some(document) = unsafe { app.as_mut() }.tabs.document_mut(id)
+    {
+        document.encoding = loaded.encoding;
+        document.disk_stamp = stamp;
+        document.autosave_paused = false;
+    }
+    if inactive.is_none() {
+        // Population suppressed SCN_MODIFIED: the preview reads the new text.
+        crate::window::preview_host::document_reloaded(hwnd);
+    }
+    true
 }
 
 fn set_file_population(hwnd: HWND, active: bool) {
@@ -11722,6 +11887,664 @@ mod tests {
         assert_eq!(list_top(), closed_top);
     }
 
+    /// Opens the replace field, runs the search for `query` to its end, and types `replacement`.
+    fn search_to_replace(hwnd: HWND, query: &str, replacement: &str) {
+        crate::window::search_view::show_replace(hwnd);
+        search_for(hwnd, query);
+        type_into_replace(hwnd, replacement);
+    }
+
+    /// Pumps until a replace report is pushed, and returns it.
+    fn wait_for_report(hwnd: HWND) -> String {
+        let report = || {
+            notices(hwnd)
+                .into_iter()
+                .find(|notice| notice.starts_with("Replaced "))
+        };
+        pump_until(hwnd, || report().is_some());
+        report().unwrap()
+    }
+
+    /// Queues a No for the next question and returns whether it was asked.
+    fn decline_next_confirm() -> std::rc::Rc<std::cell::Cell<bool>> {
+        let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let answered = std::rc::Rc::clone(&asked);
+        crate::window::answer_next_confirm(move |_| {
+            answered.set(true);
+            false
+        });
+        asked
+    }
+
+    const SAVED_LINE: &str = "\nNotes that aren't open are saved and can't be undone.";
+
+    #[test]
+    fn a_background_dirty_tab_is_replaced_in_the_editor_not_on_disk() {
+        // Break caught (Review Focus 5): a background tab's unsaved edits replaced from the
+        // note's disk text or written over on disk, the same note also written as a closed note,
+        // the active tab changed in the background tab's place, the background tab left clean,
+        // or its replacement taking more than one undo.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-background-dirty");
+        let a = scratch.note("a.md", "old needle\r\n");
+        let b = scratch.note("b.md", "b needle\n");
+        let c = scratch.note("c.md", "c needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        // Leaving a tab autosaves it (`switching_tabs_autosaves_the_tab_being_left`); a's edits
+        // must stay unsaved.
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        crate::window::modal::take_last_confirm();
+        super::open_path(window.hwnd, &a).unwrap();
+        pump_posted_messages(window.hwnd);
+        editor.set_text("typed needle here\r\n").unwrap();
+        let a_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        let b_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert_ne!(a_id, b_id);
+
+        search_to_replace(window.hwnd, "needle", "pin");
+        assert_eq!(search_rows(window.hwnd).len(), 3);
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 3 matches in 3 notes."
+        );
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            Some(format!(
+                "Replace 3 matches in 3 notes with \"pin\"?{SAVED_LINE}"
+            )),
+            "c is closed: the warning shows"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "old needle\r\n",
+            "a's file is never written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "b needle\n",
+            "b is open too: changed in the editor only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&c).unwrap(),
+            "c pin",
+            "c is closed: written"
+        );
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().id,
+            b_id,
+            "b stays in front"
+        );
+        assert_eq!(editor.text().unwrap(), "b pin\n");
+        assert!(app_mut(window.hwnd).tabs.document(a_id).unwrap().dirty);
+
+        assert!(super::activate_document_by_id(window.hwnd, a_id));
+        assert_eq!(
+            editor.text().unwrap(),
+            "typed pin here\r\n",
+            "replaced in the tab's live text"
+        );
+        editor.undo().unwrap();
+        assert_eq!(
+            editor.text().unwrap(),
+            "typed needle here\r\n",
+            "one undo action"
+        );
+    }
+
+    #[test]
+    fn replace_all_writes_the_closed_notes_updates_the_library_and_searches_again() {
+        // Break caught: a closed note left unwritten, a note written that the search never
+        // listed, the library keeping the old size (the next rescan would read FastPad's own
+        // write as an outside change), or the results still listing notes with nothing left to
+        // match.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-closed");
+        let a = scratch.note("a.md", "one needle, two needle\r\n");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let b = scratch.note(r"sub\b.md", "needle\n");
+        let c = scratch.note("c.md", "nothing");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        let before = search_generation(window.hwnd);
+
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 3 matches in 2 notes."
+        );
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            Some(format!(
+                "Replace 3 matches in 2 notes with \"pin\"?{SAVED_LINE}"
+            ))
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "one pin, two pin\r\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "pin\n");
+        assert_eq!(std::fs::read_to_string(&c).unwrap(), "nothing");
+        let size = |relative: &str| {
+            crate::window::library_host::with_state(window.hwnd, |state| {
+                state
+                    .notes
+                    .iter()
+                    .find(|note| {
+                        crate::library::model::same_path(&note.path, std::path::Path::new(relative))
+                    })
+                    .map(|note| note.size)
+            })
+            .flatten()
+        };
+        assert_eq!(size("a.md"), Some("one pin, two pin\r\n".len() as u64));
+        assert_eq!(size(r"sub\b.md"), Some("pin\n".len() as u64));
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+
+        wait_for_search(window.hwnd, before);
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some((crate::window::search_view::NO_MATCH.to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn declining_the_question_writes_nothing_and_a_later_replace_still_runs() {
+        // Break caught: a No that still writes the closed notes or changes the open tab, or one
+        // that leaves the replace marked as running, so Replace all never works again.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-declined");
+        let a = scratch.note("a.md", "needle");
+        let b = scratch.note("b.md", "b needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+
+        let asked = decline_next_confirm();
+        crate::window::text_search_host::replace_all(window.hwnd);
+        pump_until(window.hwnd, || asked.get());
+        pump_past_debounce(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+        assert_eq!(editor.text().unwrap(), "b needle");
+        assert!(
+            !notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.starts_with("Replaced "))
+        );
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 2 matches in 2 notes."
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+        assert_eq!(editor.text().unwrap(), "b pin");
+    }
+
+    #[test]
+    fn results_open_nothing_and_the_summary_says_replacing_while_a_replace_runs() {
+        // Break caught: a result opened (and so a tab made, whose text the split then changes in
+        // the editor instead of the file the question warned about) while the count or the
+        // write runs, or the summary still claiming the old results.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-busy");
+        scratch.note("a.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        let tabs = || tab_paths(window.hwnd).len();
+        let before = tabs();
+
+        let asked = decline_next_confirm();
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert!(crate::window::text_search_host::replacing(window.hwnd));
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some((crate::window::search_view::REPLACING.to_owned(), false))
+        );
+        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Permanent, true);
+        assert_eq!(tabs(), before, "nothing opened");
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+
+        pump_until(window.hwnd, || asked.get());
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+        assert_eq!(
+            crate::window::search_view::summary(window.hwnd),
+            Some(("1 note".to_owned(), false))
+        );
+        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+        assert!(
+            app_mut(window.hwnd).tabs.preview_id().is_some(),
+            "opens again"
+        );
+    }
+
+    #[test]
+    fn a_note_changed_on_disk_since_the_search_is_skipped_and_named_in_the_report() {
+        // Break caught (Review Focus 1, in the window): a sync client's newer text overwritten
+        // with a replacement of the text the search read, or the skip left out of the report.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-changed");
+        let a = scratch.note("a.md", "needle");
+        let b = scratch.note("b.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        std::fs::write(&b, "needle, edited elsewhere").unwrap();
+
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 1 match in 1 note. 1 note was skipped because it changed since the search. (b)"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "needle, edited elsewhere"
+        );
+    }
+
+    #[test]
+    fn the_row_replace_changes_one_note_and_asks_only_when_it_is_closed() {
+        // Break caught: a row's button replacing in every result, asking about a note whose
+        // change one Ctrl+Z undoes, or saving a closed note without asking.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-row");
+        let a = scratch.note("a.md", "needle");
+        let b = scratch.note("b.md", "b needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        crate::window::modal::take_last_confirm();
+        let before = search_generation(window.hwnd);
+
+        crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("b.md"));
+        assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
+        assert_eq!(crate::window::modal::take_last_confirm(), None, "b is open");
+        assert_eq!(editor.text().unwrap(), "b pin");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+        wait_for_search(window.hwnd, before);
+        assert_eq!(
+            search_rows(window.hwnd),
+            vec![search_row("a", "needle")],
+            "b's row is gone"
+        );
+
+        app_mut(window.hwnd).notifications.dismiss_all();
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("a.md"));
+        assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some(
+                "Replace 1 match in \"a\" with \"pin\"? The note is saved and this can't be undone."
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+    }
+
+    #[test]
+    fn ctrl_alt_enter_replaces_an_open_tab_with_its_groups_as_one_undo_action() {
+        // Break caught: Ctrl+Alt+Enter opening a result instead, `$1` inserted literally in regex
+        // mode (spec §12a), the tab saved, the warning shown with every note open, or the
+        // replacement taking one undo per match.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-ctrl-alt-enter");
+        let a = scratch.note("a.md", "x needle y needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &a).unwrap();
+        pump_posted_messages(window.hwnd);
+        crate::window::search_view::show_replace(window.hwnd);
+        crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+        search_for(window.hwnd, "n(ee)dle");
+        type_into_replace(window.hwnd, "[$1]");
+        let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+
+        crate::window::answer_next_confirm(|_| true);
+        press_with(replace, VK_RETURN, true, false, true);
+
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 2 matches in 1 note."
+        );
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some("Replace 2 matches in 1 note with \"[$1]\"?"),
+            "every note is open: no warning line"
+        );
+        assert_eq!(editor.text().unwrap(), "x [ee] y [ee]");
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "x needle y needle");
+        editor.undo().unwrap();
+        assert_eq!(
+            editor.text().unwrap(),
+            "x needle y needle",
+            "one undo action"
+        );
+    }
+
+    #[test]
+    fn a_tab_closed_before_an_unasked_row_replace_applies_is_not_written() {
+        // Break caught: a note saved without the question ever saying so, because its tab (whose
+        // text the count read, so no question was asked) closed while the count ran.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-closed-meanwhile");
+        let b = scratch.note("b.md", "b needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        crate::window::modal::take_last_confirm();
+
+        crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("b.md"));
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert!(
+            tab_paths(window.hwnd)
+                .iter()
+                .all(|path| path.as_deref() != Some(b.as_path()))
+        );
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 0 matches in 0 notes. 1 note was skipped because it changed since the search. (b)"
+        );
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            None,
+            "never asked"
+        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b needle");
+    }
+
+    #[test]
+    fn a_hit_from_a_dirty_tab_that_has_closed_is_never_written() {
+        // Break caught (R-nostamp): a note whose hit came from a tab's unsaved text (no stamp,
+        // so no check that the file is what the search read) written from its file after the
+        // tab closed, or its skip left out of the report.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-no-stamp");
+        let a = scratch.note("a.md", "needle");
+        let b = scratch.note("b.md", "b needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        editor.set_text("b needle typed").unwrap();
+        search_to_replace(window.hwnd, "needle", "pin");
+        assert_eq!(search_rows(window.hwnd).len(), 2);
+        answer_next_close_prompt(|_| CloseDecision::Discard);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert!(
+            tab_paths(window.hwnd)
+                .iter()
+                .all(|path| path.as_deref() != Some(b.as_path()))
+        );
+
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 1 match in 1 note. 1 note was skipped because it changed since the search. (b)"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b needle");
+    }
+
+    fn one_closed_match() -> crate::library::text_replace::ReplaceCount {
+        crate::library::text_replace::ReplaceCount {
+            matches: 1,
+            notes: 1,
+            closed_notes: 1,
+        }
+    }
+
+    #[test]
+    fn a_count_of_an_earlier_replace_or_notebook_is_dropped() {
+        // Break caught: the question asked, or the old notebook's notes written, for a count
+        // that arrived after the user switched notebooks or after its replace was cancelled.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-stale");
+        let a = scratch.note("a.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        crate::window::modal::take_last_confirm();
+        let host = |lparam| crate::window::text_search_host::replace_counted(window.hwnd, lparam);
+        let generation = || crate::window::text_search_host::replace_generation(window.hwnd);
+        let counted = |generation| {
+            crate::window::text_search_host::test_counted(
+                window.hwnd,
+                generation,
+                one_closed_match(),
+            )
+        };
+
+        host(counted(generation().wrapping_sub(1)));
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            None,
+            "an older one"
+        );
+        // What a notebook change does (`library_host`'s notebook switch calls it).
+        let before_forget = generation();
+        crate::window::text_search_host::forget(window.hwnd);
+        host(counted(before_forget));
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            None,
+            "from before a notebook change"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+
+        // The same count with the current generation is asked about: the generation dropped it.
+        let asked = decline_next_confirm();
+        host(counted(generation()));
+        assert!(asked.get());
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            Some(format!(
+                "Replace 1 match in 1 note with \"pin\"?{SAVED_LINE}"
+            ))
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+    }
+
+    #[test]
+    fn a_count_that_arrives_while_a_file_is_populated_asks_once_it_ends() {
+        // Break caught: the question (a nested modal loop) or a background-tab swap run in the
+        // middle of a file population, or a held count lost so the replace never asks.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-held");
+        let a = scratch.note("a.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        crate::window::modal::take_last_confirm();
+        let counted = crate::window::text_search_host::test_counted(
+            window.hwnd,
+            crate::window::text_search_host::replace_generation(window.hwnd),
+            one_closed_match(),
+        );
+
+        app_mut(window.hwnd).populating_file = true;
+        crate::window::text_search_host::replace_counted(window.hwnd, counted);
+        assert!(crate::window::text_search_host::replace_held(window.hwnd));
+        crate::window::text_search_host::replace_timer(window.hwnd);
+        assert!(
+            crate::window::text_search_host::replace_held(window.hwnd),
+            "still populating"
+        );
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            None,
+            "no question during the population"
+        );
+
+        app_mut(window.hwnd).populating_file = false;
+        let asked = decline_next_confirm();
+        crate::window::text_search_host::replace_timer(window.hwnd);
+        assert!(asked.get());
+        assert!(!crate::window::text_search_host::replace_held(window.hwnd));
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+    }
+
+    #[test]
+    fn a_clean_tab_on_a_written_note_reloads_from_disk_and_a_dirty_one_keeps_its_text() {
+        // Break caught: a clean tab opened while the write ran left showing the text from before
+        // it (its next save would undo the replace), a dirty tab's unsaved edits dropped for the
+        // file's text, or a reload that leaves the tab dirty or with an undo back to the old
+        // text.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-reload");
+        let a = scratch.note("a.md", "a needle");
+        let b = scratch.note("b.md", "b needle");
+        let c = scratch.note("c.md", "c needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &c).unwrap();
+        pump_posted_messages(window.hwnd);
+        editor.set_text("c typed").unwrap();
+        let c_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        super::open_path(window.hwnd, &a).unwrap();
+        pump_posted_messages(window.hwnd);
+        let a_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        let b_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        // What the write did while those tabs opened.
+        let mut written = Vec::new();
+        for (path, text) in [(&a, "a pin"), (&b, "b pin"), (&c, "c pin")] {
+            std::fs::write(path, text).unwrap();
+            let relative = PathBuf::from(path.file_name().unwrap());
+            let stamp = crate::library::text_search::Stamp {
+                size: text.len() as u64,
+                mtime: 1,
+            };
+            written.push((relative, stamp));
+        }
+        let report = crate::library::text_replace::ReplaceReport {
+            matches: 3,
+            written,
+            ..Default::default()
+        };
+
+        crate::window::text_search_host::replace_written(
+            window.hwnd,
+            crate::window::text_search_host::test_written(
+                crate::window::text_search_host::replace_generation(window.hwnd),
+                report,
+            ),
+        );
+        assert_eq!(
+            notices(window.hwnd).last().map(String::as_str),
+            Some("Replaced 3 matches in 3 notes.")
+        );
+        pump_until(window.hwnd, || editor.text().unwrap() == "b pin");
+        let dirty = |id| app_mut(window.hwnd).tabs.document(id).unwrap().dirty;
+        assert!(!dirty(b_id), "the active tab stays clean");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.document(b_id).unwrap().disk_stamp,
+            crate::library::disk_stamp(&b)
+        );
+        assert!(!editor.can_undo().unwrap(), "no undo back to the old text");
+
+        assert!(super::activate_document_by_id(window.hwnd, a_id));
+        assert_eq!(editor.text().unwrap(), "a pin", "a background tab too");
+        assert!(!dirty(a_id));
+        assert!(super::activate_document_by_id(window.hwnd, c_id));
+        assert_eq!(
+            editor.text().unwrap(),
+            "c typed",
+            "a dirty tab keeps its text"
+        );
+        assert!(dirty(c_id));
+        assert_eq!(std::fs::read_to_string(&c).unwrap(), "c pin");
+    }
+
+    #[test]
+    fn closing_the_window_waits_for_the_write_worker_to_end() {
+        // Break caught (R-join): the write worker left running past the window's end, so a note
+        // is written (or half written) after FastPad has closed.
+        use crate::window::text_search_host::writer_hooks;
+        struct Unpause;
+        impl Drop for Unpause {
+            fn drop(&mut self) {
+                writer_hooks::set_pause(0);
+            }
+        }
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-join");
+        let paths = (0..50)
+            .map(|index| scratch.note(&format!("n{index:03}.md"), "needle"))
+            .collect::<Vec<_>>();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let answered = std::rc::Rc::clone(&asked);
+        crate::window::answer_next_confirm(move |_| {
+            answered.set(true);
+            true
+        });
+        // The worker is still running when the window closes: it waits after its notes.
+        let _unpause = Unpause;
+        writer_hooks::set_pause(300);
+        let ended = writer_hooks::ended();
+        crate::window::text_search_host::replace_all(window.hwnd);
+        pump_until(window.hwnd, || asked.get());
+        assert_eq!(writer_hooks::ended(), ended, "still writing");
+
+        drop(window);
+        assert_eq!(
+            writer_hooks::ended(),
+            ended + 1,
+            "WM_DESTROY waited for the worker"
+        );
+        let texts = || {
+            paths
+                .iter()
+                .map(|path| std::fs::read_to_string(path).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            texts().iter().all(|text| text == "needle" || text == "pin"),
+            "every note whole"
+        );
+    }
+
     /// Sends `key` to `window` as a key press with Ctrl and Shift held as given.
     fn press_with(window: HWND, key: u16, ctrl: bool, shift: bool, alt: bool) {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -11802,6 +12625,9 @@ mod tests {
         scratch.install(window.hwnd);
         let panel = sidebar_panel(window.hwnd);
         let requests = || crate::window::search_view::replace_requests(window.hwnd);
+        // The first request that runs (the row's, below) starts a real replace of that closed
+        // note, whose question is declined; the others wait for it.
+        let asked = decline_next_confirm();
 
         crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
         search_for(window.hwnd, "needle");
@@ -11879,6 +12705,14 @@ mod tests {
             None,
             "nothing opened"
         );
+
+        pump_until(window.hwnd, || asked.get());
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some("Replace 1 match in \"b\" with \"\"? The note is saved and this can't be undone."),
+            "the row's request ran the replace of that row's note"
+        );
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
     }
 
     #[test]

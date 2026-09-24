@@ -445,6 +445,25 @@ impl Tabs {
         true
     }
 
+    /// A background tab's text was changed in the editor while it was swapped in with
+    /// notifications suppressed (a Search replace, note-search spec §12a). Records what
+    /// `SCN_SAVEPOINTLEFT` and `SCN_MODIFIED` would have for the active tab: dirty, a new
+    /// generation (so recovery snapshots it), and a preview kept. Returns whether the strip
+    /// changed.
+    pub(crate) fn note_background_edit(&mut self, id: DocumentId) -> bool {
+        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+            return false;
+        };
+        document.generation = document.generation.saturating_add(1);
+        let changed = !document.dirty || document.preview;
+        document.dirty = true;
+        document.preview = false;
+        if changed {
+            self.view.update(&self.documents);
+        }
+        changed
+    }
+
     /// The preview tab, if one is open. There is at most one.
     pub(crate) fn preview_id(&self) -> Option<DocumentId> {
         self.documents
@@ -674,6 +693,24 @@ mod tests {
         let mut document = document(id);
         document.preview = true;
         document
+    }
+
+    #[test]
+    fn a_background_edit_marks_only_that_tab_dirty_and_keeps_its_preview() {
+        // Break caught: a Search replace into a background tab leaving it clean (closing it
+        // would drop the replacement without asking), marking the active tab instead, or leaving
+        // a preview that the next click replaces with its edits in it.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(preview(2)).unwrap();
+        tabs.activate(DocumentId(1)).unwrap();
+        let before = tabs.document(DocumentId(2)).unwrap().generation;
+        assert!(tabs.note_background_edit(DocumentId(2)));
+        let edited = tabs.document(DocumentId(2)).unwrap();
+        assert!(edited.dirty && !edited.preview);
+        assert_eq!(edited.generation, before + 1);
+        assert!(!tabs.active().unwrap().dirty);
+        assert!(!tabs.note_background_edit(DocumentId(2)), "already dirty");
+        assert!(!tabs.note_background_edit(DocumentId(9)), "no such tab");
     }
 
     #[test]

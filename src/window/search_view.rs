@@ -51,6 +51,8 @@ pub(crate) const NO_NOTEBOOK: &str = "Open a notebook to search it.";
 pub(crate) const NO_MATCH: &str = "No notes match.";
 pub(crate) const LOADING: &str = "Loading\u{2026}";
 pub(crate) const TOO_SHORT: &str = "Type at least 2 characters.";
+/// The summary while a replace runs.
+pub(crate) const REPLACING: &str = "Replacing\u{2026}";
 
 const HEADER_AT_96_DPI: i32 = 38;
 /// The summary line, the notice and the status line.
@@ -231,7 +233,7 @@ fn note_count(count: usize, capped: bool) -> String {
 }
 
 /// `value` with a comma between each group of three digits.
-fn thousands(value: usize) -> String {
+pub(crate) fn thousands(value: usize) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
@@ -459,6 +461,8 @@ pub(crate) struct SearchView {
     row_hover_button: Option<usize>,
     /// The header button under the pointer.
     header_hover: Option<HeaderButton>,
+    /// A replace runs (`set_replacing`): the summary says so and no result opens.
+    replacing: bool,
     /// The rows a row replace was asked for (`row_replace_requested`), for in-process tests.
     #[cfg(test)]
     row_replace_requests: Vec<usize>,
@@ -516,6 +520,7 @@ impl SearchView {
             replace_text: String::new(),
             row_hover_button: None,
             header_hover: None,
+            replacing: false,
             #[cfg(test)]
             row_replace_requests: Vec::new(),
             #[cfg(test)]
@@ -914,6 +919,9 @@ impl SearchView {
     }
 
     pub(crate) fn summary(&self) -> Option<(String, bool)> {
+        if self.replacing {
+            return Some((REPLACING.to_owned(), false));
+        }
         summary_text(&self.search, self.results.len())
     }
 
@@ -1512,6 +1520,41 @@ pub(crate) fn result_paths(hwnd: HWND) -> Vec<PathBuf> {
     .unwrap_or_default()
 }
 
+/// The listed notes in list order, as a replace takes them (spec §12a: never a note that isn't
+/// listed), and whether the results were capped.
+pub(crate) fn replace_candidates(hwnd: HWND) -> (Vec<text_search_host::Candidate>, bool) {
+    with_view(hwnd, |view| {
+        let candidates = view
+            .results
+            .iter()
+            .map(|hit| text_search_host::Candidate {
+                path: hit.path.clone(),
+                name: hit.name.clone(),
+                stamp: hit.stamp,
+            })
+            .collect();
+        let capped = matches!(view.search, SearchState::Done { capped: true, .. });
+        (candidates, capped)
+    })
+    .unwrap_or_default()
+}
+
+/// A replace started or ended (`text_search_host`): while one runs the summary says so and no
+/// result opens.
+pub(crate) fn set_replacing(hwnd: HWND, replacing: bool) {
+    let Some(panel) = with_view(hwnd, |view| {
+        (view.replacing != replacing).then(|| {
+            view.replacing = replacing;
+            view.panel
+        })
+    })
+    .flatten() else {
+        return;
+    };
+    invalidate(panel);
+    announce_lines(hwnd, false);
+}
+
 /// The search box, made now if the view has none yet. A failure is reported once.
 fn ensure_edit(hwnd: HWND) -> Option<HWND> {
     let (panel, edit, failed) = with_view(hwnd, |view| (view.panel, view.edit, view.edit_failed))?;
@@ -1630,16 +1673,11 @@ fn replace_changed(hwnd: HWND, edit: HWND) {
 }
 
 /// The replace field's text as `EN_CHANGE` last kept it; empty before it is first opened.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the replace flow reads it from Task 6")
-)]
 pub(crate) fn replace_text(hwnd: HWND) -> String {
     with_view(hwnd, |view| view.replace_text.clone()).unwrap_or_default()
 }
 
 /// Whether Replace all can run now (`SearchView::replace_all_enabled`).
-#[expect(dead_code, reason = "the replace flow reads it from Task 6")]
 pub(crate) fn replace_all_enabled(hwnd: HWND) -> bool {
     with_view(hwnd, |view| view.replace_all_enabled()).unwrap_or(false)
 }
@@ -1844,6 +1882,10 @@ pub(crate) fn open_selected(hwnd: HWND, mode: OpenMode, focus_editor: bool) {
 }
 
 fn open_result(hwnd: HWND, relative: &Path, mode: OpenMode, focus_editor: bool) {
+    // A replace is changing these notes: a result opens again once its report is in.
+    if with_view(hwnd, |view| view.replacing).unwrap_or(false) {
+        return;
+    }
     super::main_window::open_search_result(hwnd, relative, mode, focus_editor);
 }
 
@@ -1910,21 +1952,23 @@ fn replace_all_requested(hwnd: HWND) {
     if ready {
         #[cfg(test)]
         with_view(hwnd, |view| view.replace_all_requests += 1);
-        // The replace itself (`text_search_host::replace_all`) is not wired yet.
+        text_search_host::replace_all(hwnd);
     }
 }
 
 /// A result's replace button, or Ctrl+Shift+1 on the selected result: replaces in that note only
 /// (spec §11). It runs under the same rule as Replace all, while the replace field is open.
 fn row_replace_requested(hwnd: HWND, index: usize) {
-    let ready = with_view(hwnd, |view| {
-        view.replace_open && view.replace_all_enabled() && index < view.results.len()
+    let path = with_view(hwnd, |view| {
+        (view.replace_open && view.replace_all_enabled())
+            .then(|| view.results.get(index).map(|hit| hit.path.clone()))
+            .flatten()
     })
-    .unwrap_or(false);
-    if ready {
+    .flatten();
+    if let Some(path) = path {
         #[cfg(test)]
         with_view(hwnd, |view| view.row_replace_requests.push(index));
-        // The replace itself (`text_search_host::replace_in`) is not wired yet.
+        text_search_host::replace_in(hwnd, &path);
     }
 }
 
@@ -2433,8 +2477,7 @@ pub(crate) fn edit_hwnd(hwnd: HWND) -> Option<HWND> {
     with_view(hwnd, |view| view.edit).flatten()
 }
 
-/// Whether the replace field is open.
-#[cfg(test)]
+/// Whether the replace field is open: Replace all and the rows' buttons need it.
 pub(crate) fn replace_open(hwnd: HWND) -> bool {
     with_view(hwnd, |view| view.replace_open).unwrap_or(false)
 }
