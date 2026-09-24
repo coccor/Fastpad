@@ -59,6 +59,17 @@ const RESERVED: [&str; 22] = [
 /// A filename stem Windows accepts: no `<>:"/\|?*` or control characters, no trailing dots,
 /// spaces or label ellipsis, not a reserved device name, never empty.
 pub fn sanitize_stem(name: &str) -> String {
+    clean_stem(name).unwrap_or_else(|| "Untitled".to_owned())
+}
+
+/// A folder name typed in the name box, cleaned the way `sanitize_stem` cleans a stem, with no
+/// extension handling; `None` when nothing is left of it (notebook folders spec §4.1).
+pub fn folder_name(input: &str) -> Option<String> {
+    clean_stem(input)
+}
+
+/// `sanitize_stem`'s cleaning, with `None` for a name that cleans to nothing.
+fn clean_stem(name: &str) -> Option<String> {
     let cleaned: String = name
         .chars()
         .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
@@ -70,7 +81,7 @@ pub fn sanitize_stem(name: &str) -> String {
         .trim()
         .to_owned();
     if trimmed.is_empty() {
-        return "Untitled".to_owned();
+        return None;
     }
     // Windows reads "con.txt" and "con .txt" as the device too: neutralise the part before the
     // first dot.
@@ -80,9 +91,9 @@ pub fn sanitize_stem(name: &str) -> String {
         .any(|reserved| reserved.eq_ignore_ascii_case(device))
     {
         let (name, rest) = trimmed.split_at(device.len());
-        return format!("{name}_{rest}");
+        return Some(format!("{name}_{rest}"));
     }
-    trimmed
+    Some(trimmed)
 }
 
 pub fn default_extension(language: Language) -> &'static str {
@@ -284,5 +295,23 @@ mod tests {
         );
         assert!(is_note_extension("YML"));
         assert!(!is_note_extension("png"));
+    }
+
+    #[test]
+    fn folder_names_are_cleaned_like_stems_and_an_empty_one_is_none() {
+        // Break caught: a typed "a/b: c?" or "CON" folder that Windows refuses, "..." creating a
+        // folder named "Untitled", or "v1.2" losing ".2" to extension handling (spec §4.1).
+        assert_eq!(folder_name(" a/b: c?. ").as_deref(), Some("ab c"));
+        assert_eq!(folder_name("Plans.  ").as_deref(), Some("Plans"));
+        assert_eq!(folder_name("CON").as_deref(), Some("CON_"));
+        assert_eq!(folder_name("v1.2").as_deref(), Some("v1.2"));
+        assert_eq!(folder_name("..."), None);
+        assert_eq!(folder_name("   "), None);
+        assert_eq!(folder_name("<>"), None);
+        assert_eq!(
+            sanitize_stem("..."),
+            "Untitled",
+            "file stems keep their fallback"
+        );
     }
 }

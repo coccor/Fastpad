@@ -85,6 +85,7 @@ pub enum CommandId {
     FindPrevious = 189,
     ReplaceInNotes = 190,
     QuickOpen = 191,
+    NoteNewFolder = 192,
 }
 
 impl CommandId {
@@ -131,6 +132,7 @@ impl CommandId {
                 | Self::SearchToggleRegex
                 | Self::ReplaceInNotes
                 | Self::QuickOpen
+                | Self::NoteNewFolder
         )
     }
 
@@ -185,7 +187,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 83] = [
+        const COMMANDS: [CommandId; 84] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -269,6 +271,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::FindPrevious,
             CommandId::ReplaceInNotes,
             CommandId::QuickOpen,
+            CommandId::NoteNewFolder,
         ];
         COMMANDS
             .into_iter()
@@ -457,7 +460,17 @@ mod tests {
         assert_eq!(CommandId::try_from(191), Ok(CommandId::QuickOpen));
         assert!(!CommandId::QuickOpen.needs_document());
         assert!(!CommandId::QuickOpen.is_sidebar());
-        assert_eq!(CommandId::try_from(192), Err(()));
+    }
+
+    #[test]
+    fn new_folder_is_192_and_neither_needs_a_document_nor_the_sidebar() {
+        // Break caught: New folder renumbered onto another command, greyed out while no tab is
+        // open, or treated as a sidebar command (notebook folders spec §6).
+        assert_eq!(CommandId::NoteNewFolder as u16, 192);
+        assert_eq!(CommandId::try_from(192), Ok(CommandId::NoteNewFolder));
+        assert!(!CommandId::NoteNewFolder.needs_document());
+        assert!(!CommandId::NoteNewFolder.is_sidebar());
+        assert_eq!(CommandId::try_from(193), Err(()));
     }
 
     #[test]

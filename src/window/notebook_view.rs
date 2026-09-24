@@ -59,6 +59,7 @@ const GLYPH_STAR: &str = "\u{E734}";
 const GLYPH_STAR_FILLED: &str = "\u{E735}";
 const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_MORE: &str = "\u{E712}";
+const GLYPH_NEW_FOLDER: &str = "\u{E8F4}";
 
 // Tooltip tool IDs.
 const TOOL_ROW: usize = 1;
@@ -66,6 +67,7 @@ const TOOL_TITLE: usize = 2;
 const TOOL_FAVORITE: usize = 3;
 const TOOL_NEW: usize = 4;
 const TOOL_MORE: usize = 5;
+const TOOL_NEW_FOLDER: usize = 6;
 
 /// What the view shows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +89,7 @@ pub(crate) const LOAD_FAILED: &str = "Couldn't load this notebook.";
 pub(crate) enum HeaderButton {
     Favorite,
     NewNote,
+    NewFolder,
     More,
 }
 
@@ -185,8 +188,8 @@ pub(crate) fn row_parts(row: RECT, depth: u16, dpi: u32) -> RowParts {
 #[derive(Clone, Copy)]
 pub(crate) struct HeaderLayout {
     pub title: RECT,
-    /// Left to right: star, New note, "…".
-    pub buttons: [(HeaderButton, RECT); 3],
+    /// Left to right: star, New note, New folder, "…".
+    pub buttons: [(HeaderButton, RECT); 4],
 }
 
 pub(crate) fn header_layout(area: RECT, dpi: u32) -> HeaderLayout {
@@ -201,8 +204,9 @@ pub(crate) fn header_layout(area: RECT, dpi: u32) -> HeaderLayout {
         bottom: top + size,
     };
     let buttons = [
-        (HeaderButton::Favorite, slot(2)),
-        (HeaderButton::NewNote, slot(1)),
+        (HeaderButton::Favorite, slot(3)),
+        (HeaderButton::NewNote, slot(2)),
+        (HeaderButton::NewFolder, slot(1)),
         (HeaderButton::More, slot(0)),
     ];
     let title_left = area.left + scale(12, dpi);
@@ -892,6 +896,7 @@ impl NotebookView {
             let (id, text) = match button {
                 HeaderButton::Favorite => (TOOL_FAVORITE, favorite),
                 HeaderButton::NewNote => (TOOL_NEW, "New note"),
+                HeaderButton::NewFolder => (TOOL_NEW_FOLDER, "New folder"),
                 HeaderButton::More => (TOOL_MORE, "More actions"),
             };
             let text = if buttons_shown { text } else { "" };
@@ -1071,6 +1076,7 @@ impl NotebookView {
                 HeaderButton::Favorite if self.favorite => GLYPH_STAR_FILLED,
                 HeaderButton::Favorite => GLYPH_STAR,
                 HeaderButton::NewNote => GLYPH_ADD,
+                HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
                 HeaderButton::More => GLYPH_MORE,
             };
             let color = if hot {
@@ -1134,6 +1140,7 @@ impl NotebookView {
                     HeaderButton::Favorite if self.favorite => "Remove from favorites",
                     HeaderButton::Favorite => "Add to favorites",
                     HeaderButton::NewNote => "New note",
+                    HeaderButton::NewFolder => "New folder",
                     HeaderButton::More => "More actions",
                 };
                 buttons.push((name.to_owned(), rect));
@@ -1379,6 +1386,23 @@ pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
     }
 }
 
+/// Selects the row showing `kind` and scrolls it into view; false when no row shows it.
+pub(crate) fn select_row(hwnd: HWND, kind: &RowKind) -> bool {
+    with_view(hwnd, |view| {
+        let Some(index) = tree::row_index(&view.rows, kind) else {
+            return false;
+        };
+        view.select(index);
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Gives the tree the keyboard focus, after a folder command closed its name box.
+pub(crate) fn focus_tree(hwnd: HWND) {
+    focus_panel(hwnd);
+}
+
 impl NotebookView {
     /// Under row `index`, in main-window client coordinates, for a menu opened from the
     /// keyboard.
@@ -1462,10 +1486,14 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
             let path = root.join(relative);
             let entries = [
                 MenuEntry::command("New note here", CommandId::New),
+                MenuEntry::command("New folder here", CommandId::NoteNewFolder),
                 MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
             ];
             match super::menus::track_popup(hwnd, &entries, point) {
                 Some(CommandId::New) => super::library_host::new_note_in(hwnd, Some(path)),
+                Some(CommandId::NoteNewFolder) => {
+                    super::library_host::new_folder(hwnd, Some(relative.clone()));
+                }
                 Some(CommandId::NoteRevealInExplorer) => super::library_host::reveal(hwnd, &path),
                 _ => {}
             }
@@ -1781,6 +1809,7 @@ pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
     match button {
         HeaderButton::Favorite => super::library_host::toggle_notebook_favorite(hwnd),
         HeaderButton::NewNote => run(hwnd, CommandId::New),
+        HeaderButton::NewFolder => run(hwnd, CommandId::NoteNewFolder),
         HeaderButton::More => more_menu(hwnd),
     }
 }
@@ -1788,7 +1817,7 @@ pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
 /// "…": the notebook's own actions.
 fn more_menu(hwnd: HWND) {
     let Some(at) = with_view(hwnd, |view| {
-        let rect = header_layout(view.client(), view.dpi()).buttons[2].1;
+        let rect = header_layout(view.client(), view.dpi()).buttons[3].1;
         view.to_main(POINT {
             x: rect.left,
             y: rect.bottom,
@@ -2106,17 +2135,27 @@ mod tests {
             bottom: 600,
         };
         let layout = header_layout(area, 96);
-        let [(first, star), (second, new), (third, more)] = layout.buttons;
+        let [
+            (first, star),
+            (second, new),
+            (third, folder),
+            (fourth, more),
+        ] = layout.buttons;
         assert_eq!(
-            (first, second, third),
+            (first, second, third, fourth),
             (
                 HeaderButton::Favorite,
                 HeaderButton::NewNote,
+                HeaderButton::NewFolder,
                 HeaderButton::More
             )
         );
         assert_eq!(edges(more), (226, 5, 254, 33));
-        assert_eq!((star.right, new.right), (new.left, more.left));
+        assert_eq!(
+            (star.right, new.right, folder.right),
+            (new.left, folder.left, more.left),
+            "New folder sits right of New note"
+        );
         assert!(layout.title.right <= star.left);
         assert_eq!(layout.title.bottom, 38);
         assert_eq!(body_rect(area, 96).top, 38);

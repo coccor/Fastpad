@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 70] = [
+pub(crate) const ENTRIES: [PaletteEntry; 71] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -75,6 +75,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 70] = [
         "Notebook: Toggle favorite",
         CommandId::ToggleNotebookFavorite,
     ),
+    entry("Notebook: New folder\u{2026}", CommandId::NoteNewFolder),
     entry("Note: Reload from disk", CommandId::NoteReloadFromDisk),
     entry("Note: Keep my version", CommandId::NoteKeepMine),
     entry("Note: Toggle pin", CommandId::NoteTogglePin),
@@ -1431,7 +1432,15 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 70);
+        assert_eq!(ENTRIES.len(), 71);
+    }
+
+    #[test]
+    fn new_folder_is_listed_under_notebook_without_a_shortcut() {
+        // Break caught: the palette never offering New folder, or showing a shortcut it doesn't
+        // have (spec §6).
+        assert_eq!(labels("new folder")[0], "Notebook: New folder\u{2026}");
+        assert_eq!(shortcut_text(CommandId::NoteNewFolder), None);
     }
 
     #[test]

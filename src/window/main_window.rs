@@ -1813,12 +1813,15 @@ fn refilter_command_palette(hwnd: HWND) {
         let has_tabs = tab_count(hwnd) > 0;
         let markdown = crate::window::preview_host::buttons_visible(hwnd);
         let sidebar = notes_mode_enabled(hwnd);
+        // New folder needs a notebook, open or loading, to put the folder in (spec §4.1).
+        let notebook = crate::window::library_host::folder(hwnd).is_some();
         let subset = with_command_palette(hwnd, CommandPalette::subset).flatten();
         let entries = command_palette::filter_entries(&query, |command| {
             subset.is_none_or(|subset| subset.contains(&command))
                 && (has_tabs || !command.needs_document())
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
+                && (notebook || command != CommandId::NoteNewFolder)
         });
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
@@ -2484,6 +2487,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::FindPrevious => find_again(hwnd, true),
         CommandId::CommandPalette => open_command_palette(hwnd),
         CommandId::QuickOpen => open_quick_open(hwnd),
+        CommandId::NoteNewFolder => crate::window::library_host::new_folder(hwnd, None),
         CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
         CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
@@ -16680,5 +16684,272 @@ mod tests {
         editor.set_selection(0..3).unwrap();
         super::replace_current(window.hwnd);
         assert_eq!(editor.text().unwrap(), "X foobar");
+    }
+
+    #[test]
+    fn new_folder_from_the_header_creates_it_on_disk_and_selects_its_row() {
+        // Break caught: the header button opening nothing, a folder created before Enter or on
+        // Escape, a suggested name that is taken, or the new folder not selected in the tree.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("new-folder-header");
+        std::fs::create_dir_all(scratch.folder().join("New folder")).unwrap();
+        scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Note("top.md".into()));
+        let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+        let count = crate::window::side_panel::accessible_item_count(panel);
+        assert!(
+            (0..count)
+                .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+                .any(|item| item.name == "New folder"),
+            "the header button has its accessible name"
+        );
+        let press = || {
+            crate::window::notebook_view::header_clicked(
+                window.hwnd,
+                crate::window::notebook_view::HeaderButton::NewFolder,
+            );
+        };
+
+        press();
+        let edit = app_mut(window.hwnd).name_box.as_ref().unwrap().edit_hwnd();
+        unsafe { SendMessageW(edit, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+        assert!(!name_box_visible(window.hwnd));
+        assert!(
+            !scratch.folder().join("New folder 2").exists(),
+            "Escape creates nothing"
+        );
+
+        press();
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(
+            name_box.purpose(),
+            Some(&crate::window::name_box::NamePurpose::NewFolder(
+                std::path::PathBuf::new()
+            ))
+        );
+        assert_eq!(name_box.text(), "New folder 2", "the first free name");
+        assert!(
+            !scratch.folder().join("New folder 2").exists(),
+            "nothing before Enter"
+        );
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        assert!(!name_box_visible(window.hwnd));
+        assert!(scratch.folder().join("New folder 2").is_dir());
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Folder("New folder 2".into()))
+        );
+        assert_eq!(
+            unsafe { GetFocus() },
+            panel,
+            "the focus returns to the tree"
+        );
+    }
+
+    #[test]
+    fn new_folder_here_creates_it_inside_that_folder_expanded_and_refuses_a_taken_name() {
+        // Break caught: "New folder here" creating at the root, a clash with a note or a non-note
+        // file missed (or closing the box), or the new row hidden in a collapsed folder.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("new-folder-here");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        std::fs::write(scratch.folder().join(r"sub\notes.bin"), "x").unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let index = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+        crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteNewFolder));
+        crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert_eq!(
+            name_box.purpose(),
+            Some(&crate::window::name_box::NamePurpose::NewFolder(
+                "sub".into()
+            ))
+        );
+        assert_eq!(name_box.text(), "New folder");
+        for taken in ["A.md", "notes.bin"] {
+            type_into_name_box(window.hwnd, taken);
+            crate::window::library_host::name_box_submit(window.hwnd);
+            let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+            assert!(name_box.is_visible(), "{taken}");
+            assert_eq!(
+                name_box.error(),
+                Some(
+                    format!("A folder or file named \u{201c}{taken}\u{201d} already exists")
+                        .as_str()
+                )
+            );
+        }
+        type_into_name_box(window.hwnd, "Plans");
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        assert!(!name_box_visible(window.hwnd));
+        assert!(scratch.folder().join(r"sub\Plans").is_dir());
+        assert!(
+            crate::window::library_host::expanded(window.hwnd)
+                .contains(&std::path::PathBuf::from("sub"))
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Folder(r"sub\Plans".into()))
+        );
+    }
+
+    #[test]
+    fn a_typed_folder_name_is_sanitized_and_empty_or_hidden_names_are_refused() {
+        // Break caught: a name Windows refuses failing with a path error, "..." creating
+        // "Untitled", or a .git or node_modules folder that the next rescan hides (spec §4.1).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("new-folder-names");
+        scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        let create = |typed: &str| {
+            crate::window::library_host::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
+            type_into_name_box(window.hwnd, typed);
+            crate::window::library_host::name_box_submit(window.hwnd);
+        };
+        let error = || {
+            app_mut(window.hwnd)
+                .name_box
+                .as_ref()
+                .unwrap()
+                .error()
+                .map(str::to_owned)
+        };
+
+        create(" a/b: c?. ");
+        assert!(scratch.folder().join("ab c").is_dir());
+        create("CON");
+        assert!(scratch.folder().join("CON_").is_dir());
+        assert!(!name_box_visible(window.hwnd));
+
+        create("...");
+        assert!(name_box_visible(window.hwnd));
+        assert_eq!(error().as_deref(), Some("Type a folder name"));
+        for hidden in [".git", "node_modules"] {
+            type_into_name_box(window.hwnd, hidden);
+            crate::window::library_host::name_box_submit(window.hwnd);
+            assert_eq!(
+                error(),
+                Some(format!(
+                    "FastPad hides folders named \u{201c}{hidden}\u{201d}. Choose another name."
+                ))
+            );
+            assert!(!scratch.folder().join(hidden).exists());
+        }
+    }
+
+    #[test]
+    fn a_new_folder_box_survives_a_rescan_but_closes_when_its_parent_goes() {
+        // Break caught: a rescan closing the box (and the typed name) for nothing, a box left
+        // offering to create inside a folder deleted in Explorer, or one outliving its notebook.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("new-folder-rescan");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        crate::window::library_host::new_folder(window.hwnd, Some("sub".into()));
+        type_into_name_box(window.hwnd, "Typed");
+        super::create_new_document(window.hwnd).unwrap();
+        assert!(
+            name_box_visible(window.hwnd),
+            "a tab switch keeps a folder box"
+        );
+
+        rescan_and_wait(window.hwnd);
+        assert!(name_box_visible(window.hwnd));
+        assert_eq!(
+            app_mut(window.hwnd).name_box.as_ref().unwrap().text(),
+            "Typed"
+        );
+
+        std::fs::remove_dir_all(scratch.folder().join("sub")).unwrap();
+        rescan_and_wait(window.hwnd);
+        assert!(!name_box_visible(window.hwnd));
+
+        crate::window::library_host::new_folder(window.hwnd, None);
+        assert!(name_box_visible(window.hwnd));
+        crate::window::library_host::close_notebook(window.hwnd);
+        assert!(!name_box_visible(window.hwnd));
+    }
+
+    #[test]
+    fn an_empty_folder_made_on_disk_appears_after_a_rescan_and_goes_with_it() {
+        // Break caught: a folder made in Explorer staying invisible until it holds a note, or a
+        // folder deleted in Explorer keeping its row (spec §3.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("empty-folder-rescan");
+        scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+
+        std::fs::create_dir(scratch.folder().join("Fresh")).unwrap();
+        rescan_and_wait(window.hwnd);
+        row_of(window.hwnd, &RowKind::Folder("Fresh".into()));
+
+        std::fs::remove_dir(scratch.folder().join("Fresh")).unwrap();
+        rescan_and_wait(window.hwnd);
+        assert!(
+            crate::library::tree::row_index(
+                &notebook_view(window.hwnd).rows,
+                &RowKind::Folder("Fresh".into())
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_palette_offers_new_folder_only_while_a_notebook_is_open() {
+        // Break caught: "Notebook: New folder…" listed with no notebook, where it can only say
+        // "Open a notebook first.", or missing once one is open (spec §4.1).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("palette-new-folder");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let listed = || {
+            execute_command(window.hwnd, CommandId::CommandPalette);
+            let listed = app_mut(window.hwnd)
+                .command_palette
+                .as_ref()
+                .unwrap()
+                .shown()
+                .iter()
+                .any(|entry| entry.command == CommandId::NoteNewFolder);
+            super::close_command_palette(window.hwnd, false);
+            listed
+        };
+        assert!(crate::window::library_host::folder(window.hwnd).is_none());
+        assert!(!listed());
+        scratch.install(window.hwnd);
+        assert!(listed());
     }
 }

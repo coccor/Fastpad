@@ -5,6 +5,7 @@ use super::main_window::{app_ptr, push_notice, window_identity};
 use crate::library::model::LibraryError;
 use crate::library::ops::PendingOp;
 use crate::library::title;
+use crate::library::tree::RowKind;
 use crate::library::{self, LibraryState, Metadata, ids::IdSource};
 use crate::window::command_palette::{Picker, PickerChoice, PickerKind};
 use crate::window::name_box::{NameBox, NamePurpose};
@@ -484,6 +485,8 @@ fn install(hwnd: HWND, fresh: LibraryState) {
     );
     // A load or rescan may have seen outside edits: the Search view's query runs again.
     crate::window::text_search_host::notes_reloaded(hwnd);
+    // A folder box whose folder the rescan no longer finds closes.
+    close_stale_name_box(hwnd);
     super::side_panel::refresh(hwnd);
     // A notebook's first load reveals the (restored) active note: its row is selected and its
     // folders expand (spec §6.1). A rescan leaves the user's selection where it was.
@@ -746,6 +749,8 @@ fn open_checked_folder(hwnd: HWND, path: PathBuf) {
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);
     });
+    // A folder box names a folder of the notebook that just went.
+    close_stale_name_box(hwnd);
     update_folders(hwnd, |folders| folders.push(path.clone()));
     start_load(hwnd);
     super::main_window::invalidate_title_strip(hwnd);
@@ -1340,6 +1345,110 @@ fn folder_display_name(hwnd: HWND) -> String {
         .unwrap_or_else(|| "the notebook".to_owned())
 }
 
+const NEW_FOLDER: &str = "New folder";
+const NO_FOLDER_NAME: &str = "Type a folder name";
+
+/// A new or renamed folder's name is taken by a folder or file (spec §4.1).
+fn folder_taken_error(name: &str) -> String {
+    format!("A folder or file named \u{201c}{name}\u{201d} already exists")
+}
+
+/// A folder named like one the scan skips would vanish at the next rescan (scan §3.1).
+fn hidden_folder_error(name: &str) -> String {
+    format!("FastPad hides folders named \u{201c}{name}\u{201d}. Choose another name.")
+}
+
+/// "in <folder>": `parent`'s own name, or the notebook's at the root (spec §4.1, §4.2).
+fn folder_suffix(hwnd: HWND, parent: &Path) -> String {
+    match parent.file_name() {
+        Some(name) => format!("in {}", name.to_string_lossy()),
+        None => format!("in {}", folder_display_name(hwnd)),
+    }
+}
+
+/// `folder` (absolute, inside the notebook `root`) relative to it; empty for the root itself.
+fn relative_folder(root: &Path, folder: &Path) -> PathBuf {
+    if library::model::same_path(root, folder) {
+        PathBuf::new()
+    } else {
+        library::record_path(root, folder)
+    }
+}
+
+/// The Notebook view's New folder button, "New folder here" on a folder row (`parent`, relative
+/// to the notebook) and Notebook: New folder… (spec §4.1). The name box opens for a folder in
+/// `parent`, else in the selected row's folder, else at the root. Nothing is created before
+/// Enter.
+pub(crate) fn new_folder(hwnd: HWND, parent: Option<PathBuf>) {
+    if !ready_library(hwnd) {
+        return;
+    }
+    let Some(root) = folder(hwnd) else {
+        return;
+    };
+    let parent = parent.unwrap_or_else(|| {
+        super::notebook_view::selected_folder(hwnd)
+            .map(|selected| relative_folder(&root, &selected))
+            .unwrap_or_default()
+    });
+    let purpose = NamePurpose::NewFolder(parent.clone());
+    // New folder again while the box is open for the same folder keeps what was typed.
+    if name_box_purpose(hwnd) == Some(purpose.clone()) {
+        focus_name_box(hwnd);
+        return;
+    }
+    let name = with_state(hwnd, |state| {
+        title::free_name(NEW_FOLDER, "", |candidate| {
+            state.is_listed(&parent.join(candidate))
+        })
+    })
+    .unwrap_or_else(|| NEW_FOLDER.to_owned());
+    let suffix = folder_suffix(hwnd, &parent);
+    open_name_box(hwnd, purpose, &name, suffix, false);
+}
+
+/// Enter in the New folder box: creates the folder with the one disk call, then lists it,
+/// expands its parent, selects its row and gives the tree the focus.
+fn submit_new_folder(hwnd: HWND, parent: &Path, text: &str) {
+    let Some(root) = folder(hwnd) else {
+        close_name_box(hwnd);
+        return;
+    };
+    let Some(name) = title::folder_name(text) else {
+        name_box_error(hwnd, NO_FOLDER_NAME.to_owned());
+        return;
+    };
+    if library::scan::skip_directory(&name) {
+        name_box_error(hwnd, hidden_folder_error(&name));
+        return;
+    }
+    let relative = parent.join(&name);
+    if with_state(hwnd, |state| state.is_listed(&relative)).unwrap_or(false) {
+        name_box_error(hwnd, folder_taken_error(&name));
+        return;
+    }
+    if let Err(error) = std::fs::create_dir(root.join(&relative)) {
+        // A file (or a folder the scan skips) may already have the name.
+        let error = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            folder_taken_error(&name)
+        } else {
+            format!("FastPad could not create the folder: {error}")
+        };
+        name_box_error(hwnd, error);
+        return;
+    }
+    with_state(hwnd, |state| state.add_folder(&relative));
+    for ancestor in library::tree::ancestors(&relative) {
+        set_expanded(hwnd, &ancestor, true);
+    }
+    close_name_box(hwnd);
+    super::side_panel::with_accessible_events(hwnd, || {
+        super::side_panel::refresh(hwnd);
+        super::notebook_view::select_row(hwnd, &RowKind::Folder(relative.clone()));
+    });
+    super::notebook_view::focus_tree(hwnd);
+}
+
 pub(crate) fn open_name_box(
     hwnd: HWND,
     purpose: NamePurpose,
@@ -1389,11 +1498,23 @@ fn name_box_purpose(hwnd: HWND) -> Option<NamePurpose> {
     })
 }
 
-/// Closes a name box whose tab is gone or no longer active, or whose first save already happened.
+/// Closes a name box whose tab is gone or no longer active, or whose first save already
+/// happened. A folder box belongs to the notebook, not a tab: it closes when the notebook goes
+/// (no state) or when its folder, or a new folder's parent, is no longer in the tree.
 pub(crate) fn close_stale_name_box(hwnd: HWND) {
     let Some(purpose) = name_box_purpose(hwnd) else {
         return;
     };
+    if let Some(folder) = purpose.folder() {
+        let listed = with_state(hwnd, |state| {
+            folder.as_os_str().is_empty() || state.is_folder(folder)
+        })
+        .unwrap_or(false);
+        if !listed {
+            close_name_box(hwnd);
+        }
+        return;
+    }
     let Some(id) = purpose.document() else {
         return;
     };
@@ -1464,8 +1585,11 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
     };
     match purpose {
         NamePurpose::FirstSave(id) => submit_first_save(hwnd, id, &text),
-        NamePurpose::RenameNote(_) if !ready_library(hwnd) => close_name_box(hwnd),
+        NamePurpose::RenameNote(_) | NamePurpose::NewFolder(_) if !ready_library(hwnd) => {
+            close_name_box(hwnd);
+        }
         NamePurpose::RenameNote(id) => submit_rename(hwnd, id, &text),
+        NamePurpose::NewFolder(parent) => submit_new_folder(hwnd, &parent, &text),
     }
 }
 
