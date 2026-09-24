@@ -216,37 +216,47 @@ pub(crate) fn find_in_editor(
         .flatten()
 }
 
-/// Whether `selection` is exactly a match of `query` under `options`, found where it starts, as
-/// Replace needs before it replaces the selection.
-pub(crate) fn is_match(
+/// The text Replace puts in place of `selection` when the selection is exactly a match of
+/// `query` under `options`, else `None`, as Replace checks before it replaces the selection.
+///
+/// - Plain mode: the match is Scintilla's, found where the selection starts, and the text is
+///   `replacement` as it is.
+/// - Regex mode: the match is one of `Matcher::replacements` over the document, and the text is
+///   `replacement` expanded with that match's captures (`$1`, `${name}`, `$$`).
+pub(crate) fn replacement_for(
     editor: &Editor,
     query: &str,
+    replacement: &str,
     options: MatchOptions,
     selection: Range<usize>,
-) -> bool {
+) -> Option<String> {
     if query.is_empty() || selection.is_empty() {
-        return false;
+        return None;
     }
     if options.regex {
-        let Some(matcher) = regex_matcher(query, options) else {
-            return false;
-        };
+        let matcher = regex_matcher(query, options)?;
         return editor
-            .with_document_text(|text| matcher.find_at(text, selection.start))
+            .with_document_text(|text| {
+                matcher
+                    .replacements(text, replacement)
+                    .into_iter()
+                    .find(|(range, _)| *range == selection)
+                    .map(|(_, text)| text)
+            })
             .ok()
-            .flatten()
-            == Some(selection);
+            .flatten();
     }
-    editor
+    let found = editor
         .search_in_target(query, selection.clone(), search_flags(options))
         .ok()
-        .flatten()
-        == Some(selection)
+        .flatten();
+    (found == Some(selection)).then(|| replacement.to_owned())
 }
 
-/// Replaces every match of `query` under `options` with `replacement` (literal text, in regex
-/// mode too) as one undo action, and returns how many. Regex mode replaces `Matcher`'s matches,
-/// from the end backwards.
+/// Replaces every match of `query` under `options` as one undo action, and returns how many.
+/// Plain mode puts `replacement` in as it is, through Scintilla's search. Regex mode replaces
+/// `Matcher`'s matches from the end backwards, each with `replacement` expanded with its own
+/// captures (`Matcher::replacements`).
 pub(crate) fn replace_all(
     editor: &Editor,
     query: &str,
@@ -264,10 +274,11 @@ pub(crate) fn replace_all(
     let Some(matcher) = regex_matcher(query, options) else {
         return 0;
     };
-    let Ok(ranges) = editor.with_document_text(|text| matcher.find_iter(text)) else {
+    let Ok(edits) = editor.with_document_text(|text| matcher.replacements(text, replacement))
+    else {
         return 0;
     };
-    editor.replace_ranges(&ranges, replacement).unwrap_or(0)
+    editor.replace_ranges_with(&edits).unwrap_or(0)
 }
 
 // --- Window integration: native child controls hosting Find/Replace ---

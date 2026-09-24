@@ -1817,11 +1817,13 @@ pub(crate) fn replace_current(hwnd: HWND) {
     }
     // Only replace when the selection is exactly a match under the options (a case-insensitive
     // "CAT" for "cat", a regex's match, a whole word); otherwise this Enter just moves to the
-    // next match, as in a bare Find field. The replacement is literal text, also in regex mode.
+    // next match, as in a bare Find field. In regex mode the replacement expands `$1` with the
+    // selected match's groups; in plain mode it is literal.
     if let Ok(selection) = editor.selection()
-        && find_bar::is_match(&editor, &query, options, selection.clone())
+        && let Some(text) =
+            find_bar::replacement_for(&editor, &query, &replacement, options, selection.clone())
     {
-        let _ = editor.replace_target(selection, &replacement);
+        let _ = editor.replace_target(selection, &text);
         if !identity.is_live_for(hwnd) {
             return;
         }
@@ -13524,6 +13526,76 @@ mod tests {
         super::replace_all_matches(window.hwnd);
         assert_eq!(editor.text().unwrap(), "abc 123");
         assert!(bar().no_match());
+    }
+
+    #[test]
+    fn the_find_bars_regex_replace_expands_groups_and_plain_replace_is_literal() {
+        // Break caught (spec §12a): the find bar's regex Replace inserting "$2/${year}" as
+        // typed, Replace All expanding every match with the first match's groups, Enter using
+        // another match's captures, group numbers shifted by the whole-word wrapper, or plain
+        // mode expanding `$1`.
+        use crate::search::SearchOption;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor
+            .populate_clean("2024-09 and 1999-01\r\n2001-12")
+            .unwrap();
+        execute_command(window.hwnd, CommandId::Replace);
+        super::toggle_find_option(window.hwnd, SearchOption::Regex);
+        set_find_query(window.hwnd, r"(?<year>\d{4})-(\d{2})");
+        set_replace_text(window.hwnd, "$2/${year} $$");
+
+        editor.set_selection(12..19).unwrap();
+        super::replace_current(window.hwnd);
+        assert_eq!(
+            editor.text().unwrap(),
+            "2024-09 and 01/1999 $\r\n2001-12",
+            "Enter expands the selected match's own groups"
+        );
+        assert_eq!(
+            editor.selection().unwrap(),
+            23..30,
+            "then moves to the next"
+        );
+
+        super::replace_all_matches(window.hwnd);
+        assert_eq!(
+            editor.text().unwrap(),
+            "09/2024 $ and 01/1999 $\r\n12/2001 $"
+        );
+        editor.undo().unwrap();
+        assert_eq!(
+            editor.text().unwrap(),
+            "2024-09 and 01/1999 $\r\n2001-12",
+            "Replace All is one undo step"
+        );
+
+        super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+        set_find_query(window.hwnd, "(fo+)");
+        set_replace_text(window.hwnd, "<$1>");
+        editor.populate_clean("foo foobar fooo").unwrap();
+        super::replace_all_matches(window.hwnd);
+        assert_eq!(editor.text().unwrap(), "<foo> foobar <fooo>");
+
+        super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+        super::toggle_find_option(window.hwnd, SearchOption::Regex);
+        set_find_query(window.hwnd, "$1");
+        set_replace_text(window.hwnd, "$2$$");
+        editor.populate_clean("a $1 b $1").unwrap();
+        editor.set_selection(2..4).unwrap();
+        super::replace_current(window.hwnd);
+        assert_eq!(
+            editor.text().unwrap(),
+            "a $2$$ b $1",
+            "plain Enter is literal"
+        );
+        super::replace_all_matches(window.hwnd);
+        assert_eq!(
+            editor.text().unwrap(),
+            "a $2$$ b $2$$",
+            "plain Replace All too"
+        );
     }
 
     #[test]

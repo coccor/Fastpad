@@ -566,8 +566,8 @@ impl Editor {
 
     /// Replaces every occurrence of `query` with `replacement`, as one undo action. Searches
     /// incrementally via `search_in_target`/`replace_target`; never retrieves the full document.
-    /// For plain search flags (the find bar's regex mode uses `replace_ranges`); an empty match
-    /// ends it rather than being replaced forever.
+    /// For plain search flags (the find bar's regex mode uses `replace_ranges_with`); an empty
+    /// match ends it rather than being replaced forever.
     #[cfg(windows)]
     pub fn replace_all(&self, query: &str, replacement: &str, search_flags: u32) -> Result<usize> {
         if query.is_empty() {
@@ -611,24 +611,26 @@ impl Editor {
         ))
     }
 
-    /// Replaces each of `ranges` (in order, none overlapping) with `replacement`, from the last
-    /// backwards so the earlier positions stay valid, as one undo action. Returns how many.
+    /// Replaces each edit's range with its text, as one undo action, and returns how many. The
+    /// ranges come in ascending order, none overlapping, as `Matcher::replacements` gives them;
+    /// they are applied from the last backwards so the earlier positions stay valid. An empty
+    /// list returns `Ok(0)` without opening an undo action.
     #[cfg(windows)]
-    pub fn replace_ranges(&self, ranges: &[Range<usize>], replacement: &str) -> Result<usize> {
-        if ranges.is_empty() {
+    pub fn replace_ranges_with(&self, edits: &[(Range<usize>, String)]) -> Result<usize> {
+        if edits.is_empty() {
             return Ok(0);
         }
         self.begin_undo_action();
-        let result = ranges
+        let result = edits
             .iter()
             .rev()
-            .try_for_each(|range| self.replace_target(range.clone(), replacement).map(drop));
+            .try_for_each(|(range, text)| self.replace_target(range.clone(), text).map(drop));
         self.end_undo_action();
-        result.map(|()| ranges.len())
+        result.map(|()| edits.len())
     }
 
     #[cfg(not(windows))]
-    pub fn replace_ranges(&self, _ranges: &[Range<usize>], _replacement: &str) -> Result<usize> {
+    pub fn replace_ranges_with(&self, _edits: &[(Range<usize>, String)]) -> Result<usize> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
@@ -1668,21 +1670,22 @@ mod tests {
     }
 
     #[test]
-    fn replace_ranges_replaces_from_the_end_as_one_undo_step() {
-        // Break caught: replacing front to back (later ranges shifted onto the wrong text), or
-        // one undo step per range.
+    fn replace_ranges_with_puts_each_text_in_its_range_from_the_end_as_one_undo_step() {
+        // Break caught: ascending edits (as `Matcher::replacements` gives them) replaced front to
+        // back (later ranges shifted onto the wrong text), an edit given another edit's text,
+        // one undo step per range, or an empty list failing instead of replacing nothing.
         let editor = test_editor();
         editor.populate_clean("foo bar foo baz foo").unwrap();
-        assert_eq!(
-            editor
-                .replace_ranges(&[0..3, 8..11, 16..19], "quux")
-                .unwrap(),
-            3
-        );
-        assert_eq!(editor.text().unwrap(), "quux bar quux baz quux");
+        let edits = [
+            (0..3, "a".to_owned()),
+            (8..11, "ță".to_owned()),
+            (16..19, "quux".to_owned()),
+        ];
+        assert_eq!(editor.replace_ranges_with(&edits).unwrap(), 3);
+        assert_eq!(editor.text().unwrap(), "a bar ță baz quux");
         editor.undo().unwrap();
         assert_eq!(editor.text().unwrap(), "foo bar foo baz foo");
-        assert_eq!(editor.replace_ranges(&[], "x").unwrap(), 0);
+        assert_eq!(editor.replace_ranges_with(&[]).unwrap(), 0);
     }
 
     #[test]
