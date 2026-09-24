@@ -59,6 +59,28 @@ pub fn recycle(owner: HWND, path: &Path) -> Result<()> {
             "the file to delete does not exist",
         ));
     }
+    shell_recycle(owner, path)
+}
+
+/// Sends one folder, with everything in it, to the Recycle Bin, the way `recycle` sends a file
+/// (notebook folders spec §4.3). A relative path, or anything but a directory, is refused before
+/// anything is sent to the shell.
+pub fn recycle_folder(owner: HWND, path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(crate::FastPadError::Invariant(
+            "recycle requires an absolute path",
+        ));
+    }
+    if !path.is_dir() {
+        return Err(crate::FastPadError::Invariant(
+            "the folder to delete does not exist",
+        ));
+    }
+    shell_recycle(owner, path)
+}
+
+/// `SHFileOperationW`'s delete to the Recycle Bin, shared by `recycle` and `recycle_folder`.
+fn shell_recycle(owner: HWND, path: &Path) -> Result<()> {
     // SHFileOperationW takes a list ending in two NULs.
     let mut from = wide(path);
     from.push(0);
@@ -137,6 +159,25 @@ mod tests {
         let dir = scratch("recycle-directory");
         assert!(recycle(std::ptr::null_mut(), &dir).is_err());
         assert!(dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recycling_a_folder_removes_it_with_everything_in_it_and_refuses_anything_else() {
+        // Break caught: a folder delete refused because `recycle` takes only files, contents left
+        // behind, or a file or relative path accepted as a folder.
+        let dir = scratch("recycle-folder");
+        let folder = dir.join("old");
+        std::fs::create_dir_all(folder.join("inner")).unwrap();
+        std::fs::write(folder.join(r"inner\a.md"), "a").unwrap();
+        recycle_folder(std::ptr::null_mut(), &folder).unwrap();
+        assert!(!folder.exists());
+        assert!(dir.exists());
+        let file = dir.join("file.md");
+        std::fs::write(&file, "x").unwrap();
+        assert!(recycle_folder(std::ptr::null_mut(), &file).is_err());
+        assert!(file.exists());
+        assert!(recycle_folder(std::ptr::null_mut(), std::path::Path::new("old")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

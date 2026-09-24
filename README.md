@@ -120,6 +120,10 @@ Hover a note to pin it.
   VS Code. With nothing typed it lists the notes open in tabs, the most recent first, so
   Ctrl+P then Enter goes back to the previous note. Add `:42` to open a note at line 42, or
   type `:42` alone to go to that line in the current tab.
+- **New folder** in the Notebook view's header, or **New folder here** on a folder's menu,
+  names a folder in the same inline box. **F2** renames a folder and **Del** sends it, with its
+  notes, to the Recycle Bin. Empty folders show in the tree, and each note has a coloured icon
+  for its type.
 - Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
 - **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
   Everything is reachable from the keyboard and exposed to screen readers.

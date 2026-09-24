@@ -50,6 +50,8 @@ pub(crate) enum NamePurpose {
     RenameNote(DocumentId),
     /// A new folder in this folder, relative to the notebook (empty for its root).
     NewFolder(PathBuf),
+    /// Renaming this folder, relative to the notebook.
+    RenameFolder(PathBuf),
 }
 
 impl NamePurpose {
@@ -57,16 +59,18 @@ impl NamePurpose {
     pub(crate) fn document(&self) -> Option<DocumentId> {
         match self {
             Self::FirstSave(id) | Self::RenameNote(id) => Some(*id),
-            Self::NewFolder(_) => None,
+            Self::NewFolder(_) | Self::RenameFolder(_) => None,
         }
     }
 
     /// For a folder box, the folder that must stay in the tree for the box to stay open: a new
-    /// folder's parent (empty for the notebook root). A folder box belongs to no tab.
+    /// folder's parent (empty for the notebook root), or the folder being renamed. A folder box
+    /// belongs to no tab.
     pub(crate) fn folder(&self) -> Option<&Path> {
         match self {
             Self::FirstSave(_) | Self::RenameNote(_) => None,
             Self::NewFolder(parent) => Some(parent),
+            Self::RenameFolder(folder) => Some(folder),
         }
     }
 }

@@ -213,3 +213,22 @@
 - Listing files other than notes.
 - Icon themes, or user-chosen colours.
 - Pinning folders.
+
+## 9. Implementation notes
+
+- **Recycling a folder** uses a new `platform::files::recycle_folder`: `recycle` takes only a file (a directory is refused, note-library spec §14), so the folder variant checks for a directory and shares its `SHFileOperationW` call.
+- **Wording:** the confirmations and the name-taken error use typographic quotes (“ ”), like the note Delete confirmation. Counts read naturally: `1 note` / `2 notes`, `1 open note has` / `2 open notes have`.
+- **Names the scan hides are refused:** a dot-folder, `node_modules`, `target`, `bin` or `obj` would vanish at the next rescan (§3.1), so New folder and Rename refuse them with `FastPad hides folders named “<name>”. Choose another name.`
+- **Name clashes** are checked in memory against the tree's folders and the listed notes. Any other file, or a folder the scan skips, with that name makes `create_dir` or `MoveFileExW` refuse, and the same message shows. `New folder N` counts listed folders only.
+- **Rescans racing folder commands:** each folder change is also kept as a `FolderChange` until the next rescan starts, and replayed onto that rescan's folders, notes and tree when it is merged, before the touched notes are re-checked. A rescan that listed the folders before the change cannot bring the old row back. The replay is idempotent and touches no disk; records come from the pending `Relocate`/`SetDeleted` operations, and expanded folders from the live state.
+- **`touched` entries** under a renamed folder are rewritten, and those under a deleted folder dropped, so a merge makes no stat for them.
+- **A folder name box closes** when its folder (or a new folder's parent) is no longer in the tree, checked after every load or rescan, after a notebook switch and after a folder delete. The check reads the tree, so a folder past `FOLDER_LIMIT` that holds notes still counts.
+- **Tab rebinds** go through `Tabs::rebind_path`, whose collision check canonicalizes the open tabs' paths, as a note rename's does. A failed rebind undoes the ones before it, renames the folder back and shows today's `Another tab already has that file open.`
+- **Focus:** Enter in a folder box moves the focus to the tree, on the new or renamed row; Escape returns it to the editor, as for the note name box. The folder name is selected in full, dots included (`v1.2`).
+- **The suffix** names the parent's own name (`in inner`, not `in outer\inner`), or the notebook at the root.
+- **The header** reads, left to right: the star, New note, New folder, "…".
+- **The empty state** ("No notes in <notebook> yet.") shows only when the notebook has no notes and no folders.
+- **Rename and Delete from the palette** still act on the active tab's note: the palette records a focused note row when it opens, not a folder row. F2, Del and the folder menu act on folders, and so do the commands run with a folder row focused.
+- **After a delete** the selection goes to the row that took the folder's index, set after the refresh, because closing the folder's tabs moves it to the new active note first.
+- **Icon contrast:** the weakest pair is Latte yellow on the Light theme's selection, about 1.7:1. A test keeps every icon colour at 1.5:1 or more on the selection, inactive selection, hover and panel backgrounds of every theme. In high contrast an icon takes the row's muted colour, which on a focused selected row is the selection text colour, as the other glyphs do.
+- **Palette placement:** `Notebook: New folder…` follows `Notebook: Toggle favorite` and is listed only while a notebook is open (or loading).

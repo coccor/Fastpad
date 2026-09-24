@@ -1365,6 +1365,22 @@ pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
     .flatten()
 }
 
+/// The selected folder row's path, relative to the notebook, while the panel has the keyboard
+/// focus: Rename and Delete act on it (notebook folders spec §4.2, §4.3).
+pub(crate) fn focused_folder(hwnd: HWND) -> Option<PathBuf> {
+    with_view(hwnd, |view| {
+        let focused = unsafe { GetFocus() } == view.panel;
+        match view.list.selected.map(|index| view.target(index)) {
+            Some(Target::Row(TreeRow {
+                kind: RowKind::Folder(relative),
+                ..
+            })) if focused => Some(relative),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
 /// The folder a new note goes to (spec §6.7): a selected folder row's own folder, or a
 /// selected note's parent. `None` (the root) for an unsaved row or no selection.
 pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
@@ -1401,6 +1417,20 @@ pub(crate) fn select_row(hwnd: HWND, kind: &RowKind) -> bool {
 /// Gives the tree the keyboard focus, after a folder command closed its name box.
 pub(crate) fn focus_tree(hwnd: HWND) {
     focus_panel(hwnd);
+}
+
+/// The index of the row showing `kind`, if one does.
+pub(crate) fn row_index_of(hwnd: HWND, kind: &RowKind) -> Option<usize> {
+    with_view(hwnd, |view| tree::row_index(&view.rows, kind)).flatten()
+}
+
+/// Selects row `index` (the last row when past the end) and scrolls it into view.
+pub(crate) fn select_index(hwnd: HWND, index: usize) {
+    with_view(hwnd, |view| {
+        if view.mode == Mode::Tree {
+            view.select(index);
+        }
+    });
 }
 
 impl NotebookView {
@@ -1487,14 +1517,24 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
             let entries = [
                 MenuEntry::command("New note here", CommandId::New),
                 MenuEntry::command("New folder here", CommandId::NoteNewFolder),
+                MenuEntry::Separator,
+                MenuEntry::command("Rename...\tF2", CommandId::NoteRename),
                 MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
+                MenuEntry::Separator,
+                MenuEntry::command("Delete...\tDel", CommandId::NoteDelete),
             ];
             match super::menus::track_popup(hwnd, &entries, point) {
                 Some(CommandId::New) => super::library_host::new_note_in(hwnd, Some(path)),
                 Some(CommandId::NoteNewFolder) => {
                     super::library_host::new_folder(hwnd, Some(relative.clone()));
                 }
+                Some(CommandId::NoteRename) if super::library_host::ready_library(hwnd) => {
+                    super::library_host::rename_folder(hwnd, relative);
+                }
                 Some(CommandId::NoteRevealInExplorer) => super::library_host::reveal(hwnd, &path),
+                Some(CommandId::NoteDelete) if super::library_host::ready_library(hwnd) => {
+                    super::library_host::delete_folder(hwnd, relative);
+                }
                 _ => {}
             }
         }
@@ -1883,24 +1923,31 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
             true
         }
         VK_F2 | VK_DELETE => {
-            let note = with_view(hwnd, |view| match view.target(selected) {
-                Target::Row(TreeRow {
-                    kind: RowKind::Note(relative),
-                    ..
-                }) => Some(relative),
+            let kind = with_view(hwnd, |view| match view.target(selected) {
+                Target::Row(row) => Some(row.kind),
                 _ => None,
             })
             .flatten();
-            if let Some(relative) = note
-                && let Some(root) = super::library_host::folder(hwnd)
-                && super::library_host::ready_library(hwnd)
-            {
-                let path = root.join(relative);
-                if key == VK_F2 {
-                    super::library_host::rename_file(hwnd, &path);
-                } else {
-                    super::library_host::delete_file(hwnd, &path);
+            let Some(root) = super::library_host::folder(hwnd) else {
+                return true;
+            };
+            match kind {
+                Some(RowKind::Note(relative)) if super::library_host::ready_library(hwnd) => {
+                    let path = root.join(relative);
+                    if key == VK_F2 {
+                        super::library_host::rename_file(hwnd, &path);
+                    } else {
+                        super::library_host::delete_file(hwnd, &path);
+                    }
                 }
+                Some(RowKind::Folder(relative)) if super::library_host::ready_library(hwnd) => {
+                    if key == VK_F2 {
+                        super::library_host::rename_folder(hwnd, &relative);
+                    } else {
+                        super::library_host::delete_folder(hwnd, &relative);
+                    }
+                }
+                _ => {}
             }
             true
         }

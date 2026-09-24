@@ -2421,8 +2421,18 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
     let tree_note = is_note_command(command)
         .then(|| recorded.or_else(|| crate::window::notebook_view::focused_note(hwnd)))
         .flatten();
-    // A focused (or recorded) note lets a note-scoped command through even with no tab open.
-    if command.needs_document() && tab_count(hwnd) == 0 && tree_note.is_none() {
+    // Rename and Delete on a focused folder row act on the folder (notebook folders spec §4.2).
+    let tree_folder = (matches!(command, CommandId::NoteRename | CommandId::NoteDelete)
+        && tree_note.is_none())
+    .then(|| crate::window::notebook_view::focused_folder(hwnd))
+    .flatten();
+    // A focused (or recorded) note or folder lets a note-scoped command through even with no
+    // tab open.
+    if command.needs_document()
+        && tab_count(hwnd) == 0
+        && tree_note.is_none()
+        && tree_folder.is_none()
+    {
         return;
     }
     // Sidebar commands do nothing with notes mode off: there is no sidebar to act on (spec §5).
@@ -2566,17 +2576,23 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         }
         CommandId::NoteRename => {
             if crate::window::library_host::ready_library(hwnd) {
-                match &tree_note {
-                    Some(path) => crate::window::library_host::rename_file(hwnd, path),
-                    None => crate::window::library_host::rename_note(hwnd),
+                match (&tree_note, &tree_folder) {
+                    (Some(path), _) => crate::window::library_host::rename_file(hwnd, path),
+                    (None, Some(folder)) => {
+                        crate::window::library_host::rename_folder(hwnd, folder);
+                    }
+                    (None, None) => crate::window::library_host::rename_note(hwnd),
                 }
             }
         }
         CommandId::NoteDelete => {
             if crate::window::library_host::ready_library(hwnd) {
-                match &tree_note {
-                    Some(path) => crate::window::library_host::delete_file(hwnd, path),
-                    None => crate::window::library_host::delete_note(hwnd),
+                match (&tree_note, &tree_folder) {
+                    (Some(path), _) => crate::window::library_host::delete_file(hwnd, path),
+                    (None, Some(folder)) => {
+                        crate::window::library_host::delete_folder(hwnd, folder);
+                    }
+                    (None, None) => crate::window::library_host::delete_note(hwnd),
                 }
             }
         }
@@ -16951,5 +16967,384 @@ mod tests {
         assert!(!listed());
         scratch.install(window.hwnd);
         assert!(listed());
+    }
+
+    #[test]
+    fn renaming_a_folder_with_an_open_note_rebinds_the_tab_and_keeps_the_notes_pin() {
+        // Break caught: a folder rename leaving its open tab on the old path (the next save
+        // re-creating the old folder), dropping the note's pin, or losing the row's selection.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        let old = open_note(&window, &scratch, r"sub\a.md", "a");
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Folder("sub".into()));
+
+        assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert_eq!(
+            name_box.purpose(),
+            Some(&crate::window::name_box::NamePurpose::RenameFolder(
+                "sub".into()
+            ))
+        );
+        assert_eq!(name_box.text(), "sub");
+        type_into_name_box(window.hwnd, "Projects");
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        let new = scratch.folder().join(r"Projects\a.md");
+        assert!(!name_box_visible(window.hwnd));
+        assert!(new.exists());
+        assert!(!old.exists());
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(new.as_path())
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Folder("Projects".into()))
+        );
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(state.is_pinned(&new));
+            assert!(!state.is_folder(std::path::Path::new("sub")));
+        });
+        crate::window::library_host::flush_now(window.hwnd);
+        let reloaded =
+            crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
+        assert!(
+            reloaded.is_pinned(&new),
+            "the pin was written under the new path"
+        );
+    }
+
+    #[test]
+    fn renaming_a_folder_moves_its_preview_and_dirty_tabs_without_saving_them() {
+        // Break caught: a rename that saves a dirty tab (touching the file's contents), turns the
+        // preview into a normal tab, or leaves either on the old path (spec §4.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-tabs");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let a = scratch.note(r"sub\a.md", "a");
+        let b = scratch.note(r"sub\b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        // Autosave would save `a` the moment `b` opens; the rename must leave it dirty.
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &a).unwrap();
+        editor.set_text("a, edited").unwrap();
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+        let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+        let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
+
+        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
+        type_into_name_box(window.hwnd, "Moved");
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        let moved = scratch.folder().join("Moved");
+        let tabs = &app_mut(window.hwnd).tabs;
+        assert_eq!(tabs.document(a_id).unwrap().path, Some(moved.join("a.md")));
+        assert!(tabs.document(a_id).unwrap().dirty);
+        assert_eq!(tabs.document(b_id).unwrap().path, Some(moved.join("b.md")));
+        assert_eq!(tabs.preview_id(), Some(b_id));
+        assert_eq!(
+            std::fs::read_to_string(moved.join("a.md")).unwrap(),
+            "a",
+            "nothing was saved"
+        );
+    }
+
+    #[test]
+    fn a_case_only_folder_rename_renames_it_on_disk_and_in_tabs_and_expansion() {
+        // Break caught: "sub" → "Sub" refused as a clash with itself, a no-op on NTFS, or the tab
+        // and the expanded entry left in the old case.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-case");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        open_note(&window, &scratch, r"sub\a.md", "a");
+
+        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
+        type_into_name_box(window.hwnd, "Sub");
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        let names: Vec<String> = std::fs::read_dir(scratch.folder())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"Sub".to_owned()), "{names:?}");
+        assert!(!name_box_visible(window.hwnd));
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path,
+            Some(scratch.folder().join(r"Sub\a.md"))
+        );
+        assert!(
+            crate::window::library_host::expanded(window.hwnd)
+                .contains(&std::path::PathBuf::from("Sub"))
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Folder("Sub".into()))
+        );
+    }
+
+    #[test]
+    fn a_folder_rename_an_open_tab_cannot_follow_is_undone() {
+        // Break caught: the folder renamed on disk while a tab stays on the old path (its next
+        // save re-creating the old folder), or a half-done rename left behind (spec §4.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-undo");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let a = scratch.note(r"sub\a.md", "a");
+        let top = scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &top).unwrap();
+        // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+        let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+        app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+            Some(scratch.folder().join(r"Moved\a.md"));
+
+        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
+        type_into_name_box(window.hwnd, "Moved");
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(
+            name_box.error(),
+            Some("Another tab already has that file open.")
+        );
+        assert!(a.exists());
+        assert!(!scratch.folder().join("Moved").exists());
+        let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a);
+        assert!(a_id.is_some(), "a's tab is back on its old path");
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(state.is_folder(std::path::Path::new("sub")));
+            assert!(!state.is_folder(std::path::Path::new("Moved")));
+        });
+    }
+
+    #[test]
+    fn a_folder_rename_onto_a_sibling_is_refused_and_the_same_name_changes_nothing() {
+        // Break caught: a rename onto an existing sibling (in another case) merging or failing
+        // oddly, or Note: Rename on a focused folder row renaming the active tab instead.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-clash");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        std::fs::create_dir_all(scratch.folder().join("Other")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Folder("sub".into()));
+        let (_, panel) = sidebar_windows(window.hwnd);
+        unsafe { SetFocus(panel) };
+        assert_eq!(unsafe { GetFocus() }, panel);
+
+        execute_command(window.hwnd, CommandId::NoteRename);
+        assert_eq!(
+            app_mut(window.hwnd).name_box.as_ref().unwrap().purpose(),
+            Some(&crate::window::name_box::NamePurpose::RenameFolder(
+                "sub".into()
+            ))
+        );
+        type_into_name_box(window.hwnd, "other");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+        assert!(name_box.is_visible());
+        assert_eq!(
+            name_box.error(),
+            Some("A folder or file named \u{201c}other\u{201d} already exists")
+        );
+        assert!(scratch.folder().join(r"sub\a.md").exists());
+
+        type_into_name_box(window.hwnd, "sub");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert!(!name_box_visible(window.hwnd));
+        assert!(scratch.folder().join(r"sub\a.md").exists());
+    }
+
+    #[test]
+    fn a_folder_name_box_selects_the_whole_name_even_with_a_dot() {
+        // Break caught: "v1.2" opening with only "v1" selected, as a file name's stem would be,
+        // so typing keeps ".2" (spec §4.2).
+        use windows_sys::Win32::UI::Controls::EM_GETSEL;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-dot");
+        std::fs::create_dir_all(scratch.folder().join("v1.2")).unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+
+        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("v1.2"));
+
+        let edit = app_mut(window.hwnd).name_box.as_ref().unwrap().edit_hwnd();
+        let (mut start, mut end) = (0_u32, 0_u32);
+        unsafe {
+            SendMessageW(
+                edit,
+                EM_GETSEL,
+                &mut start as *mut u32 as usize,
+                &mut end as *mut u32 as isize,
+            )
+        };
+        assert_eq!((start, end), (0, 4));
+    }
+
+    #[test]
+    fn a_folder_renamed_while_a_rescan_runs_keeps_its_new_name_once_the_rescan_lands() {
+        // Break caught: a rescan that listed the folder before the rename bringing the old row
+        // back, with its note at a path that is gone, and hiding the new one (spec §3.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-rescan");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        crate::window::library_host::request_rescan(window.hwnd);
+        assert!(app_mut(window.hwnd).library.scanning);
+
+        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
+        type_into_name_box(window.hwnd, "Moved");
+        crate::window::library_host::name_box_submit(window.hwnd);
+        pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning);
+
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(state.is_folder(std::path::Path::new("Moved")));
+            assert!(!state.is_folder(std::path::Path::new("sub")));
+            let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
+            assert_eq!(notes, [std::path::PathBuf::from(r"Moved\a.md")]);
+        });
+        row_of(window.hwnd, &RowKind::Folder("Moved".into()));
+        assert!(
+            crate::library::tree::row_index(
+                &notebook_view(window.hwnd).rows,
+                &RowKind::Folder("sub".into())
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn deleting_a_folder_recycles_it_closes_its_tabs_and_removes_its_rows() {
+        // Break caught: a folder delete that leaves its rows, its open tab on a file that is gone
+        // or its pinned note's record looking alive; one that deletes on Cancel; or a selection
+        // that jumps away from where the folder was (spec §4.3).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-delete");
+        std::fs::create_dir_all(scratch.folder().join(r"sub\inner")).unwrap();
+        std::fs::create_dir_all(scratch.folder().join("empty")).unwrap();
+        scratch.note(r"sub\inner\b.md", "b");
+        scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        let a = open_note(&window, &scratch, r"sub\a.md", "a");
+        execute_command(window.hwnd, CommandId::NoteTogglePin);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let menu = |kind: &RowKind, answer: CommandId| {
+            crate::window::menus::answer_next_popup_menu(move |_| Some(answer));
+            let index = row_of(window.hwnd, kind);
+            crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+        };
+        crate::window::modal::take_last_confirm();
+
+        crate::window::answer_next_confirm(|_| false);
+        menu(&RowKind::Folder("empty".into()), CommandId::NoteDelete);
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some("Move the folder \u{201c}empty\u{201d} to the Recycle Bin?")
+        );
+        assert!(
+            scratch.folder().join("empty").exists(),
+            "Cancel deletes nothing"
+        );
+
+        crate::window::answer_next_confirm(|_| true);
+        menu(&RowKind::Folder("sub".into()), CommandId::NoteDelete);
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some("Move \u{201c}sub\u{201d} and its 2 notes to the Recycle Bin?")
+        );
+        assert!(!scratch.folder().join("sub").exists());
+        assert!(
+            tab_paths(window.hwnd)
+                .iter()
+                .all(|path| path.as_deref() != Some(a.as_path()))
+        );
+        let rows = &notebook_view(window.hwnd).rows;
+        for gone in ["sub", r"sub\inner"] {
+            assert!(
+                crate::library::tree::row_index(rows, &RowKind::Folder(gone.into())).is_none(),
+                "{gone}"
+            );
+        }
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("top.md".into()))
+        );
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            let record = state.record_for(&a).unwrap();
+            assert!(record.deleted);
+            assert!(state.local.missing_since(record.id).is_some());
+            let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
+            assert_eq!(notes, [std::path::PathBuf::from("top.md")]);
+        });
+    }
+
+    #[test]
+    fn deleting_a_folder_that_holds_the_only_tab_and_the_name_box_target_warns_and_closes_both() {
+        // Break caught: unsaved edits discarded without a word, the last tab left on a deleted
+        // file, or a New folder box still offering to create inside a folder that is gone.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-delete-only-tab");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        let a = open_note(&window, &scratch, r"sub\a.md", "a");
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        editor.set_text("unsaved").unwrap();
+        crate::window::library_host::new_folder(window.hwnd, Some("sub".into()));
+        assert!(name_box_visible(window.hwnd));
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Folder("sub".into()));
+        crate::window::modal::take_last_confirm();
+        crate::window::answer_next_confirm(|_| true);
+
+        assert!(crate::window::notebook_view::key_down(
+            window.hwnd,
+            VK_DELETE
+        ));
+
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some(
+                "Move \u{201c}sub\u{201d} and its 1 note to the Recycle Bin?\n1 open note has unsaved changes, which will be lost."
+            )
+        );
+        assert!(!a.exists());
+        assert_eq!(super::tab_count(window.hwnd), 0);
+        assert!(!name_box_visible(window.hwnd));
     }
 }

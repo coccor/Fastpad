@@ -11,7 +11,7 @@ use crate::window::command_palette::{Picker, PickerChoice, PickerKind};
 use crate::window::name_box::{NameBox, NamePurpose};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{HWND, LPARAM};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, HWND, LPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
 
 pub(crate) const LIBRARY_WRITE_TIMER_ID: usize = 0x4650_4C57;
@@ -1449,6 +1449,204 @@ fn submit_new_folder(hwnd: HWND, parent: &Path, text: &str) {
     super::notebook_view::focus_tree(hwnd);
 }
 
+/// Whether a failed `MoveFileExW` means the target name is taken.
+fn already_exists(error: &crate::FastPadError) -> bool {
+    matches!(
+        error,
+        crate::FastPadError::Win32(code) if *code == ERROR_ALREADY_EXISTS || *code == ERROR_FILE_EXISTS
+    )
+}
+
+/// The open tabs whose file is inside `folder` (absolute), with their stored paths and whether
+/// each has unsaved edits. Read from the tabs' stored paths: no disk access.
+fn tabs_under(hwnd: HWND, folder: &Path) -> Vec<(crate::document::DocumentId, PathBuf, bool)> {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .tabs
+                .documents()
+                .filter_map(|document| {
+                    let path = document.path.as_ref()?;
+                    library::is_inside(folder, path)
+                        .then(|| (document.id, path.clone(), document.dirty))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// F2 or Rename… on a folder row (spec §4.2): the name box, prefilled with the folder's name.
+pub(crate) fn rename_folder(hwnd: HWND, relative: &Path) {
+    let Some(name) = relative
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let parent = relative.parent().map(Path::to_path_buf).unwrap_or_default();
+    let suffix = folder_suffix(hwnd, &parent);
+    open_name_box(
+        hwnd,
+        NamePurpose::RenameFolder(relative.to_path_buf()),
+        &name,
+        suffix,
+        false,
+    );
+}
+
+/// Enter in the folder rename box: renames the folder with the one disk call, never onto
+/// another name, then rebinds the open tabs under it and follows it in the library. A tab that
+/// cannot follow undoes the whole rename.
+fn submit_rename_folder(hwnd: HWND, old: &Path, text: &str) {
+    let Some(root) = folder(hwnd) else {
+        close_name_box(hwnd);
+        return;
+    };
+    let Some(name) = title::folder_name(text) else {
+        name_box_error(hwnd, NO_FOLDER_NAME.to_owned());
+        return;
+    };
+    let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
+    let new = parent.join(&name);
+    if new.as_os_str() == old.as_os_str() {
+        close_name_box(hwnd);
+        return;
+    }
+    if library::scan::skip_directory(&name) {
+        name_box_error(hwnd, hidden_folder_error(&name));
+        return;
+    }
+    // A change of letter case only names the same folder, so it is not a clash.
+    let case_only = library::model::same_path(&new, old);
+    if !case_only && with_state(hwnd, |state| state.is_listed(&new)).unwrap_or(false) {
+        name_box_error(hwnd, folder_taken_error(&name));
+        return;
+    }
+    let (old_path, new_path) = (root.join(old), root.join(&new));
+    if let Err(error) = crate::platform::files::rename_no_replace(&old_path, &new_path) {
+        let error = if !case_only && already_exists(&error) {
+            folder_taken_error(&name)
+        } else {
+            format!("FastPad could not rename the folder: {error}")
+        };
+        name_box_error(hwnd, error);
+        return;
+    }
+    let tabs = tabs_under(hwnd, &old_path);
+    let mut moved = Vec::with_capacity(tabs.len());
+    let mut failed = false;
+    for (id, path, _) in tabs {
+        let target = new_path.join(library::record_path(&old_path, &path));
+        let rebound = unsafe { app_ptr(hwnd) }
+            .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.rebind_path(id, target).is_ok());
+        if !rebound {
+            failed = true;
+            break;
+        }
+        moved.push((id, path));
+    }
+    if failed {
+        // Undo, so the tabs and the disk agree: the tabs that moved go back, then the folder.
+        for (id, path) in moved.into_iter().rev() {
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
+            }
+        }
+        let _ = crate::platform::files::rename_no_replace(&new_path, &old_path);
+        name_box_error(hwnd, "Another tab already has that file open.".to_owned());
+        return;
+    }
+    with_state(hwnd, |state| state.rename_folder(old, &new));
+    save_local(
+        hwnd,
+        LocalWrite {
+            wait: false,
+            force: false,
+        },
+    );
+    schedule_write(hwnd);
+    close_name_box(hwnd);
+    super::main_window::invalidate_title_strip(hwnd);
+    super::side_panel::with_accessible_events(hwnd, || {
+        super::side_panel::refresh(hwnd);
+        super::notebook_view::select_row(hwnd, &RowKind::Folder(new.clone()));
+    });
+    super::notebook_view::focus_tree(hwnd);
+}
+
+/// The Delete confirmation for a folder named `name` holding `notes` listed notes, `dirty` of
+/// its open tabs with unsaved changes (spec §4.3).
+fn delete_folder_question(name: &str, notes: usize, dirty: usize) -> String {
+    let mut question = match notes {
+        0 => format!("Move the folder \u{201c}{name}\u{201d} to the Recycle Bin?"),
+        1 => format!("Move \u{201c}{name}\u{201d} and its 1 note to the Recycle Bin?"),
+        _ => format!("Move \u{201c}{name}\u{201d} and its {notes} notes to the Recycle Bin?"),
+    };
+    match dirty {
+        0 => {}
+        1 => question.push_str("\n1 open note has unsaved changes, which will be lost."),
+        _ => question.push_str(&format!(
+            "\n{dirty} open notes have unsaved changes, which will be lost."
+        )),
+    }
+    question
+}
+
+/// Del or Delete… on a folder row (spec §4.3): after a confirm, sends the folder and everything
+/// in it to the Recycle Bin, closes the tabs under it without asking, and drops its notes, their
+/// records flagged deleted. A failure changes nothing in the library.
+pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
+    let Some(root) = folder(hwnd) else {
+        return;
+    };
+    let absolute = root.join(relative);
+    let notes = with_state(hwnd, |state| state.notes_under(relative)).unwrap_or(0);
+    let tabs = tabs_under(hwnd, &absolute);
+    let dirty = tabs.iter().filter(|(_, _, dirty)| *dirty).count();
+    let name = relative.file_name().unwrap_or_default().to_string_lossy();
+    if !confirmed(hwnd, &delete_folder_question(&name, notes, dirty)) {
+        return;
+    }
+    let row = super::notebook_view::row_index_of(hwnd, &RowKind::Folder(relative.to_path_buf()));
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    // The shell may show its own modal warning (a permanent delete), owned by this window.
+    let recycled = crate::platform::files::recycle_folder(hwnd, &absolute);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    if let Err(error) = recycled {
+        push_notice(
+            hwnd,
+            format!("FastPad could not delete {}: {error}", absolute.display()),
+        );
+        return;
+    }
+    for (id, _, _) in tabs {
+        super::main_window::close_document_without_prompt(hwnd, id);
+    }
+    with_state(hwnd, |state| {
+        state.remove_folder(relative, library::now_unix())
+    });
+    save_local(
+        hwnd,
+        LocalWrite {
+            wait: false,
+            force: false,
+        },
+    );
+    schedule_write(hwnd);
+    close_stale_name_box(hwnd);
+    super::side_panel::with_accessible_events(hwnd, || {
+        super::side_panel::refresh(hwnd);
+        // The row that took the folder's place: the next one, or the previous at the end.
+        if let Some(row) = row {
+            super::notebook_view::select_index(hwnd, row);
+        }
+    });
+}
+
 pub(crate) fn open_name_box(
     hwnd: HWND,
     purpose: NamePurpose,
@@ -1585,11 +1783,14 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
     };
     match purpose {
         NamePurpose::FirstSave(id) => submit_first_save(hwnd, id, &text),
-        NamePurpose::RenameNote(_) | NamePurpose::NewFolder(_) if !ready_library(hwnd) => {
+        NamePurpose::RenameNote(_) | NamePurpose::NewFolder(_) | NamePurpose::RenameFolder(_)
+            if !ready_library(hwnd) =>
+        {
             close_name_box(hwnd);
         }
         NamePurpose::RenameNote(id) => submit_rename(hwnd, id, &text),
         NamePurpose::NewFolder(parent) => submit_new_folder(hwnd, &parent, &text),
+        NamePurpose::RenameFolder(folder) => submit_rename_folder(hwnd, &folder, &text),
     }
 }
 
@@ -2596,5 +2797,27 @@ mod tests {
         let saved = library::local::read_folders(&library::local::folders_file(&data));
         assert!(!saved.closed);
         assert_eq!(saved.folders, [notes]);
+    }
+
+    #[test]
+    fn the_folder_delete_question_counts_notes_and_unsaved_tabs() {
+        // Break caught: an empty folder asked about as if it held notes, "1 notes", or unsaved
+        // edits lost without a word (spec §4.3).
+        assert_eq!(
+            delete_folder_question("Old", 0, 0),
+            "Move the folder \u{201c}Old\u{201d} to the Recycle Bin?"
+        );
+        assert_eq!(
+            delete_folder_question("Old", 1, 0),
+            "Move \u{201c}Old\u{201d} and its 1 note to the Recycle Bin?"
+        );
+        assert_eq!(
+            delete_folder_question("Old", 3, 1),
+            "Move \u{201c}Old\u{201d} and its 3 notes to the Recycle Bin?\n1 open note has unsaved changes, which will be lost."
+        );
+        assert_eq!(
+            delete_folder_question("Old", 3, 2),
+            "Move \u{201c}Old\u{201d} and its 3 notes to the Recycle Bin?\n2 open notes have unsaved changes, which will be lost."
+        );
     }
 }
