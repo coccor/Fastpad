@@ -1086,11 +1086,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     }
     // A single-line selection is a reasonable query prefill; a multi-line one is not (the bar has
     // no way to display it), so it's left alone rather than truncated or rejected.
-    let prefill = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let editor = unsafe { app.as_ref() }.editor.as_ref()?;
-        let text = editor.selected_text().ok()?;
-        (!text.is_empty() && !text.contains(['\n', '\r'])).then_some(text)
-    });
+    let prefill = single_line_selection(hwnd);
     let colors = title_chrome(hwnd).0;
     let opened = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let app = unsafe { app.as_mut() };
@@ -1112,6 +1108,35 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     {
         bar.focus_query();
     }
+}
+
+/// The active editor's selection as a query, when it is non-empty and on one line. A multi-line
+/// selection can't be shown in a one-line box, so it is left alone rather than cut.
+fn single_line_selection(hwnd: HWND) -> Option<String> {
+    let editor = unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())?;
+    let text = editor.selected_text().ok()?;
+    (!text.is_empty() && !text.contains(['\n', '\r'])).then_some(text)
+}
+
+/// Ctrl+Shift+F (spec §5) shows Search and focuses its box. A single-line selection in the active
+/// editor replaces the box's text and searches at once. `show_with_query` escapes it while regex
+/// is on.
+fn show_search_view(hwnd: HWND) {
+    // Read before the box takes the focus.
+    let prefill = single_line_selection(hwnd);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true);
+    if let Some(text) = prefill {
+        crate::window::search_view::show_with_query(hwnd, &text);
+    }
+}
+
+/// A `SearchToggle*` palette command shows the Search view first if it is hidden, so the option it
+/// flips is visible.
+fn toggle_search_option(hwnd: HWND, option: crate::search::SearchOption) {
+    if crate::window::side_panel::current_view(hwnd) != crate::config::SidebarView::Search {
+        crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true);
+    }
+    crate::window::search_view::toggle_option(hwnd, option);
 }
 
 pub(crate) fn close_find_bar(hwnd: HWND) {
@@ -1911,6 +1936,18 @@ fn execute_command(hwnd: HWND, command: CommandId) {
     execute_command_with_note(hwnd, command, None);
 }
 
+/// Counts `is_sidebar` commands that ran past the notes-mode guard below. The sidebar's own state
+/// (`app.sidebar`, the Search view's options) already reads as empty/default with no sidebar to
+/// hold it, so a test disabling notes mode has nothing else to observe; this hook makes the guard
+/// itself a regression test rather than an untested `if`.
+#[cfg(test)]
+static SIDEBAR_COMMAND_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+fn sidebar_command_runs() -> u32 {
+    SIDEBAR_COMMAND_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `execute_command`, for a command chosen from the command palette: `recorded` is the sidebar
 /// row that `capture_palette_focus` recorded when the palette opened, taken by
 /// `run_command_palette_selection` before closing it moved focus off the panel (spec §6.3).
@@ -1925,6 +1962,14 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
     // A focused (or recorded) note lets a note-scoped command through even with no tab open.
     if command.needs_document() && tab_count(hwnd) == 0 && tree_note.is_none() {
         return;
+    }
+    // Sidebar commands do nothing with notes mode off: there is no sidebar to act on (spec §5).
+    if command.is_sidebar() && !notes_mode_enabled(hwnd) {
+        return;
+    }
+    #[cfg(test)]
+    if command.is_sidebar() {
+        SIDEBAR_COMMAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(index) = command.tab_index() {
         if index < tab_count(hwnd) {
@@ -2124,8 +2169,13 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::ShowNotebookView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, true)
         }
-        CommandId::ShowSearchView => {
-            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true)
+        CommandId::ShowSearchView => show_search_view(hwnd),
+        CommandId::SearchToggleCase
+        | CommandId::SearchToggleWholeWord
+        | CommandId::SearchToggleRegex => {
+            if let Some(option) = command.search_option() {
+                toggle_search_option(hwnd, option);
+            }
         }
         CommandId::ShowFavoritesView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Favorites, true)
@@ -4945,7 +4995,8 @@ fn store_app(hwnd: HWND, value: Box<App>) {
 mod tests {
     use super::{
         MainWindowClass, WindowCreateContext, execute_command, handle_paint_with,
-        mark_first_paint_complete, take_deferred_start_pending, with_command_palette,
+        mark_first_paint_complete, sidebar_command_runs, take_deferred_start_pending,
+        with_command_palette,
     };
     use crate::app::App;
     use crate::document::{CloseDecision, Language, RecoveryId};
@@ -6974,7 +7025,10 @@ mod tests {
         assert!(press(b'B', false));
         assert_eq!(view(), SidebarView::Hidden);
         assert_eq!(saved(), "# kept\r\nsidebar_view=none\r\n");
-        assert!(press(b'K', false));
+        // Break caught: Ctrl+K still bound after Search moved to Ctrl+Shift+F.
+        assert!(!press(b'K', false));
+        assert_eq!(view(), SidebarView::Hidden);
+        assert!(press(b'F', true));
         assert_eq!(view(), SidebarView::Search);
         assert!(press(b'B', false));
         assert!(press(b'B', false));
@@ -11208,6 +11262,206 @@ mod tests {
                 search_row("planning", "planning")
             ]
         );
+    }
+
+    #[test]
+    fn ctrl_shift_f_takes_a_single_line_selection_and_ignores_a_multi_line_one() {
+        // Break caught: Ctrl+Shift+F ignoring the selection, pasting a multi-line one into the
+        // box, or clearing the box when nothing is selected.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-prefill-selection");
+        scratch.note("a.md", "alpha beta");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let query =
+            || crate::window::search_view::current_query(window.hwnd).map(|(query, _)| query);
+        editor.populate_clean("alpha beta\r\ngamma").unwrap();
+
+        editor.set_selection(6..10).unwrap();
+        execute_command(window.hwnd, CommandId::ShowSearchView);
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            crate::config::SidebarView::Search
+        );
+        assert_eq!(query().as_deref(), Some("beta"));
+        // The prefill searches at once, with no keystroke to start the debounce.
+        pump_until(window.hwnd, || {
+            crate::window::search_view::shown_results(window.hwnd).len() == 1
+        });
+
+        editor.set_selection(6..14).unwrap();
+        execute_command(window.hwnd, CommandId::ShowSearchView);
+        assert_eq!(query().as_deref(), Some("beta"), "a multi-line selection");
+
+        editor.set_selection(3..3).unwrap();
+        execute_command(window.hwnd, CommandId::ShowSearchView);
+        assert_eq!(query().as_deref(), Some("beta"), "no selection");
+    }
+
+    #[test]
+    fn ctrl_shift_f_escapes_the_selection_while_regex_is_on() {
+        // Break caught: "a.b" searched as a pattern that also matches "axb".
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-prefill-regex");
+        scratch.note("a.md", "see a.b here");
+        scratch.note("x.md", "see axb here");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+        editor.populate_clean("see a.b here").unwrap();
+        editor.set_selection(4..7).unwrap();
+
+        execute_command(window.hwnd, CommandId::ShowSearchView);
+
+        assert_eq!(
+            crate::window::search_view::current_query(window.hwnd).map(|(query, _)| query),
+            Some(r"a\.b".to_owned())
+        );
+        pump_until(window.hwnd, || {
+            !crate::window::search_view::shown_results(window.hwnd).is_empty()
+        });
+        assert_eq!(
+            crate::window::search_view::shown_results(window.hwnd),
+            vec![("a".to_owned(), "see a.b here".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_search_toggle_commands_show_search_and_flip_its_options() {
+        // Break caught: a palette toggle that flips an option nobody can see, or flips the
+        // wrong one.
+        use crate::search::MatchOptions;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-toggle-commands");
+        scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        let options = || crate::window::search_view::options(window.hwnd);
+
+        execute_command(window.hwnd, CommandId::SearchToggleCase);
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            crate::config::SidebarView::Search
+        );
+        assert_eq!(
+            options(),
+            MatchOptions {
+                case: true,
+                ..MatchOptions::default()
+            }
+        );
+        execute_command(window.hwnd, CommandId::SearchToggleWholeWord);
+        execute_command(window.hwnd, CommandId::SearchToggleRegex);
+        assert_eq!(
+            options(),
+            MatchOptions {
+                case: true,
+                whole_word: true,
+                regex: true
+            }
+        );
+        execute_command(window.hwnd, CommandId::SearchToggleCase);
+        assert!(!options().case);
+    }
+
+    #[test]
+    fn with_notes_mode_off_ctrl_shift_f_and_the_search_toggles_do_nothing() {
+        // Break caught: a sidebar command reaching code that assumes a sidebar, or reading and
+        // changing editor state with notes mode off.
+        let _scintilla = load_native_scintilla();
+        let mut app = make_app();
+        app.settings.notes_mode = false;
+        let window = ProductionWindow::new(app);
+        let editor = install_test_editor(&window);
+        editor.populate_clean("alpha beta").unwrap();
+        editor.set_selection(0..5).unwrap();
+        let before = sidebar_command_runs();
+
+        for command in [
+            CommandId::ShowSearchView,
+            CommandId::SearchToggleCase,
+            CommandId::SearchToggleWholeWord,
+            CommandId::SearchToggleRegex,
+        ] {
+            execute_command(window.hwnd, command);
+        }
+
+        // The Search view's own state already reads as empty with no sidebar to hold it, so this
+        // counts commands that ran past the notes-mode guard instead (see `sidebar_command_runs`).
+        assert_eq!(
+            sidebar_command_runs(),
+            before,
+            "the is_sidebar guard should have skipped every command"
+        );
+        assert!(app_mut(window.hwnd).sidebar.is_none());
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            crate::config::SidebarView::Hidden
+        );
+        assert_eq!(editor.selection().unwrap(), 0..5);
+        assert!(notices(window.hwnd).is_empty());
+    }
+
+    #[test]
+    fn shift_alt_f_formats_json_and_ctrl_shift_f_no_longer_does() {
+        // Break caught: Format JSON left on Ctrl+Shift+F, where it would rewrite a JSON file
+        // the user only meant to search from, or not reachable from any shortcut.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN, WM_SYSKEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        // Presses F with the given modifiers held, through the accelerator table.
+        let press_f = |ctrl: bool, shift: bool, alt: bool| {
+            let mut keys = [0u8; 256];
+            unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+            let original = keys;
+            keys[VK_CONTROL as usize] = if ctrl { 0x80 } else { 0 };
+            keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
+            keys[VK_MENU as usize] = if alt { 0x80 } else { 0 };
+            unsafe { SetKeyboardState(keys.as_ptr()) };
+            let message = MSG {
+                hwnd: editor.hwnd(),
+                message: if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN },
+                wParam: usize::from(b'F'),
+                // Bit 29, the context code, is set while Alt is down.
+                lParam: if alt { 1 << 29 } else { 0 },
+                ..Default::default()
+            };
+            let translated =
+                unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+            unsafe { SetKeyboardState(original.as_ptr()) };
+            translated
+        };
+        editor.populate_clean("{\"a\":1}").unwrap();
+
+        assert!(press_f(true, true, false));
+        pump_posted_messages(window.hwnd);
+        assert_eq!(
+            editor.text().unwrap(),
+            "{\"a\":1}",
+            "Ctrl+Shift+F leaves JSON alone"
+        );
+
+        assert!(press_f(false, true, true));
+        pump_posted_messages(window.hwnd);
+        assert_eq!(editor.text().unwrap(), "{\n  \"a\": 1\n}");
     }
 
     #[test]

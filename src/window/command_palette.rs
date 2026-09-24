@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 63] = [
+pub(crate) const ENTRIES: [PaletteEntry; 66] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -81,6 +81,15 @@ pub(crate) const ENTRIES: [PaletteEntry; 63] = [
     entry("Edit: Paste", CommandId::Paste),
     entry("Search: Find", CommandId::Find),
     entry("Search: Replace", CommandId::Replace),
+    entry("Search: Toggle match case", CommandId::SearchToggleCase),
+    entry(
+        "Search: Toggle whole word",
+        CommandId::SearchToggleWholeWord,
+    ),
+    entry(
+        "Search: Toggle regular expression",
+        CommandId::SearchToggleRegex,
+    ),
     entry("JSON: Format document", CommandId::FormatJson),
     entry("JSON: Validate document", CommandId::ValidateJson),
     entry("Language: Plain text", CommandId::LanguagePlainText),
@@ -1030,7 +1039,31 @@ mod tests {
             shortcut_text(CommandId::ShowNotebookView).as_deref(),
             Some("Ctrl+Shift+E")
         );
+        // Break caught: the palette row still reading Ctrl+K after the shortcut moved.
+        assert_eq!(
+            shortcut_text(CommandId::ShowSearchView).as_deref(),
+            Some("Ctrl+Shift+F")
+        );
         assert_eq!(shortcut_text(CommandId::ShowFavoritesView), None);
+    }
+
+    #[test]
+    fn the_search_option_rows_are_listed_without_shortcuts() {
+        // Break caught: a toggle the palette never offers, or one showing a shortcut it doesn't
+        // have (the Alt keys work only inside the Search box and the find bar).
+        assert_eq!(labels("toggle match case")[0], "Search: Toggle match case");
+        assert_eq!(labels("whole word")[0], "Search: Toggle whole word");
+        assert_eq!(
+            labels("regular expression")[0],
+            "Search: Toggle regular expression"
+        );
+        for command in [
+            CommandId::SearchToggleCase,
+            CommandId::SearchToggleWholeWord,
+            CommandId::SearchToggleRegex,
+        ] {
+            assert_eq!(shortcut_text(command), None, "{command:?}");
+        }
     }
 
     #[test]
@@ -1107,6 +1140,11 @@ mod tests {
         assert_eq!(
             shortcut_text(CommandId::CommandPalette).as_deref(),
             Some("Ctrl+Shift+P")
+        );
+        // Break caught: Format JSON's row still showing Ctrl+Shift+F, now Search's shortcut.
+        assert_eq!(
+            shortcut_text(CommandId::FormatJson).as_deref(),
+            Some("Shift+Alt+F")
         );
         assert_eq!(shortcut_text(CommandId::Copy), None);
     }

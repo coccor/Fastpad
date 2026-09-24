@@ -78,6 +78,9 @@ pub enum CommandId {
     NoteRevealInExplorer = 182,
     FocusNextPane = 183,
     FocusPreviousPane = 184,
+    SearchToggleCase = 185,
+    SearchToggleWholeWord = 186,
+    SearchToggleRegex = 187,
 }
 
 impl CommandId {
@@ -119,6 +122,9 @@ impl CommandId {
                 | Self::ToggleNotebookFavorite
                 | Self::FocusNextPane
                 | Self::FocusPreviousPane
+                | Self::SearchToggleCase
+                | Self::SearchToggleWholeWord
+                | Self::SearchToggleRegex
         )
     }
 
@@ -140,7 +146,20 @@ impl CommandId {
                 | Self::ShowNotebookView
                 | Self::ShowSearchView
                 | Self::ShowFavoritesView
+                | Self::SearchToggleCase
+                | Self::SearchToggleWholeWord
+                | Self::SearchToggleRegex
         )
+    }
+
+    /// The Search view option a `SearchToggle*` command flips.
+    pub const fn search_option(self) -> Option<crate::search::SearchOption> {
+        match self {
+            Self::SearchToggleCase => Some(crate::search::SearchOption::Case),
+            Self::SearchToggleWholeWord => Some(crate::search::SearchOption::WholeWord),
+            Self::SearchToggleRegex => Some(crate::search::SearchOption::Regex),
+            _ => None,
+        }
     }
 
     /// The zero-based tab a `SelectTabN` command activates.
@@ -159,7 +178,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 76] = [
+        const COMMANDS: [CommandId; 79] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -236,6 +255,9 @@ impl TryFrom<u16> for CommandId {
             CommandId::NoteRevealInExplorer,
             CommandId::FocusNextPane,
             CommandId::FocusPreviousPane,
+            CommandId::SearchToggleCase,
+            CommandId::SearchToggleWholeWord,
+            CommandId::SearchToggleRegex,
         ];
         COMMANDS
             .into_iter()
@@ -371,6 +393,29 @@ mod tests {
         assert_eq!(CommandId::SelectTab9.tab_index(), Some(8));
         assert_eq!(CommandId::NextTab.tab_index(), None);
         assert_eq!(CommandId::ZoomIn.tab_index(), None);
+    }
+
+    #[test]
+    fn search_option_commands_have_their_reserved_numbers_and_are_sidebar_commands() {
+        // Break caught: a toggle renumbered into another command's range, greyed out while no
+        // tab is open, or left enabled with notes mode off, where there is no Search view.
+        use crate::search::SearchOption;
+        for (value, command, option) in [
+            (185, CommandId::SearchToggleCase, SearchOption::Case),
+            (
+                186,
+                CommandId::SearchToggleWholeWord,
+                SearchOption::WholeWord,
+            ),
+            (187, CommandId::SearchToggleRegex, SearchOption::Regex),
+        ] {
+            assert_eq!(CommandId::try_from(value), Ok(command));
+            assert!(command.is_sidebar(), "{command:?}");
+            assert!(!command.needs_document(), "{command:?}");
+            assert_eq!(command.search_option(), Some(option));
+        }
+        assert_eq!(CommandId::ShowSearchView.search_option(), None);
+        assert_eq!(CommandId::Find.search_option(), None);
     }
 
     #[test]

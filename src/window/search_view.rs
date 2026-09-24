@@ -974,13 +974,6 @@ pub(crate) fn set_pattern_error(hwnd: HWND, error: Option<String>) {
     invalidate(panel);
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only `show_with_query` calls it, until Ctrl+Shift+F does (Task 6)"
-    )
-)]
 pub(crate) fn options(hwnd: HWND) -> MatchOptions {
     with_view(hwnd, |view| view.options).unwrap_or_default()
 }
@@ -999,10 +992,6 @@ pub(crate) fn toggle_option(hwnd: HWND, option: SearchOption) {
 
 /// Ctrl+Shift+F with a one-line selection: `text` replaces the box's text (escaped first when
 /// regex is on), all of it selected, and the search runs at once. The caller shows the view.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Ctrl+Shift+F calls it (Task 6)")
-)]
 pub(crate) fn show_with_query(hwnd: HWND, text: &str) {
     let text = if options(hwnd).regex {
         escape(text)

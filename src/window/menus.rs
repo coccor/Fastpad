@@ -42,7 +42,8 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 49] {
         accelerator(FCONTROL, b'H', CommandId::Replace),
         accelerator(FCONTROL, b'Z', CommandId::Undo),
         accelerator(FCONTROL, b'Y', CommandId::Redo),
-        accelerator(FCONTROL | FSHIFT, b'F', CommandId::FormatJson),
+        accelerator(FCONTROL | FSHIFT, b'F', CommandId::ShowSearchView),
+        accelerator(FSHIFT | FALT, b'F', CommandId::FormatJson),
         virtual_key(FCONTROL, VK_TAB, CommandId::NextTab),
         virtual_key(FCONTROL | FSHIFT, VK_TAB, CommandId::PreviousTab),
         accelerator(FCONTROL, b'1', CommandId::SelectTab1),
@@ -77,7 +78,6 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 49] {
         accelerator(FCONTROL | FSHIFT, b'V', CommandId::MarkdownPreviewCycle),
         accelerator(FCONTROL, b'B', CommandId::ToggleSidebar),
         accelerator(FCONTROL | FSHIFT, b'E', CommandId::ShowNotebookView),
-        accelerator(FCONTROL, b'K', CommandId::ShowSearchView),
         accelerator(FALT, b'Z', CommandId::ToggleWordWrap),
         virtual_key(0, VK_F6, CommandId::FocusNextPane),
         virtual_key(FSHIFT, VK_F6, CommandId::FocusPreviousPane),
@@ -586,7 +586,7 @@ mod tests {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_TAB,
         };
-        use windows_sys::Win32::UI::WindowsAndMessaging::{FCONTROL, FSHIFT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
         let bound = |modifiers: u8, key: u16| {
             accelerator_specs()
                 .into_iter()
@@ -620,10 +620,7 @@ mod tests {
             Some(CommandId::CommandPalette)
         );
         assert_eq!(
-            bound(
-                windows_sys::Win32::UI::WindowsAndMessaging::FALT,
-                u16::from(b'Z')
-            ),
+            bound(FALT, u16::from(b'Z')),
             Some(CommandId::ToggleWordWrap)
         );
         assert_eq!(
@@ -635,8 +632,20 @@ mod tests {
             Some(CommandId::ShowNotebookView)
         );
         assert_eq!(
-            bound(FCONTROL, u16::from(b'K')),
+            bound(FCONTROL | FSHIFT, u16::from(b'F')),
             Some(CommandId::ShowSearchView)
+        );
+        assert_eq!(
+            bound(FSHIFT | FALT, u16::from(b'F')),
+            Some(CommandId::FormatJson)
+        );
+        // Break caught: Ctrl+K still showing Search after Search moved to Ctrl+Shift+F.
+        assert_eq!(bound(FCONTROL, u16::from(b'K')), None);
+        // The option toggles are palette-only (spec §5).
+        assert!(
+            accelerator_specs()
+                .iter()
+                .all(|spec| spec.command.search_option().is_none())
         );
     }
 

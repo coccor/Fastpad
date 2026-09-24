@@ -223,7 +223,7 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 - **Opening and closing views:**
   - Clicking an inactive icon shows its view. Clicking the active icon closes the panel.
   - Ctrl+B reopens the last view or closes the panel.
-  - Ctrl+Shift+E shows the Notebook view and moves focus into the tree. Ctrl+K shows Search and focuses its box.
+  - Ctrl+Shift+E shows the Notebook view and moves focus into the tree. Ctrl+K showed Search and focused its box; the note search spec (2026-09-24, §5) moves this to Ctrl+Shift+F and removes Ctrl+K.
   - There is no shortcut for Favorites.
 - **Settings** opens the command palette filtered to FastPad's settings commands.
 - **New `fastpad.ini` keys,** saved when a drag ends or the view changes, through `change_setting`:
@@ -237,7 +237,7 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 - **New, in the palette:**
   - View: Toggle sidebar (Ctrl+B).
   - View: Show notebook (Ctrl+Shift+E).
-  - View: Show search (Ctrl+K).
+  - View: Show search (Ctrl+K; Ctrl+Shift+F since the note search spec, §5).
   - View: Show favorites.
   - Notebook: Close.
   - Notebook: Toggle favorite.

@@ -14,7 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR, WM_COMM
 
 #[test]
 fn format_json_reformats_with_two_spaces_and_is_undone_in_one_step() {
-    // Break caught: Ctrl+Shift+F's Format JSON command not reaching the editor, not using
+    // Break caught: Shift+Alt+F's Format JSON command not reaching the editor, not using
     // serde_json's two-space pretty printer, or splitting its rewrite into more than one undo
     // action (which would force repeated Ctrl+Z to fully restore the original bytes).
     let _scintilla = support::win32::WindowHarness::new().unwrap();

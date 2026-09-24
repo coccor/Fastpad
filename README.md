@@ -106,7 +106,7 @@ Hover a note to pin it.
 - **Ctrl+N** gives you a new note, labelled by its first line as you type. The first Ctrl+S asks
   for its name inline and saves it into the notebook. Notes in the notebook save themselves
   from then on.
-- **Ctrl+K** searches note names. Star a notebook to keep it in **Favorites**, and switch
+- **Ctrl+Shift+F** searches your notes. Star a notebook to keep it in **Favorites**, and switch
   between notebooks from there.
 - **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
   Everything is reachable from the keyboard and exposed to screen readers.
@@ -120,7 +120,7 @@ is written into a folder until you pin something. Turn it all off with `notes_mo
 <img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
 
 Syntax highlighting as soon as you open a `.json` file. **Validate JSON** points to the exact line
-and column of a mistake; **Format JSON** (Ctrl+Shift+F) pretty-prints the whole document in one step you can undo. Neither will touch a
+and column of a mistake; **Format JSON** (Shift+Alt+F) pretty-prints the whole document in one step you can undo. Neither will touch a
 file that doesn't parse.
 
 ### Tabs, done right
@@ -175,14 +175,14 @@ before closing again.
 |---|---|---|---|---|
 | New tab | `Ctrl+N` or `Ctrl+T` | | Command palette | `Ctrl+Shift+P` |
 | Open | `Ctrl+O` | | Markdown preview modes | `Ctrl+Shift+V` |
-| Save | `Ctrl+S` | | Format JSON | `Ctrl+Shift+F` |
+| Save | `Ctrl+S` | | Format JSON | `Shift+Alt+F` |
 | Save as | `Ctrl+Shift+S` | | Word wrap | `Alt+Z` |
 | Find | `Ctrl+F` | | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Ctrl+1` … `Ctrl+9` |
 | Left-to-right text | `Ctrl+L` | | Right-to-left text | `Ctrl+R` |
 | Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` |
-| Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+K` |
+| Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+Shift+F` |
 | Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |
 
 ## Make it yours
