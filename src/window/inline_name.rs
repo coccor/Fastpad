@@ -786,8 +786,9 @@ pub(crate) fn rename_active(hwnd: HWND) {
 
 /// Shows the note at `path` in the Notebook view (opening the sidebar on it if hidden or on
 /// another view), its folders expanded and its row selected and scrolled into view (spec
-/// §3.3). `None`, changing nothing, when it has no row there: outside the notebook, not a note,
-/// not listed yet, or no sidebar.
+/// §3.3). `None` when it has no row there: outside the notebook, not a note, not listed yet, or
+/// no sidebar, which change nothing; or a listed note whose row is still not found once the view
+/// is shown and its folders expanded, which stay so.
 fn reveal(hwnd: HWND, path: &Path) -> Option<PathBuf> {
     let root = library_host::folder(hwnd)?;
     if !library::is_inside(&root, path) || side_panel::windows(hwnd).is_none() {
@@ -860,27 +861,33 @@ fn announce(hwnd: HWND) {
 
 /// The field is losing the focus to `to` (spec §5.3). Another window of FastPad commits the
 /// edit, once the focus change is over; none (another app, or the window deactivating) keeps it
-/// and arms `refocus`.
+/// and arms `refocus`. Both only post `WM_FASTPAD_INLINE_NAME_LEFT`: the focus change may come
+/// from a `SetFocus` made while its caller still holds the app, so nothing is borrowed here.
 fn focus_leaving(hwnd: HWND, to: HWND) {
     let ours = !to.is_null()
         && unsafe { GetWindowThreadProcessId(to, std::ptr::null_mut()) }
             == unsafe { GetCurrentThreadId() };
-    let open = with_inline(hwnd, |inline| {
-        let edit = inline.edit.as_mut()?;
-        if !ours {
-            edit.refocus = true;
-        }
-        Some(())
-    })
-    .flatten()
-    .is_some();
-    if open && ours {
-        unsafe { PostMessageW(hwnd, crate::window::WM_FASTPAD_INLINE_NAME_LEFT, 0, 0) };
-    }
+    let wparam = if ours { 0 } else { LEFT_FASTPAD };
+    unsafe { PostMessageW(hwnd, crate::window::WM_FASTPAD_INLINE_NAME_LEFT, wparam, 0) };
 }
 
-/// `WM_FASTPAD_INLINE_NAME_LEFT`: commits the open edit unless the focus is back in the field
-/// (a menu closed, or another edit started meanwhile).
+/// `WM_FASTPAD_INLINE_NAME_LEFT`'s wparam when the focus left FastPad. The other value, 0, is
+/// also what a message held through a modal prompt is re-posted with.
+pub(crate) const LEFT_FASTPAD: usize = 1;
+
+/// `WM_FASTPAD_INLINE_NAME_LEFT` from the focus leaving FastPad: the open edit stays and takes
+/// the focus back when the window is activated again (`refocus`).
+pub(crate) fn focus_left_fastpad(hwnd: HWND) {
+    with_inline(hwnd, |inline| {
+        if let Some(edit) = inline.edit.as_mut() {
+            edit.refocus = true;
+        }
+    });
+}
+
+/// `WM_FASTPAD_INLINE_NAME_LEFT` from the focus moving to another window of FastPad: commits the
+/// open edit unless the focus is back in the field (a menu closed, or another edit started
+/// meanwhile).
 pub(crate) fn focus_left(hwnd: HWND) {
     let Some(field) = with_inline(hwnd, |inline| inline.edit.as_ref().and(inline.field)).flatten()
     else {
@@ -1051,6 +1058,20 @@ pub(crate) fn commit(hwnd: HWND, how: How) {
         Purpose::RenameNote(relative) => commit_rename_note(hwnd, how, &relative, &text),
         Purpose::RenameFolder(relative) => commit_rename_folder(hwnd, how, &relative, &text),
     }
+}
+
+/// Opens an edit for `purpose` with `text` typed, skipping `start`'s checks and its row, and
+/// commits it with Enter: reaches the commits' own path guards with a purpose no row could give.
+#[cfg(test)]
+pub(crate) fn commit_unchecked(hwnd: HWND, purpose: Purpose, text: &str) {
+    let Some(field) = ensure_field(hwnd) else {
+        return;
+    };
+    with_inline(hwnd, |inline| {
+        inline.begin(purpose, String::new(), String::new())
+    });
+    set_field_text(field, text);
+    commit(hwnd, How::Enter);
 }
 
 /// New folder (spec §5.2): the folder is made with the one disk call, listed, and its row
@@ -1607,10 +1628,10 @@ mod tests {
     }
 
     #[test]
-    fn only_ctrl_z_among_the_field_keys_is_an_accelerator() {
+    fn only_ctrl_z_and_ctrl_y_among_the_field_keys_are_accelerators() {
         // Break caught: an accelerator on Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V, Del, Home, End,
         // Ctrl+Left, Ctrl+Right or Ctrl+Backspace taking the key from the field, which keeps
-        // only Ctrl+Z from the table (inline naming spec §5.1).
+        // only Ctrl+Z and Ctrl+Y from the table (inline naming spec §5.1, §11).
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             VK_BACK, VK_DELETE, VK_END, VK_HOME, VK_LEFT, VK_RIGHT,
         };
@@ -1643,6 +1664,10 @@ mod tests {
         assert!(
             bound(FCONTROL, letter(b'Z')),
             "Ctrl+Z is Undo: the field keeps it"
+        );
+        assert!(
+            bound(FCONTROL, letter(b'Y')),
+            "Ctrl+Y is Redo: the field keeps it"
         );
     }
 }

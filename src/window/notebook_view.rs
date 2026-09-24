@@ -797,17 +797,22 @@ impl NotebookView {
 
     fn apply(&mut self, mut snapshot: Snapshot, names: Vec<(String, Option<String>)>) {
         // A draft row needs the tree, even in a notebook with nothing listed yet (inline naming
-        // spec §3.1).
-        if snapshot.mode == Mode::Empty && self.inline.wants_draft() {
+        // spec §3.1), as long as the draft lasts.
+        let empty = snapshot.mode == Mode::Empty;
+        if empty && self.inline.wants_draft() {
             snapshot.mode = Mode::Tree;
         }
         // The edit ends with its notebook, when the tree goes, or when its folder or row is no
-        // longer listed (spec §5.4); `fit` puts the draft row back in.
+        // longer listed (spec §5.4); `fit` puts the draft row back in. An empty notebook whose
+        // draft ended keeps its empty state.
         if snapshot.root != self.root
             || snapshot.mode != Mode::Tree
             || !self.inline.fit(&mut snapshot.rows)
         {
             self.inline.end();
+            if empty {
+                snapshot.mode = Mode::Empty;
+            }
         }
         let reset = snapshot.mode != self.mode || snapshot.root != self.root;
         if reset {
@@ -1606,7 +1611,8 @@ pub(crate) fn select_row(hwnd: HWND, kind: &RowKind) -> bool {
     selected
 }
 
-/// Gives the tree the keyboard focus, after a folder command closed its name box.
+/// Gives the tree the keyboard focus, after an inline name edit ended with Enter or Esc
+/// (inline naming spec §5.1).
 pub(crate) fn focus_tree(hwnd: HWND) {
     focus_panel(hwnd);
 }

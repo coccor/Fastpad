@@ -725,10 +725,12 @@ unsafe extern "system" fn main_window_proc(
                 crate::window::library_host::notebook_checked(hwnd, lparam);
                 return 0;
             }
-            // Focus left the Notebook tree's name field (inline naming spec §5.3). A modal
-            // prompt that took it holds the commit until it ends.
+            // Focus left the Notebook tree's name field (inline naming spec §5.3): leaving
+            // FastPad keeps the edit; a modal prompt that took it holds the commit until it ends.
             if message == crate::window::WM_FASTPAD_INLINE_NAME_LEFT {
-                if !crate::window::modal::hold_while_modal(hwnd, message) {
+                if wparam == crate::window::inline_name::LEFT_FASTPAD {
+                    crate::window::inline_name::focus_left_fastpad(hwnd);
+                } else if !crate::window::modal::hold_while_modal(hwnd, message) {
                     crate::window::inline_name::focus_left(hwnd);
                 }
                 return 0;
@@ -2486,7 +2488,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
                 }
             }
         }
-        CommandId::New => crate::window::library_host::new_note_in(hwnd, None),
+        CommandId::New => crate::window::library_host::new_note_in(hwnd),
         CommandId::CloseTab => close_active_document(hwnd),
         CommandId::CloseAllTabs => close_all_documents(hwnd),
         CommandId::Save => crate::window::library_host::save_command(hwnd),
@@ -5814,8 +5816,8 @@ pub(crate) unsafe fn translate_accelerator(
         return true;
     }
     // Ctrl+W in the palette's field closes the palette, not a tab (quick-open spec §4). The
-    // table would turn it into Close tab before the field's hook saw the key. Ctrl+Z in the
-    // Notebook tree's name field is the field's own undo (inline naming spec §5.1).
+    // table would turn it into Close tab before the field's hook saw the key. Ctrl+Z and Ctrl+Y in
+    // the Notebook tree's name field stay with the field (inline naming spec §5.1, §11).
     if palette_keeps_key(hwnd, message) || inline_name_keeps_key(hwnd, message) {
         return false;
     }
@@ -5833,23 +5835,28 @@ fn palette_keeps_key(
     hwnd: HWND,
     message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
 ) -> bool {
-    message.message == WM_KEYDOWN
-        && message.wParam == usize::from(b'W')
-        && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
-        && unsafe { GetKeyState(VK_MENU as i32) } >= 0
-        && command_palette_owns(hwnd, message.hwnd)
+    ctrl_letter_keydown(message, b'W') && command_palette_owns(hwnd, message.hwnd)
 }
 
-/// Ctrl+Z (without Alt) aimed at the Notebook tree's inline name field.
+/// Ctrl+Z or Ctrl+Y (without Alt) aimed at the Notebook tree's inline name field: the field's own
+/// undo, never the editor's Undo or Redo (inline naming spec §5.1, §11).
 fn inline_name_keeps_key(
     hwnd: HWND,
     message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
 ) -> bool {
+    (ctrl_letter_keydown(message, b'Z') || ctrl_letter_keydown(message, b'Y'))
+        && crate::window::inline_name::owns(hwnd, message.hwnd)
+}
+
+/// A WM_KEYDOWN of Ctrl+`letter` with Alt up.
+fn ctrl_letter_keydown(
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+    letter: u8,
+) -> bool {
     message.message == WM_KEYDOWN
-        && message.wParam == usize::from(b'Z')
+        && message.wParam == usize::from(letter)
         && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
         && unsafe { GetKeyState(VK_MENU as i32) } >= 0
-        && crate::window::inline_name::owns(hwnd, message.hwnd)
 }
 
 fn menu_activation_message(
@@ -11775,6 +11782,15 @@ mod tests {
         };
     }
 
+    /// A new untitled tab (Ctrl+N) whose first save goes to `folder`, as if that folder's row
+    /// had been selected when it was made.
+    fn untitled_tab_saving_in(hwnd: HWND, folder: std::path::PathBuf) {
+        execute_command(hwnd, CommandId::New);
+        let tabs = &mut app_mut(hwnd).tabs;
+        let id = tabs.active().unwrap().id;
+        tabs.document_mut(id).unwrap().save_folder = Some(folder);
+    }
+
     fn field_text(hwnd: HWND) -> String {
         let mut buffer = [0u16; 260];
         let copied = unsafe {
@@ -12425,7 +12441,7 @@ mod tests {
         assert!(scratch.folder().join(r"sub\Idea.md").exists());
 
         let gone = scratch.folder().join("gone");
-        crate::window::library_host::new_note_in(window.hwnd, Some(gone));
+        untitled_tab_saving_in(window.hwnd, gone);
         editor.set_text("Other").unwrap();
         execute_command(window.hwnd, CommandId::Save);
         crate::window::library_host::name_box_submit(window.hwnd);
@@ -17780,6 +17796,34 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_whose_folder_goes_in_a_notebook_left_empty_shows_the_empty_state() {
+        // Break caught: the tree forced on for a draft that the rebuild then ends (its folder
+        // gone, nothing else listed), leaving a blank tree without the empty state's New note
+        // button (spec §3.1, §5.4).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-draft-empty-gone");
+        std::fs::create_dir(scratch.folder().join("Fresh")).unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        // The test editor's own untitled tab would otherwise show as an unsaved row.
+        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
+        super::close_document_without_prompt(window.hwnd, start);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        crate::window::inline_name::new_note(window.hwnd, Some("Fresh".into()));
+        assert!(inline_open(window.hwnd));
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+
+        // The library drops the folder (deleted in Explorer, say): nothing is left to list.
+        std::fs::remove_dir(scratch.folder().join("Fresh")).unwrap();
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            state.remove_folder(std::path::Path::new("Fresh"), 0)
+        });
+        crate::window::notebook_view::rebuild(window.hwnd);
+
+        assert!(!inline_open(window.hwnd));
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    }
+
+    #[test]
     fn the_empty_notebooks_new_note_button_drafts_a_note_instead_of_opening_a_tab() {
         // Break caught: the empty state's own "New note" button opening an untitled tab
         // (`CommandId::New`) instead of drafting a note in the tree, which is the only way an
@@ -18221,8 +18265,9 @@ mod tests {
 
     #[test]
     fn folder_commands_on_an_empty_or_escaping_path_touch_no_disk() {
-        // Break caught: a folder delete or rename handed the empty path (the notebook root) or a
-        // `..` path recycling, renaming or creating outside the folder the user picked.
+        // Break caught: a folder delete or rename, or a new note or folder, handed the empty
+        // path (the notebook root) or a `..` path recycling, renaming or creating outside the
+        // folder the user picked, even when a commit is reached with such a path directly.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("folder-bad-path");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
@@ -18245,18 +18290,49 @@ mod tests {
         }
         crate::window::inline_name::new_folder(window.hwnd, Some("..".into()));
         assert!(!inline_open(window.hwnd), "no draft outside the notebook");
+        // The commits' own guards, reached with purposes no row gives.
+        use crate::window::inline_name::Purpose;
+        let listing = |folder: &std::path::Path| {
+            let mut names = std::fs::read_dir(folder)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let (around, inside) = (listing(&scratch.root), listing(&scratch.folder()));
+        for (purpose, text) in [
+            (Purpose::NewFolder("..".into()), "Outside"),
+            (Purpose::NewNote("..".into()), "Outside"),
+            (Purpose::RenameFolder("".into()), "Renamed"),
+            (Purpose::RenameFolder("..".into()), "Renamed"),
+            (Purpose::RenameFolder("sub".into()), ".."),
+        ] {
+            let shown = format!("{purpose:?} {text:?}");
+            crate::window::inline_name::commit_unchecked(window.hwnd, purpose, text);
+            assert!(!inline_open(window.hwnd), "{shown}");
+        }
 
         assert_eq!(crate::window::modal::take_last_confirm(), None);
         assert!(scratch.folder().join(r"sub\a.md").exists());
-        assert!(!scratch.root.join("Renamed").exists());
-        assert!(!scratch.root.join("Outside").exists());
+        assert_eq!(
+            listing(&scratch.root),
+            around,
+            "nothing made beside the notebook"
+        );
+        assert_eq!(
+            listing(&scratch.folder()),
+            inside,
+            "nothing made or renamed in it"
+        );
         assert_eq!(notes(), 1);
     }
 
     #[test]
     fn a_new_note_made_in_a_folder_saves_into_it_after_the_folder_is_renamed() {
-        // Break caught: an untitled tab from "New note here" keeping the folder's old path, so
-        // after a rename its first save silently lands in the notebook root instead.
+        // Break caught: an untitled tab made (Ctrl+N) with a folder of the notebook as its save
+        // folder keeping the folder's old path, so after a rename its first save silently lands
+        // in the notebook root instead.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("folder-rename-save-folder");
         std::fs::create_dir_all(scratch.folder().join(r"sub\inner")).unwrap();
@@ -18264,14 +18340,11 @@ mod tests {
         let editor = install_test_editor(&window);
         ensure_sidebar(window.hwnd);
         scratch.install(window.hwnd);
-        crate::window::library_host::new_note_in(window.hwnd, Some(scratch.folder().join("sub")));
+        untitled_tab_saving_in(window.hwnd, scratch.folder().join("sub"));
         let in_sub = app_mut(window.hwnd).tabs.active().unwrap().id;
-        crate::window::library_host::new_note_in(
-            window.hwnd,
-            Some(scratch.folder().join(r"SUB\inner")),
-        );
+        untitled_tab_saving_in(window.hwnd, scratch.folder().join(r"SUB\inner"));
         let in_inner = app_mut(window.hwnd).tabs.active().unwrap().id;
-        crate::window::library_host::new_note_in(window.hwnd, Some(scratch.folder()));
+        untitled_tab_saving_in(window.hwnd, scratch.folder());
         let at_root = app_mut(window.hwnd).tabs.active().unwrap().id;
 
         crate::window::notebook_view::rebuild(window.hwnd);
@@ -18374,7 +18447,7 @@ mod tests {
         let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
         app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
             Some(scratch.folder().join(r"Moved\a.md"));
-        crate::window::library_host::new_note_in(window.hwnd, Some(scratch.folder().join("sub")));
+        untitled_tab_saving_in(window.hwnd, scratch.folder().join("sub"));
         let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
         crate::window::library_host::fail_next_folder_rename_back();
 
@@ -18647,9 +18720,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_z_in_the_field_undoes_the_field_not_the_editor() {
-        // Break caught: Ctrl+Z in the name field undoing the note in the editor, because the
-        // accelerator table takes the key first (spec §5.1).
+    fn ctrl_z_and_ctrl_y_in_the_field_stay_with_the_field() {
+        // Break caught: Ctrl+Z in the name field undoing the note in the editor, or Ctrl+Y
+        // redoing it, because the accelerator table takes the key first (spec §5.1, §11).
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             GetKeyboardState, SetKeyboardState, VK_CONTROL,
         };
@@ -18660,6 +18733,9 @@ mod tests {
         let (window, editor) = notebook_window(&scratch);
         super::open_path(window.hwnd, &a).unwrap();
         editor.set_text("typed in the editor").unwrap();
+        editor.undo().unwrap();
+        assert!(editor.can_redo().unwrap(), "the editor has a step to redo");
+        let before = editor.text().unwrap();
         let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
         crate::window::inline_name::new_note(window.hwnd, None);
         let field = inline_field(window.hwnd);
@@ -18677,23 +18753,37 @@ mod tests {
         let original = keys;
         keys[VK_CONTROL as usize] = 0x80;
         unsafe { SetKeyboardState(keys.as_ptr()) };
-        let ctrl_z = MSG {
+        let ctrl = |key: u8| MSG {
             hwnd: field,
             message: WM_KEYDOWN,
-            wParam: usize::from(b'Z'),
+            wParam: usize::from(key),
             ..Default::default()
         };
 
-        let taken = unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl_z) };
+        let redo_taken =
+            unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl(b'Y')) };
+        unsafe {
+            SendMessageW(field, WM_KEYDOWN, usize::from(b'Y'), 0);
+            SendMessageW(field, WM_CHAR, 0x19, 0);
+        }
+        let after_redo = (field_text(window.hwnd), editor.text().unwrap());
+        let undo_taken =
+            unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl(b'Z')) };
         unsafe {
             SendMessageW(field, WM_KEYDOWN, usize::from(b'Z'), 0);
             SendMessageW(field, WM_CHAR, 0x1a, 0);
         }
         unsafe { SetKeyboardState(original.as_ptr()) };
 
-        assert!(!taken, "the field keeps Ctrl+Z");
+        assert!(!redo_taken, "the field keeps Ctrl+Y");
+        assert_eq!(after_redo, ("abc".to_owned(), before.clone()));
+        assert!(!undo_taken, "the field keeps Ctrl+Z");
         assert_eq!(field_text(window.hwnd), "");
-        assert_eq!(editor.text().unwrap(), "typed in the editor");
+        assert_eq!(editor.text().unwrap(), before);
+        assert!(
+            editor.can_redo().unwrap(),
+            "nothing redid the editor's step"
+        );
     }
 
     #[test]

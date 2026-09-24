@@ -1261,13 +1261,12 @@ pub(crate) fn suggested_file_name(hwnd: HWND) -> String {
         .unwrap_or_else(|| "Untitled.md".to_owned())
 }
 
-/// Ctrl+N and File → New tab. The new untitled tab remembers where its first save goes:
-/// `folder`, else the folder of the sidebar's selected row, else the notebook root. With no
-/// notebook open it is a plain new tab.
-pub(crate) fn new_note_in(hwnd: HWND, folder: Option<PathBuf>) {
+/// Ctrl+N and File → New tab. The new untitled tab remembers where its first save goes: the
+/// folder of the sidebar's selected row, else the notebook root. With no notebook open it is a
+/// plain new tab.
+pub(crate) fn new_note_in(hwnd: HWND) {
     let destination = self::folder(hwnd).filter(|_| notes_mode(hwnd)).map(|root| {
-        folder
-            .or_else(|| super::notebook_view::selected_folder(hwnd))
+        super::notebook_view::selected_folder(hwnd)
             .filter(|candidate| {
                 library::model::same_path(candidate, &root) || library::is_inside(&root, candidate)
             })
