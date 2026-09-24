@@ -88,3 +88,26 @@ at most 1 MB over the `feat/note-library` build with the same notes. Generate th
 folder with its own `library-scan DIR --count 10000`: the sidebar build writes a version 2
 `library.ini`, which the library build reports as damaged and never rewrites. Run the two builds
 back to back, in pairs, because the machine drifts between runs.
+
+## Note search
+
+`library-scan` also generates a second notebook (10,000 notes of about 4 KB, 500 per folder) in
+a scratch folder under the build's `target` directory (`target\bench-notes`, git-ignored), not
+under `%TEMP%`, whose antivirus scanning of fresh files would dominate the timings. It warms the
+OS cache with one untimed search and times the text search of the note search spec (§14), as the
+median of five runs each:
+- `text_search_first_batch_ms`: from starting the worker to its first batch, for a phrase in
+  every note. The target is under 50 ms.
+- `text_search_full_ms`: the whole search for a phrase in one note in fifty (200 hits, below
+  the 500-note cap), so every note is read. The target is under 400 ms.
+- `text_search_batch_ui_ms`: the UI thread's part of one batch, inserting 50 hits into 450
+  shown results by binary search. The `InvalidateRect` that follows only queues a paint and
+  isn't timed. The target is under 2 ms.
+
+`--enforce-reference` fails the run when any of them reaches its target; without it the numbers
+are only printed. A full search at or above 400 ms on the reference machine is the point where §14
+says an index would be justified.
+
+The note search build's idle private working set, with the Search view open on a 10,000-note
+notebook and nothing typed, may grow by at most 0.5 MB over the `feat/note-sidebar` build with
+the same notebook. The `regex` crate may add at most 1.5 MB to the release exe.

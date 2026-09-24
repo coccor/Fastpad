@@ -333,6 +333,16 @@ const LIBRARY_SCAN_REFERENCE_MS: f64 = 500.0;
 const TREE_BUILD_REFERENCE_MS: f64 = 20.0;
 const TREE_ROWS_REFERENCE_MS: f64 = 16.0;
 const NAME_SEARCH_REFERENCE_MS: f64 = 5.0;
+/// The note-search spec's §14 text search targets on the reference machine, over
+/// `TEXT_SEARCH_NOTES` notes of about 4 KB each with a warm OS cache.
+const TEXT_SEARCH_NOTES: usize = 10_000;
+const TEXT_SEARCH_NOTE_BYTES: usize = 4_096;
+/// Every this-many-th note mentions the invoice: 200 hits, so the full search visits every note
+/// without reaching the 500-note cap.
+const TEXT_SEARCH_RARE_EVERY: usize = 50;
+const TEXT_SEARCH_FIRST_BATCH_REFERENCE_MS: f64 = 50.0;
+const TEXT_SEARCH_FULL_REFERENCE_MS: f64 = 400.0;
+const TEXT_SEARCH_BATCH_UI_REFERENCE_MS: f64 = 2.0;
 
 /// Times one cold and several warm `library::load` calls of `folder`, first generating `count`
 /// notes and a `library.ini` into it when asked.
@@ -404,6 +414,8 @@ fn run_library_scan(
             &paths, "note 12", 500,
         ));
     });
+    let (text_search_first_batch_ms, text_search_full_ms, text_search_batch_ui_ms) =
+        text_search_timings()?;
 
     println!("notes={}", state.notes.len());
     println!("cold_ms={cold_ms:.1}");
@@ -412,6 +424,9 @@ fn run_library_scan(
     println!("tree_build_ms={tree_build_ms:.2}");
     println!("tree_rows_expanded_ms={tree_rows_expanded_ms:.2}");
     println!("name_search_ms={name_search_ms:.2}");
+    println!("text_search_first_batch_ms={text_search_first_batch_ms:.2}");
+    println!("text_search_full_ms={text_search_full_ms:.2}");
+    println!("text_search_batch_ui_ms={text_search_batch_ui_ms:.3}");
     if enforce_reference {
         let failures = [
             (
@@ -426,6 +441,21 @@ fn run_library_scan(
                 TREE_ROWS_REFERENCE_MS,
             ),
             ("name search", name_search_ms, NAME_SEARCH_REFERENCE_MS),
+            (
+                "text search, first batch",
+                text_search_first_batch_ms,
+                TEXT_SEARCH_FIRST_BATCH_REFERENCE_MS,
+            ),
+            (
+                "text search, whole notebook",
+                text_search_full_ms,
+                TEXT_SEARCH_FULL_REFERENCE_MS,
+            ),
+            (
+                "text search, one batch on the UI thread",
+                text_search_batch_ui_ms,
+                TEXT_SEARCH_BATCH_UI_REFERENCE_MS,
+            ),
         ]
         .into_iter()
         .filter(|(_, measured, limit)| measured >= limit)
@@ -508,6 +538,164 @@ fn create_library_fixture(folder: &Path, count: usize) -> Result<(), String> {
     fastpad::library::store::write(&path, &library)
         .map_err(|error| format!("could not write {}: {error}", path.display()))?;
     Ok(())
+}
+
+/// Note `index` of the text-search fixture: about `TEXT_SEARCH_NOTE_BYTES` of prose, every line
+/// holding "lazy dog". One note in `TEXT_SEARCH_RARE_EVERY` also mentions an invoice, on its
+/// last line, so a search for it reads the whole note first.
+fn text_search_note(index: usize) -> String {
+    let mut text = format!("# Note {index}\r\n\r\n");
+    while text.len() < TEXT_SEARCH_NOTE_BYTES - 64 {
+        text.push_str("The quick brown fox jumps over the lazy dog.\r\n");
+    }
+    if index.is_multiple_of(TEXT_SEARCH_RARE_EVERY) {
+        text.push_str(&format!("Paid the invoice march {index}.\r\n"));
+    }
+    text
+}
+
+/// Writes `TEXT_SEARCH_NOTES` fixture notes into `folder`, 500 per subfolder.
+fn create_text_search_fixture(folder: &Path) -> Result<(), String> {
+    for index in 0..TEXT_SEARCH_NOTES {
+        let path = folder.join(format!(r"batch{}\note{index}.md", index / 500));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(&path, text_search_note(index))
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// The scratch folder for the text-search notebook: `bench-notes\text-search-<pid>` in the build's
+/// `target` directory, which git ignores. Not `%TEMP%`: the antivirus scans files freshly written
+/// there, and reading them would time the scanner, not the search. `fastpad-bench.exe` runs from
+/// `target\<profile>`, so `target` is the nearest ancestor of that name, or else the exe folder's
+/// parent.
+fn text_search_scratch_root() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("could not find the bench executable: {error}"))?;
+    let target = exe
+        .ancestors()
+        .skip(1)
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("target"))
+        })
+        .or_else(|| exe.parent().and_then(Path::parent))
+        .ok_or_else(|| format!("{} has no parent folder", exe.display()))?;
+    Ok(target
+        .join("bench-notes")
+        .join(format!("text-search-{}", std::process::id())))
+}
+
+/// Times the note-search spec's §14 text search over a notebook generated in a scratch folder.
+/// Returns, in milliseconds:
+/// - the first batch for a phrase in every note;
+/// - the whole search for a phrase in one note in fifty;
+/// - the UI thread's sorted insert of one 50-hit batch into 450 shown results.
+///
+/// The `InvalidateRect` that follows a batch is not part of it: it only queues a paint.
+fn text_search_timings() -> Result<(f64, f64, f64), String> {
+    use fastpad::library::text_search::{self, BATCH_HITS, Progress, SearchNote, TextHit};
+    use fastpad::search::{MatchOptions, Matcher, Snippet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Removed on drop, with the notebook and its library.ini, on every return.
+    let root = ScratchDir(text_search_scratch_root()?);
+    let _ = std::fs::remove_dir_all(&root.0);
+    let notebook = root.0.join("notes");
+    std::fs::create_dir_all(&notebook)
+        .map_err(|error| format!("could not create {}: {error}", notebook.display()))?;
+    create_text_search_fixture(&notebook)?;
+    let local = root.0.join("library.ini");
+    let state = fastpad::library::load(&notebook, &local, fastpad::library::now_unix())
+        .map_err(|error| format!("could not load {}: {error}", notebook.display()))?;
+    let notes = state.notes.iter().map(SearchNote::from).collect::<Vec<_>>();
+    let overlays = std::collections::HashMap::new();
+    let common =
+        Matcher::new("lazy dog", MatchOptions::default()).map_err(|error| error.to_string())?;
+    let rare = Matcher::new("invoice march", MatchOptions::default())
+        .map_err(|error| error.to_string())?;
+    // One untimed pass warms the OS cache, as §14 measures.
+    text_search::run(
+        &notebook,
+        &notes,
+        &overlays,
+        &rare,
+        &AtomicBool::new(false),
+        &mut |_: Vec<TextHit>, _: Progress| {},
+    );
+
+    // The first batch fills at 50 hits, after 50 notes; the sink then cancels the rest.
+    let first_batch_ms = median_ms(|| {
+        let cancel = AtomicBool::new(false);
+        text_search::run(
+            &notebook,
+            &notes,
+            &overlays,
+            &common,
+            &cancel,
+            &mut |hits: Vec<TextHit>, _: Progress| {
+                std::hint::black_box(hits);
+                cancel.store(true, Ordering::Relaxed);
+            },
+        );
+    });
+    let full_ms = median_ms(|| {
+        std::hint::black_box(text_search::run(
+            &notebook,
+            &notes,
+            &overlays,
+            &rare,
+            &AtomicBool::new(false),
+            &mut |hits: Vec<TextHit>, _: Progress| {
+                std::hint::black_box(hits);
+            },
+        ));
+    });
+
+    let hit = |index: usize| TextHit {
+        path: PathBuf::from(format!(r"batch{}\note{index}.md", index / 500)),
+        name: format!("note{index}"),
+        folder: format!("batch{}", index / 500),
+        snippet: Snippet {
+            text: format!("Paid the invoice march {index}."),
+            highlight: 9..22,
+        },
+        stamp: None,
+    };
+    let mut shown = (0..450).map(|i| hit(i * 20)).collect::<Vec<_>>();
+    shown.sort_by(text_search::hit_cmp);
+    let batch = (0..BATCH_HITS)
+        .map(|i| hit(i * 20 + 10))
+        .collect::<Vec<_>>();
+    let mut times = Vec::with_capacity(LIBRARY_SCAN_WARM_LOADS);
+    for _ in 0..LIBRARY_SCAN_WARM_LOADS {
+        let mut results = shown.clone();
+        let incoming = batch.clone();
+        let started = std::time::Instant::now();
+        for hit in incoming {
+            let at = results
+                .binary_search_by(|probe| text_search::hit_cmp(probe, &hit))
+                .unwrap_or_else(|at| at);
+            results.insert(at, hit);
+        }
+        times.push(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box(results);
+    }
+    times.sort_by(f64::total_cmp);
+    Ok((first_batch_ms, full_ms, times[times.len() / 2]))
+}
+
+/// A scratch folder removed on drop, including on an early `?` return.
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A scratch file removed on drop, including on an early `?` return.
@@ -1623,6 +1811,26 @@ mod tests {
     };
     use fastpad::perf::protocol::BenchmarkRecord;
     use std::path::PathBuf;
+
+    #[test]
+    fn text_search_notes_are_about_4_kb_and_one_in_fifty_mentions_the_invoice() {
+        // Break caught: a fixture that measures 200-byte notes, or one where every note (or no
+        // note) matches the rare phrase, so the full search is capped or finds nothing.
+        for index in [0, 1, 49, 50, 9_999] {
+            let text = super::text_search_note(index);
+            assert!(
+                (4_000..=4_200).contains(&text.len()),
+                "{index}: {}",
+                text.len()
+            );
+            assert!(text.contains("lazy dog"));
+            assert_eq!(
+                text.contains("invoice march"),
+                index.is_multiple_of(50),
+                "{index}"
+            );
+        }
+    }
 
     #[test]
     fn percentile_uses_the_required_ceiling_rank() {

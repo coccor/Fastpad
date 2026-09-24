@@ -15,15 +15,16 @@ use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{
-    AccessibleObjectFromWindow, ROLE_SYSTEM_OUTLINEITEM, ROLE_SYSTEM_PAGETAB,
+    AccessibleObjectFromWindow, ROLE_SYSTEM_CHECKBUTTON, ROLE_SYSTEM_OUTLINEITEM,
+    ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_TEXT,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F3, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    OBJID_CLIENT, PostMessageW, WM_ACTIVATEAPP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    OBJID_CLIENT, PostMessageW, SendMessageW, WM_ACTIVATEAPP, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -212,7 +213,7 @@ struct AccessibleVtable {
     invoke: usize,
     get_acc_parent: usize,
     get_acc_child_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
-    get_acc_child: usize,
+    get_acc_child: unsafe extern "system" fn(*mut c_void, VARIANT, *mut *mut c_void) -> HRESULT,
     get_acc_name: unsafe extern "system" fn(*mut c_void, VARIANT, *mut BSTR) -> HRESULT,
     get_acc_value: usize,
     get_acc_description: usize,
@@ -302,6 +303,19 @@ impl Accessible {
             right: left + width,
             bottom: top + height,
         })
+    }
+
+    /// Whether child `child` has a full object of its own (a native control), releasing it.
+    fn has_child_object(&self, child: i32) -> bool {
+        let mut object = std::ptr::null_mut();
+        let result =
+            unsafe { (self.vtable().get_acc_child)(self.0, child_variant(child), &mut object) };
+        if result < 0 || object.is_null() {
+            return false;
+        }
+        let vtable = unsafe { &**(object as *const *const AccessibleVtable) };
+        unsafe { (vtable.release)(object) };
+        true
     }
 
     /// The child IDs and names, in order.
@@ -407,6 +421,17 @@ fn write_folders(data: &Scratch, folders: fastpad::library::local::RecentFolders
         folders.encode(),
     )
     .unwrap();
+}
+
+/// The editor's selection, as Scintilla byte positions.
+fn selection(editor: HWND) -> (isize, isize) {
+    use fastpad::editor::scintilla_constants::{SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART};
+    unsafe {
+        (
+            SendMessageW(editor, SCI_GETSELECTIONSTART, 0, 0),
+            SendMessageW(editor, SCI_GETSELECTIONEND, 0, 0),
+        )
+    }
 }
 
 #[test]
@@ -831,5 +856,72 @@ fn with_notes_mode_off_there_is_no_activity_bar_or_side_panel() {
     find_child_by_class(hwnd, "Scintilla").unwrap();
     assert!(find_child_by_class(hwnd, ACTIVITY_BAR_CLASS).is_err());
     assert!(find_child_by_class(hwnd, SIDE_PANEL_CLASS).is_err());
+    close(process, hwnd);
+}
+
+#[test]
+fn searching_the_notebook_opens_a_result_at_its_first_match_and_f3_steps_on() {
+    // Break caught: the Search view not searching note text in the real exe, the box or
+    // toggles missing from what a screen reader sees, a result opening without the find bar
+    // seeded, the first match not selected, or F3 not reaching the next match.
+    let _lock = LIBRARY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dpi = DpiContext::per_monitor_v2();
+    let _com = ComApartment::initialize();
+    let data = Scratch::new("text-search");
+    data.note(
+        "a.md",
+        "alpha\r\nthe invoice march is paid\r\ninvoice again\r\n",
+    );
+    data.note("b.md", "nothing to see");
+    let mut process =
+        FastPadProcess::spawn_with_local_app_data([data.folder()], &data.root).unwrap();
+    let hwnd = process.wait_for_main_window(WAIT).unwrap();
+    let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
+    wait_for_library(&data);
+    let panel = find_child_by_class(hwnd, SIDE_PANEL_CLASS).unwrap();
+
+    // Ctrl+Shift+F's command; the in-process tests pin the accelerator itself.
+    command(hwnd, CommandId::ShowSearchView);
+    wait_until("the search box to take focus", || {
+        focused_window(hwnd).is_ok_and(|focus| focus != editor && focus != panel)
+    });
+    let search_box = focused_window(hwnd).unwrap();
+    for unit in "invoice".encode_utf16() {
+        unsafe {
+            PostMessageW(search_box, WM_CHAR, unit as usize, 0);
+        }
+    }
+    let result = "a: the invoice march is paid";
+    wait_until("the result", || panel_lists(panel, result));
+    assert!(!panel_lists(panel, "b: nothing to see"));
+
+    let accessible = Accessible::from_window(panel).unwrap();
+    let children = accessible.children();
+    assert!(
+        children.iter().any(|(id, name)| {
+            name == "Match case" && accessible.role(*id) == Some(ROLE_SYSTEM_CHECKBUTTON)
+        }),
+        "{children:?}"
+    );
+    let (box_id, _) = children
+        .iter()
+        .find(|(id, _)| accessible.role(*id) == Some(ROLE_SYSTEM_TEXT))
+        .expect("the search box is one of the panel's children");
+    assert!(accessible.has_child_object(*box_id));
+    drop(accessible);
+
+    click_child(panel, result);
+    // "alpha\r\n" is 7 bytes and "the " 4 more: the first "invoice" is 11..18.
+    wait_until("a to open at its first match", || {
+        selection(editor) == (11, 18)
+    });
+    assert!(scintilla_text(editor).is_ok_and(|text| text.starts_with("alpha\r\n")));
+    unsafe {
+        PostMessageW(editor, WM_KEYDOWN, VK_F3 as usize, 0);
+    }
+    // The next line starts at 7 + 27 = 34.
+    wait_until("F3 to reach the next match", || {
+        selection(editor) == (34, 41)
+    });
     close(process, hwnd);
 }

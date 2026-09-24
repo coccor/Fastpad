@@ -106,8 +106,12 @@ Hover a note to pin it.
 - **Ctrl+N** gives you a new note, labelled by its first line as you type. The first Ctrl+S asks
   for its name inline and saves it into the notebook. Notes in the notebook save themselves
   from then on.
-- **Ctrl+Shift+F** searches your notes. Star a notebook to keep it in **Favorites**, and switch
-  between notebooks from there.
+- **Ctrl+Shift+F** searches the text of every note in the notebook as you type, with match
+  case (**Alt+C**), whole word (**Alt+W**) and regular expression (**Alt+R**) toggles. Select
+  a word first and it becomes the search. Opening a result puts your search in the find bar,
+  so **F3** steps through every match in that note. Nothing is indexed: the notes are read
+  when you search, and results stream in as they're found.
+- Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
 - **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
   Everything is reachable from the keyboard and exposed to screen readers.
 
@@ -165,7 +169,9 @@ before closing again.
   leaves you with a half-written file.
 - **Encodings preserved.** UTF-8, UTF-8 with BOM, UTF-16 LE and UTF-16 BE are detected on open and
   kept on save.
-- **Find and replace**, zoom, word wrap, line numbers, and left-to-right or right-to-left text.
+- **Find and replace**, with match case, whole word and regular expressions (Alt+C, Alt+W,
+  Alt+R) and F3 / Shift+F3, plus zoom, word wrap, line numbers, and left-to-right or
+  right-to-left text.
 - **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive
   technology and can be followed from it.
 
@@ -184,6 +190,7 @@ before closing again.
 | Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` |
 | Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+Shift+F` |
 | Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |
+| Find next / previous | `F3` / `Shift+F3` | | Match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` |
 
 ## Make it yours
 

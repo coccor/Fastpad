@@ -331,4 +331,117 @@ For each note, in the library's note-list order:
 
 ## 17. Implementation notes
 
-(Reserved for deviations recorded during implementation, as in the sidebar spec §16.)
+- **The debounce timer lives on the main window** (a deviation from §7, which said "on the
+  panel, with the timer ID in `ids.rs`"). `TEXT_SEARCH_TIMER_ID` (`0x4650_5453`) is defined in
+  `text_search_host.rs` and handled in the main window's `WM_TIMER`, like
+  `LIBRARY_WRITE_TIMER_ID`. `ids.rs` holds library IDs, and every other timer is the main
+  window's.
+- **The debounce waits out modal loops and file population.** When the timer fires inside a
+  nested modal loop or while a file is being populated, it does nothing and stays armed, so it
+  tries again at the next tick: reading the dirty tabs swaps editor documents, which neither may
+  see.
+- **Plain search compiles a literal `Regex`** of the escaped query rather than using a substring
+  search. Without match case it is a case-insensitive literal for an ASCII query, and otherwise
+  a literal of the case-folded query matched against case-folded text.
+- **`text_search::run` has no `narrow` parameter.** Narrowing passes the narrowed slice of notes
+  (the previous hits plus the notes the previous search skipped, which are carried over through
+  `run_noting_skipped`), and a batch carries `SearchBatch.end: Option<RunEnd>`, set on the last.
+- **Narrowing is stricter than §7:** it is disabled for whole word (a longer whole word can
+  match where the shorter one was part of a word) and for regex, and it also needs the same
+  options and unchanged dirty-tab text. Its record includes every note's size and modification
+  time, so it is dropped on any library load or rescan and on any save in the notebook
+  (FastPad's own included); the next query is then a full search.
+- **A library change runs the query again only when the note paths or their `online_only` flags
+  changed, or after a load or rescan.** `side_panel::refresh` also runs for pins, favorites and
+  expansions, and a save of a listed note changes neither (§7). The re-run is deferred through
+  the debounce timer rather than started inline, so no editor document is swapped inside an
+  install, save or notebook flow; it costs at most 150 ms more after a library change.
+- **The UI thread's cost at search start grows with the dirty tabs and the notebook** (accepted):
+  it copies the note list and each dirty tab's text for the worker before starting it. §7 allows
+  it; very large dirty tabs make it noticeable.
+- **Cancelling bumps the generation too,** so batches a cancelled search already posted are
+  dropped, not only those of an older search.
+- **A dirty tab's text is searched even when its note is online only or over 4 MB,** since it is
+  already in memory. It is never counted as skipped.
+- **The cap ends a search as "500+ notes" only when notes remain** after the 500th hit. When the
+  500th hit is the last note, it is a completed search ("500 notes").
+- **A regex error's message** is the last line of the `regex` crate's error text
+  (`error: <description>`), with `error:` stripped and a capital first letter: "Unclosed group".
+  A pattern too large to compile reads "The pattern is too large.", a message §4 doesn't list.
+- **The snippet's 80 characters "after" the match are counted from the match's start** (§7): the
+  match and what follows it together are at most 80 characters, so a match longer than that is
+  itself cut with `…`.
+- **`name_search::folder_of` became `pub(super)`** (§9 says nothing else changes in
+  `name_search`). It is a visibility change only: text search reuses it so a result's folder
+  follows the same rule as a name match's.
+- **The Search box is made when the user first shows the Search view** (`search_view::shown`),
+  even with no notebook, so the toggles work then (§4). `layout`, which also runs on the first
+  `WM_SIZE`, makes it only with a notebook open, so a Search view restored at startup still makes
+  nothing before the first paint (§14).
+- **Visuals:** a toggle that is on is filled with `Palette.selection_background`, since the
+  palette has no accent color. `Palette.error_foreground` is new, for the pattern error and the
+  find bar's no-match outline. The bold snippet font is created lazily, on the first snippet
+  paint, not in `UiFonts::create`. A Search result row is 42 px tall at 96 DPI (two 18 px line
+  slots), and since `row_list::thumb_width` scales from the row height, the Search view's scroll
+  thumb becomes 9 px wide (the other views keep 6 px).
+- **F3 and Shift+F3 are new commands,** `FindNext` (188) and `FindPrevious` (189). §8 assumed
+  they existed; nothing bound F3 before. With no query yet, they open the find bar. They're in
+  the Search menu and the palette. 3b's commands start at 190.
+- **The find bar gained a no-match state.** §8 speaks of its "existing" one, but a miss used to
+  leave no trace. Now the query field's outline turns `Palette.error_foreground` until the query
+  changes or a search finds something. An invalid regex shows it too. Scintilla reports a bad
+  pattern as -1 (-2 in some versions), which is a miss, never an error or a notice.
+- **Whole word in the find bar's regex mode is a per-hit word test.** Scintilla's regex search
+  ignores `SCFIND_WHOLEWORD`, and MSVC's `std::wregex` `\b` treats accented letters as non-word
+  characters, so wrapping the pattern in `\b(?:…)\b` was wrong both ways on Romanian text. The
+  find bar searches the bare pattern and accepts a hit only if Scintilla's `SCI_ISRANGEWORD`
+  holds for it, stepping past rejected hits.
+- **Search and the find bar differ at the edges of their regex dialects:**
+  - Scintilla's regex search runs line by line, so a Search hit that spans lines (a pattern
+    with `\n` or `\s` across a line end) opens to the find bar's no-match state.
+  - Whole word is the `regex` crate's word boundary in Search and Scintilla's word test in the
+    find bar, so they can disagree where a word edge is punctuation only.
+- **Empty regex matches are stepped past in the find bar.** A pattern like `x*` matches empty
+  text at the caret; find next and find previous move one character past an empty hit and keep
+  searching, and Replace all skips empty hits and continues, so a pattern that matches both
+  empty and real text still finds the real matches. Search rejects patterns that match empty
+  text outright (§6).
+- **Scintilla is built with C++11 regex** (`NO_CXX11_REGEX` is never set by
+  `tools/build-native.ps1`). An in-process test pins it with `\d{2}`.
+- **A regex match's length comes from Scintilla** (`SCI_GETTARGETEND`), not from the pattern's
+  length, so find next, replace and Replace all handle regex matches correctly. Replace in the
+  find bar inserts its text literally, in regex mode too (no `$1` or `\1`).
+- **A click on a result moves the focus to the editor; Enter keeps it in the list** (sidebar
+  spec §6.4; `open_search_result`'s `focus_editor` is true for a click, false for Enter). §8's
+  "focus goes to the editor" holds for the click. Either way the first match is selected and F3
+  continues from it.
+- **A selection prefilled into the find bar while regex is on** is escaped for ECMAScript
+  (`find_bar::escape_pattern`), not with `regex::escape`, whose `\#` and `\-` ECMAScript rejects.
+- **The find bar's tooltip is updated under a shared App borrow** (`TTM_*` sends in
+  `FindBar::layout`), an accepted exception to the App-borrow rule: the tooltip is a same-thread
+  control that never calls back into the main window.
+- **Accessibility:** the Search view's children are the box (its full object is the `Edit`'s
+  own), the three toggles (check buttons), the summary line, the status line, then the results.
+  The status line comes before the results so its child ID stays fixed while they stream in. A
+  result reads its snippet; at the root, where there is no folder to add, it is named
+  "<name>: <snippet>". The summary and status lines announce a change at most once a second. The
+  find bar's panel now has a provider too: the Find field, the toggles, the Replace field in
+  Replace mode, and Close.
+- **`text_search_batch_ui_ms` times the sorted insert only.** It inserts 50 hits into 450 by
+  binary search, calling `hit_cmp` directly, since the bench can't reach `search_view`. The
+  `InvalidateRect` after it only queues a paint.
+- **Format JSON has no menu-bar entry with a shortcut.** The palette row shows Shift+Alt+F from
+  the accelerator table; the overflow menu shows no shortcuts for any entry.
+- **Measured** on the reference machine itself (Intel Core i5-4590 at 3.3 GHz, 8 GB, Windows 10
+  22H2), warm cache, notebook under `target\bench-notes`, the second of two runs:
+  `text_search_first_batch_ms` 5.57, `text_search_full_ms` 1133.18,
+  `text_search_batch_ui_ms` 0.119. The first batch and the UI-thread batch meet their targets
+  (50 and 2 ms). **The full search misses its 400 ms target by almost three times.** The first
+  batch reads 50 notes in about the same time per note (0.11 ms) as the full search's 10,000, so
+  the cost looks like opening and reading each file (the file system and the antivirus filter on
+  every open), not matching. §14 names this as the point where an index would be justified; none
+  was added in 3a. Release exe with `release-package`: 1,565,696 bytes on `feat/note-sidebar`
+  (4c9ba2e), 2,833,408 bytes here (+1,267,712 bytes, budget 1,572,864). Idle private working
+  set with the Search view open on a 10,000-note notebook: +86,016 bytes over
+  `feat/note-sidebar` in each of two back-to-back pairs of 30 runs (p50 4,390,912 there,
+  4,476,928 here; budget 524,288). `compare` found no regressed milestone in either pair.
