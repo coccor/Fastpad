@@ -63,6 +63,18 @@ pub struct Stamp {
     pub mtime: u64,
 }
 
+impl Stamp {
+    /// The stamp of a file from its metadata: the search and the replace both take it this way
+    /// (the replace also right after each save), so a note nobody touched in between has the
+    /// same stamp.
+    pub(super) fn of(metadata: &std::fs::Metadata) -> Stamp {
+        Stamp {
+            size: metadata.len(),
+            mtime: metadata.last_write_time(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextHit {
     /// Relative to the notebook, as the note list has it.
@@ -366,6 +378,17 @@ fn search_note(
     })
 }
 
+/// Opens `path`, reads at most `MAX_NOTE_BYTES + 1` bytes into `bytes` (cleared first), and
+/// returns the stamp of the opened file. The search and the replace both read a note from disk
+/// this way, so a note nobody touched keeps the same stamp between the two.
+pub(super) fn read_bytes(path: &Path, bytes: &mut Vec<u8>) -> std::io::Result<Stamp> {
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    bytes.clear();
+    file.take(MAX_NOTE_BYTES + 1).read_to_end(bytes)?;
+    Ok(Stamp::of(&metadata))
+}
+
 /// The note's text from disk and the stamp of what was read. An online-only note is never
 /// opened, so a search never recalls it; a note over the limit by the scan's size is not opened
 /// either, and one that grew past it since is not read past the limit.
@@ -380,27 +403,13 @@ fn read_note(
     if note.size > MAX_NOTE_BYTES {
         return Err(SkipReason::TooLarge);
     }
-    let file =
-        std::fs::File::open(notebook.join(&note.path)).map_err(|_| SkipReason::Unreadable)?;
-    let metadata = file.metadata().map_err(|_| SkipReason::Unreadable)?;
-    if metadata.len() > MAX_NOTE_BYTES {
-        return Err(SkipReason::TooLarge);
-    }
-    bytes.clear();
-    file.take(MAX_NOTE_BYTES + 1)
-        .read_to_end(bytes)
-        .map_err(|_| SkipReason::Unreadable)?;
+    let stamp =
+        read_bytes(&notebook.join(&note.path), bytes).map_err(|_| SkipReason::Unreadable)?;
     if bytes.len() as u64 > MAX_NOTE_BYTES {
         return Err(SkipReason::TooLarge);
     }
     let decoded = encoding::decode(bytes).map_err(|_| SkipReason::NotText)?;
-    Ok((
-        decoded.text,
-        Stamp {
-            size: metadata.len(),
-            mtime: metadata.last_write_time(),
-        },
-    ))
+    Ok((decoded.text, stamp))
 }
 
 #[cfg(test)]

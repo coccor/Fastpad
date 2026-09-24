@@ -10,6 +10,7 @@ pub mod ops;
 pub mod reconcile;
 pub mod scan;
 pub mod store;
+pub mod text_replace;
 pub mod text_search;
 pub mod title;
 pub mod tree;
@@ -19,7 +20,7 @@ use ids::IdSource;
 use local::LocalState;
 use model::{Library, LibraryError, NoteRecord, NoteRef, same_path};
 use ops::PendingOp;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use store::{FileStamp, ReadOutcome};
 
@@ -501,6 +502,42 @@ impl LibraryState {
         }
     }
 
+    /// Records a note FastPad just wrote outside the editor (a Search replace) from the stamp
+    /// the writer took of the saved file, so the next rescan reads no outside change. It is the
+    /// update `add_note` makes for a note already listed (size, time, `online_only` cleared, a
+    /// `touched` entry), with no disk access: the UI thread calls it for every written note.
+    /// Returns false, changing nothing, when `relative` isn't listed.
+    pub fn record_written(&mut self, relative: &Path, stamp: text_search::Stamp) -> bool {
+        self.record_written_all(std::slice::from_ref(&(relative.to_path_buf(), stamp))) == 1
+    }
+
+    /// Records every note in `written` the way `record_written` records one, in a single pass
+    /// over `notes` (a path key to index map, built once), so a batch of many written notes costs
+    /// one scan of the list instead of one per note. Returns how many of `written`'s paths were
+    /// listed (`record_written`'s bool, summed).
+    pub fn record_written_all(&mut self, written: &[(PathBuf, text_search::Stamp)]) -> usize {
+        let index_of: HashMap<String, usize> = self
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| (path_key(&note.path), index))
+            .collect();
+        let mut recorded = 0;
+        for (relative, stamp) in written {
+            let Some(&index) = index_of.get(&path_key(relative)) else {
+                continue;
+            };
+            let existing = &mut self.notes[index];
+            existing.size = stamp.size;
+            existing.mtime = stamp.mtime;
+            // FastPad just wrote the file, so its data is on this PC.
+            existing.online_only = false;
+            self.touched.push(relative.clone());
+            recorded += 1;
+        }
+        recorded
+    }
+
     pub fn remove_note(&mut self, path: &Path) {
         let Some(stored) = strip_folder(&self.folder, path) else {
             return;
@@ -922,6 +959,88 @@ mod tests {
         let fresh = bare_state(&scratch, entries(scan::NOTE_LIMIT), true);
         let merged = merge_rescan(previous, fresh);
         assert_eq!(merged.notes.len(), scan::NOTE_LIMIT);
+    }
+
+    #[test]
+    fn a_replace_write_is_recorded_as_a_save_is_without_reading_the_disk() {
+        // Break caught: FastPad's own replace read as an outside change by the next rescan (the
+        // old size or time kept, or the note missing from `touched`), an online-only flag left
+        // set so search keeps skipping the note, a stamp taken from the disk on the UI thread
+        // for each written note, or a note that isn't listed added.
+        let scratch = Scratch::new("record-written");
+        let mut state = bare_state(&scratch, entries(2), false);
+        state.notes[1].online_only = true;
+        let stamp = text_search::Stamp {
+            size: 42,
+            mtime: 133_700_000_000_000_000,
+        };
+        let taken = store::stats_taken();
+
+        assert!(state.record_written(Path::new("F1.md"), stamp));
+        assert!(!state.record_written(Path::new("missing.md"), stamp));
+
+        assert_eq!(store::stats_taken(), taken, "no stamp taken from the disk");
+        let note = &state.notes[1];
+        assert_eq!(
+            (note.size, note.mtime, note.online_only),
+            (42, stamp.mtime, false)
+        );
+        assert_eq!(state.notes[0].size, 0, "only that note changes");
+        assert_eq!(state.notes.len(), 2, "nothing is added");
+        assert_eq!(state.touched, [PathBuf::from("F1.md")]);
+    }
+
+    #[test]
+    fn record_written_all_updates_every_listed_note_in_one_pass() {
+        // Break caught (R1): a batch of several written notes handled by re-scanning `notes` once
+        // per note instead of once for the whole batch, or a path in the batch that isn't listed
+        // changing something or being counted.
+        let scratch = Scratch::new("record-written-all");
+        let mut state = bare_state(&scratch, entries(3), false);
+        state.notes[0].online_only = true;
+        state.notes[2].online_only = true;
+        let stamp0 = text_search::Stamp {
+            size: 10,
+            mtime: 100,
+        };
+        let stamp2 = text_search::Stamp {
+            size: 30,
+            mtime: 300,
+        };
+        let written = [
+            (PathBuf::from("F0.md"), stamp0),
+            (PathBuf::from("missing.md"), stamp0),
+            (PathBuf::from("F2.md"), stamp2),
+        ];
+
+        let recorded = state.record_written_all(&written);
+
+        assert_eq!(recorded, 2, "the unlisted path is not counted");
+        assert_eq!(
+            (
+                state.notes[0].size,
+                state.notes[0].mtime,
+                state.notes[0].online_only
+            ),
+            (10, 100, false)
+        );
+        assert_eq!(
+            state.notes[1].size, 0,
+            "the note not in the batch is untouched"
+        );
+        assert_eq!(
+            (
+                state.notes[2].size,
+                state.notes[2].mtime,
+                state.notes[2].online_only
+            ),
+            (30, 300, false)
+        );
+        assert_eq!(
+            state.touched,
+            [PathBuf::from("F0.md"), PathBuf::from("F2.md")]
+        );
+        assert_eq!(state.notes.len(), 3, "nothing is added");
     }
 
     /// `count` index entries that exist only in memory.
