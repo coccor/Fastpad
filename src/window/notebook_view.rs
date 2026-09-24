@@ -53,10 +53,10 @@ const GLYPH_CHEVRON_RIGHT: &str = "\u{E76C}";
 const GLYPH_CHEVRON_DOWN: &str = "\u{E70D}";
 const GLYPH_FOLDER: &str = "\u{E8B7}";
 const GLYPH_NOTE: &str = "\u{E8A5}";
-const GLYPH_PIN: &str = "\u{E718}";
+/// The tilted pin's outline (Segoe's Pinned), needle included.
+const GLYPH_PIN: &str = "\u{E840}";
+/// The tilted pin's head fill (PinFill), with no needle: drawn under `GLYPH_PIN`.
 const GLYPH_PINNED: &str = "\u{E842}";
-/// The outline of `GLYPH_PINNED`'s tilted pin, needle included.
-const GLYPH_PINNED_OUTLINE: &str = "\u{E840}";
 const GLYPH_STAR: &str = "\u{E734}";
 const GLYPH_STAR_FILLED: &str = "\u{E735}";
 const GLYPH_ADD: &str = "\u{E710}";
@@ -501,7 +501,7 @@ fn draw_tree_row(
         // head's fill, with no needle: its tilted outline (Pinned) is drawn over it to complete
         // the shape.
         if row.pinned {
-            for glyph in [GLYPH_PINNED, GLYPH_PINNED_OUTLINE] {
+            for glyph in [GLYPH_PINNED, GLYPH_PIN] {
                 unsafe { draw_text(dc, glyph, parts.pin, fonts.glyph, foreground, CENTERED) };
             }
         } else if look.hover || look.selected {
