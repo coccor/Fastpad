@@ -55,6 +55,16 @@ pub struct NoteEntry {
     pub online_only: bool,
 }
 
+/// A folder change FastPad made itself (notebook folders spec §3.2). Each is kept until the next
+/// rescan starts, and replayed onto that rescan's result, which may have listed the folders
+/// before the change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FolderChange {
+    Added(PathBuf),
+    Removed(PathBuf),
+    Renamed { old: PathBuf, new: PathBuf },
+}
+
 #[derive(Debug)]
 pub struct LibraryState {
     pub folder: PathBuf,
@@ -68,6 +78,8 @@ pub struct LibraryState {
     /// (notebook folders spec §3.1). A rescan replaces it; FastPad's own folder commands update
     /// it in place.
     pub folders: Vec<PathBuf>,
+    /// FastPad's own folder changes since the running rescan started, replayed onto its result.
+    pub folder_changes: Vec<FolderChange>,
     /// The notes as the sidebar's folder tree. Built with the scan on the worker; every later
     /// change to `notes` or to a pin updates it in place.
     pub tree: tree::NoteTree,
@@ -151,6 +163,19 @@ fn sync_pins(tree: &mut tree::NoteTree, before: &[PathBuf], after: &[PathBuf]) {
             tree.set_pinned(path, false);
         }
     }
+}
+
+/// Whether `path` is `folder` itself or inside it, ignoring case.
+fn at_or_under(path: &Path, folder: &Path) -> bool {
+    same_path(path, folder) || strip_folder(folder, path).is_some()
+}
+
+/// `path` moved from `old` to `new`, when it is `old` itself or inside it.
+fn reroot(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
+    if same_path(path, old) {
+        return Some(new.to_path_buf());
+    }
+    strip_folder(old, path).map(|rest| new.join(rest))
 }
 
 #[cfg(test)]
@@ -258,6 +283,7 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
         tree,
         truncated: scan.truncated,
         folders: scan.folders,
+        folder_changes: Vec::new(),
         pending: reconciled.ops,
         relocated: reconciled.relocated,
         touched: Vec::new(),
@@ -361,11 +387,17 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         pending: previous_pending,
         local: previous_local,
         touched,
+        folder_changes,
         ..
     } = previous;
     let mut fresh = fresh;
     // The rescan built its tree from these pins; what the merge changes is applied to it below.
     let built_pins = pinned_paths(&fresh.library);
+    // FastPad's folder changes while the rescan ran, which its result may not have seen: first,
+    // so the touched notes below are re-checked at their current paths.
+    for change in &folder_changes {
+        fresh.change_folders(change);
+    }
     fresh.notes = merge_notes(&fresh.folder, std::mem::take(&mut fresh.notes), &touched);
     if fresh.truncated {
         // A truncated scan's own list is already capped at the limit; touched entries that
@@ -418,6 +450,7 @@ fn update_merged_tree(state: &mut LibraryState, touched: &[PathBuf], built_pins:
     let pinned: HashSet<String> = pins.iter().map(|path| path_key(path)).collect();
     for path in touched {
         if state.notes.iter().any(|note| same_path(&note.path, path)) {
+            state.list_folders_of(path);
             state
                 .tree
                 .insert_note(path, pinned.contains(&path_key(path)));
@@ -497,6 +530,7 @@ impl LibraryState {
             false
         } else {
             let pinned = self.is_pinned(&relative);
+            self.list_folders_of(&relative);
             self.tree.insert_note(&relative, pinned);
             self.notes.push(NoteEntry {
                 path: relative,
@@ -506,6 +540,23 @@ impl LibraryState {
             });
             true
         }
+    }
+
+    /// Lists every folder above the note at `relative` that `folders` lacks, spelled as in its
+    /// path: a note saved into a folder the scan never saw (one made in the save dialog) gets
+    /// the folder rows a rebuild from `folders` would give it. Touches no disk.
+    fn list_folders_of(&mut self, relative: &Path) {
+        let Some(parent) = relative.parent() else {
+            return;
+        };
+        let mut missing: Vec<PathBuf> = parent
+            .ancestors()
+            .filter(|folder| !folder.as_os_str().is_empty())
+            .filter(|folder| !self.folders.iter().any(|listed| same_path(listed, folder)))
+            .map(Path::to_path_buf)
+            .collect();
+        missing.reverse();
+        self.folders.extend(missing);
     }
 
     /// Records a note FastPad just wrote outside the editor (a Search replace) from the stamp
@@ -600,6 +651,142 @@ impl LibraryState {
                 .find(|note| same_path(&note.path, &relative))
         {
             entry.online_only = true;
+        }
+    }
+
+    /// Whether the tree has a folder at `relative`, ignoring case.
+    pub fn is_folder(&self, relative: &Path) -> bool {
+        self.tree.contains_folder(relative)
+    }
+
+    /// Whether a folder or a listed note already has the path `relative`, ignoring case: what a
+    /// new or renamed folder may not take (notebook folders spec §4.1).
+    pub fn is_listed(&self, relative: &Path) -> bool {
+        self.is_folder(relative)
+            || self
+                .notes
+                .iter()
+                .any(|note| same_path(&note.path, relative))
+    }
+
+    /// How many listed notes are inside the folder `relative`, at any depth.
+    pub fn notes_under(&self, relative: &Path) -> usize {
+        self.notes
+            .iter()
+            .filter(|note| at_or_under(&note.path, relative))
+            .count()
+    }
+
+    /// Follows a folder FastPad just created: it is listed and has a row.
+    pub fn add_folder(&mut self, relative: &Path) {
+        let change = FolderChange::Added(relative.to_path_buf());
+        self.change_folders(&change);
+        self.folder_changes.push(change);
+    }
+
+    /// Follows a folder rename FastPad just made on disk: the records of the notes under it move
+    /// (`Relocate`, so their IDs and pins survive), and so do the notes, the folder list, the
+    /// expanded folders and the tree. Touches no disk.
+    pub fn rename_folder(&mut self, old: &Path, new: &Path) {
+        let relocations: Vec<PendingOp> = self
+            .library
+            .notes
+            .iter()
+            .filter(|record| !record.deleted && !record.path.is_absolute())
+            .filter_map(|record| {
+                let path = reroot(&record.path, old, new)?;
+                Some(PendingOp::Relocate {
+                    note: NoteRef {
+                        id: record.id,
+                        path: record.path.clone(),
+                    },
+                    path,
+                })
+            })
+            .collect();
+        for op in relocations {
+            let _ = self.apply(op);
+        }
+        for entry in self
+            .local
+            .expanded
+            .iter_mut()
+            .chain(self.touched.iter_mut())
+        {
+            if let Some(moved) = reroot(entry, old, new) {
+                *entry = moved;
+            }
+        }
+        let change = FolderChange::Renamed {
+            old: old.to_path_buf(),
+            new: new.to_path_buf(),
+        };
+        self.change_folders(&change);
+        self.folder_changes.push(change);
+    }
+
+    /// Follows a folder FastPad just sent to the Recycle Bin: its notes leave the list and the
+    /// tree, their records are flagged deleted and marked missing at `now`, as a deleted note's
+    /// are, and its expanded entries go. Touches no disk.
+    pub fn remove_folder(&mut self, relative: &Path, now: u64) {
+        let doomed: Vec<NoteRef> = self
+            .library
+            .notes
+            .iter()
+            .filter(|record| {
+                !record.deleted && !record.path.is_absolute() && at_or_under(&record.path, relative)
+            })
+            .map(|record| NoteRef {
+                id: record.id,
+                path: record.path.clone(),
+            })
+            .collect();
+        for note in doomed {
+            let id = note.id;
+            let _ = self.apply(PendingOp::SetDeleted { note, value: true });
+            self.local.set_missing(id, now);
+        }
+        self.local
+            .expanded
+            .retain(|folder| !at_or_under(folder, relative));
+        self.touched.retain(|path| !at_or_under(path, relative));
+        let change = FolderChange::Removed(relative.to_path_buf());
+        self.change_folders(&change);
+        self.folder_changes.push(change);
+    }
+
+    /// The in-memory part of a folder change: the folder list, the notes and the tree. A
+    /// rescan's result gets only this part replayed: its records come from the pending
+    /// operations, and its expanded folders from the live state.
+    fn change_folders(&mut self, change: &FolderChange) {
+        match change {
+            FolderChange::Added(path) => {
+                if !self.folders.iter().any(|folder| same_path(folder, path)) {
+                    self.folders.push(path.clone());
+                }
+                self.tree.insert_folder(path);
+            }
+            FolderChange::Removed(path) => {
+                self.folders.retain(|folder| !at_or_under(folder, path));
+                self.notes.retain(|note| !at_or_under(&note.path, path));
+                self.tree.remove_folder(path);
+            }
+            FolderChange::Renamed { old, new } => {
+                for folder in &mut self.folders {
+                    if let Some(moved) = reroot(folder, old, new) {
+                        *folder = moved;
+                    }
+                }
+                if !self.folders.iter().any(|folder| same_path(folder, new)) {
+                    self.folders.push(new.clone());
+                }
+                for note in &mut self.notes {
+                    if let Some(moved) = reroot(&note.path, old, new) {
+                        note.path = moved;
+                    }
+                }
+                self.tree.rename_folder(old, new);
+            }
         }
     }
 }
@@ -1089,6 +1276,7 @@ mod tests {
             tree: tree::NoteTree::build(&paths, &[], &[]),
             notes,
             folders: Vec::new(),
+            folder_changes: Vec::new(),
             truncated,
             pending: Vec::new(),
             relocated: Vec::new(),
@@ -1377,6 +1565,221 @@ mod tests {
         let fresh = load(&folder, &scratch.local(), 101).unwrap();
         let merged = merge_rescan(previous, fresh);
         assert_eq!(sorted(&merged), ["later", "sub"].map(PathBuf::from));
+    }
+
+    fn sorted_folders(state: &LibraryState) -> Vec<PathBuf> {
+        let mut folders = state.folders.clone();
+        folders.sort();
+        folders
+    }
+
+    fn sorted_notes(state: &LibraryState) -> Vec<PathBuf> {
+        let mut notes: Vec<PathBuf> = state.notes.iter().map(|note| note.path.clone()).collect();
+        notes.sort();
+        notes
+    }
+
+    #[test]
+    fn renaming_a_folder_rewrites_its_notes_records_expanded_entries_and_tree() {
+        // Break caught: a folder rename leaving notes, pins or expanded folders at the old path,
+        // so rows open files that are gone, pins vanish, or the renamed folder and its nested
+        // empty folders collapse.
+        let scratch = Scratch::new("folder-rename");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join(r"work\empty\deeper")).unwrap();
+        std::fs::write(folder.join(r"work\plan.md"), "p").unwrap();
+        std::fs::write(folder.join("top.md"), "t").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut state = load(&folder, &scratch.local(), 100).unwrap();
+        let target = state.note_ref(&mut ids, &folder.join(r"work\plan.md"));
+        state
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        state.local.set_expanded(Path::new("work"), true);
+        state.local.set_expanded(Path::new(r"work\empty"), true);
+        state.local.set_expanded(Path::new("other"), true);
+        std::fs::rename(folder.join("work"), folder.join("Archive")).unwrap();
+
+        state.rename_folder(Path::new("work"), Path::new("Archive"));
+
+        assert_eq!(
+            sorted_notes(&state),
+            [PathBuf::from(r"Archive\plan.md"), PathBuf::from("top.md")]
+        );
+        assert!(
+            state.is_pinned(Path::new(r"Archive\plan.md")),
+            "the record moved"
+        );
+        assert!(!state.is_pinned(Path::new(r"work\plan.md")));
+        assert_eq!(
+            state.local.expanded,
+            [
+                PathBuf::from("Archive"),
+                PathBuf::from(r"Archive\empty"),
+                PathBuf::from("other")
+            ]
+        );
+        assert_eq!(
+            sorted_folders(&state),
+            ["Archive", r"Archive\empty", r"Archive\empty\deeper"].map(PathBuf::from)
+        );
+        assert!(state.is_folder(Path::new(r"archive\EMPTY\deeper")));
+        assert!(!state.is_folder(Path::new("work")));
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+        assert!(state.pending.iter().any(|op| matches!(
+            op,
+            PendingOp::Relocate { path, .. } if path == Path::new(r"Archive\plan.md")
+        )));
+        assert_eq!(flush(&mut state).unwrap(), Flushed::Wrote);
+        let reloaded = load(&folder, &scratch.local(), 101).unwrap();
+        assert!(reloaded.is_pinned(Path::new(r"Archive\plan.md")));
+    }
+
+    #[test]
+    fn removing_a_folder_drops_its_notes_marks_their_records_deleted_and_forgets_its_expansion() {
+        // Break caught: a deleted folder's notes still listed (rows that open nothing), its
+        // pinned note's record looking alive, or its expanded entries left in the local file.
+        let scratch = Scratch::new("folder-remove");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join(r"old\inner")).unwrap();
+        std::fs::write(folder.join(r"old\a.md"), "a").unwrap();
+        std::fs::write(folder.join(r"old\inner\b.md"), "b").unwrap();
+        std::fs::write(folder.join("keep.md"), "k").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut state = load(&folder, &scratch.local(), 100).unwrap();
+        let target = state.note_ref(&mut ids, &folder.join(r"old\a.md"));
+        state
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        state.local.set_expanded(Path::new("old"), true);
+        state.local.set_expanded(Path::new(r"old\inner"), true);
+        assert_eq!(state.notes_under(Path::new("OLD")), 2);
+        assert!(state.is_listed(Path::new("keep.md")));
+        assert!(state.is_listed(Path::new(r"Old\Inner")));
+        assert!(!state.is_listed(Path::new("new")));
+
+        state.remove_folder(Path::new("old"), 500);
+
+        assert_eq!(sorted_notes(&state), [PathBuf::from("keep.md")]);
+        let record = state.library.note_by_path(Path::new(r"old\a.md")).unwrap();
+        assert!(record.deleted);
+        assert_eq!(state.local.missing_since(record.id), Some(500));
+        assert!(!state.is_pinned(Path::new(r"old\a.md")));
+        assert!(state.local.expanded.is_empty());
+        assert!(state.folders.is_empty());
+        assert!(!state.is_folder(Path::new(r"old\inner")));
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+        assert_eq!(tree_rows(&state.tree).len(), 1);
+    }
+
+    #[test]
+    fn a_folder_changed_while_a_rescan_ran_is_not_undone_by_its_result() {
+        // Break caught: a rescan that listed the folders before FastPad renamed or made one
+        // bringing the old row back (with its note at a path that is gone) and hiding the new
+        // one until the next rescan; or a replay that breaks a rescan that already saw it.
+        let scratch = Scratch::new("folder-merge");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join(r"work\empty")).unwrap();
+        std::fs::write(folder.join(r"work\plan.md"), "p").unwrap();
+        std::fs::write(folder.join("top.md"), "t").unwrap();
+        let mut previous = load(&folder, &scratch.local(), 100).unwrap();
+        let stale = load(&folder, &scratch.local(), 101).unwrap();
+        std::fs::rename(folder.join("work"), folder.join("Archive")).unwrap();
+        previous.rename_folder(Path::new("work"), Path::new("Archive"));
+        std::fs::create_dir(folder.join("Made")).unwrap();
+        previous.add_folder(Path::new("Made"));
+
+        let merged = merge_rescan(previous, stale);
+
+        assert_eq!(
+            sorted_folders(&merged),
+            ["Archive", r"Archive\empty", "Made"].map(PathBuf::from)
+        );
+        assert_eq!(
+            sorted_notes(&merged),
+            [PathBuf::from(r"Archive\plan.md"), PathBuf::from("top.md")]
+        );
+        assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
+
+        let mut previous = load(&folder, &scratch.local(), 102).unwrap();
+        std::fs::rename(folder.join("Archive"), folder.join("Final")).unwrap();
+        previous.rename_folder(Path::new("Archive"), Path::new("Final"));
+        let seen = load(&folder, &scratch.local(), 103).unwrap();
+
+        let merged = merge_rescan(previous, seen);
+
+        assert_eq!(
+            sorted_folders(&merged),
+            ["Final", r"Final\empty", "Made"].map(PathBuf::from)
+        );
+        assert_eq!(
+            sorted_notes(&merged),
+            [PathBuf::from(r"Final\plan.md"), PathBuf::from("top.md")]
+        );
+        assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
+    }
+
+    #[test]
+    fn a_note_saved_into_an_unlisted_folder_lists_its_folders_so_the_tree_matches_a_rebuild() {
+        // Break caught: a Save As into a folder the scan never listed (made in the save dialog)
+        // giving the tree folder rows that a rebuild from the state's folders would not have,
+        // so the rows drift once the note is removed and the emptied folders stay.
+        let scratch = Scratch::new("folder-unlisted");
+        let folder = scratch.folder();
+        let mut state = load(&folder, &scratch.local(), 100).unwrap();
+        std::fs::create_dir_all(folder.join(r"new\deeper")).unwrap();
+        let note = folder.join(r"new\deeper\n.md");
+        std::fs::write(&note, "n").unwrap();
+        assert!(state.add_note(&note));
+        assert!(!state.add_note(&folder.join(r"NEW\Deeper\n.md")));
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+
+        state.remove_note(&note);
+
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+        assert_eq!(
+            sorted_folders(&state),
+            ["new", r"new\deeper"].map(PathBuf::from)
+        );
+        let top = folder.join("top.md");
+        std::fs::write(&top, "t").unwrap();
+        assert!(state.add_note(&top));
+        std::fs::create_dir(folder.join(r"new\other")).unwrap();
+        let moved = folder.join(r"New\other\m.md");
+        std::fs::rename(&top, &moved).unwrap();
+        state.rename_note(&top, &moved);
+        assert_eq!(
+            sorted_folders(&state),
+            [r"New\other", "new", r"new\deeper"].map(PathBuf::from),
+            "a rename lists only the missing folder, once, spelled as in its path"
+        );
+        assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
+    }
+
+    #[test]
+    fn a_note_saved_into_a_new_folder_while_a_rescan_ran_lists_that_folder_after_the_merge() {
+        // Break caught: a rescan that listed the folders before the save dialog made a new one
+        // merging the saved note back in with folder rows its folder list lacks.
+        let scratch = Scratch::new("folder-unlisted-merge");
+        let folder = scratch.folder();
+        let mut previous = load(&folder, &scratch.local(), 100).unwrap();
+        let stale = load(&folder, &scratch.local(), 101).unwrap();
+        std::fs::create_dir(folder.join("made")).unwrap();
+        let note = folder.join(r"made\n.md");
+        std::fs::write(&note, "n").unwrap();
+        assert!(previous.add_note(&note));
+
+        let merged = merge_rescan(previous, stale);
+
+        assert_eq!(sorted_folders(&merged), [PathBuf::from("made")]);
+        assert_eq!(sorted_notes(&merged), [PathBuf::from(r"made\n.md")]);
+        assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
     }
 
     #[test]

@@ -284,6 +284,7 @@ fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
         // The merge re-checks only what FastPad changes in the index from here on.
         if let Some(state) = host.state.as_mut() {
             state.touched.clear();
+            state.folder_changes.clear();
         }
         Some((folder, host.generation))
     })
