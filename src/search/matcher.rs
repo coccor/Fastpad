@@ -167,6 +167,61 @@ impl Matcher {
         all
     }
 
+    /// Every match, in `find_iter`'s order (ascending byte ranges into `text`, never overlapping),
+    /// with the text that replaces it. No match gives an empty `Vec`.
+    ///
+    /// - In regex mode it is `template` expanded with that match's own captures by
+    ///   `regex::Captures::expand`: `$1` and `${1}` are group 1, `$name` and `${name}` a named
+    ///   group, and `$$` is a `$`. A group that took no part in the match, or doesn't exist, is
+    ///   empty, and `$1a` names a group "1a". The captures come from the compiled regex on the
+    ///   same line (or the whole text) that `find_iter` matches in, so `^`, `$` and `\b` judge
+    ///   the same way. Whole word wraps the pattern in a group that captures nothing, so the
+    ///   numbers are the pattern's own.
+    /// - In plain mode it is `template` itself, never expanded.
+    pub fn replacements(&self, text: &str, template: &str) -> Vec<(Range<usize>, String)> {
+        let Engine::Regex(regex) = &self.engine else {
+            return self
+                .find_iter(text)
+                .into_iter()
+                .map(|range| (range, template.to_owned()))
+                .collect();
+        };
+        let mut all = Vec::new();
+        self.each_segment(text, &mut |segment, base| {
+            for captures in regex.captures_iter(segment) {
+                let found = captures.get_match();
+                // As in `segment_matches`: an empty match at a position (`\b`) is never a match.
+                if found.is_empty() {
+                    continue;
+                }
+                let mut replacement = String::new();
+                captures.expand(template, &mut replacement);
+                all.push((found.start() + base..found.end() + base, replacement));
+            }
+            true
+        });
+        all
+    }
+
+    /// `text` with every match replaced by its `replacements` text, and how many there were. Each
+    /// match of the original text is replaced once: a replacement that contains the query, or
+    /// makes a new match with the text beside it, is never matched again.
+    pub fn replace_text(&self, text: &str, template: &str) -> (String, usize) {
+        let edits = self.replacements(text, template);
+        if edits.is_empty() {
+            return (text.to_owned(), 0);
+        }
+        let mut replaced = String::with_capacity(text.len());
+        let mut copied = 0;
+        for (range, replacement) in &edits {
+            replaced.push_str(&text[copied..range.start]);
+            replaced.push_str(replacement);
+            copied = range.end;
+        }
+        replaced.push_str(&text[copied..]);
+        (replaced, edits.len())
+    }
+
     /// The first match that starts at or after byte `from`, judged in the whole text: a word
     /// edge or an anchor at `from` sees the characters before it, as it would in `find_iter`.
     /// A `from` inside a character counts from that character's start.
@@ -259,14 +314,23 @@ impl Matcher {
 
     /// Calls `emit` with each match until it returns false.
     fn each_match(&self, text: &str, emit: &mut dyn FnMut(Range<usize>) -> bool) {
+        self.each_segment(text, &mut |segment, base| {
+            self.segment_matches(segment, base, emit)
+        });
+    }
+
+    /// Calls `visit` with each piece of `text` that is matched on its own, and the byte of the
+    /// text it starts at, until it returns false: each line without its `\n` or `\r\n`, or the
+    /// whole text when matching isn't per line.
+    fn each_segment(&self, text: &str, visit: &mut dyn FnMut(&str, usize) -> bool) {
         if !self.per_line {
-            self.segment_matches(text, 0, emit);
+            visit(text, 0);
             return;
         }
         let mut start = 0;
         for line in text.split('\n') {
             let body = line.strip_suffix('\r').unwrap_or(line);
-            if !self.segment_matches(body, start, emit) {
+            if !visit(body, start) {
                 return;
             }
             start += line.len() + 1;
@@ -850,6 +914,177 @@ mod tests {
         // finds "Îndemn" but the find bar doesn't.
         let found = matcher("îndemn|élan", options(false, false, true));
         assert_eq!(found.find_iter("Îndemn, Élan"), vec![0..7, 9..14]);
+    }
+
+    /// `text` with every match replaced by the `regex` crate itself: `Regex::replace_all` on each
+    /// line, or on the whole text when the pattern names a newline, as `Matcher` matches.
+    fn crate_replace_all(
+        pattern: &str,
+        options: MatchOptions,
+        text: &str,
+        template: &str,
+    ) -> String {
+        let per_line = !pattern.contains(r"\n");
+        let pattern = if options.whole_word {
+            format!(r"\b(?:{pattern})\b")
+        } else {
+            pattern.to_owned()
+        };
+        let regex = RegexBuilder::new(&pattern)
+            .case_insensitive(!options.case)
+            .multi_line(!per_line)
+            .build()
+            .unwrap();
+        if !per_line {
+            return regex.replace_all(text, template).into_owned();
+        }
+        text.split('\n')
+            .map(|line| regex.replace_all(line, template).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn expansion_follows_the_regex_crate_and_plain_mode_is_literal() {
+        // Break caught (review focus 3): a hand-rolled `$1` that differs from the crate (a group
+        // that took no part printed as "$2" or panicking, `$$` left doubled, `$1a` read as group
+        // 1), every match expanded with the first match's groups, group numbers shifted by the
+        // whole-word wrapper, or plain mode expanding `$1`.
+        let regex = options(false, false, true);
+        let text = "a1 b c3\nd4";
+        let found = matcher(r"(\w)(\d)?", regex);
+        assert_eq!(
+            found.replace_text(text, "[$1|$2]").0,
+            "[a|1] [b|] [c|3]\n[d|4]"
+        );
+        assert_eq!(found.replace_text(text, "$$1").0, "$1 $1 $1\n$1");
+        assert_eq!(found.replace_text(text, "$0$0").0, "a1a1 bb c3c3\nd4d4");
+        let named = matcher(r"(?<letter>\w)(?<digit>\d)?", regex);
+        assert_eq!(named.replace_text(text, "${digit}$letter").0, "1a b 3c\n4d");
+        let one = matcher(r"(\w)", regex);
+        assert_eq!(
+            one.replace_text("x", "$1a|${1}a|$9|${nope}|$|${1").0,
+            "|xa|||$|${1"
+        );
+
+        // Every template against the crate's own `replace_all`, in each mode `Matcher` has.
+        let templates = [
+            "$1-$2",
+            "${2}${1}",
+            "$$",
+            "$",
+            "$1a",
+            "${9}",
+            "<$0>",
+            "no groups",
+        ];
+        let patterns = [
+            (
+                r"(\w+)@(\w+)",
+                options(false, false, true),
+                "ann@site, BOB@HOST x@",
+            ),
+            (
+                r"(\w+)@(\w+)",
+                options(true, false, true),
+                "ann@site, BOB@HOST x@",
+            ),
+            (
+                r"(fo+)(x)?",
+                options(false, true, true),
+                "foo foobar fooo foox",
+            ),
+            (r"^(\w)(\w*)$", options(false, false, true), "ab\ncd\nef"),
+            (r"(\w)\n(\w)", options(false, false, true), "a\nb c\nd"),
+            (r"(?<left>\w)\r\n(?<right>\w)", regex, "a\r\nb"),
+        ];
+        for (pattern, options, text) in patterns {
+            let found = matcher(pattern, options);
+            for template in templates {
+                assert_eq!(
+                    found.replace_text(text, template).0,
+                    crate_replace_all(pattern, options, text, template),
+                    "{pattern:?} {options:?} {template:?}"
+                );
+            }
+            let ranges: Vec<Range<usize>> = found
+                .replacements(text, "$1")
+                .into_iter()
+                .map(|(range, _)| range)
+                .collect();
+            assert_eq!(
+                ranges,
+                found.find_iter(text),
+                "{pattern:?}: the same matches"
+            );
+            // `Editor::replace_ranges_with` and the Search replace rely on this order.
+            assert!(
+                ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
+                "{pattern:?}: ascending and never overlapping"
+            );
+        }
+        let word = matcher(r"(\w+)@(\w+)", options(false, true, true));
+        assert_eq!(
+            word.replace_text("ann@site x", "$2 at $1").0,
+            "site at ann x",
+            "whole word keeps the pattern's group numbers"
+        );
+
+        // Plain mode: the template is text, whatever it holds.
+        for case in [false, true] {
+            let plain = matcher("$1", options(case, false, false));
+            assert_eq!(
+                plain.replacements("a $1 b $1", "$2$$ ${x}"),
+                [
+                    (2..4, "$2$$ ${x}".to_owned()),
+                    (7..9, "$2$$ ${x}".to_owned())
+                ]
+            );
+        }
+        let folded = matcher("é", MatchOptions::default());
+        assert_eq!(folded.replace_text("é É", "$0").0, "$0 $0");
+    }
+
+    #[test]
+    fn a_replacement_containing_the_query_is_applied_once() {
+        // Break caught (review focus 4): replacing until nothing matches, so `a` → `aa` never
+        // ends, or matching again inside text already replaced.
+        let plain = MatchOptions::default();
+        assert_eq!(
+            matcher("a", plain).replace_text("banana", "aa"),
+            ("baanaanaa".to_owned(), 3)
+        );
+        assert_eq!(
+            matcher("(a)", options(false, false, true)).replace_text("banana", "$1$1"),
+            ("baanaanaa".to_owned(), 3)
+        );
+        assert_eq!(
+            matcher("foo", plain).replace_text("foo Foo", "FOO foo"),
+            ("FOO foo FOO foo".to_owned(), 2)
+        );
+        // A replacement that joins the text beside it into a new match is not matched either.
+        assert_eq!(
+            matcher("ab", plain).replace_text("aabb", "a"),
+            ("aab".to_owned(), 1)
+        );
+        assert_eq!(
+            matcher(r"a\nb", options(false, false, true)).replace_text("a\nb", "a\nb a\nb"),
+            ("a\nb a\nb".to_owned(), 1)
+        );
+        // Line endings, and the text around the matches, are kept as they are.
+        assert_eq!(
+            matcher("foo", plain).replace_text("foo\r\nx foo\nfoo", "bar"),
+            ("bar\r\nx bar\nbar".to_owned(), 3)
+        );
+        // An empty match at a position is never replaced; without a match the text is as it was.
+        assert_eq!(
+            matcher(r"x|\b", options(false, false, true)).replace_text("ab x", "_"),
+            ("ab _".to_owned(), 1)
+        );
+        assert_eq!(
+            matcher("zeta", plain).replace_text("alpha", "beta"),
+            ("alpha".to_owned(), 0)
+        );
     }
 
     #[test]
