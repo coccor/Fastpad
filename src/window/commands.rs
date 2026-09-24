@@ -86,6 +86,7 @@ pub enum CommandId {
     ReplaceInNotes = 190,
     QuickOpen = 191,
     NoteNewFolder = 192,
+    NoteNew = 193,
 }
 
 impl CommandId {
@@ -133,6 +134,7 @@ impl CommandId {
                 | Self::ReplaceInNotes
                 | Self::QuickOpen
                 | Self::NoteNewFolder
+                | Self::NoteNew
         )
     }
 
@@ -187,7 +189,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 84] = [
+        const COMMANDS: [CommandId; 85] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -272,6 +274,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::ReplaceInNotes,
             CommandId::QuickOpen,
             CommandId::NoteNewFolder,
+            CommandId::NoteNew,
         ];
         COMMANDS
             .into_iter()
@@ -470,7 +473,16 @@ mod tests {
         assert_eq!(CommandId::try_from(192), Ok(CommandId::NoteNewFolder));
         assert!(!CommandId::NoteNewFolder.needs_document());
         assert!(!CommandId::NoteNewFolder.is_sidebar());
-        assert_eq!(CommandId::try_from(193), Err(()));
+    }
+
+    #[test]
+    fn new_note_is_193_and_neither_needs_a_document_nor_the_sidebar() {
+        // Break caught: a renumbered command breaking the menus, or New note hidden while no
+        // tab is open, when it is most wanted (inline naming spec §8).
+        assert_eq!(CommandId::NoteNew as u16, 193);
+        assert_eq!(CommandId::try_from(193), Ok(CommandId::NoteNew));
+        assert!(!CommandId::NoteNew.needs_document());
+        assert!(!CommandId::NoteNew.is_sidebar());
     }
 
     #[test]

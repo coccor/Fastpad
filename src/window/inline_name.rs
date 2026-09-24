@@ -743,6 +743,13 @@ pub(crate) fn new_folder(hwnd: HWND, parent: Option<PathBuf>) {
     }
 }
 
+/// The header's "+", "New note here" (`parent`) and Notebook: New note… (spec §3.1).
+pub(crate) fn new_note(hwnd: HWND, parent: Option<PathBuf>) {
+    if let Some(parent) = target_folder(hwnd, parent) {
+        start(hwnd, Purpose::NewNote(parent));
+    }
+}
+
 /// `EN_CHANGE` from the field: the live check runs on what is typed now, against the rows in
 /// memory (spec §4.4). No disk access.
 pub(crate) fn changed(hwnd: HWND) {
@@ -921,10 +928,9 @@ pub(crate) fn commit(hwnd: HWND, how: How) {
     // Read with nothing of the App borrowed.
     let text = field_text(field);
     match purpose {
+        Purpose::NewNote(parent) => commit_new_note(hwnd, how, &parent, &text),
         Purpose::NewFolder(parent) => commit_new_folder(hwnd, how, &parent, &text),
-        Purpose::NewNote(_) | Purpose::RenameNote(_) | Purpose::RenameFolder(_) => {
-            cancelled(hwnd, how);
-        }
+        Purpose::RenameNote(_) | Purpose::RenameFolder(_) => cancelled(hwnd, how),
     }
 }
 
@@ -966,6 +972,49 @@ fn commit_new_folder(hwnd: HWND, how: How, parent: &Path, text: &str) {
     });
     if how == How::Enter {
         notebook_view::focus_tree(hwnd);
+    }
+}
+
+/// New note (spec §4.1, §5.2): the empty file is made with the one disk call, never over an
+/// existing file, listed, and opened as a normal tab. After Enter the focus goes to the editor.
+fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str) {
+    let Some(root) = library_host::folder(hwnd) else {
+        cancel(hwnd);
+        return;
+    };
+    let Some(name) = title::new_note_name(text) else {
+        cancelled(hwnd, how);
+        return;
+    };
+    // Defence in depth: the note made must be inside the notebook.
+    if !parent.as_os_str().is_empty() && !tree::is_plain_relative_folder(parent) {
+        cancel(hwnd);
+        return;
+    }
+    let folder = root.join(parent);
+    let path = folder.join(&name);
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map(drop);
+    if let Err(error) = created {
+        // A file the tree doesn't list may already have the name.
+        let error = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            let (stem, extension) = title::split_typed_name(text, "md");
+            library_host::name_taken_error(&folder, &stem, &extension)
+        } else {
+            format!("FastPad could not create {name}: {error}")
+        };
+        fail(hwnd, how, error);
+        return;
+    }
+    with_state(hwnd, |state| state.add_note(&path));
+    end(hwnd);
+    side_panel::refresh(hwnd);
+    let mode = super::main_window::OpenMode::Permanent;
+    if let Err(error) = super::main_window::open_note(hwnd, &path, mode, how == How::Enter) {
+        super::main_window::report_open_failure(hwnd, &path, &error);
     }
 }
 

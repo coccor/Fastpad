@@ -1637,7 +1637,7 @@ impl NotebookView {
 
 /// Row `index`'s context menu (spec §6.6), at `at` (main-window client coordinates) or under
 /// the row when opened from the keyboard. The chosen entry acts on that row, not the active
-/// tab. "Open in new tab" is `CommandId::Open` and "New note here" is `CommandId::New` here.
+/// tab. "Open in new tab" is `CommandId::Open` and "New note here" is `CommandId::NoteNew` here.
 pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
     let Some((target, point)) = with_view(hwnd, |view| {
         if view.mode != Mode::Tree {
@@ -1704,7 +1704,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
         RowKind::Folder(relative) => {
             let path = root.join(relative);
             let entries = [
-                MenuEntry::command("New note here", CommandId::New),
+                MenuEntry::command("New note here", CommandId::NoteNew),
                 MenuEntry::command("New folder here", CommandId::NoteNewFolder),
                 MenuEntry::Separator,
                 MenuEntry::command("Rename...\tF2", CommandId::NoteRename),
@@ -1713,7 +1713,9 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 MenuEntry::command("Delete...\tDel", CommandId::NoteDelete),
             ];
             match super::menus::track_popup(hwnd, &entries, point) {
-                Some(CommandId::New) => super::library_host::new_note_in(hwnd, Some(path)),
+                Some(CommandId::NoteNew) => {
+                    super::inline_name::new_note(hwnd, Some(relative.clone()));
+                }
                 Some(CommandId::NoteNewFolder) => {
                     super::inline_name::new_folder(hwnd, Some(relative.clone()));
                 }
@@ -2052,7 +2054,7 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
 pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
     match button {
         HeaderButton::Favorite => super::library_host::toggle_notebook_favorite(hwnd),
-        HeaderButton::NewNote => run(hwnd, CommandId::New),
+        HeaderButton::NewNote => run(hwnd, CommandId::NoteNew),
         HeaderButton::NewFolder => run(hwnd, CommandId::NoteNewFolder),
         HeaderButton::More => more_menu(hwnd),
     }
@@ -2084,10 +2086,13 @@ fn more_menu(hwnd: HWND) {
     }
 }
 
-fn state_button(hwnd: HWND) {
+/// `pub(crate)` for the tests that click the state button directly.
+pub(crate) fn state_button(hwnd: HWND) {
     match with_view(hwnd, |view| view.mode) {
         Some(Mode::NoNotebook) => super::library_host::choose_and_open_folder(hwnd),
-        Some(Mode::Empty) => run(hwnd, CommandId::New),
+        // The empty notebook's own "New note" puts a draft row in the tree, not an untitled tab
+        // (inline naming spec §3.1): there is no tree yet, but `apply` makes one for a draft.
+        Some(Mode::Empty) => run(hwnd, CommandId::NoteNew),
         Some(Mode::Failed) => super::library_host::retry_load(hwnd),
         _ => {}
     }

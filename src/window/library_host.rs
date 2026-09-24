@@ -1264,9 +1264,9 @@ pub(crate) fn suggested_file_name(hwnd: HWND) -> String {
         .unwrap_or_else(|| "Untitled.md".to_owned())
 }
 
-/// Ctrl+N, the Notebook view's New note, and "New note here" (`folder`). The new untitled tab
-/// remembers where its first save goes: `folder`, else the folder of the sidebar's selected row,
-/// else the notebook root. With no notebook open it is a plain new tab.
+/// Ctrl+N and File → New tab. The new untitled tab remembers where its first save goes:
+/// `folder`, else the folder of the sidebar's selected row, else the notebook root. With no
+/// notebook open it is a plain new tab.
 pub(crate) fn new_note_in(hwnd: HWND, folder: Option<PathBuf>) {
     let destination = self::folder(hwnd).filter(|_| notes_mode(hwnd)).map(|root| {
         folder
@@ -1822,7 +1822,7 @@ fn name_box_error(hwnd: HWND, error: String) {
 }
 
 /// "<name> already exists. Try <first free name>."
-fn name_taken_error(folder: &Path, stem: &str, extension: &str) -> String {
+pub(crate) fn name_taken_error(folder: &Path, stem: &str, extension: &str) -> String {
     let free = title::free_name(stem, extension, |candidate| folder.join(candidate).exists());
     format!(
         "{} already exists. Try {free}.",

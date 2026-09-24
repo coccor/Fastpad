@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 71] = [
+pub(crate) const ENTRIES: [PaletteEntry; 72] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -75,6 +75,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 71] = [
         "Notebook: Toggle favorite",
         CommandId::ToggleNotebookFavorite,
     ),
+    entry("Notebook: New note\u{2026}", CommandId::NoteNew),
     entry("Notebook: New folder\u{2026}", CommandId::NoteNewFolder),
     entry("Note: Reload from disk", CommandId::NoteReloadFromDisk),
     entry("Note: Keep my version", CommandId::NoteKeepMine),
@@ -1432,7 +1433,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 71);
+        assert_eq!(ENTRIES.len(), 72);
     }
 
     #[test]
@@ -1441,6 +1442,22 @@ mod tests {
         // have (spec §6).
         assert_eq!(labels("new folder")[0], "Notebook: New folder\u{2026}");
         assert_eq!(shortcut_text(CommandId::NoteNewFolder), None);
+    }
+
+    #[test]
+    fn new_note_is_listed_right_before_new_folder_without_a_shortcut() {
+        // Break caught: the palette never offering New note, listing it away from New folder,
+        // or showing Ctrl+N (which opens an untitled tab) beside it (inline naming spec §8).
+        assert_eq!(
+            labels("notebook: new note")[0],
+            "Notebook: New note\u{2026}"
+        );
+        assert_eq!(shortcut_text(CommandId::NoteNew), None);
+        let position = |command| ENTRIES.iter().position(|entry| entry.command == command);
+        assert_eq!(
+            position(CommandId::NoteNew).map(|index| index + 1),
+            position(CommandId::NoteNewFolder)
+        );
     }
 
     #[test]

@@ -1813,7 +1813,8 @@ fn refilter_command_palette(hwnd: HWND) {
         let has_tabs = tab_count(hwnd) > 0;
         let markdown = crate::window::preview_host::buttons_visible(hwnd);
         let sidebar = notes_mode_enabled(hwnd);
-        // New folder needs a notebook, open or loading, to put the folder in (spec §4.1).
+        // New note and New folder need a notebook, open or loading, to put the item in (inline
+        // naming spec §3.1).
         let notebook = crate::window::library_host::folder(hwnd).is_some();
         let subset = with_command_palette(hwnd, CommandPalette::subset).flatten();
         let entries = command_palette::filter_entries(&query, |command| {
@@ -1821,7 +1822,7 @@ fn refilter_command_palette(hwnd: HWND) {
                 && (has_tabs || !command.needs_document())
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
-                && (notebook || command != CommandId::NoteNewFolder)
+                && (notebook || !matches!(command, CommandId::NoteNew | CommandId::NoteNewFolder))
         });
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
@@ -2498,6 +2499,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::CommandPalette => open_command_palette(hwnd),
         CommandId::QuickOpen => open_quick_open(hwnd),
         CommandId::NoteNewFolder => crate::window::inline_name::new_folder(hwnd, None),
+        CommandId::NoteNew => crate::window::inline_name::new_note(hwnd, None),
         CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
         CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
@@ -6322,14 +6324,17 @@ mod tests {
         execute_command(window.hwnd, CommandId::CommandPalette);
         assert!(palette(window.hwnd).is_visible());
         assert!(panel_visible(window.hwnd));
-        // Markdown preview commands are listed only while the active tab is Markdown, and
-        // New folder only while a notebook is open (this window has none).
+        // Markdown preview commands are listed only while the active tab is Markdown, and New
+        // note and New folder only while a notebook is open (this window has none).
         assert_eq!(
             palette(window.hwnd).shown().len(),
             crate::window::command_palette::ENTRIES
                 .iter()
                 .filter(|entry| !entry.command.is_markdown_preview())
-                .filter(|entry| entry.command != CommandId::NoteNewFolder)
+                .filter(|entry| !matches!(
+                    entry.command,
+                    CommandId::NoteNew | CommandId::NoteNewFolder
+                ))
                 .count()
         );
         let query = palette(window.hwnd).query_hwnd();
@@ -12427,10 +12432,14 @@ mod tests {
             assert!(!state.is_pinned(&a));
         });
 
-        menu(&RowKind::Folder("sub".into()), CommandId::New);
-        let untitled = app_mut(window.hwnd).tabs.active().unwrap();
-        assert_eq!(untitled.save_folder, Some(scratch.folder().join("sub")));
-        let untitled = untitled.id;
+        menu(&RowKind::Folder("sub".into()), CommandId::NoteNew);
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::NewNote("sub".into()))
+        );
+        crate::window::inline_name::cancel(window.hwnd);
+        execute_command(window.hwnd, CommandId::New);
+        let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
 
         let before = super::tab_count(window.hwnd);
         menu(&RowKind::Unsaved(untitled.0), CommandId::CloseTab);
@@ -17223,14 +17232,14 @@ mod tests {
     }
 
     #[test]
-    fn the_palette_offers_new_folder_only_while_a_notebook_is_open() {
-        // Break caught: "Notebook: New folder…" listed with no notebook, where it can only say
-        // "Open a notebook first.", or missing once one is open (spec §4.1).
+    fn the_palette_offers_new_note_and_new_folder_only_while_a_notebook_is_open() {
+        // Break caught: "Notebook: New note…" or "Notebook: New folder…" listed with no
+        // notebook, where they can only say "Open a notebook first." (inline naming spec §3.1).
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("palette-new-folder");
+        let scratch = LibraryScratch::new("palette-new-note");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
-        let listed = || {
+        let listed = |command: CommandId| {
             execute_command(window.hwnd, CommandId::CommandPalette);
             let listed = app_mut(window.hwnd)
                 .command_palette
@@ -17238,14 +17247,260 @@ mod tests {
                 .unwrap()
                 .shown()
                 .iter()
-                .any(|entry| entry.command == CommandId::NoteNewFolder);
+                .any(|entry| entry.command == command);
             super::close_command_palette(window.hwnd, false);
             listed
         };
         assert!(crate::window::library_host::folder(window.hwnd).is_none());
-        assert!(!listed());
+        assert!(!listed(CommandId::NoteNew));
+        assert!(!listed(CommandId::NoteNewFolder));
         scratch.install(window.hwnd);
-        assert!(listed());
+        assert!(listed(CommandId::NoteNew));
+        assert!(listed(CommandId::NoteNewFolder));
+    }
+
+    #[test]
+    fn plus_new_note_here_and_the_palette_each_draft_a_note_in_the_right_folder() {
+        // Break caught: "+" or "New note here" opening an untitled tab instead, a draft in the
+        // wrong folder or at the wrong depth, a field not focused, or the palette ignoring the
+        // selected row's folder (inline naming spec §3.1).
+        use crate::window::inline_name::Purpose;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-new-note-starts");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\b.md", "b");
+        scratch.note("top.md", "t");
+        let (window, _editor) = notebook_window(&scratch);
+        let tabs = super::tab_count(window.hwnd);
+        select_row(window.hwnd, &RowKind::Note("top.md".into()));
+
+        crate::window::notebook_view::header_clicked(
+            window.hwnd,
+            crate::window::notebook_view::HeaderButton::NewNote,
+        );
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(Purpose::NewNote(std::path::PathBuf::new()))
+        );
+        // The test editor's own untitled tab is an unsaved row at index 0; the root draft goes
+        // below it (spec §3.1).
+        assert_eq!(draft_row(window.hwnd), Some((1, 0)));
+        assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+        assert_eq!(super::tab_count(window.hwnd), tabs, "no untitled tab");
+        field_key(window.hwnd, VK_ESCAPE);
+        assert_eq!(draft_row(window.hwnd), None);
+
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), false);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let sub = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+        crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteNew));
+        crate::window::notebook_view::open_context_menu(window.hwnd, sub, None);
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(Purpose::NewNote("sub".into()))
+        );
+        assert_eq!(draft_row(window.hwnd), Some((sub + 1, 1)), "sub expanded");
+        field_key(window.hwnd, VK_ESCAPE);
+
+        select_row(window.hwnd, &RowKind::Note(r"sub\b.md".into()));
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let query = app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .query_hwnd();
+        let typed = crate::platform::wide_null("Notebook: New note");
+        unsafe { SetWindowTextW(query, typed.as_ptr()) };
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(Purpose::NewNote("sub".into())),
+            "the selected note's folder"
+        );
+        assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+        assert_eq!(super::tab_count(window.hwnd), tabs);
+    }
+
+    #[test]
+    fn enter_on_a_new_note_creates_the_file_and_opens_it_with_focus_in_the_editor() {
+        // Break caught: the note left unsaved in an untitled tab, created with text or over a
+        // file, opened as the preview, not listed in the tree, or the focus left in the tree
+        // (spec §4.1, §5.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_RETURN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-new-note-enter");
+        scratch.note("top.md", "t");
+        let (window, editor) = notebook_window(&scratch);
+
+        crate::window::inline_name::new_note(window.hwnd, None);
+        type_into_field(window.hwnd, "todo");
+        field_key(window.hwnd, VK_RETURN);
+
+        let todo = scratch.folder().join("todo.md");
+        assert_eq!(std::fs::read(&todo).unwrap(), b"", "an empty file");
+        assert!(!inline_open(window.hwnd));
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(todo.as_path()));
+        assert!(!active.preview);
+        assert_eq!(unsafe { GetFocus() }, editor.hwnd());
+        row_of(window.hwnd, &RowKind::Note("todo.md".into()));
+
+        crate::window::inline_name::new_note(window.hwnd, Some(std::path::PathBuf::new()));
+        type_into_field(window.hwnd, "data.json");
+        field_key(window.hwnd, VK_RETURN);
+        assert!(
+            scratch.folder().join("data.json").exists(),
+            "a typed note extension is kept"
+        );
+        assert!(!scratch.folder().join("data.json.md").exists());
+    }
+
+    #[test]
+    fn a_new_note_with_a_listed_name_shows_the_message_and_enter_keeps_the_field() {
+        // Break caught: a clash with a listed note missed until Enter, the message shown in
+        // another case than typed, or Enter going ahead (spec §4.4).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-new-note-taken");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::inline_name::new_note(window.hwnd, None);
+
+        type_into_field(window.hwnd, "A");
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
+            Some("A.md already exists here.")
+        );
+        field_key(window.hwnd, VK_RETURN);
+        assert!(inline_open(window.hwnd));
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("a.md")).unwrap(),
+            "a"
+        );
+        type_into_field(window.hwnd, "b");
+        assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+    }
+
+    #[test]
+    fn a_new_note_clashing_with_an_unlisted_file_or_a_vanished_folder_says_so_after_enter() {
+        // Break caught: a file written after the scan overwritten, a note created somewhere
+        // else when its folder was deleted in Explorer, or the field closing on the failure
+        // (spec §4.4, §5.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-new-note-disk");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note("top.md", "t");
+        let (window, _editor) = notebook_window(&scratch);
+        std::fs::write(scratch.folder().join("fresh.md"), "theirs").unwrap();
+
+        crate::window::inline_name::new_note(window.hwnd, None);
+        type_into_field(window.hwnd, "fresh");
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd),
+            None,
+            "not listed"
+        );
+        field_key(window.hwnd, VK_RETURN);
+        assert!(inline_open(window.hwnd));
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
+            Some("fresh.md already exists. Try fresh 2.md.")
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("fresh.md")).unwrap(),
+            "theirs"
+        );
+        crate::window::inline_name::cancel(window.hwnd);
+
+        crate::window::inline_name::new_note(window.hwnd, Some("sub".into()));
+        std::fs::remove_dir(scratch.folder().join("sub")).unwrap();
+        type_into_field(window.hwnd, "x");
+        field_key(window.hwnd, VK_RETURN);
+        assert!(inline_open(window.hwnd));
+        let problem = crate::window::inline_name::problem(window.hwnd).unwrap();
+        assert!(
+            problem.starts_with("FastPad could not create x.md: "),
+            "{problem}"
+        );
+        assert!(!scratch.folder().join("x.md").exists());
+    }
+
+    #[test]
+    fn a_rescan_that_lists_the_typed_name_shows_the_problem_without_a_keystroke() {
+        // Break caught: the live check run only on keystrokes, so a note that appeared on disk
+        // while the user typed its name is only caught by the disk call (spec §4.4, §5.4).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-new-note-rescan");
+        scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        scratch.install(window.hwnd);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        crate::window::inline_name::new_note(window.hwnd, None);
+        type_into_field(window.hwnd, "idea");
+        assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+
+        scratch.note("idea.md", "made elsewhere");
+        rescan_and_wait(window.hwnd);
+
+        assert!(inline_open(window.hwnd));
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
+            Some("idea.md already exists here.")
+        );
+    }
+
+    #[test]
+    fn the_first_note_of_an_empty_notebook_gets_a_draft_row() {
+        // Break caught: "+" in a notebook with no notes doing nothing, because the empty state
+        // has no tree to put the draft row in (spec §3.1).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-new-note-empty");
+        let (window, _editor) = notebook_window(&scratch);
+        // The test editor's own untitled tab would otherwise show as an unsaved row.
+        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
+        super::close_document_without_prompt(window.hwnd, start);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+
+        crate::window::notebook_view::header_clicked(
+            window.hwnd,
+            crate::window::notebook_view::HeaderButton::NewNote,
+        );
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+        field_key(window.hwnd, VK_ESCAPE);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    }
+
+    #[test]
+    fn the_empty_notebooks_new_note_button_drafts_a_note_instead_of_opening_a_tab() {
+        // Break caught: the empty state's own "New note" button opening an untitled tab
+        // (`CommandId::New`) instead of drafting a note in the tree, which is the only way an
+        // empty notebook can name its own first note (inline naming spec §3.1).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-empty-state-button");
+        let (window, _editor) = notebook_window(&scratch);
+        // The test editor's own untitled tab would otherwise show as an unsaved row.
+        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
+        super::close_document_without_prompt(window.hwnd, start);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+        let tabs = super::tab_count(window.hwnd);
+
+        crate::window::notebook_view::state_button(window.hwnd);
+
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+        assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+        assert_eq!(super::tab_count(window.hwnd), tabs, "no untitled tab");
     }
 
     #[test]
