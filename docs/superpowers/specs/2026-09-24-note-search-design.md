@@ -446,15 +446,23 @@ For each note, in the library's note-list order:
   `InvalidateRect` after it only queues a paint.
 - **Format JSON has no menu-bar entry with a shortcut.** The palette row shows Shift+Alt+F from
   the accelerator table; the overflow menu shows no shortcuts for any entry.
-- **Measured** on the reference machine itself (Intel Core i5-4590 at 3.3 GHz, 8 GB, Windows 10
-  22H2), warm cache, notebook under `target\bench-notes`, the second of two runs:
-  `text_search_first_batch_ms` 5.57, `text_search_full_ms` 1133.18,
-  `text_search_batch_ui_ms` 0.119. The first batch and the UI-thread batch meet their targets
-  (50 and 2 ms). **The full search misses its 400 ms target by almost three times.** The first
-  batch reads 50 notes in about the same time per note (0.11 ms) as the full search's 10,000, so
-  the cost looks like opening and reading each file (the file system and the antivirus filter on
-  every open), not matching. §14 names this as the point where an index would be justified; none
-  was added in 3a. Release exe with `release-package`: 1,565,696 bytes on `feat/note-sidebar`
+- **The worker reads notes on up to four threads** (`std::thread::scope`, as many as
+  `available_parallelism` allows, at most 4). Each reader takes the next note in the list's
+  order from an `AtomicUsize`, checks the cancel flag before each note, and sends the note's
+  outcome over a channel to the worker's one batching loop, which keeps the batching, the cap,
+  the progress counts and the skipped paths as §7 describes. Notes are therefore counted in
+  about the list's order but not exactly, and **which 500 notes a capped search finds is not
+  fixed**; results are sorted by `hit_cmp` on the UI side, so the order shown doesn't change.
+  During a search up to four files' text is in memory at once, not one (§14).
+- **Measured** on the reference machine itself (Intel Core i5-4590 at 3.3 GHz, 4 cores, 8 GB,
+  Windows 10 22H2), warm cache, notebook under `target\bench-notes`, the second of two runs with
+  four readers: `text_search_first_batch_ms` 3.06, `text_search_full_ms` 386.42,
+  `text_search_batch_ui_ms` 0.115 (a third run: 3.00, 390.27, 0.118). All three meet their
+  targets (50, 400 and 2 ms), the full search only just. Read serially (caa493b) it measured 1133.18:
+  the cost is opening and reading each file (the file system and the antivirus filter on every
+  open), not matching, and parallel reads hide most of it. No index was added in 3a. Release
+  exe with `release-package`, and the idle working set below, were measured at caa493b, before
+  the final fixes: 1,565,696 bytes on `feat/note-sidebar`
   (4c9ba2e), 2,833,408 bytes here (+1,267,712 bytes, budget 1,572,864). Idle private working
   set with the Search view open on a 10,000-note notebook: +86,016 bytes over
   `feat/note-sidebar` in each of two back-to-back pairs of 30 runs (p50 4,390,912 there,

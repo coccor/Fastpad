@@ -1,6 +1,7 @@
 //! Text search over a notebook, run on a worker thread: each note's text (from disk, or from a
 //! dirty tab's overlay) is matched, and each note's first match goes to a sink in batches with
-//! the progress so far. No Win32 and no window.
+//! the progress so far. A few reader threads open and match the notes in parallel; the worker
+//! thread itself batches what they find. No Win32 and no window.
 
 use super::name_search::folder_of;
 use super::path_key;
@@ -12,7 +13,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// A search stops after this many matching notes.
@@ -23,6 +25,17 @@ pub const MAX_NOTE_BYTES: u64 = 4 * 1024 * 1024;
 pub const BATCH_HITS: usize = 50;
 /// ...or when this long has passed since the last one.
 pub const BATCH_INTERVAL: Duration = Duration::from_millis(50);
+/// At most this many threads read notes at once. Opening and reading each file dominates a
+/// search, and on the reference four-core machine four readers keep the disk cache and the
+/// antivirus filter busy without starving the UI thread.
+const MAX_READERS: usize = 4;
+
+/// How many reader threads a search uses: `MAX_READERS`, fewer on a machine with fewer cores.
+fn reader_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, MAX_READERS)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchNote {
@@ -117,8 +130,11 @@ pub fn hit_cmp(a: &TextHit, b: &TextHit) -> Ordering {
         .then_with(|| a.path.cmp(&b.path))
 }
 
-/// Searches `notes` in order and streams each note's first match to `sink`.
+/// Searches `notes` and streams each note's first match to `sink`.
 ///
+/// - Notes are read by up to `MAX_READERS` threads at once, each taking the next note in the
+///   list's order, so they finish (and are counted and batched) in about that order but not
+///   exactly; which notes a capped search found is not fixed. The UI sorts the hits anyway.
 /// - `overlays` holds dirty tabs' text by relative path (compared ignoring case). An overlay is
 ///   searched instead of the disk, even for a note that is online only or over the size limit.
 /// - A batch goes to `sink` at `BATCH_HITS` hits, or when `BATCH_INTERVAL` has passed since the
@@ -126,8 +142,8 @@ pub fn hit_cmp(a: &TextHit, b: &TextHit) -> Ordering {
 ///   once more at the end even if empty.
 /// - At `RESULT_CAP` hits the batch holding the last one is sent and the search ends `Capped`,
 ///   unless that note was the last, which ends `Completed`.
-/// - `cancel` is read before each note and before the final batch. Once it is set, nothing more
-///   is sent.
+/// - `cancel` is read by each reader before each note, and by the batching loop before it counts
+///   each note and before the final batch. Once it is set, nothing more is sent.
 pub fn run(
     notebook: &Path,
     notes: &[SearchNote],
@@ -144,6 +160,7 @@ pub fn run(
         cancel,
         sink,
         &mut Instant::now,
+        reader_count(),
     )
 }
 
@@ -167,11 +184,17 @@ pub fn run_noting_skipped(
         sink,
         &mut Instant::now,
         skipped,
+        reader_count(),
     )
 }
 
-/// `run` with the clock passed in, so tests can step time. The clock is read once at the start
-/// and once after each note.
+/// `run` with the clock and the reader count passed in, so tests can step time and, with one
+/// reader, fix the order notes are counted in. The clock is read once at the start and once
+/// after each note.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`run`'s arguments plus the test clock and reader count"
+)]
 fn run_with_clock(
     notebook: &Path,
     notes: &[SearchNote],
@@ -180,6 +203,7 @@ fn run_with_clock(
     cancel: &AtomicBool,
     sink: &mut dyn FnMut(Vec<TextHit>, Progress),
     clock: &mut dyn FnMut() -> Instant,
+    readers: usize,
 ) -> RunEnd {
     search_all(
         notebook,
@@ -190,12 +214,13 @@ fn run_with_clock(
         sink,
         clock,
         &mut Vec::new(),
+        readers,
     )
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "`run_noting_skipped`'s arguments plus the test clock"
+    reason = "`run_noting_skipped`'s arguments plus the test clock and reader count"
 )]
 fn search_all(
     notebook: &Path,
@@ -206,26 +231,68 @@ fn search_all(
     sink: &mut dyn FnMut(Vec<TextHit>, Progress),
     clock: &mut dyn FnMut() -> Instant,
     skipped: &mut Vec<PathBuf>,
+    readers: usize,
 ) -> RunEnd {
-    let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let cancelled = || cancel.load(Relaxed);
     let overlays: Vec<(String, &str)> = overlays
         .iter()
         .map(|(path, text)| (path_key(path), text.as_str()))
         .collect();
+    let overlays = overlays.as_slice();
+    // The next note a reader takes, and whether the batching loop has stopped (capped or
+    // cancelled), so readers don't start another note.
+    let next = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (sender, outcomes) = mpsc::channel::<(usize, Searched)>();
+        for _ in 0..readers.clamp(1, notes.len().max(1)) {
+            let sender = sender.clone();
+            let (next, stopped) = (&next, &stopped);
+            scope.spawn(move || {
+                // One buffer per reader for every file it reads; freed when the search ends.
+                let mut bytes = Vec::new();
+                while !stopped.load(Relaxed) && !cancelled() {
+                    let index = next.fetch_add(1, Relaxed);
+                    let Some(note) = notes.get(index) else {
+                        break;
+                    };
+                    let outcome = search_note(notebook, note, overlays, matcher, &mut bytes);
+                    if sender.send((index, outcome)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // The loop below ends when every reader has finished and dropped its sender.
+        drop(sender);
+        let end = batch_outcomes(notes, outcomes, &cancelled, sink, clock, skipped);
+        stopped.store(true, Relaxed);
+        end
+    })
+}
+
+/// The batching loop: counts each note's outcome as the readers send it, and sends batches,
+/// honoring the cap and `cancelled`.
+fn batch_outcomes(
+    notes: &[SearchNote],
+    outcomes: mpsc::Receiver<(usize, Searched)>,
+    cancelled: &dyn Fn() -> bool,
+    sink: &mut dyn FnMut(Vec<TextHit>, Progress),
+    clock: &mut dyn FnMut() -> Instant,
+    skipped: &mut Vec<PathBuf>,
+) -> RunEnd {
     let mut progress = Progress {
         total: notes.len(),
         ..Progress::default()
     };
     let mut batch = Vec::new();
     let mut hits = 0;
-    // One buffer for every file read; it is freed when the search ends.
-    let mut bytes = Vec::new();
     let mut last_sent = clock();
-    for note in notes {
+    for (index, outcome) in outcomes {
         if cancelled() {
             return RunEnd::Cancelled;
         }
-        match search_note(notebook, note, &overlays, matcher, &mut bytes) {
+        match outcome {
             Searched::Hit(hit) => {
                 batch.push(hit);
                 hits += 1;
@@ -233,7 +300,7 @@ fn search_all(
             Searched::NoMatch => {}
             Searched::Skipped(reason) => {
                 progress.skipped[reason.index()] += 1;
-                skipped.push(note.path.clone());
+                skipped.push(notes[index].path.clone());
             }
         }
         progress.visited += 1;
@@ -340,7 +407,6 @@ fn read_note(
 mod tests {
     use super::*;
     use crate::search::MatchOptions;
-    use std::sync::atomic::Ordering::Relaxed;
 
     struct Scratch(PathBuf);
 
@@ -384,12 +450,15 @@ mod tests {
 
     type Batches = Vec<(Vec<TextHit>, Progress)>;
 
-    fn collect(
+    /// Runs with `MAX_READERS` readers, or with one for a test that needs the notes counted in
+    /// the list's order.
+    fn collect_with(
         notebook: &Path,
         notes: &[SearchNote],
         overlays: &HashMap<PathBuf, String>,
         matcher: &Matcher,
         clock: &mut dyn FnMut() -> Instant,
+        readers: usize,
     ) -> (RunEnd, Batches) {
         let mut batches = Vec::new();
         let cancel = AtomicBool::new(false);
@@ -401,8 +470,19 @@ mod tests {
             &cancel,
             &mut |hits, progress| batches.push((hits, progress)),
             clock,
+            readers,
         );
         (end, batches)
+    }
+
+    fn collect(
+        notebook: &Path,
+        notes: &[SearchNote],
+        overlays: &HashMap<PathBuf, String>,
+        matcher: &Matcher,
+        clock: &mut dyn FnMut() -> Instant,
+    ) -> (RunEnd, Batches) {
+        collect_with(notebook, notes, overlays, matcher, clock, MAX_READERS)
     }
 
     fn search(
@@ -413,7 +493,9 @@ mod tests {
     ) -> (RunEnd, Vec<TextHit>, Progress) {
         let (end, batches) = collect(notebook, notes, overlays, &find(query), &mut frozen_clock());
         let progress = batches.last().map(|(_, progress)| *progress).unwrap();
-        let hits = batches.into_iter().flat_map(|(hits, _)| hits).collect();
+        let mut hits: Vec<TextHit> = batches.into_iter().flat_map(|(hits, _)| hits).collect();
+        // Readers finish in no fixed order; the UI sorts by `hit_cmp` too.
+        hits.sort_by(hit_cmp);
         (end, hits, progress)
     }
 
@@ -521,7 +603,7 @@ mod tests {
             (PathBuf::from("Large.md"), "typed needle".to_owned()),
         ]);
         let (_, hits, progress) = search(&scratch.0, &[online, large], &overlays, "needle");
-        assert_eq!(names(&hits), ["Online", "Large"]);
+        assert_eq!(names(&hits), ["Large", "Online"]);
         assert_eq!(progress.skipped_total(), 0);
     }
 
@@ -579,9 +661,9 @@ mod tests {
         let wide = scratch.file("wide.txt", &utf16);
         let bom = scratch.file("bom.md", b"\xEF\xBB\xBFneedle first");
         let (_, hits, _) = search(&scratch.0, &[wide, bom], &HashMap::new(), "needle");
-        assert_eq!(names(&hits), ["wide", "bom"]);
-        assert_eq!(hits[0].snippet.text, "Ünïcode needle");
-        assert_eq!(hits[1].snippet.text, "needle first");
+        assert_eq!(names(&hits), ["bom", "wide"]);
+        assert_eq!(hits[0].snippet.text, "needle first");
+        assert_eq!(hits[1].snippet.text, "Ünïcode needle");
     }
 
     #[test]
@@ -647,7 +729,15 @@ mod tests {
         // The clock reads 0 at the start and 30, 60, 90, 120, 150 ms after each note: batches go
         // out after the second note (60 ms since the start) and the fourth (60 ms since then).
         let mut clock = stepping_clock(Duration::from_millis(30));
-        let (end, batches) = collect(&scratch.0, &notes, &overlays, &find("needle"), &mut clock);
+        // One reader, so the notes are counted in the list's order.
+        let (end, batches) = collect_with(
+            &scratch.0,
+            &notes,
+            &overlays,
+            &find("needle"),
+            &mut clock,
+            1,
+        );
         assert_eq!(end, RunEnd::Completed);
         let shape: Vec<(Vec<&str>, usize)> = batches
             .iter()
@@ -714,6 +804,7 @@ mod tests {
             &mut skipped,
         );
         assert_eq!(end, RunEnd::Completed);
+        skipped.sort();
         assert_eq!(
             skipped,
             [PathBuf::from("cloud.md"), PathBuf::from("gone.md")]
@@ -754,9 +845,34 @@ mod tests {
                 cancel.store(true, Relaxed);
             },
             &mut frozen_clock(),
+            MAX_READERS,
         );
         assert_eq!(end, RunEnd::Cancelled);
         assert_eq!(seen, [(50, 50)]);
+    }
+
+    #[test]
+    fn parallel_readers_visit_every_note_once_with_skips_and_hits_counted() {
+        // Break caught: two readers taking the same note (a hit twice, visited past the total),
+        // a note no reader takes, or skips lost between the readers and the batching loop.
+        let scratch = Scratch::new("parallel");
+        let mut notes = Vec::new();
+        for index in 0..300 {
+            let text = if index % 3 == 0 { "a needle" } else { "hay" };
+            notes.push(scratch.file(&format!("n{index}.md"), text.as_bytes()));
+        }
+        for index in 0..7 {
+            notes.push(note(&format!("gone{index}.md"), 5));
+        }
+        let (end, hits, progress) = search(&scratch.0, &notes, &HashMap::new(), "needle");
+        assert_eq!(end, RunEnd::Completed);
+        let mut paths: Vec<&Path> = hits.iter().map(|hit| hit.path.as_path()).collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!((hits.len(), paths.len()), (100, 100));
+        assert_eq!((progress.visited, progress.total), (307, 307));
+        assert_eq!(progress.skipped[SkipReason::Unreadable.index()], 7);
+        assert!(reader_count() >= 1 && reader_count() <= MAX_READERS);
     }
 
     #[test]
