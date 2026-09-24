@@ -235,11 +235,12 @@
 - **Switching views wins.** Showing another view or hiding the sidebar cancels, even when the
   palette took the focus first and a focus-leave commit is still queued.
 - **Keys.** The Edit control has no Ctrl+A or Ctrl+Backspace of its own: the field's hook
-  handles both. Of the field's keys only Ctrl+Z is an accelerator; the field keeps it.
+  handles both. Of the field's keys only Ctrl+Z (Undo) and Ctrl+Y (Redo) are accelerators; the
+  field keeps both, so neither reaches the editor's document.
 - **Screen readers.** The field's accessible name and its problem (as the description) are set
   through `IAccPropServices` dynamic annotation, so the system's own `Edit` proxy reports them.
-- **A problem shown after Enter** stays until the text changes; Enter again with the same text
-  is refused like any other problem.
+- **A problem shown after Enter** stays until the text changes or the tree is rebuilt, which
+  re-runs the live check; Enter again with the same text is refused like any other problem.
 - **A vanished row is not the active tab.** When `Note: Rename…` acts on a row that left the
   notebook before Enter, it renames nothing, unless that row is the active tab's own note, which
   then uses the name bar.
