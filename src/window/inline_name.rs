@@ -1,15 +1,12 @@
 //! Naming notes and folders in the Notebook tree (inline naming spec): an `EDIT` field over a
 //! row's name for New note, New folder and both renames. The pure half comes first; the field,
 //! the edit it shows and the commits follow.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired up task by task by the inline naming plan")
-)]
 
-use super::main_window::push_notice;
+use super::main_window::{app_ptr, push_notice};
 use super::notebook_view::{self, NotebookView, with_view};
 use super::side_panel;
 use crate::config::SidebarView;
+use crate::library;
 use crate::library::title;
 use crate::library::tree::{self, RowKind, TreeRow};
 use crate::platform::{last_error, wide_null};
@@ -355,12 +352,9 @@ struct Edit {
     announce: bool,
     /// Focus left FastPad while the field had it: it goes back when the window is active again
     /// (spec §5.3).
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "read by the focus handling (inline naming plan, Task 5)"
-        )
+    #[expect(
+        dead_code,
+        reason = "read by the focus handling (inline naming plan, Task 5)"
     )]
     refocus: bool,
 }
@@ -750,6 +744,64 @@ pub(crate) fn new_note(hwnd: HWND, parent: Option<PathBuf>) {
     }
 }
 
+/// F2 or Rename… on a note or folder row (spec §3.3): the field over that row's name.
+pub(crate) fn rename(hwnd: HWND, row: &RowKind) {
+    let purpose = match row {
+        RowKind::Note(relative) => Purpose::RenameNote(relative.clone()),
+        RowKind::Folder(relative) => Purpose::RenameFolder(relative.clone()),
+        RowKind::Unsaved(_) | RowKind::Draft => return,
+    };
+    start(hwnd, purpose);
+}
+
+/// Note: Rename… on the note at `path` (absolute; the palette's recorded row): its row,
+/// revealed, else the name bar for a file the tree has no row for (spec §3.3).
+pub(crate) fn rename_note_at(hwnd: HWND, path: &Path) {
+    match reveal(hwnd, path) {
+        Some(relative) => start(hwnd, Purpose::RenameNote(relative)),
+        None => library_host::rename_note(hwnd),
+    }
+}
+
+/// Note: Rename… with no row focused: the active tab's note (spec §3.3).
+pub(crate) fn rename_active(hwnd: HWND) {
+    if let Some(path) = library_host::active_file(hwnd) {
+        rename_note_at(hwnd, &path);
+    }
+}
+
+/// Shows the note at `path` in the Notebook view (opening the sidebar on it if hidden or on
+/// another view), its folders expanded and its row selected and scrolled into view (spec
+/// §3.3). `None`, changing nothing, when it has no row there: outside the notebook, not a note,
+/// not listed yet, or no sidebar.
+fn reveal(hwnd: HWND, path: &Path) -> Option<PathBuf> {
+    let root = library_host::folder(hwnd)?;
+    if !library::is_inside(&root, path) || side_panel::windows(hwnd).is_none() {
+        return None;
+    }
+    let relative = library::record_path(&root, path);
+    let listed = with_state(hwnd, |state| {
+        state
+            .notes
+            .iter()
+            .any(|note| library::model::same_path(&note.path, &relative))
+    })
+    .unwrap_or(false);
+    if !listed {
+        return None;
+    }
+    if side_panel::current_view(hwnd) != SidebarView::Notebook {
+        side_panel::show_view(hwnd, SidebarView::Notebook, false);
+    }
+    for folder in tree::ancestors(&relative) {
+        library_host::set_expanded(hwnd, &folder, true);
+    }
+    if notebook_view::stale(hwnd) {
+        side_panel::with_accessible_events(hwnd, || notebook_view::rebuild(hwnd));
+    }
+    notebook_view::select_row(hwnd, &RowKind::Note(relative.clone())).then_some(relative)
+}
+
 /// `EN_CHANGE` from the field: the live check runs on what is typed now, against the rows in
 /// memory (spec §4.4). No disk access.
 pub(crate) fn changed(hwnd: HWND) {
@@ -930,7 +982,8 @@ pub(crate) fn commit(hwnd: HWND, how: How) {
     match purpose {
         Purpose::NewNote(parent) => commit_new_note(hwnd, how, &parent, &text),
         Purpose::NewFolder(parent) => commit_new_folder(hwnd, how, &parent, &text),
-        Purpose::RenameNote(_) | Purpose::RenameFolder(_) => cancelled(hwnd, how),
+        Purpose::RenameNote(relative) => commit_rename_note(hwnd, how, &relative, &text),
+        Purpose::RenameFolder(relative) => commit_rename_folder(hwnd, how, &relative, &text),
     }
 }
 
@@ -1015,6 +1068,168 @@ fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str) {
     let mode = super::main_window::OpenMode::Permanent;
     if let Err(error) = super::main_window::open_note(hwnd, &path, mode, how == How::Enter) {
         super::main_window::report_open_failure(hwnd, &path, &error);
+    }
+}
+
+/// A note rename (spec §4.3, §5.2): the one disk call, never over another file, then the tab
+/// that has it open follows (dirty or preview alike) and the library follows it. A tab that
+/// cannot follow undoes the rename. No tab is opened. After Enter the focus stays in the tree.
+fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
+    let Some(root) = library_host::folder(hwnd) else {
+        cancel(hwnd);
+        return;
+    };
+    let old = root.join(relative);
+    let current = old
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned());
+    let Some(name) = title::renamed_note_name(text, current.as_deref()) else {
+        cancelled(hwnd, how);
+        return;
+    };
+    let new = old.with_file_name(&name);
+    if new == old {
+        cancelled(hwnd, how);
+        return;
+    }
+    // A change of letter case only names the same file, so it is not a clash.
+    let case_only = library::model::same_path(&new, &old);
+    if let Err(error) = crate::platform::files::rename_no_replace(&old, &new) {
+        let error = if !case_only && library_host::already_exists(&error) {
+            let (stem, extension) = title::split_rename(text, current.as_deref());
+            let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
+            library_host::name_taken_error(&parent, &stem, &extension.unwrap_or_default())
+        } else {
+            format!("FastPad could not rename the file: {error}")
+        };
+        fail(hwnd, how, error);
+        return;
+    }
+    let rebound = match library_host::rebind_open_tab(hwnd, &old, new.clone()) {
+        Ok(rebound) => rebound,
+        Err(()) => {
+            // Undo, so the tab and the disk agree.
+            let _ = crate::platform::files::rename_no_replace(&new, &old);
+            fail(
+                hwnd,
+                how,
+                "Another tab already has that file open.".to_owned(),
+            );
+            return;
+        }
+    };
+    with_state(hwnd, |state| state.rename_note(&old, &new));
+    library_host::schedule_write(hwnd);
+    end(hwnd);
+    let moved = library::record_path(&root, &new);
+    side_panel::with_accessible_events(hwnd, || {
+        side_panel::refresh(hwnd);
+        notebook_view::select_row(hwnd, &RowKind::Note(moved.clone()));
+    });
+    if how == How::Enter {
+        notebook_view::focus_tree(hwnd);
+    }
+    if rebound {
+        // The extension may have changed, and with it the language.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                crate::window::WM_FASTPAD_APPLY_LANGUAGE,
+                0,
+                0,
+            );
+        }
+    }
+}
+
+/// A folder rename (spec §4.3, §5.2): the one disk call, never onto another name, then the open
+/// tabs under it follow and the library follows it. A tab that cannot follow undoes the whole
+/// rename; if the undo fails, the rename stands and a notice names the tabs left on their old
+/// paths. After Enter the focus stays in the tree.
+fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
+    let Some(root) = library_host::folder(hwnd) else {
+        cancel(hwnd);
+        return;
+    };
+    // Defence in depth: an empty or escaping path would rename the notebook root or a folder
+    // outside it.
+    if !tree::is_plain_relative_folder(old) {
+        cancel(hwnd);
+        return;
+    }
+    let Some(name) = title::folder_name(text) else {
+        cancelled(hwnd, how);
+        return;
+    };
+    let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
+    let new = parent.join(&name);
+    if new.as_os_str() == old.as_os_str() || !tree::is_plain_relative_folder(&new) {
+        cancelled(hwnd, how);
+        return;
+    }
+    // A change of letter case only names the same folder, so it is not a clash.
+    let case_only = library::model::same_path(&new, old);
+    let (old_path, new_path) = (root.join(old), root.join(&new));
+    if let Err(error) = crate::platform::files::rename_no_replace(&old_path, &new_path) {
+        let error = if !case_only && library_host::already_exists(&error) {
+            library_host::folder_taken_error(&name)
+        } else {
+            format!("FastPad could not rename the folder: {error}")
+        };
+        fail(hwnd, how, error);
+        return;
+    }
+    let tabs = library_host::tabs_under(hwnd, &old_path);
+    let mut moved = Vec::with_capacity(tabs.len());
+    let mut stuck = Vec::new();
+    for (id, path, _) in tabs {
+        let target = new_path.join(library::record_path(&old_path, &path));
+        let rebound = unsafe { app_ptr(hwnd) }
+            .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.rebind_path(id, target).is_ok());
+        if rebound {
+            moved.push((id, path));
+        } else {
+            stuck.push(path);
+        }
+    }
+    let mut undo_failed = None;
+    if !stuck.is_empty() {
+        // Undo, so the tabs and the disk agree: the folder goes back, then the tabs that moved.
+        if library_host::rename_folder_back(&new_path, &old_path).is_ok() {
+            for (id, path) in moved.into_iter().rev() {
+                if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                    let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
+                }
+            }
+            fail(
+                hwnd,
+                how,
+                "Another tab already has that file open.".to_owned(),
+            );
+            return;
+        }
+        // The disk is the truth: the rename stands, the tabs that moved keep their new paths,
+        // and the ones that could not follow are named.
+        let old_name = old.file_name().unwrap_or_default().to_string_lossy();
+        undo_failed = Some(library_host::rename_undo_failed_notice(
+            &old_name, &name, &stuck,
+        ));
+    }
+    library_host::reroot_save_folders(hwnd, &old_path, &new_path);
+    with_state(hwnd, |state| state.rename_folder(old, &new));
+    library_host::save_local_soon(hwnd);
+    library_host::schedule_write(hwnd);
+    end(hwnd);
+    super::main_window::invalidate_title_strip(hwnd);
+    side_panel::with_accessible_events(hwnd, || {
+        side_panel::refresh(hwnd);
+        notebook_view::select_row(hwnd, &RowKind::Folder(new.clone()));
+    });
+    if how == How::Enter {
+        notebook_view::focus_tree(hwnd);
+    }
+    if let Some(notice) = undo_failed {
+        push_notice(hwnd, notice);
     }
 }
 

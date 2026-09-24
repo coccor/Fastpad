@@ -1689,11 +1689,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 Some(CommandId::NoteMoveToNotebook) => {
                     super::library_host::move_to_notebook(hwnd, &path);
                 }
-                Some(CommandId::NoteRename) => {
-                    if super::library_host::ready_library(hwnd) {
-                        super::library_host::rename_file(hwnd, &path);
-                    }
-                }
+                Some(CommandId::NoteRename) => super::inline_name::rename(hwnd, &row.kind),
                 Some(CommandId::NoteRevealInExplorer) => super::library_host::reveal(hwnd, &path),
                 Some(CommandId::NoteDelete) if super::library_host::ready_library(hwnd) => {
                     super::library_host::delete_file(hwnd, &path);
@@ -1719,9 +1715,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 Some(CommandId::NoteNewFolder) => {
                     super::inline_name::new_folder(hwnd, Some(relative.clone()));
                 }
-                Some(CommandId::NoteRename) if super::library_host::ready_library(hwnd) => {
-                    super::library_host::rename_folder(hwnd, relative);
-                }
+                Some(CommandId::NoteRename) => super::inline_name::rename(hwnd, &row.kind),
                 Some(CommandId::NoteRevealInExplorer) => super::library_host::reveal(hwnd, &path),
                 Some(CommandId::NoteDelete) if super::library_host::ready_library(hwnd) => {
                     super::library_host::delete_folder(hwnd, relative);
@@ -2141,20 +2135,14 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
                 return true;
             };
             match kind {
+                Some(kind @ (RowKind::Note(_) | RowKind::Folder(_))) if key == VK_F2 => {
+                    super::inline_name::rename(hwnd, &kind);
+                }
                 Some(RowKind::Note(relative)) if super::library_host::ready_library(hwnd) => {
-                    let path = root.join(relative);
-                    if key == VK_F2 {
-                        super::library_host::rename_file(hwnd, &path);
-                    } else {
-                        super::library_host::delete_file(hwnd, &path);
-                    }
+                    super::library_host::delete_file(hwnd, &root.join(relative));
                 }
                 Some(RowKind::Folder(relative)) if super::library_host::ready_library(hwnd) => {
-                    if key == VK_F2 {
-                        super::library_host::rename_folder(hwnd, &relative);
-                    } else {
-                        super::library_host::delete_folder(hwnd, &relative);
-                    }
+                    super::library_host::delete_folder(hwnd, &relative);
                 }
                 _ => {}
             }

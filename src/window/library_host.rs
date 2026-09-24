@@ -1,5 +1,5 @@
 //! Window wiring for the note library: the deferred load, rescans, debounced metadata writes,
-//! folder commands, first-save naming, autosave, and pins.
+//! folder deletes, first-save naming, autosave, and pins.
 
 use super::main_window::{app_ptr, push_notice, window_identity};
 use crate::library::model::LibraryError;
@@ -534,10 +534,6 @@ fn save_local(hwnd: HWND, how: LocalWrite) {
 }
 
 /// `save_local` on a writer thread, for a change the user just made (a folder rename).
-#[expect(
-    dead_code,
-    reason = "used by the folder rename (inline naming plan, Task 4)"
-)]
 pub(crate) fn save_local_soon(hwnd: HWND) {
     save_local(
         hwnd,
@@ -591,10 +587,11 @@ pub(crate) fn expanded(hwnd: HWND) -> Vec<PathBuf> {
 /// `Ok(true)` when a tab followed, `Ok(false)` when none had `old` open, `Err` when a tab had
 /// `old` open but could not be rebound because another tab already has `new` open — the file
 /// moved, but that tab is left pointing at a path that no longer exists. `move_note_to` refuses
-/// upfront when the target is already open, and `submit_rename` rebinds its own tab itself (and
-/// undoes the rename when it cannot), so `Err` comes from a relocation the rescan finds: a file
-/// moved outside FastPad onto a path another tab already has open. The caller reports it.
-fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) -> Result<bool, ()> {
+/// upfront when the target is already open, and the renames undo themselves on `Err`
+/// (`submit_rename` rebinds its own tab; `inline_name` calls this and undoes the rename), so an
+/// unexpected `Err` comes from a relocation the rescan finds: a file moved outside FastPad onto a
+/// path another tab already has open. The caller reports it.
+pub(crate) fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) -> Result<bool, ()> {
     let stamp = library::disk_stamp(&new);
     let outcome = unsafe { app_ptr(hwnd) }.map(|mut app| {
         let app = unsafe { app.as_mut() };
@@ -1360,8 +1357,6 @@ fn folder_display_name(hwnd: HWND) -> String {
         .unwrap_or_else(|| "the notebook".to_owned())
 }
 
-const NO_FOLDER_NAME: &str = "Type a folder name";
-
 /// A new or renamed folder's name is taken by a folder or file (spec §4.1).
 pub(crate) fn folder_taken_error(name: &str) -> String {
     format!("A folder or file named \u{201c}{name}\u{201d} already exists")
@@ -1370,14 +1365,6 @@ pub(crate) fn folder_taken_error(name: &str) -> String {
 /// A folder named like one the scan skips would vanish at the next rescan (scan §3.1).
 pub(crate) fn hidden_folder_error(name: &str) -> String {
     format!("FastPad hides folders named \u{201c}{name}\u{201d}. Choose another name.")
-}
-
-/// "in <folder>": `parent`'s own name, or the notebook's at the root (spec §4.1, §4.2).
-fn folder_suffix(hwnd: HWND, parent: &Path) -> String {
-    match parent.file_name() {
-        Some(name) => format!("in {}", name.to_string_lossy()),
-        None => format!("in {}", folder_display_name(hwnd)),
-    }
 }
 
 /// `folder` (absolute, inside the notebook `root`) relative to it; empty for the root itself.
@@ -1391,7 +1378,7 @@ pub(crate) fn relative_folder(root: &Path, folder: &Path) -> PathBuf {
 
 /// After a folder rename on disk from `old` to `new` (both absolute): the untitled tabs whose
 /// first save was to go at or under `old` go at the same place under `new`.
-fn reroot_save_folders(hwnd: HWND, old: &Path, new: &Path) {
+pub(crate) fn reroot_save_folders(hwnd: HWND, old: &Path, new: &Path) {
     let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
         return;
     };
@@ -1412,7 +1399,7 @@ fn reroot_save_folders(hwnd: HWND, old: &Path, new: &Path) {
 }
 
 /// Whether a failed `MoveFileExW` means the target name is taken.
-fn already_exists(error: &crate::FastPadError) -> bool {
+pub(crate) fn already_exists(error: &crate::FastPadError) -> bool {
     matches!(
         error,
         crate::FastPadError::Win32(code) if *code == ERROR_ALREADY_EXISTS || *code == ERROR_FILE_EXISTS
@@ -1421,7 +1408,10 @@ fn already_exists(error: &crate::FastPadError) -> bool {
 
 /// The open tabs whose file is inside `folder` (absolute), with their stored paths and whether
 /// each has unsaved edits. Read from the tabs' stored paths: no disk access.
-fn tabs_under(hwnd: HWND, folder: &Path) -> Vec<(crate::document::DocumentId, PathBuf, bool)> {
+pub(crate) fn tabs_under(
+    hwnd: HWND,
+    folder: &Path,
+) -> Vec<(crate::document::DocumentId, PathBuf, bool)> {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
             unsafe { app.as_ref() }
@@ -1435,122 +1425,6 @@ fn tabs_under(hwnd: HWND, folder: &Path) -> Vec<(crate::document::DocumentId, Pa
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// F2 or Rename… on a folder row (spec §4.2): the name box, prefilled with the folder's name.
-pub(crate) fn rename_folder(hwnd: HWND, relative: &Path) {
-    let Some(name) = relative
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-    else {
-        return;
-    };
-    let parent = relative.parent().map(Path::to_path_buf).unwrap_or_default();
-    let suffix = folder_suffix(hwnd, &parent);
-    open_name_box(
-        hwnd,
-        NamePurpose::RenameFolder(relative.to_path_buf()),
-        &name,
-        suffix,
-        false,
-    );
-}
-
-/// Enter in the folder rename box: renames the folder with the one disk call, never onto
-/// another name, then rebinds the open tabs under it and follows it in the library. A tab that
-/// cannot follow undoes the whole rename; if the undo fails, the rename stands and a notice
-/// names the tabs left on their old paths.
-fn submit_rename_folder(hwnd: HWND, old: &Path, text: &str) {
-    let Some(root) = folder(hwnd) else {
-        close_name_box(hwnd);
-        return;
-    };
-    // Defence in depth: an empty or escaping path would rename the notebook root or a folder
-    // outside it.
-    if !library::tree::is_plain_relative_folder(old) {
-        close_name_box(hwnd);
-        return;
-    }
-    let Some(name) = title::folder_name(text) else {
-        name_box_error(hwnd, NO_FOLDER_NAME.to_owned());
-        return;
-    };
-    let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
-    let new = parent.join(&name);
-    if new.as_os_str() == old.as_os_str() || !library::tree::is_plain_relative_folder(&new) {
-        close_name_box(hwnd);
-        return;
-    }
-    if library::scan::skip_directory(&name) {
-        name_box_error(hwnd, hidden_folder_error(&name));
-        return;
-    }
-    // A change of letter case only names the same folder, so it is not a clash.
-    let case_only = library::model::same_path(&new, old);
-    if !case_only && with_state(hwnd, |state| state.is_listed(&new)).unwrap_or(false) {
-        name_box_error(hwnd, folder_taken_error(&name));
-        return;
-    }
-    let (old_path, new_path) = (root.join(old), root.join(&new));
-    if let Err(error) = crate::platform::files::rename_no_replace(&old_path, &new_path) {
-        let error = if !case_only && already_exists(&error) {
-            folder_taken_error(&name)
-        } else {
-            format!("FastPad could not rename the folder: {error}")
-        };
-        name_box_error(hwnd, error);
-        return;
-    }
-    let tabs = tabs_under(hwnd, &old_path);
-    let mut moved = Vec::with_capacity(tabs.len());
-    let mut stuck = Vec::new();
-    for (id, path, _) in tabs {
-        let target = new_path.join(library::record_path(&old_path, &path));
-        let rebound = unsafe { app_ptr(hwnd) }
-            .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.rebind_path(id, target).is_ok());
-        if rebound {
-            moved.push((id, path));
-        } else {
-            stuck.push(path);
-        }
-    }
-    let mut undo_failed = None;
-    if !stuck.is_empty() {
-        // Undo, so the tabs and the disk agree: the folder goes back, then the tabs that moved.
-        if rename_folder_back(&new_path, &old_path).is_ok() {
-            for (id, path) in moved.into_iter().rev() {
-                if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                    let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
-                }
-            }
-            name_box_error(hwnd, "Another tab already has that file open.".to_owned());
-            return;
-        }
-        // The disk is the truth: the rename stands, the tabs that moved keep their new paths,
-        // and the ones that could not follow are named.
-        let old_name = old.file_name().unwrap_or_default().to_string_lossy();
-        undo_failed = Some(rename_undo_failed_notice(&old_name, &name, &stuck));
-    }
-    reroot_save_folders(hwnd, &old_path, &new_path);
-    with_state(hwnd, |state| state.rename_folder(old, &new));
-    save_local(
-        hwnd,
-        LocalWrite {
-            wait: false,
-            force: false,
-        },
-    );
-    schedule_write(hwnd);
-    close_name_box(hwnd);
-    super::main_window::invalidate_title_strip(hwnd);
-    super::side_panel::with_accessible_events(hwnd, || {
-        super::side_panel::refresh(hwnd);
-        super::notebook_view::select_row(hwnd, &RowKind::Folder(new.clone()));
-    });
-    super::notebook_view::focus_tree(hwnd);
-    if let Some(notice) = undo_failed {
-        push_notice(hwnd, notice);
-    }
 }
 
 #[cfg(test)]
@@ -1569,7 +1443,7 @@ pub(crate) fn fail_next_folder_rename_back() {
 }
 
 /// Renames a folder back after a tab could not follow its rename.
-fn rename_folder_back(from: &Path, to: &Path) -> crate::Result<()> {
+pub(crate) fn rename_folder_back(from: &Path, to: &Path) -> crate::Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_FOLDER_RENAME_BACK.with(|fail| fail.replace(false)) {
         return Err(crate::FastPadError::Invariant(
@@ -1581,7 +1455,7 @@ fn rename_folder_back(from: &Path, to: &Path) -> crate::Result<()> {
 
 /// The notice when a folder rename could not be undone after `stuck` (the tabs' old paths)
 /// could not follow it.
-fn rename_undo_failed_notice(old: &str, new: &str, stuck: &[PathBuf]) -> String {
+pub(crate) fn rename_undo_failed_notice(old: &str, new: &str, stuck: &[PathBuf]) -> String {
     let name = |path: &PathBuf| {
         path.file_name()
             .unwrap_or_default()
@@ -1750,26 +1624,12 @@ fn name_box_purpose(hwnd: HWND) -> Option<NamePurpose> {
     })
 }
 
-/// Closes a name box whose tab is gone or no longer active, or whose first save already
-/// happened. A folder box belongs to the notebook, not a tab: it closes when the notebook goes
-/// (no state) or when its folder, or a new folder's parent, is no longer in the tree.
+/// Closes a name box whose tab is gone or no longer active, or whose first save already happened.
 pub(crate) fn close_stale_name_box(hwnd: HWND) {
     let Some(purpose) = name_box_purpose(hwnd) else {
         return;
     };
-    if let Some(folder) = purpose.folder() {
-        let listed = with_state(hwnd, |state| {
-            folder.as_os_str().is_empty() || state.is_folder(folder)
-        })
-        .unwrap_or(false);
-        if !listed {
-            close_name_box(hwnd);
-        }
-        return;
-    }
-    let Some(id) = purpose.document() else {
-        return;
-    };
+    let id = purpose.document();
     let stale = unsafe { app_ptr(hwnd) }.is_none_or(|app| {
         let tabs = &unsafe { app.as_ref() }.tabs;
         let Some(document) = tabs.document(id) else {
@@ -1837,11 +1697,8 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
     };
     match purpose {
         NamePurpose::FirstSave(id) => submit_first_save(hwnd, id, &text),
-        NamePurpose::RenameNote(_) | NamePurpose::RenameFolder(_) if !ready_library(hwnd) => {
-            close_name_box(hwnd);
-        }
+        NamePurpose::RenameNote(_) if !ready_library(hwnd) => close_name_box(hwnd),
         NamePurpose::RenameNote(id) => submit_rename(hwnd, id, &text),
-        NamePurpose::RenameFolder(folder) => submit_rename_folder(hwnd, &folder, &text),
     }
 }
 
@@ -1886,7 +1743,8 @@ fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
     }
 }
 
-/// Note: Rename...: the name box, prefilled with the file's current name.
+/// Note: Rename… on a file with no row in the Notebook tree (outside the open notebook, or not
+/// a note): the name bar, prefilled with the file's current name.
 pub(crate) fn rename_note(hwnd: HWND) {
     let Some(path) = active_file(hwnd) else {
         return;
@@ -1897,7 +1755,7 @@ pub(crate) fn rename_note(hwnd: HWND) {
         return;
     };
     // The tab is about to be renamed: a preview would be replaced by the next click in the tree
-    // and take the name box with it, so it becomes a normal tab, as the sidebar's F2 makes it.
+    // and take the name box with it, so it becomes a normal tab.
     promote_tab_for(hwnd, &path);
     let name = path
         .file_name()
@@ -2235,18 +2093,6 @@ pub(crate) fn reveal(hwnd: HWND, path: &Path) {
             ),
         );
     }
-}
-
-/// Rename… from the sidebar. The note opens as a normal tab first, because the name box renames
-/// a tab, then the name box opens as for Note: Rename.
-pub(crate) fn rename_file(hwnd: HWND, path: &Path) {
-    if let Err(error) =
-        super::main_window::open_note(hwnd, path, super::main_window::OpenMode::Permanent, false)
-    {
-        super::main_window::report_open_failure(hwnd, path, &error);
-        return;
-    }
-    rename_note(hwnd);
 }
 
 /// Note: Delete, on the active tab's file.

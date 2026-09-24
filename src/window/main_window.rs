@@ -2579,11 +2579,12 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::NoteRename => {
             if crate::window::library_host::ready_library(hwnd) {
                 match (&tree_note, &tree_folder) {
-                    (Some(path), _) => crate::window::library_host::rename_file(hwnd, path),
-                    (None, Some(folder)) => {
-                        crate::window::library_host::rename_folder(hwnd, folder);
-                    }
-                    (None, None) => crate::window::library_host::rename_note(hwnd),
+                    (Some(path), _) => crate::window::inline_name::rename_note_at(hwnd, path),
+                    (None, Some(folder)) => crate::window::inline_name::rename(
+                        hwnd,
+                        &crate::library::tree::RowKind::Folder(folder.clone()),
+                    ),
+                    (None, None) => crate::window::inline_name::rename_active(hwnd),
                 }
             }
         }
@@ -11142,7 +11143,8 @@ mod tests {
         let _editor = install_test_editor(&window);
         let old = open_note(&window, &scratch, "a.md", "text");
         execute_command(window.hwnd, CommandId::NoteTogglePin);
-        execute_command(window.hwnd, CommandId::NoteRename);
+        // The name bar itself: Note: Rename… would edit the note's row in the tree.
+        crate::window::library_host::rename_note(window.hwnd);
         assert_eq!(
             app_mut(window.hwnd).name_box.as_ref().unwrap().text(),
             "a.md"
@@ -11168,7 +11170,8 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         let a = open_note(&window, &scratch, "a.md", "a");
-        execute_command(window.hwnd, CommandId::NoteRename);
+        // The name bar itself: Note: Rename… would edit the note's row in the tree.
+        crate::window::library_host::rename_note(window.hwnd);
         type_into_name_box(window.hwnd, "B.md");
         crate::window::library_host::name_box_submit(window.hwnd);
         assert!(a.exists());
@@ -11195,7 +11198,8 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         open_note(&window, &scratch, "plan.md", "text");
-        execute_command(window.hwnd, CommandId::NoteRename);
+        // The name bar itself: Note: Rename… would edit the note's row in the tree.
+        crate::window::library_host::rename_note(window.hwnd);
         type_into_name_box(window.hwnd, "Plan.md");
         crate::window::library_host::name_box_submit(window.hwnd);
         let names: Vec<String> = std::fs::read_dir(scratch.folder())
@@ -12458,27 +12462,209 @@ mod tests {
     }
 
     #[test]
-    fn f2_on_a_note_row_that_is_not_open_opens_it_and_the_rename_box() {
-        // Break caught: F2 in the tree renaming the active tab's note instead of the selected one,
-        // or doing nothing because the name box needs a tab.
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+    fn f2_and_rename_on_a_note_row_rename_it_in_the_tree_without_opening_a_tab() {
+        // Break caught: F2 opening the note as a tab first, renaming the active tab's note, a
+        // prefill that selects the extension, or the renamed row losing the selection and the
+        // focus (inline naming spec §3.3, §5.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_F2, VK_RETURN};
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("tree-f2");
+        let scratch = LibraryScratch::new("inline-rename-note");
         let a = scratch.note("a.md", "a");
-        let b = scratch.note("b.md", "b");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
+        scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
         super::open_path(window.hwnd, &a).unwrap();
+        let tabs = super::tab_count(window.hwnd);
         select_row(window.hwnd, &RowKind::Note("b.md".into()));
 
         assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::RenameNote(
+                "b.md".into()
+            ))
+        );
+        assert_eq!(field_text(window.hwnd), "b.md");
+        assert_eq!(field_selection(window.hwnd), (0, 1), "the stem is selected");
+        assert_eq!(super::tab_count(window.hwnd), tabs, "no tab opened");
+        type_into_field(window.hwnd, "c");
+        field_key(window.hwnd, VK_RETURN);
 
-        let active = app_mut(window.hwnd).tabs.active().unwrap();
-        assert_eq!(active.path.as_deref(), Some(b.as_path()));
-        assert!(!active.preview);
-        let id = active.id;
+        assert!(!scratch.folder().join("b.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("c.md")).unwrap(),
+            "b"
+        );
+        assert_eq!(super::tab_count(window.hwnd), tabs);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path())
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("c.md".into()))
+        );
+        assert_eq!(unsafe { GetFocus() }, sidebar_windows(window.hwnd).1);
+
+        let index = row_of(window.hwnd, &RowKind::Note("c.md".into()));
+        crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteRename));
+        crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::RenameNote(
+                "c.md".into()
+            ))
+        );
+        assert_eq!(super::tab_count(window.hwnd), tabs);
+    }
+
+    #[test]
+    fn renaming_open_dirty_and_preview_notes_in_the_tree_rebinds_their_tabs() {
+        // Break caught: a rename that saves a dirty tab, turns the preview into a normal tab,
+        // or leaves either on the old path (spec §5.2).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F2, VK_RETURN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-rename-tabs");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, editor) = notebook_window(&scratch);
+        // Autosave would save `a` the moment `b` opens; the rename must leave it dirty.
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &a).unwrap();
+        editor.set_text("a, edited").unwrap();
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+        let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+        let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
+        let rename = |from: &str, to: &str| {
+            select_row(window.hwnd, &RowKind::Note(from.into()));
+            assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+            type_into_field(window.hwnd, to);
+            field_key(window.hwnd, VK_RETURN);
+        };
+
+        rename("a.md", "a2");
+        rename("b.md", "b2");
+
+        let tabs = &app_mut(window.hwnd).tabs;
+        assert_eq!(
+            tabs.document(a_id).unwrap().path,
+            Some(scratch.folder().join("a2.md"))
+        );
+        assert!(tabs.document(a_id).unwrap().dirty);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("a2.md")).unwrap(),
+            "a",
+            "nothing was saved"
+        );
+        assert_eq!(
+            tabs.document(b_id).unwrap().path,
+            Some(scratch.folder().join("b2.md"))
+        );
+        assert_eq!(
+            tabs.preview_id(),
+            Some(b_id),
+            "the preview stays the preview"
+        );
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    #[test]
+    fn a_case_only_rename_in_the_tree_renames_the_note_and_the_folder() {
+        // Break caught: "plan.md" → "Plan.md" or "sub" → "Sub" refused as a clash with itself,
+        // or a no-op on NTFS (spec §4.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-rename-case");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note("plan.md", "p");
+        let (window, _editor) = notebook_window(&scratch);
+        let names = || {
+            let mut names: Vec<String> = std::fs::read_dir(scratch.folder())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with('.'))
+                .collect();
+            names.sort();
+            names
+        };
+
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("plan.md".into()));
+        type_into_field(window.hwnd, "Plan.md");
+        assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+        field_key(window.hwnd, VK_RETURN);
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "Sub");
+        field_key(window.hwnd, VK_RETURN);
+
+        assert_eq!(names(), ["Plan.md", "Sub"]);
+        assert!(!inline_open(window.hwnd));
+    }
+
+    #[test]
+    fn note_rename_from_the_palette_with_the_sidebar_hidden_reveals_the_row_and_edits_it() {
+        // Break caught: Note: Rename… on the active tab opening the name bar while the note has
+        // a row, or editing a row nobody can see in a hidden sidebar or a collapsed folder
+        // (spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-rename-reveal");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        open_note(&window, &scratch, r"sub\a.md", "a");
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), false);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Hidden,
+            false,
+        );
+
+        execute_command(window.hwnd, CommandId::NoteRename);
+
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            crate::config::SidebarView::Notebook
+        );
+        assert!(
+            crate::window::library_host::expanded(window.hwnd)
+                .contains(&std::path::PathBuf::from("sub"))
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"sub\a.md".into()))
+        );
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::RenameNote(
+                r"sub\a.md".into()
+            ))
+        );
+        assert_eq!(field_text(window.hwnd), "a.md");
+        assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+        assert!(
+            !app_mut(window.hwnd)
+                .name_box
+                .as_ref()
+                .is_some_and(|name_box| name_box.is_visible())
+        );
+    }
+
+    #[test]
+    fn note_rename_on_a_file_outside_the_notebook_uses_the_name_bar() {
+        // Break caught: a file with no row revealing nothing and doing nothing, or the tree
+        // edited for some other row (spec §3.3).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-rename-outside");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let outside = scratch.root.join("outside.md");
+        std::fs::write(&outside, "o").unwrap();
+        super::open_path(window.hwnd, &outside).unwrap();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+
+        execute_command(window.hwnd, CommandId::NoteRename);
+
+        assert!(!inline_open(window.hwnd));
         let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
         assert!(name_box.is_visible());
         assert_eq!(
@@ -12741,7 +12927,8 @@ mod tests {
 
         super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
         assert!(app_mut(window.hwnd).tabs.preview_id().is_some());
-        execute_command(window.hwnd, CommandId::NoteRename);
+        // The name bar itself: Note: Rename… would edit the note's row in the tree.
+        crate::window::library_host::rename_note(window.hwnd);
         assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None, "rename");
         crate::window::library_host::close_name_box(window.hwnd);
 
@@ -17520,19 +17707,21 @@ mod tests {
         select_row(window.hwnd, &RowKind::Folder("sub".into()));
 
         assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
-        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
         assert_eq!(
-            name_box.purpose(),
-            Some(&crate::window::name_box::NamePurpose::RenameFolder(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::RenameFolder(
                 "sub".into()
             ))
         );
-        assert_eq!(name_box.text(), "sub");
-        type_into_name_box(window.hwnd, "Projects");
-        crate::window::library_host::name_box_submit(window.hwnd);
+        assert_eq!(field_text(window.hwnd), "sub");
+        type_into_field(window.hwnd, "Projects");
+        field_key(
+            window.hwnd,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+        );
 
         let new = scratch.folder().join(r"Projects\a.md");
-        assert!(!name_box_visible(window.hwnd));
+        assert!(!inline_open(window.hwnd));
         assert!(new.exists());
         assert!(!old.exists());
         assert_eq!(
@@ -17576,10 +17765,14 @@ mod tests {
         super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
         let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
         let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
+        crate::window::notebook_view::rebuild(window.hwnd);
 
-        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
-        type_into_name_box(window.hwnd, "Moved");
-        crate::window::library_host::name_box_submit(window.hwnd);
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "Moved");
+        field_key(
+            window.hwnd,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+        );
 
         let moved = scratch.folder().join("Moved");
         let tabs = &app_mut(window.hwnd).tabs;
@@ -17605,17 +17798,21 @@ mod tests {
         let _editor = install_test_editor(&window);
         ensure_sidebar(window.hwnd);
         open_note(&window, &scratch, r"sub\a.md", "a");
+        crate::window::notebook_view::rebuild(window.hwnd);
 
-        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
-        type_into_name_box(window.hwnd, "Sub");
-        crate::window::library_host::name_box_submit(window.hwnd);
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "Sub");
+        field_key(
+            window.hwnd,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+        );
 
         let names: Vec<String> = std::fs::read_dir(scratch.folder())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(names.contains(&"Sub".to_owned()), "{names:?}");
-        assert!(!name_box_visible(window.hwnd));
+        assert!(!inline_open(window.hwnd));
         assert_eq!(
             app_mut(window.hwnd).tabs.active().unwrap().path,
             Some(scratch.folder().join(r"Sub\a.md"))
@@ -17649,15 +17846,18 @@ mod tests {
         let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
         app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
             Some(scratch.folder().join(r"Moved\a.md"));
+        crate::window::notebook_view::rebuild(window.hwnd);
 
-        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
-        type_into_name_box(window.hwnd, "Moved");
-        crate::window::library_host::name_box_submit(window.hwnd);
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "Moved");
+        field_key(
+            window.hwnd,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+        );
 
-        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
-        assert!(name_box.is_visible());
+        assert!(inline_open(window.hwnd));
         assert_eq!(
-            name_box.error(),
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
             Some("Another tab already has that file open.")
         );
         assert!(a.exists());
@@ -17673,18 +17873,15 @@ mod tests {
     #[test]
     fn a_folder_rename_onto_a_sibling_is_refused_and_the_same_name_changes_nothing() {
         // Break caught: a rename onto an existing sibling (in another case) merging or failing
-        // oddly, or Note: Rename on a focused folder row renaming the active tab instead.
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        // oddly, Note: Rename on a focused folder row renaming the active tab instead, or an
+        // unchanged name showing a message (spec §4.3, §4.4).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("folder-rename-clash");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
         std::fs::create_dir_all(scratch.folder().join("Other")).unwrap();
         scratch.note(r"sub\a.md", "a");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
-        crate::window::notebook_view::rebuild(window.hwnd);
+        let (window, _editor) = notebook_window(&scratch);
         select_row(window.hwnd, &RowKind::Folder("sub".into()));
         let (_, panel) = sidebar_windows(window.hwnd);
         unsafe { SetFocus(panel) };
@@ -17692,53 +17889,40 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::NoteRename);
         assert_eq!(
-            app_mut(window.hwnd).name_box.as_ref().unwrap().purpose(),
-            Some(&crate::window::name_box::NamePurpose::RenameFolder(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::RenameFolder(
                 "sub".into()
             ))
         );
-        type_into_name_box(window.hwnd, "other");
-        crate::window::library_host::name_box_submit(window.hwnd);
-        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
-        assert!(name_box.is_visible());
+        type_into_field(window.hwnd, "other");
         assert_eq!(
-            name_box.error(),
-            Some("A folder or file named \u{201c}other\u{201d} already exists")
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
+            Some("other already exists here.")
         );
+        field_key(window.hwnd, VK_RETURN);
+        assert!(inline_open(window.hwnd));
         assert!(scratch.folder().join(r"sub\a.md").exists());
 
-        type_into_name_box(window.hwnd, "sub");
-        crate::window::library_host::name_box_submit(window.hwnd);
-        assert!(!name_box_visible(window.hwnd));
+        type_into_field(window.hwnd, "sub");
+        assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+        field_key(window.hwnd, VK_RETURN);
+        assert!(!inline_open(window.hwnd));
         assert!(scratch.folder().join(r"sub\a.md").exists());
     }
 
     #[test]
-    fn a_folder_name_box_selects_the_whole_name_even_with_a_dot() {
+    fn a_folder_rename_selects_the_whole_name_even_with_a_dot() {
         // Break caught: "v1.2" opening with only "v1" selected, as a file name's stem would be,
-        // so typing keeps ".2" (spec §4.2).
-        use windows_sys::Win32::UI::Controls::EM_GETSEL;
+        // so typing keeps ".2" (spec §3.3).
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("folder-rename-dot");
         std::fs::create_dir_all(scratch.folder().join("v1.2")).unwrap();
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
+        let (window, _editor) = notebook_window(&scratch);
 
-        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("v1.2"));
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("v1.2".into()));
 
-        let edit = app_mut(window.hwnd).name_box.as_ref().unwrap().edit_hwnd();
-        let (mut start, mut end) = (0_u32, 0_u32);
-        unsafe {
-            SendMessageW(
-                edit,
-                EM_GETSEL,
-                &mut start as *mut u32 as usize,
-                &mut end as *mut u32 as isize,
-            )
-        };
-        assert_eq!((start, end), (0, 4));
+        assert_eq!(field_text(window.hwnd), "v1.2");
+        assert_eq!(field_selection(window.hwnd), (0, 4));
     }
 
     #[test]
@@ -17757,9 +17941,13 @@ mod tests {
         crate::window::library_host::request_rescan(window.hwnd);
         assert!(app_mut(window.hwnd).library.scanning);
 
-        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
-        type_into_name_box(window.hwnd, "Moved");
-        crate::window::library_host::name_box_submit(window.hwnd);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "Moved");
+        field_key(
+            window.hwnd,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+        );
         pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning);
 
         crate::window::library_host::with_state(window.hwnd, |state| {
@@ -17922,7 +18110,6 @@ mod tests {
     fn folder_commands_on_an_empty_or_escaping_path_touch_no_disk() {
         // Break caught: a folder delete or rename handed the empty path (the notebook root) or a
         // `..` path recycling, renaming or creating outside the folder the user picked.
-        use crate::window::name_box::NamePurpose;
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("folder-bad-path");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
@@ -17935,22 +18122,14 @@ mod tests {
         let notes = || {
             crate::window::library_host::with_state(window.hwnd, |state| state.notes.len()).unwrap()
         };
-        let submit = |purpose: NamePurpose, text: &str| {
-            crate::window::library_host::open_name_box(
-                window.hwnd,
-                purpose,
-                text,
-                String::new(),
-                false,
-            );
-            crate::window::library_host::name_box_submit(window.hwnd);
-        };
 
         crate::window::answer_next_confirm(|_| true);
         crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(""));
         crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(".."));
-        submit(NamePurpose::RenameFolder("".into()), "Renamed");
-        submit(NamePurpose::RenameFolder("..".into()), "Renamed");
+        for bad in ["", ".."] {
+            crate::window::inline_name::rename(window.hwnd, &RowKind::Folder(bad.into()));
+            assert!(!inline_open(window.hwnd), "{bad:?} has no row");
+        }
         crate::window::inline_name::new_folder(window.hwnd, Some("..".into()));
         assert!(!inline_open(window.hwnd), "no draft outside the notebook");
 
@@ -17982,9 +18161,13 @@ mod tests {
         crate::window::library_host::new_note_in(window.hwnd, Some(scratch.folder()));
         let at_root = app_mut(window.hwnd).tabs.active().unwrap().id;
 
-        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
-        type_into_name_box(window.hwnd, "Moved");
-        crate::window::library_host::name_box_submit(window.hwnd);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "Moved");
+        field_key(
+            window.hwnd,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+        );
 
         let moved = scratch.folder().join("Moved");
         let save_folder = |id| {
@@ -18082,9 +18265,13 @@ mod tests {
         let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
         crate::window::library_host::fail_next_folder_rename_back();
 
-        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
-        type_into_name_box(window.hwnd, "Moved");
-        crate::window::library_host::name_box_submit(window.hwnd);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "Moved");
+        field_key(
+            window.hwnd,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+        );
 
         let moved = scratch.folder().join("Moved");
         assert!(moved.join("b.md").exists());
@@ -18098,7 +18285,7 @@ mod tests {
             "the rename stands, so the untitled tab's first save follows it"
         );
         assert!(!scratch.folder().join("sub").exists());
-        assert!(!name_box_visible(window.hwnd));
+        assert!(!inline_open(window.hwnd));
         let tabs = &app_mut(window.hwnd).tabs;
         assert_eq!(tabs.document(b_id).unwrap().path, Some(moved.join("b.md")));
         assert_eq!(tabs.document(a_id).unwrap().path, Some(a.clone()));
@@ -18119,7 +18306,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_rename_with_a_folder_row_focused_opens_the_folder_rename_box() {
+    fn palette_rename_with_a_folder_row_focused_edits_the_folder_row() {
         // Break caught: the palette's Note: Rename renaming the active tab's note while the user
         // had a folder row focused, or renaming anything before Enter (spec §9).
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
@@ -18149,15 +18336,13 @@ mod tests {
         unsafe { SetWindowTextW(query, typed.as_ptr()) };
         unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
 
-        let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
-        assert!(name_box.is_visible());
         assert_eq!(
-            name_box.purpose(),
-            Some(&crate::window::name_box::NamePurpose::RenameFolder(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::RenameFolder(
                 "sub".into()
             ))
         );
-        assert_eq!(name_box.text(), "sub");
+        assert_eq!(field_text(window.hwnd), "sub");
         assert!(
             scratch.folder().join("sub").is_dir(),
             "nothing renamed before Enter"

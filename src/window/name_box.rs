@@ -1,6 +1,6 @@
 //! The inline name box: one text field with Save and Browse… buttons, shown above the editor for
-//! a first save and for renaming a note. Enter saves, Esc cancels, Tab moves between the field
-//! and the buttons.
+//! a first save and for renaming a file the Notebook tree has no row for. Enter saves, Esc
+//! cancels, Tab moves between the field and the buttons.
 
 use crate::document::DocumentId;
 use crate::platform::{last_error, wide_null};
@@ -8,7 +8,6 @@ use crate::window::palette::Palette;
 use crate::window::panel::{
     create_child, create_child_with_id, create_panel, fill, inset, scale, text_height,
 };
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -48,25 +47,13 @@ pub(crate) const fn name_box_height(dpi: u32) -> i32 {
 pub(crate) enum NamePurpose {
     FirstSave(DocumentId),
     RenameNote(DocumentId),
-    /// Renaming this folder, relative to the notebook.
-    RenameFolder(PathBuf),
 }
 
 impl NamePurpose {
     /// The tab this purpose acts on: the box closes when that tab goes away.
-    pub(crate) fn document(&self) -> Option<DocumentId> {
+    pub(crate) fn document(&self) -> DocumentId {
         match self {
-            Self::FirstSave(id) | Self::RenameNote(id) => Some(*id),
-            Self::RenameFolder(_) => None,
-        }
-    }
-
-    /// For a folder rename box, the folder being renamed, which must stay in the tree for the box
-    /// to stay open. A folder box belongs to no tab.
-    pub(crate) fn folder(&self) -> Option<&Path> {
-        match self {
-            Self::FirstSave(_) | Self::RenameNote(_) => None,
-            Self::RenameFolder(folder) => Some(folder),
+            Self::FirstSave(id) | Self::RenameNote(id) => *id,
         }
     }
 }
@@ -348,19 +335,11 @@ impl NameBox {
     }
 
     /// Focuses the field with the name selected up to its extension, so typing replaces the stem.
-    /// A folder name has no extension: it is selected in full.
     pub(crate) fn focus(&self) {
         let text = self.text();
-        let folder = self
-            .purpose
-            .as_ref()
-            .is_some_and(|purpose| purpose.folder().is_some());
-        let end = if folder {
-            -1
-        } else {
-            text.rfind('.')
-                .map_or(-1, |dot| text[..dot].encode_utf16().count() as isize)
-        };
+        let end = text
+            .rfind('.')
+            .map_or(-1, |dot| text[..dot].encode_utf16().count() as isize);
         unsafe {
             SetFocus(self.edit);
             SendMessageW(self.edit, EM_SETSEL, 0, end);
