@@ -34,6 +34,8 @@ pub struct Palette {
     pub line_number_foreground: u32,
     /// Resting caption-button glyphs and status-line text on `strip_background`.
     pub strip_foreground: u32,
+    /// Error text on `editor_background` or the panel, such as a regex error in the Search view.
+    pub error_foreground: u32,
     /// Whether the frame and editor scrollbars should request the dark system styling.
     pub dark_frame: bool,
 }
@@ -59,6 +61,7 @@ const LIGHT: Palette = Palette {
     caret_line_background: rgb(245, 247, 250),
     line_number_foreground: rgb(110, 118, 129),
     strip_foreground: rgb(32, 32, 32),
+    error_foreground: rgb(0xA1, 0x26, 0x0D),
     dark_frame: false,
 };
 
@@ -79,6 +82,7 @@ const DARK: Palette = Palette {
     caret_line_background: rgb(40, 40, 40),
     line_number_foreground: rgb(133, 133, 133),
     strip_foreground: rgb(212, 212, 212),
+    error_foreground: rgb(0xF4, 0x87, 0x71),
     dark_frame: true,
 };
 
@@ -102,6 +106,7 @@ const fn catppuccin(flavor: &Flavor, dark: bool) -> Palette {
         caret_line_background: catppuccin::blend(flavor.text, flavor.base, 26),
         line_number_foreground: flavor.overlay1,
         strip_foreground: flavor.text,
+        error_foreground: flavor.red,
         dark_frame: dark,
     }
 }
@@ -173,6 +178,7 @@ impl Palette {
             caret_line_background: window,
             line_number_foreground: text,
             strip_foreground: color(COLOR_BTNTEXT),
+            error_foreground: text,
             dark_frame: false,
         }
     }
@@ -292,5 +298,31 @@ mod tests {
                 palette.close_hover_foreground
             );
         }
+    }
+
+    #[test]
+    fn the_error_color_stands_apart_from_the_text_and_the_background() {
+        // Break caught: a regex error in the Search view that reads like the note count, or
+        // vanishes into the background.
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
+            assert_ne!(
+                palette.error_foreground, palette.editor_background,
+                "{theme:?}"
+            );
+            assert_ne!(
+                palette.error_foreground, palette.editor_foreground,
+                "{theme:?}"
+            );
+            assert_ne!(
+                palette.error_foreground, palette.muted_foreground,
+                "{theme:?}"
+            );
+        }
+        assert_eq!(
+            Palette::for_theme(Theme::CatppuccinMocha, true).error_foreground,
+            unsafe { GetSysColor(COLOR_WINDOWTEXT) },
+            "high contrast keeps the system text color"
+        );
     }
 }

@@ -4966,7 +4966,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use windows_sys::Win32::Foundation::{HWND, LRESULT, RECT};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -11799,6 +11799,171 @@ mod tests {
             DestroyWindow(window.hwnd);
         }
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    /// The search field's toggle rectangles in the Search view's panel.
+    fn search_toggles(hwnd: HWND) -> (HWND, [RECT; 3]) {
+        let panel = sidebar_panel(hwnd);
+        let mut client = RECT::default();
+        unsafe { GetClientRect(panel, &mut client) };
+        let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+        let field = crate::window::search_view::SearchView::field_rect(client, dpi);
+        (
+            panel,
+            crate::window::option_toggles::toggle_rects(field, dpi),
+        )
+    }
+
+    const ALT_DOWN: LPARAM = 1 << 29;
+
+    #[test]
+    fn the_toggles_change_by_click_and_by_alt_keys_in_the_box_and_the_results() {
+        // Break caught: toggles that paint but ignore clicks, Alt+C/W/R going to the menu band
+        // instead of flipping the option, a toggle that flips it without searching again, or a
+        // regex error with no line saying so.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-toggles");
+        scratch.note("A.md", "Needle");
+        scratch.note("b.md", "needle");
+        scratch.note("c.md", "needles");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "needle");
+        assert_eq!(search_rows(window.hwnd).len(), 3);
+        let dpi = unsafe { GetDpiForWindow(sidebar_panel(window.hwnd)) }.max(96);
+        assert_eq!(
+            app_mut(window.hwnd)
+                .sidebar
+                .as_ref()
+                .unwrap()
+                .search
+                .list
+                .row_height,
+            crate::window::panel::scale(42, dpi),
+            "two-line rows"
+        );
+        let options = || crate::window::search_view::options(window.hwnd);
+
+        // A click on Match case.
+        let (panel, rects) = search_toggles(window.hwnd);
+        let center = |rect: RECT| {
+            ((((rect.top + rect.bottom) / 2) as u32) << 16 | ((rect.left + rect.right) / 2) as u32)
+                as LPARAM
+        };
+        let before = search_generation(window.hwnd);
+        unsafe {
+            SendMessageW(panel, WM_LBUTTONDOWN, 0, center(rects[0]));
+            SendMessageW(panel, WM_LBUTTONUP, 0, center(rects[0]));
+        }
+        assert!(options().case);
+        wait_for_search(window.hwnd, before);
+        assert_eq!(
+            search_rows(window.hwnd),
+            vec![search_row("b", "needle"), search_row("c", "needles")]
+        );
+
+        // Alt+C in the box turns it off again.
+        let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        let before = search_generation(window.hwnd);
+        unsafe { SendMessageW(edit, WM_SYSKEYDOWN, usize::from(b'C'), ALT_DOWN) };
+        assert!(!options().case);
+        wait_for_search(window.hwnd, before);
+        assert_eq!(search_rows(window.hwnd).len(), 3);
+        // The character that follows is swallowed, not handed to the menu band.
+        assert_eq!(
+            unsafe { SendMessageW(edit, WM_SYSCHAR, usize::from(b'c'), ALT_DOWN) },
+            0
+        );
+        assert!(app_mut(window.hwnd).menu_mode.is_none());
+
+        // Alt+W in the results: whole word drops "needles".
+        let before = search_generation(window.hwnd);
+        unsafe { SendMessageW(panel, WM_SYSKEYDOWN, usize::from(b'W'), ALT_DOWN) };
+        assert!(options().whole_word);
+        wait_for_search(window.hwnd, before);
+        assert_eq!(
+            search_rows(window.hwnd),
+            vec![search_row("A", "Needle"), search_row("b", "needle")]
+        );
+        // Without Alt held (F10 also sends WM_SYSKEYDOWN), nothing flips.
+        unsafe { SendMessageW(panel, WM_SYSKEYDOWN, usize::from(b'W'), 0) };
+        assert!(options().whole_word);
+
+        // Alt+R; an invalid pattern shows its error in place of the summary and keeps the rows.
+        let before = search_generation(window.hwnd);
+        unsafe { SendMessageW(edit, WM_SYSKEYDOWN, usize::from(b'R'), ALT_DOWN) };
+        assert!(options().regex);
+        wait_for_search(window.hwnd, before);
+        type_into_search(window.hwnd, "need(le");
+        pump_until(window.hwnd, || {
+            matches!(
+                search_state(window.hwnd),
+                crate::window::search_view::SearchState::PatternError(_)
+            )
+        });
+        let (message, error) = crate::window::search_view::summary(window.hwnd).unwrap();
+        assert!(error && !message.is_empty(), "{message}");
+        assert_eq!(
+            search_rows(window.hwnd).len(),
+            2,
+            "the previous results stay"
+        );
+    }
+
+    #[test]
+    fn esc_in_the_search_box_clears_it_and_then_returns_to_the_editor() {
+        // Break caught: Esc leaving the query in place, or jumping to the editor with text still
+        // in the box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-escape");
+        scratch.note("a.md", "ab");
+        let window = shown_window();
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "ab");
+        let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        unsafe { SetFocus(edit) };
+
+        unsafe { SendMessageW(edit, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        assert_eq!(unsafe { GetWindowTextLengthW(edit) }, 0);
+        assert!(search_rows(window.hwnd).is_empty());
+        assert_eq!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Idle
+        );
+        assert_eq!(focused(), edit, "the first Esc only clears");
+
+        unsafe { SendMessageW(edit, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        assert_eq!(
+            focused(),
+            editor.hwnd(),
+            "Esc in the empty box goes to the editor"
+        );
+    }
+
+    #[test]
+    fn with_no_notebook_the_search_box_and_its_toggles_still_work() {
+        // Break caught: the options impossible to set until a notebook opens.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        assert_eq!(
+            crate::window::search_view::status(window.hwnd),
+            Some(crate::window::search_view::NO_NOTEBOOK)
+        );
+        let edit = crate::window::search_view::edit_hwnd(window.hwnd).expect("the box shows");
+        unsafe { SendMessageW(edit, WM_SYSKEYDOWN, usize::from(b'C'), ALT_DOWN) };
+        assert!(crate::window::search_view::options(window.hwnd).case);
     }
 
     #[test]

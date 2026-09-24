@@ -8,7 +8,8 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASS, TTF_SUBCLASS,
-    TTM_ADDTOOLW, TTM_DELTOOLW, TTM_RELAYEVENT, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+    TTM_ADDTOOLW, TTM_DELTOOLW, TTM_RELAYEVENT, TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    TTTOOLINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DestroyWindow, GetCursorPos, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
@@ -118,6 +119,14 @@ impl Tooltip {
         };
         unsafe {
             SendMessageW(self.hwnd, TTM_RELAYEVENT, 0, &msg as *const MSG as LPARAM);
+        }
+    }
+
+    /// Lets tips break at `\r\n` and wrap at `width` pixels. Without a maximum width the control
+    /// shows every tip on one line.
+    pub(crate) fn set_max_width(&self, width: i32) {
+        unsafe {
+            SendMessageW(self.hwnd, TTM_SETMAXTIPWIDTH, 0, width as LPARAM);
         }
     }
 

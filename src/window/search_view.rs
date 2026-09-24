@@ -7,23 +7,25 @@
 
 use crate::config::SidebarView;
 use crate::library::model::same_path;
-use crate::library::text_search::{self, Progress, RunEnd, TextHit, hit_cmp};
+use crate::library::text_search::{self, Progress, RunEnd, SkipReason, TextHit, hit_cmp};
 use crate::platform::{last_error, wide_null};
-use crate::search::{MatchOptions, SearchOption, escape};
+use crate::search::{MatchOptions, SearchOption, Snippet, escape};
 use crate::window::library_host;
 use crate::window::main_window::OpenMode;
 use crate::window::notebook_view::LOAD_FAILED;
+use crate::window::option_toggles;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill, inset, scale, text_height};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
-use crate::window::side_panel::{self, ViewPaint, draw_text, point_of};
+use crate::window::side_panel::{self, UiFonts, ViewPaint, draw_text, point_of};
 use crate::window::text_search_host::{self, SearchBatch};
+use crate::window::tooltip::Tooltip;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, EndPaint, HBRUSH, HDC, InvalidateRect, PAINTSTRUCT, SetBkColor,
-    SetTextColor,
+    BeginPaint, CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_EXPANDTABS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT,
+    InvalidateRect, PAINTSTRUCT, SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::UI::Controls::{
     EM_GETMARGINS, EM_REPLACESEL, EM_SETSEL, EM_UNDO, WM_MOUSELEAVE,
@@ -48,7 +50,13 @@ pub(crate) const LOADING: &str = "Loading\u{2026}";
 pub(crate) const TOO_SHORT: &str = "Type at least 2 characters.";
 
 const HEADER_AT_96_DPI: i32 = 38;
-const ROW_AT_96_DPI: i32 = 26;
+/// The summary line, the notice and the status line.
+const LINE_AT_96_DPI: i32 = 22;
+/// A result: two line slots with a little room above and below. The 12 px Segoe UI line is 16 px
+/// tall at 96 DPI; the old one-line row was 26 px.
+const ROW_AT_96_DPI: i32 = 42;
+const ROW_LINE_AT_96_DPI: i32 = 18;
+const ROW_INSET_AT_96_DPI: i32 = 3;
 const PADDING_AT_96_DPI: i32 = 12;
 const FIELD_MARGIN_AT_96_DPI: i32 = 8;
 const FIELD_HEIGHT_AT_96_DPI: i32 = 28;
@@ -57,12 +65,15 @@ const GLYPH_AT_96_DPI: i32 = 20;
 const GAP_AT_96_DPI: i32 = 6;
 const DOCUMENT_GLYPH: &str = "\u{E8A5}";
 const SEARCH_HOOK_ID: usize = 0x4650_5356;
+/// The status line's tooltip. The toggles are tools 0 to 2, in `SearchOption::ALL` order.
+const STATUS_TOOL: usize = 3;
+const TOOLTIP_WIDTH_AT_96_DPI: i32 = 300;
 
-/// The box's placeholder: "Search <notebook>", with the notebook's display name.
+/// The box's placeholder: "Search text in <notebook>", with the notebook's display name.
 pub(crate) fn placeholder(notebook: Option<&Path>) -> String {
     notebook
-        .map(|notebook| format!("Search {}", library_host::notebook_name(notebook)))
-        .unwrap_or_else(|| "Search".to_owned())
+        .map(|notebook| format!("Search text in {}", library_host::notebook_name(notebook)))
+        .unwrap_or_else(|| "Search text".to_owned())
 }
 
 /// The search's progress, as the summary and status lines read it.
@@ -155,6 +166,126 @@ fn thousands(value: usize) -> String {
     grouped
 }
 
+/// The status line's tooltip: one line per reason that skipped a note.
+pub(crate) fn skipped_tooltip(progress: &Progress) -> String {
+    SkipReason::ALL
+        .into_iter()
+        .filter_map(|reason| {
+            let count = progress.skipped[reason.index()];
+            let why = match reason {
+                SkipReason::OnlineOnly => "online only",
+                SkipReason::TooLarge => "larger than 4 MB",
+                SkipReason::Unreadable => "couldn't be read",
+                SkipReason::NotText => "not text",
+            };
+            (count > 0).then(|| format!("{} {why}", thousands(count)))
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// The part of a snippet before its match, cut from the start (with `…`) until it is at most
+/// `room` pixels wide, so the match stays in view in a narrow panel. `measure` gives a text's
+/// width. Empty when not even `…` and one character fit.
+fn fit_before(before: &str, room: i32, measure: impl Fn(&str) -> i32) -> String {
+    if measure(before) <= room {
+        return before.to_owned();
+    }
+    let starts = before
+        .char_indices()
+        .map(|(index, _)| index)
+        .skip(1)
+        .collect::<Vec<_>>();
+    let cut = |start: usize| format!("\u{2026}{}", &before[start..]);
+    // A later start is never wider: find the first that fits.
+    let first = starts.partition_point(|&start| measure(&cut(start)) > room);
+    starts
+        .get(first)
+        .map_or_else(String::new, |&start| cut(start))
+}
+
+/// `text`'s width in `font`, measured as `draw_snippet` draws it: on one line, tabs expanded.
+fn text_width(hdc: HDC, text: &str, font: HFONT) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rect = RECT::default();
+    unsafe {
+        let previous = (!font.is_null()).then(|| SelectObject(hdc, font));
+        DrawTextW(
+            hdc,
+            wide.as_ptr(),
+            wide.len() as i32,
+            &mut rect,
+            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | DT_EXPANDTABS,
+        );
+        if let Some(previous) = previous {
+            SelectObject(hdc, previous);
+        }
+    }
+    (rect.right - rect.left).max(0)
+}
+
+/// A result's second line: the snippet, its match in bold. The text before the match is cut
+/// from its start when the row is too narrow, so the match stays in view. The snippet is the raw
+/// line and can hold tabs, so they are expanded (`DT_EXPANDTABS`) rather than drawn as boxes.
+unsafe fn draw_snippet(hdc: HDC, snippet: &Snippet, rect: RECT, fonts: UiFonts, color: u32) {
+    let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT | DT_EXPANDTABS;
+    let text = snippet.text.as_str();
+    let range = snippet.highlight.clone();
+    let (Some(before), Some(matched), Some(after)) = (
+        text.get(..range.start),
+        text.get(range.clone()),
+        text.get(range.end..),
+    ) else {
+        // Never made by `snippet::cut`, but a bad range draws the text plain, never panics.
+        unsafe { draw_text(hdc, text, rect, fonts.text, color, line | DT_END_ELLIPSIS) };
+        return;
+    };
+    let available = (rect.right - rect.left).max(0);
+    let room = (available - text_width(hdc, matched, fonts.text_bold)).max(available / 3);
+    let before = fit_before(before, room, |part| text_width(hdc, part, fonts.text));
+    let mut left = rect.left;
+    unsafe {
+        left += draw_text(hdc, &before, RECT { left, ..rect }, fonts.text, color, line);
+        if left < rect.right {
+            left += draw_text(
+                hdc,
+                matched,
+                RECT { left, ..rect },
+                fonts.text_bold,
+                color,
+                line | DT_END_ELLIPSIS,
+            );
+        }
+        if left < rect.right {
+            draw_text(
+                hdc,
+                after,
+                RECT { left, ..rect },
+                fonts.text,
+                color,
+                line | DT_END_ELLIPSIS,
+            );
+        }
+    }
+}
+
+/// A rectangle as an array, so the tooltip tools can be compared (`RECT` has no `PartialEq`).
+const fn edges(rect: RECT) -> [i32; 4] {
+    [rect.left, rect.top, rect.right, rect.bottom]
+}
+
+const fn rect_of(edges: [i32; 4]) -> RECT {
+    RECT {
+        left: edges[0],
+        top: edges[1],
+        right: edges[2],
+        bottom: edges[3],
+    }
+}
+
 fn inside(rect: RECT, point: POINT) -> bool {
     point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
 }
@@ -215,6 +346,15 @@ pub(crate) struct SearchView {
     thumb_grab: Option<i32>,
     /// Bumped whenever the results change (`AccessibleView::accessible_generation`).
     order: u64,
+    /// The toggle under the pointer.
+    toggle_hover: Option<SearchOption>,
+    /// The toggles' and the status line's tooltip, made when the pointer first moves over the
+    /// Search view.
+    tooltip: Option<Tooltip>,
+    /// The tooltip could not be made; it is not tried again.
+    tooltip_failed: bool,
+    /// The tools the tooltip has, so a pointer move changes them only when they differ.
+    tools_shown: Vec<(usize, [i32; 4], String)>,
 }
 
 impl SearchView {
@@ -243,6 +383,10 @@ impl SearchView {
             placeholder: placeholder(None),
             thumb_grab: None,
             order: 0,
+            toggle_hover: None,
+            tooltip: None,
+            tooltip_failed: false,
+            tools_shown: Vec::new(),
         }
     }
 
@@ -259,11 +403,87 @@ impl SearchView {
         }
     }
 
-    /// Where the results are: everything under the header.
+    /// Where the results are: under the header and the summary line, above the status line when
+    /// it shows.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
+        let top = (client.top + scale(HEADER_AT_96_DPI, dpi) + scale(LINE_AT_96_DPI, dpi))
+            .min(client.bottom);
+        let bottom = if self.status_line().is_some() {
+            (client.bottom - scale(LINE_AT_96_DPI, dpi)).max(top)
+        } else {
+            client.bottom
+        };
         RECT {
-            top: (client.top + scale(HEADER_AT_96_DPI, dpi)).min(client.bottom),
+            top,
+            bottom,
             ..client
+        }
+    }
+
+    /// The summary line under the box, where the notice shows too.
+    pub(crate) fn summary_rect(client: RECT, dpi: u32) -> RECT {
+        let pad = scale(PADDING_AT_96_DPI, dpi);
+        let top = (client.top + scale(HEADER_AT_96_DPI, dpi)).min(client.bottom);
+        RECT {
+            left: client.left + pad,
+            top,
+            right: client.right - pad,
+            bottom: (top + scale(LINE_AT_96_DPI, dpi)).min(client.bottom),
+        }
+    }
+
+    /// The status line along the bottom.
+    pub(crate) fn status_rect(client: RECT, dpi: u32) -> RECT {
+        let pad = scale(PADDING_AT_96_DPI, dpi);
+        RECT {
+            left: client.left + pad,
+            top: (client.bottom - scale(LINE_AT_96_DPI, dpi)).max(client.top),
+            right: client.right - pad,
+            bottom: client.bottom,
+        }
+    }
+
+    /// The toggle under `point`, while the field shows.
+    fn toggle_at(&self, point: POINT, client: RECT, dpi: u32) -> Option<SearchOption> {
+        self.edit?;
+        option_toggles::hit(
+            &option_toggles::toggle_rects(Self::field_rect(client, dpi), dpi),
+            point,
+        )
+    }
+
+    /// The tooltip's tools: the toggles while the field shows, and the status line while it says
+    /// notes were skipped. An empty text removes a tool.
+    fn tooltip_tools(&self, client: RECT, dpi: u32) -> Vec<(usize, [i32; 4], String)> {
+        let rects = option_toggles::toggle_rects(Self::field_rect(client, dpi), dpi);
+        let mut tools = SearchOption::ALL
+            .into_iter()
+            .zip(rects)
+            .enumerate()
+            .map(|(id, (option, rect))| {
+                let text = if self.edit.is_some() {
+                    option_toggles::tooltip(option).to_owned()
+                } else {
+                    String::new()
+                };
+                (id, edges(rect), text)
+            })
+            .collect::<Vec<_>>();
+        let skipped = match &self.search {
+            SearchState::Done { progress, .. } if self.notice().is_none() => {
+                skipped_tooltip(progress)
+            }
+            _ => String::new(),
+        };
+        tools.push((STATUS_TOOL, edges(Self::status_rect(client, dpi)), skipped));
+        tools
+    }
+
+    /// Destroys the view's tooltip, if it made one. The popup is owned by the main window, so
+    /// destroying the panel does not take it along (`side_panel::destroy_windows` calls this).
+    pub(crate) fn destroy_tooltip(&self) {
+        if let Some(tooltip) = self.tooltip {
+            tooltip.destroy();
         }
     }
 
@@ -423,40 +643,51 @@ impl SearchView {
         let dpi = paint.dpi;
         let palette = paint.palette;
         let client = paint.client;
-        let pad = scale(PADDING_AT_96_DPI, dpi);
-        let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+        let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT | DT_END_ELLIPSIS;
         unsafe {
             fill(paint.hdc, client, paint.background);
-            if self.notebook.is_some() {
+            if self.edit.is_some() {
                 let field = Self::field_rect(client, dpi);
                 fill(paint.hdc, field, palette.selection_background);
                 fill(paint.hdc, inset(field, 1), palette.editor_background);
+                option_toggles::paint(
+                    paint.hdc,
+                    &option_toggles::toggle_rects(field, dpi),
+                    self.options,
+                    self.toggle_hover,
+                    &palette,
+                    paint.fonts.text,
+                );
             }
-            // One line in place of the list: the notice, or the summary while there is no row.
-            // Task 5 gives the summary and the status line places of their own.
-            let line_text = self.notice().map(str::to_owned).or_else(|| {
-                self.results
-                    .is_empty()
-                    .then(|| self.summary().map(|(text, _)| text))
-                    .flatten()
-            });
-            if let Some(text) = line_text {
-                let area = self.list_area(client, dpi);
-                let status_line = RECT {
-                    left: client.left + pad,
-                    top: area.top,
-                    right: client.right - pad,
-                    bottom: area.top + scale(ROW_AT_96_DPI, dpi),
-                };
+            let summary = Self::summary_rect(client, dpi);
+            if let Some(notice) = self.notice() {
                 draw_text(
                     paint.hdc,
-                    &text,
-                    status_line,
+                    notice,
+                    summary,
                     paint.fonts.text,
                     palette.muted_foreground,
-                    line | DT_LEFT | DT_END_ELLIPSIS,
+                    line,
                 );
                 return;
+            }
+            if let Some((text, error)) = self.summary() {
+                let color = if error {
+                    palette.error_foreground
+                } else {
+                    palette.muted_foreground
+                };
+                draw_text(paint.hdc, &text, summary, paint.fonts.text, color, line);
+            }
+            if let Some(status) = self.status_line() {
+                draw_text(
+                    paint.hdc,
+                    &status,
+                    Self::status_rect(client, dpi),
+                    paint.fonts.text,
+                    palette.muted_foreground,
+                    line,
+                );
             }
         }
         let area = self.list_area(client, dpi);
@@ -470,7 +701,8 @@ impl SearchView {
         );
     }
 
-    /// One result: the file icon, the name, and its folder in dim text.
+    /// One result on two lines: the file icon, the name and its folder in dim text, then the
+    /// snippet with its match in bold.
     fn draw_row(&self, hdc: HDC, index: usize, rect: RECT, look: RowLook, paint: &ViewPaint) {
         let Some(result) = self.results.get(index) else {
             return;
@@ -478,11 +710,17 @@ impl SearchView {
         let dpi = paint.dpi;
         let palette = paint.palette;
         let pad = scale(PADDING_AT_96_DPI, dpi);
+        let slot = scale(ROW_LINE_AT_96_DPI, dpi);
         let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+        let first = RECT {
+            top: rect.top + scale(ROW_INSET_AT_96_DPI, dpi),
+            bottom: rect.top + scale(ROW_INSET_AT_96_DPI, dpi) + slot,
+            ..rect
+        };
         let glyph = RECT {
             left: rect.left + pad,
             right: rect.left + pad + scale(GLYPH_AT_96_DPI, dpi),
-            ..rect
+            ..first
         };
         let foreground = row_foreground(look, &palette);
         // Over the focused selection, dim text takes the selection's text color to stay legible.
@@ -494,7 +732,12 @@ impl SearchView {
         let text = RECT {
             left: glyph.right + scale(GAP_AT_96_DPI, dpi),
             right: rect.right - pad,
-            ..rect
+            ..first
+        };
+        let second = RECT {
+            top: first.bottom,
+            bottom: first.bottom + slot,
+            ..text
         };
         unsafe {
             draw_text(
@@ -526,6 +769,7 @@ impl SearchView {
                     line | DT_LEFT | DT_END_ELLIPSIS,
                 );
             }
+            draw_snippet(hdc, &result.snippet, second, paint.fonts, foreground);
         }
     }
 
@@ -742,10 +986,6 @@ pub(crate) fn options(hwnd: HWND) -> MatchOptions {
 }
 
 /// Flips `option` and runs the query again at once.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the toggle buttons and Alt keys call it (Task 5)")
-)]
 pub(crate) fn toggle_option(hwnd: HWND, option: SearchOption) {
     let Some(panel) = with_view(hwnd, |view| {
         view.options = view.options.toggled(option);
@@ -831,15 +1071,16 @@ fn create_edit(panel: HWND) -> crate::Result<HWND> {
     Ok(edit)
 }
 
-/// Places the box in the header and shows it while the Search view shows a notebook, making it
-/// the first time. Part of `side_panel::layout`, and run whenever the view or the notebook
-/// changes.
+/// Places the box in the header, short of the toggles, and shows it while the Search view shows,
+/// making it the first time the view shows a notebook. Part of `side_panel::layout`, and run
+/// whenever the view or the notebook changes. It never makes the box without a notebook: at
+/// startup that would come before the first paint. `shown` makes it once the user opens the view.
 pub(crate) fn layout(hwnd: HWND) {
     let Some(has_notebook) = with_view(hwnd, |view| view.notebook.is_some()) else {
         return;
     };
-    let show = has_notebook && side_panel::current_view(hwnd) == SidebarView::Search;
-    let edit = if show {
+    let show = side_panel::current_view(hwnd) == SidebarView::Search;
+    let edit = if show && has_notebook {
         ensure_edit(hwnd)
     } else {
         with_view(hwnd, |view| view.edit).flatten()
@@ -859,15 +1100,9 @@ pub(crate) fn layout(hwnd: HWND) {
     let text = text_height(edit, text_font).clamp(1, (field.bottom - field.top - 2).max(1));
     let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
     let top = field.top + (field.bottom - field.top - text) / 2;
+    let width = (field.right - field.left - inset_x - option_toggles::reserved_width(dpi)).max(0);
     unsafe {
-        MoveWindow(
-            edit,
-            field.left + inset_x,
-            top,
-            (field.right - field.left - 2 * inset_x).max(0),
-            text,
-            1,
-        );
+        MoveWindow(edit, field.left + inset_x, top, width, text, 1);
     }
     with_view(hwnd, |view| {
         view.list.row_height = scale(ROW_AT_96_DPI, dpi)
@@ -892,16 +1127,16 @@ fn hide_box(edit: HWND) {
     }
 }
 
-/// `side_panel::show_view` switched to Search. `focus` puts the caret in the box (Ctrl+K). A
-/// library change while the view was hidden runs the query again now.
+/// `side_panel::show_view` switched to Search. The user opened it, so the box is made now even
+/// with no notebook: its toggles set the options (spec §4). `focus` puts the caret in the box. A
+/// library change while the view was hidden runs the query again now, if the notes changed.
 pub(crate) fn shown(hwnd: HWND, focus: bool) {
+    ensure_edit(hwnd);
     layout(hwnd);
     if with_view(hwnd, |view| std::mem::take(&mut view.stale)).unwrap_or(false) {
         text_search_host::library_changed(hwnd);
     }
-    let Some((panel, edit, has_notebook)) = with_view(hwnd, |view| {
-        (view.panel, view.edit, view.notebook.is_some())
-    }) else {
+    let Some((panel, edit)) = with_view(hwnd, |view| (view.panel, view.edit)) else {
         return;
     };
     if !focus {
@@ -909,31 +1144,55 @@ pub(crate) fn shown(hwnd: HWND, focus: bool) {
     }
     unsafe {
         match edit {
-            Some(edit) if has_notebook => {
+            Some(edit) => {
                 SetFocus(edit);
                 SendMessageW(edit, EM_SETSEL, 0, -1);
             }
-            _ => {
+            None => {
                 SetFocus(panel);
             }
         }
     }
 }
 
-/// `side_panel::show_view` switched away from Search. The query stays.
+/// `side_panel::show_view` switched away from Search. The query stays. The toggles' tooltips go,
+/// or they would show over the other view.
 pub(crate) fn hidden(hwnd: HWND) {
-    if let Some(edit) = with_view(hwnd, |view| view.edit).flatten() {
+    let Some((edit, tooltip, tools)) = with_view(hwnd, |view| {
+        (
+            view.edit,
+            view.tooltip,
+            std::mem::take(&mut view.tools_shown),
+        )
+    }) else {
+        return;
+    };
+    if let Some(tooltip) = tooltip {
+        for (id, _, _) in tools {
+            tooltip.set_tool(id, RECT::default(), "");
+        }
+    }
+    if let Some(edit) = edit {
         hide_box(edit);
     }
 }
 
-/// The panel's `WM_PAINT` while the Search view shows.
+/// The panel's `WM_PAINT` while the Search view shows. The bold snippet font is made here, the
+/// first time a result paints, so nothing new is made before the window's first paint.
 pub(crate) fn paint(hwnd: HWND, paint: &ViewPaint) {
-    with_view(hwnd, |view| view.set_colors(paint.palette));
+    let mut paint = *paint;
+    if let Some(mut app) = unsafe { super::main_window::app_ptr(hwnd) }
+        && let Some(sidebar) = unsafe { app.as_mut() }.sidebar.as_mut()
+    {
+        sidebar.search.set_colors(paint.palette);
+        if !sidebar.search.results.is_empty() && sidebar.search.notice().is_none() {
+            paint.fonts.text_bold = sidebar.text_bold(paint.dpi);
+        }
+    }
     if let Some(app) = unsafe { super::main_window::app_ptr(hwnd) }
         && let Some(sidebar) = unsafe { app.as_ref() }.sidebar.as_ref()
     {
-        sidebar.search.paint(paint);
+        sidebar.search.paint(&paint);
     }
 }
 
@@ -996,10 +1255,10 @@ fn enter_results(hwnd: HWND, panel: HWND) {
 }
 
 /// Whether panel point (`x`, `y`) is on the painted search field, which is client area, not
-/// window caption. The field shows only while a notebook is open.
+/// window caption. The field shows once the box exists.
 pub(crate) fn header_hit(hwnd: HWND, panel: HWND, x: i32, y: i32) -> bool {
     let (client, dpi) = geometry(panel);
-    with_view(hwnd, |view| view.notebook.is_some()).unwrap_or(false)
+    with_view(hwnd, |view| view.edit.is_some()).unwrap_or(false)
         && inside(SearchView::field_rect(client, dpi), POINT { x, y })
 }
 
@@ -1018,7 +1277,52 @@ fn field_pressed(hwnd: HWND, panel: HWND, at: POINT) -> bool {
     true
 }
 
-/// Input for the Search view's result list. `None` leaves the message to the panel.
+/// Gives the tooltip the tools the view has now, making the tooltip on the first pointer move and
+/// handing it that move. Runs with nothing of the App borrowed: creating the control and adding
+/// tools send messages.
+fn update_tooltips(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+    let (client, dpi) = geometry(panel);
+    let Some((tools, existing, failed, changed)) = with_view(hwnd, |view| {
+        let tools = view.tooltip_tools(client, dpi);
+        let changed = tools != view.tools_shown;
+        (tools, view.tooltip, view.tooltip_failed, changed)
+    }) else {
+        return;
+    };
+    let (tooltip, created) = match existing {
+        Some(tooltip) => (tooltip, false),
+        None if failed => return,
+        None => {
+            let created = Tooltip::create(panel);
+            let kept = with_view(hwnd, |view| {
+                view.tooltip = created;
+                view.tooltip_failed = created.is_none();
+            });
+            match (created, kept) {
+                (Some(tooltip), Some(())) => {
+                    tooltip.set_max_width(scale(TOOLTIP_WIDTH_AT_96_DPI, dpi));
+                    (tooltip, true)
+                }
+                (Some(tooltip), None) => {
+                    tooltip.destroy();
+                    return;
+                }
+                (None, _) => return,
+            }
+        }
+    };
+    if changed || created {
+        for (id, rect, text) in &tools {
+            tooltip.set_tool(*id, rect_of(*rect), text);
+        }
+        with_view(hwnd, |view| view.tools_shown = tools);
+    }
+    if created {
+        tooltip.relay(message, wparam, lparam);
+    }
+}
+
+/// Input for the Search view's field and result list. `None` leaves the message to the panel.
 pub(crate) fn handle(
     hwnd: HWND,
     panel: HWND,
@@ -1026,6 +1330,15 @@ pub(crate) fn handle(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
+    // Alt+C, Alt+W and Alt+R in the results flip the toggles (spec §4), and the character that
+    // follows is swallowed before the menu band sees it.
+    if let Some(option) = option_toggles::alt_option(message, wparam, lparam) {
+        toggle_option(hwnd, option);
+        return Some(0);
+    }
+    if option_toggles::is_toggle_char(message, wparam, lparam) {
+        return Some(0);
+    }
     let (client, dpi) = geometry(panel);
     match message {
         WM_MOUSEMOVE => {
@@ -1044,8 +1357,24 @@ pub(crate) fn handle(
                     let area = view.list_area(client, dpi);
                     return view.list.drag_thumb(grab, at.y - area.top, height(area));
                 }
+                let toggle = view.toggle_at(at, client, dpi);
+                let toggle_changed = std::mem::replace(&mut view.toggle_hover, toggle) != toggle;
                 let hover = view.row_under(at, client, dpi);
-                view.list.set_hover(hover)
+                let row_changed = view.list.set_hover(hover);
+                toggle_changed || row_changed
+            })
+            .unwrap_or(false);
+            if changed {
+                invalidate(panel);
+            }
+            update_tooltips(hwnd, panel, message, wparam, lparam);
+            Some(0)
+        }
+        WM_MOUSELEAVE => {
+            let changed = with_view(hwnd, |view| {
+                let toggle_changed = view.toggle_hover.take().is_some();
+                let row_changed = view.list.set_hover(None);
+                toggle_changed || row_changed
             })
             .unwrap_or(false);
             if changed {
@@ -1053,14 +1382,13 @@ pub(crate) fn handle(
             }
             Some(0)
         }
-        WM_MOUSELEAVE => {
-            if with_view(hwnd, |view| view.list.set_hover(None)).unwrap_or(false) {
-                invalidate(panel);
-            }
-            Some(0)
-        }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let at = point(lparam);
+            if let Some(option) = with_view(hwnd, |view| view.toggle_at(at, client, dpi)).flatten()
+            {
+                toggle_option(hwnd, option);
+                return Some(0);
+            }
             if field_pressed(hwnd, panel, at) {
                 return Some(0);
             }
@@ -1217,6 +1545,14 @@ unsafe extern "system" fn search_edit_proc(
     if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b) {
         return 0;
     }
+    // Alt+C, Alt+W and Alt+R flip the toggles before the menu band sees the letter (spec §4).
+    if let Some(option) = option_toggles::alt_option(message, wparam, lparam) {
+        toggle_option(main, option);
+        return 0;
+    }
+    if option_toggles::is_toggle_char(message, wparam, lparam) {
+        return 0;
+    }
     if message == WM_PAINT
         && unsafe { GetWindowTextLengthW(hwnd) } == 0
         && paint_placeholder(main, hwnd)
@@ -1239,7 +1575,17 @@ unsafe extern "system" fn search_edit_proc(
                 return 0;
             }
             VK_ESCAPE => {
-                super::main_window::focus_content(main);
+                // Esc clears the box; in an empty box it returns to the editor (spec §4).
+                if unsafe { GetWindowTextLengthW(hwnd) } > 0 {
+                    let empty = wide_null("");
+                    // WM_SETTEXT comes back through this proc, which repaints the placeholder,
+                    // and EN_CHANGE clears the results.
+                    unsafe {
+                        SetWindowTextW(hwnd, empty.as_ptr());
+                    }
+                } else {
+                    super::main_window::focus_content(main);
+                }
                 return 0;
             }
             _ => {}
@@ -1363,12 +1709,14 @@ impl crate::window::sidebar_accessibility::AccessibleView for SearchView {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOADING, NO_MATCH, NO_NOTEBOOK, SearchState, SearchView, TOO_SHORT, notice_text,
-        placeholder, status_text, summary_text,
+        LOADING, NO_MATCH, NO_NOTEBOOK, ROW_AT_96_DPI, ROW_INSET_AT_96_DPI, ROW_LINE_AT_96_DPI,
+        SearchState, SearchView, TOO_SHORT, fit_before, notice_text, placeholder, skipped_tooltip,
+        status_text, summary_text,
     };
     use crate::library::text_search::{Progress, RunEnd, TextHit};
     use crate::search::{MatchOptions, SearchOption, Snippet};
     use crate::window::notebook_view::LOAD_FAILED;
+    use crate::window::panel::scale;
     use crate::window::text_search_host::SearchBatch;
     use std::path::{Path, PathBuf};
 
@@ -1383,13 +1731,85 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_names_the_open_notebook() {
-        // Break caught: the box saying "Search" with no hint of which notebook it searches.
+    fn the_placeholder_says_it_searches_text_in_the_open_notebook() {
+        // Break caught: the box saying "Search" with no hint that it searches the notes' text,
+        // or of which notebook.
         assert_eq!(
             placeholder(Some(Path::new(r"C:\Users\me\Work"))),
-            "Search Work"
+            "Search text in Work"
         );
-        assert_eq!(placeholder(None), "Search");
+        assert_eq!(placeholder(None), "Search text");
+    }
+
+    #[test]
+    fn a_long_prefix_is_cut_from_the_start_so_the_match_stays_in_view() {
+        // Break caught: in a narrow panel, forty characters before the match pushing it off the
+        // row, or a cut inside a multi-byte character.
+        let measure = |text: &str| text.chars().count() as i32 * 10;
+        assert_eq!(fit_before("abcdef", 100, measure), "abcdef");
+        assert_eq!(fit_before("abcdef", 40, measure), "\u{2026}def");
+        assert_eq!(fit_before("\u{2026}été ab", 50, measure), "\u{2026}é ab");
+        assert_eq!(
+            fit_before("abc", 5, measure),
+            "",
+            "not even the ellipsis fits"
+        );
+        assert_eq!(fit_before("", 0, measure), "");
+    }
+
+    #[test]
+    fn the_skipped_tooltip_has_one_line_per_reason_that_skipped_a_note() {
+        let progress = Progress {
+            visited: 9,
+            total: 9,
+            skipped: [2, 0, 1, 1_500],
+        };
+        assert_eq!(
+            skipped_tooltip(&progress),
+            "2 online only\r\n1 couldn't be read\r\n1,500 not text"
+        );
+        let large = Progress {
+            skipped: [0, 3, 0, 0],
+            ..progress
+        };
+        assert_eq!(skipped_tooltip(&large), "3 larger than 4 MB");
+        assert_eq!(skipped_tooltip(&Progress::default()), "");
+    }
+
+    #[test]
+    fn a_result_row_holds_two_lines_of_the_sidebar_text_at_every_dpi() {
+        // Break caught: the snippet line clipped at 150% or 200%, or the bold match taller than
+        // its slot.
+        use crate::window::titlebar::create_ui_font;
+        use windows_sys::Win32::Graphics::Gdi::{
+            DeleteObject, FW_BOLD, FW_NORMAL, GetDC, GetTextMetricsW, ReleaseDC, SelectObject,
+            TEXTMETRICW,
+        };
+        for dpi in [96, 120, 144, 192] {
+            let mut tallest = 0;
+            for weight in [FW_NORMAL, FW_BOLD] {
+                let font = create_ui_font(scale(12, dpi), "Segoe UI", weight as i32, false);
+                unsafe {
+                    let dc = GetDC(std::ptr::null_mut());
+                    let previous = SelectObject(dc, font);
+                    let mut metrics = TEXTMETRICW::default();
+                    assert_ne!(GetTextMetricsW(dc, &mut metrics), 0);
+                    tallest = tallest.max(metrics.tmHeight);
+                    SelectObject(dc, previous);
+                    ReleaseDC(std::ptr::null_mut(), dc);
+                    DeleteObject(font);
+                }
+            }
+            assert!(
+                scale(ROW_LINE_AT_96_DPI, dpi) >= tallest,
+                "{dpi}: {tallest}"
+            );
+            assert!(
+                scale(ROW_AT_96_DPI, dpi)
+                    >= 2 * scale(ROW_LINE_AT_96_DPI, dpi) + 2 * scale(ROW_INSET_AT_96_DPI, dpi) - 1,
+                "{dpi}"
+            );
+        }
     }
 
     #[test]

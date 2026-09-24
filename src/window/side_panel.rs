@@ -27,7 +27,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DRAW_TEXT_FORMAT, DT_CALCRECT,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FW_SEMIBOLD, HDC, HFONT,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FW_SEMIBOLD, HDC, HFONT,
     InvalidateRect, PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
     TRANSPARENT,
 };
@@ -44,8 +44,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
     WM_CTLCOLOREDIT, WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WNDCLASSW, WNDPROC, WS_CHILD,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WNDCLASSW,
+    WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 /// Sizes at 96 DPI, scaled with `panel::scale`.
@@ -60,6 +60,9 @@ pub(crate) const GRIP_WIDTH_96: i32 = 4;
 pub(crate) struct UiFonts {
     /// Row and body text: Segoe UI, 12 px at 96 DPI.
     pub(crate) text: HFONT,
+    /// The match in a Search result's snippet: Segoe UI bold, 12 px. Made on the first paint of a
+    /// snippet (`Sidebar::text_bold`), not with the others, so it adds nothing before first paint.
+    pub(crate) text_bold: HFONT,
     /// Header titles in small capitals: Segoe UI semibold, 11 px.
     pub(crate) bold: HFONT,
     /// Unsaved rows and notices inside the list: Segoe UI italic, 12 px.
@@ -74,6 +77,7 @@ impl Default for UiFonts {
     fn default() -> Self {
         Self {
             text: std::ptr::null_mut(),
+            text_bold: std::ptr::null_mut(),
             bold: std::ptr::null_mut(),
             italic: std::ptr::null_mut(),
             glyph: std::ptr::null_mut(),
@@ -87,6 +91,7 @@ impl UiFonts {
         let normal = FW_NORMAL as i32;
         Self {
             text: create_ui_font(scale(12, dpi), "Segoe UI", normal, false),
+            text_bold: std::ptr::null_mut(),
             bold: create_ui_font(scale(11, dpi), "Segoe UI", FW_SEMIBOLD as i32, false),
             italic: create_ui_font(scale(12, dpi), "Segoe UI", normal, true),
             glyph: create_ui_font(scale(12, dpi), "Segoe MDL2 Assets", normal, false),
@@ -97,6 +102,7 @@ impl UiFonts {
     fn delete(self) {
         for font in [
             self.text,
+            self.text_bold,
             self.bold,
             self.italic,
             self.glyph,
@@ -149,6 +155,20 @@ impl Sidebar {
         let fonts = UiFonts::create(dpi);
         self.fonts = Some((dpi, fonts));
         fonts
+    }
+
+    /// The bold text font for `dpi`, made the first time a Search snippet paints at that DPI.
+    /// It lives with the other fonts and goes with them.
+    pub(crate) fn text_bold(&mut self, dpi: u32) -> HFONT {
+        let font = self.fonts(dpi).text_bold;
+        if !font.is_null() {
+            return font;
+        }
+        let font = create_ui_font(scale(12, dpi), "Segoe UI", FW_BOLD as i32, false);
+        if let Some((_, fonts)) = self.fonts.as_mut() {
+            fonts.text_bold = font;
+        }
+        font
     }
 }
 
@@ -414,6 +434,7 @@ fn destroy_windows(sidebar: &Sidebar) {
         tooltip.destroy();
     }
     sidebar.notebook.destroy_tooltip();
+    sidebar.search.destroy_tooltip();
     unsafe {
         DestroyWindow(sidebar.panel);
         DestroyWindow(sidebar.bar);
@@ -980,6 +1001,10 @@ unsafe extern "system" fn panel_proc(
         }
         // Capture taken away mid-drag (a task switch, a dialog): keep and save what was reached.
         WM_CAPTURECHANGED if finish_resize(main, false) => 0,
+        // The Search view's Alt+C, Alt+W and Alt+R, before the menu band sees the letter.
+        WM_SYSKEYDOWN | WM_SYSCHAR if current_view(main) == SidebarView::Search => {
+            route(main, panel, message, wparam, lparam)
+        }
         // Everything else a view may want goes to it first. Wheel and context-menu positions are
         // screen coordinates; the view converts them.
         WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_CAPTURECHANGED
@@ -1005,7 +1030,9 @@ unsafe extern "system" fn panel_proc(
 /// `DefWindowProcW` handles whatever the view leaves (`None`).
 fn route(main: HWND, panel: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let answer = PanelView::of(current_view(main)).and_then(|view| match message {
-        WM_KEYDOWN | WM_CHAR => view_key(main, view, panel, message, wparam, lparam),
+        WM_KEYDOWN | WM_CHAR | WM_SYSKEYDOWN | WM_SYSCHAR => {
+            view_key(main, view, panel, message, wparam, lparam)
+        }
         _ => view_mouse(main, view, panel, message, wparam, lparam),
     });
     answer.unwrap_or_else(|| unsafe { DefWindowProcW(panel, message, wparam, lparam) })
@@ -1081,8 +1108,8 @@ fn view_mouse(
     }
 }
 
-/// `WM_KEYDOWN` and `WM_CHAR` while the panel has the focus. `None` leaves the key to
-/// `DefWindowProcW`. Each view's `handle` takes keys and mouse messages alike.
+/// `WM_KEYDOWN`, `WM_CHAR`, `WM_SYSKEYDOWN` and `WM_SYSCHAR` while the panel has the focus. `None`
+/// leaves the key to `DefWindowProcW`. Each view's `handle` takes keys and mouse messages alike.
 fn view_key(
     main: HWND,
     view: PanelView,
