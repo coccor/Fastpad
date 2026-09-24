@@ -2,11 +2,12 @@ use crate::editor::scintilla_constants::{
     SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY,
     SCI_CREATEDOCUMENT, SCI_CUT, SCI_EMPTYUNDOBUFFER, SCI_ENDUNDOACTION, SCI_GETDIRECTFUNCTION,
     SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETLENGTH, SCI_GETSELECTIONEND,
-    SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTEXT, SCI_GETTEXTLENGTH, SCI_PASTE, SCI_REDO,
-    SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET, SCI_SEARCHINTARGET, SCI_SETCODEPAGE,
-    SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETSEL,
-    SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_STYLECLEARALL, SCI_STYLESETBACK,
-    SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
+    SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTARGETEND, SCI_GETTEXT, SCI_GETTEXTLENGTH,
+    SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET,
+    SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETSAVEPOINT,
+    SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION,
+    SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
+    SCI_UNDO,
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{
@@ -461,6 +462,11 @@ impl Editor {
         let _ = self.endpoint.send_direct_if_alive(SCI_SCROLLCARET, 0, 0);
     }
 
+    /// Searches `range` for `needle` with `search_flags`. A backward search passes a range whose
+    /// start is after its end. The match's end is Scintilla's own target end, so a regular
+    /// expression's match is as long as the text it matched, not as long as the pattern.
+    /// Scintilla reports a pattern it can't compile as a miss (-1, or -2 in some versions), and
+    /// so does this: `Ok(None)`, never an error.
     #[cfg(windows)]
     pub fn search_in_target(
         &self,
@@ -483,9 +489,11 @@ impl Editor {
         if found < 0 {
             return Ok(None);
         }
-
-        let start = found as usize;
-        Ok(Some(start..start + needle.as_bytes().len()))
+        let end = self
+            .endpoint
+            .send_direct_checked(SCI_GETTARGETEND, 0, 0)?
+            .max(found);
+        Ok(Some(found as usize..end as usize))
     }
 
     #[cfg(not(windows))]
@@ -540,6 +548,10 @@ impl Editor {
                 else {
                     break;
                 };
+                // A regex that matched empty text would match at the same place forever.
+                if found.is_empty() {
+                    break;
+                }
                 let replaced = self.replace_target(found, replacement)?;
                 count += 1;
                 position = replaced.end;
@@ -1473,12 +1485,13 @@ mod tests {
     use crate::editor::scintilla_constants::{
         SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
         SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
-        SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_PASTE,
-        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETDOCPOINTER,
-        SCI_SETELEMENTCOLOUR, SCI_SETILEXER, SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT,
-        SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS,
-        SCI_SETSEL, SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
-        SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
+        SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT,
+        SCI_GETTARGETEND, SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET,
+        SCI_SEARCHINTARGET, SCI_SETDOCPOINTER, SCI_SETELEMENTCOLOUR, SCI_SETILEXER,
+        SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
+        SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
+        SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
+        SCI_UNDO,
     };
     use crate::editor::scintilla_constants::{
         SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_SETZOOM, SCI_STYLEGETBACK,
@@ -1662,11 +1675,59 @@ mod tests {
         assert_eq!(found, Some(7..13));
         assert_eq!(
             harness.messages(),
-            vec![SCI_SETTARGETRANGE, SCI_SETSEARCHFLAGS, SCI_SEARCHINTARGET]
+            vec![
+                SCI_SETTARGETRANGE,
+                SCI_SETSEARCHFLAGS,
+                SCI_SEARCHINTARGET,
+                SCI_GETTARGETEND
+            ]
         );
         assert_eq!(harness.target_range(), Some((3, 15)));
         assert_eq!(harness.search_flags(), Some(99));
         assert_eq!(harness.search_needle(), Some(b"needle".to_vec()));
+    }
+
+    #[test]
+    fn search_in_target_reports_the_length_scintilla_matched() {
+        // Break caught: a regex hit reported as long as the pattern, so `\d+` over "12345"
+        // selects three characters, or a find-next that starts inside the previous match.
+        let harness = TestDirectHarness::new();
+        harness.push_response(2);
+        harness.push_target_end(7);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert_eq!(
+            editor.search_in_target(r"\d+", 0..10, 0).unwrap(),
+            Some(2..7)
+        );
+    }
+
+    #[test]
+    fn a_pattern_scintilla_cannot_compile_is_a_miss_not_an_error() {
+        // Break caught: Scintilla's -2 (a bad regex in some versions) turned into an error or a
+        // bogus range, which the find bar would report or panic on.
+        let harness = TestDirectHarness::new();
+        harness.push_response(-2);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert_eq!(editor.search_in_target("(", 0..10, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn replace_all_stops_at_an_empty_match() {
+        // Break caught: a regex that can match empty text (`x*`) replacing at the same
+        // position forever, or inserting the replacement between every character.
+        let harness = TestDirectHarness::new();
+        harness.push_response(0); // SCI_BEGINUNDOACTION
+        harness.push_response(5); // SCI_GETLENGTH
+        harness.push_response(0); // SCI_SEARCHINTARGET: an empty match at 0
+        harness.push_target_end(0);
+        harness.push_response(0); // SCI_ENDUNDOACTION
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert_eq!(editor.replace_all("x*", "y", 0).unwrap(), 0);
+        assert!(harness.replace_bytes().is_empty());
+        assert_eq!(harness.event_log(), vec!["begin", "end"]);
     }
 
     #[test]
@@ -2206,6 +2267,10 @@ mod tests {
         target_range: Option<(usize, isize)>,
         search_flags: Option<usize>,
         search_needle: Option<Vec<u8>>,
+        /// Where the last hit's target ends: its position plus the needle's length, as a plain
+        /// search reports it, unless `target_ends` scripts another end (a regex match).
+        last_target_end: isize,
+        target_ends: VecDeque<isize>,
         replace_bytes: Vec<Vec<u8>>,
         set_sel_calls: Vec<(usize, isize)>,
         selected_text: Option<Vec<u8>>,
@@ -2237,6 +2302,11 @@ mod tests {
 
         fn push_response(&self, response: isize) {
             self.state.lock().unwrap().responses.push_back(response);
+        }
+
+        /// Scripts `SCI_GETTARGETEND` for the next hit, as a regex match of another length would.
+        fn push_target_end(&self, end: isize) {
+            self.state.lock().unwrap().target_ends.push_back(end);
         }
 
         fn messages(&self) -> Vec<u32> {
@@ -2331,7 +2401,15 @@ mod tests {
             SCI_SEARCHINTARGET => {
                 let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };
                 state.search_needle = Some(bytes.to_vec());
-                state.responses.pop_front().unwrap_or(-1)
+                let found = state.responses.pop_front().unwrap_or(-1);
+                if found >= 0 {
+                    state.last_target_end = found + wparam as isize;
+                }
+                found
+            }
+            SCI_GETTARGETEND => {
+                let scripted = state.target_ends.pop_front();
+                scripted.unwrap_or(state.last_target_end)
             }
             SCI_REPLACETARGET => {
                 let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };

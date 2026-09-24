@@ -922,10 +922,6 @@ pub(crate) fn current_query(hwnd: HWND) -> Option<(String, MatchOptions)> {
 }
 
 /// The query and options the shown results ran with, or `None` without a view.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Task 7 seeds the find bar from it")
-)]
 pub(crate) fn run_query(hwnd: HWND) -> Option<(String, MatchOptions)> {
     with_view(hwnd, |view| (view.query.clone(), view.run_options))
 }
@@ -1210,16 +1206,7 @@ pub(crate) fn open_selected(hwnd: HWND, mode: OpenMode, focus_editor: bool) {
 }
 
 fn open_result(hwnd: HWND, relative: &Path, mode: OpenMode, focus_editor: bool) {
-    let Some(folder) = library_host::folder(hwnd) else {
-        return;
-    };
-    let path = folder.join(relative);
-    if let Err(error) = super::main_window::open_note(hwnd, &path, mode, focus_editor) {
-        super::main_window::push_notice(
-            hwnd,
-            format!("FastPad could not open {}: {error}", path.display()),
-        );
-    }
+    super::main_window::open_search_result(hwnd, relative, mode, focus_editor);
 }
 
 /// Down from the box: the focus moves into the results.

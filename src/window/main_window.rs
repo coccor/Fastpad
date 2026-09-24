@@ -502,6 +502,15 @@ unsafe extern "system" fn main_window_proc(
             refilter_command_palette(hwnd);
             0
         }
+        // Typing in the find bar clears its no-match outline until the next search.
+        WM_COMMAND
+            if lparam != 0
+                && ((wparam >> 16) & 0xffff) as u32 == EN_CHANGE
+                && find_bar_owns(hwnd, lparam as HWND) =>
+        {
+            set_find_no_match(hwnd, false);
+            0
+        }
         WM_CTLCOLOREDIT if find_bar_owns(hwnd, lparam as HWND) => unsafe { app_ptr(hwnd) }
             .and_then(|app| {
                 unsafe { app.as_ref() }
@@ -1081,25 +1090,35 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     };
     // The two bars share the band above the editor; only one shows at a time.
     crate::window::library_host::close_name_box(hwnd);
-    if !identity.is_live_for(hwnd) {
+    if !identity.is_live_for(hwnd) || !ensure_find_bar(hwnd) {
         return;
     }
     // A single-line selection is a reasonable query prefill; a multi-line one is not (the bar has
-    // no way to display it), so it's left alone rather than truncated or rejected.
-    let prefill = single_line_selection(hwnd);
-    let colors = title_chrome(hwnd).0;
-    let opened = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
-        let app = unsafe { app.as_mut() };
-        if app.find_bar.is_none() {
-            app.find_bar = find_bar::FindBar::create(hwnd).ok();
+    // no way to display it), so it's left alone rather than truncated or rejected. With regex
+    // on, it is escaped so it matches only itself.
+    let regex = unsafe { app_ptr(hwnd) }
+        .and_then(|app| Some(unsafe { app.as_ref() }.find_bar.as_ref()?.options().regex))
+        .unwrap_or(false);
+    let prefill = single_line_selection(hwnd).map(|text| {
+        if regex {
+            find_bar::escape_pattern(&text)
+        } else {
+            text
         }
-        let Some(bar) = app.find_bar.as_mut() else {
-            return false;
-        };
-        bar.show(mode, prefill.as_deref(), colors);
-        true
     });
-    if !opened || !identity.is_live_for(hwnd) {
+    let colors = title_chrome(hwnd).0;
+    let pending = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        Some(bar.show(mode, prefill.as_deref(), colors))
+    });
+    let Some(pending) = pending else {
+        return;
+    };
+    // Applied with nothing borrowed: the field's EN_CHANGE borrows the bar again.
+    if let Some(pending) = pending {
+        pending.apply();
+    }
+    if !identity.is_live_for(hwnd) {
         return;
     }
     layout_editor_and_find_bar(hwnd);
@@ -1108,6 +1127,27 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     {
         bar.focus_query();
     }
+}
+
+/// Makes the find bar the first time it's needed, with nothing of the `App` borrowed, because
+/// creating its controls sends messages. Returns false when there's no bar and none could be
+/// made.
+fn ensure_find_bar(hwnd: HWND) -> bool {
+    let Some(exists) =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.find_bar.is_some())
+    else {
+        return false;
+    };
+    if exists {
+        return true;
+    }
+    let Ok(bar) = find_bar::FindBar::create(hwnd) else {
+        return false;
+    };
+    unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        unsafe { app.as_mut() }.find_bar = Some(bar);
+        true
+    })
 }
 
 /// The active editor's selection as a query, when it is non-empty and on one line. A multi-line
@@ -1502,7 +1542,7 @@ pub(crate) fn paint_panel(hwnd: HWND, panel: HWND) {
             palette.paint_panel(panel);
             true
         } else if let Some(bar) = app.find_bar.as_ref().filter(|bar| bar.owns(panel)) {
-            bar.paint_panel(panel, glyph_font);
+            bar.paint_panel(panel, glyph_font, text_font);
             true
         } else if let Some(name_box) = app.name_box.as_ref().filter(|n| n.owns(panel)) {
             name_box.paint_panel(panel, text_font);
@@ -1563,17 +1603,63 @@ pub(crate) fn command_palette_owns(hwnd: HWND, control: HWND) -> bool {
         && with_command_palette(hwnd, |palette| palette.owns(control)).unwrap_or(false)
 }
 
-/// Mouse input on a panel: hovering and clicking the find bar's close button.
-pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, lparam: LPARAM) {
-    let close = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+/// Mouse input on a panel: hovering over and clicking the find bar's close button and toggles.
+pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+    if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE {
+        ensure_find_tooltip(hwnd, panel, message, wparam, lparam);
+    }
+    let click = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .find_bar
             .as_ref()
             .filter(|bar| bar.owns(panel))
-            .is_some_and(|bar| bar.pointer(message, lparam))
+            .and_then(|bar| bar.pointer(message, lparam))
     });
-    if close {
-        close_find_bar(hwnd);
+    match click {
+        Some(find_bar::BarClick::Close) => close_find_bar(hwnd),
+        Some(find_bar::BarClick::Toggle(option)) => toggle_find_option(hwnd, option),
+        None => {}
+    }
+}
+
+/// The first pointer move over the find bar makes its toggles' tooltip and hands it that move,
+/// so the first hover starts the tip's timer like any later one. Nothing before that needs it.
+fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+    let wanted = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .find_bar
+            .as_ref()
+            .is_some_and(|bar| bar.owns(panel) && bar.wants_tooltip())
+    });
+    if !wanted {
+        return;
+    }
+    // Made with nothing of the App borrowed: creating the control sends messages.
+    let created = crate::window::tooltip::Tooltip::create(panel);
+    let tools = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
+        bar.set_tooltip(created);
+        Some(bar.toggle_tools())
+    });
+    match (created, tools) {
+        (Some(_), Some(Some((tooltip, tools)))) => {
+            for (index, (rect, text)) in tools.into_iter().enumerate() {
+                tooltip.set_tool(index, rect, text);
+            }
+            tooltip.relay(message, wparam, lparam);
+        }
+        // The bar went while the tooltip was being made.
+        (Some(tooltip), None) => tooltip.destroy(),
+        _ => {}
+    }
+}
+
+/// Flips a find bar option: a toggle click, or Alt+C, Alt+W or Alt+R in its fields.
+pub(crate) fn toggle_find_option(hwnd: HWND, option: crate::search::SearchOption) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_mut() }.find_bar.as_mut()
+    {
+        bar.toggle_option(option);
     }
 }
 
@@ -1596,7 +1682,7 @@ fn name_box_owns(hwnd: HWND, control: HWND) -> bool {
     })
 }
 
-fn find_bar_owns(hwnd: HWND, control: HWND) -> bool {
+pub(crate) fn find_bar_owns(hwnd: HWND, control: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
             .find_bar
@@ -1613,40 +1699,84 @@ pub(crate) fn find_previous(hwnd: HWND) {
     navigate_to_match(hwnd, true);
 }
 
+/// F3 and Shift+F3 step through the find bar's query, even while the bar is closed. With no
+/// query yet, they open the bar.
+fn find_again(hwnd: HWND, backward: bool) {
+    let has_query = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .find_bar
+            .as_ref()
+            .is_some_and(|bar| !bar.query_text().is_empty())
+    });
+    if has_query {
+        navigate_to_match(hwnd, backward);
+    } else {
+        open_find_bar(hwnd, find_bar::FindBarMode::Find);
+    }
+}
+
 fn navigate_to_match(hwnd: HWND, backward: bool) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let Some((editor, query)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((editor, query, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
         let editor = app.editor.clone()?;
-        let query = app.find_bar.as_ref()?.query_text();
-        Some((editor, query))
+        let bar = app.find_bar.as_ref()?;
+        Some((editor, bar.query_text(), bar.options()))
     }) else {
         return;
     };
     if query.is_empty() {
         return;
     }
-    let (Ok(selection), Ok(doc_len)) = (editor.selection(), editor.length()) else {
+    let Ok(selection) = editor.selection() else {
         return;
     };
-    let origin = if backward {
-        selection.start
+    let (origin, direction) = if backward {
+        (selection.start, find_bar::SearchDirection::Backward)
     } else {
-        selection.end
+        (selection.end, find_bar::SearchDirection::Forward)
     };
-    let direction = if backward {
-        find_bar::SearchDirection::Backward
-    } else {
-        find_bar::SearchDirection::Forward
+    select_match(hwnd, &identity, &editor, &query, options, origin, direction);
+}
+
+/// Selects the next match of `query` under `options` from `origin`, wrapping once, and scrolls
+/// it into view. When there is none, the selection stays and the find bar shows its no-match
+/// state. A pattern Scintilla can't compile counts as no match.
+fn select_match(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    editor: &Editor,
+    query: &str,
+    options: crate::search::MatchOptions,
+    origin: usize,
+    direction: find_bar::SearchDirection,
+) {
+    let Ok(doc_len) = editor.length() else {
+        return;
     };
-    let mut state = find_bar::SearchState::new(&query, direction, origin);
-    if let Ok(Some(found)) = state.next_editor_match(&editor, 0, doc_len)
-        && identity.is_live_for(hwnd)
-    {
+    let pattern = find_bar::scintilla_query(query, options);
+    let mut state = find_bar::SearchState::new(&pattern, direction, origin);
+    let found = state
+        .next_editor_match(editor, find_bar::search_flags(options), doc_len)
+        .ok()
+        .flatten();
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    if let Some(found) = found.clone() {
         let _ = editor.set_selection(found);
         editor.scroll_caret_into_view();
+    }
+    set_find_no_match(hwnd, found.is_none());
+}
+
+fn set_find_no_match(hwnd: HWND, no_match: bool) {
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar.as_ref()
+    {
+        bar.set_no_match(no_match);
     }
 }
 
@@ -1654,21 +1784,28 @@ pub(crate) fn replace_current(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let Some((editor, query, replacement)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((editor, query, replacement, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
         let editor = app.editor.clone()?;
         let bar = app.find_bar.as_ref()?;
-        Some((editor, bar.query_text(), bar.replace_text()))
+        Some((editor, bar.query_text(), bar.replace_text(), bar.options()))
     }) else {
         return;
     };
     if query.is_empty() {
         return;
     }
-    // Only replace when the current selection is exactly the query match; otherwise this Enter
-    // press just navigates to the next match, matching a bare Find field's behavior.
-    if let (Ok(selection), Ok(selected)) = (editor.selection(), editor.selected_text())
-        && selected == query
+    // Only replace when the selection is exactly a match under the options (a case-insensitive
+    // "CAT" for "cat", or a regex's match); otherwise this Enter just moves to the next match,
+    // as in a bare Find field. The replacement is literal text, also in regex mode.
+    let pattern = find_bar::scintilla_query(&query, options);
+    if let Ok(selection) = editor.selection()
+        && !selection.is_empty()
+        && editor
+            .search_in_target(&pattern, selection.clone(), find_bar::search_flags(options))
+            .ok()
+            .flatten()
+            == Some(selection.clone())
     {
         let _ = editor.replace_target(selection, &replacement);
         if !identity.is_live_for(hwnd) {
@@ -1682,20 +1819,24 @@ pub(crate) fn replace_all_matches(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let Some((editor, query, replacement)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((editor, query, replacement, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
         let editor = app.editor.clone()?;
         let bar = app.find_bar.as_ref()?;
-        Some((editor, bar.query_text(), bar.replace_text()))
+        Some((editor, bar.query_text(), bar.replace_text(), bar.options()))
     }) else {
         return;
     };
     if query.is_empty() {
         return;
     }
-    let _ = editor.replace_all(&query, &replacement, 0);
+    let pattern = find_bar::scintilla_query(&query, options);
+    let replaced = editor
+        .replace_all(&pattern, &replacement, find_bar::search_flags(options))
+        .unwrap_or(0);
     if identity.is_live_for(hwnd) {
         editor.scroll_caret_into_view();
+        set_find_no_match(hwnd, replaced == 0);
     }
 }
 
@@ -2021,6 +2162,8 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             let _ = editor.paste();
         }),
         CommandId::Find => open_find_bar(hwnd, find_bar::FindBarMode::Find),
+        CommandId::FindNext => find_again(hwnd, false),
+        CommandId::FindPrevious => find_again(hwnd, true),
         CommandId::CommandPalette => open_command_palette(hwnd),
         CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
@@ -3036,6 +3179,89 @@ pub(crate) fn open_note(
         focus_content(hwnd);
     }
     Ok(())
+}
+
+/// Opens a Search result (spec §8). The note opens as `open_note` opens it. The find bar then
+/// opens in Find mode with the query and options the shown results ran with, and selects the
+/// first match from the start of the note. The find bar searches the live text: a phrase gone
+/// since the search leaves the note open and the bar in its no-match state. `focus_editor` then
+/// moves the focus to the editor, so F3 and Shift+F3 step on from the selected match. A note
+/// that can't be opened (moved or deleted since the search) gets a notice, and the search runs
+/// again.
+pub(crate) fn open_search_result(
+    hwnd: HWND,
+    relative: &std::path::Path,
+    mode: OpenMode,
+    focus_editor: bool,
+) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let Some(folder) = crate::window::library_host::folder(hwnd) else {
+        return;
+    };
+    let path = folder.join(relative);
+    // The results' query, not the box's text, which may be newer while the debounce runs.
+    let search = crate::window::search_view::run_query(hwnd);
+    if let Err(error) = open_note(hwnd, &path, mode, false) {
+        push_notice(
+            hwnd,
+            format!("FastPad could not open {}: {error}", path.display()),
+        );
+        crate::window::text_search_host::run_now(hwnd);
+        return;
+    }
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    if let Some((query, options)) = search.filter(|(query, _)| !query.is_empty()) {
+        seed_find_bar(hwnd, &identity, &query, options);
+    }
+    if focus_editor && identity.is_live_for(hwnd) {
+        focus_content(hwnd);
+    }
+}
+
+/// Shows the find bar with `query` and `options` and selects the first match from position 0.
+fn seed_find_bar(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    query: &str,
+    options: crate::search::MatchOptions,
+) {
+    crate::window::library_host::close_name_box(hwnd);
+    if !identity.is_live_for(hwnd) || !ensure_find_bar(hwnd) {
+        return;
+    }
+    let colors = title_chrome(hwnd).0;
+    let pending = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        Some(bar.show_with(find_bar::FindBarMode::Find, query, options, colors))
+    });
+    let Some(pending) = pending else {
+        return;
+    };
+    // Applied with nothing borrowed: the field's EN_CHANGE borrows the bar again.
+    pending.apply();
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    layout_editor_and_find_bar(hwnd);
+    let Some(editor) =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+    else {
+        return;
+    };
+    let _ = editor.set_selection(0..0);
+    select_match(
+        hwnd,
+        identity,
+        &editor,
+        query,
+        options,
+        0,
+        find_bar::SearchDirection::Forward,
+    );
 }
 
 /// Makes `id` a normal tab and repaints its label.
@@ -5630,6 +5856,7 @@ mod tests {
             window.hwnd,
             panel,
             windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+            0,
             point(client.right / 2, band / 2),
         );
         assert!(
@@ -5640,6 +5867,7 @@ mod tests {
             window.hwnd,
             panel,
             windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+            0,
             close_point,
         );
         assert!(!visible(panel));
@@ -12769,5 +12997,200 @@ mod tests {
             }
         }
         assert_eq!(worker.join().unwrap() as usize, expected);
+    }
+
+    fn set_find_query(hwnd: HWND, text: &str) {
+        let edit = app_mut(hwnd).find_bar.as_ref().unwrap().query_hwnd();
+        let wide = crate::platform::wide_null(text);
+        // Sends EN_CHANGE, handled with nothing of the App borrowed here.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
+        }
+    }
+
+    #[test]
+    fn the_find_bar_passes_its_options_to_scintilla_and_a_bad_regex_is_a_miss() {
+        // Break caught: toggles that change nothing, whole word matching inside foo_bar, the
+        // basic regex dialect instead of C++11 (no `{2}`), or an invalid pattern reported as an
+        // error or leaving no trace.
+        use crate::search::SearchOption;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor
+            .populate_clean("Foo foo foobar foo_bar foo. a1 b22")
+            .unwrap();
+        execute_command(window.hwnd, CommandId::Find);
+        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+
+        set_find_query(window.hwnd, "foo");
+        super::toggle_find_option(window.hwnd, SearchOption::Case);
+        editor.set_selection(0..0).unwrap();
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 4..7, "match case skips Foo");
+
+        super::toggle_find_option(window.hwnd, SearchOption::Case);
+        super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+        editor.set_selection(7..7).unwrap();
+        super::find_next(window.hwnd);
+        assert_eq!(
+            editor.selection().unwrap(),
+            23..26,
+            "whole word skips foobar and foo_bar"
+        );
+
+        // `{2}` exists only in Scintilla's C++11 (ECMAScript) regex. If this fails, the DLL was
+        // built with NO_CXX11_REGEX (see the Task 7 findings).
+        super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+        super::toggle_find_option(window.hwnd, SearchOption::Regex);
+        set_find_query(window.hwnd, r"b\d{2}");
+        editor.set_selection(0..0).unwrap();
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 31..34);
+        assert!(!bar().no_match());
+
+        set_find_query(window.hwnd, "(");
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 31..34, "the selection stays");
+        assert!(bar().no_match());
+        assert!(notices(window.hwnd).is_empty());
+        set_find_query(window.hwnd, "a1");
+        assert!(!bar().no_match(), "typing clears the no-match state");
+    }
+
+    #[test]
+    fn alt_keys_and_clicks_flip_the_find_bar_toggles() {
+        // Break caught: Alt+C opening a menu instead of flipping match case, a toggle click that
+        // does nothing, or the letter reaching the menu band after the flip.
+        use crate::search::MatchOptions;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::Find);
+        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let (query, panel) = (bar().query_hwnd(), bar().panel_hwnd());
+        let alt = 1 << 29;
+
+        unsafe { SendMessageW(query, WM_SYSKEYDOWN, usize::from(b'C'), alt) };
+        assert!(bar().options().case);
+        unsafe { SendMessageW(query, WM_SYSCHAR, usize::from(b'c'), alt) };
+        assert_eq!(app_mut(window.hwnd).menu_mode, None);
+        unsafe {
+            SendMessageW(query, WM_SYSKEYDOWN, usize::from(b'W'), alt);
+            SendMessageW(query, WM_SYSKEYDOWN, usize::from(b'R'), alt);
+        }
+        assert_eq!(
+            bar().options(),
+            MatchOptions {
+                case: true,
+                whole_word: true,
+                regex: true
+            }
+        );
+
+        let rect = bar().toggle_rects()[0];
+        let x = (rect.left + rect.right) / 2;
+        let y = (rect.top + rect.bottom) / 2;
+        let point = ((y as u32) << 16 | (x as u32 & 0xffff)) as super::LPARAM;
+        super::panel_pointer(window.hwnd, panel, WM_LBUTTONUP, 0, point);
+        assert!(!bar().options().case, "a click on Aa turns match case off");
+    }
+
+    #[test]
+    fn replace_current_replaces_a_selection_that_matches_under_the_options() {
+        // Break caught: Enter in Replace comparing the selection to the query byte for byte, so
+        // a case-insensitive "CAT" is skipped instead of replaced.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.populate_clean("CAT cat").unwrap();
+        execute_command(window.hwnd, CommandId::Replace);
+        set_find_query(window.hwnd, "cat");
+        let replace = app_mut(window.hwnd)
+            .find_bar
+            .as_ref()
+            .unwrap()
+            .replace_hwnd();
+        let dog = crate::platform::wide_null("dog");
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(replace, dog.as_ptr());
+        }
+        editor.set_selection(0..3).unwrap();
+
+        super::replace_current(window.hwnd);
+
+        assert_eq!(editor.text().unwrap(), "dog cat");
+        assert_eq!(editor.selection().unwrap(), 4..7);
+    }
+
+    #[test]
+    fn opening_a_result_seeds_the_find_bar_with_search_options_and_f3_steps_on() {
+        // Break caught: the find bar keeping its own options (so match case is lost), the first
+        // match not selected, or F3 and Shift+F3 not reaching the next and previous matches.
+        use crate::search::{MatchOptions, SearchOption};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("result-seed");
+        scratch.note("a.md", "beta Beta beta Beta");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        crate::window::search_view::toggle_option(window.hwnd, SearchOption::Case);
+        type_into_search(window.hwnd, "Beta");
+        pump_until(window.hwnd, || {
+            crate::window::search_view::shown_results(window.hwnd).len() == 1
+        });
+
+        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, true);
+
+        assert_eq!(editor.text().unwrap(), "beta Beta beta Beta");
+        assert_eq!(editor.selection().unwrap(), 5..9);
+        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        assert!(bar.is_visible());
+        assert_eq!(bar.query_text(), "Beta");
+        assert_eq!(
+            bar.options(),
+            MatchOptions {
+                case: true,
+                ..MatchOptions::default()
+            }
+        );
+        assert!(!bar.no_match());
+        execute_command(window.hwnd, CommandId::FindNext);
+        assert_eq!(editor.selection().unwrap(), 15..19);
+        execute_command(window.hwnd, CommandId::FindPrevious);
+        assert_eq!(editor.selection().unwrap(), 5..9);
+    }
+
+    #[test]
+    fn opening_a_result_whose_text_changed_shows_no_match() {
+        // Break caught (review focus 5): a stale result opening nothing, panicking on its
+        // snippet, selecting text that no longer matches, or reporting the miss as an error.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("result-stale");
+        let note = scratch.note("a.md", "alpha beta");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        type_into_search(window.hwnd, "beta");
+        pump_until(window.hwnd, || {
+            crate::window::search_view::shown_results(window.hwnd).len() == 1
+        });
+        std::fs::write(&note, "alpha gamma").unwrap();
+        let before = notices(window.hwnd).len();
+
+        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+
+        assert_eq!(editor.text().unwrap(), "alpha gamma");
+        assert_eq!(editor.selection().unwrap(), 0..0);
+        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        assert!(bar.is_visible());
+        assert_eq!(bar.query_text(), "beta");
+        assert!(bar.no_match());
+        assert_eq!(notices(window.hwnd).len(), before);
     }
 }

@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 66] = [
+pub(crate) const ENTRIES: [PaletteEntry; 68] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -80,6 +80,8 @@ pub(crate) const ENTRIES: [PaletteEntry; 66] = [
     entry("Edit: Copy", CommandId::Copy),
     entry("Edit: Paste", CommandId::Paste),
     entry("Search: Find", CommandId::Find),
+    entry("Search: Find next", CommandId::FindNext),
+    entry("Search: Find previous", CommandId::FindPrevious),
     entry("Search: Replace", CommandId::Replace),
     entry("Search: Toggle match case", CommandId::SearchToggleCase),
     entry(
@@ -303,11 +305,14 @@ pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
             text.push_str(name);
         }
     }
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_OEM_MINUS, VK_OEM_PLUS};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_F1, VK_F24, VK_OEM_MINUS, VK_OEM_PLUS,
+    };
     match spec.key {
         VK_TAB => text.push_str("Tab"),
         VK_OEM_PLUS => text.push('+'),
         VK_OEM_MINUS => text.push('-'),
+        key @ VK_F1..=VK_F24 => text.push_str(&format!("F{}", key - VK_F1 + 1)),
         key => text.push(char::from_u32(u32::from(key))?),
     }
     Some(text)
@@ -1145,6 +1150,11 @@ mod tests {
         assert_eq!(
             shortcut_text(CommandId::FormatJson).as_deref(),
             Some("Shift+Alt+F")
+        );
+        assert_eq!(shortcut_text(CommandId::FindNext).as_deref(), Some("F3"));
+        assert_eq!(
+            shortcut_text(CommandId::FindPrevious).as_deref(),
+            Some("Shift+F3")
         );
         assert_eq!(shortcut_text(CommandId::Copy), None);
     }

@@ -113,7 +113,7 @@ unsafe extern "system" fn panel_proc(
         }
         WM_ERASEBKGND => 1,
         WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONUP => {
-            super::main_window::panel_pointer(main, hwnd, message, lparam);
+            super::main_window::panel_pointer(main, hwnd, message, wparam, lparam);
             0
         }
         WM_COMMAND | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {

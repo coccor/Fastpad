@@ -8,9 +8,9 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_F6, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3,
-    VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_MINUS,
-    VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
+    VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_F3, VK_F6, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2,
+    VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9,
+    VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CallNextHookEx, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 49] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 51] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -40,6 +40,8 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 49] {
         accelerator(FCONTROL | FSHIFT, b'S', CommandId::SaveAs),
         accelerator(FCONTROL, b'F', CommandId::Find),
         accelerator(FCONTROL, b'H', CommandId::Replace),
+        virtual_key(0, VK_F3, CommandId::FindNext),
+        virtual_key(FSHIFT, VK_F3, CommandId::FindPrevious),
         accelerator(FCONTROL, b'Z', CommandId::Undo),
         accelerator(FCONTROL, b'Y', CommandId::Redo),
         accelerator(FCONTROL | FSHIFT, b'F', CommandId::ShowSearchView),
@@ -170,6 +172,8 @@ impl MenuBar {
             append_popup(root, MENU_TITLES[1], edit)?;
             let search = create_popup(&[
                 MenuEntry::command("&Find\tCtrl+F", CommandId::Find),
+                MenuEntry::command("Find &next\tF3", CommandId::FindNext),
+                MenuEntry::command("Find pre&vious\tShift+F3", CommandId::FindPrevious),
                 MenuEntry::command("&Replace\tCtrl+H", CommandId::Replace),
             ])?;
             append_popup(root, MENU_TITLES[2], search)?;
@@ -556,7 +560,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 49);
+        assert_eq!(specs.len(), 51);
     }
 
     #[test]
@@ -584,7 +588,7 @@ mod tests {
     #[test]
     fn tab_zoom_and_direction_shortcuts_are_bound() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-            VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_TAB,
+            VK_F3, VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_TAB,
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
         let bound = |modifiers: u8, key: u16| {
@@ -647,6 +651,9 @@ mod tests {
                 .iter()
                 .all(|spec| spec.command.search_option().is_none())
         );
+        // Break caught: F3 unbound, so opening a Search result can't step on (spec §8).
+        assert_eq!(bound(0, VK_F3), Some(CommandId::FindNext));
+        assert_eq!(bound(FSHIFT, VK_F3), Some(CommandId::FindPrevious));
     }
 
     #[test]

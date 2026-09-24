@@ -124,7 +124,11 @@ impl SearchState {
             return Ok(None);
         }
         let bounds = self.scintilla_bounds(doc_len);
-        if let Some(found) = editor.search_in_target(&self.query, bounds, flags)? {
+        // An empty match (a regex like `x*`) would be found at the caret again and again.
+        let found = editor
+            .search_in_target(&self.query, bounds, flags)?
+            .filter(|found| !found.is_empty());
+        if let Some(found) = found {
             self.record_match(found.clone());
             return Ok(Some(found));
         }
@@ -133,7 +137,9 @@ impl SearchState {
         }
         self.record_miss(doc_len);
         let bounds = self.scintilla_bounds(doc_len);
-        let found = editor.search_in_target(&self.query, bounds, flags)?;
+        let found = editor
+            .search_in_target(&self.query, bounds, flags)?
+            .filter(|found| !found.is_empty());
         if let Some(found) = &found {
             self.record_match(found.clone());
         }
@@ -141,14 +147,63 @@ impl SearchState {
     }
 }
 
+use crate::editor::scintilla_constants::{
+    SCFIND_CXX11REGEX, SCFIND_MATCHCASE, SCFIND_NONE, SCFIND_REGEXP, SCFIND_WHOLEWORD,
+};
+use crate::search::{MatchOptions, SearchOption};
+
+/// The Scintilla search flags for `options` (spec §8). Whole word in regex mode is carried by
+/// the pattern instead (`scintilla_query`): Scintilla's regex search ignores the word flags.
+pub(crate) fn search_flags(options: MatchOptions) -> u32 {
+    let mut flags = SCFIND_NONE;
+    if options.case {
+        flags |= SCFIND_MATCHCASE;
+    }
+    if options.regex {
+        flags |= SCFIND_REGEXP | SCFIND_CXX11REGEX;
+    } else if options.whole_word {
+        flags |= SCFIND_WHOLEWORD;
+    }
+    flags
+}
+
+/// What Scintilla searches for: the query, wrapped as `\b(?:…)\b` for a whole-word regex, as
+/// the Search view wraps it (spec §6).
+pub(crate) fn scintilla_query(query: &str, options: MatchOptions) -> String {
+    if options.regex && options.whole_word {
+        format!(r"\b(?:{query})\b")
+    } else {
+        query.to_owned()
+    }
+}
+
+/// `text` as a pattern that matches it literally in Scintilla's ECMAScript regex, for a
+/// selection prefilled while regex is on. Only ECMAScript's syntax characters are escaped,
+/// because there an identity escape of anything else (`\#`, `\-`) is an error.
+pub(crate) fn escape_pattern(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '\\' | '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 // --- Window integration: native child controls hosting Find/Replace ---
 
 use crate::platform::{last_error, wide_null};
+use crate::window::option_toggles;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::tooltip::Tooltip;
 use std::cell::Cell;
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT,
@@ -221,6 +276,7 @@ fn bar_layout(width: i32, dpi: u32, text_height: i32, mode: FindBarMode) -> BarL
 }
 
 /// The fields across `width` (the right padding included), starting `top` pixels down the bar.
+/// The query field's right end holds the three option toggles (spec §8).
 fn field_layouts(
     width: i32,
     dpi: u32,
@@ -232,7 +288,9 @@ fn field_layouts(
     let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
     let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
     let text_height = text_height.clamp(1, (field_height - 2).max(1));
-    let field = |left: i32, right: i32| {
+    let toggles = option_toggles::reserved_width(dpi);
+    // `reserve` is how far the Edit stops short of the field's right edge.
+    let field = |left: i32, right: i32, reserve: i32| {
         let field = RECT {
             left,
             top,
@@ -245,19 +303,19 @@ fn field_layouts(
             edit: RECT {
                 left: left + inset_x,
                 top: edit_top,
-                right: (field.right - inset_x).max(left + inset_x),
+                right: (field.right - reserve).max(left + inset_x),
                 bottom: edit_top + text_height,
             },
         }
     };
     match mode {
-        FindBarMode::Find => (field(padding, width - padding), None),
+        FindBarMode::Find => (field(padding, width - padding, toggles), None),
         FindBarMode::Replace => {
             let half = (width - 3 * padding) / 2;
             (
-                field(padding, padding + half),
+                field(padding, padding + half, toggles),
                 // An odd leftover pixel stays at the right edge so both fields match.
-                Some(field(2 * padding + half, 2 * padding + 2 * half)),
+                Some(field(2 * padding + half, 2 * padding + 2 * half, inset_x)),
             )
         }
     }
@@ -276,6 +334,36 @@ pub(crate) struct FindBar {
     colors: Palette,
     field_brush: HBRUSH,
     close_hovered: Cell<bool>,
+    /// Match case, whole word and regex (spec §8). They last for the session, and opening a
+    /// Search result replaces them with Search's.
+    options: MatchOptions,
+    /// The last search found nothing. Cleared when the query changes or a search finds a match.
+    no_match: Cell<bool>,
+    hovered_toggle: Cell<Option<SearchOption>>,
+    /// The toggles' tooltip, made the first time the pointer moves over the bar.
+    tooltip: Cell<Option<Tooltip>>,
+    tooltip_failed: Cell<bool>,
+}
+
+/// What a click released on the bar hit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BarClick {
+    Close,
+    Toggle(SearchOption),
+}
+
+/// Text to put in the query field once nothing of the `App` is borrowed. Setting it sends
+/// `EN_CHANGE`, and the main window handles that by borrowing the find bar again.
+#[must_use = "the text only reaches the field when applied"]
+pub(crate) struct PendingText {
+    edit: HWND,
+    text: String,
+}
+
+impl PendingText {
+    pub(crate) fn apply(self) {
+        set_control_text(self.edit, &self.text);
+    }
 }
 
 impl FindBar {
@@ -307,6 +395,11 @@ impl FindBar {
             colors,
             field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
             close_hovered: Cell::new(false),
+            options: MatchOptions::default(),
+            no_match: Cell::new(false),
+            hovered_toggle: Cell::new(None),
+            tooltip: Cell::new(None),
+            tooltip_failed: Cell::new(false),
         })
     }
 
@@ -327,13 +420,18 @@ impl FindBar {
         control_text(self.replace_edit)
     }
 
-    pub(crate) fn show(&mut self, mode: FindBarMode, prefill: Option<&str>, colors: Palette) {
+    /// Shows the bar in `mode`. The caller applies the returned prefill once it holds no `App`
+    /// borrow.
+    pub(crate) fn show(
+        &mut self,
+        mode: FindBarMode,
+        prefill: Option<&str>,
+        colors: Palette,
+    ) -> Option<PendingText> {
         self.set_colors(colors);
         self.mode = mode;
         self.visible = true;
-        if let Some(text) = prefill {
-            set_control_text(self.query_edit, text);
-        }
+        self.no_match.set(false);
         unsafe {
             ShowWindow(
                 self.replace_edit,
@@ -344,6 +442,85 @@ impl FindBar {
                 },
             );
         }
+        prefill.map(|text| PendingText {
+            edit: self.query_edit,
+            text: text.to_owned(),
+        })
+    }
+
+    /// Shows the bar with `query` and `options`, as opening a Search result does (spec §8).
+    pub(crate) fn show_with(
+        &mut self,
+        mode: FindBarMode,
+        query: &str,
+        options: MatchOptions,
+        colors: Palette,
+    ) -> PendingText {
+        self.options = options;
+        let _ = self.show(mode, None, colors);
+        PendingText {
+            edit: self.query_edit,
+            text: query.to_owned(),
+        }
+    }
+
+    pub(crate) fn options(&self) -> MatchOptions {
+        self.options
+    }
+
+    pub(crate) fn toggle_option(&mut self, option: SearchOption) {
+        self.options = self.options.toggled(option);
+        self.no_match.set(false);
+        unsafe {
+            InvalidateRect(self.panel, std::ptr::null(), 0);
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the window tests"))]
+    pub(crate) fn no_match(&self) -> bool {
+        self.no_match.get()
+    }
+
+    /// Shows or clears the no-match outline on the query field.
+    pub(crate) fn set_no_match(&self, no_match: bool) {
+        if self.no_match.replace(no_match) != no_match {
+            unsafe {
+                InvalidateRect(self.panel, std::ptr::null(), 0);
+            }
+        }
+    }
+
+    /// The three toggles, in bar coordinates, in `SearchOption::ALL` order.
+    pub(crate) fn toggle_rects(&self) -> [RECT; 3] {
+        let (layout, dpi) = self.current_layout();
+        option_toggles::toggle_rects(layout.query.field, dpi)
+    }
+
+    /// Whether the pointer's first move over the bar should make the toggles' tooltip.
+    pub(crate) fn wants_tooltip(&self) -> bool {
+        self.tooltip.get().is_none() && !self.tooltip_failed.get()
+    }
+
+    /// Keeps the tooltip made for the bar. `None` means it couldn't be made, and that is not
+    /// tried again.
+    pub(crate) fn set_tooltip(&self, tooltip: Option<Tooltip>) {
+        self.tooltip.set(tooltip);
+        self.tooltip_failed.set(tooltip.is_none());
+    }
+
+    /// The tooltip and each toggle's tool, to set with nothing of the `App` borrowed.
+    pub(crate) fn toggle_tools(&self) -> Option<(Tooltip, [(RECT, &'static str); 3])> {
+        let tooltip = self.tooltip.get()?;
+        let rects = self.toggle_rects();
+        Some((
+            tooltip,
+            std::array::from_fn(|index| {
+                (
+                    rects[index],
+                    option_toggles::tooltip(SearchOption::ALL[index]),
+                )
+            }),
+        ))
     }
 
     pub(crate) fn hide(&mut self) {
@@ -415,6 +592,13 @@ impl FindBar {
             );
             InvalidateRect(self.panel, std::ptr::null(), 0);
         }
+        // Keeps the tooltip's tools on the toggles. The tooltip is a control of this thread, and
+        // setting its tools calls nothing back in the main window.
+        if let Some((tooltip, tools)) = self.toggle_tools() {
+            for (index, (rect, text)) in tools.into_iter().enumerate() {
+                tooltip.set_tool(index, rect, text);
+            }
+        }
     }
 
     pub(crate) fn focus_query(&self) {
@@ -433,17 +617,28 @@ impl FindBar {
         self.field_brush
     }
 
-    /// `WM_MOUSEMOVE`, `WM_MOUSELEAVE` and `WM_LBUTTONUP` on the bar; returns true when the close
-    /// button was clicked.
-    pub(crate) fn pointer(&self, message: u32, lparam: LPARAM) -> bool {
-        let layout = self.current_layout();
-        let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-        let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
-        let over_close = message != WM_MOUSELEAVE
-            && x >= layout.close.left
-            && x < layout.close.right
-            && y >= layout.close.top
-            && y < layout.close.bottom;
+    /// `WM_MOUSEMOVE`, `WM_MOUSELEAVE` and `WM_LBUTTONUP` on the bar: tracks hovering over the
+    /// close button and the toggles, and reports a click released on one of them.
+    pub(crate) fn pointer(&self, message: u32, lparam: LPARAM) -> Option<BarClick> {
+        let (layout, dpi) = self.current_layout();
+        let point = POINT {
+            x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+            y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+        };
+        let leaving = message == WM_MOUSELEAVE;
+        let over_close = !leaving
+            && point.x >= layout.close.left
+            && point.x < layout.close.right
+            && point.y >= layout.close.top
+            && point.y < layout.close.bottom;
+        let over_toggle = if leaving {
+            None
+        } else {
+            option_toggles::hit(
+                &option_toggles::toggle_rects(layout.query.field, dpi),
+                point,
+            )
+        };
         if message == WM_MOUSEMOVE {
             let mut track = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -460,16 +655,28 @@ impl FindBar {
                 InvalidateRect(self.panel, &layout.close, 0);
             }
         }
-        message == WM_LBUTTONUP && over_close
+        if self.hovered_toggle.replace(over_toggle) != over_toggle {
+            unsafe {
+                InvalidateRect(self.panel, &layout.query.field, 0);
+            }
+        }
+        if message != WM_LBUTTONUP {
+            return None;
+        }
+        if over_close {
+            Some(BarClick::Close)
+        } else {
+            over_toggle.map(BarClick::Toggle)
+        }
     }
 
-    fn current_layout(&self) -> BarLayout {
+    fn current_layout(&self) -> (BarLayout, u32) {
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.panel, &mut client);
         }
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(self.panel) }.max(96);
-        bar_layout(client.right, dpi, 0, self.mode)
+        (bar_layout(client.right, dpi, 0, self.mode), dpi)
     }
 
     /// `WM_PAINT` for an empty field: its placeholder in the muted color where typed text starts.
@@ -522,7 +729,7 @@ impl FindBar {
 
     /// `WM_PAINT` for the bar: strip background, a hairline above the editor, each visible
     /// field's box (outlined with the accent while it has the focus), and the close button.
-    pub(crate) fn paint_panel(&self, panel: HWND, glyph_font: HFONT) {
+    pub(crate) fn paint_panel(&self, panel: HWND, glyph_font: HFONT, text_font: HFONT) {
         let mut paint = PAINTSTRUCT::default();
         let dc = unsafe { BeginPaint(panel, &mut paint) };
         if dc.is_null() {
@@ -554,13 +761,26 @@ impl FindBar {
                 let Some(layout) = layout else {
                     continue;
                 };
-                let outline = if focus == edit {
+                let outline = if edit == self.query_edit && self.no_match.get() {
+                    // A miss is outlined in the Search view's error color.
+                    colors.error_foreground
+                } else if focus == edit {
                     colors.selection_background
                 } else {
                     colors.pressed_background
                 };
                 fill(dc, layout.field, outline);
                 fill(dc, inset(layout.field, 1), colors.editor_background);
+            }
+            if !text_font.is_null() {
+                option_toggles::paint(
+                    dc,
+                    &option_toggles::toggle_rects(query.field, dpi),
+                    self.options,
+                    self.hovered_toggle.get(),
+                    &colors,
+                    text_font,
+                );
             }
             let hovered = self.close_hovered.get();
             if hovered {
@@ -620,6 +840,10 @@ impl FindBar {
 
 impl Drop for FindBar {
     fn drop(&mut self) {
+        // The tooltip's popup is owned by the main window, not by the bar, so it goes by hand.
+        if let Some(tooltip) = self.tooltip.get() {
+            tooltip.destroy();
+        }
         unsafe {
             DeleteObject(self.field_brush);
         }
@@ -672,6 +896,15 @@ unsafe extern "system" fn find_field_proc(
     }
     // A single-line Edit beeps at Enter and Escape characters; both are handled on key down.
     if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b) {
+        return 0;
+    }
+    // Alt+C, Alt+W and Alt+R flip the options while a field has the focus (spec §8). The key
+    // down flips; its WM_SYSCHAR is swallowed, so the menu band never sees the letter.
+    if let Some(option) = option_toggles::alt_option(message, wparam, lparam) {
+        super::main_window::toggle_find_option(hook.parent, option);
+        return 0;
+    }
+    if option_toggles::is_toggle_char(message, wparam, lparam) {
         return 0;
     }
     if message == WM_PAINT
@@ -765,7 +998,7 @@ mod tests {
     use super::{SearchDirection, SearchState};
     use crate::editor::Editor;
     use crate::editor::scintilla_constants::{
-        SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
+        SCI_GETTARGETEND, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -836,6 +1069,9 @@ mod tests {
     struct TargetLog {
         responses: VecDeque<isize>,
         ranges: Vec<(usize, isize)>,
+        /// Scripted target ends; otherwise a hit ends one needle-length after it starts.
+        ends: VecDeque<isize>,
+        last_end: isize,
     }
 
     unsafe extern "C" fn target_range_stub(
@@ -852,7 +1088,17 @@ mod tests {
                 0
             }
             SCI_SETSEARCHFLAGS => 0,
-            SCI_SEARCHINTARGET => log.responses.pop_front().unwrap_or(-1),
+            SCI_SEARCHINTARGET => {
+                let found = log.responses.pop_front().unwrap_or(-1);
+                if found >= 0 {
+                    log.last_end = found + wparam as isize;
+                }
+                found
+            }
+            SCI_GETTARGETEND => {
+                let scripted = log.ends.pop_front();
+                scripted.unwrap_or(log.last_end)
+            }
             _ => 0,
         }
     }
@@ -864,7 +1110,7 @@ mod tests {
         // wrong range or never find the wrapped match.
         let log = Mutex::new(TargetLog {
             responses: VecDeque::from([8_isize, -1, 0, -1]),
-            ranges: Vec::new(),
+            ..TargetLog::default()
         });
         let editor =
             Editor::test_fixture(target_range_stub, &log as *const Mutex<TargetLog> as isize);
@@ -881,6 +1127,95 @@ mod tests {
             log.lock().unwrap().ranges,
             vec![(8, 11), (11, 11), (0, 8), (3, 8)]
         );
+    }
+
+    #[test]
+    fn options_map_to_scintilla_flags_and_a_whole_word_regex_is_wrapped() {
+        // Break caught: the toggles changing nothing, whole word silently ignored in regex mode
+        // (Scintilla's regex search drops the word flags), or plain text wrapped as a pattern.
+        use super::{scintilla_query, search_flags};
+        use crate::editor::scintilla_constants::{
+            SCFIND_CXX11REGEX, SCFIND_MATCHCASE, SCFIND_REGEXP, SCFIND_WHOLEWORD,
+        };
+        use crate::search::MatchOptions;
+        let plain = MatchOptions::default();
+        let case = MatchOptions {
+            case: true,
+            ..plain
+        };
+        let word = MatchOptions {
+            whole_word: true,
+            ..plain
+        };
+        let regex = MatchOptions {
+            regex: true,
+            ..plain
+        };
+        let all = MatchOptions {
+            case: true,
+            whole_word: true,
+            regex: true,
+        };
+        assert_eq!(search_flags(plain), 0);
+        assert_eq!(search_flags(case), SCFIND_MATCHCASE);
+        assert_eq!(search_flags(word), SCFIND_WHOLEWORD);
+        assert_eq!(search_flags(regex), SCFIND_REGEXP | SCFIND_CXX11REGEX);
+        assert_eq!(
+            search_flags(all),
+            SCFIND_MATCHCASE | SCFIND_REGEXP | SCFIND_CXX11REGEX
+        );
+        assert_eq!(scintilla_query("a|b", all), r"\b(?:a|b)\b");
+        assert_eq!(scintilla_query("a|b", regex), "a|b");
+        assert_eq!(scintilla_query("a|b", word), "a|b");
+    }
+
+    #[test]
+    fn a_prefilled_selection_is_escaped_for_ecmascript() {
+        // Break caught: a selected "a.b" matching "axb" with regex on, or an escape ECMAScript
+        // rejects (`\#`, `\-`) making every prefill an invalid pattern.
+        use super::escape_pattern;
+        assert_eq!(
+            escape_pattern(r"a.b*(c)[d]{2}^$|?+\"),
+            r"a\.b\*\(c\)\[d\]\{2\}\^\$\|\?\+\\"
+        );
+        assert_eq!(escape_pattern("plain words #1 & -2"), "plain words #1 & -2");
+    }
+
+    #[test]
+    fn the_query_field_leaves_room_for_the_three_toggles() {
+        // Break caught: typed text running under the toggles, or toggles outside the field.
+        use super::{FindBarMode, bar_layout};
+        use crate::window::option_toggles::toggle_rects;
+        for dpi in [96, 144] {
+            for mode in [FindBarMode::Find, FindBarMode::Replace] {
+                let query = bar_layout(800, dpi, 16, mode).query;
+                let rects = toggle_rects(query.field, dpi);
+                assert!(query.edit.right <= rects[0].left, "{dpi} {mode:?}");
+                assert!(rects[2].right <= query.field.right, "{dpi} {mode:?}");
+                for rect in rects {
+                    assert!(rect.top >= query.field.top && rect.bottom <= query.field.bottom);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_regex_error_or_an_empty_match_is_no_match() {
+        // Break caught: a bad pattern reported as an error, or an empty match "found" at the
+        // caret forever, so F3 never moves.
+        let log = Mutex::new(TargetLog {
+            responses: VecDeque::from([-2_isize, -2, 4, 4]),
+            ends: VecDeque::from([4_isize, 4]),
+            ..TargetLog::default()
+        });
+        let editor =
+            Editor::test_fixture(target_range_stub, &log as *const Mutex<TargetLog> as isize);
+
+        let mut bad = SearchState::new("(", SearchDirection::Forward, 0);
+        assert_eq!(bad.next_editor_match(&editor, 0, 11).unwrap(), None);
+
+        let mut empty = SearchState::new("x*", SearchDirection::Forward, 4);
+        assert_eq!(empty.next_editor_match(&editor, 0, 11).unwrap(), None);
     }
 
     #[test]

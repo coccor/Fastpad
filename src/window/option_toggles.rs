@@ -18,6 +18,8 @@ const GAP_AT_96_DPI: i32 = 2;
 const RIGHT_PADDING_AT_96_DPI: i32 = 3;
 /// Bit 29 of a key message's `lParam`: Alt is down.
 const ALT_DOWN: LPARAM = 1 << 29;
+/// Bit 30 of a key message's `lParam`: the key was already down (an auto-repeat).
+const REPEAT: LPARAM = 1 << 30;
 
 /// The three toggles inside `field`'s right end, in `SearchOption::ALL` order: 22 px squares with
 /// 2 px gaps and 3 px of padding on the right at 96 DPI, centered vertically.
@@ -150,9 +152,10 @@ pub(crate) fn alt_key(vk: u32) -> Option<SearchOption> {
 }
 
 /// The toggle a key message flips: only a `WM_SYSKEYDOWN` for C, W or R with Alt held (bit 29
-/// of `lparam`). F10 also arrives as `WM_SYSKEYDOWN`, without that bit.
+/// of `lparam`). F10 also arrives as `WM_SYSKEYDOWN`, without that bit. An auto-repeat (bit 30)
+/// flips nothing, so holding the keys flips the option once.
 pub(crate) fn alt_option(message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<SearchOption> {
-    if message != WM_SYSKEYDOWN || lparam & ALT_DOWN == 0 {
+    if message != WM_SYSKEYDOWN || lparam & ALT_DOWN == 0 || lparam & REPEAT != 0 {
         return None;
     }
     alt_key(u32::try_from(wparam).ok()?)
@@ -307,6 +310,22 @@ mod tests {
         assert!(!is_toggle_char(WM_SYSCHAR, usize::from(b'f'), ALT_DOWN));
         assert!(!is_toggle_char(WM_SYSCHAR, usize::from(b'c'), 0));
         assert!(!is_toggle_char(WM_CHAR, usize::from(b'c'), ALT_DOWN));
+    }
+
+    #[test]
+    fn a_held_alt_letter_flips_its_option_once_not_on_every_repeat() {
+        // Break caught: holding Alt+C flipping match case on and off with every auto-repeat.
+        const REPEAT: isize = 1 << 30;
+        let c = usize::from(b'C');
+        assert_eq!(
+            alt_option(WM_SYSKEYDOWN, c, ALT_DOWN),
+            Some(SearchOption::Case)
+        );
+        assert_eq!(alt_option(WM_SYSKEYDOWN, c, ALT_DOWN | REPEAT), None);
+        assert!(
+            is_toggle_char(WM_SYSCHAR, usize::from(b'c'), ALT_DOWN | REPEAT),
+            "a repeat's character is still swallowed"
+        );
     }
 
     #[test]

@@ -81,6 +81,8 @@ pub enum CommandId {
     SearchToggleCase = 185,
     SearchToggleWholeWord = 186,
     SearchToggleRegex = 187,
+    FindNext = 188,
+    FindPrevious = 189,
 }
 
 impl CommandId {
@@ -178,7 +180,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 79] = [
+        const COMMANDS: [CommandId; 81] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -258,6 +260,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::SearchToggleCase,
             CommandId::SearchToggleWholeWord,
             CommandId::SearchToggleRegex,
+            CommandId::FindNext,
+            CommandId::FindPrevious,
         ];
         COMMANDS
             .into_iter()
@@ -416,6 +420,14 @@ mod tests {
         }
         assert_eq!(CommandId::ShowSearchView.search_option(), None);
         assert_eq!(CommandId::Find.search_option(), None);
+    }
+
+    #[test]
+    fn find_next_and_previous_have_stable_values_and_need_a_document() {
+        assert_eq!(CommandId::try_from(188), Ok(CommandId::FindNext));
+        assert_eq!(CommandId::try_from(189), Ok(CommandId::FindPrevious));
+        assert!(CommandId::FindNext.needs_document());
+        assert!(!CommandId::FindNext.is_sidebar());
     }
 
     #[test]
