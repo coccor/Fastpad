@@ -22,7 +22,8 @@ use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, S
 use crate::editor::scintilla_constants::{
     SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCOLUMN, SCI_GETCURRENTPOS,
     SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER, SCI_LINEFROMPOSITION,
-    SCI_LINELENGTH, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
+    SCI_LINELENGTH, SCI_POSITIONAFTER, SCI_POSITIONBEFORE, SCI_POSITIONFROMLINE,
+    SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
 };
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
@@ -370,6 +371,49 @@ impl Editor {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
+    /// Where `line` starts.
+    #[cfg(windows)]
+    pub fn line_start(&self, line: usize) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_POSITIONFROMLINE, line, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn line_start(&self, _line: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// The position one character after `position` (a whole UTF-8 sequence or CRLF), or the
+    /// document's length at its end.
+    #[cfg(windows)]
+    pub fn position_after(&self, position: usize) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_POSITIONAFTER, position, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn position_after(&self, _position: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// The position one character before `position`, or 0 at the start.
+    #[cfg(windows)]
+    pub fn position_before(&self, position: usize) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_POSITIONBEFORE, position, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn position_before(&self, _position: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
     #[cfg(windows)]
     pub fn line_count(&self) -> Result<usize> {
         Ok(self
@@ -548,9 +592,16 @@ impl Editor {
                 else {
                     break;
                 };
-                // A regex that matched empty text would match at the same place forever.
+                // An empty match (a regex like `a*` between the runs it matches) is stepped over,
+                // never replaced: replacing it would insert the replacement between characters,
+                // and searching from the same place again would find it forever.
                 if found.is_empty() {
-                    break;
+                    let next = self.position_after(found.end)?;
+                    if next <= found.end {
+                        break;
+                    }
+                    position = next;
+                    continue;
                 }
                 let replaced = self.replace_target(found, replacement)?;
                 count += 1;
@@ -1486,12 +1537,12 @@ mod tests {
         SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
         SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
         SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT,
-        SCI_GETTARGETEND, SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET,
-        SCI_SEARCHINTARGET, SCI_SETDOCPOINTER, SCI_SETELEMENTCOLOUR, SCI_SETILEXER,
-        SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
-        SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
-        SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
-        SCI_UNDO,
+        SCI_GETTARGETEND, SCI_PASTE, SCI_POSITIONAFTER, SCI_REDO, SCI_RELEASEDOCUMENT,
+        SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETDOCPOINTER, SCI_SETELEMENTCOLOUR,
+        SCI_SETILEXER, SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN,
+        SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS, SCI_SETSEL,
+        SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
+        SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
     };
     use crate::editor::scintilla_constants::{
         SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_SETZOOM, SCI_STYLEGETBACK,
@@ -1714,19 +1765,23 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_stops_at_an_empty_match() {
+    fn replace_all_steps_past_an_empty_match_instead_of_replacing_it() {
         // Break caught: a regex that can match empty text (`x*`) replacing at the same
-        // position forever, or inserting the replacement between every character.
+        // position forever, inserting the replacement between every character, or stopping
+        // at the first empty match so later runs are never replaced.
         let harness = TestDirectHarness::new();
         harness.push_response(0); // SCI_BEGINUNDOACTION
         harness.push_response(5); // SCI_GETLENGTH
         harness.push_response(0); // SCI_SEARCHINTARGET: an empty match at 0
         harness.push_target_end(0);
+        harness.push_response(5); // SCI_GETLENGTH
+        harness.push_response(-1); // SCI_SEARCHINTARGET from 1: nothing
         harness.push_response(0); // SCI_ENDUNDOACTION
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
         assert_eq!(editor.replace_all("x*", "y", 0).unwrap(), 0);
         assert!(harness.replace_bytes().is_empty());
+        assert_eq!(harness.target_range(), Some((1, 5)), "searched on from 1");
         assert_eq!(harness.event_log(), vec!["begin", "end"]);
     }
 
@@ -2411,6 +2466,8 @@ mod tests {
                 let scripted = state.target_ends.pop_front();
                 scripted.unwrap_or(state.last_target_end)
             }
+            // One byte per character keeps the stepping readable.
+            SCI_POSITIONAFTER => wparam as isize + 1,
             SCI_REPLACETARGET => {
                 let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };
                 state.replace_bytes.push(bytes.to_vec());

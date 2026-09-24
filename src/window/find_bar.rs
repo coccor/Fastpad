@@ -124,10 +124,7 @@ impl SearchState {
             return Ok(None);
         }
         let bounds = self.scintilla_bounds(doc_len);
-        // An empty match (a regex like `x*`) would be found at the caret again and again.
-        let found = editor
-            .search_in_target(&self.query, bounds, flags)?
-            .filter(|found| !found.is_empty());
+        let found = find_non_empty(editor, &self.query, bounds, flags)?;
         if let Some(found) = found {
             self.record_match(found.clone());
             return Ok(Some(found));
@@ -137,9 +134,7 @@ impl SearchState {
         }
         self.record_miss(doc_len);
         let bounds = self.scintilla_bounds(doc_len);
-        let found = editor
-            .search_in_target(&self.query, bounds, flags)?
-            .filter(|found| !found.is_empty());
+        let found = find_non_empty(editor, &self.query, bounds, flags)?;
         if let Some(found) = &found {
             self.record_match(found.clone());
         }
@@ -192,6 +187,88 @@ pub(crate) fn escape_pattern(text: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+/// The first non-empty match of `query` in `bounds`, or with `bounds.start > bounds.end` (a
+/// backward search) the last one. A regex that can match empty text (`\d*`, `.*`) is found as
+/// the empty match wherever it is first tried; that is stepped over rather than selected, which
+/// would leave F3 stuck at the caret, or taken as a miss, which would skip every later match.
+/// Each step moves the searched range strictly inward, so this ends.
+pub(crate) fn find_non_empty(
+    editor: &crate::editor::Editor,
+    query: &str,
+    bounds: Range<usize>,
+    flags: u32,
+) -> crate::Result<Option<Range<usize>>> {
+    if bounds.start <= bounds.end {
+        first_non_empty(editor, query, bounds, flags)
+    } else {
+        last_non_empty(editor, query, bounds.start, bounds.end, flags)
+    }
+}
+
+/// Forward: an empty hit moves the range's start one character past it.
+fn first_non_empty(
+    editor: &crate::editor::Editor,
+    query: &str,
+    mut bounds: Range<usize>,
+    flags: u32,
+) -> crate::Result<Option<Range<usize>>> {
+    loop {
+        let Some(found) = editor.search_in_target(query, bounds.clone(), flags)? else {
+            return Ok(None);
+        };
+        if !found.is_empty() {
+            return Ok(Some(found));
+        }
+        let next = editor.position_after(found.end)?;
+        if next <= found.end || next >= bounds.end {
+            return Ok(None);
+        }
+        bounds.start = next;
+    }
+}
+
+/// Backward from `high` down to `low`. Scintilla's backward regex search gives a line's last
+/// match, and for a pattern that can match empty text that is the empty one at the range's end
+/// on that line. So on an empty hit the line's earlier matches are found forward, from the
+/// line's start to the hit, and the last of them is taken. A line without one moves `high` to
+/// the end of the line before.
+fn last_non_empty(
+    editor: &crate::editor::Editor,
+    query: &str,
+    mut high: usize,
+    low: usize,
+    flags: u32,
+) -> crate::Result<Option<Range<usize>>> {
+    loop {
+        let Some(found) = editor.search_in_target(query, high..low, flags)? else {
+            return Ok(None);
+        };
+        if !found.is_empty() {
+            return Ok(Some(found));
+        }
+        let line_start = editor
+            .line_start(editor.line_from_position(found.start)?)?
+            .max(low);
+        let mut last = None;
+        let mut from = line_start;
+        while let Some(hit) = first_non_empty(editor, query, from..found.start, flags)? {
+            from = hit.end;
+            last = Some(hit);
+        }
+        if last.is_some() {
+            return Ok(last);
+        }
+        if line_start <= low {
+            return Ok(None);
+        }
+        let previous = editor.position_before(line_start)?;
+        if previous >= high {
+            return Ok(None);
+        }
+        high = previous;
+    }
 }
 
 // --- Window integration: native child controls hosting Find/Replace ---
@@ -410,6 +487,11 @@ impl FindBar {
     pub(crate) fn owns(&self, hwnd: HWND) -> bool {
         !hwnd.is_null()
             && (hwnd == self.panel || hwnd == self.query_edit || hwnd == self.replace_edit)
+    }
+
+    /// Whether `hwnd` is the query field, whose edits clear the no-match state.
+    pub(crate) fn is_query(&self, hwnd: HWND) -> bool {
+        !hwnd.is_null() && hwnd == self.query_edit
     }
 
     pub(crate) fn query_text(&self) -> String {
@@ -998,7 +1080,8 @@ mod tests {
     use super::{SearchDirection, SearchState};
     use crate::editor::Editor;
     use crate::editor::scintilla_constants::{
-        SCI_GETTARGETEND, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
+        SCI_GETTARGETEND, SCI_POSITIONAFTER, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS,
+        SCI_SETTARGETRANGE,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1099,6 +1182,8 @@ mod tests {
                 let scripted = log.ends.pop_front();
                 scripted.unwrap_or(log.last_end)
             }
+            // One byte per character keeps the stepping readable.
+            SCI_POSITIONAFTER => wparam as isize + 1,
             _ => 0,
         }
     }
@@ -1200,12 +1285,13 @@ mod tests {
     }
 
     #[test]
-    fn a_regex_error_or_an_empty_match_is_no_match() {
-        // Break caught: a bad pattern reported as an error, or an empty match "found" at the
-        // caret forever, so F3 never moves.
+    fn a_regex_error_is_a_miss_and_an_empty_match_is_stepped_over() {
+        // Break caught: a bad pattern reported as an error, an empty match "found" at the
+        // caret forever so F3 never moves, or an empty match taken as a miss so the match
+        // after it is never reached.
         let log = Mutex::new(TargetLog {
-            responses: VecDeque::from([-2_isize, -2, 4, 4]),
-            ends: VecDeque::from([4_isize, 4]),
+            responses: VecDeque::from([-2_isize, -2, 4, 6]),
+            ends: VecDeque::from([4_isize, 8]),
             ..TargetLog::default()
         });
         let editor =
@@ -1215,7 +1301,9 @@ mod tests {
         assert_eq!(bad.next_editor_match(&editor, 0, 11).unwrap(), None);
 
         let mut empty = SearchState::new("x*", SearchDirection::Forward, 4);
-        assert_eq!(empty.next_editor_match(&editor, 0, 11).unwrap(), None);
+        assert_eq!(empty.next_editor_match(&editor, 0, 11).unwrap(), Some(6..8));
+        let ranges = log.lock().unwrap().ranges.clone();
+        assert_eq!(ranges[ranges.len() - 2..], [(4, 11), (5, 11)]);
     }
 
     #[test]
