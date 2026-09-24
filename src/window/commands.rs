@@ -83,6 +83,7 @@ pub enum CommandId {
     SearchToggleRegex = 187,
     FindNext = 188,
     FindPrevious = 189,
+    ReplaceInNotes = 190,
 }
 
 impl CommandId {
@@ -127,6 +128,7 @@ impl CommandId {
                 | Self::SearchToggleCase
                 | Self::SearchToggleWholeWord
                 | Self::SearchToggleRegex
+                | Self::ReplaceInNotes
         )
     }
 
@@ -151,6 +153,7 @@ impl CommandId {
                 | Self::SearchToggleCase
                 | Self::SearchToggleWholeWord
                 | Self::SearchToggleRegex
+                | Self::ReplaceInNotes
         )
     }
 
@@ -180,7 +183,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 81] = [
+        const COMMANDS: [CommandId; 82] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -262,6 +265,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::SearchToggleRegex,
             CommandId::FindNext,
             CommandId::FindPrevious,
+            CommandId::ReplaceInNotes,
         ];
         COMMANDS
             .into_iter()
@@ -428,6 +432,19 @@ mod tests {
         assert_eq!(CommandId::try_from(189), Ok(CommandId::FindPrevious));
         assert!(CommandId::FindNext.needs_document());
         assert!(!CommandId::FindNext.is_sidebar());
+    }
+
+    #[test]
+    fn replace_in_notes_is_190_a_sidebar_command_and_needs_no_document() {
+        // Break caught: 3b's first command renumbered onto another command's value, greyed out
+        // while no tab is open, or left running with notes mode off, where there is no Search
+        // view (spec §5).
+        assert_eq!(CommandId::ReplaceInNotes as u16, 190);
+        assert_eq!(CommandId::try_from(190), Ok(CommandId::ReplaceInNotes));
+        assert!(CommandId::ReplaceInNotes.is_sidebar());
+        assert!(!CommandId::ReplaceInNotes.needs_document());
+        assert_eq!(CommandId::ReplaceInNotes.search_option(), None);
+        assert_eq!(CommandId::try_from(191), Err(()));
     }
 
     #[test]

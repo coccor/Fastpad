@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 68] = [
+pub(crate) const ENTRIES: [PaletteEntry; 69] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -83,6 +83,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 68] = [
     entry("Search: Find next", CommandId::FindNext),
     entry("Search: Find previous", CommandId::FindPrevious),
     entry("Search: Replace", CommandId::Replace),
+    entry("Search: Replace in notes", CommandId::ReplaceInNotes),
     entry("Search: Toggle match case", CommandId::SearchToggleCase),
     entry(
         "Search: Toggle whole word",
@@ -1069,6 +1070,18 @@ mod tests {
         ] {
             assert_eq!(shortcut_text(command), None, "{command:?}");
         }
+    }
+
+    #[test]
+    fn replace_in_notes_is_listed_with_its_shortcut() {
+        // Break caught: the palette never offering 3b's replace, or its row showing Ctrl+H, the
+        // find bar's Replace.
+        assert_eq!(labels("replace in notes")[0], "Search: Replace in notes");
+        assert_eq!(
+            shortcut_text(CommandId::ReplaceInNotes).as_deref(),
+            Some("Ctrl+Shift+H")
+        );
+        assert_eq!(shortcut_text(CommandId::Replace).as_deref(), Some("Ctrl+H"));
     }
 
     #[test]

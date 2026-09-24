@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 51] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 52] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -40,6 +40,7 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 51] {
         accelerator(FCONTROL | FSHIFT, b'S', CommandId::SaveAs),
         accelerator(FCONTROL, b'F', CommandId::Find),
         accelerator(FCONTROL, b'H', CommandId::Replace),
+        accelerator(FCONTROL | FSHIFT, b'H', CommandId::ReplaceInNotes),
         virtual_key(0, VK_F3, CommandId::FindNext),
         virtual_key(FSHIFT, VK_F3, CommandId::FindPrevious),
         accelerator(FCONTROL, b'Z', CommandId::Undo),
@@ -560,7 +561,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 51);
+        assert_eq!(specs.len(), 52);
     }
 
     #[test]
@@ -654,6 +655,13 @@ mod tests {
         // Break caught: F3 unbound, so opening a Search result can't step on (spec §8).
         assert_eq!(bound(0, VK_F3), Some(CommandId::FindNext));
         assert_eq!(bound(FSHIFT, VK_F3), Some(CommandId::FindPrevious));
+        // Break caught: Ctrl+Shift+H unbound, or taking Ctrl+H from the find bar's Replace
+        // (spec §11).
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, u16::from(b'H')),
+            Some(CommandId::ReplaceInNotes)
+        );
+        assert_eq!(bound(FCONTROL, u16::from(b'H')), Some(CommandId::Replace));
     }
 
     #[test]

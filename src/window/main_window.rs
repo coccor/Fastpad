@@ -1154,7 +1154,7 @@ fn ensure_find_bar(hwnd: HWND) -> bool {
 
 /// The active editor's selection as a query, when it is non-empty and on one line. A multi-line
 /// selection can't be shown in a one-line box, so it is left alone rather than cut.
-fn single_line_selection(hwnd: HWND) -> Option<String> {
+pub(crate) fn single_line_selection(hwnd: HWND) -> Option<String> {
     let editor = unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())?;
     let text = editor.selected_text().ok()?;
     (!text.is_empty() && !text.contains(['\n', '\r'])).then_some(text)
@@ -2326,6 +2326,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, true)
         }
         CommandId::ShowSearchView => show_search_view(hwnd),
+        CommandId::ReplaceInNotes => crate::window::search_view::show_replace(hwnd),
         CommandId::SearchToggleCase
         | CommandId::SearchToggleWholeWord
         | CommandId::SearchToggleRegex => {
@@ -11541,6 +11542,65 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_h_shows_search_with_the_replace_field_and_takes_a_single_line_selection() {
+        // Break caught: Ctrl+Shift+H dead in the running app, Search shown without the replace
+        // field, the selection Ctrl+Shift+F takes ignored, or Ctrl+Shift+F closing the field
+        // again (spec §11: it leaves the field as it is).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_SHIFT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-shortcut");
+        scratch.note("a.md", "alpha beta");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        editor.populate_clean("alpha beta\r\ngamma").unwrap();
+        editor.set_selection(6..10).unwrap();
+        assert!(!crate::window::search_view::replace_open(window.hwnd));
+
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        keys[VK_SHIFT as usize] = 0x80;
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let message = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_KEYDOWN,
+            wParam: usize::from(b'H'),
+            ..Default::default()
+        };
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+
+        assert!(translated, "Ctrl+Shift+H was not translated");
+        assert_eq!(
+            crate::window::side_panel::current_view(window.hwnd),
+            crate::config::SidebarView::Search
+        );
+        assert!(crate::window::search_view::replace_open(window.hwnd));
+        assert_eq!(
+            crate::window::search_view::current_query(window.hwnd)
+                .map(|(query, _)| query)
+                .as_deref(),
+            Some("beta")
+        );
+        // The prefill searches at once, as Ctrl+Shift+F's does.
+        pump_until(window.hwnd, || {
+            crate::window::search_view::shown_results(window.hwnd).len() == 1
+        });
+
+        execute_command(window.hwnd, CommandId::ShowSearchView);
+        assert!(
+            crate::window::search_view::replace_open(window.hwnd),
+            "Ctrl+Shift+F leaves the field open"
+        );
+    }
+
+    #[test]
     fn ctrl_shift_f_escapes_the_selection_while_regex_is_on() {
         // Break caught: "a.b" searched as a pattern that also matches "axb".
         let _scintilla = load_native_scintilla();
@@ -11673,6 +11733,7 @@ mod tests {
             CommandId::SearchToggleCase,
             CommandId::SearchToggleWholeWord,
             CommandId::SearchToggleRegex,
+            CommandId::ReplaceInNotes,
         ] {
             execute_command(window.hwnd, command);
         }

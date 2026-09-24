@@ -370,6 +370,9 @@ pub(crate) struct SearchView {
     pub(crate) results: Vec<TextHit>,
     /// Match case, whole word and regex, for the session.
     pub(crate) options: MatchOptions,
+    /// The replace field is open (spec §11). Ctrl+Shift+H opens it, the chevron opens and closes
+    /// it, and Ctrl+Shift+F leaves it as it is.
+    replace_open: bool,
     pub(crate) search: SearchState,
     /// The same query is running again: its first batch replaces the results.
     replace_on_batch: bool,
@@ -415,6 +418,7 @@ impl SearchView {
             run_options: MatchOptions::default(),
             results: Vec::new(),
             options: MatchOptions::default(),
+            replace_open: false,
             search: SearchState::Idle,
             replace_on_batch: false,
             restore: None,
@@ -1172,6 +1176,25 @@ pub(crate) fn show_with_query(hwnd: HWND, text: &str) {
     text_search_host::run_now(hwnd);
 }
 
+/// Ctrl+Shift+H (spec §11): shows Search with the replace field open. A one-line selection in the
+/// active editor fills the search box and searches at once, as Ctrl+Shift+F's does
+/// (`show_with_query` escapes it while regex is on).
+pub(crate) fn show_replace(hwnd: HWND) {
+    // Read before the view takes the focus.
+    let prefill = super::main_window::single_line_selection(hwnd);
+    side_panel::show_view(hwnd, SidebarView::Search, true);
+    if let Some(text) = prefill {
+        show_with_query(hwnd, &text);
+    }
+    let opened = with_view(hwnd, |view| {
+        (!std::mem::replace(&mut view.replace_open, true)).then_some(view.panel)
+    })
+    .flatten();
+    if let Some(panel) = opened {
+        invalidate(panel);
+    }
+}
+
 /// The listed notes' paths, relative to the notebook, in list order.
 pub(crate) fn result_paths(hwnd: HWND) -> Vec<PathBuf> {
     with_view(hwnd, |view| {
@@ -1787,6 +1810,12 @@ pub(crate) fn search_state(hwnd: HWND) -> SearchState {
 #[cfg(test)]
 pub(crate) fn edit_hwnd(hwnd: HWND) -> Option<HWND> {
     with_view(hwnd, |view| view.edit).flatten()
+}
+
+/// Whether the replace field is open.
+#[cfg(test)]
+pub(crate) fn replace_open(hwnd: HWND) -> bool {
+    with_view(hwnd, |view| view.replace_open).unwrap_or(false)
 }
 
 impl sidebar_accessibility::AccessibleView for SearchView {
