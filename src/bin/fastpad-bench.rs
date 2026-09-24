@@ -332,7 +332,8 @@ const LIBRARY_SCAN_REFERENCE_MS: f64 = 500.0;
 /// Spec §12 targets on the reference machine.
 const TREE_BUILD_REFERENCE_MS: f64 = 20.0;
 const TREE_ROWS_REFERENCE_MS: f64 = 16.0;
-const NAME_SEARCH_REFERENCE_MS: f64 = 5.0;
+/// The quick-open spec's §3.6 budget for one Ctrl+P keystroke.
+const QUICK_OPEN_REFERENCE_MS: f64 = 5.0;
 /// The note-search spec's §14 text search targets on the reference machine, over
 /// `TEXT_SEARCH_NOTES` notes of about 4 KB each with a warm OS cache.
 const TEXT_SEARCH_NOTES: usize = 10_000;
@@ -409,10 +410,8 @@ fn run_library_scan(
     let tree_rows_expanded_ms = median_ms(|| {
         std::hint::black_box(tree.rows(&|_| true, &[]));
     });
-    let name_search_ms = median_ms(|| {
-        std::hint::black_box(fastpad::library::name_search::search(
-            &paths, "note 12", 500,
-        ));
+    let quick_open_ms = median_ms(|| {
+        std::hint::black_box(fastpad::library::quick_open::search(&paths, "nt 12", 50));
     });
     let (text_search_first_batch_ms, text_search_full_ms, text_search_batch_ui_ms) =
         text_search_timings()?;
@@ -423,7 +422,7 @@ fn run_library_scan(
     println!("index_bytes~{index_bytes}");
     println!("tree_build_ms={tree_build_ms:.2}");
     println!("tree_rows_expanded_ms={tree_rows_expanded_ms:.2}");
-    println!("name_search_ms={name_search_ms:.2}");
+    println!("quick_open_ms={quick_open_ms:.2}");
     println!("text_search_first_batch_ms={text_search_first_batch_ms:.2}");
     println!("text_search_full_ms={text_search_full_ms:.2}");
     println!("text_search_batch_ui_ms={text_search_batch_ui_ms:.3}");
@@ -440,7 +439,7 @@ fn run_library_scan(
                 tree_rows_expanded_ms,
                 TREE_ROWS_REFERENCE_MS,
             ),
-            ("name search", name_search_ms, NAME_SEARCH_REFERENCE_MS),
+            ("quick open", quick_open_ms, QUICK_OPEN_REFERENCE_MS),
             (
                 "text search, first batch",
                 text_search_first_batch_ms,

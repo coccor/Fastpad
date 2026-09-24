@@ -3,8 +3,8 @@
 //! the progress so far. A few reader threads open and match the notes in parallel; the worker
 //! thread itself batches what they find. No Win32 and no window.
 
-use super::name_search::folder_of;
 use super::path_key;
+use super::quick_open::folder_of;
 use super::tree::natural_cmp;
 use crate::file::encoding;
 use crate::search::{Matcher, Snippet, first_snippet};

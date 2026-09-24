@@ -77,7 +77,8 @@ five runs each):
 - `tree_build_ms`: `NoteTree::build` over every note. The target is under 20 ms for 10,000 notes.
 - `tree_rows_expanded_ms`: flattening with every folder expanded (500 notes per folder). The
   target is under 16 ms.
-- `name_search_ms`: one Search-view keystroke over every name. The target is under 5 ms.
+- `quick_open_ms`: one Ctrl+P keystroke (`nt 12`) scored over every note. The target is under
+  5 ms.
 
 `--enforce-reference` fails the run when any of them reaches its target.
 
