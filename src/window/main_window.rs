@@ -11296,6 +11296,15 @@ mod tests {
         }
     }
 
+    fn type_into_replace(hwnd: HWND, text: &str) {
+        let edit = crate::window::search_view::replace_edit_hwnd(hwnd).unwrap();
+        let wide = crate::platform::wide_null(text);
+        // The Edit sends EN_CHANGE to the panel, which keeps the text; no search runs.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
+        }
+    }
+
     fn search_state(hwnd: HWND) -> crate::window::search_view::SearchState {
         crate::window::search_view::search_state(hwnd)
     }
@@ -11597,6 +11606,278 @@ mod tests {
         assert!(
             crate::window::search_view::replace_open(window.hwnd),
             "Ctrl+Shift+F leaves the field open"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_h_focuses_the_replace_field_and_typing_there_runs_no_search() {
+        // Break caught: the caret left in the search box, the replace text read by WM_GETTEXT
+        // under the App borrow instead of kept, a keystroke in the replace field restarting the
+        // search, or Esc and Up in it doing what they do in the box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_UP};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-field");
+        scratch.note("a.md", "alpha needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+
+        execute_command(window.hwnd, CommandId::ReplaceInNotes);
+        let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+        let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        assert!(is_shown(replace));
+        assert_eq!(unsafe { GetFocus() }, replace);
+
+        search_for(window.hwnd, "needle");
+        let generation = search_generation(window.hwnd);
+        type_into_replace(window.hwnd, "pin");
+        assert_eq!(crate::window::search_view::replace_text(window.hwnd), "pin");
+        pump_past_debounce(window.hwnd);
+        assert_eq!(
+            search_generation(window.hwnd),
+            generation,
+            "typing a replacement runs no search"
+        );
+        assert_eq!(search_rows(window.hwnd).len(), 1);
+
+        unsafe { SendMessageW(replace, WM_KEYDOWN, VK_UP as usize, 0) };
+        assert_eq!(unsafe { GetFocus() }, search_box, "Up goes to the box");
+        unsafe { SendMessageW(replace, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+        assert_eq!(
+            crate::window::search_view::replace_text(window.hwnd),
+            "",
+            "Esc clears the field"
+        );
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(replace) };
+        unsafe { SendMessageW(replace, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+        assert_eq!(
+            unsafe { GetFocus() },
+            editor.hwnd(),
+            "Esc in the empty field returns to the editor"
+        );
+    }
+
+    #[test]
+    fn the_chevron_opens_and_closes_the_replace_field() {
+        // Break caught: a chevron that does nothing, a replace field made before the user asks
+        // for it, one left showing (or holding the caret) once closed, or the results kept under
+        // the replace row.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-chevron");
+        scratch.note("a.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "needle");
+        assert!(
+            crate::window::search_view::replace_edit_hwnd(window.hwnd).is_none(),
+            "made the first time it opens"
+        );
+        let panel = sidebar_panel(window.hwnd);
+        let (width, height) = client_size(panel);
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(panel) }.max(96);
+        let chevron = crate::window::search_view::SearchView::chevron_rect(client, dpi);
+        let (x, y) = (
+            (chevron.left + chevron.right) / 2,
+            (chevron.top + chevron.bottom) / 2,
+        );
+        let list_top = || {
+            app_mut(window.hwnd)
+                .sidebar
+                .as_ref()
+                .unwrap()
+                .search
+                .list_area(client, dpi)
+                .top
+        };
+        let closed_top = list_top();
+
+        click(panel, x, y);
+        assert!(crate::window::search_view::replace_open(window.hwnd));
+        let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+        assert!(is_shown(replace));
+        assert_eq!(unsafe { GetFocus() }, replace);
+        assert!(
+            list_top() > closed_top,
+            "the results move under the replace row"
+        );
+
+        click(panel, x, y);
+        assert!(!crate::window::search_view::replace_open(window.hwnd));
+        assert!(!is_shown(replace));
+        assert_eq!(
+            unsafe { GetFocus() },
+            crate::window::search_view::edit_hwnd(window.hwnd).unwrap(),
+            "the caret goes back to the search box"
+        );
+        assert_eq!(list_top(), closed_top);
+    }
+
+    /// Sends `key` to `window` as a key press with Ctrl and Shift held as given.
+    fn press_with(window: HWND, key: u16, ctrl: bool, shift: bool, alt: bool) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_SYSKEYDOWN};
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = if ctrl { 0x80 } else { 0 };
+        keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
+        keys[VK_MENU as usize] = if alt { 0x80 } else { 0 };
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let message = if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN };
+        unsafe { SendMessageW(window, message, usize::from(key), 0) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+    }
+
+    #[test]
+    fn tab_cycles_the_search_box_the_replace_field_and_the_results() {
+        // Break caught: Tab beeping in the box, never reaching the replace field or the results,
+        // landing in the replace field while it is closed, or Shift+Tab not going back.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_TAB};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-tab");
+        scratch.note("a.md", "alpha needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let panel = sidebar_panel(window.hwnd);
+
+        execute_command(window.hwnd, CommandId::ReplaceInNotes);
+        search_for(window.hwnd, "needle");
+        let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+        let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        let focus = || unsafe { GetFocus() };
+        let tab = |back: bool| press_with(focus(), VK_TAB, false, back, false);
+
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(search_box) };
+        tab(false);
+        assert_eq!(focus(), replace, "box -> replace");
+        tab(false);
+        assert_eq!(focus(), panel, "replace -> results");
+        tab(false);
+        assert_eq!(focus(), search_box, "results -> box, wrapping");
+        tab(true);
+        assert_eq!(focus(), panel, "Shift+Tab: box -> results, wrapping");
+        tab(true);
+        assert_eq!(focus(), replace, "Shift+Tab: results -> replace");
+        tab(true);
+        assert_eq!(focus(), search_box, "Shift+Tab: replace -> box");
+
+        crate::window::search_view::toggle_replace(window.hwnd);
+        assert!(!crate::window::search_view::replace_open(window.hwnd));
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(search_box) };
+        tab(false);
+        assert_eq!(focus(), panel, "closed: box -> results");
+        tab(false);
+        assert_eq!(focus(), search_box, "closed: results -> box");
+        tab(true);
+        assert_eq!(focus(), panel, "closed: Shift+Tab box -> results");
+        tab(true);
+        assert_eq!(focus(), search_box, "closed: Shift+Tab results -> box");
+    }
+
+    #[test]
+    fn the_replace_buttons_and_their_keys_route_to_the_replace_and_open_nothing() {
+        // Break caught: Ctrl+Shift+1 or a press on a row's replace button opening the result
+        // instead, Ctrl+Alt+Enter in a field opening one, either running with the replace field
+        // closed, or the row button and its key reaching different places.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_RETURN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-routes");
+        scratch.note("a.md", "alpha needle");
+        scratch.note("b.md", "beta needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let panel = sidebar_panel(window.hwnd);
+        let requests = || crate::window::search_view::replace_requests(window.hwnd);
+
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "needle");
+        assert_eq!(search_rows(window.hwnd).len(), 2);
+        unsafe { SetFocus(panel) };
+        press_with(panel, u16::from(b'1'), true, true, false);
+        assert_eq!(requests(), (Vec::new(), 0), "the replace field is closed");
+
+        crate::window::search_view::toggle_replace(window.hwnd);
+        unsafe { SetFocus(panel) };
+        app_mut(window.hwnd)
+            .sidebar
+            .as_mut()
+            .unwrap()
+            .search
+            .list
+            .select(1, 400);
+        press_with(panel, u16::from(b'1'), true, true, false);
+        assert_eq!(requests(), (vec![1], 0), "Ctrl+Shift+1 on the selected row");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.preview_id(),
+            None,
+            "nothing opened"
+        );
+
+        let (width, height) = client_size(panel);
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(panel) }.max(96);
+        let button = {
+            let app = app_mut(window.hwnd);
+            let view = &app.sidebar.as_ref().unwrap().search;
+            let (row, _) = crate::window::sidebar_accessibility::row_rect(
+                view.list_area(client, dpi),
+                &view.list,
+                1,
+            );
+            crate::window::search_view::SearchView::row_replace_rect(row, dpi)
+        };
+        click(
+            panel,
+            (button.left + button.right) / 2,
+            (button.top + button.bottom) / 2,
+        );
+        assert_eq!(requests(), (vec![1, 1], 0), "the row's button");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.preview_id(),
+            None,
+            "nothing opened"
+        );
+
+        let all = crate::window::search_view::SearchView::replace_all_rect(client, dpi);
+        click(
+            panel,
+            (all.left + all.right) / 2,
+            (all.top + all.bottom) / 2,
+        );
+        assert_eq!(requests(), (vec![1, 1], 1), "Replace all");
+
+        let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+        let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        press_with(replace, VK_RETURN, true, false, true);
+        press_with(search_box, VK_RETURN, true, false, true);
+        assert_eq!(
+            requests(),
+            (vec![1, 1], 3),
+            "Ctrl+Alt+Enter in either field"
+        );
+        assert_eq!(
+            app_mut(window.hwnd).tabs.preview_id(),
+            None,
+            "nothing opened"
         );
     }
 

@@ -34,7 +34,8 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_NEXT, VK_RETURN, VK_UP,
+    TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_MENU, VK_NEXT, VK_RETURN,
+    VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -42,8 +43,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, MoveWindow,
     SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLEAR, WM_CUT, WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_PASTE, WM_SETFONT, WM_SETTEXT, WM_UNDO,
-    WS_CHILD, WS_VISIBLE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_PASTE, WM_SETFONT, WM_SETTEXT,
+    WM_SYSKEYDOWN, WM_UNDO, WS_CHILD, WS_VISIBLE,
 };
 
 pub(crate) const NO_NOTEBOOK: &str = "Open a notebook to search it.";
@@ -70,6 +71,80 @@ const SEARCH_HOOK_ID: usize = 0x4650_5356;
 /// The status line's tooltip. The toggles are tools 0 to 2, in `SearchOption::ALL` order.
 const STATUS_TOOL: usize = 3;
 const TOOLTIP_WIDTH_AT_96_DPI: i32 = 300;
+/// The chevron left of the search box that opens and closes the replace field (spec §11).
+const CHEVRON_LEFT_AT_96_DPI: i32 = 4;
+const CHEVRON_WIDTH_AT_96_DPI: i32 = 18;
+const CHEVRON_GAP_AT_96_DPI: i32 = 2;
+/// The replace field's row, under the header while the field is open.
+const REPLACE_ROW_AT_96_DPI: i32 = 34;
+/// Replace all, at the right of the replace field.
+const REPLACE_ALL_WIDTH_AT_96_DPI: i32 = 26;
+/// A result's replace button: a square at the row's right end.
+const ROW_BUTTON_AT_96_DPI: i32 = 22;
+/// Segoe MDL2 Assets: ChevronRight, ChevronDown, and Switch for both replace buttons.
+const CHEVRON_CLOSED_GLYPH: &str = "\u{E76C}";
+const CHEVRON_OPEN_GLYPH: &str = "\u{E70D}";
+const REPLACE_GLYPH: &str = "\u{E8AB}";
+const REPLACE_PLACEHOLDER: &str = "Replace";
+const REPLACE_HOOK_ID: usize = 0x4650_5352;
+/// The header buttons' and the row button's tooltips, after `STATUS_TOOL`.
+const CHEVRON_TOOL: usize = 4;
+const REPLACE_ALL_TOOL: usize = 5;
+const ROW_REPLACE_TOOL: usize = 6;
+
+/// A painted button in the Search view's header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeaderButton {
+    Chevron,
+    ReplaceAll,
+}
+
+/// A painted button's glyph color: dim while it can't run, the hover color under the pointer.
+fn button_color(enabled: bool, hover: bool, normal: u32, palette: &Palette) -> u32 {
+    if !enabled {
+        palette.line_number_foreground
+    } else if hover {
+        palette.hover_foreground
+    } else {
+        normal
+    }
+}
+
+fn key_down(key: VIRTUAL_KEY) -> bool {
+    (unsafe { GetKeyState(i32::from(key)) }) < 0
+}
+
+/// Where Tab and Shift+Tab move the caret in the Search view: the search box, the replace field
+/// while it is open, and the results, in that order, wrapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusStop {
+    Box,
+    Replace,
+    Results,
+}
+
+/// The stop after `from` (before it with `back`). The replace field is skipped while it is
+/// closed, and the results while there are none.
+fn next_stop(from: FocusStop, back: bool, replace_open: bool, has_results: bool) -> FocusStop {
+    let order = [FocusStop::Box, FocusStop::Replace, FocusStop::Results];
+    let usable = |stop: FocusStop| match stop {
+        FocusStop::Box => true,
+        FocusStop::Replace => replace_open,
+        FocusStop::Results => has_results,
+    };
+    let start = order.iter().position(|stop| *stop == from).unwrap_or(0);
+    (1..=order.len())
+        .map(|step| {
+            let index = if back {
+                (start + order.len() * 2 - step) % order.len()
+            } else {
+                (start + step) % order.len()
+            };
+            order[index]
+        })
+        .find(|stop| usable(*stop))
+        .unwrap_or(FocusStop::Box)
+}
 
 /// The box's placeholder: "Search text in <notebook>", with the notebook's display name.
 pub(crate) fn placeholder(notebook: Option<&Path>) -> String {
@@ -373,6 +448,23 @@ pub(crate) struct SearchView {
     /// The replace field is open (spec §11). Ctrl+Shift+H opens it, the chevron opens and closes
     /// it, and Ctrl+Shift+F leaves it as it is.
     replace_open: bool,
+    /// The replace field, made the first time it opens.
+    replace_edit: Option<HWND>,
+    /// Making the replace field failed and was reported; it is not tried again.
+    replace_edit_failed: bool,
+    /// The replace field's text, kept at each `EN_CHANGE` (`replace_changed`), so the replace and
+    /// screen readers read it without a `WM_GETTEXT` under the App borrow.
+    replace_text: String,
+    /// The result whose replace button is under the pointer.
+    row_hover_button: Option<usize>,
+    /// The header button under the pointer.
+    header_hover: Option<HeaderButton>,
+    /// The rows a row replace was asked for (`row_replace_requested`), for in-process tests.
+    #[cfg(test)]
+    row_replace_requests: Vec<usize>,
+    /// How many times Replace all was asked for (`replace_all_requested`), for in-process tests.
+    #[cfg(test)]
+    replace_all_requests: usize,
     pub(crate) search: SearchState,
     /// The same query is running again: its first batch replaces the results.
     replace_on_batch: bool,
@@ -419,6 +511,15 @@ impl SearchView {
             results: Vec::new(),
             options: MatchOptions::default(),
             replace_open: false,
+            replace_edit: None,
+            replace_edit_failed: false,
+            replace_text: String::new(),
+            row_hover_button: None,
+            header_hover: None,
+            #[cfg(test)]
+            row_replace_requests: Vec::new(),
+            #[cfg(test)]
+            replace_all_requests: 0,
             search: SearchState::Idle,
             replace_on_batch: false,
             restore: None,
@@ -434,24 +535,90 @@ impl SearchView {
         }
     }
 
-    /// The painted search field, border included.
+    /// The painted search field, border included, right of the chevron.
     pub(crate) fn field_rect(client: RECT, dpi: u32) -> RECT {
         let margin = scale(FIELD_MARGIN_AT_96_DPI, dpi);
         let height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
         let top = client.top + (scale(HEADER_AT_96_DPI, dpi) - height) / 2;
+        let left = client.left
+            + scale(CHEVRON_LEFT_AT_96_DPI, dpi)
+            + scale(CHEVRON_WIDTH_AT_96_DPI, dpi)
+            + scale(CHEVRON_GAP_AT_96_DPI, dpi);
         RECT {
-            left: client.left + margin,
+            left,
             top,
-            right: (client.right - margin).max(client.left + margin),
+            right: (client.right - margin).max(left),
             bottom: top + height,
         }
     }
 
-    /// Where the results are: under the header and the summary line, above the status line when
-    /// it shows.
+    /// The chevron that opens and closes the replace field, left of the search field and as tall.
+    pub(crate) fn chevron_rect(client: RECT, dpi: u32) -> RECT {
+        let field = Self::field_rect(client, dpi);
+        let left = client.left + scale(CHEVRON_LEFT_AT_96_DPI, dpi);
+        RECT {
+            left,
+            top: field.top,
+            right: left + scale(CHEVRON_WIDTH_AT_96_DPI, dpi),
+            bottom: field.bottom,
+        }
+    }
+
+    /// Replace all, in the replace row: as tall as the search field, ending at its right edge.
+    pub(crate) fn replace_all_rect(client: RECT, dpi: u32) -> RECT {
+        let field = Self::field_rect(client, dpi);
+        let height = field.bottom - field.top;
+        let top = client.top
+            + scale(HEADER_AT_96_DPI, dpi)
+            + (scale(REPLACE_ROW_AT_96_DPI, dpi) - height) / 2;
+        RECT {
+            left: (field.right - scale(REPLACE_ALL_WIDTH_AT_96_DPI, dpi)).max(field.left),
+            top,
+            right: field.right,
+            bottom: top + height,
+        }
+    }
+
+    /// The painted replace field, border included: under the search field, short of Replace all.
+    pub(crate) fn replace_field_rect(client: RECT, dpi: u32) -> RECT {
+        let field = Self::field_rect(client, dpi);
+        let all = Self::replace_all_rect(client, dpi);
+        RECT {
+            left: field.left,
+            top: all.top,
+            right: (all.left - scale(GAP_AT_96_DPI, dpi)).max(field.left),
+            bottom: all.bottom,
+        }
+    }
+
+    /// A result's replace button in `row` (the whole row's rectangle): a square, vertically
+    /// centered, in from the right edge by the rows' padding, clear of the scroll thumb.
+    pub(crate) fn row_replace_rect(row: RECT, dpi: u32) -> RECT {
+        let size = scale(ROW_BUTTON_AT_96_DPI, dpi);
+        let right = (row.right - scale(PADDING_AT_96_DPI, dpi)).max(row.left);
+        let top = row.top + (row.bottom - row.top - size) / 2;
+        RECT {
+            left: (right - size).max(row.left),
+            top,
+            right,
+            bottom: top + size,
+        }
+    }
+
+    /// Where the header ends, and the replace row under it while the replace field is open.
+    fn head_bottom(&self, client: RECT, dpi: u32) -> i32 {
+        let replace = if self.replace_open {
+            scale(REPLACE_ROW_AT_96_DPI, dpi)
+        } else {
+            0
+        };
+        (client.top + scale(HEADER_AT_96_DPI, dpi) + replace).min(client.bottom)
+    }
+
+    /// Where the results are: under the header, the replace row while it shows, and the summary
+    /// line, above the status line when it shows.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
-        let top = (client.top + scale(HEADER_AT_96_DPI, dpi) + scale(LINE_AT_96_DPI, dpi))
-            .min(client.bottom);
+        let top = (self.head_bottom(client, dpi) + scale(LINE_AT_96_DPI, dpi)).min(client.bottom);
         let bottom = if self.status_line().is_some() {
             (client.bottom - scale(LINE_AT_96_DPI, dpi)).max(top)
         } else {
@@ -464,15 +631,53 @@ impl SearchView {
         }
     }
 
-    /// The summary line under the box, where the notice shows too.
-    pub(crate) fn summary_rect(client: RECT, dpi: u32) -> RECT {
+    /// The summary line under the header (and the replace row), where the notice shows too.
+    pub(crate) fn summary_rect(&self, client: RECT, dpi: u32) -> RECT {
         let pad = scale(PADDING_AT_96_DPI, dpi);
-        let top = (client.top + scale(HEADER_AT_96_DPI, dpi)).min(client.bottom);
+        let top = self.head_bottom(client, dpi);
         RECT {
             left: client.left + pad,
             top,
             right: client.right - pad,
             bottom: (top + scale(LINE_AT_96_DPI, dpi)).min(client.bottom),
+        }
+    }
+
+    /// Whether Replace all and the rows' replace buttons can run: a search finished with results
+    /// (spec §11), and no notice shows in their place.
+    pub(crate) fn replace_all_enabled(&self) -> bool {
+        matches!(self.search, SearchState::Done { .. })
+            && !self.results.is_empty()
+            && self.notice().is_none()
+    }
+
+    /// Whether row `index` shows its replace button: the hovered and the selected row, while the
+    /// replace field is open.
+    fn row_button_shown(&self, index: usize) -> bool {
+        self.replace_open && (self.list.hover == Some(index) || self.list.selected == Some(index))
+    }
+
+    /// The row whose replace button is under `point`, while that button shows.
+    fn row_button_at(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
+        let index = self.row_under(point, client, dpi)?;
+        if !self.row_button_shown(index) {
+            return None;
+        }
+        let (row, _) =
+            sidebar_accessibility::row_rect(self.list_area(client, dpi), &self.list, index);
+        inside(Self::row_replace_rect(row, dpi), point).then_some(index)
+    }
+
+    /// The header button under `point`: the chevron while the box shows, Replace all while the
+    /// replace field is open.
+    fn header_button_at(&self, point: POINT, client: RECT, dpi: u32) -> Option<HeaderButton> {
+        self.edit?;
+        if inside(Self::chevron_rect(client, dpi), point) {
+            Some(HeaderButton::Chevron)
+        } else if self.replace_open && inside(Self::replace_all_rect(client, dpi), point) {
+            Some(HeaderButton::ReplaceAll)
+        } else {
+            None
         }
     }
 
@@ -519,6 +724,39 @@ impl SearchView {
             }
             _ => String::new(),
         };
+        let chevron = if self.edit.is_some() {
+            "Toggle replace"
+        } else {
+            ""
+        };
+        tools.push((
+            CHEVRON_TOOL,
+            edges(Self::chevron_rect(client, dpi)),
+            chevron.to_owned(),
+        ));
+        let all = if self.replace_open {
+            "Replace all (Ctrl+Alt+Enter)"
+        } else {
+            ""
+        };
+        tools.push((
+            REPLACE_ALL_TOOL,
+            edges(Self::replace_all_rect(client, dpi)),
+            all.to_owned(),
+        ));
+        let row = self
+            .row_hover_button
+            .filter(|_| self.replace_open)
+            .map(|index| {
+                let (row, _) =
+                    sidebar_accessibility::row_rect(self.list_area(client, dpi), &self.list, index);
+                Self::row_replace_rect(row, dpi)
+            });
+        tools.push((
+            ROW_REPLACE_TOOL,
+            edges(row.unwrap_or_default()),
+            if row.is_some() { "Replace" } else { "" }.to_owned(),
+        ));
         tools.push((STATUS_TOOL, edges(Self::status_rect(client, dpi)), skipped));
         tools
     }
@@ -688,6 +926,7 @@ impl SearchView {
         let palette = paint.palette;
         let client = paint.client;
         let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT | DT_END_ELLIPSIS;
+        let glyph = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
         unsafe {
             fill(paint.hdc, client, paint.background);
             if self.edit.is_some() {
@@ -702,8 +941,44 @@ impl SearchView {
                     &palette,
                     paint.fonts.text,
                 );
+                let chevron = Self::chevron_rect(client, dpi);
+                let hover = self.header_hover == Some(HeaderButton::Chevron);
+                if hover {
+                    fill(paint.hdc, chevron, palette.hover_background);
+                }
+                draw_text(
+                    paint.hdc,
+                    if self.replace_open {
+                        CHEVRON_OPEN_GLYPH
+                    } else {
+                        CHEVRON_CLOSED_GLYPH
+                    },
+                    chevron,
+                    paint.fonts.glyph,
+                    button_color(true, hover, palette.muted_foreground, &palette),
+                    glyph,
+                );
+                if self.replace_open {
+                    let replace = Self::replace_field_rect(client, dpi);
+                    fill(paint.hdc, replace, palette.selection_background);
+                    fill(paint.hdc, inset(replace, 1), palette.editor_background);
+                    let all = Self::replace_all_rect(client, dpi);
+                    let enabled = self.replace_all_enabled();
+                    let hover = enabled && self.header_hover == Some(HeaderButton::ReplaceAll);
+                    if hover {
+                        fill(paint.hdc, all, palette.hover_background);
+                    }
+                    draw_text(
+                        paint.hdc,
+                        REPLACE_GLYPH,
+                        all,
+                        paint.fonts.glyph,
+                        button_color(enabled, hover, palette.editor_foreground, &palette),
+                        glyph,
+                    );
+                }
             }
-            let summary = Self::summary_rect(client, dpi);
+            let summary = self.summary_rect(client, dpi);
             if let Some(notice) = self.notice() {
                 draw_text(
                     paint.hdc,
@@ -746,7 +1021,8 @@ impl SearchView {
     }
 
     /// One result on two lines: the file icon, the name and its folder in dim text, then the
-    /// snippet with its match in bold.
+    /// snippet with its match in bold. The hovered and the selected row show their replace
+    /// button at the right end while the replace field is open; both lines stop short of it.
     fn draw_row(&self, hdc: HDC, index: usize, rect: RECT, look: RowLook, paint: &ViewPaint) {
         let Some(result) = self.results.get(index) else {
             return;
@@ -773,9 +1049,15 @@ impl SearchView {
         } else {
             palette.muted_foreground
         };
+        let button = self
+            .row_button_shown(index)
+            .then(|| Self::row_replace_rect(rect, dpi));
+        let right = button.map_or(rect.right - pad, |button| {
+            button.left - scale(GAP_AT_96_DPI, dpi)
+        });
         let text = RECT {
             left: glyph.right + scale(GAP_AT_96_DPI, dpi),
-            right: rect.right - pad,
+            right,
             ..first
         };
         let second = RECT {
@@ -814,6 +1096,21 @@ impl SearchView {
                 );
             }
             draw_snippet(hdc, &result.snippet, second, paint.fonts, foreground);
+            if let Some(button) = button {
+                let enabled = self.replace_all_enabled();
+                let hover = enabled && self.row_hover_button == Some(index);
+                if hover {
+                    fill(hdc, button, palette.hover_background);
+                }
+                draw_text(
+                    hdc,
+                    REPLACE_GLYPH,
+                    button,
+                    paint.fonts.glyph,
+                    button_color(enabled, hover, foreground, &palette),
+                    line | DT_CENTER,
+                );
+            }
         }
     }
 
@@ -1176,22 +1473,31 @@ pub(crate) fn show_with_query(hwnd: HWND, text: &str) {
     text_search_host::run_now(hwnd);
 }
 
-/// Ctrl+Shift+H (spec §11): shows Search with the replace field open. A one-line selection in the
-/// active editor fills the search box and searches at once, as Ctrl+Shift+F's does
-/// (`show_with_query` escapes it while regex is on).
+/// Ctrl+Shift+H (spec §11): shows Search with the replace field open and the caret in it. A
+/// one-line selection in the active editor fills the search box and searches at once, as
+/// Ctrl+Shift+F's does (`show_with_query` escapes it while regex is on).
 pub(crate) fn show_replace(hwnd: HWND) {
     // Read before the view takes the focus.
     let prefill = super::main_window::single_line_selection(hwnd);
-    side_panel::show_view(hwnd, SidebarView::Search, true);
+    side_panel::show_view(hwnd, SidebarView::Search, false);
     if let Some(text) = prefill {
         show_with_query(hwnd, &text);
     }
-    let opened = with_view(hwnd, |view| {
-        (!std::mem::replace(&mut view.replace_open, true)).then_some(view.panel)
-    })
-    .flatten();
-    if let Some(panel) = opened {
-        invalidate(panel);
+    let replace = side_panel::with_accessible_events(hwnd, || set_replace_open(hwnd, true));
+    let edit = with_view(hwnd, |view| view.edit).flatten();
+    // Focused with nothing of the App borrowed.
+    unsafe {
+        match (replace, edit) {
+            (Some(replace), _) => {
+                SetFocus(replace);
+                SendMessageW(replace, EM_SETSEL, 0, -1);
+            }
+            // No replace field could be made (reported once): the box takes the caret instead.
+            (None, Some(edit)) => {
+                SetFocus(edit);
+            }
+            (None, None) => {}
+        }
     }
 }
 
@@ -1213,7 +1519,7 @@ fn ensure_edit(hwnd: HWND) -> Option<HWND> {
         return edit;
     }
     // Made with nothing of the App borrowed: creating the Edit sends messages to the panel.
-    match create_edit(panel) {
+    match create_edit(panel, SEARCH_HOOK_ID) {
         Ok(edit) => {
             if with_view(hwnd, |view| view.edit = Some(edit)).is_none() {
                 unsafe { DestroyWindow(edit) };
@@ -1232,10 +1538,117 @@ fn ensure_edit(hwnd: HWND) -> Option<HWND> {
     }
 }
 
-/// A hidden search box inside `panel`.
-fn create_edit(panel: HWND) -> crate::Result<HWND> {
+/// The replace field, made now if the view has none yet. A failure is reported once.
+fn ensure_replace_edit(hwnd: HWND) -> Option<HWND> {
+    let (panel, edit, failed) = with_view(hwnd, |view| {
+        (view.panel, view.replace_edit, view.replace_edit_failed)
+    })?;
+    if edit.is_some() || failed {
+        return edit;
+    }
+    // Made with nothing of the App borrowed: creating the Edit sends messages to the panel.
+    match create_edit(panel, REPLACE_HOOK_ID) {
+        Ok(edit) => {
+            if with_view(hwnd, |view| view.replace_edit = Some(edit)).is_none() {
+                unsafe { DestroyWindow(edit) };
+                return None;
+            }
+            Some(edit)
+        }
+        Err(error) => {
+            with_view(hwnd, |view| view.replace_edit_failed = true);
+            super::main_window::push_notice(
+                hwnd,
+                format!("FastPad could not show the replace field: {error}"),
+            );
+            None
+        }
+    }
+}
+
+/// Opens or closes the replace field, making it the first time it opens, and lays the view out
+/// again. Returns the field while it is open; `None` when it is closed or could not be made (then
+/// it stays closed). Closing it with the caret inside moves the caret to the search box.
+fn set_replace_open(hwnd: HWND, open: bool) -> Option<HWND> {
+    let replace = if open {
+        Some(ensure_replace_edit(hwnd)?)
+    } else {
+        with_view(hwnd, |view| view.replace_edit).flatten()
+    };
+    let (panel, edit) = with_view(hwnd, |view| {
+        if view.replace_open != open {
+            view.replace_open = open;
+            // The replace children come and go, and the rows move down or up.
+            view.order = view.order.wrapping_add(1);
+            view.row_hover_button = None;
+            view.header_hover = None;
+        }
+        (view.panel, view.edit)
+    })?;
+    // Focused with nothing of the App borrowed: SetFocus sends focus messages.
+    if !open
+        && let (Some(replace), Some(edit)) = (replace, edit)
+        && unsafe { GetFocus() } == replace
+    {
+        unsafe {
+            SetFocus(edit);
+        }
+    }
+    layout(hwnd);
+    invalidate(panel);
+    if open { replace } else { None }
+}
+
+/// The chevron (spec §11): opens the replace field with the caret in it, or closes it.
+pub(crate) fn toggle_replace(hwnd: HWND) {
+    let Some(open) = with_view(hwnd, |view| !view.replace_open) else {
+        return;
+    };
+    let replace = side_panel::with_accessible_events(hwnd, || set_replace_open(hwnd, open));
+    if let Some(replace) = replace {
+        unsafe {
+            SetFocus(replace);
+            SendMessageW(replace, EM_SETSEL, 0, -1);
+        }
+    }
+}
+
+/// `EN_CHANGE` from one of the view's fields (`side_panel` passes the control).
+pub(crate) fn edit_changed(hwnd: HWND, edit: HWND) {
+    if with_view(hwnd, |view| view.replace_edit == Some(edit)).unwrap_or(false) {
+        replace_changed(hwnd, edit);
+    } else {
+        query_changed(hwnd);
+    }
+}
+
+/// `EN_CHANGE` from the replace field: keeps its text. No search runs.
+fn replace_changed(hwnd: HWND, edit: HWND) {
+    // Read with nothing of the App borrowed.
+    let text = window_text(edit);
+    with_view(hwnd, |view| view.replace_text = text);
+}
+
+/// The replace field's text as `EN_CHANGE` last kept it; empty before it is first opened.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the replace flow reads it from Task 6")
+)]
+pub(crate) fn replace_text(hwnd: HWND) -> String {
+    with_view(hwnd, |view| view.replace_text.clone()).unwrap_or_default()
+}
+
+/// Whether Replace all can run now (`SearchView::replace_all_enabled`).
+#[expect(dead_code, reason = "the replace flow reads it from Task 6")]
+pub(crate) fn replace_all_enabled(hwnd: HWND) -> bool {
+    with_view(hwnd, |view| view.replace_all_enabled()).unwrap_or(false)
+}
+
+/// A hidden field inside `panel`: the search box (`SEARCH_HOOK_ID`) or the replace field
+/// (`REPLACE_HOOK_ID`). The subclass tells them apart by its ID.
+fn create_edit(panel: HWND, hook: usize) -> crate::Result<HWND> {
     let edit = create_child(panel, &wide_null("Edit"), WS_CHILD | ES_AUTOHSCROLL as u32)?;
-    if unsafe { SetWindowSubclass(edit, Some(search_edit_proc), SEARCH_HOOK_ID, 0) } == 0 {
+    if unsafe { SetWindowSubclass(edit, Some(search_edit_proc), hook, 0) } == 0 {
         let error = last_error();
         unsafe {
             DestroyWindow(edit);
@@ -1245,10 +1658,11 @@ fn create_edit(panel: HWND) -> crate::Result<HWND> {
     Ok(edit)
 }
 
-/// Places the box in the header, short of the toggles, and shows it while the Search view shows,
-/// making it the first time the view shows a notebook. Part of `side_panel::layout`, and run
-/// whenever the view or the notebook changes. It never makes the box without a notebook: at
-/// startup that would come before the first paint. `shown` makes it once the user opens the view.
+/// Places the box in the header, short of the toggles, and the replace field in its row while it
+/// is open, and shows them while the Search view shows, making the box the first time the view
+/// shows a notebook. Part of `side_panel::layout`, and run whenever the view, the notebook or the
+/// replace field's state changes. It never makes the box without a notebook: at startup that
+/// would come before the first paint. `shown` makes it once the user opens the view.
 pub(crate) fn layout(hwnd: HWND) {
     let Some(has_notebook) = with_view(hwnd, |view| view.notebook.is_some()) else {
         return;
@@ -1265,28 +1679,59 @@ pub(crate) fn layout(hwnd: HWND) {
     let panel = unsafe { GetParent(edit) };
     let (client, dpi) = geometry(panel);
     let text_font = super::main_window::ui_fonts(hwnd).text;
-    unsafe {
-        if !text_font.is_null() {
-            SendMessageW(edit, WM_SETFONT, text_font as WPARAM, 0);
-        }
-    }
-    let field = SearchView::field_rect(client, dpi);
-    let text = text_height(edit, text_font).clamp(1, (field.bottom - field.top - 2).max(1));
     let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
-    let top = field.top + (field.bottom - field.top - text) / 2;
-    let width = (field.right - field.left - inset_x - option_toggles::reserved_width(dpi)).max(0);
-    unsafe {
-        MoveWindow(edit, field.left + inset_x, top, width, text, 1);
+    place_field(
+        edit,
+        SearchView::field_rect(client, dpi),
+        text_font,
+        inset_x,
+        option_toggles::reserved_width(dpi),
+    );
+    let (replace, replace_open) = with_view(hwnd, |view| {
+        view.list.row_height = scale(ROW_AT_96_DPI, dpi);
+        (view.replace_edit, view.replace_open)
+    })
+    .unwrap_or((None, false));
+    if let Some(replace) = replace {
+        place_field(
+            replace,
+            SearchView::replace_field_rect(client, dpi),
+            text_font,
+            inset_x,
+            inset_x,
+        );
     }
-    with_view(hwnd, |view| {
-        view.list.row_height = scale(ROW_AT_96_DPI, dpi)
-    });
     if show {
         unsafe {
             ShowWindow(edit, SW_SHOWNA);
         }
     } else {
         hide_box(edit);
+    }
+    if let Some(replace) = replace {
+        if show && replace_open {
+            unsafe {
+                ShowWindow(replace, SW_SHOWNA);
+            }
+        } else {
+            hide_box(replace);
+        }
+    }
+}
+
+/// Gives `edit` the sidebar's text font and centers it vertically in the painted `field`, `inset`
+/// in from its left edge and `reserved` short of its right edge.
+fn place_field(edit: HWND, field: RECT, font: HFONT, inset: i32, reserved: i32) {
+    unsafe {
+        if !font.is_null() {
+            SendMessageW(edit, WM_SETFONT, font as WPARAM, 0);
+        }
+    }
+    let text = text_height(edit, font).clamp(1, (field.bottom - field.top - 2).max(1));
+    let top = field.top + (field.bottom - field.top - text) / 2;
+    let width = (field.right - field.left - inset - reserved).max(0);
+    unsafe {
+        MoveWindow(edit, field.left + inset, top, width, text, 1);
     }
 }
 
@@ -1329,12 +1774,13 @@ pub(crate) fn shown(hwnd: HWND, focus: bool) {
     }
 }
 
-/// `side_panel::show_view` switched away from Search. The query stays. The toggles' tooltips go,
-/// or they would show over the other view.
+/// `side_panel::show_view` switched away from Search. The query and the replace text stay. The
+/// tooltips go, or they would show over the other view.
 pub(crate) fn hidden(hwnd: HWND) {
-    let Some((edit, tooltip, tools)) = with_view(hwnd, |view| {
+    let Some((edit, replace, tooltip, tools)) = with_view(hwnd, |view| {
         (
             view.edit,
+            view.replace_edit,
             view.tooltip,
             std::mem::take(&mut view.tools_shown),
         )
@@ -1345,6 +1791,9 @@ pub(crate) fn hidden(hwnd: HWND) {
         for (id, _, _) in tools {
             tooltip.set_tool(id, RECT::default(), "");
         }
+    }
+    if let Some(replace) = replace {
+        hide_box(replace);
     }
     if let Some(edit) = edit {
         hide_box(edit);
@@ -1419,12 +1868,74 @@ fn enter_results(hwnd: HWND, panel: HWND) {
     }
 }
 
-/// Whether panel point (`x`, `y`) is on the painted search field, which is client area, not
-/// window caption. The field shows once the box exists.
+/// Tab (Shift+Tab with `back`) from `from`: the caret moves to the next of the search box, the
+/// replace field while it is open, and the results while there are any, wrapping. Focused with
+/// nothing of the App borrowed.
+fn cycle_focus(hwnd: HWND, panel: HWND, from: FocusStop, back: bool) {
+    let Some((edit, replace, has_results)) = with_view(hwnd, |view| {
+        (
+            view.edit,
+            view.replace_edit.filter(|_| view.replace_open),
+            !view.results.is_empty(),
+        )
+    }) else {
+        return;
+    };
+    let to = next_stop(from, back, replace.is_some(), has_results);
+    if to == from {
+        return;
+    }
+    let field = match to {
+        FocusStop::Box => edit,
+        FocusStop::Replace => replace,
+        FocusStop::Results => {
+            enter_results(hwnd, panel);
+            return;
+        }
+    };
+    if let Some(field) = field {
+        // As a dialog's Tab does, the field's text comes selected.
+        unsafe {
+            SetFocus(field);
+            SendMessageW(field, EM_SETSEL, 0, -1);
+        }
+    }
+}
+
+/// Replace all (spec §11): its button, or Ctrl+Alt+Enter in either field. It runs only while the
+/// replace field is open and a search finished with results (`SearchView::replace_all_enabled`).
+fn replace_all_requested(hwnd: HWND) {
+    let ready =
+        with_view(hwnd, |view| view.replace_open && view.replace_all_enabled()).unwrap_or(false);
+    if ready {
+        #[cfg(test)]
+        with_view(hwnd, |view| view.replace_all_requests += 1);
+        // The replace itself (`text_search_host::replace_all`) is not wired yet.
+    }
+}
+
+/// A result's replace button, or Ctrl+Shift+1 on the selected result: replaces in that note only
+/// (spec §11). It runs under the same rule as Replace all, while the replace field is open.
+fn row_replace_requested(hwnd: HWND, index: usize) {
+    let ready = with_view(hwnd, |view| {
+        view.replace_open && view.replace_all_enabled() && index < view.results.len()
+    })
+    .unwrap_or(false);
+    if ready {
+        #[cfg(test)]
+        with_view(hwnd, |view| view.row_replace_requests.push(index));
+        // The replace itself (`text_search_host::replace_in`) is not wired yet.
+    }
+}
+
+/// Whether panel point (`x`, `y`) is on the chevron or the painted search field, which are client
+/// area, not window caption. Both show once the box exists.
 pub(crate) fn header_hit(hwnd: HWND, panel: HWND, x: i32, y: i32) -> bool {
     let (client, dpi) = geometry(panel);
+    let point = POINT { x, y };
     with_view(hwnd, |view| view.edit.is_some()).unwrap_or(false)
-        && inside(SearchView::field_rect(client, dpi), POINT { x, y })
+        && (inside(SearchView::field_rect(client, dpi), point)
+            || inside(SearchView::chevron_rect(client, dpi), point))
 }
 
 /// A press on the field's padding, outside the box itself, puts the caret in the box. Reports
@@ -1438,6 +1949,25 @@ fn field_pressed(hwnd: HWND, panel: HWND, at: POINT) -> bool {
         unsafe {
             SetFocus(edit);
         }
+    }
+    true
+}
+
+/// A press on the replace field's padding, outside the field's Edit, puts the caret in it.
+/// Reports whether the press was on the field.
+fn replace_field_pressed(hwnd: HWND, panel: HWND, at: POINT) -> bool {
+    let (client, dpi) = geometry(panel);
+    let Some(replace) =
+        with_view(hwnd, |view| view.replace_edit.filter(|_| view.replace_open)).flatten()
+    else {
+        return false;
+    };
+    if !inside(SearchView::replace_field_rect(client, dpi), at) {
+        return false;
+    }
+    // Focused with nothing of the App borrowed.
+    unsafe {
+        SetFocus(replace);
     }
     true
 }
@@ -1524,9 +2054,15 @@ pub(crate) fn handle(
                 }
                 let toggle = view.toggle_at(at, client, dpi);
                 let toggle_changed = std::mem::replace(&mut view.toggle_hover, toggle) != toggle;
+                let header = view.header_button_at(at, client, dpi);
+                let header_changed = std::mem::replace(&mut view.header_hover, header) != header;
                 let hover = view.row_under(at, client, dpi);
                 let row_changed = view.list.set_hover(hover);
-                toggle_changed || row_changed
+                // After the hover moved: the button shows on the hovered row.
+                let button = view.row_button_at(at, client, dpi);
+                let button_changed =
+                    std::mem::replace(&mut view.row_hover_button, button) != button;
+                toggle_changed || header_changed || row_changed || button_changed
             })
             .unwrap_or(false);
             if changed {
@@ -1538,8 +2074,10 @@ pub(crate) fn handle(
         WM_MOUSELEAVE => {
             let changed = with_view(hwnd, |view| {
                 let toggle_changed = view.toggle_hover.take().is_some();
+                let header_changed = view.header_hover.take().is_some();
+                let button_changed = view.row_hover_button.take().is_some();
                 let row_changed = view.list.set_hover(None);
-                toggle_changed || row_changed
+                toggle_changed || header_changed || button_changed || row_changed
             })
             .unwrap_or(false);
             if changed {
@@ -1554,7 +2092,32 @@ pub(crate) fn handle(
                 toggle_option(hwnd, option);
                 return Some(0);
             }
-            if field_pressed(hwnd, panel, at) {
+            // A double click on a button is only its first press again.
+            let pressed = message == WM_LBUTTONDOWN;
+            match with_view(hwnd, |view| view.header_button_at(at, client, dpi)).flatten() {
+                Some(HeaderButton::Chevron) => {
+                    if pressed {
+                        toggle_replace(hwnd);
+                    }
+                    return Some(0);
+                }
+                Some(HeaderButton::ReplaceAll) => {
+                    if pressed {
+                        replace_all_requested(hwnd);
+                    }
+                    return Some(0);
+                }
+                None => {}
+            }
+            if replace_field_pressed(hwnd, panel, at) || field_pressed(hwnd, panel, at) {
+                return Some(0);
+            }
+            if let Some(index) =
+                with_view(hwnd, |view| view.row_button_at(at, client, dpi)).flatten()
+            {
+                if pressed {
+                    row_replace_requested(hwnd, index);
+                }
                 return Some(0);
             }
             // A press on the scroll thumb drags it, as in the Notebook view.
@@ -1616,7 +2179,20 @@ pub(crate) fn handle(
         }
         WM_KEYDOWN => {
             let key = wparam as u16;
-            let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+            let ctrl = key_down(VK_CONTROL);
+            let shift = key_down(VK_SHIFT);
+            // Tab and Shift+Tab move on to the search box or the replace field.
+            if key == VK_TAB && !ctrl {
+                cycle_focus(hwnd, panel, FocusStop::Results, shift);
+                return Some(0);
+            }
+            // Ctrl+Shift+1 is the selected row's replace button (VS Code's binding).
+            if key == u16::from(b'1') && ctrl && shift {
+                if let Some(index) = with_view(hwnd, |view| view.list.selected).flatten() {
+                    row_replace_requested(hwnd, index);
+                }
+                return Some(0);
+            }
             if key == VK_RETURN {
                 if ctrl {
                     open_selected(hwnd, OpenMode::Permanent, true);
@@ -1659,10 +2235,17 @@ pub(crate) fn handle(
     }
 }
 
-/// The box's placeholder, painted where typed text starts.
-fn paint_placeholder(hwnd: HWND, edit: HWND) -> bool {
-    let Some((text, colors)) = with_view(hwnd, |view| (view.placeholder.clone(), view.colors))
-    else {
+/// A field's placeholder, painted where typed text starts: "Search text in <notebook>" in the
+/// box, "Replace" in the replace field.
+fn paint_placeholder(hwnd: HWND, edit: HWND, replace: bool) -> bool {
+    let Some((text, colors)) = with_view(hwnd, |view| {
+        let text = if replace {
+            REPLACE_PLACEHOLDER.to_owned()
+        } else {
+            view.placeholder.clone()
+        };
+        (text, view.colors)
+    }) else {
         return false;
     };
     let mut paint = PAINTSTRUCT::default();
@@ -1689,25 +2272,29 @@ fn paint_placeholder(hwnd: HWND, edit: HWND) -> bool {
     true
 }
 
+/// The subclass of both fields. `subclass_id` tells them apart: `SEARCH_HOOK_ID` for the search
+/// box, `REPLACE_HOOK_ID` for the replace field.
 unsafe extern "system" fn search_edit_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    _subclass_id: usize,
+    subclass_id: usize,
     _ref_data: usize,
 ) -> LRESULT {
     if message == WM_NCDESTROY {
         // The last message: drop the hook and let the Edit finish; nothing else is looked up.
         unsafe {
-            RemoveWindowSubclass(hwnd, Some(search_edit_proc), SEARCH_HOOK_ID);
+            RemoveWindowSubclass(hwnd, Some(search_edit_proc), subclass_id);
             return DefSubclassProc(hwnd, message, wparam, lparam);
         }
     }
+    let replace = subclass_id == REPLACE_HOOK_ID;
     let panel = unsafe { GetParent(hwnd) };
     let main = unsafe { GetParent(panel) };
-    // A single-line Edit beeps at Enter and Escape characters; both are handled on key down.
-    if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b) {
+    // A single-line Edit beeps at Enter, Escape and Tab characters; all three are handled on key
+    // down.
+    if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b | 0x09) {
         return 0;
     }
     // Alt+C, Alt+W and Alt+R flip the toggles before the menu band sees the letter (spec §4).
@@ -1720,17 +2307,51 @@ unsafe extern "system" fn search_edit_proc(
     }
     if message == WM_PAINT
         && unsafe { GetWindowTextLengthW(hwnd) } == 0
-        && paint_placeholder(main, hwnd)
+        && paint_placeholder(main, hwnd, replace)
     {
         return 0;
     }
+    // Ctrl+Alt+Enter in either field is Replace all (spec §11). With Ctrl held it can come as
+    // WM_KEYDOWN or as WM_SYSKEYDOWN; either way it never opens a result.
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && wparam as u16 == VK_RETURN
+        && key_down(VK_CONTROL)
+        && key_down(VK_MENU)
+    {
+        // A held key's repeats (bit 30, the previous key state) run nothing again.
+        if lparam & (1 << 30) == 0 {
+            replace_all_requested(main);
+        }
+        return 0;
+    }
     if message == WM_KEYDOWN {
-        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+        let ctrl = key_down(VK_CONTROL);
         match wparam as u16 {
             VK_DOWN | VK_NEXT => {
                 enter_results(main, panel);
                 return 0;
             }
+            // Tab and Shift+Tab move on to the other field or the results.
+            VK_TAB if !ctrl => {
+                let from = if replace {
+                    FocusStop::Replace
+                } else {
+                    FocusStop::Box
+                };
+                cycle_focus(main, panel, from, key_down(VK_SHIFT));
+                return 0;
+            }
+            // Up from the replace field goes back to the search box above it.
+            VK_UP if replace => {
+                if let Some(edit) = with_view(main, |view| view.edit).flatten() {
+                    unsafe {
+                        SetFocus(edit);
+                    }
+                }
+                return 0;
+            }
+            // Enter in the replace field replaces nothing: Replace all is Ctrl+Alt+Enter.
+            VK_RETURN if replace => return 0,
             VK_RETURN if ctrl => {
                 open_selected(main, OpenMode::Permanent, true);
                 return 0;
@@ -1740,11 +2361,11 @@ unsafe extern "system" fn search_edit_proc(
                 return 0;
             }
             VK_ESCAPE => {
-                // Esc clears the box; in an empty box it returns to the editor (spec §4).
+                // Esc clears the field; in an empty one it returns to the editor (spec §4).
                 if unsafe { GetWindowTextLengthW(hwnd) } > 0 {
                     let empty = wide_null("");
                     // WM_SETTEXT comes back through this proc, which repaints the placeholder,
-                    // and EN_CHANGE clears the results.
+                    // and EN_CHANGE clears the results or the kept replace text.
                     unsafe {
                         SetWindowTextW(hwnd, empty.as_ptr());
                     }
@@ -1818,6 +2439,21 @@ pub(crate) fn replace_open(hwnd: HWND) -> bool {
     with_view(hwnd, |view| view.replace_open).unwrap_or(false)
 }
 
+/// The rows a row replace was asked for, and how many times Replace all was, since the view was
+/// made.
+#[cfg(test)]
+pub(crate) fn replace_requests(hwnd: HWND) -> (Vec<usize>, usize) {
+    with_view(hwnd, |view| {
+        (view.row_replace_requests.clone(), view.replace_all_requests)
+    })
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn replace_edit_hwnd(hwnd: HWND) -> Option<HWND> {
+    with_view(hwnd, |view| view.replace_edit).flatten()
+}
+
 impl sidebar_accessibility::AccessibleView for SearchView {
     /// The box, the three toggles, the summary and status lines while they show, then the
     /// results. The status line comes before the results so its child ID stays put while
@@ -1856,7 +2492,7 @@ impl sidebar_accessibility::AccessibleView for SearchView {
             }
             SearchChild::Summary => sidebar_accessibility::text_item(
                 &self.shown_lines().0.unwrap_or_default(),
-                SearchView::summary_rect(client, dpi),
+                self.summary_rect(client, dpi),
             ),
             SearchChild::Status => sidebar_accessibility::text_item(
                 &self.shown_lines().1.unwrap_or_default(),
@@ -1883,7 +2519,7 @@ impl sidebar_accessibility::AccessibleView for SearchView {
         let child = if self.box_shown() && inside(field, point) {
             option_toggles::hit(&option_toggles::toggle_rects(field, dpi), point)
                 .map_or(SearchChild::Box, SearchChild::Toggle)
-        } else if summary.is_some() && inside(SearchView::summary_rect(client, dpi), point) {
+        } else if summary.is_some() && inside(self.summary_rect(client, dpi), point) {
             SearchChild::Summary
         } else if status.is_some() && inside(SearchView::status_rect(client, dpi), point) {
             SearchChild::Status
@@ -1926,9 +2562,10 @@ impl sidebar_accessibility::AccessibleView for SearchView {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOADING, NO_MATCH, NO_NOTEBOOK, ROW_AT_96_DPI, ROW_INSET_AT_96_DPI, ROW_LINE_AT_96_DPI,
-        SearchState, SearchView, TOO_SHORT, fit_before, notice_text, placeholder, skipped_tooltip,
-        status_text, summary_text,
+        FocusStop, LOADING, NO_MATCH, NO_NOTEBOOK, PADDING_AT_96_DPI, REPLACE_ROW_AT_96_DPI,
+        ROW_AT_96_DPI, ROW_INSET_AT_96_DPI, ROW_LINE_AT_96_DPI, SearchState, SearchView, TOO_SHORT,
+        fit_before, next_stop, notice_text, placeholder, skipped_tooltip, status_text,
+        summary_text,
     };
     use crate::library::text_search::{Progress, RunEnd, TextHit};
     use crate::search::{MatchOptions, SearchOption, Snippet};
@@ -1936,6 +2573,7 @@ mod tests {
     use crate::window::panel::scale;
     use crate::window::text_search_host::SearchBatch;
     use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::RECT;
 
     #[test]
     fn the_notice_explains_an_empty_list() {
@@ -2320,5 +2958,124 @@ mod tests {
             view.apply(batch(Vec::new(), 4, None), HEIGHT),
             "the progress moved"
         );
+    }
+
+    #[test]
+    fn the_replace_row_sits_under_the_box_with_replace_all_at_its_right() {
+        // Break caught: the chevron drawn over the box, the replace field overlapping the search
+        // field or its button, or the summary and results left under the replace row.
+        for dpi in [96, 144, 192] {
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: 320,
+                bottom: 600,
+            };
+            let chevron = SearchView::chevron_rect(client, dpi);
+            let field = SearchView::field_rect(client, dpi);
+            assert!(chevron.left > client.left, "{dpi}");
+            assert!(chevron.right < field.left, "{dpi}");
+            assert_eq!((chevron.top, chevron.bottom), (field.top, field.bottom));
+
+            let replace = SearchView::replace_field_rect(client, dpi);
+            let all = SearchView::replace_all_rect(client, dpi);
+            assert_eq!(replace.left, field.left);
+            assert!(replace.top > field.bottom, "{dpi}");
+            assert_eq!(replace.bottom - replace.top, field.bottom - field.top);
+            assert!(replace.right < all.left, "{dpi}");
+            assert_eq!(all.right, field.right);
+            assert_eq!((all.top, all.bottom), (replace.top, replace.bottom));
+
+            let mut view = SearchView::new(std::ptr::null_mut(), dpi);
+            let closed = view.list_area(client, dpi);
+            assert!(view.summary_rect(client, dpi).top >= field.bottom, "{dpi}");
+            view.replace_open = true;
+            let open = view.list_area(client, dpi);
+            assert_eq!(open.top - closed.top, scale(REPLACE_ROW_AT_96_DPI, dpi));
+            assert!(
+                view.summary_rect(client, dpi).top >= replace.bottom,
+                "{dpi}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_all_waits_for_a_finished_search_with_results() {
+        // Break caught: Replace all pressable while results stream in (the list and its stamps
+        // aren't final), after a pattern error, or with nothing listed (spec §11).
+        let mut view = SearchView::new(std::ptr::null_mut(), 96);
+        view.notebook = Some(PathBuf::from(r"C:\notes"));
+        view.loaded = true;
+        assert!(!view.replace_all_enabled(), "idle");
+        view.begin("needle", 10);
+        view.apply(batch(vec![hit("a", "")], 4, None), HEIGHT);
+        assert!(!view.replace_all_enabled(), "running");
+        view.apply(batch(Vec::new(), 10, Some(RunEnd::Completed)), HEIGHT);
+        assert!(view.replace_all_enabled());
+        view.search = SearchState::PatternError("Unclosed group".to_owned());
+        assert!(!view.replace_all_enabled(), "a pattern error");
+        view.begin("zzz", 10);
+        view.apply(batch(Vec::new(), 10, Some(RunEnd::Completed)), HEIGHT);
+        assert!(!view.replace_all_enabled(), "nothing listed");
+    }
+
+    #[test]
+    fn a_row_shows_its_replace_button_while_hovered_or_selected_and_the_field_is_open() {
+        // Break caught: a replace button on every row (a stray click replaces in the wrong
+        // note), none on the selected row for keyboard users, or buttons with the field closed.
+        let mut view = SearchView::new(std::ptr::null_mut(), 96);
+        view.begin("needle", 10);
+        view.apply(
+            batch(
+                vec![hit("a", ""), hit("b", ""), hit("c", "")],
+                10,
+                Some(RunEnd::Completed),
+            ),
+            HEIGHT,
+        );
+        view.list.select(0, HEIGHT);
+        view.list.set_hover(Some(2));
+        assert!((0..3).all(|index| !view.row_button_shown(index)));
+        view.replace_open = true;
+        assert!(view.row_button_shown(0), "selected");
+        assert!(view.row_button_shown(2), "hovered");
+        assert!(!view.row_button_shown(1));
+
+        let row = RECT {
+            left: 0,
+            top: 84,
+            right: 300,
+            bottom: 126,
+        };
+        let button = SearchView::row_replace_rect(row, 96);
+        assert_eq!(button.right, 300 - scale(PADDING_AT_96_DPI, 96));
+        assert!(button.left > row.left);
+        assert!(button.top > row.top && button.bottom < row.bottom);
+        assert_eq!(button.bottom - button.top, button.right - button.left);
+    }
+
+    #[test]
+    fn tab_cycles_the_box_the_replace_field_and_the_results_and_wraps() {
+        // Break caught: Tab stuck in the box, landing in a closed (hidden) replace field or in an
+        // empty result list, or Shift+Tab not the exact reverse.
+        use FocusStop::{Box, Replace, Results};
+        // The replace field open, results listed: Box -> Replace -> Results -> Box.
+        assert_eq!(next_stop(Box, false, true, true), Replace);
+        assert_eq!(next_stop(Replace, false, true, true), Results);
+        assert_eq!(next_stop(Results, false, true, true), Box);
+        assert_eq!(next_stop(Box, true, true, true), Results);
+        assert_eq!(next_stop(Results, true, true, true), Replace);
+        assert_eq!(next_stop(Replace, true, true, true), Box);
+        // The replace field closed: Box <-> Results.
+        assert_eq!(next_stop(Box, false, false, true), Results);
+        assert_eq!(next_stop(Results, false, false, true), Box);
+        assert_eq!(next_stop(Box, true, false, true), Results);
+        assert_eq!(next_stop(Results, true, false, true), Box);
+        // No results: the fields only, or the box stays put alone.
+        assert_eq!(next_stop(Box, false, true, false), Replace);
+        assert_eq!(next_stop(Replace, false, true, false), Box);
+        assert_eq!(next_stop(Replace, true, true, false), Box);
+        assert_eq!(next_stop(Box, false, false, false), Box);
+        assert_eq!(next_stop(Box, true, false, false), Box);
     }
 }
