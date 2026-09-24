@@ -165,13 +165,13 @@ fn sync_pins(tree: &mut tree::NoteTree, before: &[PathBuf], after: &[PathBuf]) {
     }
 }
 
-/// Whether `path` is `folder` itself or inside it, ignoring case.
-fn at_or_under(path: &Path, folder: &Path) -> bool {
+/// Whether `path` is `folder` itself or inside it, component-wise and ignoring case.
+pub fn at_or_under(path: &Path, folder: &Path) -> bool {
     same_path(path, folder) || strip_folder(folder, path).is_some()
 }
 
 /// `path` moved from `old` to `new`, when it is `old` itself or inside it.
-fn reroot(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
+pub fn reroot(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
     if same_path(path, old) {
         return Some(new.to_path_buf());
     }
@@ -686,8 +686,12 @@ impl LibraryState {
 
     /// Follows a folder rename FastPad just made on disk: the records of the notes under it move
     /// (`Relocate`, so their IDs and pins survive), and so do the notes, the folder list, the
-    /// expanded folders and the tree. Touches no disk.
+    /// expanded folders and the tree. Touches no disk. Does nothing unless both paths are plain
+    /// relative folders.
     pub fn rename_folder(&mut self, old: &Path, new: &Path) {
+        if !tree::is_plain_relative_folder(old) || !tree::is_plain_relative_folder(new) {
+            return;
+        }
         let relocations: Vec<PendingOp> = self
             .library
             .notes
@@ -727,8 +731,12 @@ impl LibraryState {
 
     /// Follows a folder FastPad just sent to the Recycle Bin: its notes leave the list and the
     /// tree, their records are flagged deleted and marked missing at `now`, as a deleted note's
-    /// are, and its expanded entries go. Touches no disk.
+    /// are, and its expanded entries go. Touches no disk. Does nothing unless `relative` is a
+    /// plain relative folder: an empty path would otherwise take every note.
     pub fn remove_folder(&mut self, relative: &Path, now: u64) {
+        if !tree::is_plain_relative_folder(relative) {
+            return;
+        }
         let doomed: Vec<NoteRef> = self
             .library
             .notes
@@ -1722,6 +1730,139 @@ mod tests {
             sorted_notes(&merged),
             [PathBuf::from(r"Final\plan.md"), PathBuf::from("top.md")]
         );
+        assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
+    }
+
+    /// What a folder command could change, to prove a refused one changed nothing.
+    fn folder_snapshot(state: &LibraryState) -> impl PartialEq + std::fmt::Debug + use<> {
+        let records: Vec<(PathBuf, bool)> = state
+            .library
+            .notes
+            .iter()
+            .map(|record| (record.path.clone(), record.deleted))
+            .collect();
+        (
+            sorted_notes(state),
+            sorted_folders(state),
+            records,
+            state.local.expanded.clone(),
+            state.pending.len(),
+            state.folder_changes.len(),
+            tree_rows(&state.tree),
+        )
+    }
+
+    #[test]
+    fn a_folder_change_on_an_empty_or_escaping_path_changes_nothing() {
+        // Break caught: `remove_folder("")` taking every note (an empty folder is "at or under"
+        // everything), or a rename from or onto the root, `..` or an absolute path.
+        let scratch = Scratch::new("folder-bad-path");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join(r"sub\a.md"), "a").unwrap();
+        std::fs::write(folder.join("top.md"), "t").unwrap();
+        let mut ids = IdSource::new(1, 2);
+        let mut state = load(&folder, &scratch.local(), 100).unwrap();
+        let target = state.note_ref(&mut ids, &folder.join("top.md"));
+        state
+            .apply(PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+        state.local.set_expanded(Path::new("sub"), true);
+        let before = folder_snapshot(&state);
+
+        for bad in ["", ".", "..", r"\sub", r"C:\sub"] {
+            state.remove_folder(Path::new(bad), 500);
+            state.rename_folder(Path::new(bad), Path::new("moved"));
+            state.rename_folder(Path::new("sub"), Path::new(bad));
+            assert_eq!(folder_snapshot(&state), before, "{bad:?}");
+        }
+        state.rename_folder(Path::new("sub"), Path::new(r"..\out"));
+        assert_eq!(folder_snapshot(&state), before);
+    }
+
+    #[test]
+    fn a_folder_change_leaves_a_sibling_that_shares_its_name_prefix_alone() {
+        // Break caught: a textual prefix test treating `subway` as inside `sub`, so deleting or
+        // renaming `sub` drops or moves `subway`'s notes, records and expanded entry.
+        let scratch = Scratch::new("folder-prefix-sibling");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::create_dir_all(folder.join("subway")).unwrap();
+        std::fs::write(folder.join(r"sub\a.md"), "a").unwrap();
+        std::fs::write(folder.join(r"subway\b.md"), "b").unwrap();
+        let prepared = |at: u64| {
+            let mut ids = IdSource::new(1, 2);
+            let mut state = load(&folder, &scratch.local(), at).unwrap();
+            for note in [r"sub\a.md", r"subway\b.md"] {
+                let target = state.note_ref(&mut ids, &folder.join(note));
+                state
+                    .apply(PendingOp::SetPinned {
+                        note: target,
+                        value: true,
+                    })
+                    .unwrap();
+            }
+            state.local.set_expanded(Path::new("sub"), true);
+            state.local.set_expanded(Path::new("subway"), true);
+            state
+        };
+        let sibling_intact = |state: &LibraryState| {
+            assert!(state.is_listed(Path::new(r"subway\b.md")));
+            assert!(state.is_pinned(Path::new(r"subway\b.md")));
+            let record = state
+                .library
+                .note_by_path(Path::new(r"subway\b.md"))
+                .unwrap();
+            assert!(!record.deleted);
+            assert!(state.is_folder(Path::new("subway")));
+            assert!(
+                state
+                    .local
+                    .expanded
+                    .iter()
+                    .any(|entry| entry == Path::new("subway"))
+            );
+            assert_eq!(tree_rows(&state.tree), rebuilt_rows(state));
+        };
+
+        let mut state = prepared(100);
+        state.remove_folder(Path::new("sub"), 500);
+        assert!(!state.is_listed(Path::new(r"sub\a.md")));
+        sibling_intact(&state);
+
+        let mut state = prepared(101);
+        state.rename_folder(Path::new("sub"), Path::new("renamed"));
+        assert!(state.is_listed(Path::new(r"renamed\a.md")));
+        sibling_intact(&state);
+        assert_eq!(
+            sorted_folders(&state),
+            ["renamed", "subway"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_folder_removed_while_a_rescan_ran_does_not_come_back_with_its_result() {
+        // Break caught: a rescan that listed the folders before FastPad recycled one bringing
+        // its row and its notes back, rows that open files that are gone.
+        let scratch = Scratch::new("folder-merge-removed");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join(r"old\inner")).unwrap();
+        std::fs::write(folder.join(r"old\a.md"), "a").unwrap();
+        std::fs::write(folder.join(r"old\inner\b.md"), "b").unwrap();
+        std::fs::write(folder.join("keep.md"), "k").unwrap();
+        let mut previous = load(&folder, &scratch.local(), 100).unwrap();
+        let stale = load(&folder, &scratch.local(), 101).unwrap();
+        std::fs::remove_dir_all(folder.join("old")).unwrap();
+        previous.remove_folder(Path::new("old"), 500);
+
+        let merged = merge_rescan(previous, stale);
+
+        assert!(sorted_folders(&merged).is_empty());
+        assert_eq!(sorted_notes(&merged), [PathBuf::from("keep.md")]);
+        assert!(!merged.is_folder(Path::new("old")));
         assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
     }
 

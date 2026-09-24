@@ -183,6 +183,13 @@ fn split_path(path: &Path) -> Option<(Vec<&OsStr>, &OsStr)> {
     Some((parts, file_name))
 }
 
+/// Whether `path` is a plain relative folder path: at least one name and nothing else (not
+/// empty, absolute, rooted, `.` or `..`). The destructive folder commands refuse anything else,
+/// since joined onto the notebook root it could name the root itself or a folder outside it.
+pub fn is_plain_relative_folder(path: &Path) -> bool {
+    folder_parts(path).is_some()
+}
+
 /// The names of a plain relative folder path; `None` for anything else (absolute, rooted, `.`,
 /// `..` or empty).
 fn folder_parts(path: &Path) -> Option<Vec<&OsStr>> {
@@ -776,6 +783,16 @@ fn same_row_path(a: &Path, b: &Path) -> bool {
 }
 
 /// The row showing `kind`, with paths compared ignoring case.
+/// The row that takes row `index`'s place once it and everything shown under it go: the next row
+/// after its subtree, else the row before it.
+pub fn row_in_place_of(rows: &[TreeRow], index: usize) -> Option<&TreeRow> {
+    let depth = rows.get(index)?.depth;
+    rows[index + 1..]
+        .iter()
+        .find(|row| row.depth <= depth)
+        .or_else(|| index.checked_sub(1).and_then(|before| rows.get(before)))
+}
+
 pub fn row_index(rows: &[TreeRow], kind: &RowKind) -> Option<usize> {
     rows.iter().position(|row| match (&row.kind, kind) {
         (RowKind::Unsaved(a), RowKind::Unsaved(b)) => a == b,
@@ -1134,6 +1151,37 @@ mod tests {
             ["x/", "  y/", "    z/", "top"]
         );
         assert_eq!(tree.note_count(), 1);
+    }
+
+    #[test]
+    fn the_row_in_a_removed_folders_place_is_the_next_one_after_its_subtree_else_the_one_before() {
+        // Break caught: a folder delete selecting a row inside the folder it removed, or nothing
+        // when the folder was the last row.
+        let tree = build_with(&[r"a\x\n.md", r"a\m.md", "top.md"], &["a", r"a\x"], &[]);
+        let expanded = [PathBuf::from("a"), PathBuf::from(r"a\x")];
+        let rows = tree.rows(&|path| expanded.iter().any(|entry| entry == path), &[]);
+        let kind = |index| row_in_place_of(&rows, index).map(|row| row.kind.clone());
+        let a = row_index(&rows, &RowKind::Folder("a".into())).unwrap();
+        let x = row_index(&rows, &RowKind::Folder(r"a\x".into())).unwrap();
+        let top = row_index(&rows, &RowKind::Note("top.md".into())).unwrap();
+        assert_eq!(kind(a), Some(RowKind::Note("top.md".into())));
+        assert_eq!(kind(x), Some(RowKind::Note(r"a\m.md".into())));
+        assert_eq!(kind(top), Some(rows[top - 1].kind.clone()));
+        assert_eq!(row_in_place_of(&rows[..1], 0), None);
+        assert_eq!(row_in_place_of(&rows, rows.len()), None);
+    }
+
+    #[test]
+    fn only_a_plain_relative_path_is_a_folder_the_folder_commands_act_on() {
+        // Break caught: an empty, `.`, `..`, absolute or rooted path reaching a folder delete or
+        // rename, where joined onto the notebook root it names the root itself or a folder
+        // outside the notebook.
+        for bad in ["", ".", "..", r"C:\Notes", r"\x", r"a\..\b", r"C:x"] {
+            assert!(!is_plain_relative_folder(Path::new(bad)), "{bad:?}");
+        }
+        for good in ["a", r"a\b", "a/b", "sub way"] {
+            assert!(is_plain_relative_folder(Path::new(good)), "{good:?}");
+        }
     }
 
     #[test]

@@ -1419,9 +1419,15 @@ pub(crate) fn focus_tree(hwnd: HWND) {
     focus_panel(hwnd);
 }
 
-/// The index of the row showing `kind`, if one does.
-pub(crate) fn row_index_of(hwnd: HWND, kind: &RowKind) -> Option<usize> {
-    with_view(hwnd, |view| tree::row_index(&view.rows, kind)).flatten()
+/// Where the row showing `kind` is, and the kind of the row that takes its place once it and
+/// everything shown under it go (`tree::row_in_place_of`).
+pub(crate) fn row_in_place_of(hwnd: HWND, kind: &RowKind) -> Option<(usize, Option<RowKind>)> {
+    with_view(hwnd, |view| {
+        let index = tree::row_index(&view.rows, kind)?;
+        let next = tree::row_in_place_of(&view.rows, index).map(|row| row.kind.clone());
+        Some((index, next))
+    })
+    .flatten()
 }
 
 /// Selects row `index` (the last row when past the end) and scrolls it into view.

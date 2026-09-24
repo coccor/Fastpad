@@ -1423,6 +1423,11 @@ fn submit_new_folder(hwnd: HWND, parent: &Path, text: &str) {
         return;
     }
     let relative = parent.join(&name);
+    // Defence in depth: the folder made must be a plain relative one inside the notebook.
+    if !library::tree::is_plain_relative_folder(&relative) {
+        close_name_box(hwnd);
+        return;
+    }
     if with_state(hwnd, |state| state.is_listed(&relative)).unwrap_or(false) {
         name_box_error(hwnd, folder_taken_error(&name));
         return;
@@ -1447,6 +1452,28 @@ fn submit_new_folder(hwnd: HWND, parent: &Path, text: &str) {
         super::notebook_view::select_row(hwnd, &RowKind::Folder(relative.clone()));
     });
     super::notebook_view::focus_tree(hwnd);
+}
+
+/// After a folder rename on disk from `old` to `new` (both absolute): the untitled tabs whose
+/// first save was to go at or under `old` go at the same place under `new`.
+fn reroot_save_folders(hwnd: HWND, old: &Path, new: &Path) {
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    let app = unsafe { app.as_mut() };
+    let moved: Vec<_> = app
+        .tabs
+        .documents()
+        .filter_map(|document| {
+            let folder = document.save_folder.as_deref()?;
+            Some((document.id, library::reroot(folder, old, new)?))
+        })
+        .collect();
+    for (id, folder) in moved {
+        if let Some(document) = app.tabs.document_mut(id) {
+            document.save_folder = Some(folder);
+        }
+    }
 }
 
 /// Whether a failed `MoveFileExW` means the target name is taken.
@@ -1503,13 +1530,19 @@ fn submit_rename_folder(hwnd: HWND, old: &Path, text: &str) {
         close_name_box(hwnd);
         return;
     };
+    // Defence in depth: an empty or escaping path would rename the notebook root or a folder
+    // outside it.
+    if !library::tree::is_plain_relative_folder(old) {
+        close_name_box(hwnd);
+        return;
+    }
     let Some(name) = title::folder_name(text) else {
         name_box_error(hwnd, NO_FOLDER_NAME.to_owned());
         return;
     };
     let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
     let new = parent.join(&name);
-    if new.as_os_str() == old.as_os_str() {
+    if new.as_os_str() == old.as_os_str() || !library::tree::is_plain_relative_folder(&new) {
         close_name_box(hwnd);
         return;
     }
@@ -1563,6 +1596,7 @@ fn submit_rename_folder(hwnd: HWND, old: &Path, text: &str) {
         let old_name = old.file_name().unwrap_or_default().to_string_lossy();
         undo_failed = Some(rename_undo_failed_notice(&old_name, &name, &stuck));
     }
+    reroot_save_folders(hwnd, &old_path, &new_path);
     with_state(hwnd, |state| state.rename_folder(old, &new));
     save_local(
         hwnd,
@@ -1663,6 +1697,11 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
     let Some(root) = folder(hwnd) else {
         return;
     };
+    // Defence in depth: an empty or escaping path would recycle the notebook root or a folder
+    // outside it.
+    if !library::tree::is_plain_relative_folder(relative) {
+        return;
+    }
     let absolute = root.join(relative);
     let notes = with_state(hwnd, |state| state.notes_under(relative)).unwrap_or(0);
     let tabs = tabs_under(hwnd, &absolute);
@@ -1671,7 +1710,10 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
     if !confirmed(hwnd, &delete_folder_question(&name, notes, dirty)) {
         return;
     }
-    let row = super::notebook_view::row_index_of(hwnd, &RowKind::Folder(relative.to_path_buf()));
+    // The row that takes the folder's place, remembered by what it shows: closing the tabs
+    // can expand other folders above it and shift the indexes.
+    let place =
+        super::notebook_view::row_in_place_of(hwnd, &RowKind::Folder(relative.to_path_buf()));
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
@@ -1686,6 +1728,16 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
             format!("FastPad could not delete {}: {error}", absolute.display()),
         );
         return;
+    }
+    // Each close activates the tab it closes, which autosaves the tab being left; a doomed tab
+    // left that way has no file any more and would report it changed on disk.
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        for (id, _, _) in &tabs {
+            if let Some(document) = app.tabs.document_mut(*id) {
+                document.autosave_paused = true;
+            }
+        }
     }
     for (id, _, _) in tabs {
         super::main_window::close_document_without_prompt(hwnd, id);
@@ -1704,9 +1756,12 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
     close_stale_name_box(hwnd);
     super::side_panel::with_accessible_events(hwnd, || {
         super::side_panel::refresh(hwnd);
-        // The row that took the folder's place: the next one, or the previous at the end.
-        if let Some(row) = row {
-            super::notebook_view::select_index(hwnd, row);
+        // The row that took the folder's place: the next one after its subtree, or the previous
+        // at the end; by index only when that row went too.
+        if let Some((index, kind)) = place
+            && !kind.is_some_and(|kind| super::notebook_view::select_row(hwnd, &kind))
+        {
+            super::notebook_view::select_index(hwnd, index);
         }
     });
 }

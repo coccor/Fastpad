@@ -6322,12 +6322,14 @@ mod tests {
         execute_command(window.hwnd, CommandId::CommandPalette);
         assert!(palette(window.hwnd).is_visible());
         assert!(panel_visible(window.hwnd));
-        // Markdown preview commands are listed only while the active tab is Markdown.
+        // Markdown preview commands are listed only while the active tab is Markdown, and
+        // New folder only while a notebook is open (this window has none).
         assert_eq!(
             palette(window.hwnd).shown().len(),
             crate::window::command_palette::ENTRIES
                 .iter()
                 .filter(|entry| !entry.command.is_markdown_preview())
+                .filter(|entry| entry.command != CommandId::NoteNewFolder)
                 .count()
         );
         let query = palette(window.hwnd).query_hwnd();
@@ -17349,6 +17351,176 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_folder_with_autosave_on_closes_its_dirty_tabs_without_a_changed_on_disk_notice() {
+        // Break caught: closing a deleted folder's tabs one by one autosaving the dirty one being
+        // left, whose file is gone, so a false "changed on disk. Autosave is paused" notice shows.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-delete-autosave");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        let a = scratch.note(r"sub\a.md", "a");
+        let b = scratch.note(r"sub\b.md", "b");
+        scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        editor.set_text("b, unsaved").unwrap();
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert!(active.dirty && active.path.as_deref() == Some(b.as_path()));
+        crate::window::answer_next_confirm(|_| true);
+
+        crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new("sub"));
+
+        assert!(!scratch.folder().join("sub").exists());
+        assert_eq!(super::tab_count(window.hwnd), 0);
+        assert!(
+            !notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.contains("changed on disk")),
+            "{:?}",
+            notices(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn folder_commands_on_an_empty_or_escaping_path_touch_no_disk() {
+        // Break caught: a folder delete or rename handed the empty path (the notebook root) or a
+        // `..` path recycling, renaming or creating outside the folder the user picked.
+        use crate::window::name_box::NamePurpose;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-bad-path");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        crate::window::modal::take_last_confirm();
+        let notes = || {
+            crate::window::library_host::with_state(window.hwnd, |state| state.notes.len()).unwrap()
+        };
+        let submit = |purpose: NamePurpose, text: &str| {
+            crate::window::library_host::open_name_box(
+                window.hwnd,
+                purpose,
+                text,
+                String::new(),
+                false,
+            );
+            crate::window::library_host::name_box_submit(window.hwnd);
+        };
+
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(""));
+        crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(".."));
+        submit(NamePurpose::RenameFolder("".into()), "Renamed");
+        submit(NamePurpose::RenameFolder("..".into()), "Renamed");
+        submit(NamePurpose::NewFolder("..".into()), "Outside");
+
+        assert_eq!(crate::window::modal::take_last_confirm(), None);
+        assert!(scratch.folder().join(r"sub\a.md").exists());
+        assert!(!scratch.root.join("Renamed").exists());
+        assert!(!scratch.root.join("Outside").exists());
+        assert_eq!(notes(), 1);
+    }
+
+    #[test]
+    fn a_new_note_made_in_a_folder_saves_into_it_after_the_folder_is_renamed() {
+        // Break caught: an untitled tab from "New note here" keeping the folder's old path, so
+        // after a rename its first save silently lands in the notebook root instead.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-rename-save-folder");
+        std::fs::create_dir_all(scratch.folder().join(r"sub\inner")).unwrap();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        crate::window::library_host::new_note_in(window.hwnd, Some(scratch.folder().join("sub")));
+        let in_sub = app_mut(window.hwnd).tabs.active().unwrap().id;
+        crate::window::library_host::new_note_in(
+            window.hwnd,
+            Some(scratch.folder().join(r"SUB\inner")),
+        );
+        let in_inner = app_mut(window.hwnd).tabs.active().unwrap().id;
+        crate::window::library_host::new_note_in(window.hwnd, Some(scratch.folder()));
+        let at_root = app_mut(window.hwnd).tabs.active().unwrap().id;
+
+        crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
+        type_into_name_box(window.hwnd, "Moved");
+        crate::window::library_host::name_box_submit(window.hwnd);
+
+        let moved = scratch.folder().join("Moved");
+        let save_folder = |id| {
+            app_mut(window.hwnd)
+                .tabs
+                .document(id)
+                .unwrap()
+                .save_folder
+                .clone()
+        };
+        assert_eq!(save_folder(in_sub), Some(moved.clone()));
+        assert_eq!(save_folder(in_inner), Some(moved.join("inner")));
+        assert_eq!(save_folder(at_root), Some(scratch.folder()));
+        assert!(super::activate_document_by_id(window.hwnd, in_sub));
+        editor.set_text("Idea").unwrap();
+        execute_command(window.hwnd, CommandId::Save);
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert!(moved.join("Idea.md").exists());
+    }
+
+    #[test]
+    fn deleting_a_folder_selects_the_row_after_it_even_when_closing_its_tab_expands_another() {
+        // Break caught: the selection after a delete chosen by index, so when closing the
+        // folder's tab switches to a note in a collapsed folder above (expanding it), a row
+        // inside that folder is selected instead of the one that took the deleted folder's place.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("folder-delete-selection");
+        std::fs::create_dir_all(scratch.folder().join("above")).unwrap();
+        std::fs::create_dir_all(scratch.folder().join("doomed")).unwrap();
+        let x = scratch.note(r"above\x.md", "x");
+        let y = scratch.note(r"doomed\y.md", "y");
+        scratch.note("top.md", "t");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &x).unwrap();
+        super::open_path(window.hwnd, &y).unwrap();
+        let path = std::path::Path::new;
+        crate::window::library_host::set_expanded(window.hwnd, path("above"), false);
+        crate::window::library_host::set_expanded(window.hwnd, path("doomed"), false);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        select_row(window.hwnd, &RowKind::Folder("doomed".into()));
+        assert!(
+            crate::library::tree::row_index(
+                &notebook_view(window.hwnd).rows,
+                &RowKind::Note(r"above\x.md".into())
+            )
+            .is_none(),
+            "`above` starts collapsed"
+        );
+        crate::window::answer_next_confirm(|_| true);
+
+        crate::window::library_host::delete_folder(window.hwnd, path("doomed"));
+
+        assert!(!scratch.folder().join("doomed").exists());
+        assert!(
+            crate::library::tree::row_index(
+                &notebook_view(window.hwnd).rows,
+                &RowKind::Note(r"above\x.md".into())
+            )
+            .is_some(),
+            "switching to x's tab expanded `above`"
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("top.md".into()))
+        );
+    }
+
+    #[test]
     fn a_folder_rename_that_cannot_be_undone_stands_and_names_the_tab_left_behind() {
         // Break caught: a failed undo swallowed, leaving the folder renamed on disk while the
         // library still lists the old one and every tab points at a path that is gone.
@@ -17371,6 +17543,8 @@ mod tests {
         let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
         app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
             Some(scratch.folder().join(r"Moved\a.md"));
+        crate::window::library_host::new_note_in(window.hwnd, Some(scratch.folder().join("sub")));
+        let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
         crate::window::library_host::fail_next_folder_rename_back();
 
         crate::window::library_host::rename_folder(window.hwnd, std::path::Path::new("sub"));
@@ -17379,6 +17553,15 @@ mod tests {
 
         let moved = scratch.folder().join("Moved");
         assert!(moved.join("b.md").exists());
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .document(untitled)
+                .unwrap()
+                .save_folder,
+            Some(moved.clone()),
+            "the rename stands, so the untitled tab's first save follows it"
+        );
         assert!(!scratch.folder().join("sub").exists());
         assert!(!name_box_visible(window.hwnd));
         let tabs = &app_mut(window.hwnd).tabs;
