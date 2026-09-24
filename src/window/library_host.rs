@@ -2401,6 +2401,10 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
         }
         (PickerKind::QuickOpen, PickerChoice::GoToLine(line)) => {
             super::main_window::go_to_line(hwnd, line);
+            // A note pick focuses the editor (`open_note(.., true)`); a `:n` pick moves the
+            // caret the same way, so it must land keyboard focus there too, even when the pick
+            // was made with the sidebar focused.
+            super::main_window::focus_content(hwnd);
         }
         _ => {}
     }

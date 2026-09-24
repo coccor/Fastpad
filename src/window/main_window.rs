@@ -3865,6 +3865,24 @@ fn close_tab_at(hwnd: HWND, index: usize) {
     } else if activate_document_by_id(hwnd, review.id) && identity.is_live_for(hwnd) {
         execute_command(hwnd, CommandId::CloseTab);
     }
+    // A middle-click moves no focus, so the palette can stay open in the QuickOpen picker while
+    // a tab behind it closes; its empty-query rows (the open tabs) must drop the closed one.
+    refresh_quick_open_after_close(hwnd);
+}
+
+/// Rebuilds an open quick-open picker's rows after `close_tab_at` closes a tab, so a tab closed
+/// behind the palette does not linger in its "open tabs" rows.
+fn refresh_quick_open_after_close(hwnd: HWND) {
+    let showing_quick_open = with_command_palette(hwnd, |palette| {
+        palette.is_visible()
+            && palette
+                .picker()
+                .is_some_and(|picker| picker.kind == command_palette::PickerKind::QuickOpen)
+    })
+    .unwrap_or(false);
+    if showing_quick_open {
+        refilter_command_palette(hwnd);
+    }
 }
 
 /// The document shown by tab `index` of the strip.
@@ -6723,6 +6741,38 @@ mod tests {
     }
 
     #[test]
+    fn a_go_to_line_pick_focuses_the_editor_even_when_the_sidebar_had_focus() {
+        // Break caught: a note pick focuses the editor (`open_note(.., true)`), but a ":n" pick
+        // moved the caret and left the keyboard focus in the sidebar when it had it.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-open-line-focus");
+        let note = scratch.note("lines.md", "one\r\ntwo\r\nthree\r\nfour");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &note).unwrap();
+        let (_, panel) = sidebar_windows(window.hwnd);
+        unsafe { SetFocus(panel) };
+        assert_eq!(
+            unsafe { GetFocus() },
+            panel,
+            "the panel must hold focus to start"
+        );
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, ":3");
+        press_enter_in_palette(window.hwnd);
+
+        assert_eq!(
+            unsafe { GetFocus() },
+            editor.hwnd(),
+            "a :n pick focuses the editor, the same as a note pick"
+        );
+    }
+
+    #[test]
     fn with_no_notebook_open_the_picker_shows_one_row_that_cannot_be_picked() {
         // Break caught: an empty list that looks broken, Enter closing the picker or opening
         // something, or ":5" refused although it needs no notebook.
@@ -6781,9 +6831,10 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_closed_while_the_picker_is_open_still_opens_from_its_row() {
+    fn a_tab_closed_while_the_picker_is_open_drops_its_row() {
         // Break caught (review focus 5): a row naming a tab that closed under the open picker
-        // switching to a dead document, or doing nothing.
+        // switching to a dead document, or the row lingering after the close so a middle-click
+        // that closes a background tab leaves it pickable although the tab is gone.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("quick-open-closed-tab");
         let a = scratch.note("a.md", "a");
@@ -6796,13 +6847,20 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::QuickOpen);
         assert_eq!(quick_open_names(window.hwnd), ["b", "a"]);
+        // The clean background tab (index 0, "a") closes the way a middle-click closes it: no
+        // focus moves, so the palette stays open and must refresh its rows (spec §5).
         super::close_tab_at(window.hwnd, 0);
         assert_eq!(tab_paths(window.hwnd), [Some(b.clone())]);
-        assert!(palette_visible(window.hwnd));
+        assert!(palette_visible(window.hwnd), "the palette stayed open");
+        assert_eq!(
+            quick_open_names(window.hwnd),
+            ["b"],
+            "the closed tab's row is gone"
+        );
         press_enter_in_palette(window.hwnd);
 
-        assert_eq!(tab_paths(window.hwnd), [Some(b), Some(a.clone())]);
-        assert_eq!(active_path(window.hwnd), Some(a));
+        assert_eq!(tab_paths(window.hwnd), [Some(b.clone())]);
+        assert_eq!(active_path(window.hwnd), Some(b));
     }
 
     #[test]
