@@ -395,6 +395,7 @@ fn sync_presence(hwnd: HWND, enabled: bool) {
             Err(error) => push_notice(hwnd, format!("FastPad could not show the sidebar: {error}")),
         }
     } else if !enabled && present {
+        crate::window::inline_name::cancel(hwnd);
         let sidebar =
             unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.sidebar.take());
         if let Some(sidebar) = sidebar {
@@ -485,6 +486,11 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
 
 /// `show_view` without its win events.
 fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
+    // An inline name edit lives in the Notebook view: hiding the panel or showing another view
+    // cancels it (inline naming spec §5.4).
+    if view != SidebarView::Notebook {
+        crate::window::inline_name::cancel(hwnd);
+    }
     let Some(panel) = with_sidebar(hwnd, |sidebar| {
         if view != SidebarView::Hidden {
             sidebar.last_view = view;

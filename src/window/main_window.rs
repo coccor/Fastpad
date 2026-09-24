@@ -181,6 +181,11 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_SETFOCUS => {
+            // The frame gets the focus when the window is activated again: an inline name edit
+            // that was open when FastPad lost the focus takes it back (inline naming spec §5.3).
+            if menu_mode(hwnd).is_none() && crate::window::inline_name::refocus(hwnd) {
+                return 0;
+            }
             // With no tab open the editor is hidden and the frame itself keeps the focus, as it
             // does in menu mode to take the menu keys. A Full preview takes the editor's place.
             if menu_mode(hwnd).is_none()
@@ -718,6 +723,14 @@ unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_NOTEBOOK_CHECKED {
                 crate::window::library_host::notebook_checked(hwnd, lparam);
+                return 0;
+            }
+            // Focus left the Notebook tree's name field (inline naming spec §5.3). A modal
+            // prompt that took it holds the commit until it ends.
+            if message == crate::window::WM_FASTPAD_INLINE_NAME_LEFT {
+                if !crate::window::modal::hold_while_modal(hwnd, message) {
+                    crate::window::inline_name::focus_left(hwnd);
+                }
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_TEXT_SEARCH_BATCH {
@@ -5801,8 +5814,9 @@ pub(crate) unsafe fn translate_accelerator(
         return true;
     }
     // Ctrl+W in the palette's field closes the palette, not a tab (quick-open spec §4). The
-    // table would turn it into Close tab before the field's hook saw the key.
-    if palette_keeps_key(hwnd, message) {
+    // table would turn it into Close tab before the field's hook saw the key. Ctrl+Z in the
+    // Notebook tree's name field is the field's own undo (inline naming spec §5.1).
+    if palette_keeps_key(hwnd, message) || inline_name_keeps_key(hwnd, message) {
         return false;
     }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
@@ -5824,6 +5838,18 @@ fn palette_keeps_key(
         && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
         && unsafe { GetKeyState(VK_MENU as i32) } >= 0
         && command_palette_owns(hwnd, message.hwnd)
+}
+
+/// Ctrl+Z (without Alt) aimed at the Notebook tree's inline name field.
+fn inline_name_keeps_key(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    message.message == WM_KEYDOWN
+        && message.wParam == usize::from(b'Z')
+        && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
+        && unsafe { GetKeyState(VK_MENU as i32) } >= 0
+        && crate::window::inline_name::owns(hwnd, message.hwnd)
 }
 
 fn menu_activation_message(
@@ -11783,10 +11809,6 @@ mod tests {
     }
 
     /// The middle of the row showing `kind`, as a panel mouse message's `lParam`.
-    #[expect(
-        dead_code,
-        reason = "used by the click tests (inline naming plan, Task 5)"
-    )]
     fn row_lparam(hwnd: HWND, kind: &RowKind) -> super::LPARAM {
         let index = row_of(hwnd, kind);
         let rect = notebook_view(hwnd).row_rect_at(index).unwrap();
@@ -18439,5 +18461,238 @@ mod tests {
             "nothing renamed before Enter"
         );
         assert!(active.exists());
+    }
+
+    #[test]
+    fn focus_moving_to_the_editor_commits_and_a_taken_name_closes_with_a_notice() {
+        // Break caught: a name lost when the user clicks into the editor, a click away that
+        // leaves the field hanging, or a taken name closed without saying why (spec §5.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-focus-editor");
+        let a = scratch.note("a.md", "a");
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+
+        crate::window::inline_name::new_folder(window.hwnd, None);
+        type_into_field(window.hwnd, "Plans");
+        unsafe { SetFocus(editor.hwnd()) };
+        pump_posted_messages(window.hwnd);
+        assert!(!inline_open(window.hwnd));
+        assert!(scratch.folder().join("Plans").is_dir());
+
+        // At the root: with the new folder's row selected, None would draft inside it.
+        crate::window::inline_name::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
+        type_into_field(window.hwnd, "plans");
+        assert!(crate::window::inline_name::problem(window.hwnd).is_some());
+        unsafe { SetFocus(editor.hwnd()) };
+        pump_posted_messages(window.hwnd);
+        assert!(!inline_open(window.hwnd));
+        assert_eq!(draft_row(window.hwnd), None);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice == "plans already exists here."),
+            "{:?}",
+            notices(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn losing_focus_to_another_app_keeps_the_field_and_reactivation_refocuses_it() {
+        // Break caught: Alt+Tab creating a half-typed note, or coming back to FastPad with the
+        // field open but the caret in the editor (spec §5.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETFOCUS;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-focus-app");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::inline_name::new_note(window.hwnd, None);
+        type_into_field(window.hwnd, "half");
+
+        // What deactivation does to the focused field: focus goes to no window of this thread.
+        unsafe { SetFocus(std::ptr::null_mut()) };
+        pump_posted_messages(window.hwnd);
+        assert!(inline_open(window.hwnd));
+        assert!(!scratch.folder().join("half.md").exists());
+
+        unsafe { SendMessageW(window.hwnd, WM_SETFOCUS, 0, 0) };
+        assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+        assert_eq!(field_text(window.hwnd), "half");
+    }
+
+    #[test]
+    fn a_commit_on_focus_loss_waits_for_a_modal_prompt_to_end() {
+        // Break caught: a note created or renamed while a modal prompt that took the focus is
+        // still asking something (spec §5.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-focus-modal");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::inline_name::new_folder(window.hwnd, None);
+        type_into_field(window.hwnd, "Later");
+
+        let modal = crate::window::modal::ModalScope::enter(window.hwnd);
+        // The prompt takes the focus: here the frame does, a window of this thread.
+        unsafe { SetFocus(window.hwnd) };
+        pump_posted_messages(window.hwnd);
+        assert!(inline_open(window.hwnd));
+        assert!(!scratch.folder().join("Later").exists(), "held while modal");
+
+        // Leaving the outermost modal scope re-posts what it held.
+        drop(modal);
+        pump_posted_messages(window.hwnd);
+        assert!(!inline_open(window.hwnd));
+        assert!(scratch.folder().join("Later").is_dir());
+    }
+
+    #[test]
+    fn a_click_on_a_row_below_a_draft_commits_first_and_acts_on_that_row() {
+        // Break caught: the click selecting whatever row slid under the pointer once the empty
+        // draft went, or the rename not committed before the click (spec §5.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-click");
+        scratch.note("a.md", "a");
+        scratch.note("b.md", "b");
+        scratch.note("c.md", "c");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let click = |lparam| unsafe {
+            SendMessageW(panel, WM_LBUTTONDOWN, 0, lparam);
+            SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
+        };
+
+        crate::window::inline_name::new_note(window.hwnd, None);
+        assert_eq!(
+            draft_row(window.hwnd),
+            Some((1, 0)),
+            "after the untitled tab's row"
+        );
+        click(row_lparam(window.hwnd, &RowKind::Note("b.md".into())));
+        assert!(!inline_open(window.hwnd));
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("b.md".into()))
+        );
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path,
+            Some(scratch.folder().join("b.md"))
+        );
+
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("c.md".into()));
+        type_into_field(window.hwnd, "d");
+        click(row_lparam(window.hwnd, &RowKind::Note("a.md".into())));
+        assert!(scratch.folder().join("d.md").exists(), "committed first");
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into()))
+        );
+    }
+
+    #[test]
+    fn starting_an_edit_while_one_is_open_commits_the_open_one_first() {
+        // Break caught: a second edit dropping the first one's typing, or two fields at once
+        // (spec §3.4).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-one-edit");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+        type_into_field(window.hwnd, "a2");
+
+        crate::window::notebook_view::header_clicked(
+            window.hwnd,
+            crate::window::notebook_view::HeaderButton::NewFolder,
+        );
+
+        assert!(scratch.folder().join("a2.md").exists());
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::NewFolder(
+                std::path::PathBuf::new()
+            ))
+        );
+        assert_eq!(field_text(window.hwnd), "");
+    }
+
+    #[test]
+    fn switching_the_sidebar_view_or_hiding_it_cancels_the_edit() {
+        // Break caught: a field left typing into a view nobody can see, or Ctrl+B committing a
+        // half-typed rename (spec §5.4).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-view-switch");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        for view in [
+            crate::config::SidebarView::Search,
+            crate::config::SidebarView::Hidden,
+        ] {
+            crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+            type_into_field(window.hwnd, "zzz");
+            crate::window::side_panel::show_view(window.hwnd, view, false);
+            pump_posted_messages(window.hwnd);
+            assert!(!inline_open(window.hwnd), "{view:?}");
+            assert!(scratch.folder().join("a.md").exists(), "{view:?}");
+            crate::window::side_panel::show_view(
+                window.hwnd,
+                crate::config::SidebarView::Notebook,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_z_in_the_field_undoes_the_field_not_the_editor() {
+        // Break caught: Ctrl+Z in the name field undoing the note in the editor, because the
+        // accelerator table takes the key first (spec §5.1).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-ctrl-z");
+        let a = scratch.note("a.md", "a");
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        editor.set_text("typed in the editor").unwrap();
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        crate::window::inline_name::new_note(window.hwnd, None);
+        let field = inline_field(window.hwnd);
+        let typed = crate::platform::wide_null("abc");
+        unsafe {
+            SendMessageW(
+                field,
+                windows_sys::Win32::UI::Controls::EM_REPLACESEL,
+                1,
+                typed.as_ptr() as isize,
+            )
+        };
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let ctrl_z = MSG {
+            hwnd: field,
+            message: WM_KEYDOWN,
+            wParam: usize::from(b'Z'),
+            ..Default::default()
+        };
+
+        let taken = unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl_z) };
+        unsafe {
+            SendMessageW(field, WM_KEYDOWN, usize::from(b'Z'), 0);
+            SendMessageW(field, WM_CHAR, 0x1a, 0);
+        }
+        unsafe { SetKeyboardState(original.as_ptr()) };
+
+        assert!(!taken, "the field keeps Ctrl+Z");
+        assert_eq!(field_text(window.hwnd), "");
+        assert_eq!(editor.text().unwrap(), "typed in the editor");
     }
 }

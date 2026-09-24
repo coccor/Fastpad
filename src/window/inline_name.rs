@@ -20,6 +20,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, HBRUSH, HDC, InvalidateRect, SetBkColor, SetTextColor,
 };
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETSEL};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN, VK_TAB,
@@ -27,9 +28,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, ES_AUTOHSCROLL, EVENT_OBJECT_DESCRIPTIONCHANGE, GWL_STYLE, GetParent,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SW_HIDE, SW_SHOWNA,
-    SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, WM_CHAR, WM_KEYDOWN, WM_NCDESTROY,
-    WM_SETFONT, WS_CHILD, WS_VISIBLE,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, MoveWindow,
+    PostMessageW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    WM_CHAR, WM_KEYDOWN, WM_KILLFOCUS, WM_NCDESTROY, WM_SETFONT, WS_CHILD, WS_VISIBLE,
 };
 
 // Sizes at 96 DPI; everything is scaled with `panel::scale`.
@@ -352,10 +353,6 @@ struct Edit {
     announce: bool,
     /// Focus left FastPad while the field had it: it goes back when the window is active again
     /// (spec §5.3).
-    #[expect(
-        dead_code,
-        reason = "read by the focus handling (inline naming plan, Task 5)"
-    )]
     refocus: bool,
 }
 
@@ -642,6 +639,9 @@ unsafe extern "system" fn field_proc(
             _ => {}
         }
     }
+    if message == WM_KILLFOCUS {
+        focus_leaving(main, wparam as HWND);
+    }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
@@ -856,6 +856,58 @@ fn announce(hwnd: HWND) {
     };
     let _ = crate::platform::annotation::annotate(field, &name, &description);
     super::sidebar_accessibility::raise(field, &[(EVENT_OBJECT_DESCRIPTIONCHANGE, 0)]);
+}
+
+/// The field is losing the focus to `to` (spec §5.3). Another window of FastPad commits the
+/// edit, once the focus change is over; none (another app, or the window deactivating) keeps it
+/// and arms `refocus`.
+fn focus_leaving(hwnd: HWND, to: HWND) {
+    let ours = !to.is_null()
+        && unsafe { GetWindowThreadProcessId(to, std::ptr::null_mut()) }
+            == unsafe { GetCurrentThreadId() };
+    let open = with_inline(hwnd, |inline| {
+        let edit = inline.edit.as_mut()?;
+        if !ours {
+            edit.refocus = true;
+        }
+        Some(())
+    })
+    .flatten()
+    .is_some();
+    if open && ours {
+        unsafe { PostMessageW(hwnd, crate::window::WM_FASTPAD_INLINE_NAME_LEFT, 0, 0) };
+    }
+}
+
+/// `WM_FASTPAD_INLINE_NAME_LEFT`: commits the open edit unless the focus is back in the field
+/// (a menu closed, or another edit started meanwhile).
+pub(crate) fn focus_left(hwnd: HWND) {
+    let Some(field) = with_inline(hwnd, |inline| inline.edit.as_ref().and(inline.field)).flatten()
+    else {
+        return;
+    };
+    if unsafe { GetFocus() } != field {
+        commit(hwnd, How::FocusLeft);
+    }
+}
+
+/// The frame got the focus back (the window was activated again): the field takes it, if focus
+/// left FastPad from it (spec §5.3). Returns whether it did.
+pub(crate) fn refocus(hwnd: HWND) -> bool {
+    let field = with_inline(hwnd, |inline| {
+        let edit = inline.edit.as_mut()?;
+        std::mem::take(&mut edit.refocus)
+            .then_some(inline.field)
+            .flatten()
+    })
+    .flatten();
+    match field {
+        Some(field) => {
+            unsafe { SetFocus(field) };
+            true
+        }
+        None => false,
+    }
 }
 
 /// `WM_CTLCOLOREDIT` for the field.
@@ -1552,5 +1604,45 @@ mod tests {
             ..frame
         };
         assert_eq!(message_rect(first, tiny, 40).top, 38);
+    }
+
+    #[test]
+    fn only_ctrl_z_among_the_field_keys_is_an_accelerator() {
+        // Break caught: an accelerator on Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V, Del, Home, End,
+        // Ctrl+Left, Ctrl+Right or Ctrl+Backspace taking the key from the field, which keeps
+        // only Ctrl+Z from the table (inline naming spec §5.1).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_BACK, VK_DELETE, VK_END, VK_HOME, VK_LEFT, VK_RIGHT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FCONTROL, FSHIFT};
+        let specs = crate::window::menus::accelerator_specs();
+        let bound = |modifiers: u8, key: u16| {
+            specs
+                .iter()
+                .any(|spec| spec.modifiers == modifiers && spec.key == key)
+        };
+        let letter = |key: u8| u16::from(key);
+        for (modifiers, key) in [
+            (FCONTROL, letter(b'A')),
+            (FCONTROL, letter(b'C')),
+            (FCONTROL, letter(b'X')),
+            (FCONTROL, letter(b'V')),
+            (0, VK_DELETE),
+            (0, VK_HOME),
+            (0, VK_END),
+            (FSHIFT, VK_HOME),
+            (FSHIFT, VK_END),
+            (FCONTROL, VK_LEFT),
+            (FCONTROL, VK_RIGHT),
+            (FCONTROL | FSHIFT, VK_LEFT),
+            (FCONTROL | FSHIFT, VK_RIGHT),
+            (FCONTROL, VK_BACK),
+        ] {
+            assert!(!bound(modifiers, key), "{modifiers:#x} {key:#x}");
+        }
+        assert!(
+            bound(FCONTROL, letter(b'Z')),
+            "Ctrl+Z is Undo: the field keeps it"
+        );
     }
 }

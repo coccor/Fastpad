@@ -29,6 +29,9 @@ pub const WM_FASTPAD_TEXT_SEARCH_BATCH: u32 = WM_APP + 13;
 pub const WM_FASTPAD_REPLACE_COUNTED: u32 = WM_APP + 14;
 pub const WM_FASTPAD_REPLACE_WRITTEN: u32 = WM_APP + 15;
 pub const WM_FASTPAD_REPLACE_RELOADED: u32 = WM_APP + 16;
+/// Posted to the main window when the Notebook tree's inline name field lost the focus to
+/// another window of this thread (inline naming spec §5.3).
+pub const WM_FASTPAD_INLINE_NAME_LEFT: u32 = WM_APP + 17;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.

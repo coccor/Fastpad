@@ -1805,12 +1805,11 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_RBUTTONDOWN => {
             // Selects the row; DefWindowProc turns the button-up into WM_CONTEXTMENU.
             let (x, y) = point_of(lparam);
+            let hit = hit_after_commit(hwnd, x, y);
             focus_panel(hwnd);
-            with_view(hwnd, |view| {
-                if let Hit::Row { index, .. } = view.hit_test(x, y) {
-                    view.select(index);
-                }
-            });
+            if let Some(Hit::Row { index, .. }) = hit {
+                with_view(hwnd, |view| view.select(index));
+            }
             Some(0)
         }
         WM_CONTEXTMENU => {
@@ -1929,9 +1928,37 @@ fn focus_panel(hwnd: HWND) {
     }
 }
 
+/// What a press at `x`, `y` hits. An inline edit open when the press comes ends first, as if
+/// focus had left it (inline naming spec §5.3), and a row hit follows the row it landed on to
+/// wherever the commit moved it. `None` when there is no view, or that row went with the commit
+/// (the draft row, or the row just renamed).
+fn hit_after_commit(hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
+    let hit = with_view(hwnd, |view| view.hit_test(x, y))?;
+    if !super::inline_name::is_open(hwnd) {
+        return Some(hit);
+    }
+    let clicked = match hit {
+        Hit::Row { index, .. } => with_view(hwnd, |view| {
+            view.rows.get(index).map(|row| row.kind.clone())
+        })
+        .flatten(),
+        _ => None,
+    };
+    super::inline_name::commit(hwnd, super::inline_name::How::FocusLeft);
+    match (hit, clicked) {
+        (Hit::Row { part, .. }, Some(kind)) => {
+            let index = with_view(hwnd, |view| tree::row_index(&view.rows, &kind)).flatten()?;
+            Some(Hit::Row { index, part })
+        }
+        (Hit::Row { .. }, None) => None,
+        (hit, _) => Some(hit),
+    }
+}
+
 fn left_down(hwnd: HWND, x: i32, y: i32) {
+    let hit = hit_after_commit(hwnd, x, y);
     focus_panel(hwnd);
-    let Some(hit) = with_view(hwnd, |view| view.hit_test(x, y)) else {
+    let Some(hit) = hit else {
         return;
     };
     match hit {
