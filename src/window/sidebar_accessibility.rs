@@ -261,8 +261,8 @@ pub(crate) fn list_item(
     }
 }
 
-/// A Notebook-view row. The name carries ", pinned" or ", unsaved", so neither is conveyed by the
-/// icon alone.
+/// A Notebook-view row. The name carries a note's type, then ", pinned" or ", unsaved", so none
+/// is conveyed by the icon alone.
 pub(crate) fn tree_item(
     row: &TreeRow,
     selected: bool,
@@ -271,6 +271,14 @@ pub(crate) fn tree_item(
     visible: bool,
 ) -> AccessibleItem {
     let mut name = row.name.clone();
+    // The type comes from the extension, which the row's name leaves out (spec §5.4).
+    if let RowKind::Note(path) = &row.kind {
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy());
+        name.push_str(", ");
+        name.push_str(crate::window::file_icons::type_name(extension.as_deref()));
+    }
     if row.pinned {
         name.push_str(", pinned");
     }
@@ -1233,7 +1241,7 @@ mod tests {
             ROW,
             false,
         );
-        assert_eq!(pinned.name, "a, pinned");
+        assert_eq!(pinned.name, "a, Markdown, pinned", "the type, then the pin");
         assert_eq!(pinned.state & (STATE_EXPANDED | STATE_COLLAPSED), 0);
         assert_ne!(pinned.state & STATE_SELECTED, 0);
         assert_ne!(pinned.state & STATE_FOCUSED, 0);
@@ -1252,6 +1260,36 @@ mod tests {
             0,
             "focus follows selection only"
         );
+        // Break caught: a note's type conveyed by its coloured icon alone (spec §5.4).
+        let csv = tree_item(
+            &row(
+                RowKind::Note(PathBuf::from(r"Work\budget.CSV")),
+                "budget",
+                1,
+                false,
+                false,
+            ),
+            false,
+            false,
+            ROW,
+            true,
+        );
+        assert_eq!(csv.name, "budget, CSV");
+        let markdown = tree_item(
+            &row(
+                RowKind::Note(PathBuf::from("meeting notes.md")),
+                "meeting notes",
+                0,
+                false,
+                false,
+            ),
+            false,
+            false,
+            ROW,
+            true,
+        );
+        assert_eq!(markdown.name, "meeting notes, Markdown");
+        assert_eq!(folder.name, "Work", "folder rows are unchanged");
     }
 
     #[test]

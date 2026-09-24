@@ -208,6 +208,8 @@ pub(crate) struct ViewPaint {
     /// The panel's whole client rectangle. Each view lays out its header and body inside it.
     pub(crate) client: RECT,
     pub(crate) palette: Palette,
+    /// The Notebook view's file-type icon colours for the theme (notebook folders spec §5.2).
+    pub(crate) icons: crate::window::palette::FileIcons,
     /// The panel's fill, `Palette::panel_background`, already painted.
     pub(crate) background: u32,
     pub(crate) fonts: UiFonts,
@@ -224,6 +226,7 @@ pub(crate) fn view_paint(main: HWND, panel: HWND, hdc: HDC, client: RECT) -> Vie
         hdc,
         client,
         palette,
+        icons: super::main_window::current_file_icons(main),
         background: palette.panel_background(),
         fonts: ui_fonts(main),
         dpi: unsafe { GetDpiForWindow(panel) }.max(96),

@@ -8,8 +8,9 @@ use super::side_panel::{UiFonts, ViewPaint, draw_text, point_of};
 use crate::document::{Document, DocumentId};
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
 use crate::window::commands::CommandId;
+use crate::window::file_icons::{FOLDER_ICON, FileIcon, IconFont, file_icon};
 use crate::window::menus::MenuEntry;
-use crate::window::palette::Palette;
+use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, scale};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::tooltip::Tooltip;
@@ -434,6 +435,7 @@ fn draw_tree_row(
     rect: RECT,
     look: RowLook,
     palette: &Palette,
+    icons: &FileIcons,
     fonts: UiFonts,
     dpi: u32,
     pin_hot: bool,
@@ -453,6 +455,21 @@ fn draw_tree_row(
         return;
     };
     let parts = row_parts(rect, row.depth, dpi);
+    // A type icon keeps its colour on a selected or hovered row: the colours are mid-tones that
+    // read on the selection. High contrast draws every icon in the muted system pair, as before
+    // (notebook folders spec §5.2).
+    let draw_icon = |icon: FileIcon| {
+        let color = if palette.high_contrast {
+            muted
+        } else {
+            icons.color(icon.color)
+        };
+        let font = match icon.font {
+            IconFont::Glyph => fonts.glyph,
+            IconFont::Bold => fonts.bold,
+        };
+        unsafe { draw_text(dc, icon.text, parts.icon, font, color, CENTERED) };
+    };
     match &row.kind {
         RowKind::Folder(_) => {
             let chevron = if row.expanded {
@@ -461,9 +478,15 @@ fn draw_tree_row(
                 GLYPH_CHEVRON_RIGHT
             };
             unsafe { draw_text(dc, chevron, parts.chevron, fonts.glyph, muted, CENTERED) };
-            unsafe { draw_text(dc, GLYPH_FOLDER, parts.icon, fonts.glyph, muted, CENTERED) };
+            draw_icon(FOLDER_ICON);
         }
-        RowKind::Note(_) | RowKind::Unsaved(_) => {
+        RowKind::Note(path) => {
+            let extension = path
+                .extension()
+                .map(|extension| extension.to_string_lossy());
+            draw_icon(file_icon(extension.as_deref()));
+        }
+        RowKind::Unsaved(_) => {
             unsafe { draw_text(dc, GLYPH_NOTE, parts.icon, fonts.glyph, muted, CENTERED) };
         }
     }
@@ -995,6 +1018,7 @@ impl NotebookView {
                 let list = self.list_rect(area);
                 let rows = &self.rows;
                 let hover_pin = self.hover_pin;
+                let icons = &paint.icons;
                 row_list::paint(
                     dc,
                     list,
@@ -1008,6 +1032,7 @@ impl NotebookView {
                             rect,
                             look,
                             palette,
+                            icons,
                             fonts,
                             dpi,
                             hover_pin && look.hover,

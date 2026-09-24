@@ -1354,6 +1354,15 @@ pub(crate) fn current_palette(hwnd: HWND) -> Palette {
     title_chrome(hwnd).0
 }
 
+/// The Notebook view's file-type icon colours for the current theme. Call it with nothing of
+/// the App borrowed.
+pub(crate) fn current_file_icons(hwnd: HWND) -> crate::window::palette::FileIcons {
+    unsafe { app_ptr(hwnd) }.map_or_else(crate::window::palette::FileIcons::neutral, |app| {
+        let app = unsafe { app.as_ref() };
+        crate::window::palette::FileIcons::for_cached_theme(app.theme, app.settings.theme)
+    })
+}
+
 /// The sidebar's fonts at the window's DPI, created on first use and again after a DPI change.
 /// Null handles without a sidebar. Call it with nothing of the App borrowed.
 pub(crate) fn ui_fonts(hwnd: HWND) -> crate::window::side_panel::UiFonts {
@@ -15767,7 +15776,7 @@ mod tests {
         // The window's untitled tab is an unsaved row, left out above. "sub" is collapsed, so b
         // is not a row: pinned a first, then the folder.
         assert_eq!(rows.len(), 2, "{items:?}");
-        assert_eq!(rows[0].name, "a, pinned");
+        assert_eq!(rows[0].name, "a, Markdown, pinned");
         assert_eq!(rows[1].name, "sub");
         assert_ne!(
             rows[1].state & crate::window::sidebar_accessibility::STATE_COLLAPSED,
