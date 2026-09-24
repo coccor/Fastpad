@@ -206,3 +206,47 @@
 - Moving notes or folders by drag and drop.
 - Inline naming in the Search and Favorites views.
 - Changing the first-save name bar or its Browse… button.
+
+## 11. Decisions made while implementing
+
+- **No row, no field.** `NoteRename` uses the name bar for any file the tree has no row for:
+  outside the open notebook (§3.3), but also a non-note file inside it (`script.py`), a note not
+  listed yet, or a window with no sidebar (notes mode off).
+- **The Notebook view shows for every edit.** New note and New folder from the palette switch
+  the sidebar to the Notebook view first, opening it if hidden, as `NoteRename` does (§3.3); a
+  draft needs its row on screen.
+- **An empty notebook** shows the tree while a draft is open, with the draft as its only row,
+  and goes back to its empty state when the draft ends.
+- **The empty state's New note button** drafts a note in the tree too (`CommandId::NoteNew`), at
+  the user's request, so every New note in the Notebook view names its file first; only Ctrl+N
+  and File → New tab open an untitled tab.
+- **Wording.** The live check says `<name> already exists here.` for notes and folders alike. A
+  clash found by the disk call keeps each kind's current wording: `<name> already exists. Try
+  <free name>.` for a note, `A folder or file named “<name>” already exists` for a folder.
+- **A folder name that cleans to nothing cancels**, like an empty note name (§4.1, §5.2):
+  "Type a folder name" goes with the name box's New folder.
+- **Focus.** A commit caused by focus leaving moves no focus: a new note opens without taking
+  the focus from where it went, and a rename leaves it there too. Only Enter puts the focus in
+  the editor (new note) or keeps it in the tree (folder, renames).
+- **A click in the tree while editing** commits first, then acts on the row it landed on, found
+  by what it shows: the rows may have moved (the draft gone, the renamed row sorted elsewhere).
+  A click on the draft row or on the row just renamed does nothing more.
+- **A modal prompt** that takes the focus from the field holds the commit until it ends.
+- **Switching views wins.** Showing another view or hiding the sidebar cancels, even when the
+  palette took the focus first and a focus-leave commit is still queued.
+- **Keys.** The Edit control has no Ctrl+A or Ctrl+Backspace of its own: the field's hook
+  handles both. Of the field's keys only Ctrl+Z is an accelerator; the field keeps it.
+- **Screen readers.** The field's accessible name and its problem (as the description) are set
+  through `IAccPropServices` dynamic annotation, so the system's own `Edit` proxy reports them.
+- **A problem shown after Enter** stays until the text changes; Enter again with the same text
+  is refused like any other problem.
+- **A vanished row is not the active tab.** When `Note: Rename…` acts on a row that left the
+  notebook before Enter, it renames nothing, unless that row is the active tab's own note, which
+  then uses the name bar.
+- **A note rename that cannot be undone stands.** If a renamed note's tab cannot follow and
+  putting the file back also fails, the new name stands, the library follows the disk, and a
+  notice names the tab left on its old path, as a folder rename does.
+- **Scrolling keeps the edit.** A press on the tree's scroll thumb, left or right, neither
+  commits nor moves the focus: the field keeps editing while the list scrolls.
+- **A field scrolled out of view** is shrunk and marked hidden rather than hidden with
+  `ShowWindow`, which would take its focus away.
