@@ -8,10 +8,9 @@ pub enum SearchDirection {
 
 /// Wrap-once-then-stop search progression: bookkeeping only, independent of what actually looks
 /// for the query in a given range. `next_range` is a pure, dependency-free reference
-/// implementation driven by a plain string, used both for unit testing this algorithm and by the
-/// window layer for the (rare) case a plain string is already in hand; live document navigation
-/// instead drives the same shape of search via `Editor::search_in_target`, never materializing
-/// the full document text.
+/// implementation driven by a plain string, used for unit testing this algorithm; live plain-mode
+/// navigation drives the same shape of search via `Editor::search_in_target`, never materializing
+/// the full document text. Regex mode doesn't use it (`regex_match`).
 #[derive(Debug)]
 pub struct SearchState {
     query: String,
@@ -19,8 +18,6 @@ pub struct SearchState {
     origin: usize,
     cursor: usize,
     wrapped: bool,
-    /// Each hit must also be a whole word by Scintilla's word test (`find_match`).
-    whole_words: bool,
 }
 
 impl SearchState {
@@ -31,14 +28,7 @@ impl SearchState {
             origin: start,
             cursor: start,
             wrapped: false,
-            whole_words: false,
         }
-    }
-
-    /// Accepts only hits that are whole words, as whole word in regex mode needs (`checks_words`).
-    pub(crate) fn with_whole_words(mut self, whole_words: bool) -> Self {
-        self.whole_words = whole_words;
-        self
     }
 
     pub fn query(&self) -> &str {
@@ -91,8 +81,7 @@ impl SearchState {
     }
 
     /// Pure reference implementation of the wrap progression over an in-memory string. Never used
-    /// for live editor navigation (see the struct docs); exists for testing and for any caller
-    /// that already holds the text (e.g. a prefilled query match against a short selection).
+    /// for live editor navigation (see the struct docs); exists for testing.
     pub fn next_range(&mut self, haystack: &str) -> Option<Range<usize>> {
         let query = self.query.clone();
         let direction = self.direction;
@@ -122,10 +111,10 @@ impl SearchState {
     }
 
     /// Drives the same wrap-once progression against a live Scintilla document via
-    /// `Editor::search_in_target`, never materializing the full document text.
+    /// `Editor::search_in_target`, never materializing the full document text. For plain mode.
     pub(crate) fn next_editor_match(
         &mut self,
-        editor: &crate::editor::Editor,
+        editor: &Editor,
         flags: u32,
         doc_len: usize,
     ) -> crate::Result<Option<Range<usize>>> {
@@ -133,7 +122,7 @@ impl SearchState {
             return Ok(None);
         }
         let bounds = self.scintilla_bounds(doc_len);
-        let found = find_match(editor, &self.query, bounds, flags, self.whole_words)?;
+        let found = editor.search_in_target(&self.query, bounds, flags)?;
         if let Some(found) = found {
             self.record_match(found.clone());
             return Ok(Some(found));
@@ -143,7 +132,7 @@ impl SearchState {
         }
         self.record_miss(doc_len);
         let bounds = self.scintilla_bounds(doc_len);
-        let found = find_match(editor, &self.query, bounds, flags, self.whole_words)?;
+        let found = editor.search_in_target(&self.query, bounds, flags)?;
         if let Some(found) = &found {
             self.record_match(found.clone());
         }
@@ -151,151 +140,134 @@ impl SearchState {
     }
 }
 
-use crate::editor::scintilla_constants::{
-    SCFIND_CXX11REGEX, SCFIND_MATCHCASE, SCFIND_NONE, SCFIND_REGEXP, SCFIND_WHOLEWORD,
-};
-use crate::search::{MatchOptions, SearchOption};
+use crate::editor::Editor;
+use crate::editor::scintilla_constants::{SCFIND_MATCHCASE, SCFIND_NONE, SCFIND_WHOLEWORD};
+use crate::search::{MatchOptions, Matcher, SearchOption};
 
-/// The Scintilla search flags for `options` (spec §8). Scintilla's regex search ignores
-/// `SCFIND_WHOLEWORD`, so whole word in regex mode is left out here and checked on each hit
-/// instead (`checks_words`).
+/// The Scintilla search flags for plain mode (spec §8). Regex mode doesn't search with Scintilla
+/// but with `Matcher` (`regex_matcher`).
 pub(crate) fn search_flags(options: MatchOptions) -> u32 {
     let mut flags = SCFIND_NONE;
     if options.case {
         flags |= SCFIND_MATCHCASE;
     }
-    if options.regex {
-        flags |= SCFIND_REGEXP | SCFIND_CXX11REGEX;
-    } else if options.whole_word {
+    if options.whole_word {
         flags |= SCFIND_WHOLEWORD;
     }
     flags
 }
 
-/// Whether each hit must pass Scintilla's word test (`Editor::is_range_word`): whole word in
-/// regex mode. The pattern is not wrapped in `\b(?:…)\b`: Scintilla's C++11 regex is MSVC's
-/// `std::wregex`, whose `\b` counts letters like ă as non-word characters, so "mașină" would be
-/// missed as a word and found inside "mașinării". The word test uses Scintilla's Unicode
-/// classes, the same test `SCFIND_WHOLEWORD` applies in plain mode.
-pub(crate) fn checks_words(options: MatchOptions) -> bool {
-    options.regex && options.whole_word
+/// The find bar's regex mode: the same `Matcher` Search uses, so a result opens to the match
+/// Search showed (spec §8). `None` for a pattern error or a pattern that matches empty text,
+/// which the bar shows as its no-match state, as Search shows its pattern error.
+pub(crate) fn regex_matcher(query: &str, options: MatchOptions) -> Option<Matcher> {
+    Matcher::new(
+        query,
+        MatchOptions {
+            regex: true,
+            ..options
+        },
+    )
+    .ok()
 }
 
-/// `text` as a pattern that matches it literally in Scintilla's ECMAScript regex, for a
-/// selection prefilled while regex is on. Only ECMAScript's syntax characters are escaped,
-/// because there an identity escape of anything else (`\#`, `\-`) is an error.
-pub(crate) fn escape_pattern(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(
-            c,
-            '\\' | '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
-        ) {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-    }
-    escaped
-}
-
-/// The first match of `query` in `bounds` that the find bar accepts, or with
-/// `bounds.start > bounds.end` (a backward search) the last one. An accepted hit is non-empty,
-/// and with `whole_words` passes `Editor::is_range_word`.
-///
-/// A regex that can match empty text (`\d*`, `.*`) is found as the empty match wherever it is
-/// first tried; that is stepped over rather than selected, which would leave F3 stuck at the
-/// caret, or taken as a miss, which would skip every later match. A hit that isn't a whole word
-/// is stepped over the same way. Each step moves the searched range strictly inward, so this
-/// ends.
-pub(crate) fn find_match(
-    editor: &crate::editor::Editor,
-    query: &str,
-    bounds: Range<usize>,
-    flags: u32,
-    whole_words: bool,
-) -> crate::Result<Option<Range<usize>>> {
-    if bounds.start <= bounds.end {
-        first_match(editor, query, bounds, flags, whole_words)
-    } else {
-        last_match(editor, query, bounds.start, bounds.end, flags, whole_words)
+/// Forward, the first match starting at or after `origin`, else (wrapping once) the first in the
+/// text. Backward, the last match ending at or before `origin`, else the last in the text.
+pub(crate) fn regex_match(
+    matcher: &Matcher,
+    text: &str,
+    origin: usize,
+    direction: SearchDirection,
+) -> Option<Range<usize>> {
+    match direction {
+        SearchDirection::Forward => matcher
+            .find_at(text, origin)
+            .or_else(|| matcher.find_at(text, 0)),
+        SearchDirection::Backward => matcher
+            .last_before(text, origin)
+            .or_else(|| matcher.last_before(text, text.len())),
     }
 }
 
-fn accepted(
-    editor: &crate::editor::Editor,
-    found: &Range<usize>,
-    whole_words: bool,
-) -> crate::Result<bool> {
-    Ok(!found.is_empty() && (!whole_words || editor.is_range_word(found.clone())?))
+/// The match of `query` under `options` that find next (or previous) selects from `origin`,
+/// wrapping once. Plain mode searches with Scintilla; regex mode runs `Matcher` over the
+/// document's text, borrowed without a copy. A pattern error is `None`, a miss.
+pub(crate) fn find_in_editor(
+    editor: &Editor,
+    query: &str,
+    options: MatchOptions,
+    origin: usize,
+    direction: SearchDirection,
+) -> Option<Range<usize>> {
+    if query.is_empty() {
+        return None;
+    }
+    if options.regex {
+        let matcher = regex_matcher(query, options)?;
+        return editor
+            .with_document_text(|text| regex_match(&matcher, text, origin, direction))
+            .ok()
+            .flatten();
+    }
+    let doc_len = editor.length().ok()?;
+    SearchState::new(query, direction, origin)
+        .next_editor_match(editor, search_flags(options), doc_len)
+        .ok()
+        .flatten()
 }
 
-/// Forward: a hit that isn't accepted moves the range's start one character past its start,
-/// where a shorter or later match may be.
-fn first_match(
-    editor: &crate::editor::Editor,
+/// Whether `selection` is exactly a match of `query` under `options`, found where it starts, as
+/// Replace needs before it replaces the selection.
+pub(crate) fn is_match(
+    editor: &Editor,
     query: &str,
-    mut bounds: Range<usize>,
-    flags: u32,
-    whole_words: bool,
-) -> crate::Result<Option<Range<usize>>> {
-    loop {
-        let Some(found) = editor.search_in_target(query, bounds.clone(), flags)? else {
-            return Ok(None);
+    options: MatchOptions,
+    selection: Range<usize>,
+) -> bool {
+    if query.is_empty() || selection.is_empty() {
+        return false;
+    }
+    if options.regex {
+        let Some(matcher) = regex_matcher(query, options) else {
+            return false;
         };
-        if accepted(editor, &found, whole_words)? {
-            return Ok(Some(found));
-        }
-        let next = editor.position_after(found.start)?;
-        if next <= found.start || next >= bounds.end {
-            return Ok(None);
-        }
-        bounds.start = next;
+        return editor
+            .with_document_text(|text| matcher.find_at(text, selection.start))
+            .ok()
+            .flatten()
+            == Some(selection);
     }
+    editor
+        .search_in_target(query, selection.clone(), search_flags(options))
+        .ok()
+        .flatten()
+        == Some(selection)
 }
 
-/// Backward from `high` down to `low`. Scintilla's backward regex search gives a line's last
-/// match. When that isn't accepted (for a pattern that can match empty text it is the empty one
-/// at the range's end on that line), the line's matches are found forward, from the line's start
-/// to `high`, and the last accepted one is taken. A line without one moves `high` to the end of
-/// the line before.
-fn last_match(
-    editor: &crate::editor::Editor,
+/// Replaces every match of `query` under `options` with `replacement` (literal text, in regex
+/// mode too) as one undo action, and returns how many. Regex mode replaces `Matcher`'s matches,
+/// from the end backwards.
+pub(crate) fn replace_all(
+    editor: &Editor,
     query: &str,
-    mut high: usize,
-    low: usize,
-    flags: u32,
-    whole_words: bool,
-) -> crate::Result<Option<Range<usize>>> {
-    loop {
-        let Some(found) = editor.search_in_target(query, high..low, flags)? else {
-            return Ok(None);
-        };
-        if accepted(editor, &found, whole_words)? {
-            return Ok(Some(found));
-        }
-        let line_start = editor
-            .line_start(editor.line_from_position(found.start)?)?
-            .max(low);
-        let mut last = None;
-        let mut from = line_start;
-        while from < high
-            && let Some(hit) = first_match(editor, query, from..high, flags, whole_words)?
-        {
-            from = hit.end;
-            last = Some(hit);
-        }
-        if last.is_some() {
-            return Ok(last);
-        }
-        if line_start <= low {
-            return Ok(None);
-        }
-        let previous = editor.position_before(line_start)?;
-        if previous >= high {
-            return Ok(None);
-        }
-        high = previous;
+    replacement: &str,
+    options: MatchOptions,
+) -> usize {
+    if query.is_empty() {
+        return 0;
     }
+    if !options.regex {
+        return editor
+            .replace_all(query, replacement, search_flags(options))
+            .unwrap_or(0);
+    }
+    let Some(matcher) = regex_matcher(query, options) else {
+        return 0;
+    };
+    let Ok(ranges) = editor.with_document_text(|text| matcher.find_iter(text)) else {
+        return 0;
+    };
+    editor.replace_ranges(&ranges, replacement).unwrap_or(0)
 }
 
 // --- Window integration: native child controls hosting Find/Replace ---
@@ -1252,8 +1224,7 @@ mod tests {
     use super::{SearchDirection, SearchState};
     use crate::editor::Editor;
     use crate::editor::scintilla_constants::{
-        SCI_GETTARGETEND, SCI_ISRANGEWORD, SCI_POSITIONAFTER, SCI_SEARCHINTARGET,
-        SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
+        SCI_GETTARGETEND, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1327,8 +1298,6 @@ mod tests {
         /// Scripted target ends; otherwise a hit ends one needle-length after it starts.
         ends: VecDeque<isize>,
         last_end: isize,
-        /// Scripted `SCI_ISRANGEWORD` answers; otherwise every range is a word.
-        words: VecDeque<isize>,
     }
 
     unsafe extern "C" fn target_range_stub(
@@ -1356,9 +1325,6 @@ mod tests {
                 let scripted = log.ends.pop_front();
                 scripted.unwrap_or(log.last_end)
             }
-            // One byte per character keeps the stepping readable.
-            SCI_POSITIONAFTER => wparam as isize + 1,
-            SCI_ISRANGEWORD => log.words.pop_front().unwrap_or(1),
             _ => 0,
         }
     }
@@ -1390,13 +1356,11 @@ mod tests {
     }
 
     #[test]
-    fn options_map_to_scintilla_flags_and_a_whole_word_regex_is_checked_per_hit() {
-        // Break caught: the toggles changing nothing, or whole word silently ignored in regex
-        // mode (Scintilla's regex search drops the word flags).
-        use super::{checks_words, search_flags};
-        use crate::editor::scintilla_constants::{
-            SCFIND_CXX11REGEX, SCFIND_MATCHCASE, SCFIND_REGEXP, SCFIND_WHOLEWORD,
-        };
+    fn plain_options_map_to_scintilla_flags_and_regex_adds_none() {
+        // Break caught: the toggles changing nothing in plain mode, or a Scintilla regex flag
+        // left in, so regex mode would search with a second dialect.
+        use super::search_flags;
+        use crate::editor::scintilla_constants::{SCFIND_MATCHCASE, SCFIND_WHOLEWORD};
         use crate::search::MatchOptions;
         let plain = MatchOptions::default();
         let case = MatchOptions {
@@ -1407,10 +1371,6 @@ mod tests {
             whole_word: true,
             ..plain
         };
-        let regex = MatchOptions {
-            regex: true,
-            ..plain
-        };
         let all = MatchOptions {
             case: true,
             whole_word: true,
@@ -1419,29 +1379,57 @@ mod tests {
         assert_eq!(search_flags(plain), 0);
         assert_eq!(search_flags(case), SCFIND_MATCHCASE);
         assert_eq!(search_flags(word), SCFIND_WHOLEWORD);
-        assert_eq!(search_flags(regex), SCFIND_REGEXP | SCFIND_CXX11REGEX);
-        assert_eq!(
-            search_flags(all),
-            SCFIND_MATCHCASE | SCFIND_REGEXP | SCFIND_CXX11REGEX
-        );
-        assert!(
-            checks_words(all),
-            "whole word in regex mode is checked per hit"
-        );
-        assert!(!checks_words(regex));
-        assert!(!checks_words(word), "plain whole word is SCFIND_WHOLEWORD");
+        assert_eq!(search_flags(all), SCFIND_MATCHCASE | SCFIND_WHOLEWORD);
     }
 
     #[test]
-    fn a_prefilled_selection_is_escaped_for_ecmascript() {
-        // Break caught: a selected "a.b" matching "axb" with regex on, or an escape ECMAScript
-        // rejects (`\#`, `\-`) making every prefill an invalid pattern.
-        use super::escape_pattern;
+    fn regex_mode_wraps_once_each_way_and_a_pattern_error_is_no_matcher() {
+        // Break caught: find next restarting at the caret's own match, find previous taking a
+        // match that ends after the caret, no wrap, or `\d*` (empty-capable) or `(` searched
+        // at all instead of shown as no match.
+        use super::{regex_match, regex_matcher};
+        use crate::search::MatchOptions;
+        let options = MatchOptions::default();
+        let matcher = regex_matcher(r"\d+", options).unwrap();
+        let text = "a1 b22\nc333";
+        let find = |origin, direction| regex_match(&matcher, text, origin, direction);
+        assert_eq!(find(0, SearchDirection::Forward), Some(1..2));
+        assert_eq!(find(2, SearchDirection::Forward), Some(4..6));
+        assert_eq!(find(6, SearchDirection::Forward), Some(8..11), "next line");
+        assert_eq!(find(11, SearchDirection::Forward), Some(1..2), "wrapped");
+        assert_eq!(find(8, SearchDirection::Backward), Some(4..6));
+        assert_eq!(find(5, SearchDirection::Backward), Some(1..2));
+        assert_eq!(find(1, SearchDirection::Backward), Some(8..11), "wrapped");
+        assert!(regex_matcher(r"\d*", options).is_none());
+        assert!(regex_matcher("(", options).is_none());
+        assert!(regex_matcher("", options).is_none());
+    }
+
+    #[test]
+    fn a_regex_find_next_in_a_megabyte_note_takes_well_under_a_frame() {
+        // Break caught: a regex find next that copies, recompiles per step or rescans the text
+        // more than once, putting F3 in a 1 MB note past one 16 ms frame. The worst case is a
+        // miss: the whole text after the caret, then the whole text again after the wrap.
+        // Measured in release only (`cargo test --release`), like the matcher's own budget test.
+        use super::{regex_match, regex_matcher};
+        use crate::search::MatchOptions;
+        let line = "Plain text with a café, some numbers 12345 and Îndemn words.\r\n";
+        let text = line.repeat(1_048_576 / line.len());
+        let options = MatchOptions {
+            whole_word: true,
+            ..MatchOptions::default()
+        };
+        let started = std::time::Instant::now();
+        let matcher = regex_matcher(r"invoice\s+\d{4}", options).unwrap();
         assert_eq!(
-            escape_pattern(r"a.b*(c)[d]{2}^$|?+\"),
-            r"a\.b\*\(c\)\[d\]\{2\}\^\$\|\?\+\\"
+            regex_match(&matcher, &text, text.len() / 2, SearchDirection::Forward),
+            None
         );
-        assert_eq!(escape_pattern("plain words #1 & -2"), "plain words #1 & -2");
+        let elapsed = started.elapsed();
+        eprintln!("regex find next over {} bytes: {elapsed:?}", text.len());
+        if !cfg!(debug_assertions) {
+            assert!(elapsed < std::time::Duration::from_millis(8), "{elapsed:?}");
+        }
     }
 
     #[test]
@@ -1460,48 +1448,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn a_regex_error_is_a_miss_and_an_empty_match_is_stepped_over() {
-        // Break caught: a bad pattern reported as an error, an empty match "found" at the
-        // caret forever so F3 never moves, or an empty match taken as a miss so the match
-        // after it is never reached.
-        let log = Mutex::new(TargetLog {
-            responses: VecDeque::from([-2_isize, -2, 4, 6]),
-            ends: VecDeque::from([4_isize, 8]),
-            ..TargetLog::default()
-        });
-        let editor =
-            Editor::test_fixture(target_range_stub, &log as *const Mutex<TargetLog> as isize);
-
-        let mut bad = SearchState::new("(", SearchDirection::Forward, 0);
-        assert_eq!(bad.next_editor_match(&editor, 0, 11).unwrap(), None);
-
-        let mut empty = SearchState::new("x*", SearchDirection::Forward, 4);
-        assert_eq!(empty.next_editor_match(&editor, 0, 11).unwrap(), Some(6..8));
-        let ranges = log.lock().unwrap().ranges.clone();
-        assert_eq!(ranges[ranges.len() - 2..], [(4, 11), (5, 11)]);
-    }
-
-    #[test]
-    fn a_hit_that_is_not_a_whole_word_is_stepped_over_when_words_are_checked() {
-        // Break caught: a whole-word regex accepting "foo" inside "foobar", or a rejected hit
-        // ending the search so the later whole word is never reached.
-        let log = Mutex::new(TargetLog {
-            responses: VecDeque::from([0_isize, 7]),
-            words: VecDeque::from([0_isize, 1]),
-            ..TargetLog::default()
-        });
-        let editor =
-            Editor::test_fixture(target_range_stub, &log as *const Mutex<TargetLog> as isize);
-        let mut state = SearchState::new("foo", SearchDirection::Forward, 0).with_whole_words(true);
-
-        assert_eq!(
-            state.next_editor_match(&editor, 0, 11).unwrap(),
-            Some(7..10)
-        );
-        assert_eq!(log.lock().unwrap().ranges, vec![(0, 11), (1, 11)]);
     }
 
     #[test]

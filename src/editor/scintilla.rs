@@ -20,10 +20,9 @@ use crate::editor::scintilla_constants::{
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
 use crate::editor::scintilla_constants::{
-    SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCOLUMN, SCI_GETCURRENTPOS,
-    SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER, SCI_ISRANGEWORD,
-    SCI_LINEFROMPOSITION, SCI_LINELENGTH, SCI_POSITIONAFTER, SCI_POSITIONBEFORE,
-    SCI_POSITIONFROMLINE, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
+    SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCHARACTERPOINTER, SCI_GETCODEPAGE,
+    SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER,
+    SCI_LINEFROMPOSITION, SCI_LINELENGTH, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
 };
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
@@ -358,6 +357,41 @@ impl Editor {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
+    /// Runs `f` on the whole document's text, borrowed straight out of Scintilla's buffer
+    /// (`SCI_GETCHARACTERPOINTER`, which closes the gap once and then costs nothing until the
+    /// next edit). Byte offsets into it are Scintilla positions. `f` sees the text only for the
+    /// call, so no edit can move the buffer under it. A document that isn't in the UTF-8 code
+    /// page, or whose bytes aren't valid UTF-8, is an error: every FastPad document is UTF-8
+    /// (`initialize_view`), so nothing is converted.
+    #[cfg(windows)]
+    pub fn with_document_text<R>(&self, f: impl FnOnce(&str) -> R) -> Result<R> {
+        let code_page = self.endpoint.send_direct_checked(SCI_GETCODEPAGE, 0, 0)?;
+        if code_page != SC_CP_UTF8 as isize {
+            return Err(FastPadError::Invariant("The document is not UTF-8"));
+        }
+        let length = self.length()?;
+        if length == 0 {
+            return Ok(f(""));
+        }
+        let pointer = self
+            .endpoint
+            .send_direct_checked(SCI_GETCHARACTERPOINTER, 0, 0)?;
+        if pointer == 0 {
+            return Err(FastPadError::Invariant(
+                "Scintilla returned no character pointer",
+            ));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(pointer as *const u8, length) };
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| FastPadError::Invariant("Scintilla returned invalid UTF-8"))?;
+        Ok(f(text))
+    }
+
+    #[cfg(not(windows))]
+    pub fn with_document_text<R>(&self, _f: impl FnOnce(&str) -> R) -> Result<R> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
     #[cfg(windows)]
     pub fn line_from_position(&self, position: usize) -> Result<usize> {
         Ok(self
@@ -372,64 +406,6 @@ impl Editor {
     }
 
     /// Where `line` starts.
-    #[cfg(windows)]
-    pub fn line_start(&self, line: usize) -> Result<usize> {
-        Ok(self
-            .endpoint
-            .send_direct_checked(SCI_POSITIONFROMLINE, line, 0)?
-            .max(0) as usize)
-    }
-
-    #[cfg(not(windows))]
-    pub fn line_start(&self, _line: usize) -> Result<usize> {
-        Err(FastPadError::Invariant("Scintilla unavailable"))
-    }
-
-    /// The position one character after `position` (a whole UTF-8 sequence or CRLF), or the
-    /// document's length at its end.
-    #[cfg(windows)]
-    pub fn position_after(&self, position: usize) -> Result<usize> {
-        Ok(self
-            .endpoint
-            .send_direct_checked(SCI_POSITIONAFTER, position, 0)?
-            .max(0) as usize)
-    }
-
-    #[cfg(not(windows))]
-    pub fn position_after(&self, _position: usize) -> Result<usize> {
-        Err(FastPadError::Invariant("Scintilla unavailable"))
-    }
-
-    /// Whether `range` is a whole word by Scintilla's word characters (Unicode classes in a
-    /// UTF-8 document): it starts and ends at a change of character class, as `SCFIND_WHOLEWORD`
-    /// requires of a plain match. An empty range is not a word.
-    #[cfg(windows)]
-    pub fn is_range_word(&self, range: Range<usize>) -> Result<bool> {
-        Ok(self
-            .endpoint
-            .send_direct_checked(SCI_ISRANGEWORD, range.start, range.end as isize)?
-            != 0)
-    }
-
-    #[cfg(not(windows))]
-    pub fn is_range_word(&self, _range: Range<usize>) -> Result<bool> {
-        Err(FastPadError::Invariant("Scintilla unavailable"))
-    }
-
-    /// The position one character before `position`, or 0 at the start.
-    #[cfg(windows)]
-    pub fn position_before(&self, position: usize) -> Result<usize> {
-        Ok(self
-            .endpoint
-            .send_direct_checked(SCI_POSITIONBEFORE, position, 0)?
-            .max(0) as usize)
-    }
-
-    #[cfg(not(windows))]
-    pub fn position_before(&self, _position: usize) -> Result<usize> {
-        Err(FastPadError::Invariant("Scintilla unavailable"))
-    }
-
     #[cfg(windows)]
     pub fn line_count(&self) -> Result<usize> {
         Ok(self
@@ -590,16 +566,10 @@ impl Editor {
 
     /// Replaces every occurrence of `query` with `replacement`, as one undo action. Searches
     /// incrementally via `search_in_target`/`replace_target`; never retrieves the full document.
-    /// With `whole_words`, a match replaces only if `is_range_word` holds for it: whole word in
-    /// regex mode, where Scintilla ignores `SCFIND_WHOLEWORD`.
+    /// For plain search flags (the find bar's regex mode uses `replace_ranges`); an empty match
+    /// ends it rather than being replaced forever.
     #[cfg(windows)]
-    pub fn replace_all(
-        &self,
-        query: &str,
-        replacement: &str,
-        search_flags: u32,
-        whole_words: bool,
-    ) -> Result<usize> {
+    pub fn replace_all(&self, query: &str, replacement: &str, search_flags: u32) -> Result<usize> {
         if query.is_empty() {
             return Ok(0);
         }
@@ -616,18 +586,8 @@ impl Editor {
                 else {
                     break;
                 };
-                // An empty match (a regex like `a*` between the runs it matches) is stepped over,
-                // never replaced: replacing it would insert the replacement between characters,
-                // and searching from the same place again would find it forever. So is a match
-                // that isn't a whole word when whole words are asked for; the search goes on one
-                // character after its start, where a shorter match may be a word.
-                if found.is_empty() || (whole_words && !self.is_range_word(found.clone())?) {
-                    let next = self.position_after(found.start)?;
-                    if next <= found.start {
-                        break;
-                    }
-                    position = next;
-                    continue;
+                if found.is_empty() {
+                    break;
                 }
                 let replaced = self.replace_target(found, replacement)?;
                 count += 1;
@@ -645,8 +605,30 @@ impl Editor {
         _query: &str,
         _replacement: &str,
         _search_flags: u32,
-        _whole_words: bool,
     ) -> Result<usize> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Replaces each of `ranges` (in order, none overlapping) with `replacement`, from the last
+    /// backwards so the earlier positions stay valid, as one undo action. Returns how many.
+    #[cfg(windows)]
+    pub fn replace_ranges(&self, ranges: &[Range<usize>], replacement: &str) -> Result<usize> {
+        if ranges.is_empty() {
+            return Ok(0);
+        }
+        self.begin_undo_action();
+        let result = ranges
+            .iter()
+            .rev()
+            .try_for_each(|range| self.replace_target(range.clone(), replacement).map(drop));
+        self.end_undo_action();
+        result.map(|()| ranges.len())
+    }
+
+    #[cfg(not(windows))]
+    pub fn replace_ranges(&self, _ranges: &[Range<usize>], _replacement: &str) -> Result<usize> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
@@ -1564,12 +1546,12 @@ mod tests {
         SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
         SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
         SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT,
-        SCI_GETTARGETEND, SCI_PASTE, SCI_POSITIONAFTER, SCI_REDO, SCI_RELEASEDOCUMENT,
-        SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETDOCPOINTER, SCI_SETELEMENTCOLOUR,
-        SCI_SETILEXER, SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN,
-        SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS, SCI_SETSEL,
-        SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
-        SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
+        SCI_GETTARGETEND, SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET,
+        SCI_SEARCHINTARGET, SCI_SETDOCPOINTER, SCI_SETELEMENTCOLOUR, SCI_SETILEXER,
+        SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
+        SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
+        SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
+        SCI_UNDO,
     };
     use crate::editor::scintilla_constants::{
         SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_SETZOOM, SCI_STYLEGETBACK,
@@ -1667,6 +1649,40 @@ mod tests {
         editor.set_text("alpha\nbeta\ngamma").unwrap();
         assert_eq!(editor.range_bytes(6..10).unwrap(), b"beta");
         assert_eq!(editor.range_bytes(0..0).unwrap(), b"");
+    }
+
+    #[test]
+    fn document_text_is_the_whole_buffer_even_after_an_edit_moves_the_gap() {
+        // Break caught: a pointer read before the gap is closed (text after the caret missing
+        // or garbled), a stale length, or an empty document refused.
+        let editor = test_editor();
+        editor.set_text("o mașină nouă").unwrap();
+        editor.set_selection(2..2).unwrap();
+        editor.replace_target(2..2, "altă ").unwrap();
+        assert_eq!(
+            editor.with_document_text(str::to_owned).unwrap(),
+            "o altă mașină nouă"
+        );
+        editor.set_text("").unwrap();
+        assert_eq!(editor.with_document_text(str::len).unwrap(), 0);
+    }
+
+    #[test]
+    fn replace_ranges_replaces_from_the_end_as_one_undo_step() {
+        // Break caught: replacing front to back (later ranges shifted onto the wrong text), or
+        // one undo step per range.
+        let editor = test_editor();
+        editor.populate_clean("foo bar foo baz foo").unwrap();
+        assert_eq!(
+            editor
+                .replace_ranges(&[0..3, 8..11, 16..19], "quux")
+                .unwrap(),
+            3
+        );
+        assert_eq!(editor.text().unwrap(), "quux bar quux baz quux");
+        editor.undo().unwrap();
+        assert_eq!(editor.text().unwrap(), "foo bar foo baz foo");
+        assert_eq!(editor.replace_ranges(&[], "x").unwrap(), 0);
     }
 
     #[test]
@@ -1789,50 +1805,6 @@ mod tests {
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
         assert_eq!(editor.search_in_target("(", 0..10, 0).unwrap(), None);
-    }
-
-    #[test]
-    fn replace_all_with_whole_words_skips_a_match_that_is_not_a_word() {
-        // Break caught: a whole-word regex replacing inside "foobar", or the rejected match
-        // ending Replace All so a later whole word is left alone.
-        let harness = TestDirectHarness::new();
-        harness.push_response(0); // SCI_BEGINUNDOACTION
-        harness.push_response(10); // SCI_GETLENGTH
-        harness.push_response(0); // SCI_SEARCHINTARGET: "foo" at 0, inside "foobar"
-        harness.push_response(0); // SCI_ISRANGEWORD: not a word
-        harness.push_response(10); // SCI_GETLENGTH
-        harness.push_response(7); // SCI_SEARCHINTARGET from 1: "foo" at 7
-        harness.push_response(1); // SCI_ISRANGEWORD: a word
-        harness.push_response(0); // SCI_REPLACETARGET
-        harness.push_response(8); // SCI_GETLENGTH
-        harness.push_response(-1); // SCI_SEARCHINTARGET from 8: nothing
-        harness.push_response(0); // SCI_ENDUNDOACTION
-        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
-
-        assert_eq!(editor.replace_all("fo+", "X", 0, true).unwrap(), 1);
-        assert_eq!(harness.replace_bytes(), vec![b"X".to_vec()]);
-        assert_eq!(harness.target_range(), Some((8, 8)));
-    }
-
-    #[test]
-    fn replace_all_steps_past_an_empty_match_instead_of_replacing_it() {
-        // Break caught: a regex that can match empty text (`x*`) replacing at the same
-        // position forever, inserting the replacement between every character, or stopping
-        // at the first empty match so later runs are never replaced.
-        let harness = TestDirectHarness::new();
-        harness.push_response(0); // SCI_BEGINUNDOACTION
-        harness.push_response(5); // SCI_GETLENGTH
-        harness.push_response(0); // SCI_SEARCHINTARGET: an empty match at 0
-        harness.push_target_end(0);
-        harness.push_response(5); // SCI_GETLENGTH
-        harness.push_response(-1); // SCI_SEARCHINTARGET from 1: nothing
-        harness.push_response(0); // SCI_ENDUNDOACTION
-        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
-
-        assert_eq!(editor.replace_all("x*", "y", 0, false).unwrap(), 0);
-        assert!(harness.replace_bytes().is_empty());
-        assert_eq!(harness.target_range(), Some((1, 5)), "searched on from 1");
-        assert_eq!(harness.event_log(), vec!["begin", "end"]);
     }
 
     #[test]
@@ -1981,7 +1953,7 @@ mod tests {
         harness.push_response(0); // SCI_ENDUNDOACTION (ignored)
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        let count = editor.replace_all("one", "1111", 0, false).unwrap();
+        let count = editor.replace_all("one", "1111", 0).unwrap();
 
         assert_eq!(count, 2);
         assert_eq!(
@@ -2359,7 +2331,7 @@ mod tests {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        let count = editor.replace_all("", "x", 0, false).unwrap();
+        let count = editor.replace_all("", "x", 0).unwrap();
 
         assert_eq!(count, 0);
         assert!(harness.messages().is_empty());
@@ -2516,8 +2488,6 @@ mod tests {
                 let scripted = state.target_ends.pop_front();
                 scripted.unwrap_or(state.last_target_end)
             }
-            // One byte per character keeps the stepping readable.
-            SCI_POSITIONAFTER => wparam as isize + 1,
             SCI_REPLACETARGET => {
                 let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };
                 state.replace_bytes.push(bytes.to_vec());

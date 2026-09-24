@@ -123,7 +123,7 @@ The main uses:
   - Matching is per line: lines are split at `\n`, and a trailing `\r` is removed first. A match never spans lines.
   - In regex mode, a pattern containing `\n` (literally, or the escape `\n`) is matched against the whole text instead.
 - **Empty matches** are rejected when the pattern is compiled, by testing whether it matches `""`.
-- **The same `Matcher`** is used by the Search worker and by 3b's replace. The find bar keeps Scintilla (§8).
+- **The same `Matcher`** is used by the Search worker, by the find bar's regex mode (§8) and by 3b's replace.
 
 ## 7. Search execution
 
@@ -179,16 +179,20 @@ For each note, in the library's note-list order:
 ## 8. The find bar
 
 - It gets the same three toggles, drawn and exposed the same way as in the Search box, with Alt+C, Alt+W and Alt+R while focus is in the find bar.
-- Scintilla still does the searching:
+- **Plain mode** searches with Scintilla, with these flags wherever `search_flags` is used: find next and previous, replace, and replace all in the editor.
 
   | Option | Scintilla flag |
   |---|---|
   | Match case | `SCFIND_MATCHCASE` |
   | Whole word | `SCFIND_WHOLEWORD` |
-  | Regex | `SCFIND_REGEXP | SCFIND_CXX11REGEX` |
 
-  The flags are passed wherever `search_flags` is used today. This covers find next and previous, the match highlight and replace all in the editor.
-- **Regex dialect:** the find bar uses Scintilla's C++11 regex (ECMAScript), and Search uses Rust's `regex`. They agree on ordinary patterns: classes, `\d \w \s`, `^ $`, alternation, groups and quantifiers. They differ on things like lookaround, which Rust rejects and ECMAScript accepts. This is accepted, and documented here. An invalid pattern in the find bar shows the find bar's existing "no match" state.
+- **Regex mode** uses the same `Matcher` as Search (§6), built from the find bar's query and options, over the document's UTF-8 text. The text is borrowed from Scintilla with `SCI_GETCHARACTERPOINTER`, so nothing is copied, and the `Matcher`'s byte offsets are Scintilla positions.
+  - **Find next** selects the first match that starts at or after the selection's end, and wraps once to the first match in the note.
+  - **Find previous** selects the last match that ends at or before the selection's start, and wraps once to the last match.
+  - **Replace** replaces the selection only if it is exactly the match found where it starts.
+  - **Replace all** replaces every match, from the last backwards, as one undo action. The replacement is literal text (no `$1`).
+  - With one engine, a regex Search result always opens to the match Search showed: the same dialect, case folding, whole word and lines.
+- **Pattern errors:** a pattern that doesn't compile, or that matches empty text, shows the find bar's no-match state, as Search shows its pattern error (§6).
 - **Opening a Search result:**
   - The find bar opens in Find mode with the Search query and **Search's options**, which then become the find bar's options.
   - It selects the first match at or after the start of the document, and scrolls it into view.
@@ -211,7 +215,7 @@ For each note, in the library's note-list order:
   - It stops using `name_search`.
   - It gets two-line rows, the toggle buttons in the field, the summary line, the pattern error and the status line.
   - Its toggle buttons and summary are added to the panel's accessible children.
-- **`src/window/find_bar.rs`**: the toggle buttons, the flags, and `show_with(query, options)`.
+- **`src/window/find_bar.rs`**: the toggle buttons, the plain-mode flags, the regex-mode search over the document, and `show_with(query, options)`.
 - **`src/window/menus.rs` and `commands.rs`**: Ctrl+Shift+F, Shift+Alt+F, Ctrl+K removed, and the three palette rows.
 - **`Cargo.toml`**: `regex = "=1.13.1"`.
 - **`src/library/name_search.rs`** stays for Ctrl+P. It keeps its unit tests and the `library-scan` bench's `name_search_ms` case, which keep it compiled and warning-free; nothing else changes in it.
@@ -396,28 +400,27 @@ For each note, in the library's note-list order:
   the Search menu and the palette. 3b's commands start at 190.
 - **The find bar gained a no-match state.** §8 speaks of its "existing" one, but a miss used to
   leave no trace. Now the query field's outline turns `Palette.error_foreground` until the query
-  changes or a search finds something. An invalid regex shows it too. Scintilla reports a bad
-  pattern as -1 (-2 in some versions), which is a miss, never an error or a notice.
-- **Whole word in the find bar's regex mode is a per-hit word test.** Scintilla's regex search
-  ignores `SCFIND_WHOLEWORD`, and MSVC's `std::wregex` `\b` treats accented letters as non-word
-  characters, so wrapping the pattern in `\b(?:…)\b` was wrong both ways on Romanian text. The
-  find bar searches the bare pattern and accepts a hit only if Scintilla's `SCI_ISRANGEWORD`
-  holds for it, stepping past rejected hits.
-- **Search and the find bar differ at the edges of their regex dialects:**
-  - Scintilla's regex search runs line by line, so a Search hit that spans lines (a pattern
-    with `\n` or `\s` across a line end) opens to the find bar's no-match state.
-  - Whole word is the `regex` crate's word boundary in Search and Scintilla's word test in the
-    find bar, so they can disagree where a word edge is punctuation only.
-- **Empty regex matches are stepped past in the find bar.** A pattern like `x*` matches empty
-  text at the caret; find next and find previous move one character past an empty hit and keep
-  searching, and Replace all skips empty hits and continues, so a pattern that matches both
-  empty and real text still finds the real matches. Search rejects patterns that match empty
-  text outright (§6).
-- **Scintilla is built with C++11 regex** (`NO_CXX11_REGEX` is never set by
-  `tools/build-native.ps1`). An in-process test pins it with `\d{2}`.
-- **A regex match's length comes from Scintilla** (`SCI_GETTARGETEND`), not from the pattern's
-  length, so find next, replace and Replace all handle regex matches correctly. Replace in the
-  find bar inserts its text literally, in regex mode too (no `$1` or `\1`).
+  changes or a search finds something. A regex that doesn't compile or matches empty text
+  shows it too; neither is an error or a notice.
+- **The find bar's regex mode reads the document in place.** `Editor::with_document_text`
+  runs a closure on the text from `SCI_GETCHARACTERPOINTER`, which closes Scintilla's gap once
+  (a move of at most the document's size) and then costs nothing until the next edit. It checks
+  the code page is UTF-8 and the bytes are valid UTF-8; every FastPad document is UTF-8, so
+  nothing is converted, and a document that failed the check would show as no match. The
+  `Matcher` is compiled on each find next, not kept between presses.
+- **Find next in regex mode is `Matcher::find_at`,** which starts at the selection's end but
+  judges word edges and anchors in the whole line, so `\bfoo` never matches inside "xfoo" when
+  the caret sits after the x. **Find previous is `Matcher::last_before`,** the last of
+  `find_iter`'s matches that ends by the selection's start, tried from that line backwards.
+- **Measured:** a regex find next that misses in a 1 MB note (the worst case: the text after
+  the caret, then all of it again after the wrap, with the pattern compiled) takes about 3 ms in
+  a release build (`a_regex_find_next_in_a_megabyte_note_takes_well_under_a_frame`, which
+  asserts under 8 ms in release).
+- **Plain mode keeps Scintilla's own case folding and word test.** Both are Unicode-aware in a
+  UTF-8 document, so they agree with Search's plain matching on ordinary text; Search's
+  one-character folding (§6) may still differ from Scintilla's at rare characters.
+- **Replace in the find bar inserts its text literally,** in both modes (no `$1` or `\1`). A
+  plain match's length is Scintilla's `SCI_GETTARGETEND`; a regex match's is the `Matcher`'s.
 - **A click on a result moves the focus to the editor; Enter keeps it in the list** (sidebar
   spec §6.4; `open_search_result`'s `focus_editor` is true for a click, false for Enter). §8's
   "focus goes to the editor" holds for the click. Either way the first match is selected and F3
@@ -426,8 +429,8 @@ For each note, in the library's note-list order:
   and `run_options` (the options when that search began), not the box's current text or
   toggles. A query or option edited after the search, still inside its debounce, never leaks
   into the find bar, so F3 steps through the same matches the result showed.
-- **A selection prefilled into the find bar while regex is on** is escaped for ECMAScript
-  (`find_bar::escape_pattern`), not with `regex::escape`, whose `\#` and `\-` ECMAScript rejects.
+- **A selection prefilled into the find bar while regex is on** is escaped with
+  `search::escape` (`regex::escape`), as Search's prefill is.
 - **The find bar's tooltip is updated under a shared App borrow** (`TTM_*` sends in
   `FindBar::layout`), an accepted exception to the App-borrow rule: the tooltip is a same-thread
   control that never calls back into the main window.

@@ -167,6 +167,96 @@ impl Matcher {
         all
     }
 
+    /// The first match that starts at or after byte `from`, judged in the whole text: a word
+    /// edge or an anchor at `from` sees the characters before it, as it would in `find_iter`.
+    /// A `from` inside a character counts from that character's start.
+    pub fn find_at(&self, text: &str, from: usize) -> Option<Range<usize>> {
+        let from = floor_boundary(text, from);
+        if !self.per_line {
+            return self.segment_first_at(text, 0, from);
+        }
+        let mut start = text[..from].rfind('\n').map_or(0, |newline| newline + 1);
+        for line in text[start..].split('\n') {
+            let body = line.strip_suffix('\r').unwrap_or(line);
+            let offset = from.saturating_sub(start);
+            if offset <= body.len()
+                && let Some(found) = self.segment_first_at(body, start, offset)
+            {
+                return Some(found);
+            }
+            start += line.len() + 1;
+        }
+        None
+    }
+
+    /// The last match that ends at or before byte `until`, among the matches `find_iter` gives.
+    /// Lines are tried from the one holding `until` backwards, so a match near `until` costs
+    /// only the lines it has to look at (whole-text mode looks at the text up to `until`).
+    pub fn last_before(&self, text: &str, until: usize) -> Option<Range<usize>> {
+        let until = floor_boundary(text, until);
+        let last_in = |segment: &str, base: usize| {
+            let mut last = None;
+            self.segment_matches(segment, base, &mut |range| {
+                if range.end > until {
+                    return false;
+                }
+                last = Some(range);
+                true
+            });
+            last
+        };
+        if !self.per_line {
+            return last_in(text, 0);
+        }
+        let mut line_start = text[..until].rfind('\n').map_or(0, |newline| newline + 1);
+        loop {
+            let line_end = text[line_start..]
+                .find('\n')
+                .map_or(text.len(), |newline| line_start + newline);
+            let line = &text[line_start..line_end];
+            let body = line.strip_suffix('\r').unwrap_or(line);
+            if let Some(found) = last_in(body, line_start) {
+                return Some(found);
+            }
+            if line_start == 0 {
+                return None;
+            }
+            line_start = text[..line_start - 1]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1);
+        }
+    }
+
+    /// The first match in `segment` (at byte `base` of the text) starting at or after `offset`
+    /// within it.
+    fn segment_first_at(&self, segment: &str, base: usize, offset: usize) -> Option<Range<usize>> {
+        if let Engine::Regex(regex) = &self.engine {
+            let mut position = offset;
+            while position <= segment.len() {
+                let found = regex.find_at(segment, position)?;
+                if !found.is_empty() {
+                    return Some(found.start() + base..found.end() + base);
+                }
+                // An empty match at a position (`\b`) is never a match; look past it.
+                position = found.end()
+                    + segment[found.end()..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
+            }
+            return None;
+        }
+        let mut first = None;
+        self.segment_matches(segment, base, &mut |range| {
+            if range.start < base + offset {
+                return true;
+            }
+            first = Some(range);
+            false
+        });
+        first
+    }
+
     /// Calls `emit` with each match until it returns false.
     fn each_match(&self, text: &str, emit: &mut dyn FnMut(Range<usize>) -> bool) {
         if !self.per_line {
@@ -234,6 +324,15 @@ impl Matcher {
             }
         }
     }
+}
+
+/// `position`, clamped to `text` and moved back to the start of the character it is inside.
+fn floor_boundary(text: &str, position: usize) -> usize {
+    let mut position = position.min(text.len());
+    while !text.is_char_boundary(position) {
+        position -= 1;
+    }
+    position
 }
 
 /// `regex::escape`, for text that must match as it is in regex mode.
@@ -709,6 +808,48 @@ mod tests {
             }
             assert_eq!(on.toggled(option), none);
         }
+    }
+
+    #[test]
+    fn find_at_starts_at_the_offset_but_judges_words_in_the_whole_text() {
+        // Break caught: a search from the caret that slices the text there, so "foo" inside
+        // "xfoo" counts as a whole word, `^` matches mid-line, or the next line is never
+        // reached.
+        let word = matcher("fo+", options(false, true, true));
+        let text = "xfoo foo\nfoo";
+        assert_eq!(word.find_at(text, 1), Some(5..8));
+        assert_eq!(word.find_at(text, 6), Some(9..12));
+        assert_eq!(word.find_at(text, 12), None);
+        let anchored = matcher("^b", options(false, false, true));
+        assert_eq!(anchored.find_at("ab\r\nb", 1), Some(4..5));
+        let plain = matcher("é", options(false, false, false));
+        assert_eq!(plain.find_at("é É", 1), Some(0..2), "inside a character");
+        assert_eq!(plain.find_at("é É", 2), Some(3..5));
+        let spanning = matcher(r"a\nb", options(false, false, true));
+        assert_eq!(spanning.find_at("a\nb a\nb", 1), Some(4..7));
+    }
+
+    #[test]
+    fn last_before_finds_the_last_match_ending_by_the_offset_on_earlier_lines_too() {
+        // Break caught: a match that ends after the offset taken, a search that stops at the
+        // offset's own line, or `$` judged at a cut instead of at the line's end.
+        let word = matcher("fo+", options(false, true, true));
+        let text = "foo x\nfoobar foo foo";
+        assert_eq!(word.last_before(text, 20), Some(17..20));
+        assert_eq!(word.last_before(text, 19), Some(13..16));
+        assert_eq!(word.last_before(text, 12), Some(0..3), "the line before");
+        assert_eq!(word.last_before(text, 2), None);
+        let end = matcher("o$", options(false, false, true));
+        assert_eq!(end.last_before("foo\nfoo", 2), None, "$ is the line's end");
+        assert_eq!(end.last_before("foo\nfoo", 5), Some(2..3));
+    }
+
+    #[test]
+    fn case_insensitive_regex_folds_accented_capitals() {
+        // Break caught: case folding limited to ASCII, as MSVC's std::wregex does, so Search
+        // finds "Îndemn" but the find bar doesn't.
+        let found = matcher("îndemn|élan", options(false, false, true));
+        assert_eq!(found.find_iter("Îndemn, Élan"), vec![0..7, 9..14]);
     }
 
     #[test]

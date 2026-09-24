@@ -1097,13 +1097,13 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     }
     // A single-line selection is a reasonable query prefill; a multi-line one is not (the bar has
     // no way to display it), so it's left alone rather than truncated or rejected. With regex
-    // on, it is escaped so it matches only itself.
+    // on, it is escaped (as Search escapes it) so it matches only itself.
     let regex = unsafe { app_ptr(hwnd) }
         .and_then(|app| Some(unsafe { app.as_ref() }.find_bar.as_ref()?.options().regex))
         .unwrap_or(false);
     let prefill = single_line_selection(hwnd).map(|text| {
         if regex {
-            find_bar::escape_pattern(&text)
+            crate::search::escape(&text)
         } else {
             text
         }
@@ -1771,7 +1771,7 @@ fn navigate_to_match(hwnd: HWND, backward: bool) {
 
 /// Selects the next match of `query` under `options` from `origin`, wrapping once, and scrolls
 /// it into view. When there is none, the selection stays and the find bar shows its no-match
-/// state. A pattern Scintilla can't compile counts as no match.
+/// state. A regex that doesn't compile, or matches empty text, counts as no match.
 fn select_match(
     hwnd: HWND,
     identity: &WindowIdentity,
@@ -1781,15 +1781,7 @@ fn select_match(
     origin: usize,
     direction: find_bar::SearchDirection,
 ) {
-    let Ok(doc_len) = editor.length() else {
-        return;
-    };
-    let mut state = find_bar::SearchState::new(query, direction, origin)
-        .with_whole_words(find_bar::checks_words(options));
-    let found = state
-        .next_editor_match(editor, find_bar::search_flags(options), doc_len)
-        .ok()
-        .flatten();
+    let found = find_bar::find_in_editor(editor, query, options, origin, direction);
     if !identity.is_live_for(hwnd) {
         return;
     }
@@ -1827,17 +1819,7 @@ pub(crate) fn replace_current(hwnd: HWND) {
     // "CAT" for "cat", a regex's match, a whole word); otherwise this Enter just moves to the
     // next match, as in a bare Find field. The replacement is literal text, also in regex mode.
     if let Ok(selection) = editor.selection()
-        && !selection.is_empty()
-        && find_bar::find_match(
-            &editor,
-            &query,
-            selection.clone(),
-            find_bar::search_flags(options),
-            find_bar::checks_words(options),
-        )
-        .ok()
-        .flatten()
-            == Some(selection.clone())
+        && find_bar::is_match(&editor, &query, options, selection.clone())
     {
         let _ = editor.replace_target(selection, &replacement);
         if !identity.is_live_for(hwnd) {
@@ -1862,14 +1844,7 @@ pub(crate) fn replace_all_matches(hwnd: HWND) {
     if query.is_empty() {
         return;
     }
-    let replaced = editor
-        .replace_all(
-            &query,
-            &replacement,
-            find_bar::search_flags(options),
-            find_bar::checks_words(options),
-        )
-        .unwrap_or(0);
+    let replaced = find_bar::replace_all(&editor, &query, &replacement, options);
     if identity.is_live_for(hwnd) {
         editor.scroll_caret_into_view();
         set_find_no_match(hwnd, replaced == 0);
@@ -11598,6 +11573,43 @@ mod tests {
     }
 
     #[test]
+    fn a_regex_prefill_with_hash_and_dash_opens_to_its_match_in_the_find_bar() {
+        // Break caught (final review issue 1): `regex::escape` writes `\#` and `\-`, which the
+        // find bar's old ECMAScript regex rejected, so the result opened to no match.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("search-prefill-regex-open");
+        scratch.note("a.md", "see a-b#c here");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+        editor.populate_clean("x a-b#c").unwrap();
+        editor.set_selection(2..7).unwrap();
+
+        execute_command(window.hwnd, CommandId::ShowSearchView);
+        assert_eq!(
+            crate::window::search_view::current_query(window.hwnd).map(|(query, _)| query),
+            Some(r"a\-b\#c".to_owned())
+        );
+        pump_until(window.hwnd, || {
+            crate::window::search_view::shown_results(window.hwnd).len() == 1
+        });
+
+        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, true);
+
+        assert_eq!(editor.text().unwrap(), "see a-b#c here");
+        assert_eq!(editor.selection().unwrap(), 4..9);
+        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        assert!(bar.options().regex);
+        assert!(!bar.no_match());
+    }
+
+    #[test]
     fn the_search_toggle_commands_show_search_and_flip_its_options() {
         // Break caught: a palette toggle that flips an option nobody can see, or flips the
         // wrong one.
@@ -13293,8 +13305,8 @@ mod tests {
 
     #[test]
     fn the_find_bar_passes_its_options_to_scintilla_and_a_bad_regex_is_a_miss() {
-        // Break caught: toggles that change nothing, whole word matching inside foo_bar, the
-        // basic regex dialect instead of C++11 (no `{2}`), or an invalid pattern reported as an
+        // Break caught: toggles that change nothing, whole word matching inside foo_bar, regex
+        // mode not reaching the `regex` crate (no `{2}`), or an invalid pattern reported as an
         // error or leaving no trace.
         use crate::search::SearchOption;
         let _scintilla = load_native_scintilla();
@@ -13322,8 +13334,6 @@ mod tests {
             "whole word skips foobar and foo_bar"
         );
 
-        // `{2}` exists only in Scintilla's C++11 (ECMAScript) regex. If this fails, the DLL was
-        // built with NO_CXX11_REGEX (see the Task 7 findings).
         super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
         set_find_query(window.hwnd, r"b\d{2}");
@@ -13486,11 +13496,10 @@ mod tests {
     }
 
     #[test]
-    fn a_regex_that_can_match_empty_text_still_reaches_the_matches_after_it() {
-        // Break caught: `\d*` found as the empty match at the caret and taken as a miss (or
-        // selected, so F3 never moves), Shift+F3 always missing because Scintilla's backward
-        // search gives the empty match at the line's end, or Replace All stopping after the
-        // first run of `a*`.
+    fn a_regex_that_can_match_empty_text_shows_no_match_and_replaces_nothing() {
+        // Break caught: `\d*` searched at all (a hang stepping past empty matches, or the empty
+        // match selected at the caret), or Replace All inserting the replacement between
+        // characters. Search rejects such a pattern too (spec §6).
         use crate::search::SearchOption;
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
@@ -13501,34 +13510,55 @@ mod tests {
         set_find_query(window.hwnd, r"\d*");
         let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
 
-        editor.set_selection(0..0).unwrap();
+        editor.set_selection(1..1).unwrap();
         super::find_next(window.hwnd);
-        assert_eq!(editor.selection().unwrap(), 4..7, "F3");
-        assert!(!bar().no_match());
-
-        editor.set_selection(7..7).unwrap();
+        assert_eq!(editor.selection().unwrap(), 1..1, "F3");
+        assert!(bar().no_match());
         super::find_previous(window.hwnd);
-        assert_eq!(editor.selection().unwrap(), 4..7, "Shift+F3 from the end");
-        assert!(!bar().no_match());
+        assert_eq!(editor.selection().unwrap(), 1..1, "Shift+F3");
+        assert!(bar().no_match());
 
-        // Over two lines, backward from the second line's start reaches the first line's
-        // match, and forward from the end wraps to it.
-        editor.populate_clean("x 12 y\nz").unwrap();
-        editor.set_selection(7..7).unwrap();
-        super::find_previous(window.hwnd);
-        assert_eq!(editor.selection().unwrap(), 2..4, "the line before");
-        editor.set_selection(8..8).unwrap();
-        super::find_next(window.hwnd);
-        assert_eq!(editor.selection().unwrap(), 2..4, "wrapped");
-
-        // Each run is replaced once; the empty matches between them are stepped over.
-        editor.populate_clean("aab aa").unwrap();
-        editor.set_selection(0..0).unwrap();
         execute_command(window.hwnd, CommandId::Replace);
         set_find_query(window.hwnd, "a*");
         set_replace_text(window.hwnd, "y");
         super::replace_all_matches(window.hwnd);
-        assert_eq!(editor.text().unwrap(), "yb y");
+        assert_eq!(editor.text().unwrap(), "abc 123");
+        assert!(bar().no_match());
+    }
+
+    #[test]
+    fn a_case_insensitive_regex_folds_accented_capitals_and_f3_wraps() {
+        // Break caught: case folding limited to ASCII (MSVC std::wregex), so "îndemn" never
+        // finds "Îndemn" though Search does, or F3 and Shift+F3 not wrapping at the ends.
+        use crate::search::SearchOption;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor
+            .populate_clean("Îndemn la drum, cu Élan\nîndemn")
+            .unwrap();
+        execute_command(window.hwnd, CommandId::Find);
+        super::toggle_find_option(window.hwnd, SearchOption::Regex);
+        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+
+        set_find_query(window.hwnd, "élan");
+        editor.set_selection(0..0).unwrap();
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 20..25);
+        assert!(!bar().no_match());
+
+        set_find_query(window.hwnd, "îndemn");
+        editor.set_selection(0..0).unwrap();
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 0..7);
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 26..33, "the next line");
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 0..7, "F3 wraps");
+        super::find_previous(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 26..33, "Shift+F3 wraps");
+        super::find_previous(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 0..7);
         assert!(!bar().no_match());
     }
 
@@ -13554,10 +13584,9 @@ mod tests {
 
     #[test]
     fn a_whole_word_regex_matches_a_non_ascii_word_only_as_a_whole_word() {
-        // Break caught: a whole-word regex judged by MSVC std::wregex's `\b`, which counts ă as
-        // a non-word character, so "mașină" is missed as a whole word and found inside
-        // "mașinării". Scintilla's own word test (Unicode classes) decides instead, as it does
-        // for plain whole word.
+        // Break caught: a whole-word regex whose `\b` counts ă as a non-word character (as MSVC
+        // std::wregex's does), so "mașină" is missed as a whole word and found inside
+        // "mașinării". The `regex` crate's Unicode `\b` agrees with plain whole word here.
         use crate::search::SearchOption;
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
@@ -13630,6 +13659,13 @@ mod tests {
         set_replace_text(window.hwnd, "X");
         super::replace_all_matches(window.hwnd);
         assert_eq!(editor.text().unwrap(), "foobar foo_bar X x");
+
+        // Several whole words go in one undo step.
+        editor.populate_clean("fooo foobar fo").unwrap();
+        super::replace_all_matches(window.hwnd);
+        assert_eq!(editor.text().unwrap(), "X foobar X");
+        editor.undo().unwrap();
+        assert_eq!(editor.text().unwrap(), "fooo foobar fo");
 
         // Enter in Replace replaces a selected whole word, and not a selection inside one.
         editor.populate_clean("foo foobar").unwrap();
