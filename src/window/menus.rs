@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 53] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 54] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -78,6 +78,7 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 53] {
         virtual_key(FCONTROL, VK_NUMPAD0, CommandId::ZoomReset),
         accelerator(FCONTROL, b'L', CommandId::TextLeftToRight),
         accelerator(FCONTROL, b'R', CommandId::TextRightToLeft),
+        accelerator(FCONTROL, b'P', CommandId::QuickOpen),
         accelerator(FCONTROL | FSHIFT, b'P', CommandId::CommandPalette),
         accelerator(FCONTROL | FSHIFT, b'V', CommandId::MarkdownPreviewCycle),
         accelerator(FCONTROL, b'B', CommandId::ToggleSidebar),
@@ -151,6 +152,7 @@ impl MenuBar {
                 MenuEntry::command("&New\tCtrl+N", CommandId::New),
                 MenuEntry::command("&Open...\tCtrl+O", CommandId::Open),
                 MenuEntry::command("Open &Notebook...\tCtrl+Shift+O", CommandId::OpenFolder),
+                MenuEntry::command("&Go to note\u{2026}\tCtrl+P", CommandId::QuickOpen),
                 MenuEntry::command("&Save\tCtrl+S", CommandId::Save),
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
                 MenuEntry::command("&Close tab	Ctrl+W", CommandId::CloseTab),
@@ -573,7 +575,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 53);
+        assert_eq!(specs.len(), 54);
     }
 
     #[test]
@@ -582,6 +584,20 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         assert_eq!(std::mem::align_of::<super::AlignedAccelerators<1>>() % 4, 0);
         super::AcceleratorTable::create().expect("accelerator table");
+    }
+
+    #[test]
+    fn ctrl_p_opens_quick_open_and_ctrl_shift_p_stays_the_palette() {
+        // Break caught: Ctrl+P unbound, or taking Ctrl+Shift+P from the command palette.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FCONTROL, FSHIFT};
+        let bound = |modifiers: u8| {
+            accelerator_specs()
+                .into_iter()
+                .find(|spec| spec.modifiers == modifiers && spec.key == u16::from(b'P'))
+                .map(|spec| spec.command)
+        };
+        assert_eq!(bound(FCONTROL), Some(CommandId::QuickOpen));
+        assert_eq!(bound(FCONTROL | FSHIFT), Some(CommandId::CommandPalette));
     }
 
     #[test]

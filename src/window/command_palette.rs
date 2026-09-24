@@ -3,11 +3,13 @@
 //! owner-drawn `ListBox` in the editor's palette colors; the main window owns showing, layout,
 //! and running the chosen command.
 
+use crate::library::quick_open::QuickMatch;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
 use crate::window::menus::{AcceleratorSpec, accelerator_specs};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use std::path::PathBuf;
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -44,11 +46,12 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 69] = [
+pub(crate) const ENTRIES: [PaletteEntry; 70] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
     entry("File: Open recent notebook...", CommandId::OpenRecentFolder),
+    entry("Go to note\u{2026}", CommandId::QuickOpen),
     entry("File: Save", CommandId::Save),
     entry("File: Save as...", CommandId::SaveAs),
     entry("File: Close tab", CommandId::CloseTab),
@@ -230,7 +233,15 @@ pub(crate) fn filter_entries(
 pub(crate) enum PickerKind {
     RecentFolder,
     MoveToNotebook,
+    /// Ctrl+P (quick-open spec §3): notes by name. Its rows come from `main_window`, not from
+    /// `Picker::items`.
+    QuickOpen,
 }
+
+/// The most rows quick open lists (spec §3.3).
+pub(crate) const QUICK_OPEN_ROWS: usize = 50;
+/// Quick open's one row while no notebook is open; it can't be picked (spec §3.1).
+pub(crate) const NO_NOTEBOOK: &str = "No notebook is open";
 
 /// A list of runtime items shown in the palette instead of commands.
 #[derive(Clone, Debug)]
@@ -245,12 +256,27 @@ pub(crate) struct Picker {
 pub(crate) enum PickerRow {
     Item(usize),
     Create(String),
+    /// A quick-open note, and the line the query's `:<n>` names.
+    Note {
+        found: QuickMatch,
+        line: Option<u32>,
+    },
+    /// A quick-open query that is only `:<n>`: that line of the current tab.
+    GoToLine(u32),
+    /// A row that can't be picked, such as `NO_NOTEBOOK`.
+    Notice(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PickerChoice {
     Item(usize),
     Create(String),
+    /// A quick-open note, relative to the notebook.
+    Note {
+        path: PathBuf,
+        line: Option<u32>,
+    },
+    GoToLine(u32),
 }
 
 pub(crate) fn picker_rows(picker: &Picker, query: &str) -> Vec<PickerRow> {
@@ -291,6 +317,10 @@ pub(crate) fn picker_row_label(picker: &Picker, row: &PickerRow) -> String {
                 picker.create.unwrap_or("Create")
             )
         }
+        PickerRow::Note { found, .. } if found.folder.is_empty() => found.name.clone(),
+        PickerRow::Note { found, .. } => format!("{}, in {}", found.name, found.folder),
+        PickerRow::GoToLine(line) => format!("Go to line {line}"),
+        PickerRow::Notice(text) => (*text).to_owned(),
     }
 }
 
@@ -399,6 +429,8 @@ pub(crate) struct CommandPalette {
     picker: Option<Picker>,
     /// The rows `picker` currently shows, filtered by the query.
     picker_rows: Vec<PickerRow>,
+    /// The row `fill_list` selects in picker mode; `None` selects nothing.
+    picker_selected: Option<usize>,
     /// `Some` while command mode lists only these commands (the Settings button).
     subset: Option<&'static [CommandId]>,
     visible: bool,
@@ -445,6 +477,7 @@ impl CommandPalette {
             shown: Vec::new(),
             picker: None,
             picker_rows: Vec::new(),
+            picker_selected: None,
             subset: None,
             visible: false,
             colors,
@@ -510,6 +543,7 @@ impl CommandPalette {
     pub(crate) fn mark_hidden(&mut self) -> bool {
         self.picker = None;
         self.picker_rows = Vec::new();
+        self.picker_selected = None;
         self.subset = None;
         std::mem::take(&mut self.visible)
     }
@@ -538,6 +572,7 @@ impl CommandPalette {
     pub(crate) fn set_picker(&mut self, picker: Option<Picker>) {
         self.picker = picker;
         self.picker_rows = Vec::new();
+        self.picker_selected = None;
     }
 
     pub(crate) fn picker(&self) -> Option<&Picker> {
@@ -553,9 +588,11 @@ impl CommandPalette {
         self.subset
     }
 
-    /// Records the picker rows to list; `fill_list` then puts them in the list box.
-    pub(crate) fn set_picker_rows(&mut self, rows: Vec<PickerRow>) {
+    /// Records the picker rows to list and the one to select; `fill_list` then puts them in the
+    /// list box.
+    pub(crate) fn set_picker_rows(&mut self, rows: Vec<PickerRow>, selected: Option<usize>) {
         self.picker_rows = rows;
+        self.picker_selected = selected;
     }
 
     /// Refills the list box from the recorded rows and selects the best match.
@@ -563,14 +600,14 @@ impl CommandPalette {
         unsafe {
             SendMessageW(self.list, LB_RESETCONTENT, 0, 0);
         }
-        let count = if self.picker.is_some() {
+        let (count, selected) = if self.picker.is_some() {
             let empty = wide_null("");
             for _ in 0..self.picker_rows.len() {
                 unsafe {
                     SendMessageW(self.list, LB_ADDSTRING, 0, empty.as_ptr() as LPARAM);
                 }
             }
-            self.picker_rows.len()
+            (self.picker_rows.len(), self.picker_selected)
         } else {
             for entry in &self.shown {
                 let label = wide_null(entry.label);
@@ -578,11 +615,11 @@ impl CommandPalette {
                     SendMessageW(self.list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM);
                 }
             }
-            self.shown.len()
+            (self.shown.len(), Some(0))
         };
-        if count > 0 {
+        if let Some(selected) = selected.filter(|&selected| selected < count) {
             unsafe {
-                SendMessageW(self.list, LB_SETCURSEL, 0, 0);
+                SendMessageW(self.list, LB_SETCURSEL, selected, 0);
             }
         }
     }
@@ -718,6 +755,12 @@ impl CommandPalette {
         Some(match row {
             PickerRow::Item(index) => PickerChoice::Item(*index),
             PickerRow::Create(name) => PickerChoice::Create(name.clone()),
+            PickerRow::Note { found, line } => PickerChoice::Note {
+                path: found.path.clone(),
+                line: *line,
+            },
+            PickerRow::GoToLine(line) => PickerChoice::GoToLine(*line),
+            PickerRow::Notice(_) => return None,
         })
     }
 
@@ -865,6 +908,16 @@ impl CommandPalette {
     #[cfg(test)]
     pub(crate) fn shown(&self) -> &[PaletteEntry] {
         &self.shown
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shown_picker_rows(&self) -> &[PickerRow] {
+        &self.picker_rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_row(&self) -> Option<usize> {
+        usize::try_from(unsafe { SendMessageW(self.list, LB_GETCURSEL, 0, 0) }).ok()
     }
 
     #[cfg(test)]
@@ -1021,6 +1074,18 @@ mod tests {
             .into_iter()
             .map(|entry| entry.label)
             .collect()
+    }
+
+    #[test]
+    fn go_to_note_is_listed_once_with_ctrl_p() {
+        // Break caught: Ctrl+P working but the palette never offering it, or its row showing no
+        // shortcut (quick-open spec §3.1).
+        assert_eq!(labels("go to note")[0], "Go to note\u{2026}");
+        assert_eq!(
+            shortcut_text(CommandId::QuickOpen).as_deref(),
+            Some("Ctrl+P")
+        );
+        assert_eq!(ENTRIES.len(), 70);
     }
 
     #[test]

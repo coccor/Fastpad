@@ -84,6 +84,7 @@ pub enum CommandId {
     FindNext = 188,
     FindPrevious = 189,
     ReplaceInNotes = 190,
+    QuickOpen = 191,
 }
 
 impl CommandId {
@@ -129,6 +130,7 @@ impl CommandId {
                 | Self::SearchToggleWholeWord
                 | Self::SearchToggleRegex
                 | Self::ReplaceInNotes
+                | Self::QuickOpen
         )
     }
 
@@ -183,7 +185,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 82] = [
+        const COMMANDS: [CommandId; 83] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -266,6 +268,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::FindNext,
             CommandId::FindPrevious,
             CommandId::ReplaceInNotes,
+            CommandId::QuickOpen,
         ];
         COMMANDS
             .into_iter()
@@ -444,7 +447,17 @@ mod tests {
         assert!(CommandId::ReplaceInNotes.is_sidebar());
         assert!(!CommandId::ReplaceInNotes.needs_document());
         assert_eq!(CommandId::ReplaceInNotes.search_option(), None);
-        assert_eq!(CommandId::try_from(191), Err(()));
+    }
+
+    #[test]
+    fn quick_open_is_191_and_needs_no_document() {
+        // Break caught: Ctrl+P renumbered onto another command, greyed out while no tab is open
+        // (when opening a note matters most), or hidden with notes mode off.
+        assert_eq!(CommandId::QuickOpen as u16, 191);
+        assert_eq!(CommandId::try_from(191), Ok(CommandId::QuickOpen));
+        assert!(!CommandId::QuickOpen.needs_document());
+        assert!(!CommandId::QuickOpen.is_sidebar());
+        assert_eq!(CommandId::try_from(192), Err(()));
     }
 
     #[test]

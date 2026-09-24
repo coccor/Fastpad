@@ -297,13 +297,6 @@ impl Tabs {
     }
 
     /// The tabs, the most recently activated first; the active tab leads (spec §3.2).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the quick-open picker reads it (quick-open plan, Task 4)"
-        )
-    )]
     pub(crate) fn activation_order(&self) -> &[DocumentId] {
         &self.recent
     }

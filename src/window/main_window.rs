@@ -1519,6 +1519,212 @@ pub(crate) fn open_picker(hwnd: HWND, picker: command_palette::Picker) {
     with_command_palette(hwnd, CommandPalette::focus_query);
 }
 
+/// Ctrl+P, the palette row and File → Go to note… (quick-open spec §3.1): the palette in the
+/// `QuickOpen` picker with an empty query. While that picker already shows, nothing changes.
+pub(crate) fn open_quick_open(hwnd: HWND) {
+    let (visible, showing) = with_command_palette(hwnd, |palette| {
+        let quick_open = palette
+            .picker()
+            .is_some_and(|picker| picker.kind == command_palette::PickerKind::QuickOpen);
+        (palette.is_visible(), palette.is_visible() && quick_open)
+    })
+    .unwrap_or((false, false));
+    if showing {
+        return;
+    }
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    // Still made on first use (spec §3.6), and with nothing borrowed: it creates windows.
+    let missing = unsafe { app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.command_palette.is_none());
+    if missing {
+        let Ok(created) = CommandPalette::create(hwnd) else {
+            return;
+        };
+        if !identity.is_live_for(hwnd) {
+            return;
+        }
+        if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+            let app = unsafe { app.as_mut() };
+            if app.command_palette.is_none() {
+                app.command_palette = Some(created);
+            }
+        }
+    }
+    // Switching from the open command list keeps the focus the palette first took from.
+    if !visible {
+        capture_palette_focus(hwnd);
+    }
+    let colors = title_chrome(hwnd).0;
+    let shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let palette = unsafe { app.as_mut() }.command_palette.as_mut()?;
+        palette.mark_shown(colors);
+        palette.set_subset(None);
+        palette.set_picker(Some(command_palette::Picker {
+            kind: command_palette::PickerKind::QuickOpen,
+            items: Vec::new(),
+            create: None,
+        }));
+        Some(())
+    });
+    if shown.is_none() {
+        return;
+    }
+    // Always from an empty query. Clearing sends EN_CHANGE, which lists the rows.
+    with_command_palette(hwnd, CommandPalette::clear_query);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    refilter_command_palette(hwnd);
+    with_command_palette(hwnd, CommandPalette::focus_query);
+}
+
+/// The quick-open rows for `query` and the row to select (spec §3.1–3.4). Only reads what is
+/// in memory: the tabs and `LibraryState.notes`.
+fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>, Option<usize>) {
+    use crate::library::quick_open::{self, QuickMatch};
+    use command_palette::PickerRow;
+    let (text, line) = quick_open::split_line(query);
+    let typed = !text.trim().is_empty();
+    // `:<n>` alone needs no notebook: it moves the current tab's caret.
+    if let Some(line) = line.filter(|_| !typed) {
+        return (vec![PickerRow::GoToLine(line)], Some(0));
+    }
+    let Some(folder) = crate::window::library_host::folder(hwnd) else {
+        return (vec![PickerRow::Notice(command_palette::NO_NOTEBOOK)], None);
+    };
+    if typed {
+        let rows = crate::window::library_host::with_state(hwnd, |state| {
+            quick_open::search(
+                state.notes.iter().map(|note| &note.path),
+                text,
+                command_palette::QUICK_OPEN_ROWS,
+            )
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|found| PickerRow::Note { found, line })
+        .collect::<Vec<_>>();
+        let selected = (!rows.is_empty()).then_some(0);
+        return (rows, selected);
+    }
+    // Nothing typed: the notes open in tabs, the most recently used first (spec §3.2). Tabs
+    // outside the notebook are left out here, untitled ones by having no path.
+    let open = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let tabs = &unsafe { app.as_ref() }.tabs;
+            let active = tabs.active().map(|document| document.id);
+            tabs.activation_order()
+                .iter()
+                .filter_map(|&id| {
+                    let path = tabs.document(id)?.path.as_deref()?;
+                    let relative = crate::library::record_path(&folder, path);
+                    (!relative.is_absolute())
+                        .then(|| (crate::library::path_key(&relative), Some(id) == active))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if open.is_empty() {
+        return (Vec::new(), None);
+    }
+    // Then only the notes the library lists, spelled as it spells them.
+    let (rows, first_active) = crate::window::library_host::with_state(hwnd, |state| {
+        let wanted = open
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut listed = std::collections::HashMap::new();
+        for note in &state.notes {
+            let key = crate::library::path_key(&note.path);
+            if wanted.contains(key.as_str()) {
+                listed.insert(key, note.path.clone());
+            }
+        }
+        let mut rows = Vec::new();
+        let mut first_active = false;
+        for (key, active) in &open {
+            let Some(path) = listed.get(key) else {
+                continue;
+            };
+            let Some(found) = QuickMatch::plain(path) else {
+                continue;
+            };
+            if rows.is_empty() {
+                first_active = *active;
+            }
+            rows.push(PickerRow::Note { found, line: None });
+        }
+        (rows, first_active)
+    })
+    .unwrap_or_default();
+    // The current note leads, so the selection starts on the one before it: Ctrl+P then Enter
+    // goes back to the previous note.
+    let selected = match rows.len() {
+        0 => None,
+        1 => Some(0),
+        _ if first_active => Some(1),
+        _ => Some(0),
+    };
+    (rows, selected)
+}
+
+/// Opens a quick-open pick (spec §3.5). `relative` is resolved again against the notebook's
+/// notes, since it may have left the library since the list was shown; then it opens as a
+/// normal tab (an open one is switched to) with the focus in the editor, and `line` applies.
+pub(crate) fn open_quick_open_choice(hwnd: HWND, relative: &std::path::Path, line: Option<u32>) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let Some(folder) = crate::window::library_host::folder(hwnd) else {
+        return;
+    };
+    let path = folder.join(relative);
+    let key = crate::library::path_key(relative);
+    let listed = crate::window::library_host::with_state(hwnd, |state| {
+        state
+            .notes
+            .iter()
+            .any(|note| crate::library::path_key(&note.path) == key)
+    })
+    .unwrap_or(false);
+    if !listed {
+        report_open_failure(
+            hwnd,
+            &path,
+            &crate::FastPadError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the note is no longer in the notebook",
+            )),
+        );
+        return;
+    }
+    if let Err(error) = open_note(hwnd, &path, OpenMode::Permanent, true) {
+        report_open_failure(hwnd, &path, &error);
+        return;
+    }
+    if let Some(line) = line
+        && identity.is_live_for(hwnd)
+    {
+        go_to_line(hwnd, line);
+    }
+}
+
+/// Moves the active tab's caret to the start of 1-based `line`, the last line when past the end,
+/// and scrolls it into view (spec §3.4). Does nothing with no tab open.
+pub(crate) fn go_to_line(hwnd: HWND, line: u32) {
+    if tab_count(hwnd) == 0 {
+        return;
+    }
+    let Some(editor) =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+    else {
+        return;
+    };
+    let _ = editor.go_to_line(line.saturating_sub(1) as usize);
+}
+
 /// Hides the palette. `restore_focus` returns the focus to the editor (or the frame with no tab);
 /// it is false when the focus already moved somewhere else.
 pub(crate) fn close_command_palette(hwnd: HWND, restore_focus: bool) {
@@ -1572,12 +1778,27 @@ fn refilter_command_palette(hwnd: HWND) {
     let is_picker =
         with_command_palette(hwnd, |palette| palette.picker().is_some()).unwrap_or(false);
     if is_picker {
+        let quick_open = with_command_palette(hwnd, |palette| {
+            palette
+                .picker()
+                .is_some_and(|picker| picker.kind == command_palette::PickerKind::QuickOpen)
+        })
+        .unwrap_or(false);
+        // Built before the palette is borrowed: the rows read the tabs and the library.
+        let quick_rows = quick_open.then(|| quick_open_rows(hwnd, &query));
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
-            && let Some(picker) = palette.picker()
         {
-            let rows = command_palette::picker_rows(picker, &query);
-            palette.set_picker_rows(rows);
+            match quick_rows {
+                Some((rows, selected)) => palette.set_picker_rows(rows, selected),
+                None => {
+                    if let Some(picker) = palette.picker() {
+                        let rows = command_palette::picker_rows(picker, &query);
+                        let selected = (!rows.is_empty()).then_some(0);
+                        palette.set_picker_rows(rows, selected);
+                    }
+                }
+            }
         }
     } else {
         let has_tabs = tab_count(hwnd) > 0;
@@ -1634,6 +1855,11 @@ pub(crate) fn run_command_palette_selection(hwnd: HWND) {
             .map(|picker| (picker.kind, palette.selected_choice()))
     })
     .flatten();
+    // A quick-open row that can't be picked ("No notebook is open"), or no row at all, leaves
+    // the picker open (spec §3.1).
+    if matches!(pick, Some((command_palette::PickerKind::QuickOpen, None))) {
+        return;
+    }
     let command = if pick.is_none() {
         with_command_palette(hwnd, CommandPalette::selected_command).flatten()
     } else {
@@ -2244,6 +2470,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::FindNext => find_again(hwnd, false),
         CommandId::FindPrevious => find_again(hwnd, true),
         CommandId::CommandPalette => open_command_palette(hwnd),
+        CommandId::QuickOpen => open_quick_open(hwnd),
         CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
         CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
@@ -6286,6 +6513,290 @@ mod tests {
         answer_next_close_prompt(|_| CloseDecision::Discard);
         super::close_tab_at(window.hwnd, 0);
         assert_eq!(super::tab_count(window.hwnd), 1);
+    }
+
+    /// The quick-open rows as their names, or the row itself for a non-note row.
+    fn quick_open_names(hwnd: HWND) -> Vec<String> {
+        with_command_palette(hwnd, |palette| {
+            palette
+                .shown_picker_rows()
+                .iter()
+                .map(|row| match row {
+                    crate::window::command_palette::PickerRow::Note { found, .. } => {
+                        found.name.clone()
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    fn type_query(hwnd: HWND, text: &str) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+        let query = with_command_palette(hwnd, |palette| palette.query_hwnd()).unwrap();
+        let typed = crate::platform::wide_null(text);
+        unsafe { SetWindowTextW(query, typed.as_ptr()) };
+    }
+
+    fn press_enter_in_palette(hwnd: HWND) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        let query = with_command_palette(hwnd, |palette| palette.query_hwnd()).unwrap();
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+    }
+
+    fn palette_visible(hwnd: HWND) -> bool {
+        with_command_palette(hwnd, |palette| palette.is_visible()).unwrap_or(false)
+    }
+
+    fn active_path(hwnd: HWND) -> Option<std::path::PathBuf> {
+        app_mut(hwnd)
+            .tabs
+            .active()
+            .and_then(|document| document.path.clone())
+    }
+
+    #[test]
+    fn ctrl_p_then_enter_switches_to_the_previous_note() {
+        // Break caught: Ctrl+P dead in the running app, the open tabs listed in strip order, a
+        // file outside the notebook or an unopened note listed, or the selection on the current
+        // note, so Enter does nothing.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-open-previous");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        scratch.note("c.md", "c");
+        let outside = scratch.root.join("outside.txt");
+        std::fs::write(&outside, "outside").unwrap();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &outside).unwrap();
+        super::open_note(window.hwnd, &b, super::OpenMode::Permanent, false).unwrap();
+
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let message = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_KEYDOWN,
+            wParam: usize::from(b'P'),
+            ..Default::default()
+        };
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+
+        assert!(translated, "Ctrl+P was not translated");
+        assert!(palette_visible(window.hwnd));
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.picker().map(|p| p.kind)).flatten(),
+            Some(crate::window::command_palette::PickerKind::QuickOpen)
+        );
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.query_text()).unwrap(),
+            ""
+        );
+        assert_eq!(quick_open_names(window.hwnd), ["b", "a"]);
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+            Some(1)
+        );
+        press_enter_in_palette(window.hwnd);
+        assert!(!palette_visible(window.hwnd));
+        assert_eq!(active_path(window.hwnd), Some(a));
+    }
+
+    #[test]
+    fn typing_a_name_then_enter_opens_a_closed_note_as_a_normal_tab() {
+        // Break caught: typed letters never reaching the matcher, a folder-only match dropped,
+        // or the pick opening in the preview tab the next sidebar click replaces.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-open-type");
+        let alpha = scratch.note("alpha.md", "a");
+        scratch.note("beta.md", "b");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let gamma = scratch.note(r"work\gamma notes.md", "g");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &alpha).unwrap();
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, "wk gmn");
+        assert_eq!(quick_open_names(window.hwnd), ["gamma notes"]);
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+            Some(0)
+        );
+        press_enter_in_palette(window.hwnd);
+
+        assert_eq!(active_path(window.hwnd), Some(gamma));
+        assert_eq!(super::tab_count(window.hwnd), 2);
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+    }
+
+    #[test]
+    fn a_line_suffix_puts_the_caret_on_that_line_and_colon_digits_alone_moves_the_current_tab() {
+        // Break caught: "lines:3" matched as text, the line applied 0-based (caret on line 4),
+        // a line past the end ignored, or ":2" offering notes instead of moving the caret.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-open-line");
+        scratch.note("lines.md", "one\r\ntwo\r\nthree\r\nfour");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let caret_line = || {
+            editor
+                .line_from_position(editor.selection().unwrap().start)
+                .unwrap()
+        };
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, "lines:3");
+        assert_eq!(quick_open_names(window.hwnd), ["lines"]);
+        press_enter_in_palette(window.hwnd);
+        assert_eq!(caret_line(), 2);
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, ":2");
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.shown_picker_rows().to_vec()).unwrap(),
+            [crate::window::command_palette::PickerRow::GoToLine(2)]
+        );
+        press_enter_in_palette(window.hwnd);
+        assert_eq!(caret_line(), 1);
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, "lines:99");
+        press_enter_in_palette(window.hwnd);
+        assert_eq!(caret_line(), 3, "past the end goes to the last line");
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, ":0");
+        press_enter_in_palette(window.hwnd);
+        assert_eq!(caret_line(), 0, "line 0 behaves as line 1");
+    }
+
+    #[test]
+    fn with_no_notebook_open_the_picker_shows_one_row_that_cannot_be_picked() {
+        // Break caught: an empty list that looks broken, Enter closing the picker or opening
+        // something, or ":5" refused although it needs no notebook.
+        use crate::window::command_palette::{NO_NOTEBOOK, PickerRow};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        assert!(crate::window::library_host::folder(window.hwnd).is_none());
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        let rows =
+            || with_command_palette(window.hwnd, |p| p.shown_picker_rows().to_vec()).unwrap();
+        assert_eq!(rows(), [PickerRow::Notice(NO_NOTEBOOK)]);
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+            None
+        );
+        press_enter_in_palette(window.hwnd);
+        assert!(palette_visible(window.hwnd), "Enter does nothing");
+        assert_eq!(super::tab_count(window.hwnd), 1);
+
+        type_query(window.hwnd, ":5");
+        assert_eq!(rows(), [PickerRow::GoToLine(5)]);
+    }
+
+    #[test]
+    fn ctrl_p_again_keeps_the_query_and_a_query_of_spaces_lists_the_open_tabs() {
+        // Break caught (review focus 1 and 4): a second Ctrl+P clearing what was typed, or a
+        // query of spaces listing every note, or none.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-open-again");
+        let a = scratch.note("alpha.md", "a");
+        let b = scratch.note("beta.md", "b");
+        scratch.note("gamma.md", "g");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, "gam");
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.query_text()).unwrap(),
+            "gam"
+        );
+        assert_eq!(quick_open_names(window.hwnd), ["gamma"]);
+
+        type_query(window.hwnd, "   ");
+        assert_eq!(quick_open_names(window.hwnd), ["beta", "alpha"]);
+        assert_eq!(
+            with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_tab_closed_while_the_picker_is_open_still_opens_from_its_row() {
+        // Break caught (review focus 5): a row naming a tab that closed under the open picker
+        // switching to a dead document, or doing nothing.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-open-closed-tab");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        assert_eq!(quick_open_names(window.hwnd), ["b", "a"]);
+        super::close_tab_at(window.hwnd, 0);
+        assert_eq!(tab_paths(window.hwnd), [Some(b.clone())]);
+        assert!(palette_visible(window.hwnd));
+        press_enter_in_palette(window.hwnd);
+
+        assert_eq!(tab_paths(window.hwnd), [Some(b), Some(a.clone())]);
+        assert_eq!(active_path(window.hwnd), Some(a));
+    }
+
+    #[test]
+    fn a_note_removed_from_the_library_after_listing_reports_it_and_opens_nothing() {
+        // Break caught (review focus 5): a note deleted after the list was shown opening an
+        // empty tab, failing silently, or crashing the pick.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-open-removed");
+        scratch.note("alpha.md", "a");
+        let gamma = scratch.note("gamma.md", "g");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let tabs_before = super::tab_count(window.hwnd);
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, "gam");
+        assert_eq!(quick_open_names(window.hwnd), ["gamma"]);
+        crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&gamma));
+        std::fs::remove_file(&gamma).unwrap();
+        press_enter_in_palette(window.hwnd);
+
+        assert_eq!(super::tab_count(window.hwnd), tabs_before);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|n| n.contains("could not open") && n.contains("no longer in the notebook")),
+            "{:?}",
+            notices(window.hwnd)
+        );
     }
 
     #[test]

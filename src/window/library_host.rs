@@ -2396,6 +2396,12 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
             };
             move_note_to(hwnd, &note, &destination);
         }
+        (PickerKind::QuickOpen, PickerChoice::Note { path, line }) => {
+            super::main_window::open_quick_open_choice(hwnd, &path, line);
+        }
+        (PickerKind::QuickOpen, PickerChoice::GoToLine(line)) => {
+            super::main_window::go_to_line(hwnd, line);
+        }
         _ => {}
     }
 }

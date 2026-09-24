@@ -13,9 +13,10 @@ use crate::editor::scintilla_constants::{
 use crate::editor::scintilla_constants::{
     SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
     SC_ELEMENT_SELECTION_INACTIVE_TEXT, SC_ELEMENT_SELECTION_TEXT, SC_WRAP_NONE, SC_WRAP_WORD,
-    SCI_RESETELEMENTCOLOUR, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR, SCI_SETMARGINLEFT,
-    SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING,
-    SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
+    SCI_GOTOLINE, SCI_RESETELEMENTCOLOUR, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR,
+    SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
+    SCI_SETSCROLLWIDTHTRACKING, SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL,
+    STYLE_DEFAULT,
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
@@ -496,6 +497,22 @@ impl Editor {
     /// Scrolls so the caret (the end of the current selection) is visible, without changing it.
     pub fn scroll_caret_into_view(&self) {
         let _ = self.endpoint.send_direct_if_alive(SCI_SCROLLCARET, 0, 0);
+    }
+
+    /// Moves the caret to the start of 0-based `line`, removing any selection, and scrolls it
+    /// into view. A line past the end goes to the last line (Scintilla clamps it).
+    #[cfg(windows)]
+    pub fn go_to_line(&self, line: usize) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_GOTOLINE, line, 0)?;
+        self.scroll_caret_into_view();
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn go_to_line(&self, _line: usize) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
     }
 
     /// Searches `range` for `needle` with `search_flags`. A backward search passes a range whose
