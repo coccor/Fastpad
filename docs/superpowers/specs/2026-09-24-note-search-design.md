@@ -343,6 +343,10 @@ For each note, in the library's note-list order:
 - **Plain search compiles a literal `Regex`** of the escaped query rather than using a substring
   search. Without match case it is a case-insensitive literal for an ASCII query, and otherwise
   a literal of the case-folded query matched against case-folded text.
+- **Whole-text regex mode keeps `^` and `$` per line.** A regex that names a newline (a line
+  break or `\n` in the pattern) is matched over the whole text in one pass, not line by line,
+  and is compiled with `multi_line(true)`, so `^` and `$` still anchor at each line's start and
+  end inside it rather than only at the start and end of the note.
 - **`text_search::run` has no `narrow` parameter.** Narrowing passes the narrowed slice of notes
   (the previous hits plus the notes the previous search skipped, which are carried over through
   `run_noting_skipped`), and a batch carries `SearchBatch.end: Option<RunEnd>`, set on the last.
@@ -361,6 +365,9 @@ For each note, in the library's note-list order:
   it; very large dirty tabs make it noticeable.
 - **Cancelling bumps the generation too,** so batches a cancelled search already posted are
   dropped, not only those of an older search.
+- **A re-run keeps the old results until the first batch that carries hits or the end.** An
+  interval batch with only progress in it updates the status line but never blanks the list,
+  so a re-run (after a library change, say) doesn't flash an empty view.
 - **A dirty tab's text is searched even when its note is online only or over 4 MB,** since it is
   already in memory. It is never counted as skipped.
 - **The cap ends a search as "500+ notes" only when notes remain** after the 500th hit. When the
@@ -415,6 +422,10 @@ For each note, in the library's note-list order:
   spec §6.4; `open_search_result`'s `focus_editor` is true for a click, false for Enter). §8's
   "focus goes to the editor" holds for the click. Either way the first match is selected and F3
   continues from it.
+- **Opening a result seeds the find bar from what the results ran with**: the view's `query`
+  and `run_options` (the options when that search began), not the box's current text or
+  toggles. A query or option edited after the search, still inside its debounce, never leaks
+  into the find bar, so F3 steps through the same matches the result showed.
 - **A selection prefilled into the find bar while regex is on** is escaped for ECMAScript
   (`find_bar::escape_pattern`), not with `regex::escape`, whose `\#` and `\-` ECMAScript rejects.
 - **The find bar's tooltip is updated under a shared App borrow** (`TTM_*` sends in

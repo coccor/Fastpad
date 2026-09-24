@@ -689,12 +689,16 @@ fn text_search_timings() -> Result<(f64, f64, f64), String> {
     Ok((first_batch_ms, full_ms, times[times.len() / 2]))
 }
 
-/// A scratch folder removed on drop, including on an early `?` return.
+/// A scratch folder removed on drop, including on an early `?` return. Its parent goes too
+/// when nothing else is left in it (`remove_dir` refuses a folder that isn't empty).
 struct ScratchDir(PathBuf);
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(parent) = self.0.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }
 
