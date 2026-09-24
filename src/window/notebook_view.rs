@@ -2188,7 +2188,7 @@ mod tests {
                 (0..10).map(move |note| PathBuf::from(format!(r"Folder {folder}\Note {note}.md")))
             })
             .collect();
-        let tree = NoteTree::build(&notes, &[]);
+        let tree = NoteTree::build(&notes, &[], &[]);
         // Stored as the per-PC file may spell them: case differences still match.
         let expanded: Vec<PathBuf> = (0..1_000)
             .map(|folder| PathBuf::from(format!("folder {folder}")))

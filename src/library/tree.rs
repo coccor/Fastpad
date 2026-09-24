@@ -4,7 +4,9 @@
 //!
 //! In each folder: pinned notes, then subfolders, then other notes, each group in natural,
 //! case-insensitive name order ("Note 2" before "Note 10"), ties broken by extension, then by the
-//! exact name. A folder exists only while it holds a note at some depth. Paths are relative to
+//! exact name. Every folder the scan listed has a row, empty or not, and so does every folder a
+//! note is in; a folder leaves only through `remove_folder`, `rename_folder` or a rebuild
+//! without it (notebook folders spec §3.2). Paths are relative to
 //! the notebook and matched ignoring case, like NTFS. Nothing here recurses, so a very deep
 //! folder chain cannot overflow a stack.
 
@@ -181,6 +183,59 @@ fn split_path(path: &Path) -> Option<(Vec<&OsStr>, &OsStr)> {
     Some((parts, file_name))
 }
 
+/// The names of a plain relative folder path; `None` for anything else (absolute, rooted, `.`,
+/// `..` or empty).
+fn folder_parts(path: &Path) -> Option<Vec<&OsStr>> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// The arena index of the folder at `parts`, adding it and any missing ancestor. `key` is
+/// scratch space, reused so a whole build allocates one key buffer.
+fn arena_folder(
+    arena: &mut Vec<Folder>,
+    parents: &mut Vec<usize>,
+    by_key: &mut HashMap<String, usize>,
+    key: &mut String,
+    parts: &[&OsStr],
+) -> usize {
+    let mut current = 0;
+    key.clear();
+    for part in parts {
+        if !key.is_empty() {
+            key.push('\\');
+        }
+        key.push_str(&part.to_string_lossy().to_lowercase());
+        current = match by_key.get(key.as_str()) {
+            Some(&index) => index,
+            None => {
+                arena.push(Folder {
+                    name: part.to_os_string(),
+                    ..Folder::default()
+                });
+                parents.push(current);
+                by_key.insert(key.clone(), arena.len() - 1);
+                arena.len() - 1
+            }
+        };
+    }
+    current
+}
+
+/// Drops a folder taken out of the tree one level at a time, as `NoteTree`'s own drop does.
+fn drop_flat(folder: Folder) {
+    let mut pending = vec![folder];
+    while let Some(mut folder) = pending.pop() {
+        pending.append(&mut folder.folders);
+    }
+}
+
 /// One key per note or folder, whatever the letter case or separator.
 fn path_key(path: &Path) -> String {
     let mut key = String::new();
@@ -194,12 +249,36 @@ fn path_key(path: &Path) -> String {
 }
 
 impl Folder {
-    fn is_empty(&self) -> bool {
-        self.folders.is_empty() && self.notes.is_empty()
-    }
-
     fn pinned_count(&self) -> usize {
         self.notes.partition_point(|note| note.pinned)
+    }
+
+    /// The notes in this folder and every folder under it.
+    fn note_count(&self) -> usize {
+        let mut count = 0;
+        let mut pending = vec![self];
+        while let Some(folder) = pending.pop() {
+            count += folder.notes.len();
+            pending.extend(folder.folders.iter());
+        }
+        count
+    }
+
+    /// Every note (with its pin) and every folder under this one, as paths relative to it.
+    fn entries(&self) -> Vec<(PathBuf, Option<bool>)> {
+        let mut entries = Vec::new();
+        let mut pending = vec![(PathBuf::new(), self)];
+        while let Some((path, folder)) = pending.pop() {
+            for note in &folder.notes {
+                entries.push((path.join(file_name(&folder.names, note)), Some(note.pinned)));
+            }
+            for child in &folder.folders {
+                let child_path = path.join(&child.name);
+                entries.push((child_path.clone(), None));
+                pending.push((child_path, child));
+            }
+        }
+        entries
     }
 
     fn find_folder(&self, name: &str) -> Option<usize> {
@@ -367,11 +446,16 @@ impl Folder {
 }
 
 impl NoteTree {
-    /// The tree of `notes`, with the ones in `pinned` pinned. Both are relative to the notebook;
-    /// a path that is not a plain relative path is skipped, and a second spelling of one note
-    /// (another letter case) is dropped. `notes` is only read: the library builds its tree
-    /// straight from its own note list.
-    pub fn build<'a, P>(notes: impl IntoIterator<Item = &'a P>, pinned: &[PathBuf]) -> NoteTree
+    /// The tree of `notes` and `folders`, with the notes in `pinned` pinned. All are relative to
+    /// the notebook; a path that is not a plain relative path is skipped, and a second spelling
+    /// of one note (another letter case) is dropped. Every listed folder gets a row, even an
+    /// empty one, and so does every folder a note is in. `notes` is only read: the library
+    /// builds its tree straight from its own note list.
+    pub fn build<'a, P>(
+        notes: impl IntoIterator<Item = &'a P>,
+        folders: &[PathBuf],
+        pinned: &[PathBuf],
+    ) -> NoteTree
     where
         P: AsRef<Path> + ?Sized + 'a,
     {
@@ -383,32 +467,31 @@ impl NoteTree {
         let mut by_key: HashMap<String, usize> = HashMap::new();
         let mut count = 0;
         let mut folder_key = String::new();
+        // The listed folders go in first, so each keeps the spelling the scan saw on disk.
+        for path in folders {
+            if let Some(parts) = folder_parts(path) {
+                arena_folder(
+                    &mut arena,
+                    &mut parents,
+                    &mut by_key,
+                    &mut folder_key,
+                    &parts,
+                );
+            }
+        }
         for path in notes {
             let path = path.as_ref();
-            let Some((folders, file_name)) = split_path(path) else {
+            let Some((parts, file_name)) = split_path(path) else {
                 continue;
             };
             let is_pinned = !pinned.is_empty() && pinned.contains(&path_key(path));
-            let mut current = 0;
-            folder_key.clear();
-            for part in folders {
-                if !folder_key.is_empty() {
-                    folder_key.push('\\');
-                }
-                folder_key.push_str(&part.to_string_lossy().to_lowercase());
-                current = match by_key.get(&folder_key) {
-                    Some(&index) => index,
-                    None => {
-                        arena.push(Folder {
-                            name: part.to_os_string(),
-                            ..Folder::default()
-                        });
-                        parents.push(current);
-                        by_key.insert(folder_key.clone(), arena.len() - 1);
-                        arena.len() - 1
-                    }
-                };
-            }
+            let current = arena_folder(
+                &mut arena,
+                &mut parents,
+                &mut by_key,
+                &mut folder_key,
+                &parts,
+            );
             let folder = &mut arena[current];
             if let Some(note) = folder.push_name(file_name, is_pinned) {
                 folder.notes.push(note);
@@ -449,12 +532,14 @@ impl NoteTree {
         }
     }
 
-    /// Removes a note, and every folder that holds nothing after it. Unknown paths do nothing.
+    /// Removes a note. Its folder keeps its row even when it now holds nothing: folders leave
+    /// only through `remove_folder`, `rename_folder` or a rebuild without them. Unknown paths
+    /// do nothing.
     pub fn remove_note(&mut self, path: &Path) {
         let Some((folders, file_name)) = split_path(path) else {
             return;
         };
-        let Some(mut trail) = self.trail(&folders) else {
+        let Some(trail) = self.trail(&folders) else {
             return;
         };
         let folder = self.folder_at_mut(&trail);
@@ -463,14 +548,81 @@ impl NoteTree {
         };
         folder.remove_note_at(index);
         self.count -= 1;
-        // Deepest first: each folder left holding nothing goes, up to the first that keeps
-        // something.
-        while let Some(index) = trail.pop() {
-            let parent = self.folder_at_mut(&trail);
-            if !parent.folders[index].is_empty() {
-                break;
+    }
+
+    /// Whether the tree has a folder at `path`, ignoring case.
+    pub fn contains_folder(&self, path: &Path) -> bool {
+        folder_parts(path).is_some_and(|parts| self.trail(&parts).is_some())
+    }
+
+    /// Adds a folder row at `path`, with any missing ancestor, holding nothing. A folder already
+    /// there in any letter case keeps its spelling; a path that is not a plain relative name
+    /// does nothing.
+    pub fn insert_folder(&mut self, path: &Path) {
+        let Some(parts) = folder_parts(path) else {
+            return;
+        };
+        parts
+            .into_iter()
+            .fold(&mut self.root, |folder, part| folder.child_or_insert(part));
+    }
+
+    /// Removes the folder at `path` and everything under it. Unknown paths do nothing.
+    pub fn remove_folder(&mut self, path: &Path) {
+        let Some(parts) = folder_parts(path) else {
+            return;
+        };
+        let Some(mut trail) = self.trail(&parts) else {
+            return;
+        };
+        let Some(index) = trail.pop() else {
+            return;
+        };
+        let removed = self.folder_at_mut(&trail).folders.remove(index);
+        self.count -= removed.note_count();
+        drop_flat(removed);
+    }
+
+    /// Moves the folder at `old`, with everything under it, to `new`, keeping its notes and
+    /// their pins; a change of letter case renames it in place. When `old` is not in the tree,
+    /// `new` is added: a rescan's result that already saw the rename gets it replayed. When a
+    /// folder is already at `new`, what `old` held merges into it.
+    pub fn rename_folder(&mut self, old: &Path, new: &Path) {
+        let (Some(old_parts), Some(new_parts)) = (folder_parts(old), folder_parts(new)) else {
+            return;
+        };
+        let Some((&name, parents)) = new_parts.split_last() else {
+            return;
+        };
+        let Some(mut trail) = self.trail(&old_parts) else {
+            self.insert_folder(new);
+            return;
+        };
+        let Some(index) = trail.pop() else {
+            return;
+        };
+        let mut moved = self.folder_at_mut(&trail).folders.remove(index);
+        let mut parent = &mut self.root;
+        for part in parents {
+            parent = parent.child_or_insert(part);
+        }
+        if parent.find_folder(&name.to_string_lossy()).is_none() {
+            moved.name = name.to_os_string();
+            let index = parent
+                .folders
+                .partition_point(|existing| folder_order(existing, &moved) == Ordering::Less);
+            parent.folders.insert(index, moved);
+            return;
+        }
+        self.count -= moved.note_count();
+        let entries = moved.entries();
+        drop_flat(moved);
+        for (path, pinned) in entries {
+            let path = new.join(path);
+            match pinned {
+                Some(pinned) => self.insert_note(&path, pinned),
+                None => self.insert_folder(&path),
             }
-            parent.folders.remove(index);
         }
     }
 
@@ -678,10 +830,15 @@ mod tests {
         true
     }
 
-    fn build(notes: &[&str], pinned: &[&str]) -> NoteTree {
+    fn build_with(notes: &[&str], folders: &[&str], pinned: &[&str]) -> NoteTree {
         let notes: Vec<PathBuf> = notes.iter().map(PathBuf::from).collect();
+        let folders: Vec<PathBuf> = folders.iter().map(PathBuf::from).collect();
         let pinned: Vec<PathBuf> = pinned.iter().map(PathBuf::from).collect();
-        NoteTree::build(&notes, &pinned)
+        NoteTree::build(&notes, &folders, &pinned)
+    }
+
+    fn build(notes: &[&str], pinned: &[&str]) -> NoteTree {
+        build_with(notes, &[], pinned)
     }
 
     /// Each row as `<indent><name><marker>`: `/` a folder, `*` a pinned note, `?` unsaved.
@@ -837,8 +994,9 @@ mod tests {
 
     #[test]
     fn incremental_updates_match_a_full_rebuild() {
-        // Break caught: an insert, removal, rename or pin change leaving the tree in an order
-        // (or with an empty folder) that a fresh build of the same notes would not have.
+        // Break caught: an insert, removal, rename or pin change leaving the tree in an order, or
+        // without a folder a note once made, that a fresh build of the same notes and folders
+        // would not have.
         let names: Vec<PathBuf> = [
             "a.md",
             "b.md",
@@ -852,6 +1010,7 @@ mod tests {
         .map(PathBuf::from)
         .to_vec();
         let mut model: Vec<(PathBuf, bool)> = Vec::new();
+        let mut folders: Vec<PathBuf> = Vec::new();
         let mut tree = NoteTree::default();
         let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
         let mut next = |bound: usize| {
@@ -866,6 +1025,7 @@ mod tests {
                 0 => {
                     let pinned = next(2) == 0;
                     tree.insert_note(&path, pinned);
+                    folders.extend(ancestors(&path));
                     model.retain(|(existing, _)| existing != &path);
                     model.push((path, pinned));
                 }
@@ -888,6 +1048,7 @@ mod tests {
                     }
                     tree.rename_note(&path, &target);
                     if let Some(entry) = model.iter_mut().find(|(existing, _)| existing == &path) {
+                        folders.extend(ancestors(&target));
                         entry.0 = target;
                     }
                 }
@@ -900,7 +1061,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 tree.rows(&all, &[]),
-                NoteTree::build(&notes, &pinned).rows(&all, &[]),
+                NoteTree::build(&notes, &folders, &pinned).rows(&all, &[]),
                 "step {step}"
             );
             assert_eq!(tree.note_count(), model.len(), "step {step}");
@@ -908,15 +1069,134 @@ mod tests {
     }
 
     #[test]
-    fn removing_the_last_note_in_a_folder_chain_removes_the_chain() {
-        // Break caught: an empty folder row left behind after its only note was deleted or moved.
+    fn removing_the_last_note_in_a_folder_chain_keeps_the_chain() {
+        // Break caught: a folder row vanishing when its last note is deleted or moved while the
+        // folder is still on disk (spec §3.2).
         let mut tree = build(&[r"a\b\c\n.md", r"a\keep.md", "top.md"], &[]);
         tree.remove_note(Path::new(r"a\b\c\n.md"));
-        assert_eq!(outline(&tree.rows(&all, &[])), ["a/", "  keep", "top"]);
+        assert_eq!(
+            outline(&tree.rows(&all, &[])),
+            ["a/", "  b/", "    c/", "  keep", "top"]
+        );
         tree.remove_note(Path::new(r"a\keep.md"));
-        assert_eq!(outline(&tree.rows(&all, &[])), ["top"]);
+        assert_eq!(
+            outline(&tree.rows(&all, &[])),
+            ["a/", "  b/", "    c/", "top"]
+        );
         tree.remove_note(Path::new("missing.md"));
         assert_eq!(tree.note_count(), 1);
+    }
+
+    #[test]
+    fn listed_folders_get_rows_even_empty_and_still_sort_first() {
+        // Break caught: an empty folder with no row, a listed folder sorting among the notes, or
+        // a note's own spelling of its folder replacing the one on disk.
+        let tree = build_with(
+            &["b.md", r"notes\a.md", r"SUB\x.md"],
+            &["empty", "Zeta", r"notes\inner", "Sub"],
+            &[],
+        );
+        assert_eq!(
+            outline(&tree.rows(&all, &[])),
+            [
+                "empty/", "notes/", "  inner/", "  a", "Sub/", "  x", "Zeta/", "b"
+            ]
+        );
+        assert_eq!(tree.note_count(), 3);
+        assert!(tree.contains_folder(Path::new(r"NOTES\Inner")));
+        assert!(!tree.contains_folder(Path::new("b.md")));
+        assert!(!tree.contains_folder(Path::new("")));
+    }
+
+    #[test]
+    fn a_folder_the_list_left_out_still_gets_a_row_from_its_notes() {
+        // Break caught: a folder past the scan's folder cap hiding the notes inside it.
+        let tree = build_with(&[r"c\n.md"], &["a", "b"], &[]);
+        assert_eq!(outline(&tree.rows(&all, &[])), ["a/", "b/", "c/", "  n"]);
+    }
+
+    #[test]
+    fn insert_folder_adds_its_missing_ancestors_and_keeps_an_existing_spelling() {
+        // Break caught: a new folder inside a chain with no parent row, a second row for a folder
+        // typed in another case, or an absolute path making a row.
+        let mut tree = build(&["top.md"], &[]);
+        tree.insert_folder(Path::new(r"x\y\z"));
+        assert_eq!(
+            outline(&tree.rows(&all, &[])),
+            ["x/", "  y/", "    z/", "top"]
+        );
+        tree.insert_folder(Path::new(r"X\Y"));
+        for bad in [r"C:\abs", "", r"..\up", r"\rooted"] {
+            tree.insert_folder(Path::new(bad));
+        }
+        assert_eq!(
+            outline(&tree.rows(&all, &[])),
+            ["x/", "  y/", "    z/", "top"]
+        );
+        assert_eq!(tree.note_count(), 1);
+    }
+
+    #[test]
+    fn remove_folder_takes_its_whole_subtree_and_its_notes_count() {
+        // Break caught: a deleted folder leaving its subfolders or notes behind, or a note count
+        // that still includes them.
+        let mut tree = build_with(
+            &[r"a\one.md", r"a\b\two.md", r"a\b\c\three.md", "top.md"],
+            &[r"a\b\empty"],
+            &[r"a\b\two.md"],
+        );
+        tree.remove_folder(Path::new(r"A\B"));
+        assert_eq!(outline(&tree.rows(&all, &[])), ["a/", "  one", "top"]);
+        assert_eq!(tree.note_count(), 2);
+        tree.remove_folder(Path::new("missing"));
+        tree.remove_folder(Path::new("top.md"));
+        assert_eq!(tree.note_count(), 2);
+        tree.remove_folder(Path::new("a"));
+        assert_eq!(outline(&tree.rows(&all, &[])), ["top"]);
+        assert_eq!(tree.note_count(), 1);
+    }
+
+    #[test]
+    fn rename_folder_moves_the_subtree_with_its_notes_and_pins() {
+        // Break caught: a renamed folder losing its notes, their pins or its empty subfolders, a
+        // case-only rename leaving the old spelling, or a replayed rename losing the folder.
+        let mut tree = build_with(
+            &[r"work\plan.md", r"work\sub\deep.md", "top.md"],
+            &[r"work\empty\deeper"],
+            &[r"work\plan.md"],
+        );
+        tree.rename_folder(Path::new("work"), Path::new("Archive"));
+        assert_eq!(
+            outline(&tree.rows(&all, &[])),
+            [
+                "Archive/",
+                "  plan*",
+                "  empty/",
+                "    deeper/",
+                "  sub/",
+                "    deep",
+                "top"
+            ]
+        );
+        assert_eq!(tree.note_count(), 3);
+        let rows = tree.rows(&all, &[]);
+        assert!(row_index(&rows, &RowKind::Note(PathBuf::from(r"Archive\sub\deep.md"))).is_some());
+        assert!(!tree.contains_folder(Path::new("work")));
+
+        tree.rename_folder(Path::new("archive"), Path::new("ARCHIVE"));
+        assert_eq!(tree.rows(&all, &[])[0].name, "ARCHIVE");
+        assert_eq!(tree.note_count(), 3);
+
+        tree.rename_folder(Path::new("gone"), Path::new("Made"));
+        assert!(
+            tree.contains_folder(Path::new("Made")),
+            "a rescan that already saw the rename"
+        );
+
+        let mut merged = build_with(&[r"a\x.md", r"b\y.md"], &[], &[r"a\x.md"]);
+        merged.rename_folder(Path::new("a"), Path::new("b"));
+        assert_eq!(outline(&merged.rows(&all, &[])), ["b/", "  x*", "  y"]);
+        assert_eq!(merged.note_count(), 2);
     }
 
     #[test]
@@ -977,7 +1257,7 @@ mod tests {
             .collect();
         let pinned = vec![PathBuf::from(r"big\Note 9999.md")];
         let started = std::time::Instant::now();
-        let tree = NoteTree::build(&notes, &pinned);
+        let tree = NoteTree::build(&notes, &[], &pinned);
         let rows = tree.rows(&all, &[]);
         let elapsed = started.elapsed();
         assert_eq!(tree.note_count(), 10_000);
@@ -1003,14 +1283,20 @@ mod tests {
         let depth = 2_000;
         let folder: PathBuf = (0..depth).map(|index| format!("d{index}")).collect();
         let note = folder.join("deep.md");
-        let mut tree = NoteTree::build(std::slice::from_ref(&note), &[]);
+        let mut tree = NoteTree::build(std::slice::from_ref(&note), &[], &[]);
         let rows = tree.rows(&all, &[]);
         assert_eq!(rows.len(), depth + 1);
         assert_eq!(usize::from(rows[depth].depth), depth);
         assert_eq!(rows[depth].kind, RowKind::Note(note.clone()));
         tree.remove_note(&note);
+        assert_eq!(
+            tree.rows(&all, &[]).len(),
+            depth,
+            "the emptied folders stay"
+        );
+        tree.remove_folder(Path::new("d0"));
         assert!(tree.rows(&all, &[]).is_empty());
-        let deep = NoteTree::build(std::slice::from_ref(&note), &[]);
+        let deep = NoteTree::build(std::slice::from_ref(&note), &[], &[]);
         drop(deep);
     }
 
@@ -1044,7 +1330,7 @@ mod tests {
         let all_notes: Vec<PathBuf> = (0..100)
             .map(|index| PathBuf::from(format!(r"f\Note {index}.md")))
             .collect();
-        let mut tree = NoteTree::build(&all_notes, &[]);
+        let mut tree = NoteTree::build(&all_notes, &[], &[]);
         for path in all_notes.iter().filter(|path| {
             let name = path.to_string_lossy();
             !name.ends_with("7.md")
@@ -1061,6 +1347,7 @@ mod tests {
         kept.push(PathBuf::from(r"f\Later.md"));
         let fresh = NoteTree::build(
             &kept,
+            &[],
             &[PathBuf::from(r"f\Later.md"), PathBuf::from(r"f\Note 17.md")],
         );
         assert_eq!(tree.rows(&all, &[]), fresh.rows(&all, &[]));
@@ -1070,7 +1357,7 @@ mod tests {
     #[test]
     fn a_name_no_file_can_have_is_refused_without_leaving_its_folder() {
         let long = PathBuf::from("f").join("n".repeat(70_000));
-        let mut tree = NoteTree::build(std::slice::from_ref(&long), &[]);
+        let mut tree = NoteTree::build(std::slice::from_ref(&long), &[], &[]);
         tree.insert_note(&long, false);
         assert!(tree.rows(&all, &[]).is_empty());
         assert_eq!(tree.note_count(), 0);

@@ -245,6 +245,7 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
     // heap in the idle working set.
     let tree = tree::NoteTree::build(
         notes.iter().map(|note| note.path.as_path()),
+        &scan.folders,
         &pinned_paths(&library),
     );
     Ok(LibraryState {
@@ -1085,7 +1086,7 @@ mod tests {
             metadata: Metadata::Ready,
             stamp: None,
             local: LocalState::new(scratch.folder()),
-            tree: tree::NoteTree::build(&paths, &[]),
+            tree: tree::NoteTree::build(&paths, &[], &[]),
             notes,
             folders: Vec::new(),
             truncated,
@@ -1394,11 +1395,12 @@ mod tests {
         tree.rows(&|_| true, &[])
     }
 
-    /// What a fresh build of the state's notes and pins shows.
+    /// What a fresh build of the state's notes, folders and pins shows.
     fn rebuilt_rows(state: &LibraryState) -> Vec<tree::TreeRow> {
         let paths: Vec<PathBuf> = state.notes.iter().map(|note| note.path.clone()).collect();
         tree_rows(&tree::NoteTree::build(
             &paths,
+            &state.folders,
             &pinned_paths(&state.library),
         ))
     }
@@ -1451,10 +1453,10 @@ mod tests {
         state.remove_note(&scratch.folder().join(r"sub\b.md"));
         assert_eq!(tree_rows(&state.tree), rebuilt_rows(&state));
         assert!(
-            !tree_rows(&state.tree)
+            tree_rows(&state.tree)
                 .iter()
-                .any(|row| matches!(row.kind, tree::RowKind::Folder(_))),
-            "an emptied folder goes"
+                .any(|row| row.kind == tree::RowKind::Folder(PathBuf::from("sub"))),
+            "an emptied folder stays while it is on disk"
         );
     }
 
