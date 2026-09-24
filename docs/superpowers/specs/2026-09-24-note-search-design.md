@@ -428,8 +428,12 @@ For each note, in the library's note-list order:
 - **Plain mode keeps Scintilla's own case folding and word test.** Both are Unicode-aware in a
   UTF-8 document, so they agree with Search's plain matching on ordinary text; Search's
   one-character folding (§6) may still differ from Scintilla's at rare characters.
-- **Replace in the find bar inserts its text literally,** in both modes (no `$1` or `\1`). A
+- **Replace in the find bar** inserts its text literally in plain mode. Since 3b, regex mode
+  expands `$1`, `${name}` and `$$` through `Matcher::replacements`, in Replace and in Replace
+  all, and Enter replaces the selection only when it is one of `find_iter`'s matches over the
+  document, not any `find_at` match (in "aaa" with `aa`, a selection of 1..3 isn't replaced). A
   plain match's length is Scintilla's `SCI_GETTARGETEND`; a regex match's is the `Matcher`'s.
+  `\1` is never expanded.
 - **A click on a result moves the focus to the editor; Enter keeps it in the list** (sidebar
   spec §6.4; `open_search_result`'s `focus_editor` is true for a click, false for Enter). §8's
   "focus goes to the editor" holds for the click. Either way the first match is selected and F3
@@ -476,3 +480,112 @@ For each note, in the library's note-list order:
   set with the Search view open on a 10,000-note notebook: +86,016 bytes over
   `feat/note-sidebar` in each of two back-to-back pairs of 30 runs (p50 4,390,912 there,
   4,476,928 here; budget 524,288). `compare` found no regressed milestone in either pair.
+- **3b's layout.** The chevron sits left of the search box, where the box used to begin, so the
+  box starts 16 px further right at 96 DPI. While the field is open, a 34 px replace row comes
+  under the header, and the summary and the results move down by that much. Replace all and the
+  rows' replace buttons share MDL2's Switch glyph (`E8AB`); their tooltips tell them apart
+  ("Replace all (Ctrl+Alt+Enter)", "Replace").
+- **The row button shows on the hovered and the selected row**, and only while the replace field
+  is open (§11 says "hovering over or selecting"). Like Replace all, it runs only when a search
+  has finished with results.
+- **Ctrl+Alt+Enter and both buttons need the replace field open**, so a replace with an empty
+  replacement never starts from the search box while the field is hidden. Enter in the replace
+  field does nothing, Up goes back to the search box, and Esc clears the field (in an empty field
+  it returns to the editor, as in the box). Alt+C, Alt+W and Alt+R work in the replace field too.
+- **Keys:** Tab and Shift+Tab cycle the search box, the replace field (while it is open) and the
+  results (while there are any), wrapping round (`next_stop`); arriving in a field selects its
+  text. Ctrl+Alt+Enter in either field is Replace all (a held key's repeats run nothing again),
+  and **Ctrl+Shift+1** in the results replaces in the selected result, as its row button does. It
+  comes from the panel's `WM_KEYDOWN`, not the accelerator table: Ctrl+1's accelerator doesn't
+  match with Shift held. Every trigger goes through one of two functions,
+  `search_view::replace_all_requested` and `row_replace_requested`.
+- **The replace text is kept at `EN_CHANGE`** (`SearchView.replace_text`), as the box's is, so
+  neither the replace nor a screen reader sends `WM_GETTEXT` under the App borrow. It survives a
+  notebook change; the query doesn't (§15).
+- **A second Replace all while one runs is ignored.** The replace has its own generation and
+  cancel flag, separate from the search's. A notebook change (`forget`) and `WM_DESTROY` cancel
+  it. A write already running finishes its note, and its report is dropped. From the count to the
+  report the summary reads "Replacing…" and the results don't open (click, Enter or Ctrl+Enter).
+- **A new search drops a replace that hasn't passed its question.** The search's `cancel` (every
+  keystroke, option change, `run_now` and notebook switch) cancels a replace that is counting,
+  held or asking; once the answer is Yes and the tabs are changed, the write runs to its end. The
+  plan also carries the query and options it was made for, and `confirm_and_apply` checks them
+  against the shown results and the box before asking and again after Yes; a mismatch ends the
+  replace with nothing changed.
+- **A count that arrives inside a modal loop or a file population waits.** It is held, and
+  `REPLACE_TIMER_ID` retries it every 50 ms, since the question is a modal loop of its own and a
+  background tab is swapped into the editor. That is the guard the search's debounce uses. The
+  write's report and the tab reloads that follow it wait the same way.
+- **The question's warning follows what the count read.** "Notes that aren't open are saved and
+  can't be undone." shows only when `ReplaceCount.closed_notes > 0`, that is when the count read
+  at least one matching note's file rather than a tab's text (§11 says "if any of those notes
+  aren't open"). A row's replace asks only then too. A note whose text the count read from a tab
+  that has closed since is then skipped as changed, not saved, when no warning was shown, so a
+  note is never saved without the question saying so.
+- **The tabs are split again after the question.** A note opened in a tab while the question was
+  up is changed in the editor, never written. A hit found in a tab's text whose tab has since
+  closed has no stamp (`TextHit.stamp` is `None`), so it can't be checked: it is left out of the
+  write and reported as changed since the search, not written. Such a hit whose text the count
+  didn't read either is not counted in the question.
+- **A background tab is changed while swapped in with notifications suppressed**
+  (`with_inactive_document`, which `read_inactive_text` now uses too). It is then marked dirty,
+  given a new recovery generation and taken out of preview by hand (`Tabs::note_background_edit`).
+  Autosave only saves the active tab, so a background tab's replacement waits, like any of its
+  edits, for autosave on leaving or closing. If restoring the active tab fails after the edit, the
+  background tab is still marked edited.
+- **The library takes FastPad's writes without reading the disk on the UI thread.** After each
+  save, `text_replace::apply` reads the saved file's metadata on the worker and returns it with
+  the path in `ReplaceReport.written` (`Stamp::of`, a small addition to `text_search` that the
+  search's `read_note` now uses too). `LibraryState::record_written_all` then makes, in one pass
+  and inside one `with_state`, the update `add_note` makes for a listed note (size, time,
+  `online_only` cleared, `touched`) from each stamp; `record_written` does it for one note. No
+  metadata is read on the UI thread. `ReplaceReport` has no separate `notes` list: the notes
+  replaced into are `written`. A note whose metadata can't be read right after its save (it
+  vanished in that moment) keeps its matches in the count but is left out of `written`, so the
+  library isn't told (the next rescan takes the change as any outside one) and the report's note
+  count misses it.
+- **`text_replace` never trusts a target's path.** `count` and `apply` are `pub`, so a target
+  whose path leaves the notebook (absolute, or with a `..`) is refused before any open: `count`
+  counts it 0 and `apply` reports it failed ("The note's path leaves the notebook.").
+- **An oversized note is skipped from its metadata.** `text_search::read_bytes` opens the note
+  and reads its metadata; over `MAX_NOTE_BYTES` (4 MB) it reads nothing, so `count` counts 0 and
+  `apply`'s stamp check (no hit's stamp is over the limit) reports it changed, never decoding it.
+- **Clean tabs on written notes are reloaded from a worker.** After the write, every clean tab
+  open on a written note is read on a worker and posted back as `WM_FASTPAD_REPLACE_RELOADED`
+  (`WM_APP + 16`, after `_COUNTED` at +14 and `_WRITTEN` at +15). The tab is repopulated like a
+  file open (no undo history, still clean) only if it is still clean, still on that path, and its
+  text generation and disk stamp (`TabMark`) are what they were when the read was queued, so a
+  tab edited or saved in between keeps its text. A dirty tab on a written note is left as it is,
+  and its old disk stamp puts it through the outside-change flow.
+- **The count reads every open target tab's editor text,** clean or dirty, not only the dirty
+  tabs' overlays that search uses, because the replace changes an open tab's text in the editor.
+- **The stamp check and the write are not one step.** `apply` compares the stamp just before
+  `save_atomic`; a change landing between the two isn't seen and is overwritten. A note deleted
+  in exactly that moment is recreated, because `save_atomic` moves its temporary file into place
+  with `MoveFileExW` when there is no file to replace. Both windows are accepted.
+- **`WM_DESTROY` waits for the write worker.** It cancels the replace, then joins the write
+  workers (`join_writers`); a cancelled worker posts nothing. The note in flight is finished
+  first, so on an offline or very slow drive one save's I/O timeout can hold the close.
+- **The report is one line:** "Replaced N matches in M notes.", then how many were skipped
+  because they changed since the search and how many couldn't be written, then at most three of
+  those notes' names in brackets, "(a, b, c, and K more)" (`REPORT_NAMES`). §12's "with the note
+  names in the details" is this bracket. A replace whose count finds 0 matches reports nothing;
+  the query just runs again.
+- **Accessibility:**
+  - The chevron is a push button with the expanded or collapsed state ("Toggle replace").
+  - The replace field is a text child whose full object is the Edit's own ("Replace").
+  - Replace all is a push button that is unavailable while it can't run.
+  - The row button is exposed once, for the selected row ("Replace in <name>"), before the results.
+  - The chevron comes after the toggles, so the box and the toggles keep 3a's child IDs 1 to 4, and the summary line moves from child ID 5 to 6.
+  - The chevron, and Replace all as it becomes available or unavailable, raise `EVENT_OBJECT_STATECHANGE`.
+- **Names in §12 and §13 that differ in the code:**
+  - §13's `plan_replacements` is `text_replace::count(notebook, targets, overlays, matcher,
+    cancel) -> ReplaceCount`, and `apply` takes the replacement template as `template: &str`.
+  - §12's "the library hears about the writes ... through its rescan and reconcile" is
+    `record_written_all` from the stamps the worker read (above); a rescan still reconciles
+    anything it missed.
+  - §12's stamp is `text_search::Stamp` (size and last-write time), taken by `Stamp::of`.
+  - §13's running, applying and reporting in `text_search_host.rs` is `replace_all` /
+    `replace_in`, `start_replace`, `replace_counted`, `confirm_and_apply`, `apply_plan`,
+    `replace_written` and `replace_reloaded`; the editor side is `main_window::replace_in_document`
+    and `reload_clean_document`.

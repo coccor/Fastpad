@@ -50,6 +50,7 @@ pub(crate) const ACTION_ACTIVATE: LPARAM = 0;
 pub(crate) const ACTION_SELECT: LPARAM = 1;
 pub(crate) const ACTION_FOCUS: LPARAM = 2;
 
+pub(crate) const STATE_UNAVAILABLE: u32 = 0x0000_0001;
 pub(crate) const STATE_SELECTED: u32 = 0x0000_0002;
 pub(crate) const STATE_FOCUSED: u32 = 0x0000_0004;
 pub(crate) const STATE_PRESSED: u32 = 0x0000_0008;
@@ -156,6 +157,31 @@ pub(crate) fn button_item(name: &str, pressed: bool, focused: bool, rect: RECT) 
         value: String::new(),
         window: std::ptr::null_mut(),
     }
+}
+
+/// A painted button that opens and closes something, such as the Search view's replace
+/// chevron: a push button whose state says whether it is expanded or collapsed. It takes no
+/// keyboard focus; Ctrl+Shift+H and a click open the field.
+pub(crate) fn expander_item(name: &str, expanded: bool, rect: RECT) -> AccessibleItem {
+    let mut item = button_item(name, false, false, rect);
+    item.state &= !STATE_FOCUSABLE;
+    item.state |= if expanded {
+        STATE_EXPANDED
+    } else {
+        STATE_COLLAPSED
+    };
+    item
+}
+
+/// A painted push button that is unavailable while its action can't run, such as Replace all
+/// before a search has finished. It takes no keyboard focus; Ctrl+Alt+Enter runs Replace all.
+pub(crate) fn action_item(name: &str, enabled: bool, rect: RECT) -> AccessibleItem {
+    let mut item = button_item(name, false, false, rect);
+    item.state &= !STATE_FOCUSABLE;
+    if !enabled {
+        item.state |= STATE_UNAVAILABLE;
+    }
+    item
 }
 
 /// A painted option toggle: a check button, checked while its option is on (spec §10). The
@@ -1330,6 +1356,28 @@ mod tests {
         // having it written through as a `Call`.
         assert_eq!(unsafe { answer(std::ptr::null_mut(), 0x10) }, 0);
         assert_eq!(unsafe { answer(std::ptr::null_mut(), -1) }, 0);
+    }
+
+    #[test]
+    fn the_chevron_says_whether_it_is_expanded_and_an_unavailable_button_says_so() {
+        // Break caught: a chevron read as a plain button with no hint of what it opens, or
+        // Replace all read as pressable while a search still runs.
+        let open = expander_item("Toggle replace", true, ROW);
+        assert_eq!(open.role, ROLE_SYSTEM_PUSHBUTTON);
+        assert_ne!(open.state & STATE_EXPANDED, 0);
+        assert_eq!(open.state & (STATE_COLLAPSED | STATE_FOCUSABLE), 0);
+        assert_eq!(default_action(&open), "Press");
+        let closed = expander_item("Toggle replace", false, ROW);
+        assert_ne!(closed.state & STATE_COLLAPSED, 0);
+        assert_eq!(closed.state & STATE_EXPANDED, 0);
+
+        let ready = action_item("Replace all", true, ROW);
+        assert_eq!(ready.role, ROLE_SYSTEM_PUSHBUTTON);
+        assert_eq!(ready.state & (STATE_UNAVAILABLE | STATE_FOCUSABLE), 0);
+        assert_ne!(
+            action_item("Replace all", false, ROW).state & STATE_UNAVAILABLE,
+            0
+        );
     }
 
     #[test]

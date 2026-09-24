@@ -111,6 +111,11 @@ Hover a note to pin it.
   a word first and it becomes the search. Opening a result puts your search in the find bar,
   so **F3** steps through every match in that note. Nothing is indexed: the notes are read
   when you search, and results stream in as they're found.
+- **Ctrl+Shift+H** opens a replace field under the search. **Replace all** (or
+  **Ctrl+Alt+Enter**) replaces in every listed note after asking, and each result has its own
+  replace button (**Ctrl+Shift+1** on the selected one). Notes open in tabs change in the
+  editor, where one Ctrl+Z undoes it; the others are saved, skipping any that changed since the
+  search. With regular expressions on, `$1` inserts a group, in the find bar's Replace too.
 - Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
 - **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
   Everything is reachable from the keyboard and exposed to screen readers.
@@ -191,6 +196,8 @@ before closing again.
 | Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+Shift+F` |
 | Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |
 | Find next / previous | `F3` / `Shift+F3` | | Match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` |
+| Replace in notes | `Ctrl+Shift+H` | | Replace all (in Search) | `Ctrl+Alt+Enter` |
+| Replace in the selected result | `Ctrl+Shift+1` | | | |
 
 ## Make it yours
 

@@ -8,7 +8,9 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
-use support::process::{FastPadProcess, wait_and_cancel_dialog, wait_for_process_exit};
+use support::process::{
+    FastPadProcess, wait_and_cancel_dialog, wait_and_dismiss_dialog, wait_for_process_exit,
+};
 use support::win32::{Deadline, find_child_by_class, focused_window, scintilla_text, send_text};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SysFreeString, SysStringLen};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
@@ -218,7 +220,7 @@ struct AccessibleVtable {
     get_acc_value: usize,
     get_acc_description: usize,
     get_acc_role: unsafe extern "system" fn(*mut c_void, VARIANT, *mut VARIANT) -> HRESULT,
-    get_acc_state: usize,
+    get_acc_state: unsafe extern "system" fn(*mut c_void, VARIANT, *mut VARIANT) -> HRESULT,
     get_acc_help: usize,
     get_acc_help_topic: usize,
     get_acc_keyboard_shortcut: usize,
@@ -282,6 +284,13 @@ impl Accessible {
         let mut value = VARIANT::default();
         let result =
             unsafe { (self.vtable().get_acc_role)(self.0, child_variant(child), &mut value) };
+        (result >= 0).then_some(unsafe { value.Anonymous.Anonymous.Anonymous.lVal } as u32)
+    }
+
+    fn state(&self, child: i32) -> Option<u32> {
+        let mut value = VARIANT::default();
+        let result =
+            unsafe { (self.vtable().get_acc_state)(self.0, child_variant(child), &mut value) };
         (result >= 0).then_some(unsafe { value.Anonymous.Anonymous.Anonymous.lVal } as u32)
     }
 
@@ -432,6 +441,32 @@ fn selection(editor: HWND) -> (isize, isize) {
             SendMessageW(editor, SCI_GETSELECTIONEND, 0, 0),
         )
     }
+}
+
+/// `STATE_SYSTEM_UNAVAILABLE`: a button that can't be pressed now.
+const STATE_SYSTEM_UNAVAILABLE: u32 = 0x0000_0001;
+
+/// An Edit's text in another process. `WM_GETTEXT` is marshalled across processes;
+/// `GetWindowTextW` would read an empty caption.
+fn edit_text(edit: HWND) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_GETTEXT, WM_GETTEXTLENGTH};
+    let length = unsafe { SendMessageW(edit, WM_GETTEXTLENGTH, 0, 0) }.max(0) as usize;
+    let mut text = vec![0_u16; length + 1];
+    let copied = unsafe { SendMessageW(edit, WM_GETTEXT, text.len(), text.as_mut_ptr() as isize) }
+        .max(0) as usize;
+    String::from_utf16_lossy(&text[..copied.min(length)])
+}
+
+/// Whether the panel lists Replace all as a button that can be pressed now.
+fn replace_all_available(panel: HWND) -> bool {
+    Accessible::from_window(panel).is_some_and(|accessible| {
+        accessible.children().iter().any(|(id, name)| {
+            name == "Replace all"
+                && accessible
+                    .state(*id)
+                    .is_some_and(|state| state & STATE_SYSTEM_UNAVAILABLE == 0)
+        })
+    })
 }
 
 #[test]
@@ -923,5 +958,77 @@ fn searching_the_notebook_opens_a_result_at_its_first_match_and_f3_steps_on() {
     wait_until("F3 to reach the next match", || {
         selection(editor) == (34, 41)
     });
+    close(process, hwnd);
+}
+
+#[test]
+fn replacing_in_the_notebook_writes_the_closed_notes_and_changes_the_open_tab() {
+    // Break caught: Ctrl+Shift+H not reaching the replace field in the real exe, Replace all
+    // missing from what a screen reader sees or never available, the question never shown, a
+    // closed note left unwritten or its LF endings changed, the open tab's file written instead
+    // of its text changed in the editor, a note that didn't match touched, or the results left
+    // showing notes with nothing to match.
+    let _lock = LIBRARY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dpi = DpiContext::per_monitor_v2();
+    let _com = ComApartment::initialize();
+    let data = Scratch::new("text-replace");
+    let a = data.note("a.md", "alpha invoice\r\n");
+    let b = data.note("b.md", "invoice\ninvoice\n");
+    let c = data.note("c.md", "nothing to see");
+    let mut process =
+        FastPadProcess::spawn_with_local_app_data([data.folder()], &data.root).unwrap();
+    let hwnd = process.wait_for_main_window(WAIT).unwrap();
+    let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
+    wait_for_library(&data);
+    let panel = find_child_by_class(hwnd, SIDE_PANEL_CLASS).unwrap();
+    forward(&data, &a);
+    wait_until("a to open", || {
+        scintilla_text(editor).is_ok_and(|text| text == "alpha invoice\r\n")
+    });
+
+    command(hwnd, CommandId::ShowSearchView);
+    wait_until("the search box to take focus", || {
+        focused_window(hwnd).is_ok_and(|focus| focus != editor && focus != panel)
+    });
+    let search_box = focused_window(hwnd).unwrap();
+    for unit in "invoice".encode_utf16() {
+        unsafe {
+            PostMessageW(search_box, WM_CHAR, unit as usize, 0);
+        }
+    }
+    wait_until("both results", || {
+        panel_lists(panel, "a: alpha invoice") && panel_lists(panel, "b: invoice")
+    });
+    assert!(!panel_lists(panel, "c: nothing to see"));
+
+    // Ctrl+Shift+H's command; the in-process tests pin the accelerator itself.
+    command(hwnd, CommandId::ReplaceInNotes);
+    wait_until("the replace field to take focus", || {
+        focused_window(hwnd)
+            .is_ok_and(|focus| focus != editor && focus != panel && focus != search_box)
+    });
+    let replace = focused_window(hwnd).unwrap();
+    for unit in "bill".encode_utf16() {
+        unsafe {
+            PostMessageW(replace, WM_CHAR, unit as usize, 0);
+        }
+    }
+    wait_until("the replacement", || edit_text(replace) == "bill");
+    wait_until("Replace all to be available", || {
+        replace_all_available(panel)
+    });
+
+    click_child(panel, "Replace all");
+    // OK on "Replace 3 matches in 2 notes with "bill"?", with its line about b being saved.
+    wait_and_dismiss_dialog(process.id(), WAIT).unwrap();
+    wait_until("b to be written", || read(&b) == "bill\nbill\n");
+    wait_until("a's tab to change in the editor", || {
+        scintilla_text(editor).is_ok_and(|text| text == "alpha bill\r\n")
+    });
+    assert_eq!(read(&c), "nothing to see");
+    wait_until("the search to run again", || {
+        panel_lists(panel, "No notes match.")
+    });
+    // Closing autosaves a's tab (a note in the notebook), so no prompt stops the exit.
     close(process, hwnd);
 }

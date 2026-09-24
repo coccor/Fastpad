@@ -401,8 +401,13 @@ pub(crate) struct Spoken {
 enum SearchChild {
     Box,
     Toggle(SearchOption),
+    Chevron,
+    ReplaceField,
+    ReplaceAll,
     Summary,
     Status,
+    /// The replace button of the selected result `usize`.
+    RowReplace(usize),
     Result(usize),
 }
 
@@ -1139,12 +1144,18 @@ impl SearchView {
         }
     }
 
-    /// The MSAA children before the results.
+    /// The MSAA children before the results. The chevron comes after the toggles, so the box and
+    /// the toggles keep the child IDs they had before replace existed.
     fn head_children(&self) -> Vec<SearchChild> {
-        let mut head = Vec::with_capacity(6);
+        let mut head = Vec::with_capacity(10);
         if self.box_shown() {
             head.push(SearchChild::Box);
             head.extend(SearchOption::ALL.map(SearchChild::Toggle));
+            head.push(SearchChild::Chevron);
+            if self.replace_field_shown() {
+                head.push(SearchChild::ReplaceField);
+                head.push(SearchChild::ReplaceAll);
+            }
         }
         let (summary, status) = self.shown_lines();
         if summary.is_some() {
@@ -1153,7 +1164,27 @@ impl SearchView {
         if status.is_some() {
             head.push(SearchChild::Status);
         }
+        if let Some(row) = self.row_replace_child() {
+            head.push(SearchChild::RowReplace(row));
+        }
         head
+    }
+
+    /// Whether the replace field shows. Read from its style, as `box_shown` is.
+    fn replace_field_shown(&self) -> bool {
+        self.replace_open
+            && self.replace_edit.is_some_and(|edit| {
+                (unsafe { GetWindowLongPtrW(edit, GWL_STYLE) }) as u32 & WS_VISIBLE != 0
+            })
+    }
+
+    /// The selected result whose replace button is a child. There is one such child, the
+    /// selected row's, so a screen reader user reaches it from the row they are on and the
+    /// results keep their IDs as the selection moves.
+    fn row_replace_child(&self) -> Option<usize> {
+        let row = self.list.selected?;
+        (self.replace_field_shown() && self.notice().is_none() && row < self.results.len())
+            .then_some(row)
     }
 
     fn child_at(&self, index: usize) -> Option<SearchChild> {
@@ -1335,32 +1366,43 @@ pub(crate) fn run_query(hwnd: HWND) -> Option<(String, MatchOptions)> {
     with_view(hwnd, |view| (view.query.clone(), view.run_options))
 }
 
-/// `text_search_host::run_now` started a search for `query` over `total` notes.
+/// `text_search_host::run_now` started a search for `query` over `total` notes. Replace all
+/// waits for it, and says so.
 pub(crate) fn begin_search(hwnd: HWND, query: &str, total: usize) {
-    if let Some(panel) = with_view(hwnd, |view| {
+    let Some((panel, flipped)) = with_view(hwnd, |view| {
+        let enabled = view.replace_all_enabled();
         view.begin(query, total);
-        view.panel
-    }) {
-        invalidate(panel);
+        (view.panel, enabled != view.replace_all_enabled())
+    }) else {
+        return;
+    };
+    invalidate(panel);
+    if flipped {
+        announce_state(hwnd, SearchChild::ReplaceAll);
     }
     announce_lines(hwnd, false);
 }
 
 /// A batch of the current search (`text_search_host::batch_arrived`). The panel repaints only if
-/// something it shows changed.
+/// something it shows changed. Replace all says when it became available.
 pub(crate) fn apply_batch(hwnd: HWND, batch: SearchBatch) {
     let settled = batch.end.is_some();
-    let Some(panel) = with_view(hwnd, |view| view.panel) else {
+    let Some((panel, enabled)) = with_view(hwnd, |view| (view.panel, view.replace_all_enabled()))
+    else {
         return;
     };
     let (client, dpi) = geometry(panel);
-    let changed = with_view(hwnd, |view| {
+    let (changed, flipped) = with_view(hwnd, |view| {
         let area = view.list_area(client, dpi);
-        view.apply(batch, height(area))
+        let changed = view.apply(batch, height(area));
+        (changed, view.replace_all_enabled() != enabled)
     })
-    .unwrap_or(false);
-    if changed {
+    .unwrap_or((false, false));
+    if changed || flipped {
         invalidate(panel);
+    }
+    if flipped {
+        announce_state(hwnd, SearchChild::ReplaceAll);
     }
     announce_lines(hwnd, settled);
 }
@@ -1449,13 +1491,17 @@ pub(crate) fn announce_lines(hwnd: HWND, settled: bool) {
 
 /// Tells screen readers a toggle's checked state changed.
 fn announce_toggle(hwnd: HWND, option: SearchOption) {
+    announce_state(hwnd, SearchChild::Toggle(option));
+}
+
+/// Raises `EVENT_OBJECT_STATECHANGE` for `child`, if it is one of the view's children now: a
+/// toggle, the chevron or Replace all. Raised with nothing of the App borrowed.
+fn announce_state(hwnd: HWND, child: SearchChild) {
     if side_panel::current_view(hwnd) != SidebarView::Search {
         return;
     }
-    if let Some((panel, index)) = with_view(hwnd, |view| {
-        Some((view.panel, view.child_index(SearchChild::Toggle(option))?))
-    })
-    .flatten()
+    if let Some((panel, index)) =
+        with_view(hwnd, |view| Some((view.panel, view.child_index(child)?))).flatten()
     {
         sidebar_accessibility::notify(EVENT_OBJECT_STATECHANGE, panel, Some(index));
     }
@@ -1618,15 +1664,16 @@ fn set_replace_open(hwnd: HWND, open: bool) -> Option<HWND> {
     } else {
         with_view(hwnd, |view| view.replace_edit).flatten()
     };
-    let (panel, edit) = with_view(hwnd, |view| {
-        if view.replace_open != open {
+    let (panel, edit, changed) = with_view(hwnd, |view| {
+        let changed = view.replace_open != open;
+        if changed {
             view.replace_open = open;
             // The replace children come and go, and the rows move down or up.
             view.order = view.order.wrapping_add(1);
             view.row_hover_button = None;
             view.header_hover = None;
         }
-        (view.panel, view.edit)
+        (view.panel, view.edit, changed)
     })?;
     // Focused with nothing of the App borrowed: SetFocus sends focus messages.
     if !open
@@ -1639,6 +1686,9 @@ fn set_replace_open(hwnd: HWND, open: bool) -> Option<HWND> {
     }
     layout(hwnd);
     invalidate(panel);
+    if changed {
+        announce_state(hwnd, SearchChild::Chevron);
+    }
     if open { replace } else { None }
 }
 
@@ -2498,9 +2548,11 @@ pub(crate) fn replace_edit_hwnd(hwnd: HWND) -> Option<HWND> {
 }
 
 impl sidebar_accessibility::AccessibleView for SearchView {
-    /// The box, the three toggles, the summary and status lines while they show, then the
-    /// results. The status line comes before the results so its child ID stays put while
-    /// results stream in.
+    /// The box, the three toggles, the replace chevron (then, while the replace field is open,
+    /// the field and Replace all), the summary and status lines while they show, the selected
+    /// row's replace button while the field is open, then the results. The status line and the
+    /// row button come before the results so the results' IDs stay put while results stream in
+    /// and the selection moves.
     fn accessible_count(&self, _client: RECT, _dpi: u32) -> usize {
         self.head_children().len() + self.results.len()
     }
@@ -2533,6 +2585,41 @@ impl sidebar_accessibility::AccessibleView for SearchView {
                     option_toggles::toggle_rects(field, dpi)[position],
                 )
             }
+            SearchChild::Chevron => sidebar_accessibility::expander_item(
+                "Toggle replace",
+                self.replace_open,
+                SearchView::chevron_rect(client, dpi),
+            ),
+            SearchChild::ReplaceField => {
+                let replace = self.replace_edit?;
+                // The kept text: a WM_GETTEXT here would run under the App borrow.
+                sidebar_accessibility::field_item(
+                    REPLACE_PLACEHOLDER,
+                    self.replace_text.clone(),
+                    unsafe { GetFocus() } == replace,
+                    SearchView::replace_field_rect(client, dpi),
+                    replace,
+                )
+            }
+            SearchChild::ReplaceAll => sidebar_accessibility::action_item(
+                "Replace all",
+                self.replace_all_enabled(),
+                SearchView::replace_all_rect(client, dpi),
+            ),
+            SearchChild::RowReplace(row) => {
+                let hit = self.results.get(row)?;
+                let (rect, visible) =
+                    sidebar_accessibility::row_rect(self.list_area(client, dpi), &self.list, row);
+                let mut item = sidebar_accessibility::action_item(
+                    &format!("Replace in {}", hit.name),
+                    self.replace_all_enabled(),
+                    SearchView::row_replace_rect(rect, dpi),
+                );
+                if !visible {
+                    item.state |= sidebar_accessibility::STATE_OFFSCREEN;
+                }
+                item
+            }
             SearchChild::Summary => sidebar_accessibility::text_item(
                 &self.shown_lines().0.unwrap_or_default(),
                 self.summary_rect(client, dpi),
@@ -2559,13 +2646,27 @@ impl sidebar_accessibility::AccessibleView for SearchView {
     fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
         let field = SearchView::field_rect(client, dpi);
         let (summary, status) = self.shown_lines();
+        let row_button = self.row_replace_child().filter(|&row| {
+            let (rect, _) =
+                sidebar_accessibility::row_rect(self.list_area(client, dpi), &self.list, row);
+            inside(SearchView::row_replace_rect(rect, dpi), point)
+        });
+        let replace = self.replace_field_shown();
         let child = if self.box_shown() && inside(field, point) {
             option_toggles::hit(&option_toggles::toggle_rects(field, dpi), point)
                 .map_or(SearchChild::Box, SearchChild::Toggle)
+        } else if self.box_shown() && inside(SearchView::chevron_rect(client, dpi), point) {
+            SearchChild::Chevron
+        } else if replace && inside(SearchView::replace_all_rect(client, dpi), point) {
+            SearchChild::ReplaceAll
+        } else if replace && inside(SearchView::replace_field_rect(client, dpi), point) {
+            SearchChild::ReplaceField
         } else if summary.is_some() && inside(self.summary_rect(client, dpi), point) {
             SearchChild::Summary
         } else if status.is_some() && inside(SearchView::status_rect(client, dpi), point) {
             SearchChild::Status
+        } else if let Some(row) = row_button {
+            SearchChild::RowReplace(row)
         } else {
             SearchChild::Result(self.row_under(point, client, dpi)?)
         };
@@ -2576,8 +2677,11 @@ impl sidebar_accessibility::AccessibleView for SearchView {
         self.child_index(SearchChild::Result(self.list.selected?))
     }
 
+    /// Selects a result. The row button's child scrolls its row into view, so its default action
+    /// (a click on its center) lands on it.
     fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
-        if let Some(SearchChild::Result(row)) = self.child_at(index) {
+        if let Some(SearchChild::Result(row) | SearchChild::RowReplace(row)) = self.child_at(index)
+        {
             let area = self.list_area(client, dpi);
             self.list.select(row, area.bottom - area.top);
         }
@@ -2588,6 +2692,12 @@ impl sidebar_accessibility::AccessibleView for SearchView {
             SearchChild::Box => sidebar_accessibility::identity_of(&"search box"),
             SearchChild::Toggle(option) => {
                 sidebar_accessibility::identity_of(&("toggle", option_toggles::label(option)))
+            }
+            SearchChild::Chevron => sidebar_accessibility::identity_of(&"replace toggle"),
+            SearchChild::ReplaceField => sidebar_accessibility::identity_of(&"replace field"),
+            SearchChild::ReplaceAll => sidebar_accessibility::identity_of(&"replace all"),
+            SearchChild::RowReplace(row) => {
+                sidebar_accessibility::identity_of(&("replace in", &self.results.get(row)?.path))
             }
             SearchChild::Summary => sidebar_accessibility::identity_of(&"summary"),
             SearchChild::Status => sidebar_accessibility::identity_of(&"status"),

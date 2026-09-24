@@ -12268,6 +12268,83 @@ mod tests {
     }
 
     #[test]
+    fn the_replace_controls_are_exposed_with_their_names_and_states() {
+        // Break caught (spec §11 names): the chevron missing or read without its expanded state
+        // (or silent when it changes), the replace field or Replace all invisible to a screen
+        // reader, Replace all read as pressable while a search runs, or the row's button unnamed.
+        use crate::window::sidebar_accessibility::{
+            STATE_COLLAPSED, STATE_EXPANDED, STATE_UNAVAILABLE, take_raised,
+        };
+        use windows_sys::Win32::UI::Accessibility::{ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TEXT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_STATECHANGE;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-msaa");
+        scratch.note("a.md", "one beta");
+        scratch.note("b.md", "beta two");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "beta");
+        let panel = sidebar_panel(window.hwnd);
+        let items = || {
+            (0..crate::window::side_panel::accessible_item_count(panel))
+                .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+                .collect::<Vec<_>>()
+        };
+        let index_of = |name: &str| items().iter().position(|item| item.name == name);
+
+        let shown = items();
+        assert_eq!(shown[0].role, ROLE_SYSTEM_TEXT, "the box keeps child ID 1");
+        assert_eq!(
+            index_of("Toggle replace"),
+            Some(4),
+            "after the three toggles"
+        );
+        assert_eq!(shown[4].role, ROLE_SYSTEM_PUSHBUTTON);
+        assert_ne!(shown[4].state & STATE_COLLAPSED, 0);
+        assert_eq!(index_of("Replace"), None);
+        assert_eq!(index_of("Replace all"), None);
+        assert_eq!(index_of("Replace in a"), None);
+
+        take_raised();
+        crate::window::search_view::toggle_replace(window.hwnd);
+        assert!(
+            take_raised().contains(&(panel as usize, EVENT_OBJECT_STATECHANGE, 5)),
+            "the chevron (ID 5) raises a state change"
+        );
+        let shown = items();
+        assert_ne!(shown[4].state & STATE_EXPANDED, 0);
+        let field = &shown[index_of("Replace").expect("the replace field is a child")];
+        assert_eq!(field.role, ROLE_SYSTEM_TEXT);
+        assert_eq!(
+            field.window,
+            crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap()
+        );
+        let all = &shown[index_of("Replace all").expect("Replace all is a child")];
+        assert_eq!(all.role, ROLE_SYSTEM_PUSHBUTTON);
+        assert_eq!(all.state & STATE_UNAVAILABLE, 0);
+        let row = &shown[index_of("Replace in a").expect("the selected row's button")];
+        assert_eq!(row.role, ROLE_SYSTEM_PUSHBUTTON);
+        type_into_replace(window.hwnd, "x");
+        assert_eq!(items()[index_of("Replace").unwrap()].value, "x");
+
+        take_raised();
+        // The same query again: its results stay, and Replace all waits for the search.
+        crate::window::text_search_host::run_now(window.hwnd);
+        let all_index = index_of("Replace all").unwrap();
+        assert_ne!(items()[all_index].state & STATE_UNAVAILABLE, 0);
+        assert!(
+            take_raised().contains(&(
+                panel as usize,
+                EVENT_OBJECT_STATECHANGE,
+                all_index as i32 + 1
+            )),
+            "Replace all says it became unavailable"
+        );
+    }
+
+    #[test]
     fn a_tab_closed_before_an_unasked_row_replace_applies_is_not_written() {
         // Break caught: a note saved without the question ever saying so, because its tab (whose
         // text the count read, so no question was asked) closed while the count ran.
@@ -14295,8 +14372,10 @@ mod tests {
                 .iter()
                 .all(|item| item.role == ROLE_SYSTEM_CHECKBUTTON && item.state & STATE_CHECKED == 0)
         );
-        assert_eq!(shown[4].role, ROLE_SYSTEM_STATICTEXT);
-        assert_eq!(shown[4].name, "2 notes");
+        // The chevron comes after the toggles, so the box and the toggles keep IDs 1 to 4.
+        assert_eq!(shown[4].name, "Toggle replace");
+        assert_eq!(shown[5].role, ROLE_SYSTEM_STATICTEXT);
+        assert_eq!(shown[5].name, "2 notes");
         let results = shown
             .iter()
             .filter(|item| item.role == ROLE_SYSTEM_LISTITEM)
