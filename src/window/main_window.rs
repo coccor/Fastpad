@@ -1766,8 +1766,8 @@ fn select_match(
     let Ok(doc_len) = editor.length() else {
         return;
     };
-    let pattern = find_bar::scintilla_query(query, options);
-    let mut state = find_bar::SearchState::new(&pattern, direction, origin);
+    let mut state = find_bar::SearchState::new(query, direction, origin)
+        .with_whole_words(find_bar::checks_words(options));
     let found = state
         .next_editor_match(editor, find_bar::search_flags(options), doc_len)
         .ok()
@@ -1806,15 +1806,19 @@ pub(crate) fn replace_current(hwnd: HWND) {
         return;
     }
     // Only replace when the selection is exactly a match under the options (a case-insensitive
-    // "CAT" for "cat", or a regex's match); otherwise this Enter just moves to the next match,
-    // as in a bare Find field. The replacement is literal text, also in regex mode.
-    let pattern = find_bar::scintilla_query(&query, options);
+    // "CAT" for "cat", a regex's match, a whole word); otherwise this Enter just moves to the
+    // next match, as in a bare Find field. The replacement is literal text, also in regex mode.
     if let Ok(selection) = editor.selection()
         && !selection.is_empty()
-        && editor
-            .search_in_target(&pattern, selection.clone(), find_bar::search_flags(options))
-            .ok()
-            .flatten()
+        && find_bar::find_match(
+            &editor,
+            &query,
+            selection.clone(),
+            find_bar::search_flags(options),
+            find_bar::checks_words(options),
+        )
+        .ok()
+        .flatten()
             == Some(selection.clone())
     {
         let _ = editor.replace_target(selection, &replacement);
@@ -1840,9 +1844,13 @@ pub(crate) fn replace_all_matches(hwnd: HWND) {
     if query.is_empty() {
         return;
     }
-    let pattern = find_bar::scintilla_query(&query, options);
     let replaced = editor
-        .replace_all(&pattern, &replacement, find_bar::search_flags(options))
+        .replace_all(
+            &query,
+            &replacement,
+            find_bar::search_flags(options),
+            find_bar::checks_words(options),
+        )
         .unwrap_or(0);
     if identity.is_live_for(hwnd) {
         editor.scroll_caret_into_view();
@@ -13280,15 +13288,11 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_word_regex_on_a_non_ascii_word_follows_msvc_wregex_word_boundaries() {
-        // Records actual behaviour (Task 7 fix round 1). Scintilla's C++11 regex is MSVC's
-        // std::wregex in the "C" locale, whose `\b` counts ă as a non-word character. So a
-        // whole-word regex for "mașină" misses the word itself (no boundary between ă and a
-        // space or the end) and matches it inside "mașinării" (a boundary between ă and r).
-        // The Search view's Rust regex gets both right, so such a result opens with the find
-        // bar in its no-match state. Plain whole word (no regex) uses Scintilla's own word
-        // characters and is right. If this starts failing, the runtime or the pattern wrapping
-        // changed: update the spec's §17 note with it.
+    fn a_whole_word_regex_matches_a_non_ascii_word_only_as_a_whole_word() {
+        // Break caught: a whole-word regex judged by MSVC std::wregex's `\b`, which counts ă as
+        // a non-word character, so "mașină" is missed as a whole word and found inside
+        // "mașinării". Scintilla's own word test (Unicode classes) decides instead, as it does
+        // for plain whole word.
         use crate::search::SearchOption;
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
@@ -13297,31 +13301,78 @@ mod tests {
         super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
         set_find_query(window.hwnd, "mașină");
         let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
-        let find = |text: &str| {
+        let find = |text: &str, backward: bool| {
             editor.populate_clean(text).unwrap();
-            editor.set_selection(0..0).unwrap();
-            super::find_next(window.hwnd);
+            let end = editor.length().unwrap();
+            editor
+                .set_selection(if backward { end..end } else { 0..0 })
+                .unwrap();
+            if backward {
+                super::find_previous(window.hwnd);
+            } else {
+                super::find_next(window.hwnd);
+            }
             (!bar().no_match()).then(|| editor.selection().unwrap())
         };
 
-        assert_eq!(
-            find("o mașină nouă"),
-            Some(2..10),
-            "plain whole word finds it"
-        );
-        assert_eq!(
-            find("mașinării"),
-            None,
-            "plain whole word skips a longer word"
-        );
+        // Plain whole word (SCFIND_WHOLEWORD) is the reference.
+        assert_eq!(find("o mașină nouă", false), Some(2..10), "plain");
+        assert_eq!(find("mașinării", false), None, "plain");
 
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
-        assert_eq!(find("o mașină nouă"), None, r"wregex: no \b after ă");
-        assert_eq!(
-            find("mașinării"),
-            Some(0..8),
-            r"wregex: a \b between ă and r"
-        );
-        assert_eq!(find("o masina noua"), None, "the query is still mașină");
+        for backward in [false, true] {
+            assert_eq!(find("o mașină nouă", backward), Some(2..10), "{backward}");
+            assert_eq!(find("mașină", backward), Some(0..8), "{backward}");
+            assert_eq!(find("mașinării", backward), None, "{backward}");
+            assert_eq!(
+                find("mașinării mașină", backward),
+                Some(12..20),
+                "past the longer word, {backward}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_word_regex_skips_longer_words_forward_backward_and_in_replace() {
+        // Break caught: a hit inside foobar or foo_bar accepted, a rejected hit ending the
+        // search instead of being stepped past, Shift+F3 stopping at the rejected hit, or
+        // Replace All replacing inside longer words.
+        use crate::search::SearchOption;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.populate_clean("foobar foo_bar foo x").unwrap();
+        execute_command(window.hwnd, CommandId::Find);
+        super::toggle_find_option(window.hwnd, SearchOption::Regex);
+        super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+        set_find_query(window.hwnd, "fo+");
+        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+
+        editor.set_selection(0..0).unwrap();
+        super::find_next(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 15..18, "F3");
+        editor.set_selection(20..20).unwrap();
+        super::find_previous(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 15..18, "Shift+F3");
+        editor.set_selection(15..15).unwrap();
+        super::find_previous(window.hwnd);
+        assert_eq!(editor.selection().unwrap(), 15..18, "Shift+F3 wraps to it");
+        assert!(!bar().no_match());
+
+        editor.set_selection(0..0).unwrap();
+        execute_command(window.hwnd, CommandId::Replace);
+        set_find_query(window.hwnd, "fo+");
+        set_replace_text(window.hwnd, "X");
+        super::replace_all_matches(window.hwnd);
+        assert_eq!(editor.text().unwrap(), "foobar foo_bar X x");
+
+        // Enter in Replace replaces a selected whole word, and not a selection inside one.
+        editor.populate_clean("foo foobar").unwrap();
+        editor.set_selection(4..7).unwrap();
+        super::replace_current(window.hwnd);
+        assert_eq!(editor.text().unwrap(), "foo foobar", "inside foobar");
+        editor.set_selection(0..3).unwrap();
+        super::replace_current(window.hwnd);
+        assert_eq!(editor.text().unwrap(), "X foobar");
     }
 }

@@ -90,6 +90,7 @@ pub const SCI_GETTEXT: u32 = 2182;
 pub const SCI_GETTEXTLENGTH: u32 = 2183;
 pub const SCI_GETZOOM: u32 = 2374;
 pub const SCI_GOTOPOS: u32 = 2025;
+pub const SCI_ISRANGEWORD: u32 = 2691;
 pub const SCI_LINEFROMPOSITION: u32 = 2166;
 pub const SCI_LINELENGTH: u32 = 2350;
 pub const SCI_PASTE: u32 = 2179;

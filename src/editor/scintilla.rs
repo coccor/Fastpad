@@ -21,9 +21,9 @@ use crate::editor::scintilla_constants::{
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
 use crate::editor::scintilla_constants::{
     SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCOLUMN, SCI_GETCURRENTPOS,
-    SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER, SCI_LINEFROMPOSITION,
-    SCI_LINELENGTH, SCI_POSITIONAFTER, SCI_POSITIONBEFORE, SCI_POSITIONFROMLINE,
-    SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
+    SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER, SCI_ISRANGEWORD,
+    SCI_LINEFROMPOSITION, SCI_LINELENGTH, SCI_POSITIONAFTER, SCI_POSITIONBEFORE,
+    SCI_POSITIONFROMLINE, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
 };
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
@@ -400,6 +400,22 @@ impl Editor {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
+    /// Whether `range` is a whole word by Scintilla's word characters (Unicode classes in a
+    /// UTF-8 document): it starts and ends at a change of character class, as `SCFIND_WHOLEWORD`
+    /// requires of a plain match. An empty range is not a word.
+    #[cfg(windows)]
+    pub fn is_range_word(&self, range: Range<usize>) -> Result<bool> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_ISRANGEWORD, range.start, range.end as isize)?
+            != 0)
+    }
+
+    #[cfg(not(windows))]
+    pub fn is_range_word(&self, _range: Range<usize>) -> Result<bool> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
     /// The position one character before `position`, or 0 at the start.
     #[cfg(windows)]
     pub fn position_before(&self, position: usize) -> Result<usize> {
@@ -574,8 +590,16 @@ impl Editor {
 
     /// Replaces every occurrence of `query` with `replacement`, as one undo action. Searches
     /// incrementally via `search_in_target`/`replace_target`; never retrieves the full document.
+    /// With `whole_words`, a match replaces only if `is_range_word` holds for it: whole word in
+    /// regex mode, where Scintilla ignores `SCFIND_WHOLEWORD`.
     #[cfg(windows)]
-    pub fn replace_all(&self, query: &str, replacement: &str, search_flags: u32) -> Result<usize> {
+    pub fn replace_all(
+        &self,
+        query: &str,
+        replacement: &str,
+        search_flags: u32,
+        whole_words: bool,
+    ) -> Result<usize> {
         if query.is_empty() {
             return Ok(0);
         }
@@ -594,10 +618,12 @@ impl Editor {
                 };
                 // An empty match (a regex like `a*` between the runs it matches) is stepped over,
                 // never replaced: replacing it would insert the replacement between characters,
-                // and searching from the same place again would find it forever.
-                if found.is_empty() {
-                    let next = self.position_after(found.end)?;
-                    if next <= found.end {
+                // and searching from the same place again would find it forever. So is a match
+                // that isn't a whole word when whole words are asked for; the search goes on one
+                // character after its start, where a shorter match may be a word.
+                if found.is_empty() || (whole_words && !self.is_range_word(found.clone())?) {
+                    let next = self.position_after(found.start)?;
+                    if next <= found.start {
                         break;
                     }
                     position = next;
@@ -619,6 +645,7 @@ impl Editor {
         _query: &str,
         _replacement: &str,
         _search_flags: u32,
+        _whole_words: bool,
     ) -> Result<usize> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
@@ -1765,6 +1792,29 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_with_whole_words_skips_a_match_that_is_not_a_word() {
+        // Break caught: a whole-word regex replacing inside "foobar", or the rejected match
+        // ending Replace All so a later whole word is left alone.
+        let harness = TestDirectHarness::new();
+        harness.push_response(0); // SCI_BEGINUNDOACTION
+        harness.push_response(10); // SCI_GETLENGTH
+        harness.push_response(0); // SCI_SEARCHINTARGET: "foo" at 0, inside "foobar"
+        harness.push_response(0); // SCI_ISRANGEWORD: not a word
+        harness.push_response(10); // SCI_GETLENGTH
+        harness.push_response(7); // SCI_SEARCHINTARGET from 1: "foo" at 7
+        harness.push_response(1); // SCI_ISRANGEWORD: a word
+        harness.push_response(0); // SCI_REPLACETARGET
+        harness.push_response(8); // SCI_GETLENGTH
+        harness.push_response(-1); // SCI_SEARCHINTARGET from 8: nothing
+        harness.push_response(0); // SCI_ENDUNDOACTION
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert_eq!(editor.replace_all("fo+", "X", 0, true).unwrap(), 1);
+        assert_eq!(harness.replace_bytes(), vec![b"X".to_vec()]);
+        assert_eq!(harness.target_range(), Some((8, 8)));
+    }
+
+    #[test]
     fn replace_all_steps_past_an_empty_match_instead_of_replacing_it() {
         // Break caught: a regex that can match empty text (`x*`) replacing at the same
         // position forever, inserting the replacement between every character, or stopping
@@ -1779,7 +1829,7 @@ mod tests {
         harness.push_response(0); // SCI_ENDUNDOACTION
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        assert_eq!(editor.replace_all("x*", "y", 0).unwrap(), 0);
+        assert_eq!(editor.replace_all("x*", "y", 0, false).unwrap(), 0);
         assert!(harness.replace_bytes().is_empty());
         assert_eq!(harness.target_range(), Some((1, 5)), "searched on from 1");
         assert_eq!(harness.event_log(), vec!["begin", "end"]);
@@ -1931,7 +1981,7 @@ mod tests {
         harness.push_response(0); // SCI_ENDUNDOACTION (ignored)
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        let count = editor.replace_all("one", "1111", 0).unwrap();
+        let count = editor.replace_all("one", "1111", 0, false).unwrap();
 
         assert_eq!(count, 2);
         assert_eq!(
@@ -2309,7 +2359,7 @@ mod tests {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        let count = editor.replace_all("", "x", 0).unwrap();
+        let count = editor.replace_all("", "x", 0, false).unwrap();
 
         assert_eq!(count, 0);
         assert!(harness.messages().is_empty());
