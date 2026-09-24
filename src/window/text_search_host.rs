@@ -328,7 +328,10 @@ pub(crate) fn batch_arrived(hwnd: HWND, lparam: LPARAM) {
     }
     let end = batch.end;
     let skipped = std::mem::take(&mut batch.skipped);
-    search_view::apply_batch(hwnd, batch);
+    // New rows raise the panel's reorder, as a keystroke in the panel does.
+    crate::window::side_panel::with_accessible_events(hwnd, || {
+        search_view::apply_batch(hwnd, batch)
+    });
     let Some(end) = end else {
         return;
     };

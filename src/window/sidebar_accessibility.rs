@@ -24,16 +24,18 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Accessibility::{
-    LresultFromObject, NAVDIR_DOWN, NAVDIR_FIRSTCHILD, NAVDIR_LASTCHILD, NAVDIR_NEXT,
-    NAVDIR_PREVIOUS, NAVDIR_UP, NotifyWinEvent, ROLE_SYSTEM_LISTITEM, ROLE_SYSTEM_OUTLINEITEM,
-    ROLE_SYSTEM_PANE, ROLE_SYSTEM_PUSHBUTTON, SELFLAG_TAKEFOCUS, SELFLAG_TAKESELECTION,
+    AccessibleObjectFromWindow, LresultFromObject, NAVDIR_DOWN, NAVDIR_FIRSTCHILD,
+    NAVDIR_LASTCHILD, NAVDIR_NEXT, NAVDIR_PREVIOUS, NAVDIR_UP, NotifyWinEvent,
+    ROLE_SYSTEM_CHECKBUTTON, ROLE_SYSTEM_LISTITEM, ROLE_SYSTEM_OUTLINEITEM, ROLE_SYSTEM_PANE,
+    ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_STATICTEXT, ROLE_SYSTEM_TEXT, SELFLAG_TAKEFOCUS,
+    SELFLAG_TAKESELECTION,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_FOCUS, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_REORDER, EVENT_OBJECT_SELECTION,
     EVENT_OBJECT_STATECHANGE, GUITHREADINFO, GetClientRect, GetGUIThreadInfo, GetWindowRect,
-    GetWindowThreadProcessId, OBJID_CLIENT, PostMessageW, SendMessageW, WM_APP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP,
+    GetWindowThreadProcessId, OBJID_CLIENT, OBJID_WINDOW, PostMessageW, SendMessageW, WM_APP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -51,6 +53,8 @@ pub(crate) const ACTION_FOCUS: LPARAM = 2;
 pub(crate) const STATE_SELECTED: u32 = 0x0000_0002;
 pub(crate) const STATE_FOCUSED: u32 = 0x0000_0004;
 pub(crate) const STATE_PRESSED: u32 = 0x0000_0008;
+pub(crate) const STATE_CHECKED: u32 = 0x0000_0010;
+pub(crate) const STATE_READONLY: u32 = 0x0000_0040;
 pub(crate) const STATE_EXPANDED: u32 = 0x0000_0200;
 pub(crate) const STATE_COLLAPSED: u32 = 0x0000_0400;
 pub(crate) const STATE_OFFSCREEN: u32 = 0x0001_0000;
@@ -65,9 +69,12 @@ pub(crate) struct AccessibleItem {
     pub role: u32,
     pub state: u32,
     pub rect: RECT,
-    /// An outline item's level (0 for the root's children), as tree views report it. Empty
-    /// otherwise.
+    /// An outline item's level (0 for the root's children), as tree views report it, or a
+    /// field's text. Empty otherwise.
     pub value: String,
+    /// A native control shown as this child (the Search box, a find field). Its own MSAA object
+    /// is the child's full object. Null for a painted child.
+    pub window: HWND,
 }
 
 impl std::fmt::Debug for AccessibleItem {
@@ -78,6 +85,7 @@ impl std::fmt::Debug for AccessibleItem {
             .field("role", &self.role)
             .field("state", &format_args!("{:#x}", self.state))
             .field("value", &self.value)
+            .field("window", &self.window)
             .finish_non_exhaustive()
     }
 }
@@ -146,6 +154,51 @@ pub(crate) fn button_item(name: &str, pressed: bool, focused: bool, rect: RECT) 
         state,
         rect,
         value: String::new(),
+        window: std::ptr::null_mut(),
+    }
+}
+
+/// A painted option toggle: a check button, checked while its option is on (spec §10). The
+/// toggles take no keyboard focus: Alt+C, Alt+W and Alt+R flip them from the field.
+pub(crate) fn check_item(name: &str, checked: bool, rect: RECT) -> AccessibleItem {
+    AccessibleItem {
+        name: name.to_owned(),
+        role: ROLE_SYSTEM_CHECKBUTTON,
+        state: if checked { STATE_CHECKED } else { 0 },
+        rect,
+        value: String::new(),
+        window: std::ptr::null_mut(),
+    }
+}
+
+/// A native `Edit` shown as a child of a painted window, with its text as the value. `text` is
+/// a copy the view keeps: never read with `WM_GETTEXT` here, under the App borrow.
+pub(crate) fn field_item(
+    name: &str,
+    text: String,
+    focused: bool,
+    rect: RECT,
+    window: HWND,
+) -> AccessibleItem {
+    AccessibleItem {
+        name: name.to_owned(),
+        role: ROLE_SYSTEM_TEXT,
+        state: STATE_FOCUSABLE | if focused { STATE_FOCUSED } else { 0 },
+        rect,
+        value: text,
+        window,
+    }
+}
+
+/// A painted line of text, such as the Search view's summary or status line.
+pub(crate) fn text_item(name: &str, rect: RECT) -> AccessibleItem {
+    AccessibleItem {
+        name: name.to_owned(),
+        role: ROLE_SYSTEM_STATICTEXT,
+        state: STATE_READONLY,
+        rect,
+        value: String::new(),
+        window: std::ptr::null_mut(),
     }
 }
 
@@ -178,6 +231,7 @@ pub(crate) fn list_item(
         state: row_state(selected, focused, visible),
         rect,
         value: String::new(),
+        window: std::ptr::null_mut(),
     }
 }
 
@@ -211,6 +265,7 @@ pub(crate) fn tree_item(
         state,
         rect,
         value: row.depth.to_string(),
+        window: std::ptr::null_mut(),
     }
 }
 
@@ -230,14 +285,14 @@ pub(crate) fn row_rect(area: RECT, list: &RowListState, index: usize) -> (RECT, 
 }
 
 pub(crate) fn default_action(item: &AccessibleItem) -> &'static str {
-    if item.role == ROLE_SYSTEM_PUSHBUTTON {
-        "Press"
-    } else if item.state & STATE_EXPANDED != 0 {
-        "Collapse"
-    } else if item.state & STATE_COLLAPSED != 0 {
-        "Expand"
-    } else {
-        "Open"
+    match item.role {
+        ROLE_SYSTEM_PUSHBUTTON => "Press",
+        ROLE_SYSTEM_CHECKBUTTON if item.state & STATE_CHECKED != 0 => "Uncheck",
+        ROLE_SYSTEM_CHECKBUTTON => "Check",
+        ROLE_SYSTEM_TEXT | ROLE_SYSTEM_STATICTEXT => "",
+        _ if item.state & STATE_EXPANDED != 0 => "Collapse",
+        _ if item.state & STATE_COLLAPSED != 0 => "Expand",
+        _ => "Open",
     }
 }
 
@@ -659,8 +714,27 @@ unsafe extern "system" fn child(
         return E_INVALIDARG;
     }
     unsafe { *output = std::ptr::null_mut() };
-    match child.child_id() {
-        Some(id) if id > 0 && (id as usize) <= count_of(unsafe { provider(this) }) => S_FALSE,
+    match target(unsafe { provider(this) }, &child) {
+        // A native control's own object, so a screen reader reads and edits it as the control
+        // itself. `target` has answered and let go of the App by now: this sends WM_GETOBJECT
+        // to the control, from whichever thread the client called on.
+        Some(Some(found)) if !found.window.is_null() => {
+            let result = unsafe {
+                AccessibleObjectFromWindow(
+                    found.window,
+                    OBJID_WINDOW as u32,
+                    &IID_IDISPATCH,
+                    output,
+                )
+            };
+            if result >= 0 && !unsafe { *output }.is_null() {
+                S_OK
+            } else {
+                unsafe { *output = std::ptr::null_mut() };
+                S_FALSE
+            }
+        }
+        Some(Some(_)) => S_FALSE,
         _ => E_INVALIDARG,
     }
 }
@@ -1275,5 +1349,33 @@ mod tests {
         assert_eq!(default_action(&folder), "Expand");
         let note = list_item("n", false, false, ROW, true);
         assert_eq!(default_action(&note), "Open");
+    }
+
+    #[test]
+    fn toggles_are_check_buttons_fields_are_text_and_lines_are_static_text() {
+        // Break caught: a toggle read as a push button with no checked state, or a status line
+        // offering "Open" as its default action.
+        let on = check_item("Match case", true, ROW);
+        assert_eq!(on.role, ROLE_SYSTEM_CHECKBUTTON);
+        assert_ne!(on.state & STATE_CHECKED, 0);
+        assert_eq!(default_action(&on), "Uncheck");
+        let off = check_item("Match case", false, ROW);
+        assert_eq!(off.state & STATE_CHECKED, 0);
+        assert_eq!(default_action(&off), "Check");
+
+        let field = field_item("Find", "abc".to_owned(), true, ROW, std::ptr::null_mut());
+        assert_eq!(field.role, ROLE_SYSTEM_TEXT);
+        assert_eq!(field.value, "abc");
+        assert_ne!(field.state & STATE_FOCUSED, 0);
+        assert_eq!(default_action(&field), "");
+
+        let line = text_item("3 notes", ROW);
+        assert_eq!(line.role, ROLE_SYSTEM_STATICTEXT);
+        assert_ne!(line.state & STATE_READONLY, 0);
+        assert_eq!(default_action(&line), "");
+        assert_eq!(
+            default_action(&button_item("Close", false, false, ROW)),
+            "Press"
+        );
     }
 }

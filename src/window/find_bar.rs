@@ -304,6 +304,7 @@ use crate::platform::{last_error, wide_null};
 use crate::window::option_toggles;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSource};
 use crate::window::tooltip::Tooltip;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -314,6 +315,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow, SelectObject, SetBkColor, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
+use windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_TOOLBAR;
 use windows_sys::Win32::UI::Controls::{
     EM_GETMARGINS, EM_REPLACESEL, EM_SETSEL, EM_UNDO, WM_MOUSELEAVE,
 };
@@ -447,6 +449,10 @@ pub(crate) struct FindBar {
     /// The toggles' tooltip, made the first time the pointer moves over the bar.
     tooltip: Cell<Option<Tooltip>>,
     tooltip_failed: Cell<bool>,
+    /// The fields' text, kept at each `EN_CHANGE` (`field_changed`), so screen readers read it
+    /// without a `WM_GETTEXT` under the App borrow.
+    query_value: String,
+    replace_value: String,
 }
 
 /// What a click released on the bar hit.
@@ -504,6 +510,8 @@ impl FindBar {
             hovered_toggle: Cell::new(None),
             tooltip: Cell::new(None),
             tooltip_failed: Cell::new(false),
+            query_value: String::new(),
+            replace_value: String::new(),
         })
     }
 
@@ -527,6 +535,54 @@ impl FindBar {
 
     pub(crate) fn replace_text(&self) -> String {
         control_text(self.replace_edit)
+    }
+
+    /// Keeps `text`, read from `control` with nothing borrowed at its `EN_CHANGE`, as that
+    /// field's accessible value.
+    pub(crate) fn field_changed(&mut self, control: HWND, text: String) {
+        if control == self.query_edit {
+            self.query_value = text;
+        } else if control == self.replace_edit {
+            self.replace_value = text;
+        }
+    }
+
+    /// The bar's MSAA children, in order: the Find field, the three toggles, the Replace field
+    /// in Replace mode, and the close button.
+    pub(crate) fn accessible_items(&self) -> Vec<AccessibleItem> {
+        let (layout, dpi) = self.current_layout();
+        let focus = unsafe { GetFocus() };
+        let mut items = vec![sidebar_accessibility::field_item(
+            "Find",
+            self.query_value.clone(),
+            focus == self.query_edit,
+            layout.query.field,
+            self.query_edit,
+        )];
+        let rects = option_toggles::toggle_rects(layout.query.field, dpi);
+        for (option, rect) in SearchOption::ALL.into_iter().zip(rects) {
+            items.push(sidebar_accessibility::check_item(
+                option_toggles::label(option),
+                self.options.get(option),
+                rect,
+            ));
+        }
+        if let Some(replace) = layout.replace {
+            items.push(sidebar_accessibility::field_item(
+                "Replace",
+                self.replace_value.clone(),
+                focus == self.replace_edit,
+                replace.field,
+                self.replace_edit,
+            ));
+        }
+        items.push(sidebar_accessibility::button_item(
+            "Close",
+            false,
+            false,
+            layout.close,
+        ));
+        items
     }
 
     /// Shows the bar in `mode`. The caller applies the returned prefill once it holds no `App`
@@ -941,7 +997,6 @@ impl FindBar {
         self.replace_edit
     }
 
-    #[cfg(test)]
     pub(crate) fn panel_hwnd(&self) -> HWND {
         self.panel
     }
@@ -958,6 +1013,96 @@ impl Drop for FindBar {
         }
     }
 }
+
+/// The 0-based MSAA child of `option`'s toggle: right after the Find field.
+pub(crate) fn toggle_child(option: SearchOption) -> usize {
+    1 + SearchOption::ALL
+        .iter()
+        .position(|shown| *shown == option)
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the find bar whose panel is `panel`. Called on the window's own thread
+/// (`sidebar_accessibility` sends every query there), under a shared App borrow: `f` reads kept
+/// state and sends no messages.
+fn with_bar<R>(panel: HWND, f: impl FnOnce(&FindBar) -> R) -> Option<R> {
+    let main = unsafe { GetParent(panel) };
+    let app = unsafe { super::main_window::app_ptr(main) }?;
+    let bar = unsafe { app.as_ref() }
+        .find_bar
+        .as_ref()
+        .filter(|bar| bar.panel == panel)?;
+    Some(f(bar))
+}
+
+fn accessible_container(panel: HWND) -> (String, u32) {
+    let replace = with_bar(panel, |bar| bar.mode == FindBarMode::Replace).unwrap_or(false);
+    let name = if replace { "Find and replace" } else { "Find" };
+    (name.to_owned(), ROLE_SYSTEM_TOOLBAR)
+}
+
+fn accessible_count(panel: HWND) -> usize {
+    with_bar(panel, |bar| bar.accessible_items().len()).unwrap_or(0)
+}
+
+fn accessible_item(panel: HWND, index: usize) -> Option<AccessibleItem> {
+    with_bar(panel, |bar| bar.accessible_items().into_iter().nth(index)).flatten()
+}
+
+/// The toggles sit inside the Find field, so the last child under the point wins.
+fn accessible_hit(panel: HWND, point: POINT) -> Option<usize> {
+    with_bar(panel, |bar| {
+        bar.accessible_items().iter().rposition(|item| {
+            point.x >= item.rect.left
+                && point.x < item.rect.right
+                && point.y >= item.rect.top
+                && point.y < item.rect.bottom
+        })
+    })
+    .flatten()
+}
+
+fn accessible_current(_panel: HWND) -> Option<usize> {
+    None
+}
+
+fn accessible_select(_panel: HWND, _index: usize) {}
+
+/// A field's default action focuses it. A toggle's or the close button's is a click on its
+/// center, which `main_window::panel_pointer` handles as the mouse's. Both run with nothing of
+/// the App borrowed.
+fn accessible_activate(panel: HWND, index: usize) {
+    let Some(item) = accessible_item(panel, index) else {
+        return;
+    };
+    if item.window.is_null() {
+        sidebar_accessibility::click_item(panel, item.rect);
+    } else {
+        unsafe {
+            SetFocus(item.window);
+        }
+    }
+}
+
+fn accessible_identity(_panel: HWND, index: usize) -> Option<u64> {
+    Some(index as u64)
+}
+
+fn accessible_generation(_panel: HWND) -> u64 {
+    0
+}
+
+pub(crate) static FIND_BAR_ACCESSIBLE: AccessibleSource = AccessibleSource {
+    container: accessible_container,
+    count: accessible_count,
+    item: accessible_item,
+    hit: accessible_hit,
+    current: accessible_current,
+    select: accessible_select,
+    activate: accessible_activate,
+    identity: accessible_identity,
+    generation: accessible_generation,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FindField {
@@ -1076,7 +1221,7 @@ fn create_edit_child(panel: HWND) -> crate::Result<HWND> {
     )
 }
 
-fn control_text(hwnd: HWND) -> String {
+pub(crate) fn control_text(hwnd: HWND) -> String {
     unsafe {
         let length = GetWindowTextLengthW(hwnd);
         if length <= 0 {

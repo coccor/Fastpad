@@ -16,10 +16,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, RegisterClassW,
-    SendMessageW, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DRAWITEM,
-    WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS,
+    CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, OBJID_CLIENT,
+    RegisterClassW, SendMessageW, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
 pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
@@ -119,6 +119,32 @@ unsafe extern "system" fn panel_proc(
         WM_COMMAND | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {
             SendMessageW(main, message, wparam, lparam)
         },
+        // Only the find bar's panel answers with its own object. The palette and the name box
+        // keep the system's, which lists their native controls. `find_bar_owns` lets go of the
+        // App before `object_result` runs, as its contract requires.
+        WM_GETOBJECT
+            if lparam as i32 == OBJID_CLIENT && super::main_window::find_bar_owns(main, hwnd) =>
+        unsafe {
+            super::sidebar_accessibility::object_result(
+                hwnd,
+                &super::find_bar::FIND_BAR_ACCESSIBLE,
+                wparam,
+            )
+        },
+        super::sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACCESSIBLE => unsafe {
+            super::sidebar_accessibility::answer(hwnd, lparam)
+        },
+        super::sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACTION
+            if super::main_window::find_bar_owns(main, hwnd) =>
+        {
+            super::sidebar_accessibility::run_action(
+                hwnd,
+                &super::find_bar::FIND_BAR_ACCESSIBLE,
+                wparam,
+                lparam,
+            );
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }

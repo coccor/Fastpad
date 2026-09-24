@@ -174,10 +174,6 @@ pub(crate) fn is_toggle_char(message: u32, wparam: WPARAM, lparam: LPARAM) -> bo
 }
 
 /// The toggle's name, as screen readers read it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "screen readers read it (Task 8)")
-)]
 pub(crate) fn label(option: SearchOption) -> &'static str {
     match option {
         SearchOption::Case => "Match case",

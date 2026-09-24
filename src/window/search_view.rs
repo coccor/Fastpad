@@ -18,6 +18,7 @@ use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill, inset, scale, text_height};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{self, UiFonts, ViewPaint, draw_text, point_of};
+use crate::window::sidebar_accessibility::{self, AccessibleItem};
 use crate::window::text_search_host::{self, SearchBatch};
 use crate::window::tooltip::Tooltip;
 use std::path::{Path, PathBuf};
@@ -37,11 +38,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetParent, GetWindowTextLengthW, GetWindowTextW,
-    MoveWindow, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WM_CAPTURECHANGED,
-    WM_CHAR, WM_CLEAR, WM_CUT, WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_PASTE, WM_SETFONT,
-    WM_SETTEXT, WM_UNDO, WS_CHILD,
+    DestroyWindow, ES_AUTOHSCROLL, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_STATECHANGE, GWL_STYLE,
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, MoveWindow,
+    SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WM_CAPTURECHANGED, WM_CHAR,
+    WM_CLEAR, WM_CUT, WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_PASTE, WM_SETFONT, WM_SETTEXT, WM_UNDO,
+    WS_CHILD, WS_VISIBLE,
 };
 
 pub(crate) const NO_NOTEBOOK: &str = "Open a notebook to search it.";
@@ -306,6 +308,37 @@ fn window_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer)
 }
 
+/// How often the summary and status lines may announce a change while a search runs (spec §10).
+const ANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What screen readers last heard the summary and status lines say, and when.
+#[derive(Debug, Default)]
+pub(crate) struct Spoken {
+    summary: String,
+    status: String,
+    at: Option<std::time::Instant>,
+}
+
+/// One of the Search view's MSAA children (see the view's `AccessibleView` impl).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchChild {
+    Box,
+    Toggle(SearchOption),
+    Summary,
+    Status,
+    Result(usize),
+}
+
+/// A result's accessible name (spec §10): "<name>, <folder>: <snippet>". A note at the
+/// notebook's root has no folder, so it reads "<name>: <snippet>".
+pub(crate) fn result_name(hit: &TextHit) -> String {
+    if hit.folder.is_empty() {
+        format!("{}: {}", hit.name, hit.snippet.text)
+    } else {
+        format!("{}, {}: {}", hit.name, hit.folder, hit.snippet.text)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SearchView {
     panel: HWND,
@@ -325,6 +358,11 @@ pub(crate) struct SearchView {
     stale: bool,
     /// The query the results are for: the one the last search began with.
     pub(crate) query: String,
+    /// The box's text, kept at each `EN_CHANGE` (`query_changed`), so screen readers read it
+    /// without a `WM_GETTEXT` under the App borrow.
+    box_text: String,
+    /// What the summary and status lines last announced (`announce_lines`).
+    spoken: Spoken,
     /// The options the results are for: the view's options when the last search began. The find
     /// bar is seeded from `query` and these (Task 7).
     pub(crate) run_options: MatchOptions,
@@ -372,6 +410,8 @@ impl SearchView {
             failed: false,
             stale: false,
             query: String::new(),
+            box_text: String::new(),
+            spoken: Spoken::default(),
             run_options: MatchOptions::default(),
             results: Vec::new(),
             options: MatchOptions::default(),
@@ -773,6 +813,61 @@ impl SearchView {
         }
     }
 
+    /// Whether the box shows. Read from its style: `IsWindowVisible` would also ask its
+    /// ancestors, and a hidden test window hides everything.
+    fn box_shown(&self) -> bool {
+        self.edit.is_some_and(|edit| {
+            (unsafe { GetWindowLongPtrW(edit, GWL_STYLE) }) as u32 & WS_VISIBLE != 0
+        })
+    }
+
+    /// The summary line's text (or the notice painted in its place) and the status line's, as
+    /// `paint` draws them: while a notice shows, there is no status line.
+    fn shown_lines(&self) -> (Option<String>, Option<String>) {
+        match self.notice() {
+            Some(notice) => (Some(notice.to_owned()), None),
+            None => (self.summary().map(|(text, _)| text), self.status_line()),
+        }
+    }
+
+    /// The MSAA children before the results.
+    fn head_children(&self) -> Vec<SearchChild> {
+        let mut head = Vec::with_capacity(6);
+        if self.box_shown() {
+            head.push(SearchChild::Box);
+            head.extend(SearchOption::ALL.map(SearchChild::Toggle));
+        }
+        let (summary, status) = self.shown_lines();
+        if summary.is_some() {
+            head.push(SearchChild::Summary);
+        }
+        if status.is_some() {
+            head.push(SearchChild::Status);
+        }
+        head
+    }
+
+    fn child_at(&self, index: usize) -> Option<SearchChild> {
+        let head = self.head_children();
+        match head.get(index) {
+            Some(child) => Some(*child),
+            None => {
+                let result = index - head.len();
+                (result < self.results.len()).then_some(SearchChild::Result(result))
+            }
+        }
+    }
+
+    fn child_index(&self, child: SearchChild) -> Option<usize> {
+        let head = self.head_children();
+        match child {
+            SearchChild::Result(index) => {
+                (index < self.results.len()).then_some(head.len() + index)
+            }
+            _ => head.iter().position(|shown| *shown == child),
+        }
+    }
+
     fn row_under(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
         let area = self.list_area(client, dpi);
         if !inside(area, point) {
@@ -836,11 +931,13 @@ pub(crate) fn query_changed(hwnd: HWND) {
     let Some(edit) = with_view(hwnd, |view| view.edit).flatten() else {
         return;
     };
+    // Read with nothing of the App borrowed, and kept for screen readers.
     let query = window_text(edit);
     if text_search_host::searchable(&query) {
         text_search_host::schedule(hwnd);
         // "Type at least 2 characters." goes at once, not when the debounce ends.
         let panel = with_view(hwnd, |view| {
+            view.box_text.clone_from(&query);
             (view.search == SearchState::TooShort).then(|| {
                 view.search = SearchState::Idle;
                 view.panel
@@ -849,6 +946,7 @@ pub(crate) fn query_changed(hwnd: HWND) {
         .flatten();
         if let Some(panel) = panel {
             invalidate(panel);
+            announce_lines(hwnd, true);
         }
         return;
     }
@@ -860,6 +958,7 @@ pub(crate) fn query_changed(hwnd: HWND) {
     };
     let Some(panel) = with_view(hwnd, |view| {
         view.clear_results();
+        view.box_text.clone_from(&query);
         view.query = query;
         view.search = state;
         view.panel
@@ -867,6 +966,7 @@ pub(crate) fn query_changed(hwnd: HWND) {
         return;
     };
     invalidate(panel);
+    announce_lines(hwnd, true);
 }
 
 /// Part of `side_panel::refresh`. A new notebook cancels the search and clears the query and the
@@ -934,11 +1034,13 @@ pub(crate) fn begin_search(hwnd: HWND, query: &str, total: usize) {
     }) {
         invalidate(panel);
     }
+    announce_lines(hwnd, false);
 }
 
 /// A batch of the current search (`text_search_host::batch_arrived`). The panel repaints only if
 /// something it shows changed.
 pub(crate) fn apply_batch(hwnd: HWND, batch: SearchBatch) {
+    let settled = batch.end.is_some();
     let Some(panel) = with_view(hwnd, |view| view.panel) else {
         return;
     };
@@ -951,6 +1053,7 @@ pub(crate) fn apply_batch(hwnd: HWND, batch: SearchBatch) {
     if changed {
         invalidate(panel);
     }
+    announce_lines(hwnd, settled);
 }
 
 /// Shows a pattern's error in place of the summary, keeping the results, or clears it.
@@ -968,6 +1071,7 @@ pub(crate) fn set_pattern_error(hwnd: HWND, error: Option<String>) {
         return;
     };
     invalidate(panel);
+    announce_lines(hwnd, true);
 }
 
 pub(crate) fn options(hwnd: HWND) -> MatchOptions {
@@ -983,7 +1087,69 @@ pub(crate) fn toggle_option(hwnd: HWND, option: SearchOption) {
         return;
     };
     invalidate(panel);
+    announce_toggle(hwnd, option);
     text_search_host::run_now(hwnd);
+}
+
+/// Raises `EVENT_OBJECT_NAMECHANGE` for the summary and status lines whose text changed, at
+/// most once a second while a search runs (spec §10). `settled` (the search finished, failed or
+/// can't run) always speaks, so the limit never swallows the final count. A line that went away
+/// has no child left to name; the panel's reorder event covers it. Raised with nothing of the
+/// App borrowed: an in-context hook may call back into the panel's accessible object.
+pub(crate) fn announce_lines(hwnd: HWND, settled: bool) {
+    if side_panel::current_view(hwnd) != SidebarView::Search {
+        return;
+    }
+    let Some((panel, changed)) = with_view(hwnd, |view| {
+        let (summary, status) = view.shown_lines();
+        let (summary, status) = (summary.unwrap_or_default(), status.unwrap_or_default());
+        let summary_changed = summary != view.spoken.summary;
+        let status_changed = status != view.spoken.status;
+        if !summary_changed && !status_changed {
+            return None;
+        }
+        let running = matches!(view.search, SearchState::Running(_));
+        let recent = view
+            .spoken
+            .at
+            .is_some_and(|at| at.elapsed() < ANNOUNCE_INTERVAL);
+        if running && !settled && recent {
+            return None;
+        }
+        let mut changed = Vec::with_capacity(2);
+        if summary_changed && let Some(index) = view.child_index(SearchChild::Summary) {
+            changed.push(index);
+        }
+        if status_changed && let Some(index) = view.child_index(SearchChild::Status) {
+            changed.push(index);
+        }
+        view.spoken = Spoken {
+            summary,
+            status,
+            at: Some(std::time::Instant::now()),
+        };
+        Some((view.panel, changed))
+    })
+    .flatten() else {
+        return;
+    };
+    for index in changed {
+        sidebar_accessibility::notify(EVENT_OBJECT_NAMECHANGE, panel, Some(index));
+    }
+}
+
+/// Tells screen readers a toggle's checked state changed.
+fn announce_toggle(hwnd: HWND, option: SearchOption) {
+    if side_panel::current_view(hwnd) != SidebarView::Search {
+        return;
+    }
+    if let Some((panel, index)) = with_view(hwnd, |view| {
+        Some((view.panel, view.child_index(SearchChild::Toggle(option))?))
+    })
+    .flatten()
+    {
+        sidebar_accessibility::notify(EVENT_OBJECT_STATECHANGE, panel, Some(index));
+    }
 }
 
 /// Ctrl+Shift+F with a one-line selection: `text` replaces the box's text (escaped first when
@@ -1623,10 +1789,12 @@ pub(crate) fn edit_hwnd(hwnd: HWND) -> Option<HWND> {
     with_view(hwnd, |view| view.edit).flatten()
 }
 
-impl crate::window::sidebar_accessibility::AccessibleView for SearchView {
-    /// One list item per result. The search box is a real `Edit` with its own MSAA object.
+impl sidebar_accessibility::AccessibleView for SearchView {
+    /// The box, the three toggles, the summary and status lines while they show, then the
+    /// results. The status line comes before the results so its child ID stays put while
+    /// results stream in.
     fn accessible_count(&self, _client: RECT, _dpi: u32) -> usize {
-        self.results.len()
+        self.head_children().len() + self.results.len()
     }
 
     fn accessible_item(
@@ -1635,46 +1803,90 @@ impl crate::window::sidebar_accessibility::AccessibleView for SearchView {
         client: RECT,
         dpi: u32,
         focused: bool,
-    ) -> Option<crate::window::sidebar_accessibility::AccessibleItem> {
-        let result = self.results.get(index)?;
-        let (rect, visible) = crate::window::sidebar_accessibility::row_rect(
-            self.list_area(client, dpi),
-            &self.list,
-            index,
-        );
-        let name = if result.folder.is_empty() {
-            result.name.clone()
-        } else {
-            format!("{}, {}", result.name, result.folder)
-        };
-        Some(crate::window::sidebar_accessibility::list_item(
-            &name,
-            self.list.selected == Some(index),
-            focused,
-            rect,
-            visible,
-        ))
+    ) -> Option<AccessibleItem> {
+        let field = SearchView::field_rect(client, dpi);
+        Some(match self.child_at(index)? {
+            SearchChild::Box => {
+                let edit = self.edit?;
+                // The kept text: a WM_GETTEXT here would run under the App borrow.
+                sidebar_accessibility::field_item(
+                    &self.placeholder,
+                    self.box_text.clone(),
+                    unsafe { GetFocus() } == edit,
+                    field,
+                    edit,
+                )
+            }
+            SearchChild::Toggle(option) => {
+                let position = SearchOption::ALL.iter().position(|o| *o == option)?;
+                sidebar_accessibility::check_item(
+                    option_toggles::label(option),
+                    self.options.get(option),
+                    option_toggles::toggle_rects(field, dpi)[position],
+                )
+            }
+            SearchChild::Summary => sidebar_accessibility::text_item(
+                &self.shown_lines().0.unwrap_or_default(),
+                SearchView::summary_rect(client, dpi),
+            ),
+            SearchChild::Status => sidebar_accessibility::text_item(
+                &self.shown_lines().1.unwrap_or_default(),
+                SearchView::status_rect(client, dpi),
+            ),
+            SearchChild::Result(row) => {
+                let hit = self.results.get(row)?;
+                let (rect, visible) =
+                    sidebar_accessibility::row_rect(self.list_area(client, dpi), &self.list, row);
+                sidebar_accessibility::list_item(
+                    &result_name(hit),
+                    self.list.selected == Some(row),
+                    focused,
+                    rect,
+                    visible,
+                )
+            }
+        })
     }
 
     fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
-        self.row_under(point, client, dpi)
+        let field = SearchView::field_rect(client, dpi);
+        let (summary, status) = self.shown_lines();
+        let child = if self.box_shown() && inside(field, point) {
+            option_toggles::hit(&option_toggles::toggle_rects(field, dpi), point)
+                .map_or(SearchChild::Box, SearchChild::Toggle)
+        } else if summary.is_some() && inside(SearchView::summary_rect(client, dpi), point) {
+            SearchChild::Summary
+        } else if status.is_some() && inside(SearchView::status_rect(client, dpi), point) {
+            SearchChild::Status
+        } else {
+            SearchChild::Result(self.row_under(point, client, dpi)?)
+        };
+        self.child_index(child)
     }
 
     fn accessible_current(&self, _client: RECT, _dpi: u32) -> Option<usize> {
-        self.list.selected
+        self.child_index(SearchChild::Result(self.list.selected?))
     }
 
     fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
-        if index < self.results.len() {
+        if let Some(SearchChild::Result(row)) = self.child_at(index) {
             let area = self.list_area(client, dpi);
-            self.list.select(index, area.bottom - area.top);
+            self.list.select(row, area.bottom - area.top);
         }
     }
 
     fn accessible_identity(&self, index: usize, _client: RECT, _dpi: u32) -> Option<u64> {
-        self.results
-            .get(index)
-            .map(|result| crate::window::sidebar_accessibility::identity_of(&result.path))
+        Some(match self.child_at(index)? {
+            SearchChild::Box => sidebar_accessibility::identity_of(&"search box"),
+            SearchChild::Toggle(option) => {
+                sidebar_accessibility::identity_of(&("toggle", option_toggles::label(option)))
+            }
+            SearchChild::Summary => sidebar_accessibility::identity_of(&"summary"),
+            SearchChild::Status => sidebar_accessibility::identity_of(&"status"),
+            SearchChild::Result(row) => {
+                sidebar_accessibility::identity_of(&self.results.get(row)?.path)
+            }
+        })
     }
 
     fn accessible_generation(&self) -> u64 {
@@ -1786,6 +1998,31 @@ mod tests {
                 "{dpi}"
             );
         }
+    }
+
+    #[test]
+    fn a_result_reads_its_name_folder_and_snippet() {
+        // Break caught: a screen reader hearing only the note name, with no hint of why it
+        // matched, or a stray ", " for a note at the root.
+        use super::result_name;
+        let hit = |folder: &str| TextHit {
+            path: PathBuf::from("q1.md"),
+            name: "Q1 budget".to_owned(),
+            folder: folder.to_owned(),
+            snippet: Snippet {
+                text: "\u{2026}paid the invoice march 3\u{2026}".to_owned(),
+                highlight: 12..25,
+            },
+            stamp: None,
+        };
+        assert_eq!(
+            result_name(&hit("work")),
+            "Q1 budget, work: \u{2026}paid the invoice march 3\u{2026}"
+        );
+        assert_eq!(
+            result_name(&hit("")),
+            "Q1 budget: \u{2026}paid the invoice march 3\u{2026}"
+        );
     }
 
     #[test]
