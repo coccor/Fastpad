@@ -19,9 +19,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetClientRect, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, IsZoomed, MINMAXINFO, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CYFRAME,
-    SM_CYSIZE, WM_NCCALCSIZE, WM_NCHITTEST,
+    DefWindowProcW, DestroyIcon, GetClientRect, HICON, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON,
+    HTMINBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, MINMAXINFO, NCCALCSIZE_PARAMS,
+    SM_CXPADDEDBORDER, SM_CYFRAME, SM_CYSIZE, WM_NCCALCSIZE, WM_NCHITTEST,
 };
 
 const GLYPH_MINIMIZE: &str = "\u{E921}";
@@ -596,6 +596,39 @@ impl Drop for TitleFonts {
                 unsafe {
                     DeleteObject(font);
                 }
+            }
+        }
+    }
+}
+
+/// The activity bar's logo icon, loaded (`main_window::load_logo_icon`) for one DPI and destroyed
+/// on drop (with the App at `WM_NCDESTROY`), the same lifetime `TitleFonts` has.
+#[derive(Debug)]
+pub(crate) struct LogoIcon {
+    dpi: u32,
+    icon: HICON,
+}
+
+impl LogoIcon {
+    /// Takes ownership of `icon`, already loaded for `dpi`.
+    pub(crate) fn new(dpi: u32, icon: HICON) -> Self {
+        Self { dpi, icon }
+    }
+
+    pub(crate) fn dpi(&self) -> u32 {
+        self.dpi
+    }
+
+    pub(crate) fn icon(&self) -> HICON {
+        self.icon
+    }
+}
+
+impl Drop for LogoIcon {
+    fn drop(&mut self) {
+        if !self.icon.is_null() {
+            unsafe {
+                DestroyIcon(self.icon);
             }
         }
     }
@@ -1241,8 +1274,54 @@ unsafe fn draw_text(dc: HDC, text: &str, rect: Rect, format: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HitTarget, PointerState, Rect, Size, TitleBarLayout, frame_client_rect};
+    use super::{HitTarget, LogoIcon, PointerState, Rect, Size, TitleBarLayout, frame_client_rect};
     use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOP};
+
+    #[test]
+    fn a_logo_icon_destroys_its_handle_on_drop() {
+        // Break caught: a DPI change (which replaces `App.logo_icon`) leaking one GDI icon handle
+        // every time, because `Drop` never calls `DestroyIcon`.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIcon, GetIconInfo, ICONINFO};
+        let and_mask = [0xffu8];
+        let xor_mask = [0x00u8];
+        let icon = unsafe {
+            CreateIcon(
+                std::ptr::null_mut(),
+                1,
+                1,
+                1,
+                1,
+                and_mask.as_ptr(),
+                xor_mask.as_ptr(),
+            )
+        };
+        assert!(
+            !icon.is_null(),
+            "test setup: could not create a throwaway icon"
+        );
+        {
+            let logo = LogoIcon::new(96, icon);
+            assert_eq!(logo.dpi(), 96);
+            let mut info = ICONINFO::default();
+            assert_ne!(
+                unsafe { GetIconInfo(logo.icon(), &mut info) },
+                0,
+                "the icon is alive before drop"
+            );
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::DeleteObject(info.hbmMask);
+                if !info.hbmColor.is_null() {
+                    windows_sys::Win32::Graphics::Gdi::DeleteObject(info.hbmColor);
+                }
+            }
+        }
+        let mut info = ICONINFO::default();
+        assert_eq!(
+            unsafe { GetIconInfo(icon, &mut info) },
+            0,
+            "drop destroyed the icon"
+        );
+    }
 
     #[test]
     fn a_sidebar_offset_moves_the_tabs_right_and_keeps_its_strip_as_caption() {

@@ -16,13 +16,16 @@ use crate::window::messages::{
 use crate::window::modal::prompt_close_decision;
 use crate::window::palette::Palette;
 use crate::window::tabs::CloseReviewKey;
-use crate::window::titlebar::{HitTarget, PointerState, TitleBarLayout, TitleFontHandles};
+use crate::window::titlebar::{
+    HitTarget, LogoIcon, PointerState, TitleBarLayout, TitleFontHandles,
+};
 #[cfg(test)]
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{HDC, InvalidateRect};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, NMHDR, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -31,19 +34,20 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE,
-    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCAPTION, IsWindow,
-    IsWindowVisible, IsZoomed, KillTimer, LoadIconW, MoveWindow, OBJID_CLIENT, PostMessageW,
-    PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE,
-    SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    UnregisterClassW, WHEEL_DELTA, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
-    WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY,
-    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HICON, HTCAPTION, IMAGE_ICON,
+    IsWindow, IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadIconW, LoadImageW,
+    MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE,
+    SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_ACTIVATEAPP,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE,
+    WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
+    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -231,6 +235,11 @@ unsafe extern "system" fn main_window_proc(
             // an offline drive this can hold the close for one save's I/O timeout.
             crate::window::text_search_host::cancel_replace(hwnd);
             crate::window::text_search_host::join_writers(hwnd);
+            // Dropping it here destroys the icon (`LogoIcon::drop`); `WM_NCDESTROY` still frees
+            // the rest of App, but the logo shouldn't wait for that.
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                unsafe { app.as_mut() }.logo_icon = None;
+            }
             unsafe {
                 KillTimer(hwnd, crate::recovery::RECOVERY_TIMER_ID);
                 KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
@@ -627,6 +636,9 @@ unsafe extern "system" fn main_window_proc(
             {
                 let _ = editor.set_text_padding(dpi);
             }
+            // Replaces (and drops, which destroys) any icon loaded for the old DPI. The bar's own
+            // resize below repaints it, so no separate invalidate is needed here.
+            ensure_logo_icon(hwnd, dpi);
             // The suggested rectangle may keep the size, and then no WM_SIZE re-lays out the
             // sidebar and bands for the new DPI.
             layout_editor_and_find_bar(hwnd);
@@ -2623,11 +2635,77 @@ fn build_chrome(hwnd: HWND) {
     }
     apply_theme(hwnd);
     layout_editor_and_find_bar(hwnd);
+    load_and_show_logo(hwnd);
     unsafe {
         windows_sys::Win32::UI::Shell::DragAcceptFiles(hwnd, 1);
         InvalidateRect(hwnd, std::ptr::null(), 1);
     }
     crate::window::library_host::accept_editor_file_drops(hwnd);
+}
+
+/// Loads the activity bar's logo icon at the window's current DPI (the deferred chrome step, the
+/// first time the icon is loaded at all: nothing before first paint touches it) and invalidates
+/// only its rect on the bar, if the sidebar exists yet.
+fn load_and_show_logo(hwnd: HWND) {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    ensure_logo_icon(hwnd, dpi);
+    let bar = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .sidebar
+            .as_ref()
+            .map(|sidebar| sidebar.bar)
+    });
+    if let Some(bar) = bar {
+        let mut client = RECT::default();
+        unsafe { GetClientRect(bar, &mut client) };
+        let rect = crate::window::activity_bar::logo_rect(client, dpi);
+        unsafe { InvalidateRect(bar, &rect, 1) };
+    }
+}
+
+/// Loads the logo icon for `dpi` unless it is already loaded at that DPI, replacing (and, by
+/// dropping it, destroying) any icon loaded at a different one. Call only from `build_chrome`
+/// (after first paint) and the `WM_DPICHANGED` handler; a paint must never trigger a load.
+fn ensure_logo_icon(hwnd: HWND, dpi: u32) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        if app.logo_icon.as_ref().is_some_and(|logo| logo.dpi() == dpi) {
+            return;
+        }
+        app.logo_icon = load_logo_icon(dpi).map(|icon| LogoIcon::new(dpi, icon));
+    }
+}
+
+/// The logo icon loaded for `dpi`, or `None` before `build_chrome` has run, or momentarily while a
+/// different DPI's icon hasn't been reloaded yet. Never loads; call it with nothing of the App
+/// borrowed, from `activity_bar::paint`.
+pub(crate) fn logo_icon(hwnd: HWND, dpi: u32) -> Option<HICON> {
+    unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .logo_icon
+            .as_ref()
+            .filter(|logo| logo.dpi() == dpi)
+            .map(LogoIcon::icon)
+    })
+}
+
+/// Loads the app's icon resource (`APP_ICON_RESOURCE_ID`, embedded by `build.rs`) at `dpi`'s pixel
+/// size. No file I/O: it is already resident in the module. `None` if the resource is missing
+/// (e.g. a test binary built without it) or the load otherwise fails.
+fn load_logo_icon(dpi: u32) -> Option<HICON> {
+    let px = crate::window::panel::scale(20, dpi);
+    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let handle = unsafe {
+        LoadImageW(
+            instance,
+            APP_ICON_RESOURCE_ID as *const u16,
+            IMAGE_ICON,
+            px,
+            px,
+            LR_DEFAULTCOLOR,
+        )
+    };
+    (!handle.is_null()).then_some(handle)
 }
 
 /// Re-queries the system theme after chrome exists and restyles the editor only on a real change.
@@ -7367,6 +7445,90 @@ mod tests {
                 HTLEFT as LRESULT
             );
         }
+    }
+
+    // The icon resource (`APP_ICON_RESOURCE_ID`) is embedded by `build.rs` only into the FastPad
+    // binaries (`rustc-link-arg-bins`), not into this lib's own unit-test binary, so
+    // `load_logo_icon` returns `None` here regardless of DPI. The two tests below cover what is
+    // true either way: the load never runs before the deferred chrome step, and the square it
+    // would draw into stays caption; `ensure_logo_icon`'s replace-on-a-different-DPI wiring is
+    // exercised with a synthetic icon standing in for a loaded one. The real load, the drawn
+    // pixels and the destroy-on-drop are covered end to end by
+    // `tests/windows/titlebar.rs`'s `the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_square_stays_caption`
+    // (a real `fastpad.exe`, which does have the resource) and by
+    // `titlebar::tests::a_logo_icon_destroys_its_handle_on_drop`.
+    #[test]
+    fn the_deferred_chrome_step_is_the_first_to_touch_the_logo_and_its_square_stays_caption() {
+        // Break caught: the logo loaded before first paint (new startup latency), or its square
+        // stealing the caption hit test once something is drawn there.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTTRANSPARENT, WM_NCHITTEST};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        assert!(
+            app_mut(window.hwnd).logo_icon.is_none(),
+            "nothing loads the logo before the deferred chrome step"
+        );
+
+        super::build_chrome(window.hwnd);
+
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let (bar, _panel) = sidebar_windows(window.hwnd);
+        let (width, height) = client_size(bar);
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let rect = crate::window::activity_bar::logo_rect(client, dpi);
+        let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        let hit = |target: HWND| unsafe {
+            SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
+        };
+        assert_eq!(hit(bar), HTTRANSPARENT as LRESULT);
+        assert_eq!(hit(window.hwnd), HTCAPTION as LRESULT);
+    }
+
+    #[test]
+    fn ensure_logo_icon_leaves_a_matching_dpi_alone_and_replaces_a_different_one() {
+        // Break caught: a DPI change that keeps the old icon around (never reloaded) or leaves it
+        // set at the wrong DPI.
+        use windows_sys::Win32::UI::WindowsAndMessaging::CreateIcon;
+        let window = ProductionWindow::new(make_app());
+        // Stands in for a load already having succeeded at 96 DPI; the real loader can't run in
+        // this test binary (see the comment above).
+        let and_mask = [0xffu8];
+        let xor_mask = [0x00u8];
+        let icon = unsafe {
+            CreateIcon(
+                std::ptr::null_mut(),
+                1,
+                1,
+                1,
+                1,
+                and_mask.as_ptr(),
+                xor_mask.as_ptr(),
+            )
+        };
+        assert!(!icon.is_null());
+        app_mut(window.hwnd).logo_icon = Some(crate::window::titlebar::LogoIcon::new(96, icon));
+
+        super::ensure_logo_icon(window.hwnd, 96);
+        assert_eq!(
+            app_mut(window.hwnd).logo_icon.as_ref().unwrap().icon(),
+            icon,
+            "the same DPI is a no-op, not a reload"
+        );
+
+        super::ensure_logo_icon(window.hwnd, 144);
+        assert!(
+            app_mut(window.hwnd)
+                .logo_icon
+                .as_ref()
+                .is_none_or(|logo| logo.dpi() != 96),
+            "a different DPI replaces the stale one"
+        );
     }
 
     #[test]

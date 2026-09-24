@@ -423,6 +423,83 @@ fn title_strip_owns_the_top_edge_and_its_caption_buttons_still_work() -> TestRes
     Ok(())
 }
 
+#[test]
+fn the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_square_stays_caption()
+-> TestResult<()> {
+    // Break caught: the corner staying empty forever (the deferred load never ran or never
+    // repainted), or something drawn there stealing the drag/caption hit test from the window.
+    use windows_sys::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTTRANSPARENT};
+
+    let _dpi = DpiContext::per_monitor_v2()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+
+    let bar_class = wide_null("FastPadActivityBar");
+    let bar = unsafe {
+        FindWindowExW(
+            hwnd,
+            std::ptr::null_mut(),
+            bar_class.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    assert!(
+        !bar.is_null(),
+        "notes mode is on by default: the bar exists"
+    );
+
+    let (_, origin, layout) = frame_geometry(hwnd)?;
+    let mut bar_client = RECT::default();
+    assert_ne!(unsafe { GetClientRect(bar, &mut bar_client) }, 0);
+    let mut bar_origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    assert_ne!(unsafe { ClientToScreen(bar, &mut bar_origin) }, 0);
+    // The bar sits at the main window's client origin (spec: `side_panel::layout`), so bar-local
+    // and main-window-local coordinates coincide.
+    assert_eq!((bar_origin.x, bar_origin.y), (origin.x, origin.y));
+    // Centred in the top square: `x` is the bar's own centre, `y` is half the title strip's
+    // height regardless of the logo's size (a size `s` centred in `[0, height)` sits at
+    // `(height - s) / 2 .. (height + s) / 2`, whose midpoint is always `height / 2`).
+    let logo_x = (bar_client.right - bar_client.left) / 2;
+    let logo_y = layout.height / 2;
+
+    // A hit test at the logo's centre still gives the caption: the bar answers HTTRANSPARENT and
+    // the main window answers HTCAPTION.
+    assert_eq!(
+        hit_test(bar, bar_origin, Point::new(logo_x, logo_y)),
+        HTTRANSPARENT as isize
+    );
+    assert_eq!(
+        hit_test(hwnd, origin, Point::new(logo_x, logo_y)),
+        HTCAPTION as isize
+    );
+
+    // The icon has been loaded and drawn by then: its centre differs from the strip's plain fill,
+    // sampled a few pixels into the square's corner (well clear of the centred, smaller icon).
+    let sample = |x: i32, y: i32| unsafe {
+        let dc = GetDC(bar);
+        assert!(!dc.is_null());
+        let pixel = GetPixel(dc, x, y);
+        ReleaseDC(bar, dc);
+        pixel
+    };
+    let background = sample(2, 2);
+    // A few points near, not exactly on, the centre: the icon's own artwork (a notebook with a
+    // cutout bolt) can put the exact centre pixel back over the background.
+    let near_centre = [(-4, -3), (4, -3), (-4, 3), (4, 3)];
+    wait_until(
+        "the logo icon painted over the strip background",
+        Duration::from_secs(3),
+        || {
+            near_centre
+                .iter()
+                .any(|(dx, dy)| sample(logo_x + dx, logo_y + dy) != background)
+        },
+    )?;
+
+    process.close()
+}
+
 fn frame_geometry(
     hwnd: windows_sys::Win32::Foundation::HWND,
 ) -> TestResult<(RECT, windows_sys::Win32::Foundation::POINT, TitleBarLayout)> {

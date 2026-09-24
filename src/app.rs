@@ -14,7 +14,7 @@ use crate::window::menus::{AcceleratorTable, MenuBar};
 use crate::window::notification::NotificationCenter;
 use crate::window::status::StatusModel;
 use crate::window::tabs::Tabs;
-use crate::window::titlebar::{PointerState, TitleFonts};
+use crate::window::titlebar::{LogoIcon, PointerState, TitleFonts};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::rc::Rc;
@@ -57,6 +57,9 @@ pub struct App {
     pub(crate) status: Option<StatusModel>,
     pub(crate) title_fonts: Option<TitleFonts>,
     pub(crate) title_pointer: PointerState,
+    /// The activity bar's logo icon, loaded for the window's DPI by the post-first-paint deferred
+    /// chrome step (`main_window::build_chrome`) and reloaded on a DPI change.
+    pub(crate) logo_icon: Option<LogoIcon>,
     /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
     pub(crate) tab_thumb_grab: Option<i32>,
     pub(crate) dark_frame_applied: bool,
@@ -130,6 +133,7 @@ impl App {
             status: None,
             title_fonts: None,
             title_pointer: PointerState::default(),
+            logo_icon: None,
             tab_thumb_grab: None,
             dark_frame_applied: false,
             notifications: NotificationCenter::new(),

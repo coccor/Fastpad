@@ -17,9 +17,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetClientRect, GetParent, HTTRANSPARENT, OBJID_CLIENT, WM_CAPTURECHANGED,
-    WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS,
+    DI_NORMAL, DefWindowProcW, DrawIconEx, GetClientRect, GetParent, HTTRANSPARENT, OBJID_CLIENT,
+    WM_CAPTURECHANGED, WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS,
 };
 
 /// Segoe MDL2 Assets glyphs: Library, Search, FavoriteStar, Setting.
@@ -108,6 +108,23 @@ pub(crate) fn button_rects(client: RECT, dpi: u32) -> [RECT; 4] {
         square(top + 2 * size),
         square(settings_top),
     ]
+}
+
+/// The app logo's rect in the bar's `client` coordinates at `dpi`: a `scale(20, dpi)` px square,
+/// centred in the top square (`x` 0 to the bar's width, `y` 0 to `titlebar::strip_height`), above
+/// `button_rects(..)[0].top`. Clamped to fit when the bar is narrower than the logo.
+pub(crate) fn logo_rect(client: RECT, dpi: u32) -> RECT {
+    let width = (client.right - client.left).max(0);
+    let height = crate::window::titlebar::strip_height(dpi).max(0);
+    let size = scale(20, dpi).min(width).min(height).max(0);
+    let left = client.left + (width - size) / 2;
+    let top = client.top + (height - size) / 2;
+    RECT {
+        left,
+        top,
+        right: left + size,
+        bottom: top + size,
+    }
 }
 
 pub(crate) fn button_at(rects: &[RECT; 4], x: i32, y: i32) -> Option<ActivityButton> {
@@ -266,11 +283,31 @@ fn paint(main: HWND, bar: HWND) {
     let palette = super::main_window::current_palette(main);
     let dpi = unsafe { GetDpiForWindow(bar) }.max(96);
     let glyph = super::main_window::ui_fonts(main).bar_glyph;
+    // `None` until the deferred chrome step loads it (or momentarily during a DPI change); the
+    // corner then paints as it does today, empty.
+    let logo = super::main_window::logo_icon(main, dpi);
     let state = with_bar_state(main, |state| *state).unwrap_or_default();
     let view = side_panel::current_view(main);
     let accent = scale(ACCENT_WIDTH_96, dpi);
     paint_buffered(bar, |dc, client| unsafe {
         fill(dc, client, palette.strip_background);
+        if let Some(icon) = logo {
+            let rect = logo_rect(client, dpi);
+            let size = rect.right - rect.left;
+            if size > 0 {
+                DrawIconEx(
+                    dc,
+                    rect.left,
+                    rect.top,
+                    icon,
+                    size,
+                    size,
+                    0,
+                    std::ptr::null_mut(),
+                    DI_NORMAL,
+                );
+            }
+        }
         let rects = button_rects(client, dpi);
         for button in ActivityButton::ALL {
             let rect = rects[button.index()];
@@ -485,7 +522,7 @@ pub(crate) fn paint_keyboard_focus(bar: HWND, hdc: windows_sys::Win32::Graphics:
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityButton, button_at, button_rects, notebook_label};
+    use super::{ActivityButton, button_at, button_rects, logo_rect, notebook_label, scale};
     use crate::config::SidebarView;
     use windows_sys::Win32::Foundation::RECT;
 
@@ -519,6 +556,40 @@ mod tests {
         assert_eq!(button_at(&rects, 10, 690), Some(ActivityButton::Settings));
         assert_eq!(button_at(&rects, 10, 20), None);
         assert_eq!(button_at(&rects, 10, 300), None);
+    }
+
+    #[test]
+    fn the_logo_rect_is_a_centred_scale_20_square_above_the_first_button() {
+        // Break caught: a logo drawn off-centre, at the wrong size, or spilling into the button
+        // row it sits above.
+        for dpi in [96, 144, 192] {
+            let client = bar(200, 700);
+            let rect = logo_rect(client, dpi);
+            let size = scale(20, dpi);
+            assert_eq!(rect.right - rect.left, size, "dpi {dpi}: wrong width");
+            assert_eq!(rect.bottom - rect.top, size, "dpi {dpi}: wrong height");
+            let width = client.right - client.left;
+            let height = crate::window::titlebar::strip_height(dpi);
+            assert_eq!(rect.left, (width - size) / 2, "dpi {dpi}: not centred (x)");
+            assert_eq!(rect.top, (height - size) / 2, "dpi {dpi}: not centred (y)");
+            assert!(
+                rect.bottom <= button_rects(client, dpi)[0].top,
+                "dpi {dpi}: the logo overlaps the first button"
+            );
+        }
+    }
+
+    #[test]
+    fn the_logo_rect_is_clamped_to_a_bar_narrower_than_the_logo() {
+        // Break caught: an unclamped rect that reaches past the bar's edges when the bar is
+        // narrower than the logo would need.
+        let dpi = 96;
+        let size = scale(20, dpi);
+        let narrow = bar(size - 6, 700);
+        let rect = logo_rect(narrow, dpi);
+        assert_eq!(rect.left, 0);
+        assert_eq!(rect.right, size - 6);
+        assert_eq!(rect.right - rect.left, size - 6);
     }
 
     #[test]
