@@ -226,7 +226,9 @@ unsafe extern "system" fn main_window_proc(
         WM_DESTROY => {
             // A running text search stops reading: its posts would fail from here on anyway.
             crate::window::text_search_host::cancel(hwnd);
-            // A replace stops too; a note being written is finished before the window goes.
+            // A replace stops too. Its write worker finishes the note in hand and is waited for
+            // here: were the process to exit mid-save, that note could be left half written. On
+            // an offline drive this can hold the close for one save's I/O timeout.
             crate::window::text_search_host::cancel_replace(hwnd);
             crate::window::text_search_host::join_writers(hwnd);
             unsafe {
@@ -4132,8 +4134,15 @@ pub(crate) fn replace_in_document(
     match inactive {
         None => replace(&editor).ok(),
         Some((target, active)) => {
-            let replaced =
-                with_inactive_document(hwnd, &identity, &editor, &target, &active, replace).ok()?;
+            // What the edit replaced, even if restoring the active tab then fails: the tab's
+            // text changed, so it must be marked edited.
+            let done = std::cell::Cell::new(None);
+            let result = with_inactive_document(hwnd, &identity, &editor, &target, &active, |e| {
+                let replaced = replace(e)?;
+                done.set(Some(replaced));
+                Ok(replaced)
+            });
+            let replaced = done.get().or(result.ok())?;
             if replaced > 0 && identity.is_live_for(hwnd) {
                 let changed = unsafe { app_ptr(hwnd) }
                     .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.note_background_edit(id));
@@ -4146,16 +4155,24 @@ pub(crate) fn replace_in_document(
     }
 }
 
+/// A tab's text generation and disk stamp, taken when a reload of it begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TabMark {
+    pub generation: u64,
+    pub disk_stamp: Option<crate::library::DiskStamp>,
+}
+
 /// Shows `loaded` (read on a worker) in tab `id`, as a file open populates a tab: no undo
 /// history and no notifications, the tab left clean, and its encoding and disk stamp taken from
 /// the read. The caret and scroll position stay where they were, as far as the new text allows.
-/// Only a tab still open on `path` and still clean is changed: an edit since keeps its text, and
-/// its old disk stamp pauses its autosave. Returns whether the tab was reloaded. Call it with
-/// nothing of the App borrowed.
+/// Only a tab still open on `path`, still clean, and with the same generation and disk stamp as
+/// `mark` is changed: an edit since (saved or not) keeps its text, and its old disk stamp pauses
+/// its autosave. Returns whether the tab was reloaded. Call it with nothing of the App borrowed.
 pub(crate) fn reload_clean_document(
     hwnd: HWND,
     id: DocumentId,
     path: &std::path::Path,
+    mark: TabMark,
     loaded: &crate::file::loader::LoadedFile,
     stamp: Option<crate::library::DiskStamp>,
 ) -> bool {
@@ -4170,7 +4187,11 @@ pub(crate) fn reload_clean_document(
         let editor = app.editor.clone()?;
         let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
-        if target.dirty || target.path.as_deref() != Some(path) {
+        let unchanged = TabMark {
+            generation: target.generation,
+            disk_stamp: target.disk_stamp,
+        } == mark;
+        if target.dirty || target.path.as_deref() != Some(path) || !unchanged {
             return None;
         }
         if target.id == active.id {
@@ -12312,8 +12333,179 @@ mod tests {
             wait_for_report(window.hwnd),
             "Replaced 1 match in 1 note. 1 note was skipped because it changed since the search. (b)"
         );
+        assert_eq!(
+            crate::window::modal::take_last_confirm(),
+            Some(format!(
+                "Replace 1 match in 1 note with \"pin\"?{SAVED_LINE}"
+            )),
+            "b is never read, so the question doesn't count it"
+        );
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "b needle");
+    }
+
+    #[test]
+    fn a_new_search_drops_a_replace_that_has_not_asked_yet() {
+        // Break caught (review Important 1): a count still running or held when the user types
+        // another query asking its question anyway, so a Yes saves the old query's replacement
+        // while the results show the new one.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-new-search");
+        let a = scratch.note("a.md", "needle other");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        crate::window::modal::take_last_confirm();
+        let asked = decline_next_confirm();
+
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert!(crate::window::text_search_host::replacing(window.hwnd));
+        type_into_search(window.hwnd, "other");
+        assert!(
+            !crate::window::text_search_host::replacing(window.hwnd),
+            "the keystroke dropped the replace"
+        );
+        // A count for the current generation, made for the old results: the box shows another
+        // query, so it is not asked about either.
+        crate::window::text_search_host::replace_counted(
+            window.hwnd,
+            crate::window::text_search_host::test_counted(
+                window.hwnd,
+                crate::window::text_search_host::replace_generation(window.hwnd),
+                one_closed_match(),
+            ),
+        );
+        assert!(!asked.get(), "nothing asked");
+        assert_eq!(crate::window::modal::take_last_confirm(), None);
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle other");
+        // The queued answer was never used: take it, so no later test gets it.
+        assert!(!crate::window::modal::confirm(window.hwnd, "drain"));
+        crate::window::modal::take_last_confirm();
+    }
+
+    #[test]
+    fn a_reload_leaves_a_tab_edited_and_saved_since_its_file_was_read() {
+        // Break caught (review Minor 1): the user's edit, saved (by Ctrl+S or autosave) after the
+        // reload read the file but before its text arrived, replaced in the editor by the older
+        // file text, with the tab then claiming the older disk stamp.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-reload-edited");
+        let b = scratch.note("b.md", "b needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        std::fs::write(&b, "b pin").unwrap();
+        let report = crate::library::text_replace::ReplaceReport {
+            matches: 1,
+            written: vec![(
+                PathBuf::from("b.md"),
+                crate::library::text_search::Stamp { size: 5, mtime: 1 },
+            )],
+            ..Default::default()
+        };
+        crate::window::text_search_host::replace_written(
+            window.hwnd,
+            crate::window::text_search_host::test_written(
+                crate::window::text_search_host::replace_generation(window.hwnd),
+                report,
+            ),
+        );
+        // The reload has read "b pin" and posted it; it is not dispatched yet.
+        let message = crate::window::WM_FASTPAD_REPLACE_RELOADED;
+        pump_until_queued(window.hwnd, message);
+
+        editor.set_text("b mine").unwrap();
+        execute_command(window.hwnd, CommandId::Save);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b mine");
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+        pump_posted_messages(window.hwnd);
+        let mut queued = MSG::default();
+        assert_eq!(
+            unsafe { PeekMessageW(&mut queued, window.hwnd, message, message, PM_NOREMOVE) },
+            0,
+            "the reload was dispatched"
+        );
+        assert_eq!(editor.text().unwrap(), "b mine", "the saved edit stays");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().disk_stamp,
+            crate::library::disk_stamp(&b)
+        );
+    }
+
+    /// Waits, without dispatching anything, until `message` is queued for `hwnd`.
+    fn pump_until_queued(hwnd: HWND, message: u32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut queued = MSG::default();
+        while unsafe { PeekMessageW(&mut queued, hwnd, message, message, PM_NOREMOVE) } == 0 {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_write_report_and_its_reloads_wait_for_a_file_population_to_end() {
+        // Break caught (review Minor 6): a report's reloads swapping documents in the middle of a
+        // file population or a modal loop, or a held report or reload lost so the tab keeps the
+        // text from before the write.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-held-written");
+        let a = scratch.note("a.md", "a needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_path(window.hwnd, &a).unwrap();
+        pump_posted_messages(window.hwnd);
+        std::fs::write(&a, "a pin").unwrap();
+        let report = crate::library::text_replace::ReplaceReport {
+            matches: 1,
+            written: vec![(
+                PathBuf::from("a.md"),
+                crate::library::text_search::Stamp { size: 5, mtime: 1 },
+            )],
+            ..Default::default()
+        };
+        let reported = || {
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.starts_with("Replaced "))
+        };
+        let held = || crate::window::text_search_host::held_after_write(window.hwnd);
+
+        app_mut(window.hwnd).populating_file = true;
+        crate::window::text_search_host::replace_written(
+            window.hwnd,
+            crate::window::text_search_host::test_written(
+                crate::window::text_search_host::replace_generation(window.hwnd),
+                report,
+            ),
+        );
+        assert_eq!(held(), (true, 0));
+        crate::window::text_search_host::replace_timer(window.hwnd);
+        assert_eq!(held(), (true, 0), "still populating");
+        assert!(!reported());
+        app_mut(window.hwnd).populating_file = false;
+        crate::window::text_search_host::replace_timer(window.hwnd);
+        assert_eq!(held(), (false, 0));
+        assert!(reported());
+
+        app_mut(window.hwnd).populating_file = true;
+        pump_until(window.hwnd, || held().1 == 1);
+        assert_eq!(
+            editor.text().unwrap(),
+            "a needle",
+            "no reload during the population"
+        );
+        app_mut(window.hwnd).populating_file = false;
+        crate::window::text_search_host::replace_timer(window.hwnd);
+        assert_eq!(held(), (false, 0));
+        assert_eq!(editor.text().unwrap(), "a pin");
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
     }
 
     fn one_closed_match() -> crate::library::text_replace::ReplaceCount {

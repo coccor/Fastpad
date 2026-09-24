@@ -89,8 +89,16 @@ pub(crate) struct TextSearchHost {
     replace_cancel: Option<Arc<AtomicBool>>,
     /// A replace is between its start and its report, or its question's No: another press waits.
     replacing: bool,
+    /// The replace passed its question and is changing tabs or writing notes: a new search no
+    /// longer drops it (`drop_pending_replace`).
+    applying: bool,
     /// A count that arrived inside a modal loop or a file population, asked about once both end.
     held: Option<Box<ReplaceCounted>>,
+    /// A write report that arrived inside a modal loop or a file population.
+    held_written: Option<Box<ReplaceWritten>>,
+    /// Reloaded tab texts that arrived inside a modal loop or a file population. Kept through a
+    /// cancel: they are no replace's, only the files' current text.
+    held_reloads: Vec<ReplaceReloaded>,
     /// The write workers not known to have ended. `WM_DESTROY` joins them (`join_writers`), so
     /// the note being written when the window closes is finished, never left half written.
     writers: Vec<JoinHandle<()>>,
@@ -392,6 +400,16 @@ pub(crate) fn cancel(hwnd: HWND) {
     unsafe {
         KillTimer(hwnd, TEXT_SEARCH_TIMER_ID);
     }
+    drop_pending_replace(hwnd);
+}
+
+/// A new search (a keystroke, an option, `run_now`, a notebook change): a replace still counting,
+/// held or asking is for the results that search replaces, so it is dropped. One that passed its
+/// question goes on: its tabs are changed and its write is running.
+fn drop_pending_replace(hwnd: HWND) {
+    if with_host(hwnd, |host| host.replacing && !host.applying).unwrap_or(false) {
+        cancel_replace(hwnd);
+    }
 }
 
 /// A notebook change or close, or notes mode off: cancels the search and any replace, and
@@ -480,9 +498,19 @@ pub(crate) struct Candidate {
 #[derive(Debug)]
 pub(crate) struct ReplacePlan {
     notebook: PathBuf,
+    /// The results' query and options the plan was made for. The plan is dropped when the
+    /// Search view no longer shows them (`plan_current`).
+    query: String,
+    options: MatchOptions,
     matcher: Matcher,
     template: String,
+    /// The candidates the count reads: every one but `unread`.
     candidates: Vec<Candidate>,
+    /// Hits from a tab's text (no stamp) whose tab has closed: their file is never read, so they
+    /// are left out of the count and the question, and reported as changed since the search.
+    unread: Vec<PathBuf>,
+    /// How many notes the results list, for a capped question.
+    listed: usize,
     /// The `path_key`s of the candidates the count read from a tab's text. One whose tab closed
     /// before the split was never counted from its file and the question never warned about it,
     /// so it is never written.
@@ -523,6 +551,8 @@ struct Reload {
     id: DocumentId,
     /// The tab's path, as the tab has it.
     path: PathBuf,
+    /// The tab's generation and disk stamp when the reload began.
+    mark: super::main_window::TabMark,
     /// Read before the file, as a file open reads it.
     stamp: Option<library::DiskStamp>,
     /// `None` when the file couldn't be read, decoded or shown: the tab is left as it is.
@@ -597,7 +627,12 @@ fn prepare(
     let template = search_view::replace_text(hwnd);
     // Read with nothing of the App borrowed: a background tab is swapped into the editor.
     let overlays = target_overlays(hwnd, &notebook, &candidates);
-    let counted_open = overlays.keys().map(|path| path_key(path)).collect();
+    let counted_open: HashSet<String> = overlays.keys().map(|path| path_key(path)).collect();
+    let listed = candidates.len();
+    let (candidates, unread): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|candidate| {
+        candidate.stamp.is_some() || counted_open.contains(&path_key(&candidate.path))
+    });
+    let unread = unread.into_iter().map(|candidate| candidate.path).collect();
     let targets = candidates
         .iter()
         .map(|candidate| ReplaceTarget {
@@ -610,9 +645,13 @@ fn prepare(
         targets,
         ReplacePlan {
             notebook,
+            query,
+            options,
             matcher,
             template,
             candidates,
+            unread,
+            listed,
             counted_open,
             capped,
             single,
@@ -680,10 +719,7 @@ pub(crate) fn replace_counted(hwnd: HWND, lparam: LPARAM) {
         return;
     }
     if busy(hwnd) {
-        with_host(hwnd, |host| host.held = Some(counted));
-        unsafe {
-            SetTimer(hwnd, REPLACE_TIMER_ID, REPLACE_RETRY_MS, None);
-        }
+        hold(hwnd, |host| host.held = Some(counted));
         return;
     }
     confirm_and_apply(hwnd, *counted);
@@ -698,13 +734,45 @@ pub(crate) fn replace_timer(hwnd: HWND) {
     unsafe {
         KillTimer(hwnd, REPLACE_TIMER_ID);
     }
-    let Some(counted) = with_host(hwnd, |host| host.held.take()).flatten() else {
-        return;
-    };
-    if with_host(hwnd, |host| host.replace_generation) != Some(counted.generation) {
-        return;
+    let (reloads, written, counted) = with_host(hwnd, |host| {
+        (
+            std::mem::take(&mut host.held_reloads),
+            host.held_written.take(),
+            host.held.take(),
+        )
+    })
+    .unwrap_or_default();
+    for reloaded in reloads {
+        apply_reloads(hwnd, reloaded);
     }
-    confirm_and_apply(hwnd, *counted);
+    let current = || with_host(hwnd, |host| host.replace_generation);
+    if let Some(written) = written
+        && current() == Some(written.generation)
+    {
+        report_written(hwnd, written.report, written.tab_matches, written.tab_notes);
+    }
+    if let Some(counted) = counted
+        && current() == Some(counted.generation)
+    {
+        confirm_and_apply(hwnd, *counted);
+    }
+}
+
+/// Keeps a payload that arrived inside a modal loop or a file population for `replace_timer`.
+fn hold(hwnd: HWND, keep: impl FnOnce(&mut TextSearchHost)) {
+    with_host(hwnd, keep);
+    unsafe {
+        SetTimer(hwnd, REPLACE_TIMER_ID, REPLACE_RETRY_MS, None);
+    }
+}
+
+/// Whether the Search view still shows the results `plan` was made for: the same query and
+/// options in its results and in its box. Reads the box with nothing of the App borrowed.
+fn plan_current(hwnd: HWND, plan: &ReplacePlan) -> bool {
+    let same = |shown: Option<(String, MatchOptions)>| {
+        shown.is_some_and(|(query, options)| query == plan.query && options == plan.options)
+    };
+    same(search_view::run_query(hwnd)) && same(search_view::current_query(hwnd))
 }
 
 /// Asks (spec §11), then applies: the open tabs in the editor now, the closed notes on a worker.
@@ -716,6 +784,11 @@ fn confirm_and_apply(hwnd: HWND, counted: ReplaceCounted) {
         count,
         plan,
     } = counted;
+    // Another query or option since the start: the question would be about other results.
+    if !plan_current(hwnd, &plan) {
+        finish_replace(hwnd);
+        return;
+    }
     if count.matches == 0 {
         // The notes changed since the search: the results should show that.
         finish_replace(hwnd);
@@ -731,7 +804,7 @@ fn confirm_and_apply(hwnd: HWND, counted: ReplaceCounted) {
     } else {
         Some(confirm_text(
             count,
-            plan.candidates.len(),
+            plan.listed,
             plan.capped,
             &plan.template,
         ))
@@ -745,8 +818,12 @@ fn confirm_and_apply(hwnd: HWND, counted: ReplaceCounted) {
         }
         return;
     }
-    // A notebook change while the question was up makes the plan stale.
+    // A notebook change or a new search while the question was up makes the plan stale.
     if with_host(hwnd, |host| host.replace_generation) != Some(generation) {
+        return;
+    }
+    if !plan_current(hwnd, &plan) {
+        finish_replace(hwnd);
         return;
     }
     apply_plan(hwnd, generation, plan, count.closed_notes > 0);
@@ -760,14 +837,16 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
         matcher,
         template,
         candidates,
+        unread,
         counted_open,
         ..
     } = plan;
+    with_host(hwnd, |host| host.applying = true);
     let open = open_notes(hwnd, &notebook);
     let mut tab_matches = 0;
     let mut tab_notes = 0;
     let mut closed = Vec::new();
-    let mut stale = Vec::new();
+    let mut stale = unread;
     for candidate in candidates {
         let key = path_key(&candidate.path);
         match open.get(&key) {
@@ -804,7 +883,12 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
         report_written(hwnd, report, tab_matches, tab_notes);
         return;
     }
-    let Some(cancel) = with_host(hwnd, |host| host.replace_cancel.clone()).flatten() else {
+    let Some(cancel) = with_host(hwnd, |host| {
+        Arc::clone(
+            host.replace_cancel
+                .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
+        )
+    }) else {
         return;
     };
     let writer = spawn_write(
@@ -885,8 +969,13 @@ pub(crate) fn replace_written(hwnd: HWND, lparam: LPARAM) {
     if lparam == 0 {
         return;
     }
-    let written = *unsafe { Box::from_raw(lparam as *mut ReplaceWritten) };
+    let written = unsafe { Box::from_raw(lparam as *mut ReplaceWritten) };
     if with_host(hwnd, |host| host.replace_generation) != Some(written.generation) {
+        return;
+    }
+    // Its reloads swap documents, so it waits as a count does (`replace_timer`).
+    if busy(hwnd) {
+        hold(hwnd, |host| host.held_written = Some(written));
         return;
     }
     report_written(hwnd, written.report, written.tab_matches, written.tab_notes);
@@ -930,13 +1019,14 @@ fn report_written(hwnd: HWND, report: ReplaceReport, tab_matches: usize, tab_not
     run_now(hwnd);
 }
 
-/// The clean tabs whose file is one of `written` (relative to `notebook`), with the tab's path.
-/// Read from the tabs only: no disk.
-fn clean_tabs_on(
-    hwnd: HWND,
-    notebook: &Path,
-    written: &[(PathBuf, Stamp)],
-) -> Vec<(DocumentId, PathBuf)> {
+/// A clean tab to read again: its id and path, and its text generation and disk stamp now. The
+/// reload applies only while both are unchanged, so an edit (saved or not) made while the file
+/// was read is never replaced.
+type ReloadTab = (DocumentId, PathBuf, super::main_window::TabMark);
+
+/// The clean tabs whose file is one of `written` (relative to `notebook`). Read from the tabs
+/// only: no disk.
+fn clean_tabs_on(hwnd: HWND, notebook: &Path, written: &[(PathBuf, Stamp)]) -> Vec<ReloadTab> {
     let keys = written
         .iter()
         .map(|(path, _)| path_key(path))
@@ -951,7 +1041,13 @@ fn clean_tabs_on(
                     let path = document.path.as_deref()?;
                     (library::is_inside(notebook, path)
                         && keys.contains(&path_key(&library::record_path(notebook, path))))
-                    .then(|| (document.id, path.to_path_buf()))
+                    .then(|| {
+                        let mark = super::main_window::TabMark {
+                            generation: document.generation,
+                            disk_stamp: document.disk_stamp,
+                        };
+                        (document.id, path.to_path_buf(), mark)
+                    })
                 })
                 .collect()
         })
@@ -959,12 +1055,12 @@ fn clean_tabs_on(
 }
 
 /// Reads `tabs`' files on a worker, each as a file open reads it, and posts them back.
-fn spawn_reload(hwnd: HWND, tabs: Vec<(DocumentId, PathBuf)>) {
+fn spawn_reload(hwnd: HWND, tabs: Vec<ReloadTab>) {
     let target = hwnd as isize;
     std::thread::spawn(move || {
         let reloads = tabs
             .into_iter()
-            .map(|(id, path)| {
+            .map(|(id, path, mark)| {
                 let stamp = library::disk_stamp(&path);
                 // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer.
                 let loaded = crate::file::loader::load(&path)
@@ -973,6 +1069,7 @@ fn spawn_reload(hwnd: HWND, tabs: Vec<(DocumentId, PathBuf)>) {
                 Reload {
                     id,
                     path,
+                    mark,
                     stamp,
                     loaded,
                 }
@@ -993,12 +1090,22 @@ pub(crate) fn replace_reloaded(hwnd: HWND, lparam: LPARAM) {
         return;
     }
     let reloaded = *unsafe { Box::from_raw(lparam as *mut ReplaceReloaded) };
+    // A reload swaps documents: inside a modal loop or a file population it waits.
+    if busy(hwnd) {
+        hold(hwnd, |host| host.held_reloads.push(reloaded));
+        return;
+    }
+    apply_reloads(hwnd, reloaded);
+}
+
+fn apply_reloads(hwnd: HWND, reloaded: ReplaceReloaded) {
     for reload in reloaded.reloads {
         if let Some(loaded) = reload.loaded {
             super::main_window::reload_clean_document(
                 hwnd,
                 reload.id,
                 &reload.path,
+                reload.mark,
                 &loaded,
                 reload.stamp,
             );
@@ -1010,24 +1117,32 @@ pub(crate) fn replace_reloaded(hwnd: HWND, lparam: LPARAM) {
 fn finish_replace(hwnd: HWND) {
     with_host(hwnd, |host| {
         host.replacing = false;
+        host.applying = false;
         host.replace_cancel = None;
     });
     search_view::set_replacing(hwnd, false);
 }
 
 /// Stops a replace: a count or write still running stops before its next note (a note being
-/// written finishes), and whatever it posts is stale. A held count is dropped.
+/// written finishes), and whatever it posts is stale. A held count or report is dropped; held
+/// reloads are kept, and the timer with them.
 pub(crate) fn cancel_replace(hwnd: HWND) {
-    with_host(hwnd, |host| {
+    let reloads_held = with_host(hwnd, |host| {
         if let Some(flag) = host.replace_cancel.take() {
             flag.store(true, Ordering::Relaxed);
         }
         host.replace_generation = host.replace_generation.wrapping_add(1);
         host.replacing = false;
+        host.applying = false;
         host.held = None;
-    });
-    unsafe {
-        KillTimer(hwnd, REPLACE_TIMER_ID);
+        host.held_written = None;
+        !host.held_reloads.is_empty()
+    })
+    .unwrap_or(false);
+    if !reloads_held {
+        unsafe {
+            KillTimer(hwnd, REPLACE_TIMER_ID);
+        }
     }
     search_view::set_replacing(hwnd, false);
 }
@@ -1247,6 +1362,16 @@ pub(crate) fn replacing(hwnd: HWND) -> bool {
 #[cfg(test)]
 pub(crate) fn replace_held(hwnd: HWND) -> bool {
     with_host(hwnd, |host| host.held.is_some()).unwrap_or(false)
+}
+
+/// How many payloads wait for a modal loop or a file population to end: write reports, then
+/// reloads.
+#[cfg(test)]
+pub(crate) fn held_after_write(hwnd: HWND) -> (bool, usize) {
+    with_host(hwnd, |host| {
+        (host.held_written.is_some(), host.held_reloads.len())
+    })
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
