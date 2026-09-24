@@ -1031,4 +1031,6 @@ fn replacing_in_the_notebook_writes_the_closed_notes_and_changes_the_open_tab() 
     });
     // Closing autosaves a's tab (a note in the notebook), so no prompt stops the exit.
     close(process, hwnd);
+    // `close` waits for the process to exit: the round trip ends with the tab's text on disk.
+    assert_eq!(read(&a), "alpha bill\r\n", "a's tab autosaved on close");
 }

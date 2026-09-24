@@ -4202,33 +4202,37 @@ pub(crate) fn replace_in_document(
         }
         Some((editor, Some((target.handle.clone(), active.handle.clone()))))
     })?;
+    // Set once Scintilla is asked to change the text: from then on it may have changed, even if
+    // a replacement then fails partway.
+    let touched = std::cell::Cell::new(false);
     let replace = |editor: &Editor| -> Result<usize> {
         let edits = editor.with_document_text(|text| matcher.replacements(text, template))?;
         if edits.is_empty() {
             return Ok(0);
         }
+        touched.set(true);
         editor.replace_ranges_with(&edits)
     };
     match inactive {
         None => replace(&editor).ok(),
         Some((target, active)) => {
-            // What the edit replaced, even if restoring the active tab then fails: the tab's
-            // text changed, so it must be marked edited.
+            // What the edit replaced, even if restoring the active tab then fails.
             let done = std::cell::Cell::new(None);
             let result = with_inactive_document(hwnd, &identity, &editor, &target, &active, |e| {
                 let replaced = replace(e)?;
                 done.set(Some(replaced));
                 Ok(replaced)
             });
-            let replaced = done.get().or(result.ok())?;
-            if replaced > 0 && identity.is_live_for(hwnd) {
+            // The tab's text may have changed (a replacement that failed partway, or a restore
+            // that failed after it), so it is marked edited whatever the result.
+            if touched.get() && identity.is_live_for(hwnd) {
                 let changed = unsafe { app_ptr(hwnd) }
                     .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.note_background_edit(id));
                 if changed {
                     invalidate_title_strip(hwnd);
                 }
             }
-            Some(replaced)
+            done.get().or(result.ok())
         }
     }
 }
@@ -12507,6 +12511,292 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_and_the_row_button_are_unavailable_while_a_replace_runs() {
+        // Break caught (final review FR3): Replace all and the row's button drawn and announced
+        // as pressable during the count, the question or the write, when a press does nothing,
+        // or left unavailable once the replace ends.
+        use crate::window::sidebar_accessibility::{STATE_UNAVAILABLE, take_raised};
+        use windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_STATECHANGE;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-unavailable");
+        scratch.note("a.md", "one beta");
+        scratch.note("b.md", "beta two");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        search_for(window.hwnd, "beta");
+        crate::window::search_view::toggle_replace(window.hwnd);
+        let panel = sidebar_panel(window.hwnd);
+        let items = || {
+            (0..crate::window::side_panel::accessible_item_count(panel))
+                .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+                .collect::<Vec<_>>()
+        };
+        let index_of = |name: &str| items().iter().position(|item| item.name == name).unwrap();
+        let unavailable = |name: &str| items()[index_of(name)].state & STATE_UNAVAILABLE != 0;
+        let raised_for = |raised: &[(usize, u32, i32)], name: &str| {
+            raised.contains(&(
+                panel as usize,
+                EVENT_OBJECT_STATECHANGE,
+                index_of(name) as i32 + 1,
+            ))
+        };
+        assert!(!unavailable("Replace all"));
+        assert!(!unavailable("Replace in a"));
+        assert!(crate::window::search_view::replace_all_enabled(window.hwnd));
+
+        take_raised();
+        let asked = decline_next_confirm();
+        crate::window::text_search_host::replace_all(window.hwnd);
+        assert!(crate::window::text_search_host::replacing(window.hwnd));
+        // What paints the buttons dim (`button_color` and `row_button_color` take it).
+        assert!(!crate::window::search_view::replace_all_enabled(
+            window.hwnd
+        ));
+        assert!(unavailable("Replace all"));
+        assert!(unavailable("Replace in a"));
+        let raised = take_raised();
+        assert!(raised_for(&raised, "Replace all"), "{raised:?}");
+        assert!(raised_for(&raised, "Replace in a"), "{raised:?}");
+
+        pump_until(window.hwnd, || asked.get());
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+        assert!(crate::window::search_view::replace_all_enabled(window.hwnd));
+        assert!(!unavailable("Replace all"));
+        assert!(!unavailable("Replace in a"));
+        let raised = take_raised();
+        assert!(raised_for(&raised, "Replace all"), "{raised:?}");
+        assert!(raised_for(&raised, "Replace in a"), "{raised:?}");
+    }
+
+    #[test]
+    fn a_closed_note_is_never_written_when_the_question_had_no_saved_line() {
+        // Break caught (final review FR1): a closed note whose read failed during the count (so
+        // it counted 0 and the question never said notes are saved) written at the apply,
+        // where its read succeeds, its stamp matches and it has a match.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-no-saved-line");
+        let a = scratch.note("a.md", "a needle");
+        let b = scratch.note("b.md", "b needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &b).unwrap();
+        pump_posted_messages(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        assert_eq!(search_rows(window.hwnd).len(), 2);
+        crate::window::modal::take_last_confirm();
+
+        // The count as a failed read of a.md leaves it: b's match only, from its tab.
+        crate::window::answer_next_confirm(|_| true);
+        crate::window::text_search_host::replace_counted(
+            window.hwnd,
+            crate::window::text_search_host::test_counted(
+                window.hwnd,
+                crate::window::text_search_host::replace_generation(window.hwnd),
+                crate::library::text_replace::ReplaceCount {
+                    matches: 1,
+                    notes: 1,
+                    closed_notes: 0,
+                },
+            ),
+        );
+        assert_eq!(
+            wait_for_report(window.hwnd),
+            "Replaced 1 match in 1 note. 1 note was skipped because it changed since the search. (a)"
+        );
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some("Replace 1 match in 1 note with \"pin\"?"),
+            "no saved line"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "a needle",
+            "not written"
+        );
+        assert_eq!(
+            editor.text().unwrap(),
+            "b pin",
+            "the open tab still changes"
+        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b needle");
+    }
+
+    #[test]
+    fn a_plan_made_stale_before_its_write_starts_writes_nothing() {
+        // Break caught (Task 6 re-review New #1): `apply_plan`, finding no cancel flag (as a
+        // `cancel_replace` leaves it), making a fresh one and writing the notes of a replace
+        // that was already cancelled.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-stale-apply");
+        let a = scratch.note("a.md", "needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        search_to_replace(window.hwnd, "needle", "pin");
+        let generation = crate::window::text_search_host::replace_generation(window.hwnd);
+        crate::window::text_search_host::cancel_replace(window.hwnd);
+        let ended = crate::window::text_search_host::writer_hooks::ended();
+
+        crate::window::text_search_host::test_apply(window.hwnd, generation);
+        pump_past_debounce(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "needle",
+            "nothing written"
+        );
+        assert_eq!(
+            crate::window::text_search_host::writer_hooks::ended(),
+            ended,
+            "no writer started"
+        );
+        assert!(
+            !notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.starts_with("Replaced "))
+        );
+
+        // The same plan for the current generation, with no flag either, writes.
+        crate::window::text_search_host::test_apply(
+            window.hwnd,
+            crate::window::text_search_host::replace_generation(window.hwnd),
+        );
+        assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+    }
+
+    /// Runs `key` with Ctrl (and Shift) held through the accelerator table, as the message loop
+    /// does for a key sent to `target`, and returns whether the table translated it.
+    fn translate_key(hwnd: HWND, target: HWND, key: u8, shift: bool) -> bool {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let identity = unsafe { super::window_identity(hwnd).unwrap() };
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
+        keys[VK_MENU as usize] = 0;
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let message = MSG {
+            hwnd: target,
+            message: WM_KEYDOWN,
+            wParam: usize::from(key),
+            ..Default::default()
+        };
+        let translated = unsafe { super::translate_accelerator(hwnd, &identity, &message) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+        translated
+    }
+
+    #[test]
+    fn ctrl_shift_h_in_the_replace_field_closes_it_and_the_chevron_action_toggles_it() {
+        // Break caught (final review FR6): a keyboard user unable to close the replace field
+        // once it is open (Ctrl+Shift+H only opening it), the caret left in the hidden field,
+        // Ctrl+Shift+H elsewhere closing it, or the chevron's default action doing nothing.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-close-key");
+        scratch.note("a.md", "alpha needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        let open = || crate::window::search_view::replace_open(window.hwnd);
+
+        execute_command(window.hwnd, CommandId::ReplaceInNotes);
+        let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+        let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        assert!(open());
+        assert_eq!(unsafe { GetFocus() }, replace);
+
+        assert!(translate_key(window.hwnd, replace, b'H', true));
+        assert!(!open(), "closed from inside the field");
+        assert!(!is_shown(replace));
+        assert_eq!(
+            unsafe { GetFocus() },
+            search_box,
+            "the caret goes to the box"
+        );
+
+        assert!(translate_key(window.hwnd, search_box, b'H', true));
+        assert!(open(), "from the box it opens the field");
+        assert_eq!(unsafe { GetFocus() }, replace);
+        unsafe { SetFocus(search_box) };
+        assert!(translate_key(window.hwnd, search_box, b'H', true));
+        assert!(open(), "with the caret in the box it stays open");
+        assert_eq!(unsafe { GetFocus() }, replace);
+
+        let panel = sidebar_panel(window.hwnd);
+        let source = &crate::window::side_panel::PANEL_ACCESSIBLE;
+        let chevron = (0..(source.count)(panel))
+            .position(|index| {
+                (source.item)(panel, index).is_some_and(|item| item.name == "Toggle replace")
+            })
+            .unwrap();
+        (source.activate)(panel, chevron);
+        assert!(!open(), "the chevron's default action closes the field");
+        (source.activate)(panel, chevron);
+        assert!(open(), "and opens it again");
+        assert_eq!(unsafe { GetFocus() }, replace);
+    }
+
+    #[test]
+    fn ctrl_shift_1_is_not_an_accelerator() {
+        // Break caught (Task 5 review Minor 1): a Ctrl+Shift+1 accelerator, or a change to how
+        // the table is built, eating the key before the Search view's row replace sees it.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-ctrl-shift-1");
+        scratch.note("a.md", "alpha needle");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+        let panel = sidebar_panel(window.hwnd);
+        assert!(
+            !translate_key(window.hwnd, panel, b'1', true),
+            "in the results"
+        );
+        assert!(
+            !translate_key(window.hwnd, editor.hwnd(), b'1', true),
+            "in the editor"
+        );
+        assert!(
+            translate_key(window.hwnd, panel, b'H', true),
+            "the harness translates a real accelerator"
+        );
+    }
+
+    #[test]
+    fn the_replace_field_never_takes_the_caret_without_a_search_box() {
+        // Break caught (Task 5 review Minor 2): with the search box not made, Ctrl+Shift+H
+        // making the replace field (which `layout` never places or shows) and focusing it, so
+        // keystrokes go into an invisible control.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("replace-no-box");
+        scratch.note("a.md", "alpha needle");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        ensure_sidebar(window.hwnd);
+        assert_eq!(crate::window::search_view::edit_hwnd(window.hwnd), None);
+        assert!(crate::window::search_view::fail_search_box(window.hwnd));
+
+        execute_command(window.hwnd, CommandId::ReplaceInNotes);
+        assert_eq!(crate::window::search_view::edit_hwnd(window.hwnd), None);
+        assert_eq!(
+            crate::window::search_view::replace_edit_hwnd(window.hwnd),
+            None,
+            "no field made, so none focused"
+        );
+        assert!(!crate::window::search_view::replace_open(window.hwnd));
+    }
+
+    #[test]
     fn a_tab_closed_before_an_unasked_row_replace_applies_is_not_written() {
         // Break caught: a note saved without the question ever saying so, because its tab (whose
         // text the count read, so no question was asked) closed while the count ran.
@@ -13056,9 +13346,17 @@ mod tests {
         scratch.install(window.hwnd);
         let panel = sidebar_panel(window.hwnd);
         let requests = || crate::window::search_view::replace_requests(window.hwnd);
-        // The first request that runs (the row's, below) starts a real replace of that closed
-        // note, whose question is declined; the others wait for it.
-        let asked = decline_next_confirm();
+        // Each request that runs starts a real replace of closed notes, whose question is
+        // declined before the next request: while one runs, Replace all and the row buttons are
+        // unavailable and a request is refused (below).
+        let declined = |asked: std::rc::Rc<std::cell::Cell<bool>>| {
+            pump_until(window.hwnd, || asked.get());
+            assert!(!crate::window::text_search_host::replacing(window.hwnd));
+            crate::window::modal::take_last_confirm()
+        };
+        let row_question =
+            "Replace 1 match in \"b\" with \"\"? The note is saved and this can't be undone.";
+        let all_question = format!("Replace 2 matches in 2 notes with \"\"?{SAVED_LINE}");
 
         crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
         search_for(window.hwnd, "needle");
@@ -13076,12 +13374,22 @@ mod tests {
             .search
             .list
             .select(1, 400);
+        let asked = decline_next_confirm();
         press_with(panel, u16::from(b'1'), true, true, false);
         assert_eq!(requests(), (vec![1], 0), "Ctrl+Shift+1 on the selected row");
         assert_eq!(
             app_mut(window.hwnd).tabs.preview_id(),
             None,
             "nothing opened"
+        );
+        // While that replace runs, another request is refused.
+        assert!(crate::window::text_search_host::replacing(window.hwnd));
+        press_with(panel, u16::from(b'1'), true, true, false);
+        assert_eq!(requests(), (vec![1], 0), "refused while a replace runs");
+        assert_eq!(
+            declined(asked).as_deref(),
+            Some(row_question),
+            "the row's request ran the replace of that row's note"
         );
 
         let (width, height) = client_size(panel);
@@ -13102,6 +13410,7 @@ mod tests {
             );
             crate::window::search_view::SearchView::row_replace_rect(row, dpi)
         };
+        let asked = decline_next_confirm();
         click(
             panel,
             (button.left + button.right) / 2,
@@ -13113,37 +13422,59 @@ mod tests {
             None,
             "nothing opened"
         );
+        assert_eq!(declined(asked).as_deref(), Some(row_question));
 
         let all = crate::window::search_view::SearchView::replace_all_rect(client, dpi);
+        let asked = decline_next_confirm();
         click(
             panel,
             (all.left + all.right) / 2,
             (all.top + all.bottom) / 2,
         );
         assert_eq!(requests(), (vec![1, 1], 1), "Replace all");
+        assert_eq!(declined(asked), Some(all_question.clone()));
 
         let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
         let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        let asked = decline_next_confirm();
         press_with(replace, VK_RETURN, true, false, true);
+        assert_eq!(declined(asked), Some(all_question.clone()));
+        let asked = decline_next_confirm();
         press_with(search_box, VK_RETURN, true, false, true);
+        assert_eq!(declined(asked), Some(all_question.clone()));
+        // With Ctrl held Windows usually sends Ctrl+Alt+Enter as WM_KEYDOWN, not WM_SYSKEYDOWN.
+        for field in [replace, search_box] {
+            let asked = decline_next_confirm();
+            press_as_keydown(field, VK_RETURN, true, true);
+            assert_eq!(declined(asked), Some(all_question.clone()));
+        }
         assert_eq!(
             requests(),
-            (vec![1, 1], 3),
-            "Ctrl+Alt+Enter in either field"
+            (vec![1, 1], 5),
+            "Ctrl+Alt+Enter in either field, as either message"
         );
         assert_eq!(
             app_mut(window.hwnd).tabs.preview_id(),
             None,
             "nothing opened"
         );
+    }
 
-        pump_until(window.hwnd, || asked.get());
-        assert_eq!(
-            crate::window::modal::take_last_confirm().as_deref(),
-            Some("Replace 1 match in \"b\" with \"\"? The note is saved and this can't be undone."),
-            "the row's request ran the replace of that row's note"
-        );
-        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+    /// Sends `key` to `window` as `WM_KEYDOWN` with Ctrl and Alt held as given (Shift up).
+    fn press_as_keydown(window: HWND, key: u16, ctrl: bool, alt: bool) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = if ctrl { 0x80 } else { 0 };
+        keys[VK_SHIFT as usize] = 0;
+        keys[VK_MENU as usize] = if alt { 0x80 } else { 0 };
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        unsafe { SendMessageW(window, WM_KEYDOWN, usize::from(key), 0) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
     }
 
     #[test]

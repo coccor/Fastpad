@@ -221,8 +221,9 @@ pub(crate) fn find_in_editor(
 ///
 /// - Plain mode: the match is Scintilla's, found where the selection starts, and the text is
 ///   `replacement` as it is.
-/// - Regex mode: the match is one of `Matcher::replacements` over the document, and the text is
-///   `replacement` expanded with that match's captures (`$1`, `${name}`, `$$`).
+/// - Regex mode: the match is one of `Matcher::find_iter`'s over the document, and the text is
+///   `replacement` expanded with that match's captures (`$1`, `${name}`, `$$`). Only that match
+///   is expanded (`Matcher::replacement_at`), not every match in the document.
 pub(crate) fn replacement_for(
     editor: &Editor,
     query: &str,
@@ -236,13 +237,7 @@ pub(crate) fn replacement_for(
     if options.regex {
         let matcher = regex_matcher(query, options)?;
         return editor
-            .with_document_text(|text| {
-                matcher
-                    .replacements(text, replacement)
-                    .into_iter()
-                    .find(|(range, _)| *range == selection)
-                    .map(|(_, text)| text)
-            })
+            .with_document_text(|text| matcher.replacement_at(text, selection, replacement))
             .ok()
             .flatten();
     }

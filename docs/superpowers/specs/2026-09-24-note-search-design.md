@@ -190,7 +190,8 @@ For each note, in the library's note-list order:
   - **Find next** selects the first match that starts at or after the selection's end, and wraps once to the first match in the note.
   - **Find previous** selects the last match that ends at or before the selection's start, and wraps once to the last match.
   - **Replace** replaces the selection only if it is exactly the match found where it starts.
-  - **Replace all** replaces every match, from the last backwards, as one undo action. The replacement is literal text (no `$1`).
+  - **Replace all** replaces every match, from the last backwards, as one undo action.
+  - **The replacement**, in Replace and Replace all, is literal in plain mode. In regex mode `$1`, `${name}` and `$$` expand (§12a).
   - With one engine, a regex Search result always opens to the match Search showed: the same dialect, case folding, whole word and lines.
 - **Pattern errors:** a pattern that doesn't compile, or that matches empty text, shows the find bar's no-match state, as Search shows its pattern error (§6).
 - **Opening a Search result:**
@@ -429,9 +430,10 @@ For each note, in the library's note-list order:
   UTF-8 document, so they agree with Search's plain matching on ordinary text; Search's
   one-character folding (§6) may still differ from Scintilla's at rare characters.
 - **Replace in the find bar** inserts its text literally in plain mode. Since 3b, regex mode
-  expands `$1`, `${name}` and `$$` through `Matcher::replacements`, in Replace and in Replace
-  all, and Enter replaces the selection only when it is one of `find_iter`'s matches over the
-  document, not any `find_at` match (in "aaa" with `aa`, a selection of 1..3 isn't replaced). A
+  expands `$1`, `${name}` and `$$`, in Replace (`Matcher::replacement_at`, which expands only
+  the match at the selection) and in Replace all (`Matcher::replacements`), and Enter replaces
+  the selection only when it is one of `find_iter`'s matches over the document, not any
+  `find_at` match (in "aaa" with `aa`, a selection of 1..3 isn't replaced). A
   plain match's length is Scintilla's `SCI_GETTARGETEND`; a regex match's is the `Matcher`'s.
   `\1` is never expanded.
 - **A click on a result moves the focus to the editor; Enter keeps it in the list** (sidebar
@@ -571,10 +573,18 @@ For each note, in the library's note-list order:
   those notes' names in brackets, "(a, b, c, and K more)" (`REPORT_NAMES`). §12's "with the note
   names in the details" is this bracket. A replace whose count finds 0 matches reports nothing;
   the query just runs again.
+- **Ctrl+Shift+H closes the replace field when the caret is in it,** and the caret goes back to
+  the search box. It is the keyboard's way to close the field, since the chevron takes no focus;
+  anywhere else Ctrl+Shift+H shows Search with the field open. The chevron's MSAA default
+  action (a click on it) toggles the field.
+- **With no closed note in the warning, no closed note is written.** When the question has no
+  "Notes that aren't open are saved" line, every target that is closed at the split is reported
+  as changed since the search, as the count found no match in any note's file (a read that
+  failed during the count, or a tab that closed since).
 - **Accessibility:**
   - The chevron is a push button with the expanded or collapsed state ("Toggle replace").
   - The replace field is a text child whose full object is the Edit's own ("Replace").
-  - Replace all is a push button that is unavailable while it can't run.
+  - Replace all is a push button that is unavailable while it can't run, a replace in progress included. The row buttons follow it, and both draw dim while unavailable.
   - The row button is exposed once, for the selected row ("Replace in <name>"), before the results.
   - The chevron comes after the toggles, so the box and the toggles keep 3a's child IDs 1 to 4, and the summary line moves from child ID 5 to 6.
   - The chevron, and Replace all as it becomes available or unavailable, raise `EVENT_OBJECT_STATECHANGE`.

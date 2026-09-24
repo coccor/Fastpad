@@ -511,10 +511,6 @@ pub(crate) struct ReplacePlan {
     unread: Vec<PathBuf>,
     /// How many notes the results list, for a capped question.
     listed: usize,
-    /// The `path_key`s of the candidates the count read from a tab's text. One whose tab closed
-    /// before the split was never counted from its file and the question never warned about it,
-    /// so it is never written.
-    counted_open: HashSet<String>,
     /// The results were capped: only the listed notes are replaced (spec §12a).
     capped: bool,
     /// A row's replace: one note, asked about only if it isn't open.
@@ -652,7 +648,6 @@ fn prepare(
             candidates,
             unread,
             listed,
-            counted_open,
             capped,
             single,
         },
@@ -838,7 +833,6 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
         template,
         candidates,
         unread,
-        counted_open,
         ..
     } = plan;
     with_host(hwnd, |host| host.applying = true);
@@ -862,9 +856,11 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
                     None => stale.push(candidate.path),
                 }
             }
-            // Its tab closed since the count, which read the tab's text, and the question never
-            // said a note would be saved.
-            None if !warned && counted_open.contains(&key) => stale.push(candidate.path),
+            // The question never said a note would be saved, so no closed note is written: the
+            // count found no match in any note's file, so a match now can only come from a tab
+            // that closed since the count (which read the tab's text) or a read that failed
+            // during the count.
+            None if !warned => stale.push(candidate.path),
             None => match candidate.stamp {
                 Some(stamp) => closed.push(ReplaceTarget {
                     path: candidate.path,
@@ -883,11 +879,18 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
         report_written(hwnd, report, tab_matches, tab_notes);
         return;
     }
-    let Some(cancel) = with_host(hwnd, |host| {
-        Arc::clone(
+    // A missing flag means `cancel_replace` may have run since the generation check: a fresh
+    // flag is made only for a plan that is still current, and a stale one writes nothing (its
+    // cancel already finished the replace, and its report would be dropped).
+    let Some(Some(cancel)) = with_host(hwnd, |host| {
+        if host.replace_generation != generation {
+            host.applying = false;
+            return None;
+        }
+        Some(Arc::clone(
             host.replace_cancel
                 .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
-        )
+        ))
     }) else {
         return;
     };
@@ -1390,6 +1393,15 @@ pub(crate) fn test_counted(hwnd: HWND, generation: u64, count: ReplaceCount) -> 
         count,
         plan,
     })) as LPARAM
+}
+
+/// Applies a plan of Replace all over the view's listed notes, as `confirm_and_apply` does after
+/// Yes, for a replace of `generation`, with the saved line shown.
+#[cfg(test)]
+pub(crate) fn test_apply(hwnd: HWND, generation: u64) {
+    let (candidates, capped) = search_view::replace_candidates(hwnd);
+    let (_, _, plan) = prepare(hwnd, candidates, capped, false).expect("a finished search");
+    apply_plan(hwnd, generation, plan, true);
 }
 
 /// A boxed write report, as the write worker posts it.

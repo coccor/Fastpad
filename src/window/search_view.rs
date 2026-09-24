@@ -112,6 +112,18 @@ fn button_color(enabled: bool, hover: bool, normal: u32, palette: &Palette) -> u
     }
 }
 
+/// A row's replace button's glyph color. On the focused selection a disabled button takes the
+/// row's dim text color, the selection's text color there, since the line-number color may have
+/// little contrast with the selection's background.
+fn row_button_color(enabled: bool, hover: bool, look: RowLook, palette: &Palette) -> u32 {
+    let foreground = row_foreground(look, palette);
+    if !enabled && look.selected && look.focused {
+        foreground
+    } else {
+        button_color(enabled, hover, foreground, palette)
+    }
+}
+
 fn key_down(key: VIRTUAL_KEY) -> bool {
     (unsafe { GetKeyState(i32::from(key)) }) < 0
 }
@@ -654,11 +666,12 @@ impl SearchView {
     }
 
     /// Whether Replace all and the rows' replace buttons can run: a search finished with results
-    /// (spec §11), and no notice shows in their place.
+    /// (spec §11), no notice shows in their place, and no replace runs (a press would be ignored).
     pub(crate) fn replace_all_enabled(&self) -> bool {
         matches!(self.search, SearchState::Done { .. })
             && !self.results.is_empty()
             && self.notice().is_none()
+            && !self.replacing
     }
 
     /// Whether row `index` shows its replace button: the hovered and the selected row, while the
@@ -1120,7 +1133,7 @@ impl SearchView {
                     REPLACE_GLYPH,
                     button,
                     paint.fonts.glyph,
-                    button_color(enabled, hover, foreground, &palette),
+                    row_button_color(enabled, hover, look, &palette),
                     line | DT_CENTER,
                 );
             }
@@ -1529,8 +1542,18 @@ pub(crate) fn show_with_query(hwnd: HWND, text: &str) {
 
 /// Ctrl+Shift+H (spec §11): shows Search with the replace field open and the caret in it. A
 /// one-line selection in the active editor fills the search box and searches at once, as
-/// Ctrl+Shift+F's does (`show_with_query` escapes it while regex is on).
+/// Ctrl+Shift+F's does (`show_with_query` escapes it while regex is on). Pressed with the caret
+/// already in the open replace field, it closes the field instead and the caret goes back to the
+/// search box: the keyboard's way to close it (spec §17), as the chevron takes no focus.
 pub(crate) fn show_replace(hwnd: HWND) {
+    let field = with_view(hwnd, |view| view.replace_open.then_some(view.replace_edit))
+        .flatten()
+        .flatten();
+    // Asked with nothing of the App borrowed.
+    if field.is_some_and(|field| unsafe { GetFocus() } == field) {
+        side_panel::with_accessible_events(hwnd, || set_replace_open(hwnd, false));
+        return;
+    }
     // Read before the view takes the focus.
     let prefill = super::main_window::single_line_selection(hwnd);
     side_panel::show_view(hwnd, SidebarView::Search, false);
@@ -1585,19 +1608,31 @@ pub(crate) fn replace_candidates(hwnd: HWND) -> (Vec<text_search_host::Candidate
     .unwrap_or_default()
 }
 
-/// A replace started or ended (`text_search_host`): while one runs the summary says so and no
-/// result opens.
+/// A replace started or ended (`text_search_host`): while one runs the summary says so, no
+/// result opens, and Replace all and the row buttons are unavailable (drawn dim, and so reported),
+/// which screen readers are told when it flips.
 pub(crate) fn set_replacing(hwnd: HWND, replacing: bool) {
-    let Some(panel) = with_view(hwnd, |view| {
+    let Some((panel, flipped, row)) = with_view(hwnd, |view| {
         (view.replacing != replacing).then(|| {
+            let enabled = view.replace_all_enabled();
             view.replacing = replacing;
-            view.panel
+            (
+                view.panel,
+                enabled != view.replace_all_enabled(),
+                view.row_replace_child(),
+            )
         })
     })
     .flatten() else {
         return;
     };
     invalidate(panel);
+    if flipped {
+        announce_state(hwnd, SearchChild::ReplaceAll);
+        if let Some(row) = row {
+            announce_state(hwnd, SearchChild::RowReplace(row));
+        }
+    }
     announce_lines(hwnd, false);
 }
 
@@ -1659,6 +1694,11 @@ fn ensure_replace_edit(hwnd: HWND) -> Option<HWND> {
 /// again. Returns the field while it is open; `None` when it is closed or could not be made (then
 /// it stays closed). Closing it with the caret inside moves the caret to the search box.
 fn set_replace_open(hwnd: HWND, open: bool) -> Option<HWND> {
+    // Without the search box `layout` never places or shows the field, so it never opens: the
+    // caret must not go into a hidden control.
+    if open && with_view(hwnd, |view| view.edit.is_none()).unwrap_or(true) {
+        return None;
+    }
     let replace = if open {
         Some(ensure_replace_edit(hwnd)?)
     } else {
@@ -1725,6 +1765,13 @@ fn replace_changed(hwnd: HWND, edit: HWND) {
 /// The replace field's text as `EN_CHANGE` last kept it; empty before it is first opened.
 pub(crate) fn replace_text(hwnd: HWND) -> String {
     with_view(hwnd, |view| view.replace_text.clone()).unwrap_or_default()
+}
+
+/// Makes the search box fail to be made, as `ensure_edit` records a failure. Returns whether
+/// there was a view.
+#[cfg(test)]
+pub(crate) fn fail_search_box(hwnd: HWND) -> bool {
+    with_view(hwnd, |view| view.edit_failed = true).is_some()
 }
 
 /// Whether Replace all can run now (`SearchView::replace_all_enabled`).
@@ -3170,6 +3217,69 @@ mod tests {
         view.begin("zzz", 10);
         view.apply(batch(Vec::new(), 10, Some(RunEnd::Completed)), HEIGHT);
         assert!(!view.replace_all_enabled(), "nothing listed");
+        view.begin("needle", 10);
+        view.apply(
+            batch(vec![hit("a", "")], 10, Some(RunEnd::Completed)),
+            HEIGHT,
+        );
+        assert!(view.replace_all_enabled());
+        view.replacing = true;
+        assert!(!view.replace_all_enabled(), "a replace runs");
+        view.replacing = false;
+        assert!(view.replace_all_enabled(), "and has ended");
+    }
+
+    #[test]
+    fn a_disabled_replace_button_draws_dim_and_stays_legible_on_the_focused_selection() {
+        // Break caught (final review FR3, Task 5 review Minor 3): a disabled button drawn as
+        // pressable, or drawn in the line-number color over the focused selection, where it may
+        // have little contrast.
+        use super::{button_color, row_button_color};
+        use crate::window::palette::Palette;
+        use crate::window::row_list::RowLook;
+        let palette = Palette {
+            selection_foreground: Some(0x00AB_CDEF),
+            ..Palette::neutral()
+        };
+        let look = |selected, hover, focused| RowLook {
+            selected,
+            hover,
+            focused,
+        };
+        let normal = palette.editor_foreground;
+        let dim = palette.line_number_foreground;
+        assert_eq!(button_color(false, false, normal, &palette), dim);
+        assert_eq!(button_color(false, true, normal, &palette), dim, "no hover");
+        assert_eq!(button_color(true, false, normal, &palette), normal);
+        assert_eq!(
+            button_color(true, true, normal, &palette),
+            palette.hover_foreground
+        );
+        for (row, enabled_color) in [
+            (look(false, true, true), normal),
+            (look(true, false, false), normal),
+        ] {
+            assert_eq!(
+                row_button_color(false, false, row, &palette),
+                dim,
+                "{row:?}"
+            );
+            assert_eq!(
+                row_button_color(true, false, row, &palette),
+                enabled_color,
+                "{row:?}"
+            );
+        }
+        let focused = look(true, false, true);
+        assert_eq!(
+            row_button_color(false, false, focused, &palette),
+            0x00AB_CDEF,
+            "the selection's text color"
+        );
+        assert_eq!(
+            row_button_color(true, true, focused, &palette),
+            palette.hover_foreground
+        );
     }
 
     #[test]

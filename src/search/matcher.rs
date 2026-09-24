@@ -203,6 +203,68 @@ impl Matcher {
         all
     }
 
+    /// The text that replaces `range` when it is exactly one of `find_iter`'s matches, else
+    /// `None`: that match's `replacements` text, built for it alone. Only the line (or the whole
+    /// text) holding `range` is searched, nothing is allocated for the other matches, and only this
+    /// match's captures are expanded (`Regex::captures_at` at its start, in the same segment and
+    /// context `replacements` uses).
+    pub fn replacement_at(
+        &self,
+        text: &str,
+        range: Range<usize>,
+        template: &str,
+    ) -> Option<String> {
+        if range.is_empty()
+            || range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            return None;
+        }
+        let (segment, base) = self.segment_at(text, range.start);
+        if range.end - base > segment.len() {
+            return None;
+        }
+        let mut listed = false;
+        self.segment_matches(segment, base, &mut |found| {
+            if found.start < range.start {
+                return true;
+            }
+            listed = found == range;
+            false
+        });
+        if !listed {
+            return None;
+        }
+        let Engine::Regex(regex) = &self.engine else {
+            return Some(template.to_owned());
+        };
+        let captures = regex.captures_at(segment, range.start - base)?;
+        let found = captures.get_match();
+        (found.start() + base == range.start && found.end() + base == range.end).then(|| {
+            let mut replacement = String::new();
+            captures.expand(template, &mut replacement);
+            replacement
+        })
+    }
+
+    /// The piece of `text` that `each_segment` gives for the byte at `position`, and the byte it
+    /// starts at: its line without the `\n` or `\r\n`, or the whole text when matching isn't per
+    /// line. `position` is a character boundary within `text`.
+    fn segment_at<'t>(&self, text: &'t str, position: usize) -> (&'t str, usize) {
+        if !self.per_line {
+            return (text, 0);
+        }
+        let start = text[..position]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |newline| start + newline);
+        let line = &text[start..end];
+        (line.strip_suffix('\r').unwrap_or(line), start)
+    }
+
     /// `text` with every match replaced by its `replacements` text, and how many there were. Each
     /// match of the original text is replaced once: a replacement that contains the query, or
     /// makes a new match with the text beside it, is never matched again.
@@ -1022,7 +1084,54 @@ mod tests {
                 ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
                 "{pattern:?}: ascending and never overlapping"
             );
+            // The find bar's Replace: one match's text, built alone, is the same.
+            for template in templates {
+                for (range, replacement) in found.replacements(text, template) {
+                    assert_eq!(
+                        found.replacement_at(text, range.clone(), template),
+                        Some(replacement),
+                        "{pattern:?} {template:?} {range:?}"
+                    );
+                    let shorter = range.start..range.end - 1;
+                    assert_eq!(found.replacement_at(text, shorter, template), None);
+                    let later = range.start + 1..range.end;
+                    assert_eq!(found.replacement_at(text, later, template), None);
+                }
+            }
         }
+        // A range `find_iter` never gives, though a search from its start would match it: the
+        // matches go "aa", "aa", so "aa" at 1 is not one of them.
+        let pairs = matcher("(a)a", options(false, false, true));
+        assert_eq!(pairs.find_iter("aaaa"), [0..2, 2..4]);
+        assert_eq!(
+            pairs.replacement_at("aaaa", 2..4, "<$1>"),
+            Some("<a>".to_owned())
+        );
+        assert_eq!(pairs.replacement_at("aaaa", 1..3, "<$1>"), None);
+        assert_eq!(
+            pairs.replacement_at("aaaa", 3..5, "<$1>"),
+            None,
+            "past the end"
+        );
+        // A match found only by the whole text's context (`^` on the second line, per line).
+        let starts = matcher(r"^(\w)", options(false, false, true));
+        assert_eq!(
+            starts.replacement_at("ab\r\ncd", 4..5, "[$1]"),
+            Some("[c]".to_owned())
+        );
+        assert_eq!(starts.replacement_at("ab\r\ncd", 5..6, "[$1]"), None);
+        assert_eq!(
+            starts.replacement_at("ab\r\ncd", 2..3, "[$1]"),
+            None,
+            "the \\r"
+        );
+        // Plain mode: the template as it is.
+        let plain = matcher("$1", options(false, false, false));
+        assert_eq!(
+            plain.replacement_at("a $1", 2..4, "$$"),
+            Some("$$".to_owned())
+        );
+        assert_eq!(plain.replacement_at("a $1", 1..3, "$$"), None);
         let word = matcher(r"(\w+)@(\w+)", options(false, true, true));
         assert_eq!(
             word.replace_text("ann@site x", "$2 at $1").0,
