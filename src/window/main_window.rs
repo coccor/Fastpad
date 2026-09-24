@@ -1486,6 +1486,8 @@ fn show_command_palette(hwnd: HWND, subset: Option<&'static [CommandId]>) {
     }
     refilter_command_palette(hwnd);
     with_command_palette(hwnd, CommandPalette::focus_query);
+    // Leaving quick open with an empty field: the hint must go.
+    with_command_palette(hwnd, CommandPalette::invalidate);
 }
 
 /// Opens the palette in picker mode: it lists `picker`'s items instead of commands, and the
@@ -1578,6 +1580,8 @@ pub(crate) fn open_quick_open(hwnd: HWND) {
     }
     refilter_command_palette(hwnd);
     with_command_palette(hwnd, CommandPalette::focus_query);
+    // The field may have been empty already: the hint appears without an edit to trigger it.
+    with_command_palette(hwnd, CommandPalette::invalidate);
 }
 
 /// The quick-open rows for `query` and the row to select (spec §3.1–3.4). Only reads what is
@@ -1991,6 +1995,10 @@ pub(crate) fn paint_find_placeholder(hwnd: HWND, edit: HWND) -> bool {
             .as_ref()
             .is_some_and(|bar| bar.paint_placeholder(edit))
     })
+}
+
+pub(crate) fn paint_palette_placeholder(hwnd: HWND, edit: HWND) -> bool {
+    with_command_palette(hwnd, |palette| palette.paint_placeholder(edit)).unwrap_or(false)
 }
 
 fn name_box_owns(hwnd: HWND, control: HWND) -> bool {
@@ -6797,6 +6805,55 @@ mod tests {
             "{:?}",
             notices(window.hwnd)
         );
+    }
+
+    #[test]
+    fn quick_open_rows_carry_their_text_for_screen_readers_and_draw_their_hits_in_bold() {
+        // Break caught: rows a screen reader reads as blank, the notice read as anything else,
+        // hits drawn in the regular font, or the hint missing from the empty field (no ComCtl32
+        // v6 manifest, so EM_SETCUEBANNER shows nothing) or left behind in command mode.
+        use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+        use windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let palette = || app_mut(window.hwnd).command_palette.as_ref().unwrap();
+
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        assert_eq!(
+            palette().list_text(0),
+            crate::window::command_palette::NO_NOTEBOOK
+        );
+        assert_eq!(palette().placeholder(), Some("Go to note by name"));
+        let query = palette().query_hwnd();
+        assert!(palette().paint_placeholder(query));
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        assert_eq!(palette().placeholder(), None);
+        assert!(!palette().paint_placeholder(query));
+
+        let scratch = LibraryScratch::new("quick-open-draw");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\gamma notes.md", "g");
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::QuickOpen);
+        type_query(window.hwnd, "wk gmn");
+        assert_eq!(palette().list_text(0), r"gamma notes, in work");
+
+        let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
+        let item = DRAWITEMSTRUCT {
+            itemID: 0,
+            hDC: dc,
+            rcItem: RECT {
+                left: 0,
+                top: 0,
+                right: 400,
+                bottom: 26,
+            },
+            ..Default::default()
+        };
+        palette().draw_item(&item);
+        unsafe { DeleteDC(dc) };
+        assert!(palette().has_bold_font());
     }
 
     #[test]

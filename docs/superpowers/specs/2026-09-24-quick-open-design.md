@@ -159,3 +159,19 @@
 - Matching files outside the notebook.
 - Symbol search (`@`) and commands (`>`) typed into the picker.
 - Keeping Ctrl held while pressing P repeatedly to step through the list.
+
+## 9. Implementation notes
+
+- **Case folding** maps each char to the first char of its lowercase form (`İ` → `i`), so hits stay char indices of the original name and folder, as §6 asks.
+- **`split_line`:** `a:` drops the trailing colon (`a` is still matched, so the list doesn't empty while the number is typed); `a:x` is text; a line too large for `u32` goes to the last line.
+- **Targets:** a term is tried on the name first; only when that fails, and only for a note with a folder, on `folder\name`. The joining `\` is never a hit.
+- **`:<n>` alone** shows `Go to line <n>` even with no notebook open, since it needs none; every other query shows `No notebook is open` then.
+- **Enter with nothing to pick** (the notice row, or no rows) leaves the picker open.
+- **Selection before anything is typed:** the second row only when the first is the active tab's note.
+- **Activation order:** when the active tab closes, the tab that takes its place becomes active and moves to the front; a document replaced in place (the preview, a reused untitled tab) leaves the order and its replacement takes the front. A session restore restarts the order from the strip, the active tab first, once every tab has reopened.
+- **A note gone from the library at Enter** shows `FastPad could not open <path>: the note is no longer in the notebook`, through `report_open_failure`.
+- **The hint** is painted by the field's hook, like the find bar's: FastPad has no ComCtl32 v6 manifest, so `EM_SETCUEBANNER` would show nothing.
+- **Screen readers:** every picker's list-box strings now carry the row text (they were empty), so the older pickers' rows are read too.
+- **Ctrl+W in the palette:** `TranslateAcceleratorW` runs before the field's hook, so `translate_accelerator` leaves Ctrl+W alone for the palette's controls; the hook closes the palette and swallows the 0x17 character.
+- **Middle-click:** the press remembers the tab's index and document; the release closes only over the same index while it shows that document, and `WM_MOUSELEAVE` forgets the press. Tabs answer `HTCLIENT`, confirmed in `titlebar::nonclient_hit_test`.
+- **Placement:** the palette row `Go to note…` has no category prefix and follows `File: Open recent notebook...`; the File menu item is `&Go to note…` with `Ctrl+P`, and File → Close tab now shows `Ctrl+W`. `QuickOpen` is not a sidebar command, so it is listed with notes mode off.

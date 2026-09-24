@@ -9,16 +9,20 @@ use crate::window::commands::CommandId;
 use crate::window::menus::{AcceleratorSpec, accelerator_specs};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT,
-    InvalidateRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DEFAULT_GUI_FONT, DT_CALCRECT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject,
+    DrawTextW, EndPaint, FW_BOLD, GetCurrentObject, GetObjectW, GetStockObject, HBRUSH, HDC, HFONT,
+    InvalidateRect, LOGFONTW, OBJ_FONT, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RedrawWindow, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, EM_SETSEL, ODS_SELECTED, SetWindowTheme};
+use windows_sys::Win32::UI::Controls::{
+    DRAWITEMSTRUCT, EM_GETMARGINS, EM_REPLACESEL, EM_SETSEL, EM_UNDO, ODS_SELECTED, SetWindowTheme,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN,
     VK_SHIFT, VK_TAB, VK_UP,
@@ -29,8 +33,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     LB_ADDSTRING, LB_GETCURSEL, LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
     LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, MoveWindow, SW_HIDE, SW_SHOWNA,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow,
-    WM_CHAR, WM_GETFONT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCDESTROY,
-    WM_SETFOCUS, WM_SETFONT, WS_CHILD, WS_VISIBLE, WS_VSCROLL,
+    WM_CHAR, WM_CLEAR, WM_CUT, WM_GETFONT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_NCDESTROY, WM_PAINT, WM_PASTE, WM_SETFOCUS, WM_SETFONT, WM_SETTEXT, WM_UNDO,
+    WS_CHILD, WS_VISIBLE, WS_VSCROLL,
 };
 
 /// One runnable row: the command and what the palette calls it.
@@ -242,6 +247,8 @@ pub(crate) enum PickerKind {
 pub(crate) const QUICK_OPEN_ROWS: usize = 50;
 /// Quick open's one row while no notebook is open; it can't be picked (spec §3.1).
 pub(crate) const NO_NOTEBOOK: &str = "No notebook is open";
+/// What quick open's empty field shows (spec §3.1).
+pub(crate) const QUICK_OPEN_PLACEHOLDER: &str = "Go to note by name";
 
 /// A list of runtime items shown in the palette instead of commands.
 #[derive(Clone, Debug)]
@@ -438,6 +445,9 @@ pub(crate) struct CommandPalette {
     layout: Option<PanelLayout>,
     field_brush: HBRUSH,
     list_brush: HBRUSH,
+    /// The list's font when the bold one was made, and the bold one; null until a quick-open
+    /// row is first drawn.
+    bold: Cell<(HFONT, HFONT)>,
 }
 
 impl CommandPalette {
@@ -484,6 +494,7 @@ impl CommandPalette {
             layout: None,
             field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
             list_brush: unsafe { CreateSolidBrush(colors.strip_background) },
+            bold: Cell::new((std::ptr::null_mut(), std::ptr::null_mut())),
         })
     }
 
@@ -600,11 +611,12 @@ impl CommandPalette {
         unsafe {
             SendMessageW(self.list, LB_RESETCONTENT, 0, 0);
         }
-        let (count, selected) = if self.picker.is_some() {
-            let empty = wide_null("");
-            for _ in 0..self.picker_rows.len() {
+        let (count, selected) = if let Some(picker) = &self.picker {
+            // Owner-drawn, but the strings are what a screen reader reads (spec §3.7).
+            for row in &self.picker_rows {
+                let label = wide_null(&picker_row_label(picker, row));
                 unsafe {
-                    SendMessageW(self.list, LB_ADDSTRING, 0, empty.as_ptr() as LPARAM);
+                    SendMessageW(self.list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM);
                 }
             }
             (self.picker_rows.len(), self.picker_selected)
@@ -821,6 +833,16 @@ impl CommandPalette {
     /// A picker row has no shortcut and its label comes from `picker_row_label`.
     pub(crate) fn draw_item(&self, item: &DRAWITEMSTRUCT) {
         let index = usize::try_from(item.itemID).ok();
+        let quick_open = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == PickerKind::QuickOpen);
+        if quick_open {
+            if let Some(row) = index.and_then(|index| self.picker_rows.get(index)) {
+                self.draw_quick_open_row(item, row);
+            }
+            return;
+        }
         let (label, shortcut) = if let Some(picker) = &self.picker {
             let Some(label) = index
                 .and_then(|index| self.picker_rows.get(index))
@@ -900,6 +922,188 @@ impl CommandPalette {
         }
     }
 
+    /// A quick-open row (spec §3.3): the name with its matched letters in bold, then the folder
+    /// in the muted color, its matched letters bold too. The notice row can't be picked, so it is
+    /// muted and never drawn selected.
+    fn draw_quick_open_row(&self, item: &DRAWITEMSTRUCT, row: &PickerRow) {
+        let notice = matches!(row, PickerRow::Notice(_));
+        let selected = item.itemState & ODS_SELECTED != 0 && !notice;
+        let colors = self.colors;
+        let (background, foreground, muted) = if selected {
+            (
+                colors.hover_background,
+                colors.hover_foreground,
+                colors.hover_foreground,
+            )
+        } else {
+            (
+                colors.strip_background,
+                colors.editor_foreground,
+                colors.muted_foreground,
+            )
+        };
+        let dc = item.hDC;
+        let padding = self.layout.map_or(8, |layout| layout.edit.left - 1);
+        let mut text = RECT {
+            left: item.rcItem.left + padding,
+            right: item.rcItem.right - padding,
+            ..item.rcItem
+        };
+        let list_font = unsafe { SendMessageW(self.list, WM_GETFONT, 0, 0) } as HFONT;
+        let bold = self.bold_font(list_font);
+        // A list with no font draws in the DC's own; `draw_runs` switches fonts per run, so the
+        // DC's font is always put back, whichever the last run selected.
+        let font = if list_font.is_null() {
+            unsafe { GetCurrentObject(dc, OBJ_FONT as u32) }
+        } else {
+            list_font
+        };
+        unsafe {
+            fill(dc, item.rcItem, background);
+            SetBkMode(dc, TRANSPARENT as i32);
+        }
+        let previous = unsafe { SelectObject(dc, font) };
+        match row {
+            PickerRow::Note { found, .. } => {
+                draw_runs(
+                    dc,
+                    &mut text,
+                    &found.name,
+                    &found.name_hits,
+                    font,
+                    bold,
+                    foreground,
+                );
+                if !found.folder.is_empty() {
+                    text.left += padding;
+                    draw_runs(
+                        dc,
+                        &mut text,
+                        &found.folder,
+                        &found.folder_hits,
+                        font,
+                        bold,
+                        muted,
+                    );
+                }
+            }
+            PickerRow::Notice(label) => draw_runs(dc, &mut text, label, &[], font, bold, muted),
+            other => {
+                let label = self
+                    .picker
+                    .as_ref()
+                    .map(|picker| picker_row_label(picker, other))
+                    .unwrap_or_default();
+                draw_runs(dc, &mut text, &label, &[], font, bold, foreground);
+            }
+        }
+        unsafe {
+            SelectObject(dc, previous);
+        }
+    }
+
+    /// `base` in bold, made on first use and again when the list's font changes (a DPI change).
+    /// A list with no font yet uses the default GUI font's metrics.
+    fn bold_font(&self, base: HFONT) -> HFONT {
+        let (made_for, bold) = self.bold.get();
+        if made_for == base && !bold.is_null() {
+            return bold;
+        }
+        if !bold.is_null() {
+            unsafe {
+                DeleteObject(bold);
+            }
+        }
+        let source = if base.is_null() {
+            unsafe { GetStockObject(DEFAULT_GUI_FONT) }
+        } else {
+            base
+        };
+        let mut font = LOGFONTW::default();
+        let read = unsafe {
+            GetObjectW(
+                source,
+                std::mem::size_of::<LOGFONTW>() as i32,
+                (&mut font as *mut LOGFONTW).cast(),
+            )
+        };
+        let bold = if read == 0 {
+            std::ptr::null_mut()
+        } else {
+            font.lfWeight = FW_BOLD as i32;
+            unsafe { CreateFontIndirectW(&font) }
+        };
+        self.bold.set((base, bold));
+        bold
+    }
+
+    /// What the empty query field shows: the quick-open hint, nothing in other modes.
+    pub(crate) fn placeholder(&self) -> Option<&'static str> {
+        self.picker
+            .as_ref()
+            .filter(|picker| picker.kind == PickerKind::QuickOpen)
+            .map(|_| QUICK_OPEN_PLACEHOLDER)
+    }
+
+    /// `WM_PAINT` for the empty query field while it has a placeholder: the hint in the muted
+    /// color where typed text starts. False for any other control or mode, which paints normally.
+    pub(crate) fn paint_placeholder(&self, edit: HWND) -> bool {
+        if edit != self.query_edit {
+            return false;
+        }
+        let Some(placeholder) = self.placeholder() else {
+            return false;
+        };
+        let mut paint = PAINTSTRUCT::default();
+        let dc = unsafe { BeginPaint(edit, &mut paint) };
+        if dc.is_null() {
+            return true;
+        }
+        unsafe {
+            let mut client = RECT::default();
+            GetClientRect(edit, &mut client);
+            fill(dc, client, self.colors.editor_background);
+            let font = SendMessageW(edit, WM_GETFONT, 0, 0);
+            let previous = (font != 0).then(|| SelectObject(dc, font as _));
+            // Typed text starts after the Edit's left margin (the low word).
+            client.left += (SendMessageW(edit, EM_GETMARGINS, 0, 0) & 0xffff) as i32;
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, self.colors.muted_foreground);
+            let mut text = placeholder.encode_utf16().collect::<Vec<_>>();
+            DrawTextW(
+                dc,
+                text.as_mut_ptr(),
+                text.len() as i32,
+                &mut client,
+                DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+            if let Some(previous) = previous {
+                SelectObject(dc, previous);
+            }
+            EndPaint(edit, &paint);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_text(&self, index: usize) -> String {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{LB_GETTEXT, LB_GETTEXTLEN};
+        let length = unsafe { SendMessageW(self.list, LB_GETTEXTLEN, index, 0) };
+        let Ok(length) = usize::try_from(length) else {
+            return String::new();
+        };
+        let mut buffer = vec![0u16; length + 1];
+        let copied =
+            unsafe { SendMessageW(self.list, LB_GETTEXT, index, buffer.as_mut_ptr() as LPARAM) };
+        buffer.truncate(usize::try_from(copied).unwrap_or(0));
+        String::from_utf16_lossy(&buffer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_bold_font(&self) -> bool {
+        !self.bold.get().1.is_null()
+    }
+
     #[cfg(test)]
     pub(crate) fn query_hwnd(&self) -> HWND {
         self.query_edit
@@ -926,11 +1130,89 @@ impl CommandPalette {
     }
 }
 
+/// `text` cut into runs of chars that are all hits or all not, in order. `hits` are ascending
+/// char indices (quick_open's), never byte offsets.
+fn hit_runs<'a>(text: &'a str, hits: &[usize]) -> Vec<(&'a str, bool)> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut current = None;
+    for (index, (byte, _)) in text.char_indices().enumerate() {
+        let hit = hits.binary_search(&index).is_ok();
+        match current {
+            Some(previous) if previous == hit => {}
+            Some(previous) => {
+                runs.push((&text[start..byte], previous));
+                start = byte;
+                current = Some(hit);
+            }
+            None => current = Some(hit),
+        }
+    }
+    if let Some(last) = current {
+        runs.push((&text[start..], last));
+    }
+    runs
+}
+
+/// Draws `text` from `rect.left` in `color`, the chars at `hits` in `bold` and the rest in
+/// `regular`, and moves `rect.left` past what it drew. The run that reaches `rect.right` ends in
+/// an ellipsis, and nothing is drawn after it.
+fn draw_runs(
+    dc: HDC,
+    rect: &mut RECT,
+    text: &str,
+    hits: &[usize],
+    regular: HFONT,
+    bold: HFONT,
+    color: u32,
+) {
+    let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT;
+    unsafe {
+        SetTextColor(dc, color);
+    }
+    for (run, hit) in hit_runs(text, hits) {
+        if rect.left >= rect.right {
+            return;
+        }
+        let font = if hit && !bold.is_null() {
+            bold
+        } else {
+            regular
+        };
+        let mut wide = run.encode_utf16().collect::<Vec<_>>();
+        let mut measured = *rect;
+        unsafe {
+            if !font.is_null() {
+                SelectObject(dc, font);
+            }
+            DrawTextW(
+                dc,
+                wide.as_mut_ptr(),
+                wide.len() as i32,
+                &mut measured,
+                flags | DT_CALCRECT,
+            );
+            DrawTextW(
+                dc,
+                wide.as_mut_ptr(),
+                wide.len() as i32,
+                &mut *rect,
+                flags | DT_END_ELLIPSIS,
+            );
+        }
+        rect.left += measured.right - measured.left;
+    }
+}
+
 impl Drop for CommandPalette {
     fn drop(&mut self) {
+        let (_, bold) = self.bold.get();
         unsafe {
             DeleteObject(self.field_brush);
             DeleteObject(self.list_brush);
+            if !bold.is_null() {
+                DeleteObject(bold);
+            }
         }
     }
 }
@@ -1035,18 +1317,59 @@ unsafe extern "system" fn palette_control_proc(
             }
             return 0;
         }
+        // The empty field shows quick open's hint (EM_SETCUEBANNER needs ComCtl32 v6).
+        (PaletteControl::Query, WM_PAINT)
+            if unsafe { GetWindowTextLengthW(hwnd) } == 0
+                && super::main_window::paint_palette_placeholder(parent, hwnd) =>
+        {
+            return 0;
+        }
         _ => {}
     }
-    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    // The Edit repaints only the text it changes; the hint must go (or come back) whole.
+    let edits_text = hook.control == PaletteControl::Query
+        && matches!(
+            message,
+            WM_CHAR
+                | WM_KEYDOWN
+                | WM_PASTE
+                | WM_CUT
+                | WM_CLEAR
+                | WM_UNDO
+                | WM_SETTEXT
+                | EM_UNDO
+                | EM_REPLACESEL
+        );
+    let was_empty = edits_text && unsafe { GetWindowTextLengthW(hwnd) } == 0;
+    let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    if edits_text && was_empty != (unsafe { GetWindowTextLengthW(hwnd) } == 0) {
+        unsafe {
+            InvalidateRect(hwnd, std::ptr::null(), 1);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, SETTINGS_COMMANDS, filter_entries,
-        match_rank, picker_row_label, picker_rows, shortcut_text,
+        hit_runs, match_rank, picker_row_label, picker_rows, shortcut_text,
     };
     use crate::window::commands::CommandId;
+
+    #[test]
+    fn hit_runs_cut_at_char_positions_not_bytes() {
+        // Break caught (review focus 2): hits used as byte offsets, so "Über Straße" bolds "S"
+        // and "t" one char late, or a run split inside a multi-byte char (a panic).
+        assert_eq!(
+            hit_runs("Über Straße", &[5, 6]),
+            [("Über ", false), ("St", true), ("raße", false)]
+        );
+        assert_eq!(hit_runs("abc", &[0, 1, 2]), [("abc", true)]);
+        assert_eq!(hit_runs("abc", &[]), [("abc", false)]);
+        assert!(hit_runs("", &[]).is_empty());
+    }
 
     #[test]
     fn every_settings_command_has_exactly_one_palette_entry() {

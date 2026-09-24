@@ -116,6 +116,10 @@ Hover a note to pin it.
   replace button (**Ctrl+Shift+1** on the selected one). Notes open in tabs change in the
   editor, where one Ctrl+Z undoes it; the others are saved, skipping any that changed since the
   search. With regular expressions on, `$1` inserts a group, in the find bar's Replace too.
+- **Ctrl+P** opens a note by typing part of its name or folder, its letters in order, as in
+  VS Code. With nothing typed it lists the notes open in tabs, the most recent first, so
+  Ctrl+P then Enter goes back to the previous note. Add `:42` to open a note at line 42, or
+  type `:42` alone to go to that line in the current tab.
 - Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
 - **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
   Everything is reachable from the keyboard and exposed to screen readers.
@@ -135,7 +139,7 @@ file that doesn't parse.
 ### Tabs, done right
 
 Open as many files as you like in one window. **Ctrl+Tab** and **Ctrl+1…9** to jump, double-click
-the empty tab bar for a new tab, scroll the wheel over the tabs to browse them. Open a file from
+the empty tab bar for a new tab, scroll the wheel over the tabs to browse them, and close one with **Ctrl+W** or a middle-click. Open a file from
 Explorer or the command line and it lands as a tab in the FastPad window you already have open, not
 in a new window.
 
@@ -197,7 +201,8 @@ before closing again.
 | Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |
 | Find next / previous | `F3` / `Shift+F3` | | Match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` |
 | Replace in notes | `Ctrl+Shift+H` | | Replace all (in Search) | `Ctrl+Alt+Enter` |
-| Replace in the selected result | `Ctrl+Shift+1` | | | |
+| Replace in the selected result | `Ctrl+Shift+1` | | Go to note | `Ctrl+P` |
+| Close tab | `Ctrl+W` or middle-click | | | |
 
 ## Make it yours
 
