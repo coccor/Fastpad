@@ -196,7 +196,7 @@
   - app deactivation doesn't commit;
   - a rescan keeps the field, and one that removes the target cancels it;
   - the field's accessible name;
-  - Ctrl+W, Ctrl+A and Ctrl+Z in the field act on the field, not a tab.
+  - Ctrl+A and Ctrl+Z in the field act on the field.
 - The folders tests that used the name bar move to the field.
 - **Checks:** clippy and the targeted tests while working, then the full suite once at the end.
 
