@@ -64,6 +64,10 @@ pub struct LibraryState {
     pub stamp: Option<FileStamp>,
     pub local: LocalState,
     pub notes: Vec<NoteEntry>,
+    /// Every folder the scan walked, relative and spelled as on disk, the root not included
+    /// (notebook folders spec §3.1). A rescan replaces it; FastPad's own folder commands update
+    /// it in place.
+    pub folders: Vec<PathBuf>,
     /// The notes as the sidebar's folder tree. Built with the scan on the worker; every later
     /// change to `notes` or to a pin updates it in place.
     pub tree: tree::NoteTree,
@@ -252,6 +256,7 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
         notes,
         tree,
         truncated: scan.truncated,
+        folders: scan.folders,
         pending: reconciled.ops,
         relocated: reconciled.relocated,
         touched: Vec::new(),
@@ -1082,6 +1087,7 @@ mod tests {
             local: LocalState::new(scratch.folder()),
             tree: tree::NoteTree::build(&paths, &[]),
             notes,
+            folders: Vec::new(),
             truncated,
             pending: Vec::new(),
             relocated: Vec::new(),
@@ -1347,6 +1353,29 @@ mod tests {
         assert_eq!(state.record_for(&b).unwrap().path, PathBuf::from("b.md"));
         state.remove_note(&b);
         assert!(state.notes.is_empty());
+    }
+
+    #[test]
+    fn the_state_lists_the_scans_folders_and_a_rescan_replaces_them() {
+        // Break caught: an empty folder known only until the first rescan, or a folder deleted in
+        // Explorer kept alive by the merge.
+        let scratch = Scratch::new("folder-list");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join(r"sub\a.md"), "a").unwrap();
+        let sorted = |state: &LibraryState| {
+            let mut folders = state.folders.clone();
+            folders.sort();
+            folders
+        };
+        let previous = load(&folder, &scratch.local(), 100).unwrap();
+        assert_eq!(sorted(&previous), ["empty", "sub"].map(PathBuf::from));
+        std::fs::remove_dir(folder.join("empty")).unwrap();
+        std::fs::create_dir(folder.join("later")).unwrap();
+        let fresh = load(&folder, &scratch.local(), 101).unwrap();
+        let merged = merge_rescan(previous, fresh);
+        assert_eq!(sorted(&merged), ["later", "sub"].map(PathBuf::from));
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! Walks a folder for notes. Each directory is listed with `FileIdBothDirectoryInfo` queries,
-//! which return names, sizes, write times and file IDs in bulk without opening any file.
+//! Walks a folder for notes, and lists every folder it walks. Each directory is listed with
+//! `FileIdBothDirectoryInfo` queries, which return names, sizes, write times and file IDs in
+//! bulk without opening any file.
 
 use crate::Result;
 use crate::platform::{OwnedHandle, last_error, wide_null};
@@ -15,6 +16,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 pub const NOTE_LIMIT: usize = 10_000;
+/// At most this many folders are listed in `Scan::folders`. Past it folders are still walked:
+/// their notes count toward `NOTE_LIMIT`, and the tree gives each note's folder a row anyway.
+pub const FOLDER_LIMIT: usize = 10_000;
 const SKIPPED: [&str; 4] = ["node_modules", "target", "bin", "obj"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +37,9 @@ pub struct ScanEntry {
 pub struct Scan {
     pub volume: u32,
     pub entries: Vec<ScanEntry>,
+    /// Every folder walked, relative to the scanned folder and spelled as on disk, the root not
+    /// included: at most `FOLDER_LIMIT` of them, in walk order.
+    pub folders: Vec<PathBuf>,
     pub truncated: bool,
 }
 
@@ -61,6 +68,11 @@ fn open_directory(path: &Path) -> Result<OwnedHandle> {
 }
 
 pub fn scan(folder: &Path, limit: usize) -> Result<Scan> {
+    scan_limited(folder, limit, FOLDER_LIMIT)
+}
+
+/// `scan` with its own folder cap: at most `folder_limit` folders are listed.
+pub fn scan_limited(folder: &Path, limit: usize, folder_limit: usize) -> Result<Scan> {
     let root = open_directory(folder)?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(root.as_raw(), &mut info) } == 0 {
@@ -128,6 +140,10 @@ pub fn scan(folder: &Path, limit: usize) -> Result<Scan> {
                     if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                         if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 && !skip_directory(&name)
                         {
+                            // Listed as it is walked, so an empty folder still gets a row.
+                            if scan.folders.len() < folder_limit {
+                                scan.folders.push(path.clone());
+                            }
                             pending.push((path, None));
                         }
                     } else if Path::new(&name)
@@ -179,6 +195,10 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
+
+        fn dir(&self, relative: &str) {
+            std::fs::create_dir_all(self.0.join(relative)).unwrap();
+        }
     }
 
     impl Drop for Scratch {
@@ -195,6 +215,64 @@ mod tests {
             .collect();
         paths.sort();
         paths
+    }
+
+    fn folders(scan: &Scan) -> Vec<String> {
+        let mut folders: Vec<_> = scan
+            .folders
+            .iter()
+            .map(|folder| folder.to_string_lossy().into_owned())
+            .collect();
+        folders.sort();
+        folders
+    }
+
+    #[test]
+    fn every_walked_folder_is_listed_and_skipped_or_hidden_folders_are_not() {
+        // Break caught: an empty folder missing from the tree because only notes' parents became
+        // rows, or a .git, node_modules or hidden folder showing up as an empty row.
+        let scratch = Scratch::new("folders");
+        scratch.dir("empty");
+        scratch.dir(r"outer\inner\deepest");
+        scratch.file(r"notes\a.md", "a");
+        scratch.dir(r".git\objects");
+        scratch.dir("node_modules");
+        scratch.dir("Target");
+        scratch.file(r"secret\b.md", "b");
+        let secret = crate::platform::wide_null(&scratch.0.join("secret").to_string_lossy());
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                secret.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+            );
+        }
+        let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
+        assert_eq!(
+            folders(&scan),
+            [
+                "empty",
+                "notes",
+                "outer",
+                r"outer\inner",
+                r"outer\inner\deepest"
+            ]
+        );
+        assert_eq!(paths(&scan), [r"notes\a.md"]);
+    }
+
+    #[test]
+    fn folders_past_the_folder_limit_are_walked_but_not_listed() {
+        // Break caught: the folder cap also dropping the notes of the folders past it, or a
+        // notebook of a million empty folders listing them all.
+        let scratch = Scratch::new("folder-limit");
+        for name in ["a", "b", "c"] {
+            scratch.file(&format!(r"{name}\n.md"), "x");
+        }
+        let scan = scan_limited(&scratch.0, NOTE_LIMIT, 2).unwrap();
+        assert_eq!(scan.folders.len(), 2);
+        assert_eq!(paths(&scan), [r"a\n.md", r"b\n.md", r"c\n.md"]);
+        assert!(!scan.truncated);
+        assert_eq!(FOLDER_LIMIT, 10_000);
     }
 
     #[test]
@@ -256,6 +334,7 @@ mod tests {
         assert!(made.status.success(), "mklink /J failed: {made:?}");
         let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
         assert_eq!(paths(&scan), ["a.md"]);
+        assert!(scan.folders.is_empty(), "a junction is not a folder row");
     }
 
     #[test]

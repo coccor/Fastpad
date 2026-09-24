@@ -304,6 +304,7 @@ mod tests {
                 scan: Scan {
                     volume: VOLUME,
                     entries,
+                    folders: Vec::new(),
                     truncated: false,
                 },
                 hashes: HashMap::new(),
