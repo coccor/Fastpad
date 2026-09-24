@@ -18695,4 +18695,37 @@ mod tests {
         assert_eq!(field_text(window.hwnd), "");
         assert_eq!(editor.text().unwrap(), "typed in the editor");
     }
+
+    #[test]
+    fn pressing_the_scroll_thumb_keeps_the_edit_open_and_the_field_focused() {
+        // Break caught: grabbing the tree's scroll thumb mid-rename renaming the note to the
+        // half-typed name, or taking the focus from the field; scrolling keeps the edit (inline
+        // naming spec §5.4).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-thumb");
+        for index in 0..80 {
+            scratch.note(&format!("n{index:02}.md"), "n");
+        }
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("n00.md".into()));
+        type_into_field(window.hwnd, "half");
+        let (x, y) = notebook_view(window.hwnd)
+            .thumb_point()
+            .expect("80 notes overflow the list");
+
+        unsafe {
+            SendMessageW(panel, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+            SendMessageW(panel, WM_LBUTTONUP, 0, client_lparam(x, y));
+        }
+        pump_posted_messages(window.hwnd);
+
+        assert!(inline_open(window.hwnd));
+        assert_eq!(field_text(window.hwnd), "half");
+        assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+        assert!(scratch.folder().join("n00.md").exists());
+        assert!(!scratch.folder().join("half.md").exists());
+    }
 }

@@ -697,6 +697,16 @@ impl NotebookView {
         self.row_rect(self.list_rect(self.client()), index)
     }
 
+    /// A point on the scroll thumb in panel coordinates, while the list scrolls: its left edge,
+    /// clear of the sidebar's resize grip, halfway down.
+    #[cfg(test)]
+    pub(crate) fn thumb_point(&self) -> Option<(i32, i32)> {
+        let list = self.list_rect(self.client());
+        let (top, length) = self.list.thumb(height(list))?;
+        let left = list.right - row_list::thumb_width(self.list.row_height);
+        Some((left, list.top + top + length / 2))
+    }
+
     /// The inline field's frame, in the accent colour or the error colour while a problem
     /// shows, and the problem under the field, or above it without room below (inline naming
     /// spec §4.4).
@@ -1806,7 +1816,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             // Selects the row; DefWindowProc turns the button-up into WM_CONTEXTMENU.
             let (x, y) = point_of(lparam);
             let hit = hit_after_commit(hwnd, x, y);
-            focus_panel(hwnd);
+            focus_panel_for(hwnd, hit.as_ref());
             if let Some(Hit::Row { index, .. }) = hit {
                 with_view(hwnd, |view| view.select(index));
             }
@@ -1931,10 +1941,11 @@ fn focus_panel(hwnd: HWND) {
 /// What a press at `x`, `y` hits. An inline edit open when the press comes ends first, as if
 /// focus had left it (inline naming spec §5.3), and a row hit follows the row it landed on to
 /// wherever the commit moved it. `None` when there is no view, or that row went with the commit
-/// (the draft row, or the row just renamed).
+/// (the draft row, or the row just renamed). A press on the scroll thumb leaves the edit open.
 fn hit_after_commit(hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
     let hit = with_view(hwnd, |view| view.hit_test(x, y))?;
-    if !super::inline_name::is_open(hwnd) {
+    // The scroll thumb only scrolls, and the field scrolls with its row (spec §5.4).
+    if !super::inline_name::is_open(hwnd) || matches!(hit, Hit::Thumb(_)) {
         return Some(hit);
     }
     let clicked = match hit {
@@ -1955,9 +1966,18 @@ fn hit_after_commit(hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
     }
 }
 
+/// Moves the keyboard focus to the panel for a press that `hit`, unless it is on the scroll
+/// thumb while an inline edit is open: the field keeps the focus and goes on editing while the
+/// drag scrolls (inline naming spec §5.4).
+fn focus_panel_for(hwnd: HWND, hit: Option<&Hit>) {
+    if !(matches!(hit, Some(Hit::Thumb(_))) && super::inline_name::is_open(hwnd)) {
+        focus_panel(hwnd);
+    }
+}
+
 fn left_down(hwnd: HWND, x: i32, y: i32) {
     let hit = hit_after_commit(hwnd, x, y);
-    focus_panel(hwnd);
+    focus_panel_for(hwnd, hit.as_ref());
     let Some(hit) = hit else {
         return;
     };
