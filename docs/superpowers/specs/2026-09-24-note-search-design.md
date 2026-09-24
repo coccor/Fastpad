@@ -258,6 +258,15 @@ For each note, in the library's note-list order:
 - **The report** afterwards is a notification: "Replaced N matches in M notes." It also names any notes that were skipped, for example "2 notes were skipped because they changed since the search", with the note names in the details.
 - **The library** hears about the writes as it does about any external change, through its rescan and reconcile. The writes are also marked FastPad's own, so they don't show as outside changes to tabs.
 
+### 12a. Decisions made when 3b started (user-approved 2026-09-24)
+
+- **`$1` in both places.** In regex mode, `$1`, `${name}` and `$$` expand, with `regex::Captures::expand`. This applies to the Search view's replace and to the editor find bar's Replace and Replace all, which use the same `Matcher` since 3a. In plain mode, and in the find bar's plain mode, the replacement is literal.
+- **Capped results.** When the results are capped ("500+ notes"), Replace all replaces only in the listed notes.
+  - The confirmation says so: "Replace N matches in the 500 listed notes with "<text>"? More notes match; search again to replace in the rest."
+  - It never writes to notes that aren't listed.
+- **Background tabs.** A result note that is open in a tab that isn't in front is changed in the editor, as the active tab is: one undo action, and not saved. To do that, its document is swapped into the editor briefly, in the same way search reads it.
+  - The replace waits while a modal dialog is open or a file is being populated, with the same guard the search's debounce uses.
+
 ## 13. Code layout (3b)
 
 - **`src/library/text_replace.rs`** (new, no Win32): `plan_replacements` counts matches, and `apply(notebook, targets, matcher, replacement, cancel) -> ReplaceReport` writes the files.
