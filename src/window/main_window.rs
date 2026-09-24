@@ -4532,6 +4532,11 @@ fn finish_session_restore(hwnd: HWND) {
     if !identity.is_live_for(hwnd) {
         return;
     }
+    // Each restored tab entered the activation order at the front as it opened. Restart it from
+    // the strip, the active tab first (quick-open spec §3.2).
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.tabs.reset_activation_order();
+    }
     if restore.failed > 0 {
         push_notice(hwnd, crate::session::restore_failure_notice(restore.failed));
     }
@@ -8301,6 +8306,44 @@ mod tests {
         assert!(
             !draft_snapshot.exists(),
             "saving a restored tab removes its snapshot"
+        );
+    }
+
+    #[test]
+    fn restored_tabs_enter_the_activation_order_in_strip_order_with_the_active_tab_first() {
+        // Break caught: the restore wiring missing, so Ctrl+P after a restart lists the tabs in
+        // the reverse order they reopened in, not the saved active tab first.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-activation-order");
+        let files = ["one.txt", "two.txt", "three.txt"].map(|name| {
+            let path = scratch.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        });
+        write_session(
+            &scratch,
+            files
+                .iter()
+                .map(|path| SessionEntry::new(SessionSource::File(path.clone())))
+                .collect(),
+            1,
+        );
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+
+        run_session_restore(window.hwnd);
+
+        let app = app_mut(window.hwnd);
+        let paths = app
+            .tabs
+            .activation_order()
+            .iter()
+            .map(|&id| app.tabs.document(id).unwrap().path.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [files[1].clone(), files[0].clone(), files[2].clone()]
         );
     }
 

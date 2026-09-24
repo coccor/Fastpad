@@ -131,6 +131,9 @@ fn view_tabs(documents: &[Document]) -> Vec<TabViewTab> {
 #[derive(Debug)]
 pub struct Tabs {
     documents: Vec<Document>,
+    /// Every tab, the most recently activated first; the active tab is always first
+    /// (quick-open spec §3.2). Kept in memory only, never saved.
+    recent: Vec<DocumentId>,
     selection: TabSelection,
     view: TabView,
 }
@@ -140,6 +143,7 @@ impl Tabs {
         let documents = Vec::new();
         Self {
             view: TabView::new(&documents),
+            recent: Vec::new(),
             documents,
             selection: TabSelection::new(0),
         }
@@ -149,6 +153,7 @@ impl Tabs {
         let documents = vec![document];
         Self {
             view: TabView::new(&documents),
+            recent: documents.iter().map(|document| document.id).collect(),
             documents,
             selection: TabSelection::new(0),
         }
@@ -161,6 +166,7 @@ impl Tabs {
         validate_unique_paths(&documents)?;
         Ok(Self {
             view: TabView::new(&documents),
+            recent: documents.iter().map(|document| document.id).collect(),
             documents,
             selection: TabSelection::new(0),
         })
@@ -257,6 +263,9 @@ impl Tabs {
         let index = self.active_index();
         let active = self.documents.get_mut(index)?;
         let old = std::mem::replace(active, document);
+        let id = active.id;
+        self.recent.retain(|recent| *recent != old.id);
+        self.touch(id);
         self.view.update(&self.documents);
         Some(old)
     }
@@ -277,7 +286,41 @@ impl Tabs {
             .position(|document| document.id == id)
             .ok_or(UnknownDocument(id))?;
         self.selection.select(index, self.documents.len());
+        self.touch(id);
         Ok(())
+    }
+
+    /// Moves `id` to the front of the activation order.
+    fn touch(&mut self, id: DocumentId) {
+        self.recent.retain(|recent| *recent != id);
+        self.recent.insert(0, id);
+    }
+
+    /// The tabs, the most recently activated first; the active tab leads (spec §3.2).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the quick-open picker reads it (quick-open plan, Task 4)"
+        )
+    )]
+    pub(crate) fn activation_order(&self) -> &[DocumentId] {
+        &self.recent
+    }
+
+    /// Restarts the activation order from the strip, the active tab first: how restored tabs
+    /// enter it once a session restore has reopened them all (spec §3.2).
+    pub(crate) fn reset_activation_order(&mut self) {
+        let active = self.active().map(|document| document.id);
+        self.recent = active
+            .into_iter()
+            .chain(
+                self.documents
+                    .iter()
+                    .map(|document| document.id)
+                    .filter(|id| Some(*id) != active),
+            )
+            .collect();
     }
 
     pub fn activate_index(&mut self, index: usize) -> Result<(), UnknownDocument> {
@@ -302,9 +345,11 @@ impl Tabs {
                 return Err(DuplicateDocumentPath(candidate));
             }
         }
+        let id = document.id;
         self.documents.push(document);
         let index = self.documents.len() - 1;
         self.selection.select(index, self.documents.len());
+        self.touch(id);
         self.view.update(&self.documents);
         Ok(())
     }
@@ -315,14 +360,19 @@ impl Tabs {
         }
         let index = self.active_index();
         let closed = self.documents.remove(index);
-        self.select_after_removal(index);
+        self.select_after_removal(index, closed.id);
         Ok(closed)
     }
 
     /// Keeps the successor of a removed tab selected (or its predecessor at the end of the strip).
-    fn select_after_removal(&mut self, removed: usize) {
+    /// `closed` leaves the activation order and the tab now selected takes its front.
+    fn select_after_removal(&mut self, removed: usize, closed: DocumentId) {
         let active = removed.min(self.documents.len().saturating_sub(1));
         self.selection.active.store(active, Ordering::Release);
+        self.recent.retain(|recent| *recent != closed);
+        if let Some(id) = self.documents.get(active).map(|document| document.id) {
+            self.touch(id);
+        }
         self.view.update(&self.documents);
     }
 
@@ -357,7 +407,7 @@ impl Tabs {
             return Err(CloseReviewError::Unsaved);
         }
         let closed = self.documents.remove(index);
-        self.select_after_removal(index);
+        self.select_after_removal(index, closed.id);
         Ok(closed)
     }
 
@@ -479,8 +529,11 @@ impl Tabs {
     pub(crate) fn replace_preview(&mut self, document: Document) -> Option<Document> {
         match self.documents.iter().position(|existing| existing.preview) {
             Some(index) if !self.documents[index].dirty => {
+                let id = document.id;
                 let old = std::mem::replace(&mut self.documents[index], document);
                 self.selection.select(index, self.documents.len());
+                self.recent.retain(|recent| *recent != old.id);
+                self.touch(id);
                 self.view.update(&self.documents);
                 Some(old)
             }
@@ -511,6 +564,7 @@ impl Tabs {
 
     pub fn clear_for_shutdown(&mut self) {
         self.documents.clear();
+        self.recent.clear();
         self.selection.active.store(0, Ordering::Release);
         self.view.update(&self.documents);
     }
@@ -683,6 +737,12 @@ mod tests {
     use super::Tabs;
     use crate::document::{Document, DocumentId};
     use std::fs;
+
+    use crate::document::CloseDecision;
+
+    fn order(tabs: &Tabs) -> Vec<u64> {
+        tabs.activation_order().iter().map(|id| id.0).collect()
+    }
 
     fn document(id: u64) -> Document {
         Document::test_fixture(DocumentId(id), false)
@@ -952,5 +1012,69 @@ mod tests {
         assert!(tabs.document(DocumentId(2)).unwrap().autosave_paused);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activating_or_opening_a_tab_moves_it_to_the_front_of_the_activation_order() {
+        // Break caught: Ctrl+P listing tabs in strip order, so Ctrl+P then Enter doesn't go back
+        // to the previous note, or a new tab missing from the list.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(document(2)).unwrap();
+        tabs.push(document(3)).unwrap();
+        assert_eq!(order(&tabs), [3, 2, 1]);
+        tabs.activate(DocumentId(1)).unwrap();
+        assert_eq!(order(&tabs), [1, 3, 2]);
+        tabs.activate_index(2).unwrap();
+        assert_eq!(order(&tabs), [3, 1, 2]);
+        tabs.activate(DocumentId(3)).unwrap();
+        assert_eq!(order(&tabs), [3, 1, 2], "the active tab stays first");
+    }
+
+    #[test]
+    fn a_closed_tab_leaves_the_order_and_the_tab_taking_its_place_comes_first() {
+        // Break caught: Ctrl+P offering a closed tab's dead document, or leaving the tab now on
+        // screen second, so Ctrl+P then Enter re-selects the tab already shown.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(document(2)).unwrap();
+        tabs.push(document(3)).unwrap();
+        tabs.activate(DocumentId(2)).unwrap();
+        assert_eq!(order(&tabs), [2, 3, 1]);
+        tabs.close_active(CloseDecision::Discard).unwrap();
+        assert_eq!(tabs.active().unwrap().id, DocumentId(3));
+        assert_eq!(order(&tabs), [3, 1]);
+        let review = tabs.active_close_review().unwrap();
+        tabs.close_reviewed(review, CloseDecision::Discard).unwrap();
+        assert_eq!(order(&tabs), [1]);
+    }
+
+    #[test]
+    fn a_tab_replaced_in_place_takes_the_front_and_the_old_document_leaves_the_order() {
+        // Break caught: a replaced preview (or reused untitled tab) still listed by Ctrl+P under
+        // its old document, or the note now in it missing.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(preview(2)).unwrap();
+        tabs.push(document(3)).unwrap();
+        tabs.replace_preview(preview(4)).unwrap();
+        assert_eq!(order(&tabs), [4, 3, 1]);
+        tabs.activate(DocumentId(1)).unwrap();
+        tabs.replace_active_untitled(document(5)).unwrap();
+        assert_eq!(order(&tabs), [5, 4, 3]);
+        tabs.clear_for_shutdown();
+        assert!(order(&tabs).is_empty());
+    }
+
+    #[test]
+    fn restored_tabs_restart_the_order_from_the_strip_with_the_active_tab_first() {
+        // Break caught: after a session restore, the tabs listed last-restored first (each one
+        // entered at the front as it opened).
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(document(2)).unwrap();
+        tabs.push(document(3)).unwrap();
+        tabs.push(document(4)).unwrap();
+        tabs.activate(DocumentId(3)).unwrap();
+        tabs.reset_activation_order();
+        assert_eq!(order(&tabs), [3, 1, 2, 4]);
+        let from = Tabs::from_documents([document(5), document(6)]).unwrap();
+        assert_eq!(order(&from), [5, 6]);
     }
 }
