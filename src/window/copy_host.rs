@@ -59,10 +59,12 @@ struct Reload {
 
 /// The one copy worker a window has, started by its first copy. Its queue is a channel: a second
 /// drop waits behind the first. Dropping it (the window closing) stops the worker after the file
-/// in hand, and nothing more is posted.
+/// in hand and waits for that file to finish, so the process never exits with one half written;
+/// nothing more is copied or posted.
 #[derive(Default)]
 pub(crate) struct CopyWorker {
     sender: Option<Sender<CopyJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
     /// Drops queued whose result has not been applied yet, for `wait_for_copies`.
     #[cfg(test)]
@@ -75,9 +77,27 @@ impl std::fmt::Debug for CopyWorker {
     }
 }
 
+impl CopyWorker {
+    /// Queues `job`, starting the worker thread on the first one.
+    fn send(&mut self, job: CopyJob) {
+        let sender = self.sender.get_or_insert_with(|| {
+            let (sender, receiver) = channel();
+            let cancel = Arc::clone(&self.cancel);
+            self.thread = Some(std::thread::spawn(move || run_worker(receiver, cancel)));
+            sender
+        });
+        let _ = sender.send(job);
+    }
+}
+
 impl Drop for CopyWorker {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        // The worker's `recv` ends with the channel, and the file in hand is waited for.
+        self.sender = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -89,6 +109,7 @@ fn run_worker(jobs: Receiver<CopyJob>, cancel: Arc<AtomicBool>) {
         let items = job
             .items
             .into_iter()
+            .take_while(|_| !cancel.load(Ordering::Relaxed))
             .map(|(source, destination)| ItemDone {
                 is_folder: source.is_dir(),
                 copied: files::copy_tree(&source, &destination, &cancel),
@@ -161,22 +182,25 @@ fn recycle(hwnd: HWND, path: &Path) -> bool {
     result.is_ok()
 }
 
-/// Why the item at `destination`, which a clash is about to recycle, must stay: it is `source`
-/// itself or a folder holding it under another spelling (an 8.3 name, a `subst` drive, a `\\?\`
-/// prefix, a mapped drive, a junction), which the plan's lexical checks can't see. When
-/// `destination` can't be identified, it isn't proven safe either, and it stays with the
-/// Recycle Bin notice. `None` when it may go.
+/// Why the item at `destination`, which a clash is about to recycle, must stay, by file identity
+/// rather than by the spelling the plan's lexical checks go by: it is `source` itself, or one of
+/// the folders above `source` as spelled or above where `source` really is (`files::final_path`,
+/// which resolves junctions, symlinks, `subst` and mapped drives). When the real location can't
+/// be resolved, only the spelled path's folders are checked. When `destination` can't be
+/// identified, it isn't proven safe, and it stays with the Recycle Bin notice. `None` when it
+/// may go.
 fn kept_by_identity(source: &Path, destination: &Path, name: &str) -> Option<String> {
     let Some(id) = files::file_id(destination) else {
         return Some(tree_copy::recycle_failed_notice(name));
     };
+    let holds = |path: &Path| {
+        path.ancestors()
+            .skip(1)
+            .any(|ancestor| files::file_id(ancestor) == Some(id))
+    };
     let refusal = if files::file_id(source) == Some(id) {
         Refusal::SamePlace
-    } else if source
-        .ancestors()
-        .skip(1)
-        .any(|ancestor| files::file_id(ancestor) == Some(id))
-    {
+    } else if holds(source) || files::final_path(source).is_some_and(|real| holds(&real)) {
         Refusal::HoldsSource
     } else {
         return None;
@@ -302,22 +326,19 @@ fn clean_tabs_on(hwnd: HWND, replaced: &[PathBuf]) -> Vec<(DocumentId, PathBuf, 
 }
 
 fn queue(hwnd: HWND, job: CopyJob) {
-    let sender = library_host::with_copy_worker(hwnd, |worker| {
+    library_host::with_copy_worker(hwnd, |worker| {
         #[cfg(test)]
         worker.pending.fetch_add(1, Ordering::SeqCst);
-        worker
-            .sender
-            .get_or_insert_with(|| {
-                let (sender, receiver) = channel();
-                let cancel = Arc::clone(&worker.cancel);
-                std::thread::spawn(move || run_worker(receiver, cancel));
-                sender
-            })
-            .clone()
+        worker.send(job);
     });
-    if let Some(sender) = sender {
-        let _ = sender.send(job);
-    }
+}
+
+/// `WM_DESTROY`: stops the copy worker after the file in hand and waits for it, so the process
+/// never exits partway through a file. It is taken out of the window first, so nothing of the
+/// App is borrowed while the UI thread waits.
+pub(crate) fn stop(hwnd: HWND) {
+    let worker = library_host::with_copy_worker(hwnd, std::mem::take);
+    drop(worker);
 }
 
 /// `WM_FASTPAD_COPY_DONE`: frees the result and applies it.
@@ -444,5 +465,69 @@ pub(crate) fn wait_for_copies(hwnd: HWND) {
         );
         super::main_window::pump_posted_messages(hwnd);
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_worker_waits_for_the_file_in_hand_and_starts_no_other() {
+        // Break caught: the window closing while a copy runs, and the process exiting partway
+        // through a file, which is left in the notebook half written (open editors spec §5).
+        let dir = std::env::temp_dir().join(format!("fastpad-copy-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (from, to) = (dir.join("from"), dir.join("to"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        let block = vec![7u8; 8 * 1024 * 1024];
+        let names: Vec<String> = (0..20).map(|index| format!("f{index:02}.bin")).collect();
+        for name in &names {
+            std::fs::write(from.join(name), &block).unwrap();
+        }
+        let mut worker = CopyWorker::default();
+        worker.send(CopyJob {
+            target: 0,
+            items: names
+                .iter()
+                .map(|name| (from.join(name), to.join(name)))
+                .collect(),
+            reloads: Vec::new(),
+            notices: Vec::new(),
+            root: dir.clone(),
+            folder: PathBuf::new(),
+        });
+        let started = std::time::Instant::now();
+        while !to.join(&names[0]).exists() {
+            assert!(started.elapsed().as_secs() < 10, "the copy never started");
+            std::thread::yield_now();
+        }
+        let cancel = Arc::clone(&worker.cancel);
+
+        drop(worker);
+        assert_eq!(
+            Arc::strong_count(&cancel),
+            1,
+            "Drop returned before the worker thread ended"
+        );
+        let copied: Vec<_> = std::fs::read_dir(&to)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert!(
+            !copied.is_empty() && copied.len() < names.len(),
+            "{}",
+            copied.len()
+        );
+        for entry in copied {
+            // Compared whole: a copy in progress may already have its final size, filled later.
+            assert!(
+                std::fs::read(entry.path()).unwrap() == block,
+                "{:?} is half written",
+                entry.file_name()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

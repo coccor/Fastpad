@@ -240,6 +240,9 @@ unsafe extern "system" fn main_window_proc(
             // an offline drive this can hold the close for one save's I/O timeout.
             crate::window::text_search_host::cancel_replace(hwnd);
             crate::window::text_search_host::join_writers(hwnd);
+            // A copy into the notebook stops after the file in hand, and is waited for the same
+            // way, so no copied file is left half written.
+            crate::window::copy_host::stop(hwnd);
             // Dropping it here destroys the icon (`LogoIcon::drop`); `WM_NCDESTROY` still frees
             // the rest of App, but the logo shouldn't wait for that.
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
@@ -20600,5 +20603,40 @@ mod tests {
         assert!(notices(window.hwnd).contains(&format!(
             "{short_name} was not copied: it is already there."
         )));
+    }
+
+    #[test]
+    fn copy_host_a_junction_in_the_source_path_does_not_hide_the_folder_holding_it() {
+        // Break caught: the identity check walking only the folders of the source as spelled, so
+        // with a junction on the way the real folder holding it was not seen, and answering OK
+        // recycled that folder with the source inside it.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-junction");
+        let inner = scratch.folder().join("work").join("x").join("work");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("in.md"), "in").unwrap();
+        let link = scratch.root.join("j");
+        crate::platform::files::junction_for_test(&link, &scratch.folder().join("work").join("x"));
+        let (window, _editor) = notebook_window(&scratch);
+
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![link.join("work")],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        let folder = crate::window::library_host::notebook_name(&scratch.folder());
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some(format!("work already exists in {folder}. Replace it?").as_str()),
+            "the plan saw a clash, not the refusal"
+        );
+        assert_eq!(std::fs::read_to_string(inner.join("in.md")).unwrap(), "in");
+        assert!(
+            notices(window.hwnd)
+                .contains(&"work was not copied: it would replace the folder it is in.".to_owned())
+        );
     }
 }

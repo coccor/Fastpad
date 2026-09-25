@@ -9,9 +9,9 @@ use std::path::Path;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, CreateFileW,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW, MOVEFILE_COPY_ALLOWED,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -194,12 +194,10 @@ pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool)
     copied
 }
 
-/// The volume serial number and file index of the file or folder at `path`: the same for every
-/// spelling of one item (an 8.3 short name, a `subst` drive, a `\\?\` prefix, a junction), and
-/// different for two items that both exist. `None` when it can't be opened or asked.
-pub fn file_id(path: &Path) -> Option<(u32, u64)> {
+/// Opens the file or folder at `path` for its attributes only: no access asked for, any sharing
+/// allowed, and backup semantics so folders open. A junction or symlink on the way is followed.
+fn open_for_attributes(path: &Path) -> Option<crate::platform::OwnedHandle> {
     let path_wide = wide(path);
-    // No access asked for, so only the attributes are reachable; backup semantics opens folders.
     let handle = unsafe {
         CreateFileW(
             path_wide.as_ptr(),
@@ -212,13 +210,74 @@ pub fn file_id(path: &Path) -> Option<(u32, u64)> {
         )
     };
     // CreateFileW returns INVALID_HANDLE_VALUE on failure, which from_raw_owned rejects.
-    let handle = unsafe { crate::platform::OwnedHandle::from_raw_owned(handle) }.ok()?;
+    unsafe { crate::platform::OwnedHandle::from_raw_owned(handle) }.ok()
+}
+
+/// Where the file or folder at `path` really is (`GetFinalPathNameByHandleW`): every junction,
+/// symlink, `subst` drive and 8.3 name on the way resolved, as a drive-letter path, or as a
+/// `\\server\share` path on a network. `None` when it can't be opened or resolved.
+pub fn final_path(path: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let handle = open_for_attributes(path)?;
+    let mut buffer = vec![0u16; 512];
+    let length = loop {
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle.as_raw(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if length == 0 {
+            return None;
+        }
+        // Too small: `length` is then the size needed, its terminating NUL included.
+        if length < buffer.len() {
+            break length;
+        }
+        buffer.resize(length + 1, 0);
+    };
+    let resolved = &buffer[..length];
+    let unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let plain = if let Some(rest) = resolved.strip_prefix(unc.as_slice()) {
+        [&[u16::from(b'\\'); 2][..], rest].concat()
+    } else {
+        resolved
+            .strip_prefix(verbatim.as_slice())
+            .unwrap_or(resolved)
+            .to_vec()
+    };
+    Some(std::ffi::OsString::from_wide(&plain).into())
+}
+
+/// The volume serial number and file index of the file or folder at `path`: the same for every
+/// spelling of one item (an 8.3 short name, a `subst` drive, a `\\?\` prefix, a junction), and
+/// different for two items that both exist. `None` when it can't be opened or asked.
+pub fn file_id(path: &Path) -> Option<(u32, u64)> {
+    let handle = open_for_attributes(path)?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle.as_raw(), &mut info) } == 0 {
         return None;
     }
     let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     Some((info.dwVolumeSerialNumber, index))
+}
+
+/// Makes `link` a directory junction to `target`, as `mklink /J` does (no admin needed).
+#[cfg(test)]
+pub fn junction_for_test(link: &Path, target: &Path) {
+    let status = std::process::Command::new("cmd")
+        .arg("/c")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J failed");
 }
 
 /// `path` spelled with 8.3 short names where the volume has them; `path` itself otherwise.
@@ -400,6 +459,27 @@ mod tests {
         let folder = file_id(&dir).expect("a folder opens too");
         assert_ne!(folder, id);
         assert_eq!(file_id(&dir.join("never-existed.md")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_final_path_resolves_junctions_and_other_spellings() {
+        // Break caught: the clash check walking only the spelled path's folders, so a junction in
+        // the source's path hid the real folder holding it, and that folder was recycled.
+        let dir = scratch("final-path");
+        let file = dir.join("real").join("inner").join("a-long-file-name.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "a").unwrap();
+        junction_for_test(&dir.join("link"), &dir.join("real"));
+        let real = final_path(&file).unwrap();
+        assert!(!real.to_string_lossy().starts_with(r"\\?\"), "{real:?}");
+        assert!(real.is_absolute() && real.ends_with(r"real\inner\a-long-file-name.md"));
+        let through_link = dir.join("link").join("inner").join("a-long-file-name.md");
+        assert_eq!(final_path(&through_link), Some(real.clone()));
+        assert_eq!(final_path(&short_path_for_test(&file)), Some(real.clone()));
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", file.display()));
+        assert_eq!(final_path(&verbatim), Some(real.clone()));
+        assert_eq!(final_path(&dir.join("never-existed.md")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
