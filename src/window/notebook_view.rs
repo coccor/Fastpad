@@ -17,6 +17,7 @@ use crate::window::menus::MenuEntry;
 use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset, scale};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
+use crate::window::sidebar_accessibility::MK_LBUTTON;
 use crate::window::tooltip::Tooltip;
 use crate::window::tree_drag::{self, Drag, Hover};
 use std::collections::HashSet;
@@ -28,7 +29,6 @@ use windows_sys::Win32::Graphics::Gdi::{
     DT_VCENTER, DT_WORDBREAK, DrawTextW, GetDC, GetTextExtentPoint32W, HDC, HFONT, InvalidateRect,
     ReleaseDC, ScreenToClient, SelectObject,
 };
-use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -411,7 +411,7 @@ pub(crate) struct NotebookView {
     /// §3).
     pub(crate) drag: Option<Drag>,
     /// The right press that cancelled a drag: its release opens no menu.
-    eat_right_up: bool,
+    pub(crate) eat_right_up: bool,
     tracking_leave: bool,
     /// What the rows were last built from (`None` before the first rebuild).
     built: Option<RebuildKey>,
@@ -1926,6 +1926,9 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
                 with_view(hwnd, |view| view.eat_right_up = true);
                 return Some(0);
             }
+            // An earlier cancel's release may never have come here (it went to another window):
+            // this press is an ordinary one, so it opens the menu as usual.
+            with_view(hwnd, |view| view.eat_right_up = false);
             // Selects the row; DefWindowProc turns the button-up into WM_CONTEXTMENU.
             let (x, y) = point_of(lparam);
             let hit = hit_after_commit(hwnd, x, y);
@@ -2055,7 +2058,7 @@ fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
     .flatten() else {
         return false;
     };
-    if buttons & MK_LBUTTON as usize == 0 {
+    if buttons & MK_LBUTTON == 0 {
         // The release went elsewhere: a menu, a dialog, another window.
         if started {
             cancel_drag(hwnd);
@@ -2249,6 +2252,8 @@ fn focus_panel_for(hwnd: HWND, hit: Option<&Hit>) {
 fn left_down(hwnd: HWND, x: i32, y: i32) {
     // A drag armed by an earlier press whose release never came here.
     with_view(hwnd, |view| view.drag = None);
+    // A right press's cancel whose own release never came here either: stale by now.
+    with_view(hwnd, |view| view.eat_right_up = false);
     let hit = hit_after_commit(hwnd, x, y);
     focus_panel_for(hwnd, hit.as_ref());
     let Some(hit) = hit else {

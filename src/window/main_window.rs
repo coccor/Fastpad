@@ -18678,6 +18678,45 @@ mod tests {
     }
 
     #[test]
+    fn tree_drag_a_right_press_cancel_eats_only_its_own_release() {
+        // Break caught: a right press that cancelled a drag setting a flag that outlives its own
+        // release (the release went elsewhere, e.g. the pointer was over the editor), so the next
+        // ordinary right-click in the tree opens no menu (tree drag spec §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-right-cancel");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = || row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        drag_over(panel, work());
+        mouse(panel, WM_RBUTTONDOWN, 2, work());
+        assert!(
+            notebook_view(window.hwnd).eat_right_up,
+            "the cancel's own release should be eaten"
+        );
+        let result = unsafe { SendMessageW(panel, WM_RBUTTONUP, 0, work()) };
+        assert_eq!(result, 0, "its own release is eaten, so no menu opens");
+        assert!(!notebook_view(window.hwnd).eat_right_up);
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        drag_over(panel, work());
+        mouse(panel, WM_RBUTTONDOWN, 2, work());
+        assert!(notebook_view(window.hwnd).eat_right_up);
+        // The release never came here (it went elsewhere): a later, unrelated right press must
+        // not still be eating a release meant for it.
+        mouse(panel, WM_RBUTTONDOWN, 2, work());
+        assert!(
+            !notebook_view(window.hwnd).eat_right_up,
+            "a later ordinary right press clears the stale flag"
+        );
+    }
+
+    #[test]
     fn tree_drag_the_timer_expands_a_resting_folder_and_scrolls_near_the_bottom() {
         // Break caught: a hovered collapsed folder never opening, the list not scrolling at its
         // edge, or no timer while dragging (tree drag spec §3.3).
