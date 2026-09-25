@@ -7,7 +7,10 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_LOCK_VIOLATION,
+    ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_REMOVE_REPLACED,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
 };
@@ -16,8 +19,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 ///
 /// The bytes are first written to a collision-resistant sibling temp file in the same directory,
 /// `fsync`ed and closed, then atomically swapped into place: `ReplaceFileW` when `path` already
-/// exists, `MoveFileExW` when it does not. On any failure the original file (if any) is left
-/// untouched and the sibling temp file is removed.
+/// exists, `MoveFileExW` when it does not. A swap that another program blocks for a moment is
+/// retried (`SWAP_RETRY_DELAYS_MS`). On any failure the original file (if any) is left untouched
+/// and the sibling temp file is removed.
 pub fn save_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_then_swap(path, bytes, false)
 }
@@ -37,8 +41,44 @@ pub fn is_already_exists(error: &crate::FastPadError) -> bool {
     )
 }
 
+/// The pauses before each retry of a swap that failed because another program had the file open
+/// for a moment: antivirus, the search indexer and sync clients all open a file just written.
+/// About 0.3 s in all, spent only when a swap fails.
+const SWAP_RETRY_DELAYS_MS: [u64; 5] = [10, 20, 40, 80, 160];
+
+/// Whether a failed swap may succeed if tried again shortly: the file was open elsewhere.
+/// `ERROR_UNABLE_TO_MOVE_REPLACEMENT` left the destination deleted and the temp file in place, so
+/// the retry moves the temp file in (`replace_or_move` sees no destination).
+fn is_transient(error: &crate::FastPadError) -> bool {
+    matches!(
+        error,
+        crate::FastPadError::Win32(code) if [
+            ERROR_SHARING_VIOLATION,
+            ERROR_LOCK_VIOLATION,
+            ERROR_ACCESS_DENIED,
+            ERROR_UNABLE_TO_REMOVE_REPLACED,
+            ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+        ]
+        .contains(code)
+    )
+}
+
+fn with_retries(swap: impl Fn() -> Result<()>) -> Result<()> {
+    let mut result = swap();
+    for delay in SWAP_RETRY_DELAYS_MS {
+        match &result {
+            Err(error) if is_transient(error) => {}
+            _ => break,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        result = swap();
+    }
+    result
+}
+
 fn write_then_swap(path: &Path, bytes: &[u8], create_new: bool) -> Result<()> {
     let temp = next_sibling_temp(path)?;
+    let existed = path.exists();
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -48,12 +88,14 @@ fn write_then_swap(path: &Path, bytes: &[u8], create_new: bool) -> Result<()> {
         file.sync_all()?;
         drop(file);
         if create_new {
-            move_without_replacing(&temp, path)
+            with_retries(|| move_without_replacing(&temp, path))
         } else {
-            replace_or_move(&temp, path)
+            with_retries(|| replace_or_move(&temp, path))
         }
     })();
-    if result.is_err() {
+    // A replace that deleted the destination but could not move the temp file in leaves the
+    // temp file as the only copy of the content: it stays rather than losing both.
+    if result.is_err() && !(existed && !create_new && !path.exists()) {
         let _ = std::fs::remove_file(&temp);
     }
     result
@@ -192,6 +234,23 @@ mod tests {
         let fixture = ExistingFile::new(b"old");
         super::save_atomic(fixture.path(), b"new content").unwrap();
         assert_eq!(std::fs::read(fixture.path()).unwrap(), b"new content");
+        assert!(fixture.sibling_temp_files().is_empty());
+    }
+
+    #[test]
+    fn a_replace_blocked_for_a_moment_by_another_program_is_retried() {
+        // Break caught: an autosave, library.ini or session write lost because antivirus or a
+        // sync client held the file for a few milliseconds after it was written.
+        let mut fixture = ExistingFile::new(b"original");
+        fixture.deny_replacement();
+        let handle = fixture.deny_handle.take().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(handle);
+        });
+        super::save_atomic(fixture.path(), b"new").unwrap();
+        release.join().unwrap();
+        assert_eq!(std::fs::read(fixture.path()).unwrap(), b"new");
         assert!(fixture.sibling_temp_files().is_empty());
     }
 
