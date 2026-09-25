@@ -18732,7 +18732,7 @@ mod tests {
         use crate::window::side_panel::show_view;
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN,
         };
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("drag-right-capture");
@@ -18768,9 +18768,9 @@ mod tests {
             "a left press frees the mouse"
         );
         mouse(panel, WM_LBUTTONUP, 2, lparam);
+        // The wait is gone, so the right release would now open the tree's menu, as any other
+        // does: not sent, since the menu's loop would wait for input.
         assert!(!notebook_view(window.hwnd).eat_right_up);
-        mouse(panel, WM_RBUTTONUP, 0, lparam);
-        assert!(unsafe { GetCapture() }.is_null());
         assert!(a.exists(), "nothing moved");
     }
 
