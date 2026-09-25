@@ -19772,20 +19772,28 @@ mod tests {
         editor.set_text("changed").unwrap();
         let panel = sidebar_windows(window.hwnd).1;
         let count = crate::window::side_panel::accessible_item_count(panel);
-        let names: Vec<String> = (0..count)
+        let items: Vec<_> = (0..count)
             .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
-            .map(|item| item.name)
             .collect();
-        assert!(names.contains(&"Open editors, 1".to_owned()), "{names:?}");
-        assert!(
-            names.contains(&"a.md, open editor, modified".to_owned()),
-            "{names:?}"
-        );
-        assert!(
-            names
+        // Break caught (spec §7): tab rows exposed unlike tree rows, or a flat outline where the
+        // tree's top rows sit at the level of the rows that hold them.
+        let outline = |name: &str| {
+            let item = items
                 .iter()
-                .any(|name| name == &crate::window::library_host::notebook_name(&scratch.folder()))
-        );
+                .find(|item| item.name == name)
+                .unwrap_or_else(|| panic!("{name} in {items:?}"));
+            assert_eq!(
+                item.role,
+                windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM,
+                "{name}"
+            );
+            item.value.clone()
+        };
+        assert_eq!(outline("Open editors, 1"), "0");
+        assert_eq!(outline("a.md, open editor, modified"), "1");
+        let notebook = crate::window::library_host::notebook_name(&scratch.folder());
+        assert_eq!(outline(&notebook), "0");
+        assert_eq!(outline("a.md, Markdown"), "1", "a top-level tree row");
     }
 
     #[test]

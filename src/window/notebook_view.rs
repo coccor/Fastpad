@@ -3473,7 +3473,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         focused: bool,
     ) -> Option<crate::window::sidebar_accessibility::AccessibleItem> {
         use crate::window::sidebar_accessibility::{
-            button_item, list_item, row_rect, section_item, tree_item,
+            button_item, editor_item, list_item, row_rect, section_item, tree_item,
         };
         let buttons = self.buttons(client, dpi);
         if let Some((name, rect)) = buttons.get(index) {
@@ -3495,7 +3495,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         if index < editors {
             let row = self.editors.rows.get(index)?;
             let (rect, visible) = row_rect(layout.editors_list, &self.editors.list, index);
-            return Some(list_item(
+            return Some(editor_item(
                 &super::open_editors::accessible_name(row),
                 self.cursor == Cursor::Editor(index),
                 focused,
