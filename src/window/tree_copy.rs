@@ -2,7 +2,7 @@
 //! which ones are refused, which clash with a name already there, and the words the prompts and
 //! notices use. Pure but for the one `exists` check per item the caller passes in.
 
-use crate::library::{at_or_under, model::same_path};
+use crate::library::{at_or_under, model::same_path, normalize_folder};
 use std::path::{Path, PathBuf};
 
 /// Why an item is not copied (spec §4.2).
@@ -21,6 +21,8 @@ pub(crate) enum Refusal {
     IntoItself,
     /// The destination holds the item: replacing it would recycle the item too.
     HoldsSource,
+    /// No file name at all: a drive or UNC share root, which nothing can be copied under.
+    WholeDrive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +68,11 @@ fn refusal(source: &Path, target: &Path, destination: &Path) -> Option<Refusal> 
 }
 
 /// Where each of `sources` lands in `folder` (relative to `root`; empty is the root), refused,
-/// clashing or free. `exists` is asked once per item that isn't refused.
+/// clashing or free. `exists` is asked once per item that isn't refused. `root`, `folder` and
+/// every source are normalized first (`library::normalize_folder`: absolute, one separator
+/// style, no trailing separator or `.`/`..` component), so a trailing `\`, a `/`, or a `.`/`..`
+/// spelling of the same location compares equal to the canonical one, the way the refusal checks
+/// below need it to.
 #[cfg_attr(
     not(test),
     expect(
@@ -80,23 +86,29 @@ pub(crate) fn plan(
     folder: &Path,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Vec<Planned> {
-    let target = root.join(folder);
+    let target = normalize_folder(&root.join(folder));
     sources
         .iter()
         .map(|source| {
-            // A drive root (`C:\`) has no file name: it can only ever be refused, so the
-            // destination is a placeholder rather than a path anything is ever copied to.
-            let destination = match source.file_name() {
-                Some(name) => target.join(name),
-                None => target.clone(),
+            let source = normalize_folder(source);
+            // A drive or UNC share root has no file name: it can only ever be refused, before
+            // `exists` is asked and without ever treating `target` as its destination.
+            let Some(name) = source.file_name() else {
+                let destination = source.clone();
+                return Planned {
+                    source,
+                    destination,
+                    outcome: Outcome::Refused(Refusal::WholeDrive),
+                };
             };
-            let outcome = match refusal(source, &target, &destination) {
+            let destination = target.join(name);
+            let outcome = match refusal(&source, &target, &destination) {
                 Some(refusal) => Outcome::Refused(refusal),
                 None if exists(&destination) => Outcome::Clash,
                 None => Outcome::Copy,
             };
             Planned {
-                source: source.clone(),
+                source,
                 destination,
                 outcome,
             }
@@ -105,6 +117,7 @@ pub(crate) fn plan(
 }
 
 /// Whether dropping `sources` into `folder` copies anything: the drag's target test, in memory.
+/// Normalized the same way `plan` is, so the same spellings agree with it.
 #[cfg_attr(
     not(test),
     expect(
@@ -113,11 +126,12 @@ pub(crate) fn plan(
     )
 )]
 pub(crate) fn any_accepted(sources: &[PathBuf], root: &Path, folder: &Path) -> bool {
-    let target = root.join(folder);
+    let target = normalize_folder(&root.join(folder));
     sources.iter().any(|source| {
+        let source = normalize_folder(source);
         source
             .file_name()
-            .is_some_and(|name| refusal(source, &target, &target.join(name)).is_none())
+            .is_some_and(|name| refusal(&source, &target, &target.join(name)).is_none())
     })
 }
 
@@ -206,6 +220,7 @@ pub(crate) fn refused_notice(name: &str, refusal: Refusal) -> String {
         Refusal::SamePlace => "it is already there",
         Refusal::IntoItself => "a folder can't be copied into itself",
         Refusal::HoldsSource => "it would replace the folder it is in",
+        Refusal::WholeDrive => "a whole drive or share can't be copied into the notebook",
     };
     format!("{name} was not copied: {why}.")
 }
@@ -275,10 +290,112 @@ mod tests {
             plan_of(&[r"C:\notes\work"], r"work\inner", &[])[0].1,
             Outcome::Refused(Refusal::IntoItself)
         );
+    }
+
+    #[test]
+    fn a_whole_drive_or_share_is_refused_before_any_prompt() {
+        // Break caught (Critical): a source with no file name (a drive or a share root) had no
+        // file name to compute a destination from, so it fell back to the drop folder itself and
+        // came out as a same-named "Clash" there; OK in the copy host would then replace it,
+        // recycling the drop folder (or the notebook root) along with everything in it.
+        assert_eq!(
+            plan_of(&[r"D:\"], "work", &[])[0].1,
+            Outcome::Refused(Refusal::WholeDrive)
+        );
+        assert_eq!(
+            plan_of(&[r"\\server\share\"], "", &[])[0].1,
+            Outcome::Refused(Refusal::WholeDrive)
+        );
         assert_eq!(
             plan_of(&[r"C:\"], "work", &[])[0].1,
-            Outcome::Refused(Refusal::IntoItself)
+            Outcome::Refused(Refusal::WholeDrive),
+            "even on the same drive as the notebook"
         );
+        assert!(!any_accepted(
+            &[PathBuf::from(r"D:\")],
+            Path::new(ROOT),
+            Path::new("work")
+        ));
+    }
+
+    #[test]
+    fn same_place_and_holds_source_refusals_ignore_the_sources_spelling() {
+        // Break caught (Important): `same_path` compares the raw, lowercased string, so a
+        // trailing separator, a forward slash, or a `.`/`..` component made an identical location
+        // fail to match and land as a same-named "Clash" instead (Review Focus 1): OK would then
+        // recycle the source. `plan` and `any_accepted` normalize every path first so none of
+        // these spellings can matter.
+        for source in [
+            r"C:\notes\work\a.md",
+            "C:/notes/work/a.md",
+            r"C:\notes\.\work\a.md",
+            r"C:\notes\x\..\work\a.md",
+        ] {
+            assert_eq!(
+                plan_of(&[source], "work", &[r"C:\notes\work\a.md"])[0].1,
+                Outcome::Refused(Refusal::SamePlace),
+                "{source}"
+            );
+            assert!(
+                !any_accepted(&[PathBuf::from(source)], Path::new(ROOT), Path::new("work")),
+                "{source}"
+            );
+        }
+        for source in [
+            r"C:\notes\work\",
+            "C:/notes/work",
+            r"C:\notes\.\work",
+            r"C:\notes\x\..\work",
+        ] {
+            assert_eq!(
+                plan_of(&[source], "", &[r"C:\notes\work"])[0].1,
+                Outcome::Refused(Refusal::SamePlace),
+                "{source}"
+            );
+            assert!(
+                !any_accepted(&[PathBuf::from(source)], Path::new(ROOT), Path::new("")),
+                "{source}"
+            );
+        }
+        // Review Focus 2, the same way: notes\work\work holding notes\work.
+        for source in [
+            r"C:\notes\work\work\",
+            "C:/notes/work/work",
+            r"C:\notes\.\work\work",
+            r"C:\notes\x\..\work\work",
+        ] {
+            assert_eq!(
+                plan_of(&[source], "", &[r"C:\notes\work"])[0].1,
+                Outcome::Refused(Refusal::HoldsSource),
+                "{source}"
+            );
+            assert!(
+                !any_accepted(&[PathBuf::from(source)], Path::new(ROOT), Path::new("")),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn into_itself_refusal_ignores_the_sources_spelling() {
+        // Break caught (Important): `C:\notes\work\` (a trailing separator) dropped on `work`
+        // planned a Copy into `work\work`, and `copy_tree` would nest into it forever.
+        for source in [
+            r"C:\notes\work\",
+            "C:/notes/work",
+            r"C:\notes\.\work",
+            r"C:\notes\x\..\work",
+        ] {
+            assert_eq!(
+                plan_of(&[source], "work", &[])[0].1,
+                Outcome::Refused(Refusal::IntoItself),
+                "{source}"
+            );
+            assert!(
+                !any_accepted(&[PathBuf::from(source)], Path::new(ROOT), Path::new("work")),
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -354,6 +471,10 @@ mod tests {
         assert_eq!(
             refused_notice("work", Refusal::HoldsSource),
             "work was not copied: it would replace the folder it is in."
+        );
+        assert_eq!(
+            refused_notice(r"D:\", Refusal::WholeDrive),
+            r"D:\ was not copied: a whole drive or share can't be copied into the notebook."
         );
         assert_eq!(
             recycle_failed_notice("a.md"),
