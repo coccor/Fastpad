@@ -386,6 +386,9 @@ fn install(hwnd: HWND, fresh: LibraryState) {
             force: rewrite,
         },
     );
+    // An edit made while the folder loaded found no state, so it armed no timer: the dirty tab
+    // autosaves now that autosave is known to apply.
+    schedule_autosave(hwnd);
 }
 
 #[derive(Clone, Copy)]
