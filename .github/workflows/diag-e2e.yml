@@ -1,0 +1,35 @@
+# Temporary: repeats the flaky Save As e2e test to capture why its dialog does not close.
+name: diag-e2e
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
+      - shell: pwsh
+        run: ./tools/fetch-native.ps1
+      - shell: pwsh
+        run: ./tools/build-native.ps1
+      - shell: pwsh
+        run: |
+          cargo test --locked --target x86_64-pc-windows-msvc --test library --no-run
+          $failed = 0
+          foreach ($i in 1..40) {
+            cargo test --locked --target x86_64-pc-windows-msvc --test library -- --test-threads=1 --exact with_notes_mode_off_nothing_is_written_and_save_uses_the_dialog
+            if ($LASTEXITCODE -ne 0) { $failed++ }
+          }
+          "failed rounds: $failed"
