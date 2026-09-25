@@ -386,6 +386,7 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         stamp: previous_stamp,
         pending: previous_pending,
         local: previous_local,
+        notes: previous_notes,
         touched,
         folder_changes,
         ..
@@ -397,6 +398,22 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
     // so the touched notes below are re-checked at their current paths.
     for change in &folder_changes {
         fresh.change_folders(change);
+    }
+    // A rescan that listed a folder just before FastPad renamed it found it gone when it read
+    // inside: it has none of the notes now under the new name. The live state's are current.
+    let mut carried = Vec::new();
+    for change in &folder_changes {
+        if let FolderChange::Renamed { new, .. } = change
+            && !fresh.notes.iter().any(|note| at_or_under(&note.path, new))
+        {
+            for note in previous_notes
+                .iter()
+                .filter(|note| at_or_under(&note.path, new))
+            {
+                carried.push(note.path.clone());
+                fresh.notes.push(note.clone());
+            }
+        }
     }
     fresh.notes = merge_notes(&fresh.folder, std::mem::take(&mut fresh.notes), &touched);
     if fresh.truncated {
@@ -438,7 +455,8 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         pending.extend(previous_pending);
         fresh.pending = pending;
     }
-    update_merged_tree(&mut fresh, &touched, &built_pins);
+    carried.extend(touched);
+    update_merged_tree(&mut fresh, &carried, &built_pins);
     fresh
 }
 
@@ -1729,6 +1747,34 @@ mod tests {
         assert_eq!(
             sorted_notes(&merged),
             [PathBuf::from(r"Final\plan.md"), PathBuf::from("top.md")]
+        );
+        assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
+    }
+
+    #[test]
+    fn a_rescan_that_found_a_renamed_folder_gone_keeps_its_notes_under_the_new_name() {
+        // Break caught: a rescan that listed `sub` just before FastPad renamed it, then found it
+        // gone when it read inside, dropping the folder's notes from the list and the tree until
+        // the next rescan.
+        let scratch = Scratch::new("rename-mid-scan");
+        let folder = scratch.folder();
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join(r"sub\a.md"), "a").unwrap();
+        std::fs::write(folder.join("top.md"), "t").unwrap();
+        let mut previous = load(&folder, &scratch.local(), 100).unwrap();
+        // What that rescan saw: the folder, and nothing in it.
+        std::fs::rename(folder.join(r"sub\a.md"), folder.join("a.parked")).unwrap();
+        let emptied = load(&folder, &scratch.local(), 101).unwrap();
+        std::fs::rename(folder.join("a.parked"), folder.join(r"sub\a.md")).unwrap();
+        std::fs::rename(folder.join("sub"), folder.join("Moved")).unwrap();
+        previous.rename_folder(Path::new("sub"), Path::new("Moved"));
+
+        let merged = merge_rescan(previous, emptied);
+
+        assert_eq!(sorted_folders(&merged), [PathBuf::from("Moved")]);
+        assert_eq!(
+            sorted_notes(&merged),
+            [PathBuf::from(r"Moved\a.md"), PathBuf::from("top.md")]
         );
         assert_eq!(tree_rows(&merged.tree), rebuilt_rows(&merged));
     }
