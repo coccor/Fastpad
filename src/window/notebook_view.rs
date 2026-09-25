@@ -18,6 +18,7 @@ use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset, scale};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::tooltip::Tooltip;
+use crate::window::tree_drag::{self, Drag, Hover};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,16 +28,18 @@ use windows_sys::Win32::Graphics::Gdi::{
     DT_VCENTER, DT_WORDBREAK, DrawTextW, GetDC, GetTextExtentPoint32W, HDC, HFONT, InvalidateRect,
     ReleaseDC, ScreenToClient, SelectObject,
 };
+use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+    GetCapture, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, SendMessageW, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN,
+    GetClientRect, GetParent, GetSystemMetrics, IDC_ARROW, IDC_NO, KillTimer, LoadCursorW,
+    SM_CXDRAG, SM_CYDRAG, SendMessageW, SetCursor, SetTimer, WM_CAPTURECHANGED, WM_CHAR,
+    WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
 };
 
 // Sizes at 96 DPI; everything is scaled with `panel::scale`.
@@ -51,6 +54,9 @@ const HEADER_BUTTON: i32 = 28;
 const TYPE_AHEAD_RESET: Duration = Duration::from_secs(1);
 
 pub(crate) const TRUNCATED_ROW: &str = "Showing the first 10,000 notes";
+
+/// The panel's timer while a drag is under way (tree drag spec §3.3).
+pub(crate) const DRAG_TIMER: usize = 0x4452;
 
 // Segoe MDL2 Assets, the font the title bar already uses.
 const GLYPH_CHEVRON_RIGHT: &str = "\u{E76C}";
@@ -401,6 +407,11 @@ pub(crate) struct NotebookView {
     tooltip_failed: bool,
     typed: TypeAhead,
     thumb_grab: Option<i32>,
+    /// A drag of a row, armed by a press and under way past the drag distance (tree drag spec
+    /// §3).
+    pub(crate) drag: Option<Drag>,
+    /// The right press that cancelled a drag: its release opens no menu.
+    eat_right_up: bool,
     tracking_leave: bool,
     /// What the rows were last built from (`None` before the first rebuild).
     built: Option<RebuildKey>,
@@ -611,6 +622,8 @@ impl NotebookView {
             tooltip_failed: false,
             typed: TypeAhead::default(),
             thumb_grab: None,
+            drag: None,
+            eat_right_up: false,
             tracking_leave: false,
             built: None,
             order: 0,
@@ -967,6 +980,37 @@ impl NotebookView {
                 Hit::Row { index, part }
             }
         }
+    }
+
+    /// What a drag at panel point `x`, `y` is over (tree drag spec §3.2). The scroll thumb
+    /// counts as the row under it.
+    fn drag_hover(&self, x: i32, y: i32) -> Hover {
+        let area = self.client();
+        if self.mode != Mode::Tree || !contains(area, x, y) {
+            return Hover::Outside;
+        }
+        let list = self.list_rect(area);
+        if y < list.top {
+            return Hover::Header;
+        }
+        self.list
+            .row_at(y - list.top)
+            .map_or(Hover::Below, Hover::Row)
+    }
+
+    /// The drag moved to `x`, `y`: the target follows, and the highlight repaints when it
+    /// changed. Whether a release there moves the item.
+    fn drag_to(&mut self, x: i32, y: i32, now: Instant) -> bool {
+        let hover = self.drag_hover(x, y);
+        let Some(drag) = self.drag.as_mut() else {
+            return false;
+        };
+        let changed = drag.hover(&self.rows, (x, y), hover, now);
+        let accepted = drag.target.is_some();
+        if changed {
+            self.invalidate();
+        }
+        accepted
     }
 
     /// `point` in panel coordinates, converted to the main window's client coordinates, which
@@ -1471,10 +1515,29 @@ fn snapshot(hwnd: HWND) -> Snapshot {
 pub(crate) fn rebuild(hwnd: HWND) {
     let snapshot = snapshot(hwnd);
     let names = crate::library::local::display_names(&snapshot.recent);
-    with_view(hwnd, |view| {
+    let lost = with_view(hwnd, |view| {
         view.apply(snapshot, names);
         view.invalidate();
-    });
+        // A drag whose row went ends; a target folder that went is found again at the next
+        // move (tree drag spec §3.3).
+        let rows = &view.rows;
+        view.drag.as_mut().is_some_and(|drag| {
+            if tree::row_index(rows, &drag.source).is_none() {
+                return true;
+            }
+            if drag.target.as_ref().is_some_and(|folder| {
+                !folder.as_os_str().is_empty()
+                    && tree::row_index(rows, &RowKind::Folder(folder.clone())).is_none()
+            }) {
+                drag.target = None;
+            }
+            false
+        })
+    })
+    .unwrap_or(false);
+    if lost {
+        cancel_drag(hwnd);
+    }
     // The field follows its row, or goes with an edit the rebuild ended (inline naming spec §5.4).
     super::inline_name::place(hwnd);
 }
@@ -1812,7 +1875,9 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
     match message {
         WM_MOUSEMOVE => {
             let (x, y) = point_of(lparam);
-            mouse_move(hwnd, x, y);
+            if !drag_move(hwnd, x, y, wparam) {
+                mouse_move(hwnd, x, y);
+            }
             Some(0)
         }
         // The panel class has CS_DBLCLKS: the second press of a double-click comes as this.
@@ -1837,6 +1902,10 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             Some(0)
         }
         WM_LBUTTONUP => {
+            let (x, y) = point_of(lparam);
+            if drag_release(hwnd, x, y) {
+                return Some(0);
+            }
             // Released after the borrow ends: ReleaseCapture sends WM_CAPTURECHANGED here.
             if with_view(hwnd, |view| view.thumb_grab.take().is_some()).unwrap_or(false) {
                 unsafe {
@@ -1847,9 +1916,16 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_CAPTURECHANGED => {
             with_view(hwnd, |view| view.thumb_grab = None);
+            // Capture taken away mid-drag (a task switch, a dialog): nothing moves.
+            cancel_drag(hwnd);
             Some(0)
         }
         WM_RBUTTONDOWN => {
+            // A right press cancels a drag and does nothing else (tree drag spec §3.3).
+            if cancel_drag(hwnd) {
+                with_view(hwnd, |view| view.eat_right_up = true);
+                return Some(0);
+            }
             // Selects the row; DefWindowProc turns the button-up into WM_CONTEXTMENU.
             let (x, y) = point_of(lparam);
             let hit = hit_after_commit(hwnd, x, y);
@@ -1859,8 +1935,18 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             }
             Some(0)
         }
+        WM_RBUTTONUP => {
+            // The release of a right press that cancelled a drag opens no menu.
+            let eaten =
+                with_view(hwnd, |view| std::mem::take(&mut view.eat_right_up)).unwrap_or(false);
+            eaten.then_some(0)
+        }
         WM_CONTEXTMENU => {
             context_menu(hwnd, lparam);
+            Some(0)
+        }
+        WM_TIMER if wparam == DRAG_TIMER => {
+            drag_tick(hwnd, Instant::now());
             Some(0)
         }
         WM_KEYDOWN => key_down(hwnd, wparam as u16).then_some(0),
@@ -1927,6 +2013,154 @@ fn mouse_move(hwnd: HWND, x: i32, y: i32) {
     // The field moves with its row while the thumb is dragged (inline naming spec §5.4).
     if scrolled {
         super::inline_name::place(hwnd);
+    }
+}
+
+/// The cursor a drag shows: the arrow over a folder that takes the item, "no" elsewhere
+/// (tree drag spec §3.2). Called with nothing of the App borrowed.
+fn set_drag_cursor(accepted: bool) {
+    let cursor = if accepted { IDC_ARROW } else { IDC_NO };
+    unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };
+}
+
+/// Ends a drag's timer, capture and cursor, with nothing of the App borrowed: ReleaseCapture
+/// sends WM_CAPTURECHANGED here.
+fn end_drag_input(panel: HWND) {
+    unsafe {
+        KillTimer(panel, DRAG_TIMER);
+        if GetCapture() == panel {
+            ReleaseCapture();
+        }
+    }
+    set_drag_cursor(true);
+}
+
+/// A press on a row's body arms a drag of `source` (tree drag spec §3.1), unless an inline
+/// edit is still open.
+fn arm_drag(hwnd: HWND, source: RowKind, x: i32, y: i32) {
+    if super::inline_name::is_open(hwnd) {
+        return;
+    }
+    with_view(hwnd, |view| view.drag = Drag::armed(source, x, y));
+}
+
+/// `WM_MOUSEMOVE` with a drag armed or under way (tree drag spec §3.1, §3.2). False leaves the
+/// move to the hover code: no drag, or one that has not started.
+fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
+    let Some((started, origin, panel)) = with_view(hwnd, |view| {
+        view.drag
+            .as_ref()
+            .map(|drag| (drag.started, drag.origin, view.panel))
+    })
+    .flatten() else {
+        return false;
+    };
+    if buttons & MK_LBUTTON as usize == 0 {
+        // The release went elsewhere: a menu, a dialog, another window.
+        if started {
+            cancel_drag(hwnd);
+        } else {
+            with_view(hwnd, |view| view.drag = None);
+        }
+        return started;
+    }
+    if !started {
+        let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
+        if !tree_drag::past_threshold(origin, (x, y), cx, cy) {
+            return false;
+        }
+        with_view(hwnd, |view| {
+            if let Some(drag) = view.drag.as_mut() {
+                drag.started = true;
+            }
+            view.list.hover = None;
+            view.hover = None;
+            view.hover_pin = false;
+            view.invalidate();
+        });
+        unsafe {
+            SetCapture(panel);
+            SetTimer(panel, DRAG_TIMER, tree_drag::TICK.as_millis() as u32, None);
+        }
+    }
+    let accepted = with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false);
+    set_drag_cursor(accepted);
+    true
+}
+
+/// `WM_LBUTTONUP`: a drag under way drops where the button went up (tree drag spec §3.4). An
+/// armed drag was a click. True when a drag was under way.
+fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
+    let Some((drag, panel)) = with_view(hwnd, |view| {
+        if view.drag.as_ref().is_some_and(|drag| drag.started) {
+            view.drag_to(x, y, Instant::now());
+            view.invalidate();
+        }
+        (view.drag.take(), view.panel)
+    }) else {
+        return false;
+    };
+    let Some(drag) = drag.filter(|drag| drag.started) else {
+        return false;
+    };
+    end_drag_input(panel);
+    if let Some(folder) = drag.target {
+        super::tree_move::drop_into(hwnd, &drag.source, &folder);
+    }
+    true
+}
+
+/// Ends a drag without moving anything (tree drag spec §3.3): Esc, a right press, a lost
+/// capture, another view, the sidebar hiding, or the dragged row gone. An armed drag just goes.
+/// True when a drag was under way.
+pub(crate) fn cancel_drag(hwnd: HWND) -> bool {
+    let Some((drag, panel)) = with_view(hwnd, |view| {
+        let drag = view.drag.take();
+        if drag.as_ref().is_some_and(|drag| drag.started) {
+            view.invalidate();
+        }
+        (drag, view.panel)
+    }) else {
+        return false;
+    };
+    if !drag.is_some_and(|drag| drag.started) {
+        return false;
+    }
+    end_drag_input(panel);
+    true
+}
+
+/// The drag timer (tree drag spec §3.3): near the list's top or bottom edge the list scrolls,
+/// and a collapsed folder the pointer has rested on long enough expands. `now` comes in so the
+/// tests need not wait.
+pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
+    let Some((scrolled, expand, pointer)) = with_view(hwnd, |view| {
+        let drag = view.drag.as_ref().filter(|drag| drag.started)?;
+        let pointer = drag.pointer;
+        let expand = tree_drag::expand_due(drag.resting.as_ref(), now);
+        let list = view.list_rect(view.client());
+        let lines = tree_drag::scroll_step(pointer.1, list.top, list.bottom, view.list.row_height);
+        let scrolled = lines != 0 && view.list.scroll_lines(lines, height(list));
+        if scrolled {
+            view.invalidate();
+        }
+        Some((scrolled, expand, pointer))
+    })
+    .flatten() else {
+        return;
+    };
+    if let Some(folder) = &expand {
+        with_view(hwnd, |view| {
+            if let Some(drag) = view.drag.as_mut() {
+                drag.resting = None;
+            }
+        });
+        set_folder_expanded(hwnd, folder, true);
+    }
+    if scrolled || expand.is_some() {
+        let accepted =
+            with_view(hwnd, |view| view.drag_to(pointer.0, pointer.1, now)).unwrap_or(false);
+        set_drag_cursor(accepted);
     }
 }
 
@@ -2013,6 +2247,8 @@ fn focus_panel_for(hwnd: HWND, hit: Option<&Hit>) {
 }
 
 fn left_down(hwnd: HWND, x: i32, y: i32) {
+    // A drag armed by an earlier press whose release never came here.
+    with_view(hwnd, |view| view.drag = None);
     let hit = hit_after_commit(hwnd, x, y);
     focus_panel_for(hwnd, hit.as_ref());
     let Some(hit) = hit else {
@@ -2036,7 +2272,19 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
         }
         Hit::Row { index, part } => {
             with_view(hwnd, |view| view.select(index));
+            // Read before the click acts: opening a note or toggling a folder can move rows.
+            let source = (part == RowPart::Body)
+                .then(|| {
+                    with_view(hwnd, |view| {
+                        view.rows.get(index).map(|row| row.kind.clone())
+                    })
+                })
+                .flatten()
+                .flatten();
             row_clicked(hwnd, index, part, false);
+            if let Some(source) = source {
+                arm_drag(hwnd, source, x, y);
+            }
         }
         Hit::Title | Hit::Empty => {}
     }

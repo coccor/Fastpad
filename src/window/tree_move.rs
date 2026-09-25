@@ -126,25 +126,11 @@ pub(crate) fn move_folder(
 }
 
 /// The notice for a drop onto a name `folder` already has (tree drag spec §5).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag drop in notebook_view (next task)"
-    )
-)]
 pub(crate) fn taken_notice(name: &str, folder: &str) -> String {
     format!("{name} already exists in {folder}. Nothing was moved.")
 }
 
 /// A drop's target folder as its notice names it: the notebook's name for the root.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag drop in notebook_view (next task)"
-    )
-)]
 fn folder_label(root: &Path, folder: &Path) -> String {
     match folder.file_name() {
         Some(name) => name.to_string_lossy().into_owned(),
@@ -153,13 +139,6 @@ fn folder_label(root: &Path, folder: &Path) -> String {
 }
 
 /// The source is gone: say so, and let a rescan catch the tree up.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag drop in notebook_view (next task)"
-    )
-)]
 fn gone(hwnd: HWND, name: &str) {
     push_notice(hwnd, format!("{name} no longer exists."));
     library_host::request_rescan(hwnd);
@@ -170,13 +149,6 @@ fn gone(hwnd: HWND, name: &str) {
 /// taken name, a vanished source, a refusal from Windows or a tab that cannot follow moves
 /// nothing and says so. After a move the target folder and the folders above it expand, and
 /// the moved row is selected. The focus stays where it is.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag drop in notebook_view (next task)"
-    )
-)]
 pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
     let Some(root) = library_host::folder(hwnd) else {
         return;

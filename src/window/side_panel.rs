@@ -44,8 +44,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
     WM_CTLCOLOREDIT, WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WNDCLASSW,
-    WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 /// Sizes at 96 DPI, scaled with `panel::scale`.
@@ -403,6 +403,7 @@ fn sync_presence(hwnd: HWND, enabled: bool) {
         }
     } else if !enabled && present {
         crate::window::inline_name::cancel(hwnd);
+        crate::window::notebook_view::cancel_drag(hwnd);
         let sidebar =
             unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.sidebar.take());
         if let Some(sidebar) = sidebar {
@@ -497,6 +498,7 @@ fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
     // cancels it (inline naming spec §5.4).
     if view != SidebarView::Notebook {
         crate::window::inline_name::cancel(hwnd);
+        crate::window::notebook_view::cancel_drag(hwnd);
     }
     let Some(panel) = with_sidebar(hwnd, |sidebar| {
         if view != SidebarView::Hidden {
@@ -996,6 +998,12 @@ unsafe extern "system" fn panel_proc(
             sidebar_accessibility::run_action(panel, &PANEL_ACCESSIBLE, wparam, lparam);
             0
         }
+        // Esc during a tree drag cancels it; the focus stays in the tree (tree drag spec §3.3).
+        WM_KEYDOWN
+            if wparam as u16 == VK_ESCAPE && crate::window::notebook_view::cancel_drag(main) =>
+        {
+            0
+        }
         // Esc anywhere in the panel returns to the editor (spec §10). The search box's own Esc
         // is handled in its subclass.
         WM_KEYDOWN if wparam as u16 == VK_ESCAPE => {
@@ -1026,7 +1034,7 @@ unsafe extern "system" fn panel_proc(
         // screen coordinates; the view converts them.
         WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_CAPTURECHANGED
         | WM_MOUSELEAVE | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_CONTEXTMENU | WM_MOUSEWHEEL
-        | WM_KEYDOWN | WM_CHAR => route(main, panel, message, wparam, lparam),
+        | WM_KEYDOWN | WM_CHAR | WM_TIMER => route(main, panel, message, wparam, lparam),
         WM_SETFOCUS | WM_KILLFOCUS => {
             unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
             0

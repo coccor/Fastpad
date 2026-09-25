@@ -659,6 +659,13 @@ impl LibraryState {
         self.tree.contains_folder(relative)
     }
 
+    /// Drops a folder's row from the tree, as a rescan that no longer finds it would, without
+    /// touching `notes` or disk (tree drag spec §3.3 tests).
+    #[cfg(test)]
+    pub fn remove_folder_for_test(&mut self, relative: &Path) {
+        self.tree.remove_folder(relative);
+    }
+
     /// Whether a folder or a listed note already has the path `relative`, ignoring case: what a
     /// new or renamed folder may not take (notebook folders spec §4.1).
     pub fn is_listed(&self, relative: &Path) -> bool {

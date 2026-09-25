@@ -18411,6 +18411,381 @@ mod tests {
         assert_eq!(notices(window.hwnd).last(), Some(&expected));
     }
 
+    fn mouse(panel: HWND, message: u32, buttons: usize, lparam: super::LPARAM) {
+        unsafe { SendMessageW(panel, message, buttons, lparam) };
+    }
+
+    /// Presses on `from` and moves past the drag distance, still holding the button.
+    fn start_drag(hwnd: HWND, panel: HWND, from: &RowKind) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let lparam = row_lparam(hwnd, from);
+        mouse(panel, WM_LBUTTONDOWN, 1, lparam);
+        let (x, y) = ((lparam & 0xffff) as i32, (lparam >> 16) as i32);
+        mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x + 30, y));
+    }
+
+    fn drag_over(panel: HWND, lparam: super::LPARAM) {
+        mouse(
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+            1,
+            lparam,
+        );
+    }
+
+    fn drop_at(panel: HWND, lparam: super::LPARAM) {
+        mouse(
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+            0,
+            lparam,
+        );
+    }
+
+    /// A point in the list below its last row.
+    fn below_rows(hwnd: HWND, panel: HWND) -> super::LPARAM {
+        let mut client = windows_sys::Win32::Foundation::RECT::default();
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(panel, &mut client) };
+        let last = notebook_view(hwnd).rows.len() - 1;
+        let bottom = notebook_view(hwnd).row_rect_at(last).unwrap().bottom;
+        assert!(
+            bottom + 40 < client.bottom - 40,
+            "the panel is tall enough to test with"
+        );
+        client_lparam(client.right / 2, bottom + 40)
+    }
+
+    fn drag_cursor_is(cursor: windows_sys::core::PCWSTR) -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursor, LoadCursorW};
+        unsafe { GetCursor() == LoadCursorW(std::ptr::null_mut(), cursor) }
+    }
+
+    #[test]
+    fn tree_drag_a_short_move_or_a_missed_release_stays_a_click() {
+        // Break caught: a click turned into a drag by a jitter, or a drag started after its
+        // release went to another window (tree drag spec §3.1).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-click");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let lparam = row_lparam(window.hwnd, &RowKind::Note("a.md".into()));
+        let (x, y) = ((lparam & 0xffff) as i32, (lparam >> 16) as i32);
+
+        mouse(panel, WM_LBUTTONDOWN, 1, lparam);
+        mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x + 1, y + 1));
+        assert!(unsafe { GetCapture() }.is_null());
+        drop_at(panel, client_lparam(x + 1, y + 1));
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path()),
+            "the press still opened the note"
+        );
+
+        mouse(panel, WM_LBUTTONDOWN, 1, lparam);
+        // The release went elsewhere: the next move comes without the button.
+        mouse(
+            panel,
+            WM_MOUSEMOVE,
+            0,
+            row_lparam(window.hwnd, &RowKind::Folder("work".into())),
+        );
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert!(unsafe { GetCapture() }.is_null());
+        assert!(a.exists());
+    }
+
+    #[test]
+    fn tree_drag_a_note_dropped_on_a_folder_moves_into_it_and_is_selected() {
+        // Break caught: the drag not capturing, the drop not moving, the timer or capture left
+        // behind, or the moved row not selected (tree drag spec §3.1, §3.4).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, KillTimer};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-note");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        assert_eq!(unsafe { GetCapture() }, panel);
+        assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            Some("work".into())
+        );
+        assert!(drag_cursor_is(IDC_ARROW));
+        drop_at(panel, work);
+
+        let moved = scratch.folder().join(r"work\a.md");
+        assert!(moved.exists() && !a.exists());
+        assert!(unsafe { GetCapture() }.is_null());
+        assert_eq!(
+            unsafe { KillTimer(panel, crate::window::notebook_view::DRAG_TIMER) },
+            0
+        );
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"work\a.md".into()))
+        );
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(moved.as_path()),
+            "the preview the press opened followed"
+        );
+    }
+
+    #[test]
+    fn tree_drag_a_folder_pressed_then_dragged_to_empty_space_moves_to_the_root() {
+        // Break caught: the press's folder toggle shifting the rows so the drag follows the
+        // wrong row, or empty space not meaning the root (tree drag spec §3.1, §3.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-folder");
+        std::fs::create_dir_all(scratch.folder().join(r"work\inner")).unwrap();
+        scratch.note(r"work\inner\c.md", "c");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("work"), true);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        // The press toggles `inner` open, adding c.md's row under it.
+        start_drag(window.hwnd, panel, &RowKind::Folder(r"work\inner".into()));
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().source,
+            RowKind::Folder(r"work\inner".into())
+        );
+        let below = below_rows(window.hwnd, panel);
+        drag_over(panel, below);
+        drop_at(panel, below);
+
+        assert!(scratch.folder().join(r"inner\c.md").exists());
+        assert!(!scratch.folder().join(r"work\inner").exists());
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Folder("inner".into()))
+        );
+    }
+
+    #[test]
+    fn tree_drag_refused_targets_and_a_release_outside_move_nothing() {
+        // Break caught: a folder dropped into its own subfolder, a note "moved" into its own
+        // folder, the refusal cursor missing, or a release over the editor moving anyway
+        // (tree drag spec §3.2).
+        use windows_sys::Win32::UI::WindowsAndMessaging::IDC_NO;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-refused");
+        std::fs::create_dir_all(scratch.folder().join(r"work\inner")).unwrap();
+        scratch.note(r"work\inner\c.md", "c");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        for folder in ["work", r"work\inner"] {
+            crate::window::library_host::set_expanded(
+                window.hwnd,
+                std::path::Path::new(folder),
+                true,
+            );
+        }
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        // `work` collapses on the press; it is expanded again so `inner` is there to hover.
+        start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("work"), true);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let inner = row_lparam(window.hwnd, &RowKind::Folder(r"work\inner".into()));
+        drag_over(panel, inner);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            None
+        );
+        assert!(drag_cursor_is(IDC_NO));
+        drop_at(panel, inner);
+        assert!(scratch.folder().join(r"work\inner\c.md").exists());
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        let below = below_rows(window.hwnd, panel);
+        drag_over(panel, below);
+        assert!(drag_cursor_is(IDC_NO), "the root is a.md's own folder");
+        drop_at(panel, below);
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        drop_at(panel, client_lparam(-50, (work >> 16) as i32));
+        assert!(scratch.folder().join("a.md").exists());
+        assert!(!scratch.folder().join(r"work\a.md").exists());
+        assert!(
+            notices(window.hwnd).is_empty(),
+            "{:?}",
+            notices(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn tree_drag_esc_a_right_press_and_a_lost_capture_cancel() {
+        // Break caught: Esc sending the focus to the editor mid-drag, a right press opening the
+        // menu or leaving the drag on, or a task switch leaving a drag that drops later
+        // (tree drag spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetCapture, GetFocus, ReleaseCapture, SetCapture, VK_ESCAPE,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_RBUTTONDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-cancel");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = || row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        drag_over(panel, work());
+        unsafe { SendMessageW(panel, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert!(unsafe { GetCapture() }.is_null());
+        assert_eq!(unsafe { GetFocus() }, panel, "the focus stays in the tree");
+        drop_at(panel, work());
+        assert!(a.exists());
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        drag_over(panel, work());
+        mouse(panel, WM_RBUTTONDOWN, 2, work());
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert!(unsafe { GetCapture() }.is_null());
+        drop_at(panel, work());
+        assert!(a.exists());
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        drag_over(panel, work());
+        unsafe { SetCapture(window.hwnd) };
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        unsafe { ReleaseCapture() };
+        drop_at(panel, work());
+        assert!(a.exists());
+        assert!(!scratch.folder().join(r"work\a.md").exists());
+    }
+
+    #[test]
+    fn tree_drag_the_timer_expands_a_resting_folder_and_scrolls_near_the_bottom() {
+        // Break caught: a hovered collapsed folder never opening, the list not scrolling at its
+        // edge, or no timer while dragging (tree drag spec §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-timer");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        for index in 0..80 {
+            scratch.note(&format!("n{index:02}.md"), "n");
+        }
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("work"), false);
+        crate::window::notebook_view::rebuild(window.hwnd);
+
+        start_drag(window.hwnd, panel, &RowKind::Note("n00.md".into()));
+        let start = std::time::Instant::now();
+        drag_over(
+            panel,
+            row_lparam(window.hwnd, &RowKind::Folder("work".into())),
+        );
+        crate::window::notebook_view::drag_tick(window.hwnd, start);
+        assert!(
+            !crate::window::library_host::expanded(window.hwnd)
+                .contains(&std::path::PathBuf::from("work"))
+        );
+        crate::window::notebook_view::drag_tick(
+            window.hwnd,
+            start + std::time::Duration::from_millis(800),
+        );
+        assert!(
+            crate::window::library_host::expanded(window.hwnd)
+                .contains(&std::path::PathBuf::from("work"))
+        );
+
+        let mut client = windows_sys::Win32::Foundation::RECT::default();
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(panel, &mut client) };
+        drag_over(panel, client_lparam(client.right / 2, client.bottom - 2));
+        let top = notebook_view(window.hwnd).list.top;
+        crate::window::notebook_view::drag_tick(window.hwnd, start);
+        assert!(notebook_view(window.hwnd).list.top > top, "scrolled down");
+        assert_ne!(
+            unsafe { KillTimer(panel, crate::window::notebook_view::DRAG_TIMER) },
+            0,
+            "the drag's timer runs"
+        );
+        crate::window::notebook_view::cancel_drag(window.hwnd);
+    }
+
+    #[test]
+    fn tree_drag_a_rebuild_or_view_switch_mid_drag_cancels_or_retargets() {
+        // Break caught: a drag of a row a rescan removed staying on, a drop into a folder that
+        // vanished, or a drag surviving another view (tree drag spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-rebuild");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        std::fs::create_dir_all(scratch.folder().join("other")).unwrap();
+        let a = scratch.note("a.md", "a");
+        scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        start_drag(window.hwnd, panel, &RowKind::Note("b.md".into()));
+        drag_over(
+            panel,
+            row_lparam(window.hwnd, &RowKind::Folder("work".into())),
+        );
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            state.remove_folder_for_test(std::path::Path::new("work"));
+        });
+        crate::window::notebook_view::rebuild(window.hwnd);
+        let drag = notebook_view(window.hwnd).drag.clone().unwrap();
+        assert_eq!(drag.target, None, "the target folder's row is gone");
+
+        crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&a));
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert!(
+            notebook_view(window.hwnd).drag.is_some(),
+            "b.md is still there"
+        );
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            state.remove_note(&scratch.folder().join("b.md"))
+        });
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert!(unsafe { GetCapture() }.is_null());
+
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            let _ = state.add_note(&a);
+        });
+        crate::window::notebook_view::rebuild(window.hwnd);
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        assert!(unsafe { GetCapture() }.is_null());
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+        assert!(notebook_view(window.hwnd).drag.is_none());
+    }
+
     #[test]
     fn a_folder_rename_selects_the_whole_name_even_with_a_dot() {
         // Break caught: "v1.2" opening with only "v1" selected, as a file name's stem would be,
