@@ -1195,7 +1195,9 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
                         .unwrap_or_default();
                     library_host::name_taken_error(&parent, &stem, &extension.unwrap_or_default())
                 }
-                MoveError::Missing(error) | MoveError::Failed(error) => {
+                MoveError::Missing(error)
+                | MoveError::TargetGone(error)
+                | MoveError::Failed(error) => {
                     format!("FastPad could not rename the file: {error}")
                 }
                 MoveError::TabCantFollow => "Another tab already has that file open.".to_owned(),
@@ -1263,7 +1265,9 @@ fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
         Err(error) => {
             let message = match error {
                 MoveError::Taken => library_host::folder_taken_error(&name),
-                MoveError::Missing(error) | MoveError::Failed(error) => {
+                MoveError::Missing(error)
+                | MoveError::TargetGone(error)
+                | MoveError::Failed(error) => {
                     format!("FastPad could not rename the folder: {error}")
                 }
                 MoveError::TabCantFollow => "Another tab already has that file open.".to_owned(),

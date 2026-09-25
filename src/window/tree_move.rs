@@ -17,6 +17,9 @@ pub(crate) enum MoveError {
     Taken,
     /// The source is gone from disk.
     Missing(crate::FastPadError),
+    /// Windows says the path is gone, but the source is still there: the destination's parent
+    /// folder is what vanished (tree drag spec §5).
+    TargetGone(crate::FastPadError),
     /// Windows refused the move for another reason.
     Failed(crate::FastPadError),
     /// An open tab could not follow, and the move was undone.
@@ -32,11 +35,18 @@ pub(crate) struct Moved {
     pub(crate) stuck: Vec<PathBuf>,
 }
 
-fn disk_error(error: crate::FastPadError, case_only: bool) -> MoveError {
+/// `error` from the rename that failed to put `old_path` at its new path. A not-found error is
+/// ambiguous (Windows doesn't say which path it means): the source still being there means it
+/// was the destination's parent folder that vanished, not the source (tree drag spec §5).
+fn disk_error(error: crate::FastPadError, case_only: bool, old_path: &Path) -> MoveError {
     if !case_only && library_host::already_exists(&error) {
         MoveError::Taken
     } else if library_host::not_found(&error) {
-        MoveError::Missing(error)
+        if old_path.exists() {
+            MoveError::TargetGone(error)
+        } else {
+            MoveError::Missing(error)
+        }
     } else {
         MoveError::Failed(error)
     }
@@ -54,7 +64,7 @@ pub(crate) fn move_note(
     let (old_path, new_path) = (root.join(old), root.join(new));
     let case_only = library::model::same_path(&new_path, &old_path);
     crate::platform::files::rename_no_replace(&old_path, &new_path)
-        .map_err(|error| disk_error(error, case_only))?;
+        .map_err(|error| disk_error(error, case_only, &old_path))?;
     let mut stuck = Vec::new();
     let rebound = match library_host::rebind_open_tab(hwnd, &old_path, new_path.clone()) {
         Ok(rebound) => rebound,
@@ -92,7 +102,7 @@ pub(crate) fn move_folder(
     let case_only = library::model::same_path(new, old);
     let (old_path, new_path) = (root.join(old), root.join(new));
     crate::platform::files::rename_no_replace(&old_path, &new_path)
-        .map_err(|error| disk_error(error, case_only))?;
+        .map_err(|error| disk_error(error, case_only, &old_path))?;
     let tabs = library_host::tabs_under(hwnd, &old_path);
     let mut moved = Vec::with_capacity(tabs.len());
     let mut stuck = Vec::new();
@@ -198,6 +208,11 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
         }
         Err(MoveError::Missing(_)) => {
             gone(hwnd, &name);
+            return;
+        }
+        Err(MoveError::TargetGone(error)) => {
+            push_notice(hwnd, format!("Couldn't move {name}: {error}"));
+            library_host::request_rescan(hwnd);
             return;
         }
         Err(MoveError::Failed(error)) => {
