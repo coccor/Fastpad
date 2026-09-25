@@ -29,6 +29,7 @@ pub mod tabs;
 pub(crate) mod text_search_host;
 pub mod titlebar;
 pub(crate) mod tooltip;
+pub(crate) mod tree_drag;
 
 pub(crate) use main_window::{
     INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
