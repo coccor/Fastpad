@@ -20894,4 +20894,55 @@ mod tests {
         pump_until(window.hwnd, || scratch.folder().join("dropped.md").exists());
         crate::window::copy_host::wait_for_copies(window.hwnd);
     }
+
+    #[test]
+    fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows_the_field() {
+        // Break caught: New note, New folder or Rename opening their name field in a collapsed
+        // root, hidden, with the keyboard focus in it (open editors spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-root-collapsed");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let collapse = || {
+            crate::window::library_host::set_root_expanded(window.hwnd, false);
+            crate::window::notebook_view::rebuild(window.hwnd);
+            assert!(!notebook_view(window.hwnd).tree_shown());
+        };
+        collapse();
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
+            .buttons
+            .into_iter()
+            .find(|(button, _)| *button == crate::window::notebook_view::HeaderButton::NewNote)
+            .unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(new_note));
+        mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
+        assert!(inline_open(window.hwnd));
+        assert!(crate::window::library_host::root_expanded(window.hwnd));
+        assert!(notebook_view(window.hwnd).tree_shown());
+        assert!(is_shown(inline_field(window.hwnd)), "the name field shows");
+        field_key(window.hwnd, VK_ESCAPE);
+
+        collapse();
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+        assert!(inline_open(window.hwnd));
+        assert!(notebook_view(window.hwnd).tree_shown());
+        assert!(
+            is_shown(inline_field(window.hwnd)),
+            "the rename field shows"
+        );
+        field_key(window.hwnd, VK_ESCAPE);
+
+        collapse();
+        crate::window::inline_name::rename_note_at(window.hwnd, &scratch.folder().join("a.md"));
+        assert!(inline_open(window.hwnd));
+        assert!(notebook_view(window.hwnd).tree_shown());
+        assert!(
+            is_shown(inline_field(window.hwnd)),
+            "the revealed row's field shows"
+        );
+    }
 }

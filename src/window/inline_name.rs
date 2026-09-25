@@ -665,8 +665,8 @@ fn delete_word_before(field: HWND) {
 }
 
 /// Starts an edit for `purpose` (spec §3): the one already open commits first (§3.4), the find
-/// bar and the name bar close, the Notebook view shows, a draft's folder expands, and the field
-/// takes the keyboard focus over its row. Nothing touches the disk.
+/// bar and the name bar close, the Notebook view shows, the notebook's root row and a draft's
+/// folder expand, and the field takes the keyboard focus over its row. Nothing touches the disk.
 fn start(hwnd: HWND, purpose: Purpose) {
     if !library_host::ready_library(hwnd) || side_panel::windows(hwnd).is_none() {
         return;
@@ -677,6 +677,8 @@ fn start(hwnd: HWND, purpose: Purpose) {
     if side_panel::current_view(hwnd) != SidebarView::Notebook {
         side_panel::show_view(hwnd, SidebarView::Notebook, false);
     }
+    // A collapsed root hides the tree, and the field with it (open editors spec §3.3).
+    library_host::set_root_expanded(hwnd, true);
     if let Some(parent) = purpose.draft_parent() {
         let mut folders = tree::ancestors(parent);
         if !parent.as_os_str().is_empty() {
@@ -784,8 +786,8 @@ pub(crate) fn rename_active(hwnd: HWND) {
 }
 
 /// Shows the note at `path` in the Notebook view (opening the sidebar on it if hidden or on
-/// another view), its folders expanded and its row selected and scrolled into view (spec
-/// §3.3). `None` when it has no row there: outside the notebook, not a note, not listed yet, or
+/// another view), the root row and its folders expanded and its row selected and scrolled into
+/// view (spec §3.3). `None` when it has no row there: outside the notebook, not a note, not listed yet, or
 /// no sidebar, which change nothing; or a listed note whose row is still not found once the view
 /// is shown and its folders expanded, which stay so.
 fn reveal(hwnd: HWND, path: &Path) -> Option<PathBuf> {
@@ -807,6 +809,7 @@ fn reveal(hwnd: HWND, path: &Path) -> Option<PathBuf> {
     if side_panel::current_view(hwnd) != SidebarView::Notebook {
         side_panel::show_view(hwnd, SidebarView::Notebook, false);
     }
+    library_host::set_root_expanded(hwnd, true);
     for folder in tree::ancestors(&relative) {
         library_host::set_expanded(hwnd, &folder, true);
     }
