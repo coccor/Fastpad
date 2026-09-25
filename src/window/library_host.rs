@@ -75,6 +75,8 @@ pub(crate) struct LibraryHost {
     /// The last load of the open notebook failed, so the sidebar offers Retry instead of saying
     /// "Loading…" forever. Starting a load clears it.
     pub(crate) load_failed: bool,
+    /// Copies into the tree, queued on one worker thread (open editors spec §4.5).
+    pub(crate) copy_worker: super::copy_host::CopyWorker,
 }
 
 impl LibraryHost {
@@ -97,6 +99,7 @@ impl LibraryHost {
             expansion_revision: 0,
             shown_move: None,
             load_failed: false,
+            copy_worker: super::copy_host::CopyWorker::default(),
         }
     }
 }
@@ -139,6 +142,14 @@ pub(crate) fn folder(hwnd: HWND) -> Option<PathBuf> {
 
 pub(crate) fn with_state<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryState) -> R) -> Option<R> {
     host(hwnd, |host| host.state.as_mut().map(f)).flatten()
+}
+
+/// Runs `f` on the window's copy worker.
+pub(crate) fn with_copy_worker<R>(
+    hwnd: HWND,
+    f: impl FnOnce(&mut super::copy_host::CopyWorker) -> R,
+) -> Option<R> {
+    host(hwnd, |host| f(&mut host.copy_worker))
 }
 
 fn data_dir(hwnd: HWND) -> Option<PathBuf> {
@@ -2587,7 +2598,7 @@ fn report(hwnd: HWND, result: Result<(), LibraryError>) {
 }
 
 /// Asks `question`; false also when the window went away meanwhile.
-fn confirmed(hwnd: HWND, question: &str) -> bool {
+pub(crate) fn confirmed(hwnd: HWND, question: &str) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };

@@ -7,13 +7,6 @@ use std::path::{Path, PathBuf};
 
 /// Why an item is not copied (spec §4.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) enum Refusal {
     /// The destination is the item itself.
     SamePlace,
@@ -26,13 +19,6 @@ pub(crate) enum Refusal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) enum Outcome {
     Copy,
     /// Something already has the destination's name: ask before replacing it.
@@ -41,13 +27,6 @@ pub(crate) enum Outcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) struct Planned {
     pub source: PathBuf,
     pub destination: PathBuf,
@@ -73,13 +52,6 @@ fn refusal(source: &Path, target: &Path, destination: &Path) -> Option<Refusal> 
 /// style, no trailing separator or `.`/`..` component), so a trailing `\`, a `/`, or a `.`/`..`
 /// spelling of the same location compares equal to the canonical one, the way the refusal checks
 /// below need it to.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn plan(
     sources: &[PathBuf],
     root: &Path,
@@ -135,10 +107,6 @@ pub(crate) fn any_accepted(sources: &[PathBuf], root: &Path, folder: &Path) -> b
     })
 }
 
-#[expect(
-    dead_code,
-    reason = "wired to the copy host by a later open editors task"
-)]
 pub(crate) fn item_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
@@ -146,24 +114,10 @@ pub(crate) fn item_name(path: &Path) -> String {
     )
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn replace_question(name: &str, folder: &str) -> String {
     format!("{name} already exists in {folder}. Replace it?")
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn hidden_notice(names: &[String]) -> String {
     match names {
         [one] => format!("{one} was copied but isn't shown: the notebook lists text notes only."),
@@ -180,24 +134,10 @@ pub(crate) fn hidden_notice(names: &[String]) -> String {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn dirty_notice(name: &str) -> String {
     format!("Copied the saved version of {name}. Your unsaved changes are still in its tab.")
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn failed_notice(name: &str, reason: &str, copied_before: Option<usize>) -> String {
     let reason = reason.trim_end_matches(['.', ' ', '\r', '\n']);
     match copied_before {
@@ -208,13 +148,6 @@ pub(crate) fn failed_notice(name: &str, reason: &str, copied_before: Option<usiz
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn refused_notice(name: &str, refusal: Refusal) -> String {
     let why = match refusal {
         Refusal::SamePlace => "it is already there",
@@ -225,13 +158,6 @@ pub(crate) fn refused_notice(name: &str, refusal: Refusal) -> String {
     format!("{name} was not copied: {why}.")
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn recycle_failed_notice(name: &str) -> String {
     format!("{name} was not copied: it could not be moved to the Recycle Bin.")
 }

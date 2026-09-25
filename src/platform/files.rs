@@ -1,5 +1,6 @@
 //! File operations the note library needs that `std` does not offer safely: a rename that never
-//! replaces its target, and deleting to the Recycle Bin.
+//! replaces its target, deleting to the Recycle Bin, copying without replacing, and a file's
+//! identity whatever its path is spelled like.
 
 use crate::Result;
 use crate::platform::last_error;
@@ -7,8 +8,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{
-    COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW,
+    BY_HANDLE_FILE_INFORMATION, COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, CreateFileW,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -191,6 +194,52 @@ pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool)
     copied
 }
 
+/// The volume serial number and file index of the file or folder at `path`: the same for every
+/// spelling of one item (an 8.3 short name, a `subst` drive, a `\\?\` prefix, a junction), and
+/// different for two items that both exist. `None` when it can't be opened or asked.
+pub fn file_id(path: &Path) -> Option<(u32, u64)> {
+    let path_wide = wide(path);
+    // No access asked for, so only the attributes are reachable; backup semantics opens folders.
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    // CreateFileW returns INVALID_HANDLE_VALUE on failure, which from_raw_owned rejects.
+    let handle = unsafe { crate::platform::OwnedHandle::from_raw_owned(handle) }.ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.as_raw(), &mut info) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, index))
+}
+
+/// `path` spelled with 8.3 short names where the volume has them; `path` itself otherwise.
+#[cfg(test)]
+pub fn short_path_for_test(path: &Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let long = wide(path);
+    let mut short = vec![0u16; 1024];
+    let length = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            long.as_ptr(),
+            short.as_mut_ptr(),
+            short.len() as u32,
+        )
+    } as usize;
+    if length == 0 || length >= short.len() {
+        return path.to_path_buf();
+    }
+    std::ffi::OsString::from_wide(&short[..length]).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +380,26 @@ mod tests {
         );
         let single = copy_tree(&dir.join("a.md"), &dir.join("c.md"), &cancel);
         assert_eq!((single.files, single.error.is_none()), (1, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_id_is_the_same_for_every_spelling_and_differs_between_files() {
+        // Break caught: a clash check that trusts the spelling, so an alias of the item being
+        // copied (a `\\?\` prefix, an 8.3 name) was recycled as if it were another file.
+        let dir = scratch("file-id");
+        let first = dir.join("a-long-file-name.md");
+        let second = dir.join("b.md");
+        std::fs::write(&first, "a").unwrap();
+        std::fs::write(&second, "b").unwrap();
+        let id = file_id(&first).expect("an existing file has an id");
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", first.display()));
+        assert_eq!(file_id(&verbatim), Some(id));
+        assert_eq!(file_id(&short_path_for_test(&first)), Some(id));
+        assert_ne!(file_id(&second), Some(id));
+        let folder = file_id(&dir).expect("a folder opens too");
+        assert_ne!(folder, id);
+        assert_eq!(file_id(&dir.join("never-existed.md")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

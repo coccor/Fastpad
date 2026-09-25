@@ -751,6 +751,10 @@ unsafe extern "system" fn main_window_proc(
                 crate::window::text_search_host::replace_reloaded(hwnd, lparam);
                 return 0;
             }
+            if message == crate::window::WM_FASTPAD_COPY_DONE {
+                crate::window::copy_host::copy_done(hwnd, lparam);
+                return 0;
+            }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
             // IPC drain wait for it to end so they cannot change the document it acts on.
             if (message == crate::window::WM_FASTPAD_IPC_REQUEST
@@ -6001,12 +6005,26 @@ fn store_app(hwnd: HWND, value: Box<App>) {
     }
 }
 
+/// Dispatches everything already posted to `hwnd`, leaving any WM_QUIT for the harness.
+#[cfg(test)]
+pub(crate) fn pump_posted_messages(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
+    };
+    let mut message = MSG::default();
+    while unsafe { PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
+        unsafe {
+            DispatchMessageW(&message);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MainWindowClass, WindowCreateContext, execute_command, handle_paint_with,
-        mark_first_paint_complete, sidebar_command_runs, take_deferred_start_pending,
-        with_command_palette,
+        mark_first_paint_complete, pump_posted_messages, sidebar_command_runs,
+        take_deferred_start_pending, with_command_palette,
     };
     use crate::app::App;
     use crate::document::{CloseDecision, Language, RecoveryId};
@@ -6034,16 +6052,6 @@ mod tests {
         DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow,
         MSG, PM_REMOVE, PeekMessageW, SendMessageW, WM_CLOSE, WM_PAINT,
     };
-
-    /// Dispatches everything already posted to `hwnd`, leaving any WM_QUIT for the harness.
-    fn pump_posted_messages(hwnd: HWND) {
-        let mut message = MSG::default();
-        while unsafe { PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
-            unsafe {
-                DispatchMessageW(&message);
-            }
-        }
-    }
 
     #[test]
     fn the_main_window_has_a_title_for_the_taskbar() {
@@ -20416,5 +20424,181 @@ mod tests {
         assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
         assert!(scratch.folder().join("n00.md").exists());
         assert!(!scratch.folder().join("half.md").exists());
+    }
+
+    #[test]
+    fn copy_host_copies_files_and_folders_indexes_notes_and_says_what_is_hidden() {
+        // Break caught: a copied note missing from the tree until a rescan, a copied folder not
+        // listed, a non-note copied silently, or the single copied row not selected
+        // (open editors spec §4.5, §4.6).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-into");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(outside.join(r"pics\deep")).unwrap();
+        std::fs::write(outside.join("draft.md"), "d").unwrap();
+        std::fs::write(outside.join(r"pics\deep\x.png"), [1u8]).unwrap();
+        std::fs::write(outside.join("photo.png"), [1u8]).unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![outside.join("draft.md")],
+            std::path::Path::new("work"),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(scratch.folder().join(r"work\draft.md").exists());
+        assert!(outside.join("draft.md").exists(), "a copy, not a move");
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"work\draft.md".into()))
+        );
+
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![outside.join("pics"), outside.join("photo.png")],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(scratch.folder().join(r"pics\deep\x.png").exists());
+        assert!(scratch.folder().join("photo.png").exists());
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.contains("isn't shown") || notice.contains("aren't shown"))
+        );
+    }
+
+    #[test]
+    fn copy_host_a_clash_asks_ok_replaces_and_cancel_skips() {
+        // Break caught: a clash replaced without asking, Cancel stopping the whole drop, or a
+        // replaced clean tab left showing the old text (open editors spec §4.4, §4.7).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-clash");
+        let a = scratch.note("a.md", "old a");
+        scratch.note("b.md", "old b");
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.md"), "new a").unwrap();
+        std::fs::write(outside.join("b.md"), "new b").unwrap();
+        std::fs::write(outside.join("c.md"), "new c").unwrap();
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::modal::answer_next_confirm(|_| false);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![
+                outside.join("a.md"),
+                outside.join("b.md"),
+                outside.join("c.md"),
+            ],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        let folder = crate::window::library_host::notebook_name(&scratch.folder());
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some(format!("b.md already exists in {folder}. Replace it?").as_str())
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("b.md")).unwrap(),
+            "old b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("c.md")).unwrap(),
+            "new c"
+        );
+        assert_eq!(editor.text().unwrap(), "new a", "the clean tab reloaded");
+    }
+
+    #[test]
+    fn copy_host_a_failed_recycle_skips_that_item_and_says_so() {
+        // Break caught (Review Focus 3): an item copied (or half-copied) after its Recycle Bin
+        // step failed, or the rest of the drop abandoned.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-recycle-fails");
+        scratch.note("a.md", "old a");
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.md"), "new a").unwrap();
+        std::fs::write(outside.join("b.md"), "new b").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::copy_host::fail_next_recycle();
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![outside.join("a.md"), outside.join("b.md")],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("a.md")).unwrap(),
+            "old a"
+        );
+        assert!(scratch.folder().join("b.md").exists());
+        assert!(notices(window.hwnd).contains(
+            &"a.md was not copied: it could not be moved to the Recycle Bin.".to_owned()
+        ));
+    }
+
+    #[test]
+    fn copy_host_an_alias_of_the_source_is_refused_and_nothing_is_recycled() {
+        // Break caught: a `\\?\` or 8.3 spelling of the item itself, or of the folder holding it,
+        // passing the lexical plan as a clash, so answering OK recycled the very item being copied.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-alias");
+        let note = scratch.note("a-long-note-name.md", "keep");
+        std::fs::create_dir_all(scratch.folder().join(r"work\work")).unwrap();
+        std::fs::write(scratch.folder().join(r"work\work\in.md"), "in").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        let verbatim = |path: &std::path::Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![
+                verbatim(&note),
+                verbatim(&scratch.folder().join(r"work\work")),
+            ],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "keep");
+        assert!(scratch.folder().join(r"work\work\in.md").exists());
+        let said = notices(window.hwnd);
+        assert!(
+            said.contains(&"a-long-note-name.md was not copied: it is already there.".to_owned())
+        );
+        assert!(
+            said.contains(&"work was not copied: it would replace the folder it is in.".to_owned())
+        );
+
+        let short = crate::platform::files::short_path_for_test(&note);
+        if short.file_name() == note.file_name() {
+            // The scratch volume makes no 8.3 names: the `\\?\` spelling above stands in.
+            return;
+        }
+        let short_name = crate::window::tree_copy::item_name(&short);
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![short],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "keep");
+        assert!(notices(window.hwnd).contains(&format!(
+            "{short_name} was not copied: it is already there."
+        )));
     }
 }
