@@ -20984,4 +20984,50 @@ mod tests {
         );
         assert!(a.exists() && b.exists());
     }
+
+    /// Opens `path` with no sharing, so a copy of it fails, until the handle is dropped.
+    fn locked(path: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn copy_host_a_failure_part_way_through_a_folder_says_how_many_files_were_copied() {
+        // Break caught: a folder's failure without its count, or "1 files" (open editors spec
+        // §4.6, §8).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-part-way");
+        let pack = scratch.root.join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(pack.join(name), name).unwrap();
+        }
+        let (window, _editor) = notebook_window(&scratch);
+        let lock = locked(&pack.join("b.md"));
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![pack.clone()],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        drop(lock);
+        assert!(scratch.folder().join(r"pack\a.md").exists());
+        assert!(
+            !scratch.folder().join(r"pack\c.md").exists(),
+            "the rest stops"
+        );
+        let said = notices(window.hwnd);
+        assert!(
+            said.iter().any(|notice| {
+                notice.starts_with("pack could not be copied: ")
+                    && notice.ends_with(". 1 file was copied before the failure.")
+            }),
+            "{said:?}"
+        );
+    }
 }

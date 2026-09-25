@@ -111,6 +111,7 @@ pub(crate) fn replace_question(name: &str, folder: &str) -> String {
     format!("{name} already exists in {folder}. Replace it?")
 }
 
+/// The notice for copied files the tree doesn't list; `names` holds at least one.
 pub(crate) fn hidden_notice(names: &[String]) -> String {
     match names {
         [one] => format!("{one} was copied but isn't shown: the notebook lists text notes only."),
@@ -134,6 +135,9 @@ pub(crate) fn dirty_notice(name: &str) -> String {
 pub(crate) fn failed_notice(name: &str, reason: &str, copied_before: Option<usize>) -> String {
     let reason = reason.trim_end_matches(['.', ' ', '\r', '\n']);
     match copied_before {
+        Some(1) => {
+            format!("{name} could not be copied: {reason}. 1 file was copied before the failure.")
+        }
         Some(files) => format!(
             "{name} could not be copied: {reason}. {files} files were copied before the failure."
         ),
@@ -378,6 +382,10 @@ mod tests {
         assert_eq!(
             failed_notice("pics", "The disk is full", Some(3)),
             "pics could not be copied: The disk is full. 3 files were copied before the failure."
+        );
+        assert_eq!(
+            failed_notice("pics", "The disk is full", Some(1)),
+            "pics could not be copied: The disk is full. 1 file was copied before the failure."
         );
         assert_eq!(
             refused_notice("a.md", Refusal::SamePlace),
