@@ -130,8 +130,9 @@ Hover a note to pin it.
 - Drag a note or a folder onto another folder in the tree to move it there, or onto empty
   space to move it to the notebook's top level. A label with its name follows the pointer while
   you drag. Open tabs and pins follow it, nothing is ever overwritten, and Esc cancels the drag.
-- The tree's icons come from Material Icon Theme; **File icons: Minimal** in the palette switches
-  to plain glyphs.
+- The tree's icons come from Material Icon Theme. **File icons: Minimal** in the palette switches
+  to single-colour outlines, and **File icons: Solid** to filled shapes. Designers can edit both
+  as SVGs (`assets/icons/README.md`).
 - Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
 - **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
   Everything is reachable from the keyboard and exposed to screen readers.
@@ -234,7 +235,7 @@ line in a notification and applies the rest.
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
-| `file_icons` | `material` or `minimal` | `material` |
+| `file_icons` | `material`, `minimal` or `solid` | `material` |
 
 Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
 

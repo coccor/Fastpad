@@ -1,6 +1,8 @@
-//! The tree's Material bitmaps (icon sets spec §6): one top-down 32-bit DIB section per (icon,
-//! pixel size), made on first draw, blended 1:1 with gdi32's `GdiAlphaBlend` (no msimg32 import).
+//! The tree's icon bitmaps (icon sets spec §6): one top-down 32-bit DIB section per (Material
+//! icon, pixel size) and per (mask icon, pixel size, colour), made on first draw, blended 1:1
+//! with gdi32's `GdiAlphaBlend` (no msimg32 import).
 
+use super::masks::{MaskIcon, MaskSet, coverage};
 use super::material::{MaterialIcon, pixels};
 use super::resample::{pick_size, resample};
 use std::collections::HashMap;
@@ -11,8 +13,14 @@ use windows_sys::Win32::Graphics::Gdi::{
     HBITMAP, HDC, SelectObject,
 };
 
+/// A mask bitmap's key: the set, the icon, its pixel size and the COLORREF it is tinted with.
+type MaskKey = (MaskSet, MaskIcon, u32, u32);
+
 pub(crate) struct IconImages {
     bitmaps: HashMap<(MaterialIcon, u32), HBITMAP>,
+    /// Tinted masks. A theme switch adds a colour's bitmaps; at most 9 icons × 2 sets × the
+    /// theme colours × the pixel sizes in use, so the cache is never trimmed.
+    masks: HashMap<MaskKey, HBITMAP>,
     /// One memory DC for every blend, made on first use.
     memory: HDC,
 }
@@ -21,17 +29,42 @@ impl IconImages {
     pub(crate) fn new() -> Self {
         Self {
             bitmaps: HashMap::new(),
+            masks: HashMap::new(),
             memory: std::ptr::null_mut(),
         }
     }
 
     /// Blends `icon` at `px` square, centred in `rect`. `false` when a bitmap or the memory DC
-    /// could not be made: the caller draws the Minimal glyph instead, and the next paint tries
+    /// could not be made: the caller draws the Minimal icon instead, and the next paint tries
     /// again.
     pub(crate) fn draw(&mut self, dc: HDC, icon: MaterialIcon, rect: RECT, px: u32) -> bool {
         let Some(bitmap) = self.bitmap(icon, px) else {
             return false;
         };
+        self.blend(dc, bitmap, rect, px)
+    }
+
+    /// Blends `icon` of `set` at `px` square in `color` (a COLORREF), centred in `rect`. `false`
+    /// when a bitmap or the memory DC could not be made: the row then shows no icon, and the
+    /// next paint tries again.
+    pub(crate) fn draw_mask(
+        &mut self,
+        dc: HDC,
+        set: MaskSet,
+        icon: MaskIcon,
+        color: u32,
+        rect: RECT,
+        px: u32,
+    ) -> bool {
+        let Some(bitmap) = self.mask(set, icon, color, px) else {
+            return false;
+        };
+        self.blend(dc, bitmap, rect, px)
+    }
+
+    /// Blends the `px`-square `bitmap` centred in `rect`, drawing only the part inside `rect`:
+    /// a deep row in a narrow panel clips its icon box rather than getting a smaller bitmap.
+    fn blend(&mut self, dc: HDC, bitmap: HBITMAP, rect: RECT, px: u32) -> bool {
         if self.memory.is_null() {
             self.memory = unsafe { CreateCompatibleDC(dc) };
             if self.memory.is_null() {
@@ -41,6 +74,12 @@ impl IconImages {
         let size = px as i32;
         let x = rect.left + (rect.right - rect.left - size) / 2;
         let y = rect.top + (rect.bottom - rect.top - size) / 2;
+        let (left, top) = (x.max(rect.left), y.max(rect.top));
+        let (right, bottom) = ((x + size).min(rect.right), (y + size).min(rect.bottom));
+        if right <= left || bottom <= top {
+            return true;
+        }
+        let (width, height) = (right - left, bottom - top);
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -49,7 +88,19 @@ impl IconImages {
         };
         unsafe {
             let previous = SelectObject(self.memory, bitmap);
-            let drawn = GdiAlphaBlend(dc, x, y, size, size, self.memory, 0, 0, size, size, blend);
+            let drawn = GdiAlphaBlend(
+                dc,
+                left,
+                top,
+                width,
+                height,
+                self.memory,
+                left - x,
+                top - y,
+                width,
+                height,
+                blend,
+            );
             SelectObject(self.memory, previous);
             drawn != 0
         }
@@ -61,21 +112,58 @@ impl IconImages {
         }
         let stored = pick_size(px);
         let source = pixels(icon, stored)?;
-        let scaled;
-        let data = if stored == px {
-            source
-        } else {
-            scaled = resample(source, stored, px);
-            &scaled[..]
-        };
-        let (bitmap, bits) = dib_section(px as i32, px as i32);
-        if bitmap.is_null() || bits.is_null() {
-            return None;
-        }
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), bits.cast::<u8>(), data.len()) };
+        let bitmap = upload(&scaled(source, stored, px), px)?;
         self.bitmaps.insert((icon, px), bitmap);
         Some(bitmap)
     }
+
+    fn mask(&mut self, set: MaskSet, icon: MaskIcon, color: u32, px: u32) -> Option<HBITMAP> {
+        let key = (set, icon, px, color);
+        if let Some(&bitmap) = self.masks.get(&key) {
+            return Some(bitmap);
+        }
+        let stored = pick_size(px);
+        let source = tint(coverage(set, icon, stored)?, color);
+        let bitmap = upload(&scaled(&source, stored, px), px)?;
+        self.masks.insert(key, bitmap);
+        Some(bitmap)
+    }
+}
+
+/// `source` (premultiplied BGRA at `stored` px) at `px`.
+fn scaled(source: &[u8], stored: u32, px: u32) -> std::borrow::Cow<'_, [u8]> {
+    if stored == px {
+        source.into()
+    } else {
+        resample(source, stored, px).into()
+    }
+}
+
+/// `mask` coloured `color` (a COLORREF, 0x00BBGGRR): premultiplied BGRA.
+fn tint(mask: &[u8], color: u32) -> Vec<u8> {
+    let [red, green, blue, _] = color.to_le_bytes();
+    let times =
+        |channel: u8, alpha: u8| ((u32::from(channel) * u32::from(alpha) + 127) / 255) as u8;
+    mask.iter()
+        .flat_map(|&alpha| {
+            [
+                times(blue, alpha),
+                times(green, alpha),
+                times(red, alpha),
+                alpha,
+            ]
+        })
+        .collect()
+}
+
+/// A `px`-square DIB section holding `data` (premultiplied BGRA, top-down).
+fn upload(data: &[u8], px: u32) -> Option<HBITMAP> {
+    let (bitmap, bits) = dib_section(px as i32, px as i32);
+    if bitmap.is_null() || bits.is_null() {
+        return None;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), bits.cast::<u8>(), data.len()) };
+    Some(bitmap)
 }
 
 #[cfg(test)]
@@ -83,13 +171,18 @@ impl IconImages {
     /// The pixel sizes of every bitmap cached so far, for tests that check a clipped icon box
     /// never asks for (and caches) an oddly, narrowly sized bitmap.
     pub(crate) fn cached_pixel_sizes(&self) -> Vec<u32> {
-        self.bitmaps.keys().map(|&(_, px)| px).collect()
+        let masks = self.masks.keys().map(|&(_, _, px, _)| px);
+        self.bitmaps
+            .keys()
+            .map(|&(_, px)| px)
+            .chain(masks)
+            .collect()
     }
 }
 
 impl Drop for IconImages {
     fn drop(&mut self) {
-        for bitmap in self.bitmaps.values() {
+        for bitmap in self.bitmaps.values().chain(self.masks.values()) {
             unsafe { DeleteObject(*bitmap) };
         }
         if !self.memory.is_null() {
@@ -250,20 +343,60 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing; run at the final review: cargo test --lib material_icons_paint -- --ignored"]
-    fn material_icons_paint_no_slower_than_minimal_glyphs() {
-        // Break caught: a per-draw DC or bitmap creation that makes the tree's paint slower than
-        // the glyphs it replaces (icon sets spec §7).
-        use crate::window::file_icons::file_icon;
-        use crate::window::side_panel::draw_text;
-        use crate::window::titlebar::create_ui_font;
-        use windows_sys::Win32::Graphics::Gdi::{
-            DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
+    fn a_mask_blends_in_its_colour_and_a_clipped_box_draws_only_its_part() {
+        // Break caught: a mask tinted in the wrong channel order (a blue icon drawn red), one
+        // blended as straight alpha (dark fringes), a colour change reusing the old colour's
+        // bitmap, or a clipped box painting past its edge (spec §6).
+        const WHITE: u32 = 0x00FF_FFFF;
+        const BLUE: u32 = 0x00FF_0000; // a COLORREF: 0x00BBGGRR
+        let mut target = TestTarget::new(64, 64);
+        target.fill(WHITE);
+        let mut images = IconImages::new();
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 64,
+            bottom: 64,
         };
+        let (set, icon) = (MaskSet::Solid, MaskIcon::Folder);
+        assert!(images.draw_mask(target.dc, set, icon, BLUE, rect, 32));
+        let area = target.area(rect);
+        assert!(
+            area.contains(&0x0000_00FF),
+            "fully covered pixels are pure blue"
+        );
+        assert!(area.iter().all(|&pixel| {
+            let (red, green, blue) = (pixel >> 16, (pixel >> 8) & 0xFF, pixel & 0xFF);
+            blue == 0xFF && red == green
+        }));
+        assert!(images.draw_mask(target.dc, set, icon, 0x0000_00FF, rect, 32));
+        assert!(images.draw_mask(target.dc, set, icon, BLUE, rect, 32));
+        assert_eq!(images.masks.len(), 2, "one bitmap per colour, then reused");
 
+        target.fill(WHITE);
+        let narrow = RECT {
+            left: 20,
+            top: 0,
+            right: 26,
+            bottom: 64,
+        };
+        assert!(images.draw_mask(target.dc, set, icon, BLUE, narrow, 32));
+        for y in 0..64 {
+            for x in (0..20).chain(26..64) {
+                assert_eq!(target.pixel(x, y), WHITE, "({x}, {y}) is outside the box");
+            }
+        }
+        assert!(target.area(narrow).iter().any(|&pixel| pixel != WHITE));
+        assert_eq!(images.cached_pixel_sizes(), vec![32, 32]);
+    }
+
+    #[test]
+    #[ignore = "timing; run at the final review: cargo test --lib mask_icons_paint -- --ignored"]
+    fn mask_icons_paint_no_slower_than_material_bitmaps() {
+        // Break caught: a per-draw tint, DC or bitmap creation that makes the Minimal or Solid
+        // tree paint slower than Material's (icon sets spec §7).
         const BANDS: i32 = 1_000;
         const RUNS: usize = 20;
-
         let band = |i: i32| RECT {
             left: 0,
             top: i * 24,
@@ -271,49 +404,39 @@ mod tests {
             bottom: (i + 1) * 24,
         };
         let target = TestTarget::new(24, BANDS * 24);
-
         let mut images = IconImages::new();
-        // Warms the memory DC and all 12 cached bitmaps, so the measured runs pay only the blend.
-        for i in 0..BANDS {
+        let material = |images: &mut IconImages, i: i32| {
             images.draw(target.dc, MaterialIcon::ALL[(i % 12) as usize], band(i), 16);
-        }
-        let mut material_us: Vec<u64> = (0..RUNS)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                for i in 0..BANDS {
-                    images.draw(target.dc, MaterialIcon::ALL[(i % 12) as usize], band(i), 16);
-                }
-                started.elapsed().as_micros() as u64
-            })
-            .collect();
-        material_us.sort_unstable();
-        let material_median = material_us[RUNS / 2];
-
-        let font = create_ui_font(12, "Segoe MDL2 Assets", FW_NORMAL as i32, false);
-        let text = file_icon(Some("md")).text;
-        let flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
-        for i in 0..BANDS {
-            unsafe { draw_text(target.dc, text, band(i), font, 0x00FF_8800, flags) };
-        }
-        let mut minimal_us: Vec<u64> = (0..RUNS)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                for i in 0..BANDS {
-                    unsafe { draw_text(target.dc, text, band(i), font, 0x00FF_8800, flags) };
-                }
-                started.elapsed().as_micros() as u64
-            })
-            .collect();
-        minimal_us.sort_unstable();
-        let minimal_median = minimal_us[RUNS / 2];
-
+        };
+        let mask = |images: &mut IconImages, i: i32| {
+            let icon = MaskIcon::ALL[(i % 9) as usize];
+            images.draw_mask(target.dc, MaskSet::Minimal, icon, 0x00FF_8800, band(i), 16);
+        };
+        let median = |images: &mut IconImages, draw: &dyn Fn(&mut IconImages, i32)| {
+            // The first pass warms the memory DC and the cached bitmaps.
+            for i in 0..BANDS {
+                draw(images, i);
+            }
+            let mut runs: Vec<u64> = (0..RUNS)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    for i in 0..BANDS {
+                        draw(images, i);
+                    }
+                    started.elapsed().as_micros() as u64
+                })
+                .collect();
+            runs.sort_unstable();
+            runs[RUNS / 2]
+        };
+        let material_median = median(&mut images, &material);
+        let mask_median = median(&mut images, &mask);
         println!(
-            "material paint median {material_median} us over {BANDS} draws, \
-             minimal paint median {minimal_median} us over {BANDS} draws"
+            "material paint median {material_median} us, mask paint median {mask_median} us,              over {BANDS} draws"
         );
         assert!(
-            (material_median as f64) <= (minimal_median as f64) * 1.10,
-            "material {material_median} us > minimal {minimal_median} us * 1.10"
+            (mask_median as f64) <= (material_median as f64) * 1.10,
+            "mask {mask_median} us > material {material_median} us * 1.10"
         );
     }
 }

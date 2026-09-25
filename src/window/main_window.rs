@@ -2531,6 +2531,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
         CommandId::FileIconsMaterial => set_file_icons(hwnd, crate::config::FileIconSet::Material),
         CommandId::FileIconsMinimal => set_file_icons(hwnd, crate::config::FileIconSet::Minimal),
+        CommandId::FileIconsSolid => set_file_icons(hwnd, crate::config::FileIconSet::Solid),
         CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
         CommandId::ThemeCatppuccin => set_theme(hwnd, crate::config::ThemePreference::Catppuccin),
         CommandId::ThemeCatppuccinLatte => {
@@ -7280,7 +7281,20 @@ mod tests {
             "the repeat command still repaints (set_file_icons invalidates unconditionally)"
         );
 
-        // Minimal -> Material: a real change, so the panel must repaint again.
+        // Minimal -> Solid: a real change, so the panel must repaint.
+        unsafe { ValidateRect(panel, std::ptr::null()) };
+        execute_command(window.hwnd, CommandId::FileIconsSolid);
+        assert_ne!(
+            unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+            0,
+            "switching to Solid must invalidate the tree panel"
+        );
+        assert_eq!(
+            app_mut(window.hwnd).settings.file_icons,
+            crate::config::FileIconSet::Solid
+        );
+
+        // Solid -> Material: a real change, so the panel must repaint again.
         unsafe { ValidateRect(panel, std::ptr::null()) };
         execute_command(window.hwnd, CommandId::FileIconsMaterial);
         assert_ne!(
@@ -7305,7 +7319,10 @@ mod tests {
                 .contains(&CommandId::FileIconsMaterial)
                 && crate::window::command_palette::SETTINGS_COMMANDS
                     .contains(&CommandId::FileIconsMinimal)
+                && crate::window::command_palette::SETTINGS_COMMANDS
+                    .contains(&CommandId::FileIconsSolid)
         );
+        assert!(!CommandId::FileIconsSolid.needs_document());
         assert!(!CommandId::FileIconsMaterial.needs_document());
     }
 

@@ -1,7 +1,9 @@
-//! Regenerates `assets/icons/material/icons.bin` and `icons.source-hash` from the SVGs (icon sets
-//! spec §5.1), with the Markdown preview's Direct2D SVG renderer. Ignored in the suite; run by
+//! Regenerates every set's `icons.bin` and `icons.source-hash` under `assets/icons/` from its SVGs
+//! (icon sets spec §5.1), with the Markdown preview's Direct2D SVG renderer: Material's as
+//! premultiplied BGRA, Minimal's and Solid's as coverage masks. Ignored in the suite; run by
 //! `tools/generate-file-icons.ps1`.
 
+use super::masks::{MaskIcon, MaskSet, set_dir};
 use super::material::{MaterialIcon, SIZES, source_hash, svg_dir};
 
 /// `source` with `width` and `height` of `size` on its root, so `decode_svg` renders the viewBox
@@ -23,7 +25,7 @@ fn sized_svg(source: &str, size: u32) -> String {
 
 #[test]
 #[ignore = "regenerates the committed icon data; run tools/generate-file-icons.ps1"]
-fn generate_material_icons() {
+fn generate_file_icons() {
     use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory};
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -36,24 +38,56 @@ fn generate_material_icons() {
     let scratch = std::env::temp_dir().join(format!("fastpad-icongen-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let path = scratch.join("icon.svg");
+    // `source` at `size` px: premultiplied BGRA, `size * size * 4` bytes.
+    let render = |source: &str, size: u32, name: &str| {
+        std::fs::write(&path, sized_svg(source, size)).unwrap();
+        let image = crate::preview::svg::decode_svg(&wic, &path, 0).unwrap();
+        assert_eq!((image.width, image.height), (size, size), "{name}");
+        image.pixels
+    };
+
     let mut blob = Vec::new();
     for icon in MaterialIcon::ALL {
         let source = std::fs::read_to_string(svg_dir().join(icon.file_name())).unwrap();
         for size in SIZES {
-            std::fs::write(&path, sized_svg(&source, size)).unwrap();
-            let image = crate::preview::svg::decode_svg(&wic, &path, 0).unwrap();
-            assert_eq!((image.width, image.height), (size, size), "{icon:?}");
-            blob.extend_from_slice(&image.pixels);
+            blob.extend_from_slice(&render(&source, size, icon.file_name()));
         }
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     let material = svg_dir().parent().unwrap().to_path_buf();
     std::fs::write(material.join("icons.bin"), &blob).unwrap();
     std::fs::write(
         material.join("icons.source-hash"),
-        format!("{:016x}\n", source_hash()),
+        format!(
+            "{:016x}
+",
+            source_hash()
+        ),
     )
     .unwrap();
+
+    for set in MaskSet::ALL {
+        let mut blob = Vec::new();
+        for icon in MaskIcon::ALL {
+            let file = set_dir(set).join("svg").join(icon.file_name());
+            let source = std::fs::read_to_string(file).unwrap();
+            for size in SIZES {
+                let pixels = render(&source, size, icon.file_name());
+                let (chunks, _) = pixels.as_chunks::<4>();
+                blob.extend(chunks.iter().map(|pixel| pixel[3]));
+            }
+        }
+        std::fs::write(set_dir(set).join("icons.bin"), &blob).unwrap();
+        std::fs::write(
+            set_dir(set).join("icons.source-hash"),
+            format!(
+                "{:016x}
+",
+                super::masks::source_hash(set)
+            ),
+        )
+        .unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]

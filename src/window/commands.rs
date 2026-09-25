@@ -89,6 +89,7 @@ pub enum CommandId {
     NoteNew = 193,
     FileIconsMaterial = 194,
     FileIconsMinimal = 195,
+    FileIconsSolid = 196,
 }
 
 impl CommandId {
@@ -119,6 +120,7 @@ impl CommandId {
                 | Self::ThemeCatppuccinMocha
                 | Self::FileIconsMaterial
                 | Self::FileIconsMinimal
+                | Self::FileIconsSolid
                 | Self::ToggleRestoreSession
                 | Self::ToggleNotesMode
                 | Self::OpenFolder
@@ -193,7 +195,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 87] = [
+        const COMMANDS: [CommandId; 88] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -281,6 +283,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::NoteNew,
             CommandId::FileIconsMaterial,
             CommandId::FileIconsMinimal,
+            CommandId::FileIconsSolid,
         ];
         COMMANDS
             .into_iter()

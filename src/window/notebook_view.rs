@@ -10,9 +10,9 @@ use crate::document::{Document, DocumentId};
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
 use crate::window::commands::CommandId;
 use crate::window::drag_label::{DragLabel, LabelImage};
-use crate::window::file_icons::{FOLDER_ICON, FileIcon, IconFont, minimal_icon, note_kind};
+use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::images::IconImages;
-use crate::window::icon_sets::{TreeIcon, TreeItem, tree_icon};
+use crate::window::icon_sets::{TreeIcon, TreeItem, minimal, tree_icon};
 use crate::window::inline_name::{FieldLayout, InlineName};
 use crate::window::menus::MenuEntry;
 use crate::window::palette::{FileIcons, Palette};
@@ -466,8 +466,9 @@ fn is_dragged_row(dragged: Option<&RowKind>, rows: &[TreeRow], index: usize) -> 
     dragged.is_some_and(|dragged| rows.get(index).is_some_and(|row| &row.kind == dragged))
 }
 
-/// Draws `item`'s icon from `set` in `rect`, a `px` icon box or narrower. `muted` is the glyph
-/// colour in high contrast.
+/// Draws `item`'s icon from `set` at `px` square, centred in `rect` and clipped to it (a deep row
+/// in a narrow panel gets a box narrower than `px`). `muted` is every icon's colour in high
+/// contrast.
 #[allow(
     clippy::too_many_arguments,
     reason = "one icon's paint inputs, shared by a tree row and the drag label"
@@ -480,36 +481,26 @@ fn draw_item_icon(
     muted: u32,
     palette: &Palette,
     icons: &FileIcons,
-    fonts: UiFonts,
     images: &mut IconImages,
     set: FileIconSet,
     light_theme: bool,
 ) {
     // A type icon keeps its colour on a selected or hovered row: the colours are mid-tones that
-    // read on the selection. High contrast draws every icon in the muted system pair, as before
-    // (notebook folders spec §5.2), and every set draws Minimal (icon sets spec §3.2).
-    let draw_glyph = |icon: FileIcon| {
+    // read on the selection. High contrast draws Minimal in the muted system pair in every set
+    // (icon sets spec §3.2), and a Material bitmap that cannot be made falls back to Minimal
+    // (§6).
+    let mask = match tree_icon(set, item, light_theme, palette.high_contrast) {
+        TreeIcon::Image(icon) if images.draw(dc, icon, rect, px as u32) => return,
+        TreeIcon::Image(_) => minimal(item),
+        mask => mask,
+    };
+    if let TreeIcon::Mask { set, icon, color } = mask {
         let color = if palette.high_contrast {
             muted
         } else {
-            icons.color(icon.color)
+            icons.color(color)
         };
-        let font = match icon.font {
-            IconFont::Glyph => fonts.glyph,
-            IconFont::Bold => fonts.bold,
-        };
-        unsafe { draw_text(dc, icon.text, rect, font, color, CENTERED) };
-    };
-    // A Material bitmap that cannot be made, or whose box is clipped, falls back to the Minimal
-    // glyph (icon sets spec §6).
-    let clipped = rect.right - rect.left < px;
-    match tree_icon(set, item, light_theme, palette.high_contrast) {
-        TreeIcon::Image(icon) if !clipped && images.draw(dc, icon, rect, px as u32) => {}
-        TreeIcon::Image(_) => draw_glyph(match item {
-            TreeItem::Folder { .. } => FOLDER_ICON,
-            TreeItem::Note(kind) => minimal_icon(kind),
-        }),
-        TreeIcon::Glyph(icon) => draw_glyph(icon),
+        images.draw_mask(dc, set, icon, color, rect, px as u32);
     }
 }
 
@@ -550,8 +541,8 @@ fn draw_tree_row(
     };
     let parts = row_parts(rect, row.depth, dpi);
     // `px` is the full icon box, not the box clamped by `row_parts` to fit a narrow panel: a
-    // clipped box draws the Minimal glyph (which already clips to `parts.icon`) instead of
-    // resampling the Material bitmap smaller and caching a bitmap per clipped width.
+    // clipped box draws part of the icon instead of resampling it smaller and caching a bitmap
+    // per clipped width.
     let px = scale(GLYPH_BOX, dpi);
     let mut draw_icon = |item: TreeItem| {
         draw_item_icon(
@@ -562,7 +553,6 @@ fn draw_tree_row(
             muted,
             palette,
             icons,
-            fonts,
             images,
             set,
             light_theme,
@@ -741,7 +731,6 @@ fn paint_drag_label(
         palette.muted_foreground,
         palette,
         &paint.icons,
-        paint.fonts,
         images,
         paint.icon_set,
         paint.light_theme,
@@ -3260,10 +3249,10 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_row_draws_the_chosen_sets_icon_and_glyphs_in_high_contrast() {
-        // Break caught: the closed folder icon on an expanded folder, or a Material bitmap in
-        // high contrast (icon sets spec §3.2, §6). `assert_ne!(minimal, material)` below is what
-        // catches Material chosen but glyphs drawn; `blue > red + 60` only checks that the
+    fn a_tree_row_draws_the_chosen_sets_icon_and_minimal_in_high_contrast() {
+        // Break caught: the closed folder icon on an expanded folder, Solid drawn as Minimal, or
+        // a Material bitmap in high contrast (icon sets spec §3.2, §6). The `assert_ne!`s below
+        // catch one set chosen and another drawn; `blue > red + 60` only checks that the
         // Markdown bitmap's own blue (#42a5f5) is what got drawn into the icon box.
         use crate::window::icon_sets::images::TestTarget;
         use crate::window::icon_sets::material::MaterialIcon;
@@ -3338,17 +3327,33 @@ mod tests {
         assert_eq!(folder, direct(MaterialIcon::FolderOpen, &palette));
         assert_ne!(folder, direct(MaterialIcon::Folder, &palette));
         let minimal = draw(&note, FileIconSet::Minimal, &palette);
-        assert_ne!(minimal, material, "Minimal draws the glyph, not the bitmap");
+        assert_ne!(
+            minimal, material,
+            "Minimal draws its outline, not the bitmap"
+        );
+        assert!(
+            minimal.iter().any(|&pixel| pixel != minimal[0]),
+            "Minimal draws"
+        );
+        let solid = draw(&note, FileIconSet::Solid, &palette);
+        assert_ne!(
+            solid, minimal,
+            "Solid draws its filled shape, not the outline"
+        );
+        assert_ne!(solid, material);
         let contrast = Palette {
             high_contrast: true,
             ..palette
         };
         for row in [&note, &open_folder] {
-            assert_eq!(
-                draw(row, FileIconSet::Material, &contrast),
-                draw(row, FileIconSet::Minimal, &contrast),
-                "high contrast draws Minimal in every set"
-            );
+            let minimal = draw(row, FileIconSet::Minimal, &contrast);
+            for set in [FileIconSet::Material, FileIconSet::Solid] {
+                assert_eq!(
+                    draw(row, set, &contrast),
+                    minimal,
+                    "high contrast draws Minimal in every set"
+                );
+            }
         }
         for font in [fonts.text, fonts.bold, fonts.italic, fonts.glyph] {
             unsafe { DeleteObject(font) };
@@ -3356,10 +3361,10 @@ mod tests {
     }
 
     #[test]
-    fn a_clipped_icon_box_draws_the_glyph_not_a_shrunken_material_icon() {
-        // Break caught: a deep row in a narrow sidebar clamps `parts.icon` below the glyph box,
-        // and the old code resampled the Material bitmap down to that clipped width and cached a
-        // bitmap per clipped size, instead of falling back to the Minimal glyph.
+    fn a_clipped_icon_box_draws_part_of_the_icon_not_a_shrunken_one() {
+        // Break caught: a deep row in a narrow sidebar clamps `parts.icon` below the icon box,
+        // and an icon resampled down to that clipped width and cached per clipped size, or one
+        // painted past the box over the name.
         use crate::window::icon_sets::images::TestTarget;
         use crate::window::titlebar::create_ui_font;
         use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL, FW_SEMIBOLD};
@@ -3413,15 +3418,21 @@ mod tests {
             );
             target.area(icon_box)
         };
-        let material = draw(FileIconSet::Material);
-        let minimal = draw(FileIconSet::Minimal);
-        assert_eq!(
-            material, minimal,
-            "a clipped icon box draws the Minimal glyph in every set"
-        );
+        for set in [
+            FileIconSet::Material,
+            FileIconSet::Minimal,
+            FileIconSet::Solid,
+        ] {
+            let drawn = draw(set);
+            assert!(
+                drawn.iter().any(|&pixel| pixel != drawn[0]),
+                "{set:?} draws part of its icon in the clipped box"
+            );
+        }
+        let sizes = images.cached_pixel_sizes();
         assert!(
-            images.cached_pixel_sizes().is_empty(),
-            "a clipped row must never resample and cache a Material bitmap at the clipped width"
+            !sizes.is_empty() && sizes.iter().all(|&px| px == GLYPH_BOX as u32),
+            "a clipped row must never resample and cache a bitmap at the clipped width: {sizes:?}"
         );
         for font in [fonts.text, fonts.bold, fonts.italic, fonts.glyph] {
             unsafe { DeleteObject(font) };

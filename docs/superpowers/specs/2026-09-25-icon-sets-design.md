@@ -2,7 +2,8 @@
 
 - Status: approved in conversation on 2026-09-25.
 - Branch: `feat/icon-sets`, stacked on `feat/inline-naming` (PR #16).
-- It replaces the notebook folders spec's note-type icons (§5.1): those glyphs become the Minimal set.
+- It replaces the notebook folders spec's note-type icons (§5.1).
+- Revised on 2026-09-25 (branch `feat/minimal-icons`): Minimal and a new Solid set are FastPad's own SVG drawings, tinted when drawn (§3.4). The Segoe note-type glyphs are gone.
 
 ## 1. Goal
 
@@ -15,32 +16,32 @@
 | Question | Decision |
 |---|---|
 | What "configurable" means | Sets built into FastPad, switched from the palette and saved in `fastpad.ini`. No sets loaded from disk. |
-| The sets | **Material** (the default) and **Minimal**, which is today's Segoe glyphs and Catppuccin colours, unchanged. |
+| The sets | **Material** (the default), **Minimal** (outlines, like Seti) and **Solid** (filled shapes). Minimal and Solid are FastPad's own drawings after Material's silhouettes, one colour each (§3.4). |
 | How Material is drawn | Rasterized at build time by a dev-only generator into pixels embedded in the exe, and drawn with `AlphaBlend`. No SVG parsing or Direct2D at runtime. |
 | Which Material icons | 12: one per note type, plus the closed and open folder (§3). |
-| High contrast | Always draws the Minimal glyphs in system colours, whichever set is chosen. |
+| High contrast | Always draws Minimal in the muted system colour, whichever set is chosen. |
 
 ## 3. The icons
 
 ### 3.1 Mapping
 
-| Note type | Extensions | Material | Minimal (today) |
+| Note type | Extensions | Material | Minimal and Solid |
 |---|---|---|---|
-| Markdown | `md`, `markdown` | `markdown` | document glyph, blue |
-| JSON | `json` | `json` | `{}`, yellow |
-| YAML | `yaml`, `yml` | `yaml` | settings glyph, peach |
-| TOML | `toml` | `toml`, or `toml_light` in a light theme | settings glyph, peach |
-| INI and config | `ini`, `cfg`, `conf` | `settings` | settings glyph, peach |
-| CSV | `csv` | `table` | grid glyph, green |
-| XML | `xml` | `xml` | code glyph, maroon |
-| Text | `txt`, `text`, no extension, any other | `document` | document glyph, overlay |
-| Log | `log` | `log` | document glyph, overlay |
-| Folder, collapsed | | `folder` | folder glyph, yellow |
-| Folder, expanded | | `folder-open` | folder glyph, yellow |
+| Markdown | `md`, `markdown` | `markdown` | `markdown`, blue |
+| JSON | `json` | `json` | `braces`, yellow |
+| YAML | `yaml`, `yml` | `yaml` | `settings`, peach |
+| TOML | `toml` | `toml`, or `toml_light` in a light theme | `settings`, peach |
+| INI and config | `ini`, `cfg`, `conf` | `settings` | `settings`, peach |
+| CSV | `csv` | `table` | `table`, green |
+| XML | `xml` | `xml` | `code`, maroon |
+| Text | `txt`, `text`, no extension, any other | `document` | `document`, overlay |
+| Log | `log` | `log` | `log`, overlay |
+| Folder, collapsed | | `folder` | `folder`, yellow |
+| Folder, expanded | | `folder-open` | `folder-open`, yellow |
 
 - Extensions match ignoring case, as they do today.
 - **Light themes:** Light and Catppuccin Latte. In either one, TOML uses `toml_light`. Every other Material icon looks the same in every theme.
-- **Minimal is unchanged.** It has no open-folder glyph: an expanded folder keeps the folder glyph.
+- **Minimal and Solid** use the same nine SVG names, listed in the last column. Each colour is a Catppuccin role, the one the old Segoe glyphs used.
 - **The Material names are the ones in Material Icon Theme's `icons/` folder.** If a release has renamed one, the generator uses the new file and the Rust table keeps FastPad's own names.
 
 ### 3.2 Where the set applies
@@ -54,9 +55,9 @@
   - the pin;
   - the header buttons (+, New folder, star, more);
   - the note glyph on unsaved rows.
-- **Selected and hovered rows** keep the icon's own colours, as the coloured glyphs do today.
+- **Selected and hovered rows** keep the icon's own colours.
 - **High contrast:**
-  - Every set draws the Minimal glyphs in the muted system colour pair, which is today's high-contrast look.
+  - Every set draws Minimal's outlines in the muted system colour pair.
   - Fixed colours can't follow a high-contrast scheme.
 - **Out of the tree:** icons appear nowhere else. Tabs, Ctrl+P and Favorites don't change.
 
@@ -74,18 +75,29 @@
   - `LICENSES.md` gains a section for bundled artwork: the set, its version, MIT, and the licence file.
   - The packaging scripts that copy `licenses/` pick it up.
 
+### 3.4 Minimal and Solid
+
+- **FastPad's own drawings,** modelled on Material's silhouettes. There are no upstream files, and no licence applies beyond FastPad's own.
+- **Where they are:** `assets/icons/minimal/svg/` (outlines) and `assets/icons/solid/svg/` (filled shapes), nine files each, with the same names in both. `assets/icons/README.md` is the guide for designers.
+- **One shape, no colour:**
+  - a 24 × 24 `viewBox`, drawn in black;
+  - Minimal: strokes 1.5 wide with round caps and joins, `fill="none"`;
+  - Solid: filled paths, holes cut with `fill-rule="evenodd"`;
+  - no text, gradients, images or `<style>`.
+- **The colour is applied when drawn:** the generator keeps only each pixel's coverage. The drawing code tints it with the row's Catppuccin role, or with the muted system colour in high contrast.
+
 ## 4. Choosing a set
 
 - **The setting:**
-  - `file_icons = material | minimal` in `fastpad.ini`.
+  - `file_icons = material | minimal | solid` in `fastpad.ini`.
   - The default is `material`.
   - Values are read ignoring case.
   - An unknown value gets the usual settings warning, and the default is used.
 - **In the palette:**
-  - two rows next to the Theme rows: "File icons: Material" and "File icons: Minimal";
-  - new commands `CommandId::FileIconsMaterial` and `CommandId::FileIconsMinimal`;
-  - both rows are also in the activity bar's Settings list (`SETTINGS_COMMANDS`), after the Theme rows;
-  - neither row carries a mark, since the palette marks no current setting, the theme included.
+  - three rows next to the Theme rows: "File icons: Material", "File icons: Minimal" and "File icons: Solid";
+  - commands `CommandId::FileIconsMaterial` (194), `FileIconsMinimal` (195) and `FileIconsSolid` (196);
+  - all three rows are also in the activity bar's Settings list (`SETTINGS_COMMANDS`), after the Theme rows;
+  - no row carries a mark, since the palette marks no current setting, the theme included.
 - **Choosing one:**
   - goes through `change_setting`, as `theme` does, which saves `file_icons` to `fastpad.ini`;
   - repaints the window's Notebook tree.
@@ -99,28 +111,27 @@
 - **`tools/generate-file-icons.ps1`:**
   - runs a dev-only generator;
   - that generator is an ignored test or a `src/bin/` tool, and it isn't shipped in the package.
-- **For each SVG in `assets/icons/material/svg/`, it:**
+- **For each SVG in `assets/icons/<set>/svg/` (material, minimal, solid), it:**
   - renders the file with the existing Direct2D SVG code (`preview::svg`);
   - renders at **16, 20, 24, 32 and 48 px** square, the sizes for 100%, 125%, 150%, 200% and 300% scaling;
-  - produces premultiplied BGRA, with the SVG's viewBox fitted to the square.
-- **It writes two files:**
-  - `assets/icons/material/icons.bin`: every icon at every size, back to back. Icons are in the order of FastPad's `MaterialIcon` list, and sizes run smallest first, so an icon's offset follows from the list and needs no table.
-  - `assets/icons/material/icons.source-hash`: a 64-bit FNV-1a hash, in hex, of the SVG files' bytes in list order.
+  - produces premultiplied BGRA for Material, and one coverage byte per pixel (the alpha) for Minimal and Solid, with the SVG's viewBox fitted to the square.
+- **It writes two files per set:**
+  - `assets/icons/<set>/icons.bin`: every icon at every size, back to back. Icons are in the order of FastPad's `MaterialIcon` or `MaskIcon` list, and sizes run smallest first, so an icon's offset follows from the list and needs no table.
+  - `assets/icons/<set>/icons.source-hash`: a 64-bit FNV-1a hash, in hex, of the set's SVG files' bytes in list order.
 - **Both outputs are committed.** Building FastPad never runs the generator.
 - **Size:**
-  - about 150–250 KB of pixels for 12 icons;
+  - about 215 KB of pixels for Material's 12 icons, and 40 KB for each mask set's 9;
   - accepted in exchange for no runtime rasterizing.
 
 ### 5.2 In the exe
 
 - `icons.bin` is embedded with `include_bytes!`, so reading it involves no file access.
-- **`src/window/icon_sets/`** (a module directory: `mod.rs`, `material.rs`, `resample.rs`, `images.rs`, `generate.rs`):
-  - `IconSet { Material, Minimal }`;
-  - the lookup: `(set, note type or folder state, light theme) → TreeIcon`;
-  - `TreeIcon` is either `Glyph(FileIcon)` (today's type) or `Image(MaterialIcon)`.
-  - `MaterialIcon` lists the 12 icons, each with its SVG file name. The list is written by hand, and the generator reads it.
+- **`src/window/icon_sets/`** (a module directory: `mod.rs`, `material.rs`, `masks.rs`, `resample.rs`, `images.rs`, `generate.rs`):
+  - `FileIconSet { Material, Minimal, Solid }` (in `config`);
+  - the lookup: `(set, note type or folder state, light theme, high contrast) → TreeIcon`;
+  - `TreeIcon` is either `Image(MaterialIcon)` or `Mask { set, icon, color }`, where `color` is a Catppuccin role (`file_icons::IconColor`).
+  - `MaterialIcon` lists the 12 icons and `MaskIcon` the 9, each with its SVG file name. The lists are written by hand, and the generator reads them.
 - **`file_icons::type_name`** (screen readers) doesn't change and doesn't depend on the set.
-- **`file_icons::minimal_icon`** (by `NoteKind`) **and `FOLDER_ICON`** stay: they are the Minimal set, and they're also the fallback.
 
 ## 6. Drawing
 
@@ -132,15 +143,16 @@
   - Above 48 px, 48 is resampled up the same way.
 - **The bitmaps:**
   - The first time an icon is drawn at a pixel size, one 32-bit top-down DIB section is created from the pixels at that size.
-  - It's kept in the Notebook view's paint state, keyed by (icon, pixel size).
+  - It's kept in the Notebook view's paint state, keyed by (icon, pixel size). A mask's key also includes its colour, because the mask is tinted into premultiplied BGRA before it's resampled.
   - The cache is freed when the view is dropped.
-  - It holds at most 12 bitmaps for each pixel size the window has used, so a DPI change or a set change needs no eviction.
+  - It holds at most 12 Material bitmaps, plus 9 per mask set and colour, for each pixel size the window has used, so a DPI, set or theme change needs no eviction.
 - **Blending:**
   - `GdiAlphaBlend`, which is gdi32's export of `AlphaBlend`. It avoids a static import of msimg32.dll, which would load at startup.
   - With `AC_SRC_ALPHA`, 1:1, centred in the icon box, onto the row's background, which is already painted.
+  - A box narrower than the icon (a deep row in a narrow panel) draws only the part inside it: nothing is resampled or cached for the clipped width.
   - Selected and hover backgrounds show through the transparent parts.
 - **If creating a DIB fails:**
-  - That row draws the Minimal glyph for the same type.
+  - A Material row draws the Minimal icon for the same type. A Minimal or Solid row draws no icon.
   - Nothing is logged: FastPad has no log.
   - The next paint tries again. Nothing is shown to the user.
 
@@ -151,22 +163,22 @@
   - The setting is read with the rest of `fastpad.ini`.
 - **No file I/O,** at startup or while drawing.
 - **The cost:**
-  - One `GdiAlphaBlend` per row replaces one `DrawText`. After the first paint, the only extra work is up to 12 DIB sections per pixel size.
+  - One `GdiAlphaBlend` per row. After the first paint, the only extra work is creating the DIB sections for each pixel size, and for each colour in the case of masks.
   - No new DLL is loaded.
-  - An ignored test times 1,000 row icons under Material against Minimal: the median of 20 runs each, with the bitmaps already cached.
-    - Material must not be more than 10% slower.
+  - An ignored test times 1,000 row icons under Minimal against Material: the median of 20 runs each, with the bitmaps already cached.
+    - Minimal must not be more than 10% slower.
     - It runs at the final review, because this machine's timings are noisy.
   - `tree_build_ms` doesn't change, because icons are chosen at paint time.
 
 ## 8. Screen readers
 
 - **Row names don't change,** for example "budget.csv, CSV", because icons aren't announced.
-- **The two palette rows** are ordinary palette rows.
+- **The three palette rows** are ordinary palette rows.
 
 ## 9. Testing
 
 - **Pure:**
-  - **Lookup:** every note extension, in any letter case, and both folder states map to the right icon in each set. This includes `toml_light` in Light and Catppuccin Latte, and `toml` in the other themes.
+  - **Lookup:** every note extension, in any letter case, and both folder states map to the right icon and colour role in each set. This includes `toml_light` in Light and Catppuccin Latte, and `toml` in the other themes. High contrast gives Minimal in every set.
   - **Size choice:**
     - an exact match;
     - the next stored size up in between (for example 28 → 32);
@@ -183,14 +195,20 @@
   - `icons.bin` is exactly as long as the list and the sizes imply.
   - `icons.source-hash` matches a hash of the SVG files, so a regeneration that was forgotten fails.
   - At every size, every icon has visible pixels, and each pixel's colour channels are ≤ its alpha.
+  - Each mask set gets the same checks:
+    - its list names exactly its SVGs;
+    - its blob length and hash match;
+    - every mask covers some of its square, but not most of it.
+  - Minimal's outlines use less ink than Solid's shapes.
+  - A mask blends in its own colour and gets one bitmap per colour, and a clipped box paints nothing outside itself.
 - **Window** (temporary profile, `--test-threads=1`):
-  - Choosing "File icons: Minimal" saves `file_icons = minimal` and repaints the tree with the glyphs. Choosing Material brings the images back.
+  - Choosing "File icons: Minimal" or "File icons: Solid" saves `file_icons` and repaints the tree. Choosing Material brings the images back.
   - **Pixel checks:**
     - a Markdown row under Material shows the icon's colour in the icon box;
-    - a Markdown row under Minimal shows the glyph colour;
+    - a Markdown row under Minimal looks different from Material, and Solid looks different from both;
     - an expanded folder under Material shows `folder-open`, not `folder`.
-  - **High contrast:** the tree draws glyphs under Material.
-  - Both rows appear in the palette and in the Settings list.
+  - **High contrast:** the tree draws Minimal under Material and Solid.
+  - All three rows appear in the palette and in the Settings list.
 - **Perf:** the 1,000-row paint comparison in §7.
 
 ## 10. Out of scope
@@ -203,11 +221,11 @@
 
 ## 11. Decisions made while implementing
 
-- **No log facility exists.** A failed DIB falls back to the Minimal glyph silently; there is no
+- **No log facility exists.** A failed DIB falls back to the Minimal icon silently; there is no
   once-per-session log line (§6).
-- **`MaterialIcon::ALL` and `file_name`, and `file_icons::file_icon`, are test-only** (`#[cfg(test)]`).
-  Production code looks up icons through `tree_icon` and `file_icons::minimal_icon`, never by
-  walking every icon or every extension.
+- **`MaterialIcon::ALL`, `MaskIcon::ALL` and their `file_name`s are test-only** (`#[cfg(test)]`).
+  Production code looks up icons through `tree_icon`, never by walking every icon or every
+  extension.
 - **Resampled sizes and the bitmap cache are built as this spec describes:** `pick_size` picks the
   exact stored size, else the next one up, else 48; `resample` area-averages premultiplied BGRA.
   The cache is a `HashMap<(MaterialIcon, u32), HBITMAP>` with no eviction code — since there are

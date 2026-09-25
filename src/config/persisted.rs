@@ -61,16 +61,18 @@ pub enum FileIconSet {
     #[default]
     Material,
     Minimal,
+    Solid,
 }
 
 impl FileIconSet {
-    const ALL: [Self; 2] = [Self::Material, Self::Minimal];
+    const ALL: [Self; 3] = [Self::Material, Self::Minimal, Self::Solid];
 
     /// The `file_icons=` value that parses back to this set.
     pub const fn token(self) -> &'static str {
         match self {
             Self::Material => "material",
             Self::Minimal => "minimal",
+            Self::Solid => "solid",
         }
     }
 
@@ -728,20 +730,21 @@ mod tests {
     }
 
     #[test]
-    fn file_icons_accepts_its_two_tokens_in_any_case_and_warns_on_anything_else() {
+    fn file_icons_accepts_its_three_tokens_in_any_case_and_warns_on_anything_else() {
         // Break caught: a hand-edited "file_icons=Minimal" ignored, or a typo silently switching
         // sets (icon sets spec §4).
         for (value, set) in [
             ("material", FileIconSet::Material),
             ("Minimal", FileIconSet::Minimal),
             ("MATERIAL", FileIconSet::Material),
+            ("Solid", FileIconSet::Solid),
         ] {
             assert_eq!(parse(&format!("file_icons={value}")).file_icons, Some(set));
         }
         let delta = parse("file_icons=seti");
         assert_eq!(delta.file_icons, None);
         assert_eq!(delta.warnings.len(), 1);
-        for set in [FileIconSet::Material, FileIconSet::Minimal] {
+        for set in FileIconSet::ALL {
             assert_eq!(
                 parse(&format!("file_icons={}", set.token())).file_icons,
                 Some(set)

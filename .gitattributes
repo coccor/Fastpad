@@ -1,4 +1,4 @@
-# Material icon sources are hashed byte for byte (icon sets spec §5.1): keep them as downloaded.
-assets/icons/material/svg/*.svg -text
-assets/icons/material/icons.source-hash -text
+# Icon sources are hashed byte for byte (icon sets spec §5.1): keep them exactly as written.
+assets/icons/*/svg/*.svg -text
+assets/icons/*/icons.source-hash -text
 *.bin binary
