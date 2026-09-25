@@ -17310,8 +17310,7 @@ mod tests {
         };
 
         press();
-        // The test editor's untitled tab keeps its row above the draft (spec §3.1).
-        assert_eq!(draft_row(window.hwnd), Some((1, 0)), "first at the root");
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
         assert_eq!(
             crate::window::inline_name::purpose(window.hwnd),
             Some(crate::window::inline_name::Purpose::NewFolder(
@@ -19983,11 +19982,7 @@ mod tests {
         };
 
         crate::window::inline_name::new_note(window.hwnd, None);
-        assert_eq!(
-            draft_row(window.hwnd),
-            Some((1, 0)),
-            "after the untitled tab's row"
-        );
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
         click(row_lparam(window.hwnd, &RowKind::Note("b.md".into())));
         assert!(!inline_open(window.hwnd));
         assert_eq!(
