@@ -5,10 +5,13 @@
 
 use super::main_window::{OpenMode, app_ptr};
 use super::side_panel::{UiFonts, ViewPaint, draw_text, point_of};
+use crate::config::FileIconSet;
 use crate::document::{Document, DocumentId};
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
 use crate::window::commands::CommandId;
-use crate::window::file_icons::{FOLDER_ICON, FileIcon, IconFont, file_icon};
+use crate::window::file_icons::{FOLDER_ICON, FileIcon, IconFont, minimal_icon, note_kind};
+use crate::window::icon_sets::images::IconImages;
+use crate::window::icon_sets::{TreeIcon, TreeItem, tree_icon};
 use crate::window::inline_name::{FieldLayout, InlineName};
 use crate::window::menus::MenuEntry;
 use crate::window::palette::{FileIcons, Palette};
@@ -406,6 +409,8 @@ pub(crate) struct NotebookView {
     order: u64,
     /// The inline name field and its edit (inline naming spec §3).
     pub(crate) inline: InlineName,
+    /// The tree's Material bitmaps, made on first draw (icon sets spec §6).
+    images: IconImages,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -448,7 +453,10 @@ fn draw_tree_row(
     fonts: UiFonts,
     dpi: u32,
     pin_hot: bool,
-    editing: Option<FileIcon>,
+    editing: Option<TreeItem>,
+    images: &mut IconImages,
+    set: FileIconSet,
+    light_theme: bool,
 ) {
     let foreground = row_foreground(look, palette);
     let muted = if look.selected && look.focused {
@@ -467,8 +475,8 @@ fn draw_tree_row(
     let parts = row_parts(rect, row.depth, dpi);
     // A type icon keeps its colour on a selected or hovered row: the colours are mid-tones that
     // read on the selection. High contrast draws every icon in the muted system pair, as before
-    // (notebook folders spec §5.2).
-    let draw_icon = |icon: FileIcon| {
+    // (notebook folders spec §5.2), and every set draws Minimal (icon sets spec §3.2).
+    let draw_glyph = |icon: FileIcon| {
         let color = if palette.high_contrast {
             muted
         } else {
@@ -480,6 +488,17 @@ fn draw_tree_row(
         };
         unsafe { draw_text(dc, icon.text, parts.icon, font, color, CENTERED) };
     };
+    // A Material bitmap that cannot be made falls back to the Minimal glyph (icon sets spec §6).
+    let px = parts.icon.right - parts.icon.left;
+    let mut draw_icon =
+        |item: TreeItem| match tree_icon(set, item, light_theme, palette.high_contrast) {
+            TreeIcon::Image(icon) if px > 0 && images.draw(dc, icon, parts.icon, px as u32) => {}
+            TreeIcon::Image(_) => draw_glyph(match item {
+                TreeItem::Folder { .. } => FOLDER_ICON,
+                TreeItem::Note(kind) => minimal_icon(kind),
+            }),
+            TreeIcon::Glyph(icon) => draw_glyph(icon),
+        };
     match &row.kind {
         RowKind::Folder(_) => {
             let chevron = if row.expanded {
@@ -488,20 +507,22 @@ fn draw_tree_row(
                 GLYPH_CHEVRON_RIGHT
             };
             unsafe { draw_text(dc, chevron, parts.chevron, fonts.glyph, muted, CENTERED) };
-            draw_icon(FOLDER_ICON);
+            draw_icon(TreeItem::Folder {
+                expanded: row.expanded,
+            });
         }
         RowKind::Note(path) => {
             let extension = path
                 .extension()
                 .map(|extension| extension.to_string_lossy());
-            draw_icon(file_icon(extension.as_deref()));
+            draw_icon(TreeItem::Note(note_kind(extension.as_deref())));
         }
         RowKind::Unsaved(_) => {
             unsafe { draw_text(dc, GLYPH_NOTE, parts.icon, fonts.glyph, muted, CENTERED) };
         }
         RowKind::Draft => {
-            if let Some(icon) = editing {
-                draw_icon(icon);
+            if let Some(item) = editing {
+                draw_icon(item);
             }
         }
     }
@@ -590,6 +611,7 @@ impl NotebookView {
             built: None,
             order: 0,
             inline: InlineName::new(),
+            images: IconImages::new(),
             #[cfg(test)]
             rebuilds: 0,
         }
@@ -1179,6 +1201,8 @@ impl NotebookView {
                 let list = self.list_rect(area);
                 self.inline.set_colors(*palette);
                 let rows = &self.rows;
+                let images = &mut self.images;
+                let (icon_set, light_theme) = (paint.icon_set, paint.light_theme);
                 let hover_pin = self.hover_pin;
                 let icons = &paint.icons;
                 // The edited row leaves its name to the field; a draft row shows the icon for
@@ -1207,6 +1231,9 @@ impl NotebookView {
                             dpi,
                             hover_pin && look.hover,
                             editing,
+                            images,
+                            icon_set,
+                            light_theme,
                         );
                     },
                 );
@@ -2576,6 +2603,99 @@ mod tests {
         assert_eq!(flatten(&tree, &[], &[]).len(), 1_000);
         if !cfg!(debug_assertions) {
             assert!(elapsed < Duration::from_millis(16), "{elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn a_tree_row_draws_the_chosen_sets_icon_and_glyphs_in_high_contrast() {
+        // Break caught: Material chosen but glyphs drawn, the closed folder icon on an expanded
+        // folder, or a Material bitmap in high contrast (icon sets spec §3.2, §6).
+        use crate::window::icon_sets::images::TestTarget;
+        use crate::window::icon_sets::material::MaterialIcon;
+        use crate::window::titlebar::create_ui_font;
+        use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL, FW_SEMIBOLD};
+        let normal = FW_NORMAL as i32;
+        let fonts = UiFonts {
+            text: create_ui_font(12, "Segoe UI", normal, false),
+            bold: create_ui_font(11, "Segoe UI", FW_SEMIBOLD as i32, false),
+            italic: create_ui_font(12, "Segoe UI", normal, true),
+            glyph: create_ui_font(12, "Segoe MDL2 Assets", normal, false),
+            ..UiFonts::default()
+        };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 22,
+        };
+        let icon_box = row_parts(rect, 0, 96).icon;
+        let px = (icon_box.right - icon_box.left) as u32;
+        let look = RowLook {
+            selected: false,
+            hover: false,
+            focused: false,
+        };
+        let note = row(RowKind::Note("a.md".into()), 0);
+        let open_folder = TreeRow {
+            expanded: true,
+            ..row(RowKind::Folder("f".into()), 0)
+        };
+        let target = TestTarget::new(200, 22);
+        let mut images = IconImages::new();
+        // The icon box's pixels after drawing `row` in `set` under `palette`.
+        let mut draw = |row: &TreeRow, set: FileIconSet, palette: &Palette| {
+            unsafe { fill(target.dc, rect, palette.editor_background) };
+            draw_tree_row(
+                target.dc,
+                Some(row),
+                rect,
+                look,
+                palette,
+                &FileIcons::neutral(),
+                fonts,
+                96,
+                false,
+                None,
+                &mut images,
+                set,
+                true,
+            );
+            target.area(icon_box)
+        };
+        // The icon box's pixels after blending `icon` straight into a fresh target.
+        let direct = |icon: MaterialIcon, palette: &Palette| {
+            let target = TestTarget::new(200, 22);
+            unsafe { fill(target.dc, rect, palette.editor_background) };
+            assert!(IconImages::new().draw(target.dc, icon, icon_box, px));
+            target.area(icon_box)
+        };
+        let palette = Palette::neutral();
+        let material = draw(&note, FileIconSet::Material, &palette);
+        assert!(
+            material.iter().any(|&pixel| {
+                let (red, blue) = ((pixel >> 16) & 0xFF, pixel & 0xFF);
+                blue > red + 60
+            }),
+            "the Markdown bitmap (#42a5f5) is drawn"
+        );
+        let folder = draw(&open_folder, FileIconSet::Material, &palette);
+        assert_eq!(folder, direct(MaterialIcon::FolderOpen, &palette));
+        assert_ne!(folder, direct(MaterialIcon::Folder, &palette));
+        let minimal = draw(&note, FileIconSet::Minimal, &palette);
+        assert_ne!(minimal, material, "Minimal draws the glyph, not the bitmap");
+        let contrast = Palette {
+            high_contrast: true,
+            ..palette
+        };
+        for row in [&note, &open_folder] {
+            assert_eq!(
+                draw(row, FileIconSet::Material, &contrast),
+                draw(row, FileIconSet::Minimal, &contrast),
+                "high contrast draws Minimal in every set"
+            );
+        }
+        for font in [fonts.text, fonts.bold, fonts.italic, fonts.glyph] {
+            unsafe { DeleteObject(font) };
         }
     }
 }

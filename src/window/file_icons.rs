@@ -45,7 +45,7 @@ pub(crate) const FOLDER_ICON: FileIcon = icon(GLYPH_FOLDER, IconFont::Glyph, Ico
 
 /// The note types: each group of extensions that shares an icon and a name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind {
+pub(crate) enum NoteKind {
     Markdown,
     Json,
     Yaml,
@@ -59,61 +59,69 @@ enum Kind {
 }
 
 /// Every note extension (`title::NOTE_EXTENSIONS`) and its type.
-const KINDS: [(&str, Kind); 14] = [
-    ("md", Kind::Markdown),
-    ("markdown", Kind::Markdown),
-    ("json", Kind::Json),
-    ("yaml", Kind::Yaml),
-    ("yml", Kind::Yaml),
-    ("toml", Kind::Toml),
-    ("ini", Kind::Ini),
-    ("cfg", Kind::Config),
-    ("conf", Kind::Config),
-    ("csv", Kind::Csv),
-    ("xml", Kind::Xml),
-    ("txt", Kind::Text),
-    ("text", Kind::Text),
-    ("log", Kind::Log),
+const NOTE_KINDS: [(&str, NoteKind); 14] = [
+    ("md", NoteKind::Markdown),
+    ("markdown", NoteKind::Markdown),
+    ("json", NoteKind::Json),
+    ("yaml", NoteKind::Yaml),
+    ("yml", NoteKind::Yaml),
+    ("toml", NoteKind::Toml),
+    ("ini", NoteKind::Ini),
+    ("cfg", NoteKind::Config),
+    ("conf", NoteKind::Config),
+    ("csv", NoteKind::Csv),
+    ("xml", NoteKind::Xml),
+    ("txt", NoteKind::Text),
+    ("text", NoteKind::Text),
+    ("log", NoteKind::Log),
 ];
 
 /// `extension`'s type, ignoring case; anything else (or no extension) is text.
-fn kind(extension: Option<&str>) -> Kind {
+pub(crate) fn note_kind(extension: Option<&str>) -> NoteKind {
     extension
         .and_then(|extension| {
-            KINDS
+            NOTE_KINDS
                 .iter()
                 .find(|(known, _)| known.eq_ignore_ascii_case(extension))
         })
-        .map_or(Kind::Text, |&(_, kind)| kind)
+        .map_or(NoteKind::Text, |&(_, kind)| kind)
 }
 
-/// A note row's icon, from its file's extension (spec §5.1).
-pub(crate) fn file_icon(extension: Option<&str>) -> FileIcon {
-    match kind(extension) {
-        Kind::Markdown => icon(GLYPH_DOCUMENT, IconFont::Glyph, IconColor::Blue),
-        Kind::Json => icon("{}", IconFont::Bold, IconColor::Yellow),
-        Kind::Yaml | Kind::Toml | Kind::Ini | Kind::Config => {
+/// The Minimal set's icon for a note type (spec §5.1 of notebook folders; icon sets spec §3.1).
+pub(crate) fn minimal_icon(kind: NoteKind) -> FileIcon {
+    match kind {
+        NoteKind::Markdown => icon(GLYPH_DOCUMENT, IconFont::Glyph, IconColor::Blue),
+        NoteKind::Json => icon("{}", IconFont::Bold, IconColor::Yellow),
+        NoteKind::Yaml | NoteKind::Toml | NoteKind::Ini | NoteKind::Config => {
             icon(GLYPH_SETTINGS, IconFont::Glyph, IconColor::Peach)
         }
-        Kind::Csv => icon(GLYPH_GRID, IconFont::Glyph, IconColor::Green),
-        Kind::Xml => icon(GLYPH_CODE, IconFont::Glyph, IconColor::Maroon),
-        Kind::Text | Kind::Log => icon(GLYPH_DOCUMENT, IconFont::Glyph, IconColor::Overlay2),
+        NoteKind::Csv => icon(GLYPH_GRID, IconFont::Glyph, IconColor::Green),
+        NoteKind::Xml => icon(GLYPH_CODE, IconFont::Glyph, IconColor::Maroon),
+        NoteKind::Text | NoteKind::Log => {
+            icon(GLYPH_DOCUMENT, IconFont::Glyph, IconColor::Overlay2)
+        }
     }
+}
+
+/// A note row's Minimal icon, from its file's extension.
+#[cfg(test)]
+pub(crate) fn file_icon(extension: Option<&str>) -> FileIcon {
+    minimal_icon(note_kind(extension))
 }
 
 /// The type a note row's accessible name carries after its name (spec §5.4).
 pub(crate) fn type_name(extension: Option<&str>) -> &'static str {
-    match kind(extension) {
-        Kind::Markdown => "Markdown",
-        Kind::Json => "JSON",
-        Kind::Yaml => "YAML",
-        Kind::Toml => "TOML",
-        Kind::Ini => "INI",
-        Kind::Config => "config",
-        Kind::Csv => "CSV",
-        Kind::Xml => "XML",
-        Kind::Text => "text",
-        Kind::Log => "log",
+    match note_kind(extension) {
+        NoteKind::Markdown => "Markdown",
+        NoteKind::Json => "JSON",
+        NoteKind::Yaml => "YAML",
+        NoteKind::Toml => "TOML",
+        NoteKind::Ini => "INI",
+        NoteKind::Config => "config",
+        NoteKind::Csv => "CSV",
+        NoteKind::Xml => "XML",
+        NoteKind::Text => "text",
+        NoteKind::Log => "log",
     }
 }
 
@@ -176,7 +184,7 @@ mod tests {
         // `conf` named differently (spec §5.4).
         for extension in crate::library::title::NOTE_EXTENSIONS {
             assert!(
-                KINDS.iter().any(|(known, _)| *known == extension),
+                NOTE_KINDS.iter().any(|(known, _)| *known == extension),
                 "{extension}"
             );
         }

@@ -1378,6 +1378,18 @@ pub(crate) fn current_file_icons(hwnd: HWND) -> crate::window::palette::FileIcon
     })
 }
 
+/// The Notebook tree's icon set and whether the theme is light (icon sets spec §3.1). Call it
+/// with nothing of the App borrowed. The neutral first-paint theme is light.
+pub(crate) fn current_icon_style(hwnd: HWND) -> (crate::config::FileIconSet, bool) {
+    unsafe { app_ptr(hwnd) }.map_or((crate::config::FileIconSet::default(), true), |app| {
+        let app = unsafe { app.as_ref() };
+        let light = app
+            .theme
+            .is_none_or(|theme| !theme.effective_theme(app.settings.theme).is_dark());
+        (app.settings.file_icons, light)
+    })
+}
+
 /// The sidebar's fonts at the window's DPI, created on first use and again after a DPI change.
 /// Null handles without a sidebar. Call it with nothing of the App borrowed.
 pub(crate) fn ui_fonts(hwnd: HWND) -> crate::window::side_panel::UiFonts {

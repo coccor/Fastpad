@@ -210,6 +210,10 @@ pub(crate) struct ViewPaint {
     pub(crate) palette: Palette,
     /// The Notebook view's file-type icon colours for the theme (notebook folders spec §5.2).
     pub(crate) icons: crate::window::palette::FileIcons,
+    /// The Notebook tree's chosen icon set (icon sets spec §3).
+    pub(crate) icon_set: crate::config::FileIconSet,
+    /// The effective theme is light, for the Material icons with a light variant (spec §3.1).
+    pub(crate) light_theme: bool,
     /// The panel's fill, `Palette::panel_background`, already painted.
     pub(crate) background: u32,
     pub(crate) fonts: UiFonts,
@@ -222,11 +226,14 @@ pub(crate) struct ViewPaint {
 /// borrowed. The panel's paint and the views' paint tests use it.
 pub(crate) fn view_paint(main: HWND, panel: HWND, hdc: HDC, client: RECT) -> ViewPaint {
     let palette = current_palette(main);
+    let (icon_set, light_theme) = super::main_window::current_icon_style(main);
     ViewPaint {
         hdc,
         client,
         palette,
         icons: super::main_window::current_file_icons(main),
+        icon_set,
+        light_theme,
         background: palette.panel_background(),
         fonts: ui_fonts(main),
         dpi: unsafe { GetDpiForWindow(panel) }.max(96),

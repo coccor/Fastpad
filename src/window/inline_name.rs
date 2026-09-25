@@ -10,7 +10,8 @@ use crate::library;
 use crate::library::title;
 use crate::library::tree::{self, RowKind, TreeRow};
 use crate::platform::{last_error, wide_null};
-use crate::window::file_icons::{FOLDER_ICON, FileIcon, file_icon};
+use crate::window::file_icons::{NoteKind, note_kind};
+use crate::window::icon_sets::TreeItem;
 use crate::window::library_host::{self, with_state};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, scale};
@@ -145,11 +146,11 @@ pub(crate) fn rename_selection(name: &str, folder: bool) -> (usize, usize) {
     }
 }
 
-/// The draft row's icon (spec §3.1): the folder icon, or the note icon for the note extension
-/// typed so far, Markdown until one is.
-pub(crate) fn draft_icon(purpose: &Purpose, text: &str) -> FileIcon {
+/// What the draft row shows an icon for (spec §3.1): a closed folder, or the note type of the
+/// note extension typed so far, Markdown until one is.
+pub(crate) fn draft_icon(purpose: &Purpose, text: &str) -> TreeItem {
     if purpose.is_folder() {
-        return FOLDER_ICON;
+        return TreeItem::Folder { expanded: false };
     }
     let extension = text
         .trim()
@@ -157,7 +158,7 @@ pub(crate) fn draft_icon(purpose: &Purpose, text: &str) -> FileIcon {
         .map(|(_, extension)| extension)
         .filter(|extension| title::is_note_extension(extension))
         .unwrap_or("md");
-    file_icon(Some(extension))
+    TreeItem::Note(note_kind(Some(extension)))
 }
 
 /// The field's accessible name (spec §6). `notebook` names the root.
@@ -467,10 +468,12 @@ impl InlineName {
         self.row.filter(|_| self.draft)
     }
 
-    pub(crate) fn draft_icon(&self) -> FileIcon {
-        self.edit.as_ref().map_or(file_icon(Some("md")), |edit| {
-            draft_icon(&edit.purpose, &edit.text)
-        })
+    pub(crate) fn draft_icon(&self) -> TreeItem {
+        self.edit
+            .as_ref()
+            .map_or(TreeItem::Note(NoteKind::Markdown), |edit| {
+                draft_icon(&edit.purpose, &edit.text)
+            })
     }
 
     pub(crate) fn problem(&self) -> Option<&str> {
@@ -1471,12 +1474,16 @@ mod tests {
     fn the_draft_icon_follows_the_typed_note_extension() {
         // Break caught: a new JSON note drawn as Markdown, or a folder draft drawn as a note.
         let note = Purpose::NewNote(PathBuf::new());
-        assert_eq!(draft_icon(&note, ""), file_icon(Some("md")));
-        assert_eq!(draft_icon(&note, "data.json"), file_icon(Some("json")));
-        assert_eq!(draft_icon(&note, "v1.2"), file_icon(Some("md")));
+        let markdown = TreeItem::Note(NoteKind::Markdown);
+        assert_eq!(draft_icon(&note, ""), markdown);
+        assert_eq!(
+            draft_icon(&note, "data.json"),
+            TreeItem::Note(note_kind(Some("json")))
+        );
+        assert_eq!(draft_icon(&note, "v1.2"), markdown);
         assert_eq!(
             draft_icon(&Purpose::NewFolder(PathBuf::new()), "x.json"),
-            FOLDER_ICON
+            TreeItem::Folder { expanded: false }
         );
     }
 

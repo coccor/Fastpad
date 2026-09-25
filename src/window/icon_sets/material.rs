@@ -6,13 +6,6 @@
 /// The pixel sizes stored for every icon: 100%, 125%, 150%, 200% and 300% scaling.
 pub(crate) const SIZES: [u32; 5] = [16, 20, 24, 32, 48];
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "read by icon_sets::pixels, wired up by a later task's drawing"
-    )
-)]
 const PER_ICON: usize = {
     let mut total = 0;
     let mut index = 0;
@@ -23,20 +16,9 @@ const PER_ICON: usize = {
     total
 };
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "read by icon_sets::pixels, wired up by a later task's drawing"
-    )
-)]
 static BLOB: &[u8] = include_bytes!("../../../assets/icons/material/icons.bin");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the icon set lookup wired up by a later task")
-)]
 pub(crate) enum MaterialIcon {
     Markdown,
     Json,
@@ -54,10 +36,7 @@ pub(crate) enum MaterialIcon {
 
 impl MaterialIcon {
     /// Every icon, in blob order (`ALL[icon as usize] == icon`).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the icon set lookup wired up by a later task")
-    )]
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 12] = [
         Self::Markdown,
         Self::Json,
@@ -74,13 +53,7 @@ impl MaterialIcon {
     ];
 
     /// The SVG in `assets/icons/material/svg/` this icon is made from.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read by the generator and by a later task's drawing"
-        )
-    )]
+    #[cfg(test)]
     pub(crate) const fn file_name(self) -> &'static str {
         match self {
             Self::Markdown => "markdown.svg",
@@ -101,13 +74,6 @@ impl MaterialIcon {
 
 /// `icon` at `size` px: premultiplied BGRA, top-down rows, `size * size * 4` bytes. `None` for a
 /// size not in `SIZES`.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "wired up by the icon set drawing added in a later task"
-    )
-)]
 pub(crate) fn pixels(icon: MaterialIcon, size: u32) -> Option<&'static [u8]> {
     let index = SIZES.iter().position(|&stored| stored == size)?;
     let before: usize = SIZES[..index]
