@@ -78,6 +78,15 @@ impl IconImages {
     }
 }
 
+#[cfg(test)]
+impl IconImages {
+    /// The pixel sizes of every bitmap cached so far, for tests that check a clipped icon box
+    /// never asks for (and caches) an oddly, narrowly sized bitmap.
+    pub(crate) fn cached_pixel_sizes(&self) -> Vec<u32> {
+        self.bitmaps.keys().map(|&(_, px)| px).collect()
+    }
+}
+
 impl Drop for IconImages {
     fn drop(&mut self) {
         for bitmap in self.bitmaps.values() {
@@ -114,6 +123,12 @@ fn dib_section(width: i32, height: i32) -> (HBITMAP, *mut core::ffi::c_void) {
             0,
         )
     };
+    if !bitmap.is_null() && bits.is_null() {
+        // A bitmap handle with no bits is useless; free it rather than leaking it on every
+        // caller that just checks `bits.is_null()` and returns `None`.
+        unsafe { DeleteObject(bitmap) };
+        return (std::ptr::null_mut(), std::ptr::null_mut());
+    }
     (bitmap, bits)
 }
 
