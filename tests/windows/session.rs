@@ -46,10 +46,19 @@ fn a_closed_session_reopens_its_tabs_and_unsaved_text_on_the_next_launch() {
     let hwnd = second.wait_for_main_window(WAIT).unwrap();
     let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
     wait_for_text(editor, "unsaved words");
-    command(hwnd, CommandId::SelectTab1);
-    wait_for_text(editor, "saved text");
-    // Give the recovery unit time to run; a duplicate would show up as a third tab.
-    std::thread::sleep(Duration::from_millis(500));
+    // The unsaved tab shows while the restore is still going: finishing it shows the saved
+    // active tab again, over a Ctrl+1 sent before then. Ctrl+1 counts once its tab stays shown,
+    // which also gives the recovery unit time to run; a duplicate would show up as a third tab.
+    let deadline = Deadline::after(WAIT);
+    loop {
+        command(hwnd, CommandId::SelectTab1);
+        wait_for_text(editor, "saved text");
+        std::thread::sleep(Duration::from_millis(500));
+        if scintilla_text(editor).is_ok_and(|text| text == "saved text") {
+            break;
+        }
+        assert!(!deadline.expired(), "the first tab never stayed selected");
+    }
     command(hwnd, CommandId::SelectTab3);
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
