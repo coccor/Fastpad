@@ -2192,7 +2192,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             }
             // An earlier cancel's release may never have come here (it went to another window):
             // this press is an ordinary one, so it opens the menu as usual.
-            with_view(hwnd, |view| view.eat_right_up = false);
+            drop_right_release_wait(hwnd);
             // Selects the row; DefWindowProc turns the button-up into WM_CONTEXTMENU.
             let (x, y) = point_of(lparam);
             let hit = hit_after_commit(hwnd, x, y);
@@ -2205,18 +2205,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_RBUTTONUP => {
             // The release of a right press that cancelled a drag opens no menu; its capture,
             // kept until now, is released here (spec §10).
-            let (eaten, panel) = with_view(hwnd, |view| {
-                (std::mem::take(&mut view.eat_right_up), view.panel)
-            })
-            .unwrap_or((false, std::ptr::null_mut()));
-            if eaten {
-                unsafe {
-                    if GetCapture() == panel {
-                        ReleaseCapture();
-                    }
-                }
-            }
-            eaten.then_some(0)
+            drop_right_release_wait(hwnd).then_some(0)
         }
         WM_CONTEXTMENU => {
             context_menu(hwnd, lparam);
@@ -2518,6 +2507,26 @@ fn cancel_drag_for_right_press(hwnd: HWND) -> bool {
     true
 }
 
+/// Ends a right press's wait for its own release (`cancel_drag_for_right_press`) and releases
+/// the capture kept for it, if it still has it. Every place that drops the wait comes here: a
+/// wait dropped without releasing would leave the panel with the mouse until another window
+/// took it. No drag or thumb grab owns the capture while the wait lasts: a left press, which
+/// starts either, ends the wait first. True when there was a wait. Called with nothing of the
+/// App borrowed: ReleaseCapture sends WM_CAPTURECHANGED here.
+pub(crate) fn drop_right_release_wait(hwnd: HWND) -> bool {
+    let Some((true, panel)) = with_view(hwnd, |view| {
+        (std::mem::take(&mut view.eat_right_up), view.panel)
+    }) else {
+        return false;
+    };
+    unsafe {
+        if GetCapture() == panel {
+            ReleaseCapture();
+        }
+    }
+    true
+}
+
 /// The drag timer (tree drag spec §3.3): near the list's top or bottom edge the list scrolls,
 /// and a collapsed folder the pointer has rested on long enough expands. `now` comes in so the
 /// tests need not wait.
@@ -2638,8 +2647,9 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
     // A drag armed by an earlier press whose release never came here. `cancel_drag` also ends
     // one that had started, label and all, though its capture should have ended it already.
     cancel_drag(hwnd);
-    // A right press's cancel whose own release never came here either: stale by now.
-    with_view(hwnd, |view| view.eat_right_up = false);
+    // A right press's cancel whose own release has not come yet: this press ends the wait, and
+    // the capture kept for it (the release then opens the menu as any other would).
+    drop_right_release_wait(hwnd);
     let hit = hit_after_commit(hwnd, x, y);
     focus_panel_for(hwnd, hit.as_ref());
     let Some(hit) = hit else {

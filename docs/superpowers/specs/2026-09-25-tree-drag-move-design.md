@@ -159,5 +159,5 @@ All notices use the existing notice bar (`main_window::push_notice`).
 - **No capture until the drag starts.** A release the tree never sees (over another window before the drag distance) is noticed at the next mouse move without the button, which disarms.
 - **Highlight colours:** the band uses the theme's inactive-selection colour; in high contrast, a 1 px (scaled) outline in the system highlight colour.
 - **Shared move code:** the inline renames and the drop use the same moves (`window::tree_move`), so a rename and a move fail, undo and report stuck tabs the same way. A move whose undo failed names the new path in the existing "could not undo renaming" notice.
-- **A right press that cancels a drag** swallows its release, so no context menu opens.
+- **A right press that cancels a drag** swallows its release, so no context menu opens. The tree keeps the capture until that release. A view switch, the sidebar hiding or a left press before it releases the capture, so the tree never keeps the mouse for good.
 - **The drag label** (added after the first review, §3.2) is painted once into a bitmap when the drag starts, with the tree's own icon code (`draw_item_icon`), and the popup (`window::drag_label`) only moves after that. Its window class is registered at the first drag, so nothing runs before first paint.

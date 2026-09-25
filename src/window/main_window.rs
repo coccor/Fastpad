@@ -18723,6 +18723,58 @@ mod tests {
     }
 
     #[test]
+    fn tree_drag_a_right_press_cancel_frees_the_mouse_when_its_release_cannot_come() {
+        // Break caught: after a right press cancelled a drag, a view switch, the sidebar hiding
+        // or a left press while the right button was still down leaving the panel with the
+        // capture for good, so clicks anywhere in FastPad went to the sidebar (tree drag spec
+        // §10).
+        use crate::config::SidebarView;
+        use crate::window::side_panel::show_view;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-right-capture");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let note = RowKind::Note("a.md".into());
+        // Starts a drag of a.md and cancels it with a right press, still held.
+        let cancel_with_right_press = || {
+            start_drag(window.hwnd, panel, &note);
+            mouse(panel, WM_RBUTTONDOWN, 2, row_lparam(window.hwnd, &note));
+            assert!(notebook_view(window.hwnd).drag.is_none());
+            assert_eq!(unsafe { GetCapture() }, panel, "kept for the right release");
+        };
+
+        for (view, name) in [
+            (SidebarView::Search, "another view"),
+            (SidebarView::Hidden, "the sidebar hiding"),
+        ] {
+            cancel_with_right_press();
+            show_view(window.hwnd, view, false);
+            assert!(unsafe { GetCapture() }.is_null(), "{name} frees the mouse");
+            show_view(window.hwnd, SidebarView::Notebook, false);
+            assert!(!notebook_view(window.hwnd).eat_right_up, "{name}");
+        }
+
+        cancel_with_right_press();
+        let lparam = row_lparam(window.hwnd, &note);
+        mouse(panel, WM_LBUTTONDOWN, 3, lparam);
+        assert!(
+            unsafe { GetCapture() }.is_null(),
+            "a left press frees the mouse"
+        );
+        mouse(panel, WM_LBUTTONUP, 2, lparam);
+        assert!(!notebook_view(window.hwnd).eat_right_up);
+        mouse(panel, WM_RBUTTONUP, 0, lparam);
+        assert!(unsafe { GetCapture() }.is_null());
+        assert!(a.exists(), "nothing moved");
+    }
+
+    #[test]
     fn tree_drag_a_right_press_cancel_eats_only_its_own_release() {
         // Break caught: a right press that cancelled a drag setting a flag that outlives its own
         // release (the release went elsewhere, e.g. the pointer was over the editor), so the next

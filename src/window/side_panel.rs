@@ -499,6 +499,9 @@ fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
     if view != SidebarView::Notebook {
         crate::window::inline_name::cancel(hwnd);
         crate::window::notebook_view::cancel_drag(hwnd);
+        // A right press that cancelled a drag keeps the capture until its release, which the
+        // Notebook view will not see now.
+        crate::window::notebook_view::drop_right_release_wait(hwnd);
     }
     let Some(panel) = with_sidebar(hwnd, |sidebar| {
         if view != SidebarView::Hidden {
