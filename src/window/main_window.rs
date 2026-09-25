@@ -7225,22 +7225,76 @@ mod tests {
     #[test]
     fn file_icon_commands_save_the_set_and_repaint_the_tree_without_restyling_the_editor() {
         // Break caught: a set that is lost on restart, a tree left showing the old set until
-        // something else repaints it, or fastpad.ini rewritten beyond its own line
-        // (icon sets spec §4).
+        // something else repaints it, fastpad.ini rewritten beyond its own line (icon sets spec
+        // §4), or a file-icon command that leaks into the editor's own styling.
+        use crate::editor::scintilla_constants::STYLE_DEFAULT;
+        use windows_sys::Win32::Graphics::Gdi::{GetUpdateRect, ValidateRect};
+        const SCI_STYLEGETSIZEFRACTIONAL: u32 = 2062;
         let _scintilla = load_native_scintilla();
         let scratch = RecoveryScratch::new("file-icons");
         let ini = scratch.path().join("fastpad.ini");
         std::fs::write(&ini, "# kept\r\n").unwrap();
         super::save_settings_to(Some(ini.clone()));
         let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
+        let editor = install_test_editor(&window);
+        let panel = sidebar_panel(window.hwnd);
+        // An update region is only tracked for windows under a visible ancestor chain; without
+        // this, GetUpdateRect below would read 0 no matter what InvalidateRect did. SW_SHOWNA
+        // shows the window without activating it, so it doesn't steal focus from the test run.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                window.hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNA,
+            )
+        };
+        let editor_style = || unsafe {
+            SendMessageW(
+                editor.hwnd(),
+                SCI_STYLEGETSIZEFRACTIONAL,
+                STYLE_DEFAULT as usize,
+                0,
+            )
+        };
+        let style_before = editor_style();
+
+        // Material -> Minimal: a real change, so the panel must repaint.
+        unsafe { ValidateRect(panel, std::ptr::null()) };
         execute_command(window.hwnd, CommandId::FileIconsMinimal);
+        assert_ne!(
+            unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+            0,
+            "switching to Minimal must invalidate the tree panel"
+        );
         assert_eq!(
             app_mut(window.hwnd).settings.file_icons,
             crate::config::FileIconSet::Minimal
         );
+
+        // Minimal -> Minimal: no-op for the setting, but set_file_icons still invalidates
+        // unconditionally (main_window.rs set_file_icons), so assert what the code does.
+        unsafe { ValidateRect(panel, std::ptr::null()) };
         execute_command(window.hwnd, CommandId::FileIconsMinimal);
+        assert_ne!(
+            unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+            0,
+            "the repeat command still repaints (set_file_icons invalidates unconditionally)"
+        );
+
+        // Minimal -> Material: a real change, so the panel must repaint again.
+        unsafe { ValidateRect(panel, std::ptr::null()) };
         execute_command(window.hwnd, CommandId::FileIconsMaterial);
+        assert_ne!(
+            unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+            0,
+            "switching to Material must invalidate the tree panel"
+        );
+
+        assert_eq!(
+            editor_style(),
+            style_before,
+            "file-icon commands must not restyle the editor"
+        );
+
         super::save_settings_to(None);
         assert_eq!(
             std::fs::read_to_string(&ini).unwrap(),
