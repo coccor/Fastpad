@@ -104,8 +104,8 @@
   - renders at **16, 20, 24, 32 and 48 px** square, the sizes for 100%, 125%, 150%, 200% and 300% scaling;
   - produces premultiplied BGRA, with the SVG's viewBox fitted to the square.
 - **It writes two files:**
-  - `assets/icons/material/icons.bin`: every icon at every size, back to back;
-  - `src/window/icon_sets/material_table.rs`: for each FastPad icon name and size, its offset in `icons.bin`, plus the list of SVG files it was made from.
+  - `assets/icons/material/icons.bin`: every icon at every size, back to back. Icons are in the order of FastPad's `MaterialIcon` list, and sizes run smallest first, so an icon's offset follows from the list and needs no table.
+  - `assets/icons/material/icons.source-hash`: a 64-bit FNV-1a hash, in hex, of the SVG files' bytes in list order.
 - **Both outputs are committed.** Building FastPad never runs the generator.
 - **Size:**
   - about 150–250 KB of pixels for 12 icons;
@@ -118,6 +118,7 @@
   - `IconSet { Material, Minimal }`;
   - the lookup: `(set, note type or folder state, light theme) → TreeIcon`;
   - `TreeIcon` is either `Glyph(FileIcon)` (today's type) or `Image(MaterialIcon)`.
+  - `MaterialIcon` lists the 12 icons, each with its SVG file name. The list is written by hand, and the generator reads it.
 - **`file_icons::type_name`** (screen readers) doesn't change and doesn't depend on the set.
 - **`file_icons::file_icon` and `FOLDER_ICON`** stay: they are the Minimal set, and they're also the fallback.
 
@@ -127,16 +128,17 @@
   - It stays `scale(16, dpi)` px square (`GLYPH_BOX`), in the same place in the row.
 - **Picking a size:**
   - If the box's pixel size is one of the stored sizes, that one is used as is.
-  - Otherwise, the next stored size up is scaled down into the box, with the `HALFTONE` stretch mode set on the DC. For example, 175% is 28 px, drawn from 32.
-  - Above 48 px, 48 is scaled up.
+  - Otherwise, the next stored size up is resampled to the box's size once, in software, by area averaging on the premultiplied pixels. For example, 175% is 28 px, made from 32. GDI's `HALFTONE` mode doesn't apply to alpha blending, so the resampling can't be left to GDI.
+  - Above 48 px, 48 is resampled up the same way.
 - **The bitmaps:**
-  - The first time an icon is drawn at a pixel size, one 32-bit top-down DIB section is created from the blob's pixels.
-  - It's kept in the Notebook view's paint state, keyed by (icon, stored size).
-- **When the cache is dropped:**
-  - on a DPI change;
-  - on a set change;
-  - when the view is destroyed.
-- **Blending:** `AlphaBlend` with `AC_SRC_ALPHA`, onto the row's background, which is already painted. Selected and hover backgrounds show through the transparent parts.
+  - The first time an icon is drawn at a pixel size, one 32-bit top-down DIB section is created from the pixels at that size.
+  - It's kept in the Notebook view's paint state, keyed by (icon, pixel size).
+  - The cache is freed when the view is dropped.
+  - It holds at most 12 bitmaps for each pixel size the window has used, so a DPI change or a set change needs no eviction.
+- **Blending:**
+  - `GdiAlphaBlend`, which is gdi32's export of `AlphaBlend`. It avoids a static import of msimg32.dll, which would load at startup.
+  - With `AC_SRC_ALPHA`, 1:1, centred in the icon box, onto the row's background, which is already painted.
+  - Selected and hover backgrounds show through the transparent parts.
 - **If creating a DIB fails:**
   - That row draws the Minimal glyph for the same type.
   - The failure is logged once per session.
@@ -149,8 +151,11 @@
   - The setting is read with the rest of `fastpad.ini`.
 - **No file I/O,** at startup or while drawing.
 - **The cost:**
-  - One `AlphaBlend` per row replaces one `DrawText`. After the first paint, the only extra work is up to 12 DIB sections per DPI.
-  - A test of a 1,000-row tree paint records Material against Minimal, and Material must not be slower by more than 10%.
+  - One `GdiAlphaBlend` per row replaces one `DrawText`. After the first paint, the only extra work is up to 12 DIB sections per pixel size.
+  - No new DLL is loaded.
+  - An ignored test times 1,000 row icons under Material against Minimal: the median of 20 runs each, with the bitmaps already cached.
+    - Material must not be more than 10% slower.
+    - It runs at the final review, because this machine's timings are noisy.
   - `tree_build_ms` doesn't change, because icons are chosen at paint time.
 
 ## 8. Screen readers
@@ -166,12 +171,17 @@
     - an exact match;
     - the next stored size up in between (for example 28 → 32);
     - 48 above 48 px.
+  - **Resampling:**
+    - an opaque square stays opaque at every target size;
+    - a half-covered edge averages;
+    - the output stays premultiplied.
   - **The setting:**
     - `file_icons` parsing, including letter case and an unknown value;
     - saving.
 - **Data:**
-  - The generated table lists exactly the SVG files in `assets/icons/material/svg/`, one to one. A regeneration that was forgotten fails this test.
-  - Every entry's offset plus its length lies inside `icons.bin`, and the entries don't overlap.
+  - `MaterialIcon`'s list names exactly the SVG files in `assets/icons/material/svg/`, one to one.
+  - `icons.bin` is exactly as long as the list and the sizes imply.
+  - `icons.source-hash` matches a hash of the SVG files, so a regeneration that was forgotten fails.
   - At every size, every icon has visible pixels, and each pixel's colour channels are ≤ its alpha.
 - **Window** (temporary profile, `--test-threads=1`):
   - Choosing "File icons: Minimal" saves `file_icons = minimal` and repaints the tree with the glyphs. Choosing Material brings the images back.
