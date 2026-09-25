@@ -16390,18 +16390,27 @@ mod tests {
             .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
             .collect::<Vec<_>>();
         assert_eq!(items.len(), count);
-        let rows = items
+        let outline = items
             .iter()
             .filter(|item| {
                 item.role == windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM
             })
-            // The Open Editors header and the notebook's root row come before the tree's rows.
-            .skip(2)
             .collect::<Vec<_>>();
+        // The tree's rows are the outline items after the notebook's root row: the section rows
+        // (the Open Editors header and the root row) are at level 0, each with its rows under it.
+        let root = outline
+            .iter()
+            .position(|item| item.value == "0" && !item.name.starts_with("Open editors, "))
+            .expect("the notebook's root row");
+        let rows = &outline[root + 1..];
         // "sub" is collapsed, so b is not a row: pinned a first, then the folder.
         assert_eq!(rows.len(), 2, "{items:?}");
         assert_eq!(rows[0].name, "a.md, Markdown, pinned");
         assert_eq!(rows[1].name, "sub");
+        assert!(
+            rows.iter().all(|row| row.value == "1"),
+            "top-level rows sit one level under the root row: {items:?}"
+        );
         assert_ne!(
             rows[1].state & crate::window::sidebar_accessibility::STATE_COLLAPSED,
             0
