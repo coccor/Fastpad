@@ -335,80 +335,13 @@ fn wait_and_answer_dialog(
             answered = Some(dialog);
         }
         if deadline.expired() {
-            let what = match answered {
-                Some(_) => "timed out waiting for an answered dialog to close",
-                None => "timed out waiting for a dialog to appear",
-            };
-            return Err(format!(
-                "{what}; answered {answered:?}; {}",
-                describe_windows(process_id)
-            )
-            .into());
+            return Err(match answered {
+                Some(_) => "timed out waiting for an answered dialog to close".into(),
+                None => "timed out waiting for a dialog to appear".into(),
+            });
         }
         deadline.sleep_step();
     }
-}
-
-/// Temporary diagnostics: every top-level window of the process, and whether its thread answers.
-#[cfg(windows)]
-fn describe_windows(process_id: u32) -> String {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GW_OWNER, GetWindow, IsHungAppWindow, IsWindowVisible, SMTO_ABORTIFHUNG,
-        SendMessageTimeoutW, WM_NULL,
-    };
-    struct Found {
-        process_id: u32,
-        windows: Vec<HWND>,
-    }
-    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let found = unsafe { &mut *(lparam as *mut Found) };
-        let mut process_id = 0;
-        unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
-        if process_id == found.process_id {
-            found.windows.push(hwnd);
-        }
-        1
-    }
-    unsafe extern "system" fn count(_: HWND, lparam: LPARAM) -> BOOL {
-        unsafe { *(lparam as *mut u32) += 1 };
-        1
-    }
-    let text = |hwnd: HWND, class: bool| {
-        let mut buffer = [0_u16; 128];
-        let length = unsafe {
-            if class {
-                GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32)
-            } else {
-                GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32)
-            }
-        };
-        String::from_utf16_lossy(&buffer[..length.max(0) as usize])
-    };
-    let mut found = Found {
-        process_id,
-        windows: Vec::new(),
-    };
-    unsafe { EnumWindows(Some(collect), &mut found as *mut Found as isize) };
-    let mut out = String::from("windows:");
-    for hwnd in found.windows {
-        let mut children = 0_u32;
-        let mut result = 0;
-        let answers = unsafe {
-            EnumChildWindows(hwnd, Some(count), &mut children as *mut u32 as isize);
-            SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2_000, &mut result)
-        };
-        out += &format!(
-            "\n  {hwnd:?} class={:?} title={:?} visible={} enabled={} owner={:?} hung={} answers={} children={children}",
-            text(hwnd, true),
-            text(hwnd, false),
-            unsafe { IsWindowVisible(hwnd) },
-            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd) },
-            unsafe { GetWindow(hwnd, GW_OWNER) },
-            unsafe { IsHungAppWindow(hwnd) },
-            answers,
-        );
-    }
-    out
 }
 
 #[cfg(windows)]
