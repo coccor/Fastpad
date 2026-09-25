@@ -20842,4 +20842,56 @@ mod tests {
             "new"
         );
     }
+
+    #[test]
+    fn open_editors_a_tab_and_an_explorer_file_copy_into_an_empty_notebook() {
+        // Break caught: a notebook with no notes refusing every copy, because the drag's hover
+        // only looked for a tree (open editors spec §4.1: the root row or empty space copies into
+        // the root).
+        use windows_sys::Win32::System::Ole::DROPEFFECT_COPY;
+        let _scintilla = load_native_scintilla();
+        // The root row of an empty notebook takes a tab.
+        {
+            let scratch = LibraryScratch::new("empty-copy");
+            let outside = scratch.root.join("tab.md");
+            std::fs::write(&outside, "t").unwrap();
+            let (window, _editor) = notebook_window(&scratch);
+            super::open_path(window.hwnd, &outside).unwrap();
+            assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+            let panel = sidebar_windows(window.hwnd).1;
+
+            let tab = notebook_view(window.hwnd)
+                .editors
+                .rows
+                .iter()
+                .position(|row| row.path.as_deref() == Some(outside.as_path()))
+                .unwrap();
+            start_tab_drag(window.hwnd, panel, tab);
+            let root = notebook_view(window.hwnd).root_rect();
+            let on_root = client_lparam(root.left + 40, (root.top + root.bottom) / 2);
+            drag_over(panel, on_root);
+            assert_eq!(
+                notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+                Some(PathBuf::new()),
+                "the root row takes the tab"
+            );
+            drop_at(panel, on_root);
+            crate::window::copy_host::wait_for_copies(window.hwnd);
+            assert!(scratch.folder().join("tab.md").exists());
+        }
+
+        // Another empty notebook, and the space under its root row.
+        let scratch = LibraryScratch::new("empty-copy-body");
+        let dropped = scratch.root.join("dropped.md");
+        std::fs::write(&dropped, "d").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+        let panel = sidebar_windows(window.hwnd).1;
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let root = notebook_view(window.hwnd).root_rect();
+        let effects = explorer_drop(panel, root.left + 40, root.bottom + 40, &[&dropped]);
+        assert_eq!(effects, [DROPEFFECT_COPY; 3]);
+        pump_until(window.hwnd, || scratch.folder().join("dropped.md").exists());
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+    }
 }

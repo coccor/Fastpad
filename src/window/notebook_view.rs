@@ -1242,10 +1242,11 @@ impl NotebookView {
     }
 
     /// What a drag at panel point `x`, `y` is over (tree drag spec §3.2). The scroll thumb
-    /// counts as the row under it.
+    /// counts as the row under it. A notebook with no notes has the root row and the space under
+    /// it, both the root (open editors spec §4.1); a tree row can't be dragged there.
     fn drag_hover(&self, x: i32, y: i32) -> Hover {
         let area = self.client();
-        if self.mode != Mode::Tree || !contains(area, x, y) {
+        if !matches!(self.mode, Mode::Tree | Mode::Empty) || !contains(area, x, y) {
             return Hover::Outside;
         }
         // The title band and Open Editors take no drop; the root row is the notebook's root.
