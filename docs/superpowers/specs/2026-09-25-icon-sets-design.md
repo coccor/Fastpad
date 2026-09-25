@@ -84,11 +84,11 @@
 - **In the palette:**
   - two rows next to the Theme rows: "File icons: Material" and "File icons: Minimal";
   - new commands `CommandId::FileIconsMaterial` and `CommandId::FileIconsMinimal`;
-  - the current set is marked, as the current theme is.
+  - both rows are also in the activity bar's Settings list (`SETTINGS_COMMANDS`), after the Theme rows;
+  - neither row carries a mark, since the palette marks no current setting, the theme included.
 - **Choosing one:**
-  - saves the key with `config::save_setting("file_icons", …)`, as `theme` is saved;
-  - updates the setting in every FastPad window;
-  - repaints each window's tree.
+  - goes through `change_setting`, as `theme` does, which saves `file_icons` to `fastpad.ini`;
+  - repaints the window's Notebook tree.
   - No rescan and no restart.
 - **A failed save** shows the notice `theme` uses when its save fails. The chosen set still applies for this session.
 
@@ -156,7 +156,7 @@
 ## 8. Screen readers
 
 - **Row names don't change,** for example "budget.csv, CSV", because icons aren't announced.
-- **The two palette rows** are ordinary palette rows. The current set's mark is spoken the way the current theme's is.
+- **The two palette rows** are ordinary palette rows.
 
 ## 9. Testing
 
@@ -180,7 +180,7 @@
     - a Markdown row under Minimal shows the glyph colour;
     - an expanded folder under Material shows `folder-open`, not `folder`.
   - **High contrast:** the tree draws glyphs under Material.
-  - The palette marks the current set.
+  - Both rows appear in the palette and in the Settings list.
 - **Perf:** the 1,000-row paint comparison in §7.
 
 ## 10. Out of scope
