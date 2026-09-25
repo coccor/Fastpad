@@ -18182,6 +18182,236 @@ mod tests {
     }
 
     #[test]
+    fn tree_move_a_note_moves_into_a_folder_with_its_dirty_tab_and_pin() {
+        // Break caught: a drop that saves the dirty tab, leaves it on the old path, drops the pin,
+        // or leaves the target folder collapsed and the row unselected (tree drag spec §4).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-move-note");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let a = scratch.note("a.md", "a");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        ensure_sidebar(window.hwnd);
+        scratch.install(window.hwnd);
+        execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+        super::open_path(window.hwnd, &a).unwrap();
+        editor.set_text("a, edited").unwrap();
+        crate::window::library_host::toggle_pin(window.hwnd, &a);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        // Autosave-off and Pinned notices from setup are not what this test is about.
+        app_mut(window.hwnd).notifications.dismiss_all();
+
+        crate::window::tree_move::drop_into(
+            window.hwnd,
+            &RowKind::Note("a.md".into()),
+            std::path::Path::new("work"),
+        );
+
+        let moved = scratch.folder().join(r"work\a.md");
+        assert!(moved.exists() && !a.exists());
+        assert_eq!(
+            std::fs::read_to_string(&moved).unwrap(),
+            "a",
+            "nothing was saved"
+        );
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(moved.as_path()));
+        assert!(active.dirty);
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            assert!(state.is_pinned(&moved));
+        });
+        assert!(
+            crate::window::library_host::expanded(window.hwnd)
+                .contains(&std::path::PathBuf::from("work"))
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"work\a.md".into()))
+        );
+        assert!(
+            notices(window.hwnd).is_empty(),
+            "{:?}",
+            notices(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn tree_move_a_folder_moves_to_the_root_with_its_tabs_and_expanded_folders() {
+        // Break caught: tabs under the moved folder left on old paths, or its expanded state and
+        // its own expanded subfolder lost (tree drag spec §4).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-move-folder");
+        std::fs::create_dir_all(scratch.folder().join(r"work\inner\deep")).unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        let c = open_note(&window, &scratch, r"work\inner\c.md", "c");
+        for folder in ["work", r"work\inner", r"work\inner\deep"] {
+            crate::window::library_host::set_expanded(
+                window.hwnd,
+                std::path::Path::new(folder),
+                true,
+            );
+        }
+        crate::window::notebook_view::rebuild(window.hwnd);
+
+        crate::window::tree_move::drop_into(
+            window.hwnd,
+            &RowKind::Folder(r"work\inner".into()),
+            std::path::Path::new(""),
+        );
+
+        let moved = scratch.folder().join(r"inner\c.md");
+        assert!(moved.exists() && !c.exists());
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(moved.as_path())
+        );
+        let expanded = crate::window::library_host::expanded(window.hwnd);
+        assert!(
+            expanded.contains(&std::path::PathBuf::from("inner")),
+            "{expanded:?}"
+        );
+        assert!(
+            expanded.contains(&std::path::PathBuf::from(r"inner\deep")),
+            "{expanded:?}"
+        );
+        assert!(
+            !expanded.contains(&std::path::PathBuf::from(r"work\inner")),
+            "{expanded:?}"
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Folder("inner".into()))
+        );
+    }
+
+    #[test]
+    fn tree_move_a_taken_name_is_refused_in_memory_and_on_disk() {
+        // Break caught: a drop onto a listed name in another letter case (a clash on NTFS), or
+        // onto a file the tree has not seen yet, overwriting or half-moving (tree drag spec §5).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-move-taken");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\A.md", "work A");
+        let a = scratch.note("a.md", "root a");
+        let z = scratch.note("z.md", "root z");
+        let (window, _editor) = notebook_window(&scratch);
+        // Made after the scan: only the disk knows it.
+        std::fs::write(scratch.folder().join(r"work\z.md"), "unseen").unwrap();
+
+        let drop = |name: &str, folder: &str| {
+            crate::window::tree_move::drop_into(
+                window.hwnd,
+                &RowKind::Note(name.into()),
+                std::path::Path::new(folder),
+            )
+        };
+        drop("a.md", "work");
+        drop("z.md", "work");
+        // work\A.md onto the root, where a.md is: the notice names the notebook.
+        drop(r"work\A.md", "");
+        let root_name = crate::window::library_host::notebook_name(&scratch.folder());
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "root a");
+        assert_eq!(std::fs::read_to_string(&z).unwrap(), "root z");
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\z.md")).unwrap(),
+            "unseen"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\A.md")).unwrap(),
+            "work A"
+        );
+        assert_eq!(
+            notices(window.hwnd),
+            vec![
+                "a.md already exists in work. Nothing was moved.".to_owned(),
+                "z.md already exists in work. Nothing was moved.".to_owned(),
+                format!("A.md already exists in {root_name}. Nothing was moved."),
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_move_a_vanished_or_locked_source_says_so_and_moves_nothing() {
+        // Break caught: a missing file reported as a generic failure (or as a clash), or a
+        // sharing violation swallowed (tree drag spec §5).
+        use std::os::windows::fs::OpenOptionsExt;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-move-gone");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let gone = scratch.note("gone.md", "g");
+        let locked = scratch.note("locked.md", "l");
+        let (window, _editor) = notebook_window(&scratch);
+        std::fs::remove_file(&gone).unwrap();
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+
+        for name in ["gone.md", "locked.md"] {
+            crate::window::tree_move::drop_into(
+                window.hwnd,
+                &RowKind::Note(name.into()),
+                std::path::Path::new("work"),
+            );
+        }
+
+        assert!(!scratch.folder().join(r"work\gone.md").exists());
+        assert!(locked.exists() && !scratch.folder().join(r"work\locked.md").exists());
+        let notices = notices(window.hwnd);
+        assert_eq!(notices[0], "gone.md no longer exists.");
+        assert!(
+            notices[1].starts_with("Couldn't move locked.md: "),
+            "{notices:?}"
+        );
+        assert_eq!(notices.len(), 2, "{notices:?}");
+    }
+
+    #[test]
+    fn tree_move_a_tab_that_cannot_follow_undoes_the_move_or_names_the_stuck_tab() {
+        // Break caught: a move that leaves a tab on a path that no longer exists without saying
+        // so, or keeps the move when it could be undone (tree drag spec §5).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-move-tab");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let a = scratch.note("a.md", "a");
+        let top = scratch.note("top.md", "t");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &top).unwrap();
+        // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+        let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+        app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+            Some(scratch.folder().join(r"work\a.md"));
+        let drop = || {
+            crate::window::tree_move::drop_into(
+                window.hwnd,
+                &RowKind::Note("a.md".into()),
+                std::path::Path::new("work"),
+            )
+        };
+
+        drop();
+        assert!(a.exists(), "moved back");
+        assert_eq!(
+            notices(window.hwnd),
+            vec!["Couldn't move a.md: another tab already has that file open.".to_owned()]
+        );
+
+        crate::window::library_host::fail_next_note_rename_back();
+        drop();
+        assert!(!a.exists() && scratch.folder().join(r"work\a.md").exists());
+        let expected = crate::window::library_host::rename_undo_failed_notice(
+            "a.md",
+            r"work\a.md",
+            std::slice::from_ref(&a),
+        );
+        assert_eq!(notices(window.hwnd).last(), Some(&expected));
+    }
+
+    #[test]
     fn a_folder_rename_selects_the_whole_name_even_with_a_dot() {
         // Break caught: "v1.2" opening with only "v1" selected, as a file name's stem would be,
         // so typing keeps ".2" (spec §3.3).

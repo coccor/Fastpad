@@ -142,13 +142,6 @@ pub(crate) fn past_threshold(origin: (i32, i32), point: (i32, i32), cx: i32, cy:
 }
 
 /// A note's or folder's path, relative to the notebook.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag in notebook_view (next tasks)"
-    )
-)]
 pub(crate) fn source_path(kind: &RowKind) -> Option<&Path> {
     match kind {
         RowKind::Note(path) | RowKind::Folder(path) => Some(path),
@@ -156,13 +149,6 @@ pub(crate) fn source_path(kind: &RowKind) -> Option<&Path> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag in notebook_view (next tasks)"
-    )
-)]
 fn parent_of(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
@@ -192,13 +178,6 @@ pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
 
 /// Whether `folder` takes `source` (spec §3.2): not its own folder, where nothing would change,
 /// and for a folder, not itself or a folder inside it. Ignores letter case, as NTFS does.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag in notebook_view (next tasks)"
-    )
-)]
 pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
     let Some(path) = source_path(source) else {
         return false;
@@ -210,13 +189,6 @@ pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
 }
 
 /// Where `source` lands when dropped into `folder`: the same name in that folder.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag in notebook_view (next tasks)"
-    )
-)]
 pub(crate) fn destination(source: &RowKind, folder: &Path) -> Option<PathBuf> {
     Some(folder.join(source_path(source)?.file_name()?))
 }

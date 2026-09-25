@@ -11,7 +11,10 @@ use crate::window::command_palette::{Picker, PickerChoice, PickerKind};
 use crate::window::name_box::{NameBox, NamePurpose};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HWND,
+    LPARAM,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
 
 pub(crate) const LIBRARY_WRITE_TIMER_ID: usize = 0x4650_4C57;
@@ -1402,6 +1405,14 @@ pub(crate) fn already_exists(error: &crate::FastPadError) -> bool {
     matches!(
         error,
         crate::FastPadError::Win32(code) if *code == ERROR_ALREADY_EXISTS || *code == ERROR_FILE_EXISTS
+    )
+}
+
+/// Whether a failed `MoveFileExW` means the source is gone.
+pub(crate) fn not_found(error: &crate::FastPadError) -> bool {
+    matches!(
+        error,
+        crate::FastPadError::Win32(code) if *code == ERROR_FILE_NOT_FOUND || *code == ERROR_PATH_NOT_FOUND
     )
 }
 

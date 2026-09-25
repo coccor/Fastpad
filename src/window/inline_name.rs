@@ -15,6 +15,7 @@ use crate::window::icon_sets::TreeItem;
 use crate::window::library_host::{self, with_state};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, scale};
+use crate::window::tree_move::{self, MoveError};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -1169,76 +1170,57 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
         cancel(hwnd);
         return;
     };
-    let old = root.join(relative);
-    let current = old
+    let current = relative
         .extension()
         .map(|extension| extension.to_string_lossy().into_owned());
     let Some(name) = title::renamed_note_name(text, current.as_deref()) else {
         cancelled(hwnd, how);
         return;
     };
-    let new = old.with_file_name(&name);
-    if new == old {
+    let new = relative.with_file_name(&name);
+    if new == relative {
         cancelled(hwnd, how);
         return;
     }
-    // A change of letter case only names the same file, so it is not a clash.
-    let case_only = library::model::same_path(&new, &old);
-    if let Err(error) = crate::platform::files::rename_no_replace(&old, &new) {
-        let error = if !case_only && library_host::already_exists(&error) {
-            let (stem, extension) = title::split_rename(text, current.as_deref());
-            let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
-            library_host::name_taken_error(&parent, &stem, &extension.unwrap_or_default())
-        } else {
-            format!("FastPad could not rename the file: {error}")
-        };
-        fail(hwnd, how, error);
-        return;
-    }
-    let mut undo_failed = None;
-    let rebound = match library_host::rebind_open_tab(hwnd, &old, new.clone()) {
-        Ok(rebound) => rebound,
-        Err(()) => {
-            // Undo, so the tab and the disk agree.
-            if library_host::rename_note_back(&new, &old).is_ok() {
-                fail(
-                    hwnd,
-                    how,
-                    "Another tab already has that file open.".to_owned(),
-                );
-                return;
-            }
-            // The disk is the truth: the rename stands, and the tab left on the old path is
-            // named.
-            let name = |path: &Path| {
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
+    let moved = match tree_move::move_note(hwnd, &root, relative, &new) {
+        Ok(moved) => moved,
+        Err(error) => {
+            let message = match error {
+                MoveError::Taken => {
+                    let (stem, extension) = title::split_rename(text, current.as_deref());
+                    let parent = root
+                        .join(relative)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    library_host::name_taken_error(&parent, &stem, &extension.unwrap_or_default())
+                }
+                MoveError::Missing(error) | MoveError::Failed(error) => {
+                    format!("FastPad could not rename the file: {error}")
+                }
+                MoveError::TabCantFollow => "Another tab already has that file open.".to_owned(),
             };
-            undo_failed = Some(library_host::rename_undo_failed_notice(
-                &name(&old),
-                &name(&new),
-                std::slice::from_ref(&old),
-            ));
-            false
+            fail(hwnd, how, message);
+            return;
         }
     };
-    with_state(hwnd, |state| state.rename_note(&old, &new));
-    library_host::schedule_write(hwnd);
     end(hwnd);
-    let moved = library::record_path(&root, &new);
+    let row = library::record_path(&root, &root.join(&new));
     side_panel::with_accessible_events(hwnd, || {
         side_panel::refresh(hwnd);
-        notebook_view::select_row(hwnd, &RowKind::Note(moved.clone()));
+        notebook_view::select_row(hwnd, &RowKind::Note(row.clone()));
     });
     if how == How::Enter {
         notebook_view::focus_tree(hwnd);
     }
-    if let Some(notice) = undo_failed {
-        push_notice(hwnd, notice);
+    if !moved.stuck.is_empty() {
+        let old_name = relative.file_name().unwrap_or_default().to_string_lossy();
+        push_notice(
+            hwnd,
+            library_host::rename_undo_failed_notice(&old_name, &name, &moved.stuck),
+        );
     }
-    if rebound {
+    if moved.rebound {
         // The extension may have changed, and with it the language.
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1276,58 +1258,20 @@ fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
         cancelled(hwnd, how);
         return;
     }
-    // A change of letter case only names the same folder, so it is not a clash.
-    let case_only = library::model::same_path(&new, old);
-    let (old_path, new_path) = (root.join(old), root.join(&new));
-    if let Err(error) = crate::platform::files::rename_no_replace(&old_path, &new_path) {
-        let error = if !case_only && library_host::already_exists(&error) {
-            library_host::folder_taken_error(&name)
-        } else {
-            format!("FastPad could not rename the folder: {error}")
-        };
-        fail(hwnd, how, error);
-        return;
-    }
-    let tabs = library_host::tabs_under(hwnd, &old_path);
-    let mut moved = Vec::with_capacity(tabs.len());
-    let mut stuck = Vec::new();
-    for (id, path, _) in tabs {
-        let target = new_path.join(library::record_path(&old_path, &path));
-        let rebound = unsafe { app_ptr(hwnd) }
-            .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.rebind_path(id, target).is_ok());
-        if rebound {
-            moved.push((id, path));
-        } else {
-            stuck.push(path);
-        }
-    }
-    let mut undo_failed = None;
-    if !stuck.is_empty() {
-        // Undo, so the tabs and the disk agree: the folder goes back, then the tabs that moved.
-        if library_host::rename_folder_back(&new_path, &old_path).is_ok() {
-            for (id, path) in moved.into_iter().rev() {
-                if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                    let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
+    let moved = match tree_move::move_folder(hwnd, &root, old, &new) {
+        Ok(moved) => moved,
+        Err(error) => {
+            let message = match error {
+                MoveError::Taken => library_host::folder_taken_error(&name),
+                MoveError::Missing(error) | MoveError::Failed(error) => {
+                    format!("FastPad could not rename the folder: {error}")
                 }
-            }
-            fail(
-                hwnd,
-                how,
-                "Another tab already has that file open.".to_owned(),
-            );
+                MoveError::TabCantFollow => "Another tab already has that file open.".to_owned(),
+            };
+            fail(hwnd, how, message);
             return;
         }
-        // The disk is the truth: the rename stands, the tabs that moved keep their new paths,
-        // and the ones that could not follow are named.
-        let old_name = old.file_name().unwrap_or_default().to_string_lossy();
-        undo_failed = Some(library_host::rename_undo_failed_notice(
-            &old_name, &name, &stuck,
-        ));
-    }
-    library_host::reroot_save_folders(hwnd, &old_path, &new_path);
-    with_state(hwnd, |state| state.rename_folder(old, &new));
-    library_host::save_local_soon(hwnd);
-    library_host::schedule_write(hwnd);
+    };
     end(hwnd);
     super::main_window::invalidate_title_strip(hwnd);
     side_panel::with_accessible_events(hwnd, || {
@@ -1337,8 +1281,12 @@ fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
     if how == How::Enter {
         notebook_view::focus_tree(hwnd);
     }
-    if let Some(notice) = undo_failed {
-        push_notice(hwnd, notice);
+    if !moved.stuck.is_empty() {
+        let old_name = old.file_name().unwrap_or_default().to_string_lossy();
+        push_notice(
+            hwnd,
+            library_host::rename_undo_failed_notice(&old_name, &name, &moved.stuck),
+        );
     }
 }
 
