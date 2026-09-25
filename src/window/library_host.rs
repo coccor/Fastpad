@@ -580,14 +580,12 @@ pub(crate) fn expansion_revision(hwnd: HWND) -> u64 {
 
 /// Whether the open notebook's root row is expanded (open editors spec §3.3). True while no
 /// notebook state is loaded, so the loading and failed states show under it.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 pub(crate) fn root_expanded(hwnd: HWND) -> bool {
     with_state(hwnd, |state| !state.local.root_collapsed).unwrap_or(true)
 }
 
 /// Expands or collapses the notebook's root row and remembers it in the per-PC file, the way
 /// `set_expanded` does for a folder.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 pub(crate) fn set_root_expanded(hwnd: HWND, expanded: bool) {
     let changed = with_state(hwnd, |state| {
         let changed = state.local.root_collapsed == expanded;
@@ -1199,6 +1197,7 @@ pub(crate) fn refresh_label(hwnd: HWND) {
     });
     if changed.is_some() {
         super::main_window::refresh_tab_view(hwnd);
+        crate::window::notebook_view::editors_changed(hwnd);
     }
 }
 

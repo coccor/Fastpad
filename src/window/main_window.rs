@@ -2751,14 +2751,12 @@ fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
 }
 
 /// Whether the Notebook view's Open Editors section is expanded (open editors spec §3.3).
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 pub(crate) fn open_editors_expanded(hwnd: HWND) -> bool {
     unsafe { app_ptr(hwnd) }
         .is_none_or(|app| unsafe { app.as_ref() }.settings.open_editors_expanded)
 }
 
 /// Collapses or expands the Open Editors section and saves it. Only the panel repaints.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 pub(crate) fn set_open_editors_expanded(hwnd: HWND, expanded: bool) {
     change_setting(hwnd, |settings| {
         (settings.open_editors_expanded != expanded).then(|| {
@@ -3935,6 +3933,19 @@ fn close_active_document(hwnd: HWND) {
         review
     };
     close_reviewed_document(hwnd, &identity, &editor, review, decision);
+}
+
+/// Closes tab `id` as a middle-click on it does (open editors spec §3.2), if it is still open.
+pub(crate) fn close_document_tab(hwnd: HWND, id: DocumentId) {
+    let index = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .documents()
+            .position(|document| document.id == id)
+    });
+    if let Some(index) = index {
+        close_tab_at(hwnd, index);
+    }
 }
 
 /// Closes the tab at strip `index` (quick-open spec §5). A clean tab that isn't the active one
@@ -5632,12 +5643,15 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if changed {
         invalidate_title_strip(hwnd);
     }
+    crate::window::notebook_view::editors_changed(hwnd);
 }
 
 pub(crate) fn invalidate_title_strip(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+    // The Open Editors rows show what the strip does.
+    crate::window::notebook_view::editors_changed(hwnd);
 }
 
 /// Refreshes the retained tab-view snapshot after a document's title-affecting field (e.g. its
@@ -8583,13 +8597,13 @@ mod tests {
         let header_y = layout.resize_border + 2;
         let header = crate::window::panel::scale(crate::window::side_panel::HEADER_HEIGHT_96, dpi);
         assert!(header_y < header);
-        // Left of the Notebook header's title (which starts 12 px in and stays client area, so
-        // its tooltip works): empty header, a drag area.
+        // The Notebook view's title band holds only its caption, "NOTEBOOK": all of it is a
+        // drag area, the old title point included.
         let panel_x = crate::window::panel::scale(4, dpi);
         assert_eq!(
             hit(panel, client_size(panel).0 / 2, header_y),
-            HTCLIENT as LRESULT,
-            "the notebook's name is not a drag area"
+            HTTRANSPARENT as LRESULT,
+            "the whole title band is caption"
         );
         assert_eq!(hit(panel, panel_x, header_y), HTTRANSPARENT as LRESULT);
         assert_eq!(
@@ -19291,6 +19305,110 @@ mod tests {
             false,
         );
         assert!(gone(shown), "another view");
+    }
+
+    /// The centre of `rect` as a panel `lParam`.
+    fn centre(rect: RECT) -> super::LPARAM {
+        client_lparam((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+    }
+
+    #[test]
+    fn open_editors_lists_the_tabs_and_follows_opening_closing_and_saving() {
+        // Break caught: a tab opened or closed without its row following, a dirty tab without
+        // its dot, or the active tab's row not the selected one (open editors spec §3.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-follow");
+        let a = scratch.note("a.md", "a");
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        let outside = scratch.root.join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        super::open_path(window.hwnd, &outside).unwrap();
+        let names = |hwnd| {
+            notebook_view(hwnd)
+                .editors
+                .rows
+                .iter()
+                .map(|row| (row.name.clone(), row.dirty, row.active))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(window.hwnd),
+            [
+                ("a.md".into(), false, false),
+                ("outside.txt".into(), false, true)
+            ]
+        );
+        editor.set_text("changed").unwrap();
+        assert!(names(window.hwnd)[1].1, "the dirty dot follows the edit");
+        crate::window::modal::answer_next_close_prompt(|_| CloseDecision::Discard);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert_eq!(names(window.hwnd).len(), 1);
+    }
+
+    #[test]
+    fn open_editors_click_switches_close_box_and_middle_click_close() {
+        // Break caught: a click that opens nothing, the close box closing the wrong tab, or a
+        // middle-click ignored in the panel (open editors spec §3.2).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-click");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let c = scratch.note("c.md", "c");
+        let (window, _editor) = notebook_window(&scratch);
+        for path in [&a, &b, &c] {
+            super::open_path(window.hwnd, path).unwrap();
+        }
+        let panel = sidebar_windows(window.hwnd).1;
+        let row0 = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row0));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row0));
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path())
+        );
+
+        let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        let close = crate::window::open_editors::close_rect(row1, 96);
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(close));
+        mouse(panel, WM_LBUTTONUP, 0, centre(close));
+        assert_eq!(tab_paths(window.hwnd), [Some(a.clone()), Some(c.clone())]);
+
+        let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        mouse(panel, WM_MBUTTONDOWN, 4, centre(row1));
+        mouse(panel, WM_MBUTTONUP, 0, centre(row1));
+        assert_eq!(tab_paths(window.hwnd), [Some(a)]);
+    }
+
+    #[test]
+    fn open_editors_and_the_root_collapse_and_stay_so() {
+        // Break caught: the chevrons doing nothing, the tree still hit-tested while the root is
+        // collapsed, or either state lost (open editors spec §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-collapse");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let header = notebook_view(window.hwnd).editors_header_rect();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+        mouse(panel, WM_LBUTTONUP, 0, centre(header));
+        assert!(!super::open_editors_expanded(window.hwnd));
+        let root = notebook_view(window.hwnd).root_rect();
+        let chevron = crate::window::notebook_layout::root_parts(root, 96).chevron;
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(chevron));
+        mouse(panel, WM_LBUTTONUP, 0, centre(chevron));
+        assert!(!crate::window::library_host::root_expanded(window.hwnd));
+        assert!(!notebook_view(window.hwnd).tree_shown());
+        let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
+        assert!(
+            std::fs::read_to_string(local)
+                .unwrap()
+                .contains("root=collapsed")
+        );
     }
 
     #[test]

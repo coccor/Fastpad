@@ -18,33 +18,18 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 
 // Sizes at 96 DPI.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 const LEFT_PAD: i32 = 24;
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 const GLYPH_BOX: i32 = 16;
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 const GAP: i32 = 6;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 const CLOSE_BOX: i32 = 24;
 /// Segoe MDL2 Assets' Cancel, the tab strip's close glyph.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 const GLYPH_CLOSE: &str = "\u{E711}";
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 const DIRTY_DOT: &str = "\u{25CF}";
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 const LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX;
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
 
 /// One tab as the section shows it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) struct EditorRow {
     pub id: DocumentId,
     /// The file name with its extension, or an untitled tab's label.
@@ -64,10 +49,6 @@ pub(crate) fn unsaved_label(document: &Document) -> String {
 }
 
 /// One row per document, in the order given (the strip's).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn editor_rows<'a>(
     documents: impl Iterator<Item = &'a Document>,
     active: Option<DocumentId>,
@@ -90,7 +71,6 @@ pub(crate) fn editor_rows<'a>(
 }
 
 /// The rows for the window's tabs now. Borrows the App on its own, never nested.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 pub(crate) fn snapshot(hwnd: HWND) -> Vec<EditorRow> {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
@@ -114,10 +94,6 @@ pub(crate) fn accessible_name(row: &EditorRow) -> String {
 }
 
 /// A row's tooltip: the file's full path, or an untitled tab's label.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn tooltip(row: &EditorRow) -> String {
     row.path
         .as_ref()
@@ -125,10 +101,6 @@ pub(crate) fn tooltip(row: &EditorRow) -> String {
 }
 
 /// The close box at a row's right edge.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn close_rect(row: RECT, dpi: u32) -> RECT {
     RECT {
         left: (row.right - scale(CLOSE_BOX, dpi)).max(row.left),
@@ -137,7 +109,6 @@ pub(crate) fn close_rect(row: RECT, dpi: u32) -> RECT {
 }
 
 /// The icon a row (and its drag label) shows.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 pub(crate) fn tree_item(row: &EditorRow) -> TreeItem {
     let extension = row
         .path
@@ -149,25 +120,13 @@ pub(crate) fn tree_item(row: &EditorRow) -> TreeItem {
 
 /// The section's rows and its own list state (scroll, hover, the active row as selected).
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) struct OpenEditors {
     pub rows: Vec<EditorRow>,
     pub list: RowListState,
     /// The pointer is over the hovered row's close box.
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "wired to the panel by a later open editors task")
-    )]
     pub hover_close: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 impl OpenEditors {
     pub(crate) fn new(row_height: i32) -> Self {
         Self {
@@ -195,7 +154,6 @@ impl OpenEditors {
 
 /// Paints one row: the icon, the name, and at the right the dot of a dirty tab or, on hover or
 /// selection, a clean tab's close box.
-#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
 pub(crate) fn draw_editor_row(
     dc: HDC,
     row: &EditorRow,

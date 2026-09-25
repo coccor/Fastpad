@@ -6,6 +6,7 @@
 use super::main_window::{OpenMode, app_ptr};
 use super::side_panel::{UiFonts, ViewPaint, draw_text, point_of};
 use crate::config::FileIconSet;
+use crate::document::DocumentId;
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow};
 use crate::window::commands::CommandId;
 use crate::window::drag_label::{DragLabel, LabelImage};
@@ -14,6 +15,8 @@ use crate::window::icon_sets::images::IconImages;
 use crate::window::icon_sets::{TreeIcon, TreeItem, minimal, tree_icon};
 use crate::window::inline_name::{FieldLayout, InlineName};
 use crate::window::menus::MenuEntry;
+use crate::window::notebook_layout::{self, PanelLayout, ROW_HEIGHT};
+use crate::window::open_editors::OpenEditors;
 use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset, scale};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
@@ -36,21 +39,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, GetSystemMetrics, IDC_ARROW, IDC_NO, KillTimer, LoadCursorW,
-    SM_CXDRAG, SM_CYDRAG, SendMessageW, SetCursor, SetTimer, WM_CAPTURECHANGED, WM_CHAR,
-    WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    GetClientRect, GetCursorPos, GetParent, GetSystemMetrics, IDC_ARROW, IDC_NO, KillTimer,
+    LoadCursorW, SM_CXDRAG, SM_CYDRAG, SendMessageW, SetCursor, SetTimer, WM_CAPTURECHANGED,
+    WM_CHAR, WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_TIMER,
 };
 
 // Sizes at 96 DPI; everything is scaled with `panel::scale`.
-const ROW_HEIGHT: i32 = 26;
-const HEADER_HEIGHT: i32 = 38;
 const INDENT: i32 = 12;
 const LEFT_PAD: i32 = 8;
 const GLYPH_BOX: i32 = 16;
 const GAP: i32 = 6;
 const PIN_BOX: i32 = 24;
-const HEADER_BUTTON: i32 = 28;
 const TYPE_AHEAD_RESET: Duration = Duration::from_secs(1);
 
 pub(crate) const TRUNCATED_ROW: &str = "Showing the first 10,000 notes";
@@ -130,8 +131,17 @@ enum RowPart {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Hit {
+    /// The Open Editors header row: toggles the section.
+    EditorsHeader,
+    /// An Open Editors row; `close` on a clean tab's close box.
+    Editor {
+        index: usize,
+        close: bool,
+    },
+    /// The root row's chevron or name: toggles the tree.
+    Root,
+    /// A root row button.
     Header(HeaderButton),
-    Title,
     /// "Open notebook…" (no notebook), "New note" (empty notebook) or "Retry" (failed load).
     StateButton,
     /// "Open notebook…" under "Retry", after a failed load.
@@ -199,48 +209,6 @@ pub(crate) fn row_parts(row: RECT, depth: u16, dpi: u32) -> RowParts {
         icon,
         name,
         pin,
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct HeaderLayout {
-    pub title: RECT,
-    /// Left to right: star, New note, New folder, "…".
-    pub buttons: [(HeaderButton, RECT); 4],
-}
-
-pub(crate) fn header_layout(area: RECT, dpi: u32) -> HeaderLayout {
-    let height = scale(HEADER_HEIGHT, dpi);
-    let size = scale(HEADER_BUTTON, dpi);
-    let top = area.top + (height - size) / 2;
-    let right = area.right - scale(6, dpi);
-    let slot = |from_right: i32| RECT {
-        left: right - (from_right + 1) * size,
-        top,
-        right: right - from_right * size,
-        bottom: top + size,
-    };
-    let buttons = [
-        (HeaderButton::Favorite, slot(3)),
-        (HeaderButton::NewNote, slot(2)),
-        (HeaderButton::NewFolder, slot(1)),
-        (HeaderButton::More, slot(0)),
-    ];
-    let title_left = area.left + scale(12, dpi);
-    let title = RECT {
-        left: title_left,
-        top: area.top,
-        right: (buttons[0].1.left - scale(4, dpi)).max(title_left),
-        bottom: area.top + height,
-    };
-    HeaderLayout { title, buttons }
-}
-
-/// Everything below the header.
-pub(crate) fn body_rect(area: RECT, dpi: u32) -> RECT {
-    RECT {
-        top: (area.top + scale(HEADER_HEIGHT, dpi)).min(area.bottom),
-        ..area
     }
 }
 
@@ -358,6 +326,8 @@ struct RebuildKey {
     failed: bool,
     /// `library_host::expansion_revision`, bumped whenever a folder is expanded or collapsed.
     expansion: u64,
+    /// `library_host::root_expanded`: collapsing the root row is a rebuild.
+    root_expanded: bool,
 }
 
 /// The Notebook view's state, owned by `side_panel::Sidebar`.
@@ -399,6 +369,14 @@ pub(crate) struct NotebookView {
     pub(crate) inline: InlineName,
     /// The tree's Material bitmaps, made on first draw (icon sets spec §6).
     images: IconImages,
+    /// The Open Editors section's rows (open editors spec §3.2).
+    pub(crate) editors: OpenEditors,
+    /// The Open Editors section is expanded (`main_window::open_editors_expanded`).
+    editors_expanded: bool,
+    /// The notebook's root row is expanded (`library_host::root_expanded`).
+    root_expanded: bool,
+    /// The tab under a middle press on an Open Editors row: its release there closes it.
+    middle_press: Option<DocumentId>,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -789,6 +767,10 @@ impl NotebookView {
             order: 0,
             inline: InlineName::new(),
             images: IconImages::new(),
+            editors: OpenEditors::new(scale(ROW_HEIGHT, dpi)),
+            editors_expanded: true,
+            root_expanded: true,
+            middle_press: None,
             #[cfg(test)]
             rebuilds: 0,
         }
@@ -797,15 +779,36 @@ impl NotebookView {
     /// The list's rectangle for the current mode, in the panel's `client` coordinates at `dpi`:
     /// the tree rows, the RECENT rows, or an empty band while there are none.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
-        let body = body_rect(client, dpi);
+        let body = self.layout(client, dpi).body;
+        let empty = RECT {
+            bottom: body.top,
+            ..body
+        };
         match self.mode {
-            Mode::Tree => body,
+            Mode::Tree if self.root_expanded => body,
             Mode::NoNotebook => state_layout(body, dpi).list,
-            Mode::Loading | Mode::Empty | Mode::Failed => RECT {
-                bottom: body.top,
-                ..body
-            },
+            _ => empty,
         }
+    }
+
+    /// The panel's bands for the view as it is (open editors spec §3.1).
+    pub(crate) fn layout(&self, client: RECT, dpi: u32) -> PanelLayout {
+        notebook_layout::panel_layout(client, dpi, self.editors.rows.len(), self.editors_expanded)
+    }
+
+    /// The tree is painted and hit: loaded rows under an expanded root.
+    pub(crate) fn tree_shown(&self) -> bool {
+        self.mode == Mode::Tree && self.root_expanded
+    }
+
+    fn editors_row_rect(&self, list: RECT, index: usize) -> Option<RECT> {
+        let top = self.editors.list.row_top(index)?;
+        Some(RECT {
+            left: list.left,
+            top: list.top + top,
+            right: list.right,
+            bottom: list.top + top + self.editors.list.row_height,
+        })
     }
 
     fn dpi(&self) -> u32 {
@@ -849,7 +852,7 @@ impl NotebookView {
     /// edited row's name, clipped to the list. `None` while nothing is edited or the row is out
     /// of view.
     fn inline_layout_in(&self, area: RECT, dpi: u32) -> Option<FieldLayout> {
-        if self.mode != Mode::Tree {
+        if !self.tree_shown() {
             return None;
         }
         let index = self.inline.row()?;
@@ -894,6 +897,25 @@ impl NotebookView {
     #[cfg(test)]
     pub(crate) fn row_rect_at(&self, index: usize) -> Option<RECT> {
         self.row_rect(self.list_rect(self.client()), index)
+    }
+
+    /// Open Editors row `index`'s rectangle in panel coordinates, for tests that click it.
+    #[cfg(test)]
+    pub(crate) fn editor_rect_at(&self, index: usize) -> Option<RECT> {
+        let list = self.layout(self.client(), self.dpi()).editors_list;
+        self.editors_row_rect(list, index)
+    }
+
+    /// The Open Editors header row, in panel coordinates.
+    #[cfg(test)]
+    pub(crate) fn editors_header_rect(&self) -> RECT {
+        self.layout(self.client(), self.dpi()).editors_header
+    }
+
+    /// The notebook's root row, in panel coordinates.
+    #[cfg(test)]
+    pub(crate) fn root_rect(&self) -> RECT {
+        self.layout(self.client(), self.dpi()).root
     }
 
     /// A point on the scroll thumb in panel coordinates, while the list scrolls: its left edge,
@@ -1039,6 +1061,8 @@ impl NotebookView {
             self.order = self.order.wrapping_add(1);
         }
         self.mode = snapshot.mode;
+        self.root_expanded = snapshot.root_expanded;
+        self.editors_expanded = snapshot.editors_expanded;
         self.name = snapshot
             .root
             .as_deref()
@@ -1074,23 +1098,39 @@ impl NotebookView {
     fn hit_test(&self, x: i32, y: i32) -> Hit {
         let area = self.client();
         let dpi = self.dpi();
-        if y < area.top + scale(HEADER_HEIGHT, dpi) {
-            let header = header_layout(area, dpi);
+        let layout = self.layout(area, dpi);
+        if y < layout.title.bottom {
+            return Hit::Empty;
+        }
+        if contains(layout.editors_header, x, y) {
+            return Hit::EditorsHeader;
+        }
+        if contains(layout.editors_list, x, y) {
+            let Some(index) = self.editors.list.row_at(y - layout.editors_list.top) else {
+                return Hit::Empty;
+            };
+            let row = self.editors_row_rect(layout.editors_list, index);
+            let clean = self.editors.rows.get(index).is_some_and(|row| !row.dirty);
+            let close = clean
+                && row.is_some_and(|row| contains(super::open_editors::close_rect(row, dpi), x, y));
+            return Hit::Editor { index, close };
+        }
+        if contains(layout.root, x, y) {
             if self.mode != Mode::NoNotebook {
-                for (button, rect) in header.buttons {
+                let parts = notebook_layout::root_parts(layout.root, dpi);
+                for (button, rect) in parts.buttons {
                     if contains(rect, x, y) {
                         return Hit::Header(button);
                     }
                 }
+                return Hit::Root;
             }
-            return if contains(header.title, x, y) {
-                Hit::Title
-            } else {
-                Hit::Empty
-            };
+            return Hit::Empty;
         }
-        let body = body_rect(area, dpi);
+        let body = layout.body;
         match self.mode {
+            // The states under a collapsed root are not painted.
+            Mode::Empty | Mode::Failed if !self.root_expanded => Hit::Empty,
             Mode::NoNotebook | Mode::Empty | Mode::Failed => {
                 let layout = state_layout(body, dpi);
                 if contains(layout.button, x, y) {
@@ -1111,6 +1151,7 @@ impl NotebookView {
                 Hit::Empty
             }
             Mode::Loading => Hit::Empty,
+            Mode::Tree if !self.tree_shown() => Hit::Empty,
             Mode::Tree => {
                 let list = self.list_rect(area);
                 if let Some(grab) = self.list.thumb_hit(
@@ -1148,6 +1189,17 @@ impl NotebookView {
         let area = self.client();
         if self.mode != Mode::Tree || !contains(area, x, y) {
             return Hover::Outside;
+        }
+        // The title band and Open Editors take no drop; the root row is the notebook's root.
+        let layout = self.layout(area, self.dpi());
+        if y < layout.root.top {
+            return Hover::Outside;
+        }
+        if y < layout.root.bottom {
+            return Hover::Header;
+        }
+        if !self.tree_shown() {
+            return Hover::Below;
         }
         let list = self.list_rect(area);
         if y < list.top {
@@ -1285,7 +1337,9 @@ impl NotebookView {
     /// no tip.
     fn tooltip_tools(&mut self, fonts: UiFonts) -> Vec<(usize, RECT, String)> {
         let area = self.client();
-        let header = header_layout(area, self.dpi());
+        let dpi = self.dpi();
+        let layout = self.layout(area, dpi);
+        let parts = notebook_layout::root_parts(layout.root, dpi);
         let title = self
             .root
             .as_ref()
@@ -1297,9 +1351,18 @@ impl NotebookView {
             "Add to favorites"
         };
         let buttons_shown = self.mode != Mode::NoNotebook;
-        let (row_rect, row_text) = self.row_tip(fonts);
-        let mut tools = vec![(TOOL_TITLE, header.title, title)];
-        for (button, rect) in header.buttons {
+        // An Open Editors row shows its path; a tree row its cut-off name.
+        let editor_tip = self.editors.list.hover.and_then(|index| {
+            let rect = self.editors_row_rect(layout.editors_list, index)?;
+            let row = self.editors.rows.get(index)?;
+            Some((rect, super::open_editors::tooltip(row)))
+        });
+        let (row_rect, row_text) = match editor_tip {
+            Some(tip) => tip,
+            None => self.row_tip(fonts),
+        };
+        let mut tools = vec![(TOOL_TITLE, parts.name, title)];
+        for (button, rect) in parts.buttons {
             let (id, text) = match button {
                 HeaderButton::Favorite => (TOOL_FAVORITE, favorite),
                 HeaderButton::NewNote => (TOOL_NEW, "New note"),
@@ -1323,10 +1386,14 @@ impl NotebookView {
         );
         let palette = &paint.palette;
         self.list.row_height = scale(ROW_HEIGHT, dpi);
-        self.paint_header(dc, area, palette, fonts, dpi);
-        let body = body_rect(area, dpi);
-        let layout = state_layout(body, dpi);
+        self.editors.list.row_height = scale(ROW_HEIGHT, dpi);
+        let sections = self.layout(area, dpi);
+        self.paint_sections(paint, sections);
+        let layout = state_layout(sections.body, dpi);
         match self.mode {
+            // The states under the root show only while it is expanded; without a notebook there
+            // is no root to collapse.
+            Mode::Loading | Mode::Empty | Mode::Failed | Mode::Tree if !self.root_expanded => {}
             Mode::Loading => {
                 unsafe {
                     draw_text(
@@ -1486,43 +1553,118 @@ impl NotebookView {
         }
     }
 
-    fn paint_header(&self, dc: HDC, area: RECT, palette: &Palette, fonts: UiFonts, dpi: u32) {
-        let layout = header_layout(area, dpi);
-        let title = match self.mode {
-            Mode::NoNotebook => "NOTEBOOK".to_owned(),
-            _ => self.name.to_uppercase(),
+    fn paint_sections(&mut self, paint: &ViewPaint, layout: PanelLayout) {
+        let (dc, palette, fonts, dpi) = (paint.hdc, &paint.palette, paint.fonts, paint.dpi);
+        let bold = |text: &str, rect: RECT, color: u32| unsafe {
+            draw_text(dc, text, rect, fonts.bold, color, LINE)
+        };
+        let title = RECT {
+            left: layout.title.left + scale(12, dpi),
+            ..layout.title
+        };
+        bold("NOTEBOOK", title, palette.muted_foreground);
+        // Open Editors header: chevron, label and count.
+        let chevron = notebook_layout::section_chevron(layout.editors_header, dpi);
+        let glyph = if self.editors_expanded {
+            GLYPH_CHEVRON_DOWN
+        } else {
+            GLYPH_CHEVRON_RIGHT
         };
         unsafe {
             draw_text(
                 dc,
-                &title,
-                layout.title,
-                fonts.bold,
+                glyph,
+                chevron,
+                fonts.glyph,
                 palette.muted_foreground,
-                LINE,
+                CENTERED,
             )
         };
+        let label = RECT {
+            left: chevron.right,
+            ..layout.editors_header
+        };
+        let count = self.editors.rows.len();
+        bold(
+            &format!("OPEN EDITORS  {count}"),
+            label,
+            palette.muted_foreground,
+        );
+        // The rows.
+        let editors = &self.editors;
+        let images = &mut self.images;
+        let hover_close = editors.hover_close;
+        row_list::paint(
+            dc,
+            layout.editors_list,
+            &editors.list,
+            palette,
+            paint.focused,
+            &mut |dc, index, rect, look| {
+                if let Some(row) = editors.rows.get(index) {
+                    super::open_editors::draw_editor_row(
+                        dc,
+                        row,
+                        rect,
+                        look,
+                        paint,
+                        images,
+                        hover_close && look.hover,
+                    );
+                }
+            },
+        );
+        // The root row: chevron, name, and its buttons (not without a notebook).
+        let parts = notebook_layout::root_parts(layout.root, dpi);
         if self.mode == Mode::NoNotebook {
-            return;
-        }
-        for (button, rect) in layout.buttons {
-            let hot = self.hover == Some(Hit::Header(button));
-            if hot {
-                unsafe { fill(dc, rect, palette.hover_background) };
-            }
-            let glyph = match button {
-                HeaderButton::Favorite if self.favorite => GLYPH_STAR_FILLED,
-                HeaderButton::Favorite => GLYPH_STAR,
-                HeaderButton::NewNote => GLYPH_ADD,
-                HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
-                HeaderButton::More => GLYPH_MORE,
-            };
-            let color = if hot {
-                palette.hover_foreground
+            bold(
+                "NO NOTEBOOK",
+                RECT {
+                    left: parts.chevron.right,
+                    ..layout.root
+                },
+                palette.muted_foreground,
+            );
+        } else {
+            let glyph = if self.root_expanded {
+                GLYPH_CHEVRON_DOWN
             } else {
-                palette.muted_foreground
+                GLYPH_CHEVRON_RIGHT
             };
-            unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
+            unsafe {
+                draw_text(
+                    dc,
+                    glyph,
+                    parts.chevron,
+                    fonts.glyph,
+                    palette.muted_foreground,
+                    CENTERED,
+                )
+            };
+            bold(
+                &self.name.to_uppercase(),
+                parts.name,
+                palette.muted_foreground,
+            );
+            for (button, rect) in parts.buttons {
+                let hot = self.hover == Some(Hit::Header(button));
+                if hot {
+                    unsafe { fill(dc, rect, palette.hover_background) };
+                }
+                let glyph = match button {
+                    HeaderButton::Favorite if self.favorite => GLYPH_STAR_FILLED,
+                    HeaderButton::Favorite => GLYPH_STAR,
+                    HeaderButton::NewNote => GLYPH_ADD,
+                    HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
+                    HeaderButton::More => GLYPH_MORE,
+                };
+                let color = if hot {
+                    palette.hover_foreground
+                } else {
+                    palette.muted_foreground
+                };
+                unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
+            }
         }
     }
 
@@ -1595,7 +1737,8 @@ impl NotebookView {
     pub(crate) fn buttons(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
         let mut buttons = Vec::new();
         if self.mode != Mode::NoNotebook {
-            for (button, rect) in header_layout(client, dpi).buttons {
+            let root = self.layout(client, dpi).root;
+            for (button, rect) in notebook_layout::root_parts(root, dpi).buttons {
                 let name = match button {
                     HeaderButton::Favorite if self.favorite => "Remove from favorites",
                     HeaderButton::Favorite => "Add to favorites",
@@ -1606,8 +1749,10 @@ impl NotebookView {
                 buttons.push((name.to_owned(), rect));
             }
         }
-        let state = state_layout(body_rect(client, dpi), dpi);
+        let state = state_layout(self.layout(client, dpi).body, dpi);
         match self.mode {
+            // The states under a collapsed root are not painted.
+            Mode::Empty | Mode::Failed if !self.root_expanded => {}
             Mode::NoNotebook => buttons.push(("Open notebook…".to_owned(), state.button)),
             Mode::Empty => buttons.push(("New note".to_owned(), state.button)),
             Mode::Failed => {
@@ -1637,6 +1782,10 @@ struct Snapshot {
     recent: Vec<PathBuf>,
     root: Option<PathBuf>,
     favorite: bool,
+    /// The notebook's root row is expanded (true without a notebook).
+    root_expanded: bool,
+    /// The Open Editors section is expanded.
+    editors_expanded: bool,
     key: RebuildKey,
 }
 
@@ -1656,12 +1805,14 @@ fn rebuild_key(hwnd: HWND) -> RebuildKey {
         loaded: super::library_host::with_state(hwnd, |_| ()).is_some(),
         failed: super::library_host::load_failed(hwnd),
         expansion: super::library_host::expansion_revision(hwnd),
+        root_expanded: super::library_host::root_expanded(hwnd),
     }
 }
 
 /// Reads everything the rows need. Each call borrows the App on its own, never nested.
 fn snapshot(hwnd: HWND) -> Snapshot {
     let key = rebuild_key(hwnd);
+    let editors_expanded = super::main_window::open_editors_expanded(hwnd);
     let Some(root) = key.root.clone() else {
         return Snapshot {
             mode: Mode::NoNotebook,
@@ -1670,6 +1821,8 @@ fn snapshot(hwnd: HWND) -> Snapshot {
             recent: super::library_host::recent_notebooks(hwnd),
             root: None,
             favorite: false,
+            root_expanded: true,
+            editors_expanded,
             key,
         };
     };
@@ -1691,6 +1844,8 @@ fn snapshot(hwnd: HWND) -> Snapshot {
         recent: Vec::new(),
         root: Some(root),
         favorite,
+        root_expanded: key.root_expanded,
+        editors_expanded,
         key,
     }
 }
@@ -1738,6 +1893,30 @@ pub(crate) fn rebuild(hwnd: HWND) {
     super::inline_name::place(hwnd);
 }
 
+/// The tabs changed in some way the Open Editors rows show (a tab opened, closed, switched,
+/// renamed, saved, made dirty or clean): the rows follow, and the panel repaints only if they
+/// changed. Cheap: the tab list in memory, no rebuild of the tree.
+pub(crate) fn editors_changed(hwnd: HWND) {
+    let rows = super::open_editors::snapshot(hwnd);
+    let changed = with_view(hwnd, |view| {
+        let changed = view.editors.set_rows(rows);
+        if changed {
+            let area = view.client();
+            let height = height(view.layout(area, view.dpi()).editors_list);
+            if let Some(active) = view.editors.active_index() {
+                view.editors.list.ensure_visible(active, height);
+            }
+            view.invalidate();
+        }
+        changed
+    })
+    .unwrap_or(false);
+    // A row more or less moves the tree, and an inline field with it (inline naming spec §5.4).
+    if changed {
+        super::inline_name::place(hwnd);
+    }
+}
+
 /// The row for the active tab: its note inside the open notebook. `None` for an untitled tab.
 fn active_target(hwnd: HWND) -> Option<RowKind> {
     let root = super::library_host::folder(hwnd)?;
@@ -1760,6 +1939,7 @@ pub(crate) fn stale(hwnd: HWND) -> bool {
 /// something the rows depend on changed (a folder newly expanded, another notebook); otherwise
 /// the row is just selected.
 pub(crate) fn active_tab_changed(hwnd: HWND) {
+    editors_changed(hwnd);
     let target = active_target(hwnd);
     if let Some(RowKind::Note(relative)) = &target {
         for folder in tree::ancestors(relative) {
@@ -1785,15 +1965,6 @@ pub(crate) fn active_tab_changed(hwnd: HWND) {
 /// has already filled its background.
 pub(crate) fn paint(hwnd: HWND, paint: &ViewPaint) {
     with_view(hwnd, |view| view.paint(paint));
-}
-
-/// Whether panel point (`x`, `y`) is over the header's name or a header button, which must stay
-/// client area. The rest of the header is a window drag area (spec §6.5).
-pub(crate) fn header_hit(hwnd: HWND, x: i32, y: i32) -> bool {
-    with_view(hwnd, |view| {
-        matches!(view.hit_test(x, y), Hit::Header(_) | Hit::Title)
-    })
-    .unwrap_or(false)
 }
 
 /// Runs a main-window command as the menus do.
@@ -2049,6 +2220,8 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             with_view(hwnd, |view| {
                 view.tracking_leave = false;
                 view.list.hover = None;
+                view.editors.list.hover = None;
+                view.editors.hover_close = false;
                 view.hover = None;
                 view.hover_pin = false;
                 view.invalidate();
@@ -2058,6 +2231,29 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_LBUTTONDOWN => {
             let (x, y) = point_of(lparam);
             left_down(hwnd, x, y);
+            Some(0)
+        }
+        WM_MBUTTONDOWN => {
+            let (x, y) = point_of(lparam);
+            let pressed = with_view(hwnd, |view| match view.hit_test(x, y) {
+                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                _ => None,
+            })
+            .flatten();
+            with_view(hwnd, |view| view.middle_press = pressed);
+            Some(0)
+        }
+        WM_MBUTTONUP => {
+            let (x, y) = point_of(lparam);
+            let pressed = with_view(hwnd, |view| view.middle_press.take()).flatten();
+            let released = with_view(hwnd, |view| match view.hit_test(x, y) {
+                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                _ => None,
+            })
+            .flatten();
+            if let Some(id) = pressed.filter(|id| Some(*id) == released) {
+                super::main_window::close_document_tab(hwnd, id);
+            }
             Some(0)
         }
         WM_LBUTTONUP => {
@@ -2129,7 +2325,18 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_MOUSEWHEEL => {
             let delta = i32::from((wparam >> 16) as u16 as i16);
             let lines = row_list::wheel_lines();
+            // Over the Open Editors rows the section scrolls; anywhere else the tree does.
+            let mut pointer = POINT::default();
+            unsafe { GetCursorPos(&mut pointer) };
             let scrolled = with_view(hwnd, |view| {
+                unsafe { ScreenToClient(view.panel, &mut pointer) };
+                let editors = view.layout(view.client(), view.dpi()).editors_list;
+                if contains(editors, pointer.x, pointer.y) {
+                    if view.editors.list.wheel(delta, lines, height(editors)) {
+                        view.invalidate();
+                    }
+                    return false;
+                }
                 let height = view.list_height();
                 let scrolled = view.list.wheel(delta, lines, height);
                 if scrolled {
@@ -2169,11 +2376,25 @@ fn mouse_move(hwnd: HWND, x: i32, y: i32) {
             Hit::Row { index, part } => (Some(index), part == RowPart::Pin),
             _ => (None, false),
         };
-        let hot =
-            matches!(hit, Hit::Header(_) | Hit::StateButton | Hit::SecondButton).then_some(hit);
+        let (editor, close) = match hit {
+            Hit::Editor { index, close } => (Some(index), close),
+            _ => (None, false),
+        };
+        let hot = matches!(
+            hit,
+            Hit::Header(_) | Hit::StateButton | Hit::SecondButton | Hit::EditorsHeader | Hit::Root
+        )
+        .then_some(hit);
         let row_changed = view.list.set_hover(row);
-        if row_changed || view.hover_pin != pin || view.hover != hot {
+        let editor_changed = view.editors.list.set_hover(editor);
+        if row_changed
+            || editor_changed
+            || view.hover_pin != pin
+            || view.editors.hover_close != close
+            || view.hover != hot
+        {
             view.hover_pin = pin;
+            view.editors.hover_close = close;
             view.hover = hot;
             view.invalidate();
             return (Some(view.tooltip_tools(fonts)), false);
@@ -2556,6 +2777,27 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
         return;
     };
     match hit {
+        Hit::EditorsHeader => {
+            let expanded = with_view(hwnd, |view| view.editors_expanded).unwrap_or(true);
+            super::main_window::set_open_editors_expanded(hwnd, !expanded);
+            rebuild(hwnd);
+        }
+        Hit::Editor { index, close } => {
+            let Some(row) = with_view(hwnd, |view| view.editors.rows.get(index).cloned()).flatten()
+            else {
+                return;
+            };
+            if close {
+                super::main_window::close_document_tab(hwnd, row.id);
+            } else {
+                super::main_window::activate_document_by_id(hwnd, row.id);
+            }
+        }
+        Hit::Root => {
+            let expanded = super::library_host::root_expanded(hwnd);
+            super::library_host::set_root_expanded(hwnd, !expanded);
+            rebuild(hwnd);
+        }
         Hit::Header(button) => header_clicked(hwnd, button),
         Hit::StateButton => state_button(hwnd),
         Hit::SecondButton => super::library_host::choose_and_open_folder(hwnd),
@@ -2587,7 +2829,7 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
                 arm_drag(hwnd, source, x, y);
             }
         }
-        Hit::Title | Hit::Empty => {}
+        Hit::Empty => {}
     }
 }
 
@@ -2683,7 +2925,9 @@ pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
 /// "…": the notebook's own actions.
 fn more_menu(hwnd: HWND) {
     let Some(at) = with_view(hwnd, |view| {
-        let rect = header_layout(view.client(), view.dpi()).buttons[3].1;
+        let dpi = view.dpi();
+        let root = view.layout(view.client(), dpi).root;
+        let rect = notebook_layout::root_parts(root, dpi).buttons[3].1;
         view.to_main(POINT {
             x: rect.left,
             y: rect.bottom,
@@ -3006,43 +3250,6 @@ mod tests {
         );
         assert!(cramped.name.left <= cramped.name.right);
         assert_eq!(row_parts(rect, 1, 192).chevron.left, 16 + 24);
-    }
-
-    #[test]
-    fn the_header_buttons_sit_right_to_left_and_the_title_stops_before_them() {
-        // Break caught: the notebook name drawn under the star, or buttons that do not follow
-        // the panel's right edge when it is resized.
-        let area = RECT {
-            left: 0,
-            top: 0,
-            right: 260,
-            bottom: 600,
-        };
-        let layout = header_layout(area, 96);
-        let [
-            (first, star),
-            (second, new),
-            (third, folder),
-            (fourth, more),
-        ] = layout.buttons;
-        assert_eq!(
-            (first, second, third, fourth),
-            (
-                HeaderButton::Favorite,
-                HeaderButton::NewNote,
-                HeaderButton::NewFolder,
-                HeaderButton::More
-            )
-        );
-        assert_eq!(edges(more), (226, 5, 254, 33));
-        assert_eq!(
-            (star.right, new.right, folder.right),
-            (new.left, folder.left, more.left),
-            "New folder sits right of New note"
-        );
-        assert!(layout.title.right <= star.left);
-        assert_eq!(layout.title.bottom, 38);
-        assert_eq!(body_rect(area, 96).top, 38);
     }
 
     #[test]

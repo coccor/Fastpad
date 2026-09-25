@@ -43,9 +43,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     OBJID_CLIENT, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor,
     SetWindowPos, ShowWindow, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
     WM_CTLCOLOREDIT, WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_VISIBLE,
 };
 
 /// Sizes at 96 DPI, scaled with `panel::scale`.
@@ -555,6 +556,7 @@ fn refresh_now(hwnd: HWND) {
     let Some((bar, panel)) = windows(hwnd) else {
         return;
     };
+    crate::window::notebook_view::editors_changed(hwnd);
     crate::window::notebook_view::rebuild(hwnd);
     crate::window::favorites_view::refresh(hwnd, panel);
     crate::window::search_view::library_changed(hwnd);
@@ -975,6 +977,8 @@ unsafe extern "system" fn panel_proc(
             | WM_LBUTTONDOWN
             | WM_LBUTTONUP
             | WM_LBUTTONDBLCLK
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
             | WM_MOUSEWHEEL
             | WM_COMMAND
             | sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACTION
@@ -1036,8 +1040,10 @@ unsafe extern "system" fn panel_proc(
         // Everything else a view may want goes to it first. Wheel and context-menu positions are
         // screen coordinates; the view converts them.
         WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_CAPTURECHANGED
-        | WM_MOUSELEAVE | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_CONTEXTMENU | WM_MOUSEWHEEL
-        | WM_KEYDOWN | WM_CHAR | WM_TIMER => route(main, panel, message, wparam, lparam),
+        | WM_MOUSELEAVE | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP
+        | WM_CONTEXTMENU | WM_MOUSEWHEEL | WM_KEYDOWN | WM_CHAR | WM_TIMER => {
+            route(main, panel, message, wparam, lparam)
+        }
         WM_SETFOCUS | WM_KILLFOCUS => {
             unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
             0
@@ -1117,7 +1123,12 @@ fn paint_panel(main: HWND, panel: HWND) {
 /// Paints `view` over the panel's background.
 fn paint_view(main: HWND, view: PanelView, paint: &ViewPaint) {
     match view {
-        PanelView::Notebook => crate::window::notebook_view::paint(main, paint),
+        PanelView::Notebook => {
+            // A paint never shows stale rows. `editors_changed` repaints only when they changed,
+            // so this doesn't loop.
+            crate::window::notebook_view::editors_changed(main);
+            crate::window::notebook_view::paint(main, paint);
+        }
         PanelView::Search => crate::window::search_view::paint(main, paint),
         PanelView::Favorites => crate::window::favorites_view::paint(main, paint),
     }
@@ -1158,11 +1169,11 @@ fn view_key(
 }
 
 /// Whether header point `x`, `y` (panel client coordinates) is empty, so the window drags from
-/// it: not the Notebook header's title and buttons, the Search header's field (the search box
+/// it: all of the Notebook view's title band, but not the Search header's field (the search box
 /// and the padding painted around it), nor the Favorites header's Open notebook… button.
 fn header_is_caption(main: HWND, view: PanelView, panel: HWND, x: i32, y: i32) -> bool {
     match view {
-        PanelView::Notebook => !crate::window::notebook_view::header_hit(main, x, y),
+        PanelView::Notebook => true,
         PanelView::Search => !crate::window::search_view::header_hit(main, panel, x, y),
         PanelView::Favorites => {
             let mut client = RECT::default();

@@ -8,43 +8,15 @@ use crate::window::side_panel::HEADER_HEIGHT_96;
 use windows_sys::Win32::Foundation::RECT;
 
 /// Every row's height at 96 DPI: section headers, Open Editors rows and tree rows alike.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) const ROW_HEIGHT: i32 = 26;
 /// Open Editors rows visible before the section scrolls on its own (spec §3.1).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) const MAX_EDITOR_ROWS: usize = 9;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 const ROOT_BUTTON: i32 = 22;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 const CHEVRON_LEFT: i32 = 4;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 const CHEVRON: i32 = 16;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 const RIGHT_PAD: i32 = 6;
 
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) struct PanelLayout {
     /// The view's name, in the window's title strip: all caption.
     pub title: RECT,
@@ -59,10 +31,6 @@ pub(crate) struct PanelLayout {
 
 /// The panel's bands for `client` at `dpi`, with `editors` tabs, stacked from the top and cut at
 /// the panel's bottom edge, so a short panel never turns a band inside out.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn panel_layout(
     client: RECT,
     dpi: u32,
@@ -96,10 +64,6 @@ pub(crate) fn panel_layout(
 }
 
 /// A section header row's chevron.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn section_chevron(row: RECT, dpi: u32) -> RECT {
     let left = (row.left + scale(CHEVRON_LEFT, dpi)).min(row.right);
     RECT {
@@ -111,10 +75,6 @@ pub(crate) fn section_chevron(row: RECT, dpi: u32) -> RECT {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) struct RootParts {
     pub chevron: RECT,
     pub name: RECT,
@@ -123,10 +83,6 @@ pub(crate) struct RootParts {
 }
 
 /// The root row's chevron, the notebook's name after it, and its four buttons at the right.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn root_parts(row: RECT, dpi: u32) -> RootParts {
     let chevron = section_chevron(row, dpi);
     let size = scale(ROOT_BUTTON, dpi);
