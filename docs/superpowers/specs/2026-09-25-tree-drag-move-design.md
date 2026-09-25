@@ -51,6 +51,7 @@ While dragging:
 
 - An accepted target is highlighted: the target folder's row and the rows of its visible children, or the whole list for the root. The highlight uses the theme's selection colour at reduced strength. In high contrast it uses the system highlight colour as an outline.
 - The dragged row stays drawn where it is, dimmed.
+- A label follows the pointer, over the editor too: the dragged row's icon and name on the hover colour with a 1 px (scaled) muted border, about 85% opaque, and in high contrast the system window colours only. It sits right of and below the pointer, flips to the left or above near a monitor's edge, and cuts a long name with an ellipsis at 300 px (scaled). It is a layered popup that never takes a click or the focus; it is made when the drag starts and destroyed however the drag ends.
 - The cursor is the normal arrow over an accepted target and the "no" cursor (`IDC_NO`) over a refused target or no target.
 
 ### 3.3 While dragging
@@ -138,6 +139,7 @@ All notices use the existing notice bar (`main_window::push_notice`).
   - a release over a refused target moves nothing;
   - Esc, a right-button press and `WM_CAPTURECHANGED` cancel with nothing moved;
   - the cursor is `IDC_NO` over a refused target;
+  - a label with the dragged name follows the pointer, and every way a drag ends destroys it;
   - the timer auto-expands a collapsed folder and auto-scrolls near an edge, and it's killed when the drag ends;
   - a drag can't start while a refused name edit stays open.
 - **Docs:** the notebook folders spec §8 no longer lists drag and drop, and points here. The README describes dragging in the tree.
@@ -158,3 +160,4 @@ All notices use the existing notice bar (`main_window::push_notice`).
 - **Highlight colours:** the band uses the theme's inactive-selection colour; in high contrast, a 1 px (scaled) outline in the system highlight colour.
 - **Shared move code:** the inline renames and the drop use the same moves (`window::tree_move`), so a rename and a move fail, undo and report stuck tabs the same way. A move whose undo failed names the new path in the existing "could not undo renaming" notice.
 - **A right press that cancels a drag** swallows its release, so no context menu opens.
+- **The drag label** (added after the first review, §3.2) is painted once into a bitmap when the drag starts, with the tree's own icon code (`draw_item_icon`), and the popup (`window::drag_label`) only moves after that. Its window class is registered at the first drag, so nothing runs before first paint.

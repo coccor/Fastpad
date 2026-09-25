@@ -2,6 +2,7 @@ pub(crate) mod accessibility;
 pub(crate) mod activity_bar;
 pub(crate) mod command_palette;
 pub mod commands;
+pub(crate) mod drag_label;
 pub(crate) mod favorites_view;
 pub(crate) mod file_icons;
 pub mod find_bar;

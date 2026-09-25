@@ -19116,6 +19116,118 @@ mod tests {
     }
 
     #[test]
+    fn tree_drag_a_label_with_the_name_follows_the_pointer_until_the_drag_ends() {
+        // Break caught: a drag with nothing following the pointer, a label that takes the focus
+        // or clicks, one left on screen after a drop or a cancel, or one shown for a click
+        // (tree drag spec §3.2).
+        use crate::window::drag_label::{place, work_area};
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetFocus, ReleaseCapture, SetCapture, VK_ESCAPE,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongW, GetWindowRect, GetWindowTextW, IsWindow, IsWindowVisible,
+            WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+            WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-label");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let label = || {
+            notebook_view(window.hwnd)
+                .drag_label
+                .map(|label| label.hwnd())
+        };
+        let text = |label: HWND| {
+            let mut buffer = [0u16; 64];
+            let length = unsafe { GetWindowTextW(label, buffer.as_mut_ptr(), 64) };
+            String::from_utf16_lossy(&buffer[..length as usize])
+        };
+        let point = |lparam: super::LPARAM| ((lparam & 0xffff) as i32, (lparam >> 16) as i32);
+        // Where the label should be for the pointer at panel `lparam`.
+        let expected = |label: HWND, lparam: super::LPARAM| {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(label, &mut rect) };
+            let (x, y) = point(lparam);
+            let mut pointer = POINT { x, y };
+            unsafe { ClientToScreen(panel, &mut pointer) };
+            let size = windows_sys::Win32::Foundation::SIZE {
+                cx: rect.right - rect.left,
+                cy: rect.bottom - rect.top,
+            };
+            let at = place(pointer, size, work_area(pointer), unsafe {
+                GetDpiForWindow(panel)
+            });
+            ((rect.left, rect.top), (at.x, at.y))
+        };
+        let a = row_lparam(window.hwnd, &RowKind::Note("a.md".into()));
+        let work = || row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+        let (x, y) = point(a);
+        mouse(panel, WM_LBUTTONDOWN, 1, a);
+        mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x + 1, y + 1));
+        assert!(label().is_none(), "a click shows no label");
+        drop_at(panel, client_lparam(x + 1, y + 1));
+
+        // The click may have moved the rows: start_drag presses where the row is now.
+        let (x, y) = point(row_lparam(window.hwnd, &RowKind::Note("a.md".into())));
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        let shown = label().expect("the drag shows a label");
+        assert!(unsafe { IsWindowVisible(shown) } != 0);
+        assert_eq!(text(shown), "a.md");
+        let style = unsafe { GetWindowLongW(shown, GWL_EXSTYLE) } as u32;
+        assert_eq!(
+            style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE),
+            WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            "it never takes a click or the focus"
+        );
+        assert_eq!(unsafe { GetFocus() }, panel);
+        let (at, want) = expected(shown, client_lparam(x + 30, y));
+        assert_eq!(at, want, "next to the pointer");
+        drag_over(panel, work());
+        let (at, want) = expected(shown, work());
+        assert_eq!(at, want, "it follows the pointer");
+        drop_at(panel, work());
+        assert!(label().is_none());
+        assert!(unsafe { IsWindow(shown) } == 0, "the drop destroys it");
+        assert!(scratch.folder().join(r"work\a.md").exists());
+
+        let gone = |shown: HWND| label().is_none() && unsafe { IsWindow(shown) } == 0;
+        start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+        let shown = label().unwrap();
+        assert_eq!(text(shown), "work");
+        unsafe { SendMessageW(panel, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+        assert!(gone(shown), "Esc");
+
+        start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+        let shown = label().unwrap();
+        mouse(panel, WM_RBUTTONDOWN, 2, work());
+        assert!(gone(shown), "a right press");
+        mouse(panel, WM_RBUTTONUP, 0, work());
+
+        start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+        let shown = label().unwrap();
+        unsafe { SetCapture(window.hwnd) };
+        assert!(gone(shown), "a lost capture");
+        unsafe { ReleaseCapture() };
+
+        start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+        let shown = label().unwrap();
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Search,
+            false,
+        );
+        assert!(gone(shown), "another view");
+    }
+
+    #[test]
     fn a_folder_rename_selects_the_whole_name_even_with_a_dot() {
         // Break caught: "v1.2" opening with only "v1" selected, as a file name's stem would be,
         // so typing keeps ".2" (spec §3.3).

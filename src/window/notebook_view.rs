@@ -9,6 +9,7 @@ use crate::config::FileIconSet;
 use crate::document::{Document, DocumentId};
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
 use crate::window::commands::CommandId;
+use crate::window::drag_label::{DragLabel, LabelImage};
 use crate::window::file_icons::{FOLDER_ICON, FileIcon, IconFont, minimal_icon, note_kind};
 use crate::window::icon_sets::images::IconImages;
 use crate::window::icon_sets::{TreeIcon, TreeItem, tree_icon};
@@ -57,6 +58,12 @@ pub(crate) const TRUNCATED_ROW: &str = "Showing the first 10,000 notes";
 
 /// The panel's timer while a drag is under way (tree drag spec §3.3).
 pub(crate) const DRAG_TIMER: usize = 0x4452;
+
+// The drag label (tree drag spec §3.2), at 96 DPI: its height, the padding at either end, and
+// the widest its name gets before an ellipsis.
+const LABEL_HEIGHT: i32 = 24;
+const LABEL_PAD: i32 = 8;
+const LABEL_MAX_TEXT: i32 = 300;
 
 // Segoe MDL2 Assets, the font the title bar already uses.
 const GLYPH_CHEVRON_RIGHT: &str = "\u{E76C}";
@@ -412,6 +419,8 @@ pub(crate) struct NotebookView {
     pub(crate) drag: Option<Drag>,
     /// The right press that cancelled a drag: its release opens no menu.
     pub(crate) eat_right_up: bool,
+    /// The label following the pointer while a drag is under way (tree drag spec §3.2).
+    pub(crate) drag_label: Option<DragLabel>,
     tracking_leave: bool,
     /// What the rows were last built from (`None` before the first rebuild).
     built: Option<RebuildKey>,
@@ -457,6 +466,53 @@ fn is_dragged_row(dragged: Option<&RowKind>, rows: &[TreeRow], index: usize) -> 
     dragged.is_some_and(|dragged| rows.get(index).is_some_and(|row| &row.kind == dragged))
 }
 
+/// Draws `item`'s icon from `set` in `rect`, a `px` icon box or narrower. `muted` is the glyph
+/// colour in high contrast.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one icon's paint inputs, shared by a tree row and the drag label"
+)]
+fn draw_item_icon(
+    dc: HDC,
+    item: TreeItem,
+    rect: RECT,
+    px: i32,
+    muted: u32,
+    palette: &Palette,
+    icons: &FileIcons,
+    fonts: UiFonts,
+    images: &mut IconImages,
+    set: FileIconSet,
+    light_theme: bool,
+) {
+    // A type icon keeps its colour on a selected or hovered row: the colours are mid-tones that
+    // read on the selection. High contrast draws every icon in the muted system pair, as before
+    // (notebook folders spec §5.2), and every set draws Minimal (icon sets spec §3.2).
+    let draw_glyph = |icon: FileIcon| {
+        let color = if palette.high_contrast {
+            muted
+        } else {
+            icons.color(icon.color)
+        };
+        let font = match icon.font {
+            IconFont::Glyph => fonts.glyph,
+            IconFont::Bold => fonts.bold,
+        };
+        unsafe { draw_text(dc, icon.text, rect, font, color, CENTERED) };
+    };
+    // A Material bitmap that cannot be made, or whose box is clipped, falls back to the Minimal
+    // glyph (icon sets spec §6).
+    let clipped = rect.right - rect.left < px;
+    match tree_icon(set, item, light_theme, palette.high_contrast) {
+        TreeIcon::Image(icon) if !clipped && images.draw(dc, icon, rect, px as u32) => {}
+        TreeIcon::Image(_) => draw_glyph(match item {
+            TreeItem::Folder { .. } => FOLDER_ICON,
+            TreeItem::Note(kind) => minimal_icon(kind),
+        }),
+        TreeIcon::Glyph(icon) => draw_glyph(icon),
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "one row's paint inputs, called from one closure"
@@ -493,36 +549,25 @@ fn draw_tree_row(
         return;
     };
     let parts = row_parts(rect, row.depth, dpi);
-    // A type icon keeps its colour on a selected or hovered row: the colours are mid-tones that
-    // read on the selection. High contrast draws every icon in the muted system pair, as before
-    // (notebook folders spec §5.2), and every set draws Minimal (icon sets spec §3.2).
-    let draw_glyph = |icon: FileIcon| {
-        let color = if palette.high_contrast {
-            muted
-        } else {
-            icons.color(icon.color)
-        };
-        let font = match icon.font {
-            IconFont::Glyph => fonts.glyph,
-            IconFont::Bold => fonts.bold,
-        };
-        unsafe { draw_text(dc, icon.text, parts.icon, font, color, CENTERED) };
-    };
-    // A Material bitmap that cannot be made falls back to the Minimal glyph (icon sets spec §6).
     // `px` is the full icon box, not the box clamped by `row_parts` to fit a narrow panel: a
     // clipped box draws the Minimal glyph (which already clips to `parts.icon`) instead of
     // resampling the Material bitmap smaller and caching a bitmap per clipped width.
     let px = scale(GLYPH_BOX, dpi);
-    let clipped = parts.icon.right - parts.icon.left < px;
-    let mut draw_icon =
-        |item: TreeItem| match tree_icon(set, item, light_theme, palette.high_contrast) {
-            TreeIcon::Image(icon) if !clipped && images.draw(dc, icon, parts.icon, px as u32) => {}
-            TreeIcon::Image(_) => draw_glyph(match item {
-                TreeItem::Folder { .. } => FOLDER_ICON,
-                TreeItem::Note(kind) => minimal_icon(kind),
-            }),
-            TreeIcon::Glyph(icon) => draw_glyph(icon),
-        };
+    let mut draw_icon = |item: TreeItem| {
+        draw_item_icon(
+            dc,
+            item,
+            parts.icon,
+            px,
+            muted,
+            palette,
+            icons,
+            fonts,
+            images,
+            set,
+            light_theme,
+        );
+    };
     match &row.kind {
         RowKind::Folder(_) => {
             let chevron = if row.expanded {
@@ -616,6 +661,100 @@ fn draw_recent_row(
     unsafe { draw_text(dc, &label, text, fonts.text, foreground, LINE) };
 }
 
+/// The icon a dragged row's label shows (tree drag spec §3.2): a closed folder or the note's
+/// type. `None` for rows that can't be dragged.
+fn drag_item(kind: &RowKind) -> Option<TreeItem> {
+    match kind {
+        RowKind::Folder(_) => Some(TreeItem::Folder { expanded: false }),
+        RowKind::Note(path) => {
+            let extension = path
+                .extension()
+                .map(|extension| extension.to_string_lossy());
+            Some(TreeItem::Note(note_kind(extension.as_deref())))
+        }
+        RowKind::Unsaved(_) | RowKind::Draft => None,
+    }
+}
+
+/// The drag label's size for a name `text` pixels wide: padding, the icon, a gap, the name,
+/// padding.
+fn drag_label_size(text: i32, dpi: u32) -> SIZE {
+    SIZE {
+        cx: 2 * scale(LABEL_PAD, dpi) + scale(GLYPH_BOX, dpi) + scale(GAP, dpi) + text,
+        cy: scale(LABEL_HEIGHT, dpi),
+    }
+}
+
+/// The drag label's fill, border and text colours: the hover fill with a muted border, or in
+/// high contrast only the system window pair.
+fn drag_label_colors(palette: &Palette) -> (u32, u32, u32) {
+    if palette.high_contrast {
+        (
+            palette.editor_background,
+            palette.editor_foreground,
+            palette.editor_foreground,
+        )
+    } else {
+        (
+            palette.hover_background,
+            palette.muted_foreground,
+            palette.editor_foreground,
+        )
+    }
+}
+
+/// Paints the drag label for `item` and `name` over the whole of `dc`'s `size` (tree drag spec
+/// §3.2): a 1 px (scaled) border, the icon the row shows, and the name, cut with an ellipsis.
+fn paint_drag_label(
+    dc: HDC,
+    size: SIZE,
+    item: TreeItem,
+    name: &str,
+    paint: &ViewPaint,
+    images: &mut IconImages,
+) {
+    let (palette, dpi) = (&paint.palette, paint.dpi);
+    let (background, border, text) = drag_label_colors(palette);
+    let whole = RECT {
+        left: 0,
+        top: 0,
+        right: size.cx,
+        bottom: size.cy,
+    };
+    unsafe {
+        fill(dc, whole, border);
+        fill(dc, inset(whole, scale(1, dpi).max(1)), background);
+    }
+    let (pad, px) = (scale(LABEL_PAD, dpi), scale(GLYPH_BOX, dpi));
+    let top = (size.cy - px) / 2;
+    let icon = RECT {
+        left: pad,
+        top,
+        right: pad + px,
+        bottom: top + px,
+    };
+    draw_item_icon(
+        dc,
+        item,
+        icon,
+        px,
+        palette.muted_foreground,
+        palette,
+        &paint.icons,
+        paint.fonts,
+        images,
+        paint.icon_set,
+        paint.light_theme,
+    );
+    let name_rect = RECT {
+        left: icon.right + scale(GAP, dpi),
+        top: 0,
+        right: size.cx - pad,
+        bottom: size.cy,
+    };
+    unsafe { draw_text(dc, name, name_rect, paint.fonts.text, text, LINE) };
+}
+
 /// Where `highlight` shows in the tree's `list` area (tree drag spec §3.2): the whole list for
 /// the root, else the part of the folder's rows in view; `None` when none of them is.
 pub(crate) fn band_rect(
@@ -694,6 +833,7 @@ impl NotebookView {
             thumb_grab: None,
             drag: None,
             eat_right_up: false,
+            drag_label: None,
             tracking_leave: false,
             built: None,
             order: 0,
@@ -1092,6 +1232,31 @@ impl NotebookView {
             ScreenToClient(GetParent(self.panel), &mut point);
         }
         point
+    }
+
+    /// The started drag's label painted with `paint`, and the dragged row's name (tree drag spec
+    /// §3.2). `None` without a started drag, or if GDI can't make the image.
+    fn drag_label_image(&mut self, paint: &ViewPaint) -> Option<(LabelImage, String)> {
+        let source = self
+            .drag
+            .as_ref()
+            .filter(|drag| drag.started)?
+            .source
+            .clone();
+        let item = drag_item(&source)?;
+        let name = self
+            .rows
+            .iter()
+            .find(|row| row.kind == source)?
+            .name
+            .clone();
+        let text = self
+            .text_width(&name, paint.fonts.text)
+            .min(scale(LABEL_MAX_TEXT, paint.dpi));
+        let size = drag_label_size(text, paint.dpi);
+        let image = LabelImage::new(size.cx, size.cy)?;
+        paint_drag_label(image.dc, size, item, &name, paint, &mut self.images);
+        Some((image, name))
     }
 
     fn text_width(&mut self, text: &str, font: HFONT) -> i32 {
@@ -2191,6 +2356,47 @@ fn end_drag_input(panel: HWND) {
     set_drag_cursor(true);
 }
 
+/// Panel point (`x`, `y`) on the screen.
+fn screen_point(panel: HWND, x: i32, y: i32) -> POINT {
+    let mut point = POINT { x, y };
+    unsafe { ClientToScreen(panel, &mut point) };
+    point
+}
+
+/// Shows the label of the drag that just started, next to panel point (`x`, `y`) (tree drag spec
+/// §3.2). Called with nothing of the App borrowed: it makes a window. A label that can't be made
+/// leaves the drag without one.
+fn show_drag_label(hwnd: HWND, panel: HWND, x: i32, y: i32) {
+    let paint = super::side_panel::view_paint(hwnd, panel, std::ptr::null_mut(), RECT::default());
+    let Some((image, name)) = with_view(hwnd, |view| view.drag_label_image(&paint)).flatten()
+    else {
+        return;
+    };
+    let pointer = screen_point(panel, x, y);
+    let Some(label) = DragLabel::show(hwnd, &image, &name, pointer, paint.dpi) else {
+        return;
+    };
+    if with_view(hwnd, |view| view.drag_label = Some(label)).is_none() {
+        label.destroy();
+    }
+}
+
+/// Moves the drag's label, if it has one, next to panel point (`x`, `y`). Called with nothing of
+/// the App borrowed.
+fn move_drag_label(hwnd: HWND, panel: HWND, x: i32, y: i32) {
+    if let Some(label) = with_view(hwnd, |view| view.drag_label).flatten() {
+        label.move_to(screen_point(panel, x, y));
+    }
+}
+
+/// Destroys the drag's label, if it has one: every way a drag ends comes here. Called with
+/// nothing of the App borrowed.
+fn end_drag_label(hwnd: HWND) {
+    if let Some(label) = with_view(hwnd, |view| view.drag_label.take()).flatten() {
+        label.destroy();
+    }
+}
+
 /// A press on a row's body arms a drag of `source` (tree drag spec §3.1), unless an inline
 /// edit is still open.
 fn arm_drag(hwnd: HWND, source: RowKind, x: i32, y: i32) {
@@ -2238,6 +2444,9 @@ fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
             SetCapture(panel);
             SetTimer(panel, DRAG_TIMER, tree_drag::TICK.as_millis() as u32, None);
         }
+        show_drag_label(hwnd, panel, x, y);
+    } else {
+        move_drag_label(hwnd, panel, x, y);
     }
     let accepted = with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false);
     set_drag_cursor(accepted);
@@ -2260,6 +2469,7 @@ fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
         return false;
     };
     end_drag_input(panel);
+    end_drag_label(hwnd);
     if let Some(folder) = drag.target {
         super::tree_move::drop_into(hwnd, &drag.source, &folder);
     }
@@ -2287,6 +2497,7 @@ pub(crate) fn cancel_drag(hwnd: HWND) -> bool {
         return false;
     };
     end_drag_input(panel);
+    end_drag_label(hwnd);
     true
 }
 
@@ -2299,6 +2510,7 @@ fn cancel_drag_for_right_press(hwnd: HWND) -> bool {
         return false;
     };
     end_drag_timer(panel);
+    end_drag_label(hwnd);
     set_drag_cursor(true);
     true
 }
@@ -3366,6 +3578,108 @@ mod tests {
         };
         assert_ne!(draw(true), draw(false));
         unsafe { DeleteObject(fonts.text) };
+    }
+
+    #[test]
+    fn the_drag_label_has_a_border_a_fill_an_icon_and_its_name() {
+        // Break caught: a label painted in colours outside the system pairs in high contrast,
+        // without its border, or with no name or icon (tree drag spec §3.2).
+        use crate::window::icon_sets::images::TestTarget;
+        use crate::window::titlebar::create_ui_font;
+        use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL};
+        let fonts = UiFonts {
+            text: create_ui_font(12, "Segoe UI", FW_NORMAL as i32, false),
+            ..UiFonts::default()
+        };
+        let size = drag_label_size(80, 96);
+        assert_eq!((size.cx, size.cy), (8 + 16 + 6 + 80 + 8, 24));
+        let reference = |color: u32| {
+            let target = TestTarget::new(1, 1);
+            let pixel = RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            };
+            unsafe { fill(target.dc, pixel, color) };
+            target.pixel(0, 0)
+        };
+        let mut images = IconImages::new();
+        let mut check = |palette: Palette| {
+            let (background, border, _) = drag_label_colors(&palette);
+            let target = TestTarget::new(size.cx, size.cy);
+            let paint = ViewPaint {
+                hdc: target.dc,
+                client: RECT::default(),
+                palette,
+                icons: FileIcons::neutral(),
+                icon_set: FileIconSet::Minimal,
+                light_theme: true,
+                background: palette.panel_background(),
+                fonts,
+                dpi: 96,
+                focused: false,
+            };
+            paint_drag_label(
+                target.dc,
+                size,
+                TreeItem::Note(note_kind(Some("md"))),
+                "notes.md",
+                &paint,
+                &mut images,
+            );
+            assert_eq!(target.pixel(0, 12), reference(border), "the left border");
+            assert_eq!(target.pixel(size.cx - 1, 0), reference(border), "a corner");
+            assert_eq!(
+                target.pixel(size.cx - 3, 3),
+                reference(background),
+                "the fill past the name"
+            );
+            let drawn = |left: i32, right: i32| {
+                target
+                    .area(RECT {
+                        left,
+                        top: 2,
+                        right,
+                        bottom: size.cy - 2,
+                    })
+                    .iter()
+                    .any(|&pixel| pixel != reference(background))
+            };
+            assert!(drawn(8, 24), "the icon");
+            assert!(drawn(30, size.cx - 8), "the name");
+        };
+        check(Palette::neutral());
+        check(Palette {
+            high_contrast: true,
+            ..Palette::neutral()
+        });
+        let contrast = Palette {
+            high_contrast: true,
+            ..Palette::neutral()
+        };
+        assert_eq!(
+            drag_label_colors(&contrast),
+            (
+                contrast.editor_background,
+                contrast.editor_foreground,
+                contrast.editor_foreground
+            )
+        );
+        unsafe { DeleteObject(fonts.text) };
+    }
+
+    #[test]
+    fn the_drag_label_shows_a_closed_folder_or_the_note_type() {
+        assert_eq!(
+            drag_item(&RowKind::Folder("work".into())),
+            Some(TreeItem::Folder { expanded: false })
+        );
+        assert_eq!(
+            drag_item(&RowKind::Note(r"work\a.json".into())),
+            Some(TreeItem::Note(note_kind(Some("json"))))
+        );
+        assert_eq!(drag_item(&RowKind::Draft), None);
     }
 
     #[test]
