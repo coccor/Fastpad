@@ -450,6 +450,13 @@ const fn contains(rect: RECT, x: i32, y: i32) -> bool {
 const LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX;
 const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
 
+/// Whether row `index` is the one a started drag carries (tree drag spec §3.2): both sides
+/// absent (no drag, and `index` past the rows the list actually has, such as the truncated row)
+/// must not read as a match.
+fn is_dragged_row(dragged: Option<&RowKind>, rows: &[TreeRow], index: usize) -> bool {
+    dragged.is_some_and(|dragged| rows.get(index).is_some_and(|row| &row.kind == dragged))
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "one row's paint inputs, called from one closure"
@@ -1354,7 +1361,7 @@ impl NotebookView {
                             images,
                             icon_set,
                             light_theme,
-                            dragged.as_ref() == rows.get(index).map(|row| &row.kind),
+                            is_dragged_row(dragged.as_ref(), rows, index),
                         );
                     },
                 );
@@ -1592,13 +1599,16 @@ pub(crate) fn rebuild(hwnd: HWND) {
     let snapshot = snapshot(hwnd);
     let names = crate::library::local::display_names(&snapshot.recent);
     let lost = with_view(hwnd, |view| {
+        // The notebook itself changed under the drag (root switched): a row that happens to
+        // share a relative path in the new notebook is not the same row (tree drag spec §3.3).
+        let root_changed = snapshot.root != view.root;
         view.apply(snapshot, names);
         view.invalidate();
         // A drag whose row went ends; a target folder that went is found again at the next
-        // move (tree drag spec §3.3).
+        // move.
         let rows = &view.rows;
-        view.drag.as_mut().is_some_and(|drag| {
-            if tree::row_index(rows, &drag.source).is_none() {
+        let lost = view.drag.as_mut().is_some_and(|drag| {
+            if root_changed || tree::row_index(rows, &drag.source).is_none() {
                 return true;
             }
             if drag.target.as_ref().is_some_and(|folder| {
@@ -1608,12 +1618,20 @@ pub(crate) fn rebuild(hwnd: HWND) {
                 drag.target = None;
             }
             false
-        })
+        });
+        // The rows moved: a resting folder's timer starts over at the next move, once it is
+        // known to still be under the pointer.
+        if !lost && let Some(drag) = view.drag.as_mut() {
+            drag.resting = None;
+        }
+        lost
     })
     .unwrap_or(false);
     if lost {
         cancel_drag(hwnd);
     }
+    // A started drag's band and cursor follow the rows that moved under its pointer.
+    retarget_drag(hwnd, Instant::now());
     // The field follows its row, or goes with an edit the rebuild ended (inline naming spec §5.4).
     super::inline_name::place(hwnd);
 }
@@ -1991,14 +2009,19 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             Some(0)
         }
         WM_CAPTURECHANGED => {
-            with_view(hwnd, |view| view.thumb_grab = None);
+            with_view(hwnd, |view| {
+                view.thumb_grab = None;
+                // Taken by someone else before our own release arrived: nothing to eat now.
+                view.eat_right_up = false;
+            });
             // Capture taken away mid-drag (a task switch, a dialog): nothing moves.
             cancel_drag(hwnd);
             Some(0)
         }
         WM_RBUTTONDOWN => {
-            // A right press cancels a drag and does nothing else (tree drag spec §3.3).
-            if cancel_drag(hwnd) {
+            // A right press cancels a drag and does nothing else (tree drag spec §3.3). The
+            // capture stays until its own release reaches the panel (spec §10).
+            if cancel_drag_for_right_press(hwnd) {
                 with_view(hwnd, |view| view.eat_right_up = true);
                 return Some(0);
             }
@@ -2015,9 +2038,19 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             Some(0)
         }
         WM_RBUTTONUP => {
-            // The release of a right press that cancelled a drag opens no menu.
-            let eaten =
-                with_view(hwnd, |view| std::mem::take(&mut view.eat_right_up)).unwrap_or(false);
+            // The release of a right press that cancelled a drag opens no menu; its capture,
+            // kept until now, is released here (spec §10).
+            let (eaten, panel) = with_view(hwnd, |view| {
+                (std::mem::take(&mut view.eat_right_up), view.panel)
+            })
+            .unwrap_or((false, std::ptr::null_mut()));
+            if eaten {
+                unsafe {
+                    if GetCapture() == panel {
+                        ReleaseCapture();
+                    }
+                }
+            }
             eaten.then_some(0)
         }
         WM_CONTEXTMENU => {
@@ -2028,6 +2061,11 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             drag_tick(hwnd, Instant::now());
             Some(0)
         }
+        // A started drag owns the keyboard until it ends: Esc already cancels it, before this
+        // (side_panel routes it to cancel_drag first), so nothing here needs to (tree drag spec
+        // §3.3).
+        WM_KEYDOWN if drag_started(hwnd) => Some(0),
+        WM_CHAR if drag_started(hwnd) => Some(0),
         WM_KEYDOWN => key_down(hwnd, wparam as u16).then_some(0),
         WM_CHAR => {
             let ch = char::from_u32(wparam as u32).filter(|ch| !ch.is_control())?;
@@ -2049,6 +2087,9 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             // The field moves with its row (inline naming spec §5.4).
             if scrolled {
                 super::inline_name::place(hwnd);
+                // A started drag's band and cursor follow the rows a wheel scroll moved under
+                // its pointer (tree drag spec §3.2, §3.3).
+                retarget_drag(hwnd, Instant::now());
             }
             Some(0)
         }
@@ -2102,11 +2143,47 @@ fn set_drag_cursor(accepted: bool) {
     unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };
 }
 
+/// Whether a drag is under way (armed does not count): the keyboard is its while it lasts (tree
+/// drag spec §3.3).
+fn drag_started(hwnd: HWND) -> bool {
+    with_view(hwnd, |view| {
+        view.drag.as_ref().is_some_and(|drag| drag.started)
+    })
+    .unwrap_or(false)
+}
+
+/// Re-targets a started drag from its last pointer position and updates the cursor to match
+/// (tree drag spec §3.2, §3.3): after the rows moved under it without the pointer moving — a
+/// rebuild, a mouse-wheel scroll — the band and cursor should still match what is now under the
+/// pointer. Does nothing without a started drag.
+fn retarget_drag(hwnd: HWND, now: Instant) {
+    let Some(pointer) = with_view(hwnd, |view| {
+        view.drag
+            .as_ref()
+            .filter(|drag| drag.started)
+            .map(|drag| drag.pointer)
+    })
+    .flatten() else {
+        return;
+    };
+    let accepted = with_view(hwnd, |view| view.drag_to(pointer.0, pointer.1, now)).unwrap_or(false);
+    set_drag_cursor(accepted);
+}
+
+/// Ends a drag's timer, with nothing of the App borrowed. Leaves the capture alone: most cancels
+/// release it here too (`end_drag_input`), but a right-press cancel keeps it until its own
+/// release reaches the panel (tree drag spec §3.3, §10).
+fn end_drag_timer(panel: HWND) {
+    unsafe {
+        KillTimer(panel, DRAG_TIMER);
+    }
+}
+
 /// Ends a drag's timer, capture and cursor, with nothing of the App borrowed: ReleaseCapture
 /// sends WM_CAPTURECHANGED here.
 fn end_drag_input(panel: HWND) {
+    end_drag_timer(panel);
     unsafe {
-        KillTimer(panel, DRAG_TIMER);
         if GetCapture() == panel {
             ReleaseCapture();
         }
@@ -2189,23 +2266,40 @@ fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
     true
 }
 
-/// Ends a drag without moving anything (tree drag spec §3.3): Esc, a right press, a lost
-/// capture, another view, the sidebar hiding, or the dragged row gone. An armed drag just goes.
-/// True when a drag was under way.
-pub(crate) fn cancel_drag(hwnd: HWND) -> bool {
-    let Some((drag, panel)) = with_view(hwnd, |view| {
+/// Takes a started drag, invalidating the row it painted over. `None` when there was no drag, or
+/// it had not started (an armed one just goes, with nothing left to undo).
+fn take_started_drag(hwnd: HWND) -> Option<HWND> {
+    let (drag, panel) = with_view(hwnd, |view| {
         let drag = view.drag.take();
         if drag.as_ref().is_some_and(|drag| drag.started) {
             view.invalidate();
         }
         (drag, view.panel)
-    }) else {
+    })?;
+    drag.is_some_and(|drag| drag.started).then_some(panel)
+}
+
+/// Ends a drag without moving anything (tree drag spec §3.3): Esc, a lost capture, another view,
+/// the sidebar hiding, or the dragged row gone. An armed drag just goes. True when a drag was
+/// under way.
+pub(crate) fn cancel_drag(hwnd: HWND) -> bool {
+    let Some(panel) = take_started_drag(hwnd) else {
         return false;
     };
-    if !drag.is_some_and(|drag| drag.started) {
-        return false;
-    }
     end_drag_input(panel);
+    true
+}
+
+/// A right press cancels a drag too, but keeps the capture until its own `WM_RBUTTONUP` reaches
+/// the panel (tree drag spec §3.3, spec §10): releasing it immediately would let that release,
+/// even over the editor, fall through to `DefWindowProc` there and open its context menu. True
+/// when a drag was under way.
+fn cancel_drag_for_right_press(hwnd: HWND) -> bool {
+    let Some(panel) = take_started_drag(hwnd) else {
+        return false;
+    };
+    end_drag_timer(panel);
+    set_drag_cursor(true);
     true
 }
 
@@ -3272,5 +3366,19 @@ mod tests {
         };
         assert_ne!(draw(true), draw(false));
         unsafe { DeleteObject(fonts.text) };
+    }
+
+    #[test]
+    fn is_dragged_row_never_matches_with_no_drag_even_past_the_last_row() {
+        // Break caught: `None == None` reading as a match, dimming a row (e.g. the truncated
+        // row, past the last real one) while nothing is being dragged (tree drag spec §3.2).
+        let rows = vec![row(RowKind::Note("a.md".into()), 0)];
+        assert!(!is_dragged_row(None, &rows, 0));
+        assert!(!is_dragged_row(None, &rows, 5), "past the last row too");
+        let dragged = RowKind::Note("a.md".into());
+        assert!(is_dragged_row(Some(&dragged), &rows, 0));
+        assert!(!is_dragged_row(Some(&dragged), &rows, 5), "no row there");
+        let other = RowKind::Note("b.md".into());
+        assert!(!is_dragged_row(Some(&other), &rows, 0), "a different row");
     }
 }

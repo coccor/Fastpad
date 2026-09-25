@@ -18370,6 +18370,40 @@ mod tests {
     }
 
     #[test]
+    fn tree_move_a_drop_into_a_folder_deleted_outside_fastpad_says_so_not_that_the_note_is_gone() {
+        // Break caught: ERROR_PATH_NOT_FOUND for the destination's vanished parent folder read as
+        // the source itself being missing, which said "a.md no longer exists" instead of naming
+        // the real problem and asking for a rescan (final review Important 2; tree drag spec §5).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-move-target-gone");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        // request_rescan only starts a load with a data dir to write the local state to.
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        std::fs::remove_dir(scratch.folder().join("work")).unwrap();
+
+        crate::window::tree_move::drop_into(
+            window.hwnd,
+            &RowKind::Note("a.md".into()),
+            std::path::Path::new("work"),
+        );
+
+        assert!(a.exists(), "the source never moved");
+        let notices = notices(window.hwnd);
+        assert!(
+            notices
+                .last()
+                .is_some_and(|notice| notice.starts_with("Couldn't move a.md: ")),
+            "{notices:?}"
+        );
+        assert!(
+            app_mut(window.hwnd).library.scanning,
+            "a rescan catches the vanished folder up"
+        );
+    }
+
+    #[test]
     fn tree_move_a_tab_that_cannot_follow_undoes_the_move_or_names_the_stuck_tab() {
         // Break caught: a move that leaves a tab on a path that no longer exists without saying
         // so, or keeps the move when it could be undone (tree drag spec §5).
@@ -18640,7 +18674,9 @@ mod tests {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             GetCapture, GetFocus, ReleaseCapture, SetCapture, VK_ESCAPE,
         };
-        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_RBUTTONDOWN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_KEYDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        };
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("drag-cancel");
         std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
@@ -18663,6 +18699,15 @@ mod tests {
         drag_over(panel, work());
         mouse(panel, WM_RBUTTONDOWN, 2, work());
         assert!(notebook_view(window.hwnd).drag.is_none());
+        // The fix for review round 2 item 1: the capture stays until the right press's own
+        // release reaches the panel (otherwise that release, sent while the pointer is over the
+        // editor, would fall through to DefWindowProc there and open its context menu).
+        assert_eq!(
+            unsafe { GetCapture() },
+            panel,
+            "the capture stays until the right press's own release"
+        );
+        mouse(panel, WM_RBUTTONUP, 0, work());
         assert!(unsafe { GetCapture() }.is_null());
         drop_at(panel, work());
         assert!(a.exists());
@@ -18682,6 +18727,7 @@ mod tests {
         // Break caught: a right press that cancelled a drag setting a flag that outlives its own
         // release (the release went elsewhere, e.g. the pointer was over the editor), so the next
         // ordinary right-click in the tree opens no menu (tree drag spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
         use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("drag-right-cancel");
@@ -18714,6 +18760,49 @@ mod tests {
             !notebook_view(window.hwnd).eat_right_up,
             "a later ordinary right press clears the stale flag"
         );
+        // The first press's release never came (simulated above): its capture is still held.
+        // Tidy up, since nothing else in this scenario will release it.
+        unsafe { ReleaseCapture() };
+    }
+
+    #[test]
+    fn tree_drag_a_right_press_cancel_over_the_editor_still_gets_its_release() {
+        // Break caught: releasing the capture as soon as a right press cancels a drag lets its
+        // own WM_RBUTTONUP, sent while the pointer is over the editor, fall through to
+        // DefWindowProc there and open the editor's context menu instead of the panel eating its
+        // own release (tree drag spec §3.3, spec §10; final review Important 1).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-right-editor");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        drag_over(panel, work);
+        let mut client = RECT::default();
+        unsafe { GetClientRect(panel, &mut client) };
+        // Beyond the panel's own client width: over the editor. Capture still routes it here.
+        let beyond = client_lparam(client.right + 50, (work >> 16) as i32);
+        mouse(panel, WM_RBUTTONDOWN, 2, beyond);
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert_eq!(
+            unsafe { GetCapture() },
+            panel,
+            "the capture stays until the right press's own release reaches the panel"
+        );
+
+        let result = unsafe { SendMessageW(panel, WM_RBUTTONUP, 0, beyond) };
+        assert_eq!(
+            result, 0,
+            "eaten: DefWindowProc never turns it into a context menu"
+        );
+        assert!(unsafe { GetCapture() }.is_null());
+        assert!(!notebook_view(window.hwnd).eat_right_up);
     }
 
     #[test]
@@ -18823,6 +18912,207 @@ mod tests {
             false,
         );
         assert!(notebook_view(window.hwnd).drag.is_none());
+    }
+
+    #[test]
+    fn tree_drag_a_press_during_a_refused_edit_ends_the_edit_before_the_drag() {
+        // Break caught: a taken name left open under a drag started by the same press, instead
+        // of the press committing the refused edit first — closing it with its notice, renaming
+        // nothing — and only then arming the drag of the row it actually landed on (spec §8, tree
+        // drag spec §3.1; final review Important 3, a controller-pinned ordering).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-refused-edit");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        std::fs::create_dir_all(scratch.folder().join("other")).unwrap();
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+        type_into_field(window.hwnd, "other");
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd).as_deref(),
+            Some("other already exists here.")
+        );
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+
+        assert!(!inline_open(window.hwnd), "the refused edit closed");
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice == "other already exists here."),
+            "{:?}",
+            notices(window.hwnd)
+        );
+        assert!(scratch.folder().join("sub").is_dir(), "nothing was renamed");
+        assert!(scratch.folder().join("other").is_dir());
+        assert_eq!(
+            notebook_view(window.hwnd)
+                .drag
+                .as_ref()
+                .map(|drag| drag.source.clone()),
+            Some(RowKind::Note("a.md".into())),
+            "the pressed row's drag armed only once the edit had closed"
+        );
+        assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);
+        assert_eq!(unsafe { GetCapture() }, panel);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path()),
+            "the press still opened the note"
+        );
+
+        crate::window::notebook_view::cancel_drag(window.hwnd);
+    }
+
+    #[test]
+    fn tree_drag_a_notebook_switch_mid_drag_cancels_even_when_the_row_still_resolves() {
+        // Break caught: a rebuild that only checks whether the dragged row's RowKind still has a
+        // row, so switching to a different notebook that happens to have its own "a.md" reads as
+        // "the row is still there" and the drag survives into the wrong notebook (final review
+        // Minor 5; tree drag spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+        let _scintilla = load_native_scintilla();
+        let first = LibraryScratch::new("drag-switch-first");
+        let a = first.note("a.md", "a");
+        let (window, _editor) = notebook_window(&first);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        assert_eq!(unsafe { GetCapture() }, panel);
+
+        let second = LibraryScratch::new("drag-switch-second");
+        second.note("a.md", "a2");
+        let local = crate::library::local::local_file(&second.data(), &second.folder());
+        let state =
+            crate::library::load(&second.folder(), &local, crate::library::now_unix()).unwrap();
+        crate::window::library_host::install_for_test(window.hwnd, state);
+        crate::window::notebook_view::rebuild(window.hwnd);
+
+        assert!(
+            notebook_view(window.hwnd).drag.is_none(),
+            "a different notebook's a.md is not the same row"
+        );
+        assert!(unsafe { GetCapture() }.is_null());
+        assert!(a.exists());
+    }
+
+    #[test]
+    fn tree_drag_a_rebuild_mid_drag_retargets_the_band_from_the_still_pointer() {
+        // Break caught: rows shifting under a pointer that has not moved (a folder appearing
+        // elsewhere, a rescan) leaving the drag's target and cursor pointing at what used to be
+        // there, until the next mouse move (final review Minor 4; tree drag spec §3.2, §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::IDC_ARROW;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-rebuild-retarget");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            Some("work".into())
+        );
+
+        // A folder appears above "work", sorted before it: "work"'s row shifts down one, so the
+        // still pointer is now over the new folder's row instead.
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            state.add_folder(std::path::Path::new("AAA"));
+        });
+        crate::window::notebook_view::rebuild(window.hwnd);
+
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            Some("AAA".into()),
+            "the band followed the row that moved under the still pointer"
+        );
+        assert!(drag_cursor_is(IDC_ARROW));
+
+        crate::window::notebook_view::cancel_drag(window.hwnd);
+    }
+
+    #[test]
+    fn tree_drag_a_wheel_scroll_mid_drag_retargets_the_band_from_the_still_pointer() {
+        // Break caught: a wheel scroll during a started drag moving the rows under the pointer
+        // without re-checking the target, so the band and cursor keep showing the row that used
+        // to be there (final review Minor 4; tree drag spec §3.2, §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, IDC_NO, WM_MOUSEWHEEL};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-wheel-retarget");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note("a.md", "a");
+        for index in 0..80 {
+            scratch.note(&format!("n{index:02}.md"), "n");
+        }
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        // "a.md" is dragged: the root is its own folder, so it is refused there and accepted in
+        // "work", the only folder.
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            Some("work".into())
+        );
+        assert!(drag_cursor_is(IDC_ARROW));
+
+        // A big scroll: "work" (the list's one folder, at the top) scrolls out of view, so the
+        // still pointer, at the same pixel it was over "work" at, now lands on a root note.
+        let down = ((-(120_i16 * 20)) as u16 as usize) << 16;
+        let top = notebook_view(window.hwnd).list.top;
+        mouse(panel, WM_MOUSEWHEEL, down, 0);
+        assert!(notebook_view(window.hwnd).list.top > top, "scrolled");
+
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            None,
+            "the still pointer is over a root note now: a.md's own folder"
+        );
+        assert!(drag_cursor_is(IDC_NO));
+
+        crate::window::notebook_view::cancel_drag(window.hwnd);
+    }
+
+    #[test]
+    fn tree_drag_keys_are_ignored_while_a_drag_is_started() {
+        // Break caught: F2 opening a rename field, or a typed letter jumping the selection, on
+        // the row a started drag is carrying (final review Minor 6; tree drag spec §3.3). Esc
+        // still cancels it: side_panel routes that to cancel_drag before this is ever reached.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("drag-keys-ignored");
+        scratch.note("a.md", "a");
+        scratch.note("zzz.md", "z");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into()))
+        );
+
+        mouse(panel, WM_KEYDOWN, VK_F2 as usize, 0);
+        assert!(!inline_open(window.hwnd), "F2 opened no rename field");
+
+        mouse(panel, WM_CHAR, 'z' as usize, 0);
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into())),
+            "a typed letter did not jump the selection"
+        );
+        assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);
+
+        crate::window::notebook_view::cancel_drag(window.hwnd);
     }
 
     #[test]
