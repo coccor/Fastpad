@@ -7,7 +7,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW,
 };
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -99,6 +100,95 @@ fn shell_recycle(owner: HWND, path: &Path) -> Result<()> {
         return Err(crate::FastPadError::Win32(status as u32));
     }
     Ok(())
+}
+
+/// `CopyFileExW` with `COPY_FILE_FAIL_IF_EXISTS`: fails if `to` already exists.
+pub fn copy_file_no_replace(from: &Path, to: &Path) -> Result<()> {
+    let (from_wide, to_wide) = (wide(from), wide(to));
+    let copied = unsafe {
+        CopyFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            None,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            COPY_FILE_FAIL_IF_EXISTS,
+        )
+    };
+    if copied == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// What `copy_tree` did: the files copied, and the first error with the path it happened at.
+#[derive(Debug)]
+pub struct Copied {
+    pub files: usize,
+    pub error: Option<(std::path::PathBuf, crate::FastPadError)>,
+}
+
+/// Copies the file or folder `from` to `to`, which must not exist: a folder is created with
+/// everything in it, never merged into one that is there. Stops at the first error, and after
+/// the file in hand once `cancel` is set. An explicit stack, so a deep folder can't overflow.
+pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool) -> Copied {
+    use std::sync::atomic::Ordering;
+    let mut copied = Copied {
+        files: 0,
+        error: None,
+    };
+    let fail = |copied: &mut Copied, path: &Path, error: crate::FastPadError| {
+        copied.error = Some((path.to_path_buf(), error));
+    };
+    if !from.is_dir() {
+        match copy_file_no_replace(from, to) {
+            Ok(()) => copied.files = 1,
+            Err(error) => fail(&mut copied, from, error),
+        }
+        return copied;
+    }
+    let mut stack = vec![(from.to_path_buf(), to.to_path_buf())];
+    while let Some((source, target)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(error) = std::fs::create_dir(&target) {
+            fail(&mut copied, &target, error.into());
+            break;
+        }
+        let entries = match std::fs::read_dir(&source) {
+            Ok(entries) => entries,
+            Err(error) => {
+                fail(&mut copied, &source, error.into());
+                break;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    fail(&mut copied, &source, error.into());
+                    return copied;
+                }
+            };
+            let (inner, outer) = (entry.path(), target.join(entry.file_name()));
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                stack.push((inner, outer));
+            } else {
+                if cancel.load(Ordering::Relaxed) {
+                    return copied;
+                }
+                match copy_file_no_replace(&inner, &outer) {
+                    Ok(()) => copied.files += 1,
+                    Err(error) => {
+                        fail(&mut copied, &inner, error);
+                        return copied;
+                    }
+                }
+            }
+        }
+    }
+    copied
 }
 
 #[cfg(test)]
@@ -201,6 +291,46 @@ mod tests {
             std::fs::read_to_string(dir.join("other").join("a.md")).unwrap(),
             "a"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copying_a_file_never_replaces_and_a_folder_copies_whole() {
+        // Break caught: a copy over an existing note, a nested folder copied flat or partly, or
+        // non-note files left behind (open editors spec §4.5).
+        let dir = scratch("copy");
+        std::fs::write(dir.join("a.md"), "a").unwrap();
+        std::fs::write(dir.join("taken.md"), "keep").unwrap();
+        assert!(copy_file_no_replace(&dir.join("a.md"), &dir.join("taken.md")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("taken.md")).unwrap(),
+            "keep"
+        );
+        copy_file_no_replace(&dir.join("a.md"), &dir.join("b.md")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b.md")).unwrap(), "a");
+
+        let from = dir.join("pics");
+        std::fs::create_dir_all(from.join(r"deep\er")).unwrap();
+        std::fs::write(from.join("x.png"), [1u8, 2]).unwrap();
+        std::fs::write(from.join(r"deep\er\y.md"), "y").unwrap();
+        std::fs::create_dir_all(from.join("empty")).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let copied = copy_tree(&from, &dir.join("copy"), &cancel);
+        assert!(copied.error.is_none());
+        assert_eq!(copied.files, 2);
+        assert_eq!(std::fs::read(dir.join(r"copy\x.png")).unwrap(), [1, 2]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(r"copy\deep\er\y.md")).unwrap(),
+            "y"
+        );
+        assert!(dir.join(r"copy\empty").is_dir());
+        let again = copy_tree(&from, &dir.join("copy"), &cancel);
+        assert!(
+            again.error.is_some() && again.files == 0,
+            "an existing folder is never merged into"
+        );
+        let single = copy_tree(&dir.join("a.md"), &dir.join("c.md"), &cancel);
+        assert_eq!((single.files, single.error.is_none()), (1, true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

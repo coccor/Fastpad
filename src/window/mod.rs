@@ -33,6 +33,7 @@ pub mod tabs;
 pub(crate) mod text_search_host;
 pub mod titlebar;
 pub(crate) mod tooltip;
+pub(crate) mod tree_copy;
 pub(crate) mod tree_drag;
 pub(crate) mod tree_move;
 
