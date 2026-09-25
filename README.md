@@ -192,8 +192,7 @@ before closing again.
 - **Encodings preserved.** UTF-8, UTF-8 with BOM, UTF-16 LE and UTF-16 BE are detected on open and
   kept on save.
 - **Find and replace**, with match case, whole word and regular expressions (Alt+C, Alt+W,
-  Alt+R) and F3 / Shift+F3, plus zoom, word wrap, line numbers, and left-to-right or
-  right-to-left text.
+  Alt+R) and F3 / Shift+F3, plus zoom, word wrap and line numbers.
 - **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive
   technology and can be followed from it.
 
@@ -208,7 +207,6 @@ before closing again.
 | Find | `Ctrl+F` | | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Ctrl+1` … `Ctrl+9` |
-| Left-to-right text | `Ctrl+L` | | Right-to-left text | `Ctrl+R` |
 | Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` |
 | Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+Shift+F` |
 | Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |

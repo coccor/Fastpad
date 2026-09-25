@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 54] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 52] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -76,8 +76,6 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 54] {
         virtual_key(FCONTROL, VK_SUBTRACT, CommandId::ZoomOut),
         accelerator(FCONTROL, b'0', CommandId::ZoomReset),
         virtual_key(FCONTROL, VK_NUMPAD0, CommandId::ZoomReset),
-        accelerator(FCONTROL, b'L', CommandId::TextLeftToRight),
-        accelerator(FCONTROL, b'R', CommandId::TextRightToLeft),
         accelerator(FCONTROL, b'P', CommandId::QuickOpen),
         accelerator(FCONTROL | FSHIFT, b'P', CommandId::CommandPalette),
         accelerator(FCONTROL | FSHIFT, b'V', CommandId::MarkdownPreviewCycle),
@@ -189,9 +187,6 @@ impl MenuBar {
                 MenuEntry::command("Zoom &in	Ctrl++", CommandId::ZoomIn),
                 MenuEntry::command("Zoom &out	Ctrl+-", CommandId::ZoomOut),
                 MenuEntry::command("Reset &zoom	Ctrl+0", CommandId::ZoomReset),
-                MenuEntry::Separator,
-                MenuEntry::command("&Left-to-right text	Ctrl+L", CommandId::TextLeftToRight),
-                MenuEntry::command("&Right-to-left text	Ctrl+R", CommandId::TextRightToLeft),
                 MenuEntry::Separator,
                 MenuEntry::command("&Word wrap	Alt+Z", CommandId::ToggleWordWrap),
                 MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
@@ -575,7 +570,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 54);
+        assert_eq!(specs.len(), 52);
     }
 
     #[test]
@@ -615,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_zoom_and_direction_shortcuts_are_bound() {
+    fn tab_and_zoom_shortcuts_are_bound_and_text_direction_has_none() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             VK_F3, VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_TAB,
         };
@@ -640,14 +635,8 @@ mod tests {
         assert_eq!(bound(FCONTROL, VK_OEM_PLUS), Some(CommandId::ZoomIn));
         assert_eq!(bound(FCONTROL, VK_OEM_MINUS), Some(CommandId::ZoomOut));
         assert_eq!(bound(FCONTROL, u16::from(b'0')), Some(CommandId::ZoomReset));
-        assert_eq!(
-            bound(FCONTROL, u16::from(b'L')),
-            Some(CommandId::TextLeftToRight)
-        );
-        assert_eq!(
-            bound(FCONTROL, u16::from(b'R')),
-            Some(CommandId::TextRightToLeft)
-        );
+        assert_eq!(bound(FCONTROL, u16::from(b'L')), None);
+        assert_eq!(bound(FCONTROL, u16::from(b'R')), None);
         assert_eq!(
             bound(FCONTROL | FSHIFT, u16::from(b'P')),
             Some(CommandId::CommandPalette)

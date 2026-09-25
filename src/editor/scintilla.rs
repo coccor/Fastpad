@@ -41,19 +41,15 @@ use crate::platform::{last_error, wide_null};
 #[cfg(windows)]
 use std::mem::transmute;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{GetLastError, LPARAM, RECT, SetLastError, WPARAM};
-#[cfg(windows)]
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetWindowLongPtrW, SetWindowPos, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD,
-    WS_CLIPSIBLINGS, WS_EX_LAYOUTRTL, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_CHAR,
+    WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
 };
 
 pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
@@ -68,13 +64,6 @@ pub struct CaretStatus {
     pub line: usize,
     pub column: usize,
     pub selected_characters: usize,
-}
-
-/// The reading order the editor lays text out in.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TextDirection {
-    LeftToRight,
-    RightToLeft,
 }
 
 /// Scintilla's `SCNotification` (Scintilla.h), complete through `updated` so both `SCN_MODIFIED`
@@ -1042,46 +1031,6 @@ impl Editor {
             column: column.max(0) as usize + 1,
             selected_characters: selected.max(0) as usize,
         })
-    }
-
-    /// Mirrors the editor window so lines start at the right edge and the vertical scrollbar sits
-    /// on the left. Scintilla's own bidirectional mode needs DirectWrite, and FastPad draws with
-    /// GDI, which already reorders right-to-left runs inside a mirrored window.
-    #[cfg(windows)]
-    pub fn set_text_direction(&self, direction: TextDirection) -> Result<()> {
-        let hwnd = self.endpoint.hwnd;
-        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-        let updated = match direction {
-            TextDirection::LeftToRight => style & !(WS_EX_LAYOUTRTL as isize),
-            TextDirection::RightToLeft => style | WS_EX_LAYOUTRTL as isize,
-        };
-        if updated == style {
-            return Ok(());
-        }
-        unsafe {
-            SetLastError(0);
-            if SetWindowLongPtrW(hwnd, GWL_EXSTYLE, updated) == 0 && GetLastError() != 0 {
-                return Err(last_error());
-            }
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            InvalidateRect(hwnd, std::ptr::null(), 1);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    pub fn set_text_direction(&self, _direction: TextDirection) -> Result<()> {
-        Err(FastPadError::Invariant(
-            "Scintilla editor is only supported on Windows",
-        ))
     }
 
     /// Sets the selection (focused and unfocused) and caret-line backgrounds as opaque Scintilla 5

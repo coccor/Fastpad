@@ -34,9 +34,8 @@ pub enum CommandId {
     ZoomIn,
     ZoomOut,
     ZoomReset,
-    TextLeftToRight,
-    TextRightToLeft,
-    CommandPalette,
+    // 133 and 134 were the text direction commands.
+    CommandPalette = 135,
     ThemeSystem,
     ThemeLight,
     ThemeDark,
@@ -195,7 +194,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 88] = [
+        const COMMANDS: [CommandId; 86] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -229,8 +228,6 @@ impl TryFrom<u16> for CommandId {
             CommandId::ZoomIn,
             CommandId::ZoomOut,
             CommandId::ZoomReset,
-            CommandId::TextLeftToRight,
-            CommandId::TextRightToLeft,
             CommandId::CommandPalette,
             CommandId::ThemeSystem,
             CommandId::ThemeLight,
@@ -325,7 +322,9 @@ mod tests {
         assert_eq!(CommandId::try_from(118), Ok(CommandId::CloseAllTabs));
         assert!(!CommandId::New.needs_document());
         assert!(CommandId::Paste.needs_document());
-        assert_eq!(CommandId::try_from(134), Ok(CommandId::TextRightToLeft));
+        assert_eq!(CommandId::try_from(132), Ok(CommandId::ZoomReset));
+        assert!(CommandId::try_from(133).is_err());
+        assert!(CommandId::try_from(134).is_err());
         assert_eq!(CommandId::try_from(135), Ok(CommandId::CommandPalette));
         assert!(!CommandId::CommandPalette.needs_document());
         assert_eq!(CommandId::try_from(146), Ok(CommandId::TabWidth8));

@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 75] = [
+pub(crate) const ENTRIES: [PaletteEntry; 73] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -123,8 +123,6 @@ pub(crate) const ENTRIES: [PaletteEntry; 75] = [
     entry("View: Zoom in", CommandId::ZoomIn),
     entry("View: Zoom out", CommandId::ZoomOut),
     entry("View: Reset zoom", CommandId::ZoomReset),
-    entry("View: Left-to-right text", CommandId::TextLeftToRight),
-    entry("View: Right-to-left text", CommandId::TextRightToLeft),
     entry("View: Toggle word wrap", CommandId::ToggleWordWrap),
     entry("View: Toggle line numbers", CommandId::ToggleLineNumbers),
     entry("View: Increase font size", CommandId::FontSizeIncrease),
@@ -1439,7 +1437,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 75);
+        assert_eq!(ENTRIES.len(), 73);
     }
 
     #[test]

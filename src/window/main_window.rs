@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::app::{App, WindowIdentity};
 use crate::document::{CloseDecision, Document, DocumentId, RecoveryId};
-use crate::editor::{Editor, TextDirection};
+use crate::editor::Editor;
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
 use crate::window::accessibility::{self, AccessibleSelectRequest, WM_FASTPAD_ACCESSIBLE_SELECT};
@@ -2665,12 +2665,6 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         }),
         CommandId::ZoomReset => with_editor(hwnd, |editor| {
             let _ = editor.reset_zoom();
-        }),
-        CommandId::TextLeftToRight => with_editor(hwnd, |editor| {
-            let _ = editor.set_text_direction(TextDirection::LeftToRight);
-        }),
-        CommandId::TextRightToLeft => with_editor(hwnd, |editor| {
-            let _ = editor.set_text_direction(TextDirection::RightToLeft);
         }),
         CommandId::MarkdownPreviewCycle
         | CommandId::MarkdownPreviewSide
@@ -6332,13 +6326,9 @@ mod tests {
     }
 
     #[test]
-    fn zoom_resizes_the_line_number_gutter_and_direction_mirrors_the_editor() {
-        // Break caught: zoomed digits clipped by a gutter measured at the unzoomed size, or the
-        // direction shortcuts leaving the editor window unmirrored.
+    fn zoom_resizes_the_line_number_gutter() {
+        // Break caught: zoomed digits clipped by a gutter measured at the unzoomed size.
         use crate::editor::scintilla_constants::SCI_GETZOOM;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongPtrW, WS_EX_LAYOUTRTL,
-        };
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
         let editor = install_test_editor(&window);
@@ -6354,15 +6344,6 @@ mod tests {
         execute_command(window.hwnd, CommandId::ZoomReset);
         assert_eq!(zoom(), 0);
         assert_eq!(line_number_margin_width(&editor), unzoomed_width);
-
-        let mirrored = || {
-            (unsafe { GetWindowLongPtrW(editor.hwnd(), GWL_EXSTYLE) }) as u32 & WS_EX_LAYOUTRTL != 0
-        };
-        assert!(!mirrored());
-        execute_command(window.hwnd, CommandId::TextRightToLeft);
-        assert!(mirrored());
-        execute_command(window.hwnd, CommandId::TextLeftToRight);
-        assert!(!mirrored());
     }
 
     #[test]
