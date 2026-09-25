@@ -58,6 +58,38 @@ pub enum CommandId {
     MarkdownPreviewFull,
     MarkdownPreviewClose,
     ToggleRestoreSession,
+    ToggleNotesMode,
+    OpenFolder,
+    OpenRecentFolder,
+    ToggleFolderAutosave,
+    NoteReloadFromDisk,
+    NoteKeepMine,
+    // 163 and 166-173 were the favorite, tag and notebook commands: retired, never reused.
+    NoteTogglePin = 164,
+    NoteMoveToNotebook = 165,
+    NoteRename = 174,
+    NoteDelete = 175,
+    ToggleSidebar = 176,
+    ShowNotebookView = 177,
+    ShowSearchView = 178,
+    ShowFavoritesView = 179,
+    CloseNotebook = 180,
+    ToggleNotebookFavorite = 181,
+    NoteRevealInExplorer = 182,
+    FocusNextPane = 183,
+    FocusPreviousPane = 184,
+    SearchToggleCase = 185,
+    SearchToggleWholeWord = 186,
+    SearchToggleRegex = 187,
+    FindNext = 188,
+    FindPrevious = 189,
+    ReplaceInNotes = 190,
+    QuickOpen = 191,
+    NoteNewFolder = 192,
+    NoteNew = 193,
+    FileIconsMaterial = 194,
+    FileIconsMinimal = 195,
+    FileIconsSolid = 196,
 }
 
 impl CommandId {
@@ -86,7 +118,29 @@ impl CommandId {
                 | Self::ThemeCatppuccinFrappe
                 | Self::ThemeCatppuccinMacchiato
                 | Self::ThemeCatppuccinMocha
+                | Self::FileIconsMaterial
+                | Self::FileIconsMinimal
+                | Self::FileIconsSolid
                 | Self::ToggleRestoreSession
+                | Self::ToggleNotesMode
+                | Self::OpenFolder
+                | Self::OpenRecentFolder
+                | Self::ToggleFolderAutosave
+                | Self::ToggleSidebar
+                | Self::ShowNotebookView
+                | Self::ShowSearchView
+                | Self::ShowFavoritesView
+                | Self::CloseNotebook
+                | Self::ToggleNotebookFavorite
+                | Self::FocusNextPane
+                | Self::FocusPreviousPane
+                | Self::SearchToggleCase
+                | Self::SearchToggleWholeWord
+                | Self::SearchToggleRegex
+                | Self::ReplaceInNotes
+                | Self::QuickOpen
+                | Self::NoteNewFolder
+                | Self::NoteNew
         )
     }
 
@@ -98,6 +152,31 @@ impl CommandId {
                 | Self::MarkdownPreviewFull
                 | Self::MarkdownPreviewClose
         )
+    }
+
+    /// Commands that act on the sidebar, which exists only in notes mode.
+    pub const fn is_sidebar(self) -> bool {
+        matches!(
+            self,
+            Self::ToggleSidebar
+                | Self::ShowNotebookView
+                | Self::ShowSearchView
+                | Self::ShowFavoritesView
+                | Self::SearchToggleCase
+                | Self::SearchToggleWholeWord
+                | Self::SearchToggleRegex
+                | Self::ReplaceInNotes
+        )
+    }
+
+    /// The Search view option a `SearchToggle*` command flips.
+    pub const fn search_option(self) -> Option<crate::search::SearchOption> {
+        match self {
+            Self::SearchToggleCase => Some(crate::search::SearchOption::Case),
+            Self::SearchToggleWholeWord => Some(crate::search::SearchOption::WholeWord),
+            Self::SearchToggleRegex => Some(crate::search::SearchOption::Regex),
+            _ => None,
+        }
     }
 
     /// The zero-based tab a `SelectTabN` command activates.
@@ -116,7 +195,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 57] = [
+        const COMMANDS: [CommandId; 88] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -174,6 +253,37 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownPreviewFull,
             CommandId::MarkdownPreviewClose,
             CommandId::ToggleRestoreSession,
+            CommandId::ToggleNotesMode,
+            CommandId::OpenFolder,
+            CommandId::OpenRecentFolder,
+            CommandId::ToggleFolderAutosave,
+            CommandId::NoteReloadFromDisk,
+            CommandId::NoteKeepMine,
+            CommandId::NoteTogglePin,
+            CommandId::NoteMoveToNotebook,
+            CommandId::NoteRename,
+            CommandId::NoteDelete,
+            CommandId::ToggleSidebar,
+            CommandId::ShowNotebookView,
+            CommandId::ShowSearchView,
+            CommandId::ShowFavoritesView,
+            CommandId::CloseNotebook,
+            CommandId::ToggleNotebookFavorite,
+            CommandId::NoteRevealInExplorer,
+            CommandId::FocusNextPane,
+            CommandId::FocusPreviousPane,
+            CommandId::SearchToggleCase,
+            CommandId::SearchToggleWholeWord,
+            CommandId::SearchToggleRegex,
+            CommandId::FindNext,
+            CommandId::FindPrevious,
+            CommandId::ReplaceInNotes,
+            CommandId::QuickOpen,
+            CommandId::NoteNewFolder,
+            CommandId::NoteNew,
+            CommandId::FileIconsMaterial,
+            CommandId::FileIconsMinimal,
+            CommandId::FileIconsSolid,
         ];
         COMMANDS
             .into_iter()
@@ -188,11 +298,18 @@ pub(crate) fn choose_open_path(
     crate::platform::dialogs::show_open_dialog(owner)
 }
 
+pub(crate) fn choose_folder_path(
+    owner: windows_sys::Win32::Foundation::HWND,
+) -> crate::Result<Option<std::path::PathBuf>> {
+    crate::platform::dialogs::show_folder_dialog(owner)
+}
+
 pub(crate) fn choose_save_path(
     owner: windows_sys::Win32::Foundation::HWND,
     suggested_name: &str,
+    folder: Option<&std::path::Path>,
 ) -> crate::Result<Option<std::path::PathBuf>> {
-    crate::platform::dialogs::show_save_dialog(owner, suggested_name)
+    crate::platform::dialogs::show_save_dialog(owner, suggested_name, folder)
 }
 
 #[cfg(test)]
@@ -222,6 +339,78 @@ mod tests {
             Ok(CommandId::ToggleRestoreSession)
         );
         assert!(!CommandId::ToggleRestoreSession.needs_document());
+        assert_eq!(CommandId::try_from(157), Ok(CommandId::ToggleNotesMode));
+        assert!(!CommandId::ToggleNotesMode.needs_document());
+        assert_eq!(CommandId::try_from(158), Ok(CommandId::OpenFolder));
+        assert_eq!(CommandId::try_from(159), Ok(CommandId::OpenRecentFolder));
+        assert!(!CommandId::OpenFolder.needs_document());
+        assert!(!CommandId::OpenRecentFolder.needs_document());
+        assert_eq!(CommandId::try_from(183), Ok(CommandId::FocusNextPane));
+        assert_eq!(CommandId::try_from(184), Ok(CommandId::FocusPreviousPane));
+        assert!(!CommandId::FocusNextPane.needs_document());
+        assert_eq!(
+            CommandId::try_from(160),
+            Ok(CommandId::ToggleFolderAutosave)
+        );
+        assert_eq!(CommandId::try_from(161), Ok(CommandId::NoteReloadFromDisk));
+        assert_eq!(CommandId::try_from(162), Ok(CommandId::NoteKeepMine));
+        assert!(!CommandId::ToggleFolderAutosave.needs_document());
+        assert!(CommandId::NoteReloadFromDisk.needs_document());
+        assert!(CommandId::NoteKeepMine.needs_document());
+        // Break caught: a removed command's number reused, so a stale shortcut or a test
+        // posting 163 runs something else.
+        for retired in [163_u16, 166, 167, 168, 169, 170, 171, 172, 173] {
+            assert!(CommandId::try_from(retired).is_err(), "{retired}");
+        }
+        assert_eq!(CommandId::try_from(164), Ok(CommandId::NoteTogglePin));
+        assert_eq!(CommandId::try_from(165), Ok(CommandId::NoteMoveToNotebook));
+        assert_eq!(CommandId::try_from(174), Ok(CommandId::NoteRename));
+        assert_eq!(CommandId::try_from(175), Ok(CommandId::NoteDelete));
+        assert!(CommandId::NoteTogglePin.needs_document());
+        assert!(CommandId::NoteMoveToNotebook.needs_document());
+        assert!(CommandId::NoteRename.needs_document());
+        assert!(CommandId::NoteDelete.needs_document());
+    }
+
+    #[test]
+    fn sidebar_commands_have_their_reserved_numbers_and_need_no_document() {
+        // Break caught: a renumbered view command, which would break the accelerator table and
+        // any WM_COMMAND an outside test posts by number.
+        assert_eq!(CommandId::try_from(176), Ok(CommandId::ToggleSidebar));
+        assert_eq!(CommandId::try_from(177), Ok(CommandId::ShowNotebookView));
+        assert_eq!(CommandId::try_from(178), Ok(CommandId::ShowSearchView));
+        assert_eq!(CommandId::try_from(179), Ok(CommandId::ShowFavoritesView));
+        for command in [
+            CommandId::ToggleSidebar,
+            CommandId::ShowNotebookView,
+            CommandId::ShowSearchView,
+            CommandId::ShowFavoritesView,
+        ] {
+            assert!(!command.needs_document());
+            assert!(command.is_sidebar());
+        }
+        assert!(!CommandId::Save.is_sidebar());
+    }
+
+    #[test]
+    fn notebook_commands_have_stable_values_and_need_no_document() {
+        // Break caught: Close notebook greyed out, or silently ignored, while no tab is open.
+        assert_eq!(CommandId::try_from(180), Ok(CommandId::CloseNotebook));
+        assert_eq!(
+            CommandId::try_from(181),
+            Ok(CommandId::ToggleNotebookFavorite)
+        );
+        assert!(!CommandId::CloseNotebook.needs_document());
+        assert!(!CommandId::ToggleNotebookFavorite.needs_document());
+    }
+
+    #[test]
+    fn reveal_in_explorer_has_a_stable_value() {
+        assert_eq!(
+            CommandId::try_from(182),
+            Ok(CommandId::NoteRevealInExplorer)
+        );
+        assert!(CommandId::NoteRevealInExplorer.needs_document());
     }
 
     #[test]
@@ -230,6 +419,79 @@ mod tests {
         assert_eq!(CommandId::SelectTab9.tab_index(), Some(8));
         assert_eq!(CommandId::NextTab.tab_index(), None);
         assert_eq!(CommandId::ZoomIn.tab_index(), None);
+    }
+
+    #[test]
+    fn search_option_commands_have_their_reserved_numbers_and_are_sidebar_commands() {
+        // Break caught: a toggle renumbered into another command's range, greyed out while no
+        // tab is open, or left enabled with notes mode off, where there is no Search view.
+        use crate::search::SearchOption;
+        for (value, command, option) in [
+            (185, CommandId::SearchToggleCase, SearchOption::Case),
+            (
+                186,
+                CommandId::SearchToggleWholeWord,
+                SearchOption::WholeWord,
+            ),
+            (187, CommandId::SearchToggleRegex, SearchOption::Regex),
+        ] {
+            assert_eq!(CommandId::try_from(value), Ok(command));
+            assert!(command.is_sidebar(), "{command:?}");
+            assert!(!command.needs_document(), "{command:?}");
+            assert_eq!(command.search_option(), Some(option));
+        }
+        assert_eq!(CommandId::ShowSearchView.search_option(), None);
+        assert_eq!(CommandId::Find.search_option(), None);
+    }
+
+    #[test]
+    fn find_next_and_previous_have_stable_values_and_need_a_document() {
+        assert_eq!(CommandId::try_from(188), Ok(CommandId::FindNext));
+        assert_eq!(CommandId::try_from(189), Ok(CommandId::FindPrevious));
+        assert!(CommandId::FindNext.needs_document());
+        assert!(!CommandId::FindNext.is_sidebar());
+    }
+
+    #[test]
+    fn replace_in_notes_is_190_a_sidebar_command_and_needs_no_document() {
+        // Break caught: 3b's first command renumbered onto another command's value, greyed out
+        // while no tab is open, or left running with notes mode off, where there is no Search
+        // view (spec §5).
+        assert_eq!(CommandId::ReplaceInNotes as u16, 190);
+        assert_eq!(CommandId::try_from(190), Ok(CommandId::ReplaceInNotes));
+        assert!(CommandId::ReplaceInNotes.is_sidebar());
+        assert!(!CommandId::ReplaceInNotes.needs_document());
+        assert_eq!(CommandId::ReplaceInNotes.search_option(), None);
+    }
+
+    #[test]
+    fn quick_open_is_191_and_needs_no_document() {
+        // Break caught: Ctrl+P renumbered onto another command, greyed out while no tab is open
+        // (when opening a note matters most), or hidden with notes mode off.
+        assert_eq!(CommandId::QuickOpen as u16, 191);
+        assert_eq!(CommandId::try_from(191), Ok(CommandId::QuickOpen));
+        assert!(!CommandId::QuickOpen.needs_document());
+        assert!(!CommandId::QuickOpen.is_sidebar());
+    }
+
+    #[test]
+    fn new_folder_is_192_and_neither_needs_a_document_nor_the_sidebar() {
+        // Break caught: New folder renumbered onto another command, greyed out while no tab is
+        // open, or treated as a sidebar command (notebook folders spec §6).
+        assert_eq!(CommandId::NoteNewFolder as u16, 192);
+        assert_eq!(CommandId::try_from(192), Ok(CommandId::NoteNewFolder));
+        assert!(!CommandId::NoteNewFolder.needs_document());
+        assert!(!CommandId::NoteNewFolder.is_sidebar());
+    }
+
+    #[test]
+    fn new_note_is_193_and_neither_needs_a_document_nor_the_sidebar() {
+        // Break caught: a renumbered command breaking the menus, or New note hidden while no
+        // tab is open, when it is most wanted (inline naming spec §8).
+        assert_eq!(CommandId::NoteNew as u16, 193);
+        assert_eq!(CommandId::try_from(193), Ok(CommandId::NoteNew));
+        assert!(!CommandId::NoteNew.needs_document());
+        assert!(!CommandId::NoteNew.is_sidebar());
     }
 
     #[test]

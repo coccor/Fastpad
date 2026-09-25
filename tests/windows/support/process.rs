@@ -38,21 +38,71 @@ type TestResult<T> = Result<T, Box<dyn Error>>;
 #[cfg(windows)]
 pub struct FastPadProcess {
     process: std::process::Child,
+    /// The `LOCALAPPDATA` a plain `spawn` created for this process; removed once it has exited.
+    owned_local_app_data: Option<std::path::PathBuf>,
+}
+
+/// Name of the notes folder seeded inside a scratch `LOCALAPPDATA`.
+#[cfg(windows)]
+pub const SCRATCH_NOTES_FOLDER: &str = "FastPad-notes";
+
+/// Points `folders.ini` at a scratch notes folder inside `local_app_data`, unless the test already
+/// wrote its own. With notes mode on (the default), FastPad otherwise opens the user's real recent
+/// folder or `Documents\FastPad`, scanning it and writing `.fastpad\library.ini` there.
+#[cfg(windows)]
+pub fn seed_scratch_notes_folder(local_app_data: &std::path::Path) -> TestResult<()> {
+    let data = local_app_data.join("FastPad");
+    let folders = fastpad::library::local::folders_file(&data);
+    if folders.exists() {
+        return Ok(());
+    }
+    let notes = local_app_data.join(SCRATCH_NOTES_FOLDER);
+    std::fs::create_dir_all(&notes)?;
+    std::fs::create_dir_all(&data)?;
+    let recent = fastpad::library::local::RecentFolders {
+        folders: vec![notes],
+        ..Default::default()
+    };
+    std::fs::write(&folders, recent.encode())?;
+    Ok(())
+}
+
+/// A fresh, empty `LOCALAPPDATA` for a spawn that did not name one.
+#[cfg(windows)]
+fn owned_scratch_local_app_data() -> TestResult<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "fastpad-spawn-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+    Ok(root)
 }
 
 #[cfg(windows)]
 impl FastPadProcess {
+    /// Spawns FastPad with a fresh scratch `LOCALAPPDATA`, removed after the process exits.
     pub fn spawn<I, S>(args: I) -> TestResult<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
-        command.args(args);
-        Self::spawn_command(command)
+        let local_app_data = owned_scratch_local_app_data()?;
+        let mut process = Self::spawn_with_local_app_data(args, &local_app_data);
+        match &mut process {
+            Ok(process) => process.owned_local_app_data = Some(local_app_data),
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&local_app_data);
+            }
+        }
+        process
     }
 
-    /// Spawns FastPad with `LOCALAPPDATA` redirected so settings never touch the real profile.
+    /// Spawns FastPad with `LOCALAPPDATA` redirected so settings never touch the real profile, and
+    /// its notes folder seeded inside it (see `seed_scratch_notes_folder`).
     pub fn spawn_with_local_app_data<I, S>(
         args: I,
         local_app_data: &std::path::Path,
@@ -61,6 +111,7 @@ impl FastPadProcess {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        seed_scratch_notes_folder(local_app_data)?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
         command.args(args).env("LOCALAPPDATA", local_app_data);
         Self::spawn_command(command)
@@ -78,6 +129,7 @@ impl FastPadProcess {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        seed_scratch_notes_folder(local_app_data)?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
         command.args(args).env("LOCALAPPDATA", local_app_data);
         for (name, value) in environment {
@@ -85,11 +137,12 @@ impl FastPadProcess {
         }
         Ok(Self {
             process: command.spawn()?,
+            owned_local_app_data: None,
         })
     }
 
     pub fn has_dialog(&self) -> TestResult<bool> {
-        Ok(find_unsaved_changes_dialog(self.process.id())?.is_some())
+        Ok(find_dialog(self.process.id())?.is_some())
     }
 
     /// The child's exit code straight from `GetExitCodeProcess`, or `None` while it still runs.
@@ -109,7 +162,10 @@ impl FastPadProcess {
             WaitForInputIdle(process_raw_handle(&process), 2_000);
         }
 
-        Ok(Self { process })
+        Ok(Self {
+            process,
+            owned_local_app_data: None,
+        })
     }
 
     pub fn id(&self) -> u32 {
@@ -168,6 +224,9 @@ impl FastPadProcess {
 impl Drop for FastPadProcess {
     fn drop(&mut self) {
         let _ = cleanup_process(&mut self.process, &Deadline::after(Duration::from_secs(2)));
+        if let Some(local_app_data) = self.owned_local_app_data.take() {
+            let _ = std::fs::remove_dir_all(local_app_data);
+        }
     }
 }
 
@@ -232,34 +291,137 @@ pub fn process_has_module_loaded(process_id: u32, module_file_name: &str) -> Tes
 /// overlap with a second dialog `close()` may need to show/dismiss reentrantly (nested modal
 /// `MessageBoxW` calls on the same thread are surprising to reason about; avoiding the overlap in
 /// the first place is simpler than making `close()` robust to it).
-///
-/// Returns only once the dialog window is gone: a slow runner can list the `#32770` window before
-/// its buttons exist, so a single dismissal attempt could silently do nothing.
 #[cfg(windows)]
 pub fn wait_and_dismiss_dialog(process_id: u32, timeout: Duration) -> TestResult<()> {
-    let deadline = Deadline::after(timeout);
-    let mut dismissed = None;
+    wait_and_answer_dialog(process_id, timeout, dismiss_dialog)
+}
+
+/// Waits for a dialog over `process_id`'s windows, such as the Save As dialog, and cancels it with
+/// `IDCANCEL`.
+#[cfg(windows)]
+pub fn wait_and_cancel_dialog(process_id: u32, timeout: Duration) -> TestResult<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDCANCEL;
+    wait_and_answer_dialog(process_id, timeout, |dialog| unsafe {
+        PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0) != 0
+    })
+}
+
+/// How long an answered dialog may take to close. The first file dialog on a fresh CI runner
+/// sets up the shell on FastPad's UI thread before it handles the answer: in hosted runs the Save
+/// As cancel took up to 11.5 s and once over 15 s, against under a second on a warm machine.
+#[cfg(windows)]
+const ANSWERED_DIALOG_CLOSE_WAIT: Duration = Duration::from_secs(60);
+
+/// Waits for a dialog to appear, then calls `answer` on it until the dialog window is gone.
+/// `answer` returns false while it could not act yet.
+///
+/// Answering is repeated because a slow runner can list the `#32770` window before its buttons
+/// exist or before it handles commands, so a single attempt could silently do nothing.
+///
+/// `timeout` bounds the wait for the dialog to appear; once answered, it gets
+/// `ANSWERED_DIALOG_CLOSE_WAIT` to close.
+#[cfg(windows)]
+fn wait_and_answer_dialog(
+    process_id: u32,
+    timeout: Duration,
+    answer: impl Fn(HWND) -> bool,
+) -> TestResult<()> {
+    let mut deadline = Deadline::after(timeout);
+    let mut answered: Option<HWND> = None;
     loop {
-        match dismissed {
-            Some(dialog) if unsafe { IsWindow(dialog) } == 0 => return Ok(()),
-            Some(_) => {}
-            None => {
-                if let Some(dialog) = find_unsaved_changes_dialog(process_id)?
-                    && dismiss_dialog(dialog)
-                {
-                    dismissed = Some(dialog);
-                    continue;
-                }
+        if let Some(dialog) = answered
+            && unsafe { IsWindow(dialog) } == 0
+        {
+            return Ok(());
+        }
+        let dialog = match answered {
+            Some(dialog) => Some(dialog),
+            None => find_dialog(process_id)?,
+        };
+        if let Some(dialog) = dialog
+            && answer(dialog)
+        {
+            if answered.is_none() {
+                deadline = Deadline::after(ANSWERED_DIALOG_CLOSE_WAIT);
             }
+            answered = Some(dialog);
         }
         if deadline.expired() {
-            return Err(match dismissed {
-                Some(_) => "timed out waiting for a dismissed dialog to close".into(),
-                None => "timed out waiting for a dialog to appear".into(),
-            });
+            let what = match answered {
+                Some(_) => "timed out waiting for an answered dialog to close",
+                None => "timed out waiting for a dialog to appear",
+            };
+            return Err(format!(
+                "{what}; answered {answered:?}; {}",
+                describe_windows(process_id)
+            )
+            .into());
         }
         deadline.sleep_step();
     }
+}
+
+/// Every top-level window of the process, and whether its thread answers, for a dialog wait that
+/// timed out.
+#[cfg(windows)]
+fn describe_windows(process_id: u32) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GetWindow, IsHungAppWindow, IsWindowVisible, SMTO_ABORTIFHUNG,
+        SendMessageTimeoutW, WM_NULL,
+    };
+    struct Found {
+        process_id: u32,
+        windows: Vec<HWND>,
+    }
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(lparam as *mut Found) };
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+        if process_id == found.process_id {
+            found.windows.push(hwnd);
+        }
+        1
+    }
+    unsafe extern "system" fn count(_: HWND, lparam: LPARAM) -> BOOL {
+        unsafe { *(lparam as *mut u32) += 1 };
+        1
+    }
+    let text = |hwnd: HWND, class: bool| {
+        let mut buffer = [0_u16; 128];
+        let length = unsafe {
+            if class {
+                GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32)
+            } else {
+                GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32)
+            }
+        };
+        String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+    };
+    let mut found = Found {
+        process_id,
+        windows: Vec::new(),
+    };
+    unsafe { EnumWindows(Some(collect), &mut found as *mut Found as isize) };
+    let mut out = String::from("windows:");
+    for hwnd in found.windows {
+        let mut children = 0_u32;
+        let mut result = 0;
+        let answers = unsafe {
+            EnumChildWindows(hwnd, Some(count), &mut children as *mut u32 as isize);
+            SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2_000, &mut result)
+        };
+        out += &format!(
+            "\n  {hwnd:?} class={:?} title={:?} visible={} enabled={} owner={:?} hung={} answers={} children={children}",
+            text(hwnd, true),
+            text(hwnd, false),
+            unsafe { IsWindowVisible(hwnd) },
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd) },
+            unsafe { GetWindow(hwnd, GW_OWNER) },
+            unsafe { IsHungAppWindow(hwnd) },
+            answers,
+        );
+    }
+    out
 }
 
 #[cfg(windows)]
@@ -332,7 +494,14 @@ unsafe extern "system" fn enum_main_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         GetWindowThreadProcessId(hwnd, &mut process_id);
     }
-    if process_id == search.process_id {
+    // Only the main window: the process also owns top-level popups, such as the sidebar's
+    // tooltip, that EnumWindows may list first.
+    let mut class_name = [0_u16; 32];
+    let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+    if process_id == search.process_id
+        && length > 0
+        && String::from_utf16_lossy(&class_name[..length as usize]) == "FastPadMainWindow"
+    {
         search.hwnd = Some(hwnd);
         return 0;
     }
@@ -389,10 +558,10 @@ unsafe extern "system" fn enum_no_or_ok_button(hwnd: HWND, lparam: LPARAM) -> BO
     1
 }
 
-/// Finds a top-level standard `MessageBoxW` dialog (window class `"#32770"`) owned by `process_id`,
-/// such as FastPad's "Save changes?" close prompt.
+/// Finds a top-level dialog (window class `"#32770"`) owned by `process_id`: a `MessageBoxW` such
+/// as FastPad's "Save changes?" close prompt, or a common dialog such as Save As.
 #[cfg(windows)]
-fn find_unsaved_changes_dialog(process_id: u32) -> TestResult<Option<HWND>> {
+fn find_dialog(process_id: u32) -> TestResult<Option<HWND>> {
     let mut search = DialogSearch {
         process_id,
         hwnd: None,

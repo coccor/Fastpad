@@ -8,9 +8,9 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3,
-    VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_MINUS,
-    VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
+    VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_F3, VK_F6, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2,
+    VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9,
+    VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CallNextHookEx, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
@@ -29,18 +29,25 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 42] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 54] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
         accelerator(FCONTROL, b'O', CommandId::Open),
+        accelerator(FCONTROL | FSHIFT, b'O', CommandId::OpenFolder),
+        accelerator(FCONTROL | FSHIFT, b'M', CommandId::NoteMoveToNotebook),
         accelerator(FCONTROL, b'S', CommandId::Save),
         accelerator(FCONTROL | FSHIFT, b'S', CommandId::SaveAs),
+        accelerator(FCONTROL, b'W', CommandId::CloseTab),
         accelerator(FCONTROL, b'F', CommandId::Find),
         accelerator(FCONTROL, b'H', CommandId::Replace),
+        accelerator(FCONTROL | FSHIFT, b'H', CommandId::ReplaceInNotes),
+        virtual_key(0, VK_F3, CommandId::FindNext),
+        virtual_key(FSHIFT, VK_F3, CommandId::FindPrevious),
         accelerator(FCONTROL, b'Z', CommandId::Undo),
         accelerator(FCONTROL, b'Y', CommandId::Redo),
-        accelerator(FCONTROL | FSHIFT, b'F', CommandId::FormatJson),
+        accelerator(FCONTROL | FSHIFT, b'F', CommandId::ShowSearchView),
+        accelerator(FSHIFT | FALT, b'F', CommandId::FormatJson),
         virtual_key(FCONTROL, VK_TAB, CommandId::NextTab),
         virtual_key(FCONTROL | FSHIFT, VK_TAB, CommandId::PreviousTab),
         accelerator(FCONTROL, b'1', CommandId::SelectTab1),
@@ -71,9 +78,14 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 42] {
         virtual_key(FCONTROL, VK_NUMPAD0, CommandId::ZoomReset),
         accelerator(FCONTROL, b'L', CommandId::TextLeftToRight),
         accelerator(FCONTROL, b'R', CommandId::TextRightToLeft),
+        accelerator(FCONTROL, b'P', CommandId::QuickOpen),
         accelerator(FCONTROL | FSHIFT, b'P', CommandId::CommandPalette),
         accelerator(FCONTROL | FSHIFT, b'V', CommandId::MarkdownPreviewCycle),
+        accelerator(FCONTROL, b'B', CommandId::ToggleSidebar),
+        accelerator(FCONTROL | FSHIFT, b'E', CommandId::ShowNotebookView),
         accelerator(FALT, b'Z', CommandId::ToggleWordWrap),
+        virtual_key(0, VK_F6, CommandId::FocusNextPane),
+        virtual_key(FSHIFT, VK_F6, CommandId::FocusPreviousPane),
     ]
 }
 
@@ -139,9 +151,11 @@ impl MenuBar {
             let file = create_popup(&[
                 MenuEntry::command("&New\tCtrl+N", CommandId::New),
                 MenuEntry::command("&Open...\tCtrl+O", CommandId::Open),
+                MenuEntry::command("Open &Notebook...\tCtrl+Shift+O", CommandId::OpenFolder),
+                MenuEntry::command("&Go to note\u{2026}\tCtrl+P", CommandId::QuickOpen),
                 MenuEntry::command("&Save\tCtrl+S", CommandId::Save),
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
-                MenuEntry::command("&Close tab", CommandId::CloseTab),
+                MenuEntry::command("&Close tab	Ctrl+W", CommandId::CloseTab),
                 MenuEntry::Separator,
                 MenuEntry::command(
                     "&Restore session on startup",
@@ -162,6 +176,8 @@ impl MenuBar {
             append_popup(root, MENU_TITLES[1], edit)?;
             let search = create_popup(&[
                 MenuEntry::command("&Find\tCtrl+F", CommandId::Find),
+                MenuEntry::command("Find &next\tF3", CommandId::FindNext),
+                MenuEntry::command("Find pre&vious\tShift+F3", CommandId::FindPrevious),
                 MenuEntry::command("&Replace\tCtrl+H", CommandId::Replace),
             ])?;
             append_popup(root, MENU_TITLES[2], search)?;
@@ -179,6 +195,8 @@ impl MenuBar {
                 MenuEntry::Separator,
                 MenuEntry::command("&Word wrap	Alt+Z", CommandId::ToggleWordWrap),
                 MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
+                MenuEntry::Separator,
+                MenuEntry::command("Side&bar	Ctrl+B", CommandId::ToggleSidebar),
                 MenuEntry::Separator,
                 MenuEntry::command(
                     "Markdown preview &side by side",
@@ -227,6 +245,12 @@ pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
     }
 }
 
+/// Grays the View menu's Sidebar entry while notes mode is off and there is no sidebar.
+pub(crate) fn set_sidebar_enabled(menu: HMENU, enabled: bool) {
+    let state = MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED };
+    unsafe { EnableMenuItem(menu, CommandId::ToggleSidebar as u32, state) };
+}
+
 impl Drop for MenuBar {
     fn drop(&mut self) {
         unsafe {
@@ -235,13 +259,13 @@ impl Drop for MenuBar {
     }
 }
 
-enum MenuEntry {
+pub(crate) enum MenuEntry {
     Command(&'static str, CommandId),
     Separator,
 }
 
 impl MenuEntry {
-    const fn command(label: &'static str, command: CommandId) -> Self {
+    pub(crate) const fn command(label: &'static str, command: CommandId) -> Self {
         Self::Command(label, command)
     }
 }
@@ -314,7 +338,7 @@ pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) ->
     track_popup(hwnd, &entries, POINT { x, y })
 }
 
-fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> Option<CommandId> {
+pub(crate) fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> Option<CommandId> {
     // TrackPopupMenuEx runs a nested modal loop that reenters the window procedure, exactly as the
     // file dialogs do. Hold deferred, IPC and snapshot work for its duration so the command the
     // user picks still acts on the document that was active when they opened the menu.
@@ -531,6 +555,17 @@ mod tests {
     use crate::window::commands::CommandId;
 
     #[test]
+    fn ctrl_w_closes_the_tab() {
+        // Break caught: Ctrl+W unbound, or bound to Close all tabs (quick-open spec §4).
+        use windows_sys::Win32::UI::WindowsAndMessaging::FCONTROL;
+        let bound = accelerator_specs()
+            .into_iter()
+            .find(|spec| spec.modifiers == FCONTROL && spec.key == u16::from(b'W'))
+            .map(|spec| spec.command);
+        assert_eq!(bound, Some(CommandId::CloseTab));
+    }
+
+    #[test]
     fn shortcut_and_menu_commands_share_command_ids() {
         let specs = accelerator_specs();
         assert!(specs.iter().any(|item| item.command == CommandId::New));
@@ -540,7 +575,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 42);
+        assert_eq!(specs.len(), 54);
     }
 
     #[test]
@@ -549,6 +584,20 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         assert_eq!(std::mem::align_of::<super::AlignedAccelerators<1>>() % 4, 0);
         super::AcceleratorTable::create().expect("accelerator table");
+    }
+
+    #[test]
+    fn ctrl_p_opens_quick_open_and_ctrl_shift_p_stays_the_palette() {
+        // Break caught: Ctrl+P unbound, or taking Ctrl+Shift+P from the command palette.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FCONTROL, FSHIFT};
+        let bound = |modifiers: u8| {
+            accelerator_specs()
+                .into_iter()
+                .find(|spec| spec.modifiers == modifiers && spec.key == u16::from(b'P'))
+                .map(|spec| spec.command)
+        };
+        assert_eq!(bound(FCONTROL), Some(CommandId::QuickOpen));
+        assert_eq!(bound(FCONTROL | FSHIFT), Some(CommandId::CommandPalette));
     }
 
     #[test]
@@ -568,9 +617,9 @@ mod tests {
     #[test]
     fn tab_zoom_and_direction_shortcuts_are_bound() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-            VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_TAB,
+            VK_F3, VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_TAB,
         };
-        use windows_sys::Win32::UI::WindowsAndMessaging::{FCONTROL, FSHIFT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
         let bound = |modifiers: u8, key: u16| {
             accelerator_specs()
                 .into_iter()
@@ -604,12 +653,59 @@ mod tests {
             Some(CommandId::CommandPalette)
         );
         assert_eq!(
-            bound(
-                windows_sys::Win32::UI::WindowsAndMessaging::FALT,
-                u16::from(b'Z')
-            ),
+            bound(FALT, u16::from(b'Z')),
             Some(CommandId::ToggleWordWrap)
         );
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'B')),
+            Some(CommandId::ToggleSidebar)
+        );
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, u16::from(b'E')),
+            Some(CommandId::ShowNotebookView)
+        );
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, u16::from(b'F')),
+            Some(CommandId::ShowSearchView)
+        );
+        assert_eq!(
+            bound(FSHIFT | FALT, u16::from(b'F')),
+            Some(CommandId::FormatJson)
+        );
+        // Break caught: Ctrl+K still showing Search after Search moved to Ctrl+Shift+F.
+        assert_eq!(bound(FCONTROL, u16::from(b'K')), None);
+        // The option toggles are palette-only (spec §5).
+        assert!(
+            accelerator_specs()
+                .iter()
+                .all(|spec| spec.command.search_option().is_none())
+        );
+        // Break caught: F3 unbound, so opening a Search result can't step on (spec §8).
+        assert_eq!(bound(0, VK_F3), Some(CommandId::FindNext));
+        assert_eq!(bound(FSHIFT, VK_F3), Some(CommandId::FindPrevious));
+        // Break caught: Ctrl+Shift+H unbound, or taking Ctrl+H from the find bar's Replace
+        // (spec §11).
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, u16::from(b'H')),
+            Some(CommandId::ReplaceInNotes)
+        );
+        assert_eq!(bound(FCONTROL, u16::from(b'H')), Some(CommandId::Replace));
+    }
+
+    #[test]
+    fn the_view_menu_toggles_the_sidebar_and_grays_it_without_notes_mode() {
+        // Break caught: a Sidebar entry that stays enabled with notes mode off, where it does
+        // nothing, or no entry at all.
+        use super::{MenuBar, set_sidebar_enabled};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_GRAYED};
+        let bar = MenuBar::create().unwrap();
+        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
+        let state = || unsafe { GetMenuState(view, CommandId::ToggleSidebar as u32, MF_BYCOMMAND) };
+        assert_ne!(state(), u32::MAX, "the View menu has a Sidebar entry");
+        set_sidebar_enabled(view, false);
+        assert_ne!(state() & MF_GRAYED, 0);
+        set_sidebar_enabled(view, true);
+        assert_eq!(state() & MF_GRAYED, 0);
     }
 
     #[test]

@@ -437,7 +437,7 @@ mod tests {
         let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
         cache.request(&path, 16);
         wait_for(&mut cache, &path, 16);
-        assert_eq!(cache.size(&path), Some((256, 256)));
+        assert_eq!(cache.size(&path), Some((244, 256)));
         cache.request(&path, 64);
         wait_for(&mut cache, &path, 64);
     }

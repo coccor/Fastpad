@@ -9,6 +9,7 @@ repository = "https://github.com/coccor/FastPad"
 [dependencies]
 serde_json = "=1.0.151"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
+regex = "=1.13.1"
 windows = { version = "=0.62.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
@@ -26,6 +27,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
@@ -124,3 +126,7 @@ path = "tests/windows/session.rs"
 [[test]]
 name = "markdown_preview"
 path = "tests/windows/markdown_preview.rs"
+
+[[test]]
+name = "library"
+path = "tests/windows/library.rs"

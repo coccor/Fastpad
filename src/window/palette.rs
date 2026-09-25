@@ -3,6 +3,7 @@
 //!
 //! Every themed palette is compiled-in static data, so resolving one is an array index.
 
+use super::file_icons::IconColor;
 use crate::catppuccin::{self, Flavor};
 use crate::languages::rgb;
 use crate::platform::theme::{SystemTheme, Theme};
@@ -34,8 +35,12 @@ pub struct Palette {
     pub line_number_foreground: u32,
     /// Resting caption-button glyphs and status-line text on `strip_background`.
     pub strip_foreground: u32,
+    /// Error text on `editor_background` or the panel, such as a regex error in the Search view.
+    pub error_foreground: u32,
     /// Whether the frame and editor scrollbars should request the dark system styling.
     pub dark_frame: bool,
+    /// The system's high-contrast colors: only system color pairs may be drawn, never a blend.
+    pub high_contrast: bool,
 }
 
 const CLOSE_HOVER: u32 = rgb(0xC4, 0x2B, 0x1C);
@@ -59,7 +64,9 @@ const LIGHT: Palette = Palette {
     caret_line_background: rgb(245, 247, 250),
     line_number_foreground: rgb(110, 118, 129),
     strip_foreground: rgb(32, 32, 32),
+    error_foreground: rgb(0xA1, 0x26, 0x0D),
     dark_frame: false,
+    high_contrast: false,
 };
 
 const DARK: Palette = Palette {
@@ -79,7 +86,9 @@ const DARK: Palette = Palette {
     caret_line_background: rgb(40, 40, 40),
     line_number_foreground: rgb(133, 133, 133),
     strip_foreground: rgb(212, 212, 212),
+    error_foreground: rgb(0xF4, 0x87, 0x71),
     dark_frame: true,
+    high_contrast: false,
 };
 
 /// Maps a Catppuccin flavor onto FastPad's UI roles per the Catppuccin style guide: `mantle`
@@ -102,7 +111,9 @@ const fn catppuccin(flavor: &Flavor, dark: bool) -> Palette {
         caret_line_background: catppuccin::blend(flavor.text, flavor.base, 26),
         line_number_foreground: flavor.overlay1,
         strip_foreground: flavor.text,
+        error_foreground: flavor.red,
         dark_frame: dark,
+        high_contrast: false,
     }
 }
 
@@ -115,6 +126,84 @@ static PALETTES: [Palette; Theme::COUNT] = [
     catppuccin(&catppuccin::MACCHIATO, true),
     catppuccin(&catppuccin::MOCHA, true),
 ];
+
+/// The Notebook view's file-type icon colours (notebook folders spec §5.2): six Catppuccin
+/// roles, from the theme's own flavour, Latte's for Light and Mocha's for Dark. High contrast
+/// uses the muted system colour for all of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileIcons {
+    pub blue: u32,
+    pub yellow: u32,
+    pub peach: u32,
+    pub green: u32,
+    pub maroon: u32,
+    pub overlay2: u32,
+}
+
+const fn file_icons(flavor: &Flavor) -> FileIcons {
+    FileIcons {
+        blue: flavor.blue,
+        yellow: flavor.yellow,
+        peach: flavor.peach,
+        green: flavor.green,
+        maroon: flavor.maroon,
+        overlay2: flavor.overlay2,
+    }
+}
+
+/// Indexed by `Theme as usize`, like `PALETTES`.
+static FILE_ICONS: [FileIcons; Theme::COUNT] = [
+    file_icons(&catppuccin::LATTE),
+    file_icons(&catppuccin::MOCHA),
+    file_icons(&catppuccin::LATTE),
+    file_icons(&catppuccin::FRAPPE),
+    file_icons(&catppuccin::MACCHIATO),
+    file_icons(&catppuccin::MOCHA),
+];
+
+impl FileIcons {
+    /// The neutral first-paint palette's icons (Light's).
+    pub const fn neutral() -> Self {
+        file_icons(&catppuccin::LATTE)
+    }
+
+    pub fn for_theme(theme: Theme, high_contrast: bool) -> Self {
+        if high_contrast {
+            let muted = Palette::for_theme(theme, true).muted_foreground;
+            Self {
+                blue: muted,
+                yellow: muted,
+                peach: muted,
+                green: muted,
+                maroon: muted,
+                overlay2: muted,
+            }
+        } else {
+            FILE_ICONS[theme as usize]
+        }
+    }
+
+    /// `None` means chrome has not been built yet: the neutral icons, with no theme queries.
+    pub fn for_cached_theme(
+        theme: Option<SystemTheme>,
+        preference: crate::config::ThemePreference,
+    ) -> Self {
+        theme.map_or_else(Self::neutral, |theme| {
+            Self::for_theme(theme.effective_theme(preference), theme.high_contrast)
+        })
+    }
+
+    pub(crate) const fn color(&self, role: IconColor) -> u32 {
+        match role {
+            IconColor::Blue => self.blue,
+            IconColor::Yellow => self.yellow,
+            IconColor::Peach => self.peach,
+            IconColor::Green => self.green,
+            IconColor::Maroon => self.maroon,
+            IconColor::Overlay2 => self.overlay2,
+        }
+    }
+}
 
 impl Palette {
     /// The compiled palette used before `WM_FASTPAD_BUILD_CHROME`, so first paint makes no theme
@@ -145,6 +234,11 @@ impl Palette {
         self.editor_background
     }
 
+    /// The side panel's background: halfway between the strip and the editor, channel by channel.
+    pub const fn panel_background(&self) -> u32 {
+        ((self.strip_background >> 1) & 0x007f_7f7f) + ((self.editor_background >> 1) & 0x007f_7f7f)
+    }
+
     fn high_contrast() -> Self {
         let color = |index| unsafe { GetSysColor(index) };
         let window = color(COLOR_WINDOW);
@@ -168,7 +262,9 @@ impl Palette {
             caret_line_background: window,
             line_number_foreground: text,
             strip_foreground: color(COLOR_BTNTEXT),
+            error_foreground: text,
             dark_frame: false,
+            high_contrast: true,
         }
     }
 }
@@ -286,6 +382,138 @@ mod tests {
                 palette.close_hover_background,
                 palette.close_hover_foreground
             );
+        }
+    }
+
+    #[test]
+    fn the_error_color_stands_apart_from_the_text_and_the_background() {
+        // Break caught: a regex error in the Search view that reads like the note count, or
+        // vanishes into the background.
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
+            assert_ne!(
+                palette.error_foreground, palette.editor_background,
+                "{theme:?}"
+            );
+            assert_ne!(
+                palette.error_foreground, palette.editor_foreground,
+                "{theme:?}"
+            );
+            assert_ne!(
+                palette.error_foreground, palette.muted_foreground,
+                "{theme:?}"
+            );
+        }
+        assert_eq!(
+            Palette::for_theme(Theme::CatppuccinMocha, true).error_foreground,
+            unsafe { GetSysColor(COLOR_WINDOWTEXT) },
+            "high contrast keeps the system text color"
+        );
+    }
+
+    /// WCAG relative luminance of a `COLORREF`.
+    fn luminance(color: u32) -> f64 {
+        let channel = |shift: u32| {
+            let value = f64::from((color >> shift) & 0xFF) / 255.0;
+            if value <= 0.040_45 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(16)
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn file_icon_colours_come_from_the_themes_flavour_and_high_contrast_mutes_them() {
+        // Break caught: the Light theme drawing Mocha's pastel icons on white, a Catppuccin theme
+        // using another flavour's swatches, or coloured icons in high contrast (spec §5.2).
+        use super::FileIcons;
+        let flavors = [
+            (Theme::Light, catppuccin::LATTE),
+            (Theme::Dark, catppuccin::MOCHA),
+            (Theme::CatppuccinLatte, catppuccin::LATTE),
+            (Theme::CatppuccinFrappe, catppuccin::FRAPPE),
+            (Theme::CatppuccinMacchiato, catppuccin::MACCHIATO),
+            (Theme::CatppuccinMocha, catppuccin::MOCHA),
+        ];
+        for (theme, flavor) in flavors {
+            let icons = FileIcons::for_theme(theme, false);
+            assert_eq!(
+                (
+                    icons.blue,
+                    icons.yellow,
+                    icons.peach,
+                    icons.green,
+                    icons.maroon,
+                    icons.overlay2
+                ),
+                (
+                    flavor.blue,
+                    flavor.yellow,
+                    flavor.peach,
+                    flavor.green,
+                    flavor.maroon,
+                    flavor.overlay2
+                ),
+                "{theme:?}"
+            );
+            let muted = Palette::for_theme(theme, true).muted_foreground;
+            let system = FileIcons::for_theme(theme, true);
+            assert!(
+                [
+                    system.blue,
+                    system.yellow,
+                    system.peach,
+                    system.green,
+                    system.maroon,
+                    system.overlay2
+                ]
+                .iter()
+                .all(|&color| color == muted)
+            );
+        }
+        assert_eq!(
+            FileIcons::neutral(),
+            FileIcons::for_theme(Theme::Light, false)
+        );
+    }
+
+    #[test]
+    fn file_icon_colours_stay_visible_on_selected_and_hovered_rows() {
+        // Break caught: an icon colour that disappears into the selection or hover highlight,
+        // where spec §5.2 keeps it. The weakest pair, Latte yellow on the Light theme's
+        // selection, is about 1.7:1.
+        use super::FileIcons;
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
+            let icons = FileIcons::for_theme(theme, false);
+            for color in [
+                icons.blue,
+                icons.yellow,
+                icons.peach,
+                icons.green,
+                icons.maroon,
+                icons.overlay2,
+            ] {
+                for background in [
+                    palette.selection_background,
+                    palette.inactive_selection_background,
+                    palette.hover_background,
+                    palette.panel_background(),
+                ] {
+                    let ratio = contrast(color, background);
+                    assert!(
+                        ratio >= 1.5,
+                        "{theme:?}: {color:06x} on {background:06x} is {ratio:.2}:1"
+                    );
+                }
+            }
         }
     }
 }

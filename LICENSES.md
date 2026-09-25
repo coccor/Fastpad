@@ -12,11 +12,17 @@ text is in `LICENSE`.
 | Scintilla (`Scintilla.dll`) | 5.6.6 | License for Lexilla, Scintilla, and SciTE (Historical Permission Notice and Disclaimer style), Copyright 1998-2021 Neil Hodgson | `licenses/Scintilla.txt` |
 | Lexilla (`Lexilla.dll`) | 5.5.3 | License for Lexilla, Scintilla, and SciTE (Historical Permission Notice and Disclaimer style), Copyright 1998-2021 Neil Hodgson | `licenses/Lexilla.txt` |
 
+## Bundled artwork
+
+| Artwork | Version | License | Text |
+|---|---|---|---|
+| Material Icon Theme icons (12 file and folder icons, embedded in `FastPad.exe`) | 5.38.1 | MIT License, Copyright (c) 2025 Material Extensions | `licenses/material-icon-theme.txt` |
+
 ## Rust crates
 
-FastPad depends directly on windows-sys 0.61.2, serde_json 1.0.151, pulldown-cmark 0.13.4, windows
-0.62.2, and windows-numerics 0.3.1. The complete locked dependency closure, with the license
-expressions reported by `cargo metadata --locked`, is:
+FastPad depends directly on windows-sys 0.61.2, serde_json 1.0.151, pulldown-cmark 0.13.4, regex
+1.13.1, windows 0.62.2, and windows-numerics 0.3.1. The complete locked dependency closure, with the
+license expressions reported by `cargo metadata --locked`, is:
 
 | Crate | Version | License | Role |
 |---|---|---|---|
@@ -26,7 +32,7 @@ expressions reported by `cargo metadata --locked`, is:
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | Locked but not linked (no normal dependency edge for this target) |
 | `serde_core` | 1.0.229 | MIT OR Apache-2.0 | `serde_json` dependency (linked) |
 | `itoa` | 1.0.18 | MIT OR Apache-2.0 | `serde_json` dependency (linked) |
-| `memchr` | 2.8.3 | Unlicense OR MIT | `serde_json` dependency (linked) |
+| `memchr` | 2.8.3 | Unlicense OR MIT | `serde_json` and `regex` dependency (linked) |
 | `zmij` | 1.0.23 | MIT | `serde_json` dependency (linked) |
 | `serde_derive` | 1.0.229 | MIT OR Apache-2.0 | Build-time procedural macro |
 | `proc-macro2` | 1.0.107 | MIT OR Apache-2.0 | Build-time procedural macro support |
@@ -36,6 +42,10 @@ expressions reported by `cargo metadata --locked`, is:
 | `pulldown-cmark` | 0.13.4 | MIT | Markdown preview parser (linked) |
 | `bitflags` | 2.13.2 | MIT OR Apache-2.0 | `pulldown-cmark` dependency (linked) |
 | `unicase` | 2.9.0 | MIT OR Apache-2.0 | `pulldown-cmark` dependency (linked) |
+| `regex` | 1.13.1 | MIT OR Apache-2.0 | Note text search (linked) |
+| `regex-automata` | 0.4.18 | MIT OR Apache-2.0 | `regex` dependency (linked) |
+| `regex-syntax` | 0.8.11 | MIT OR Apache-2.0 | `regex` dependency (linked) |
+| `aho-corasick` | 1.1.5 | Unlicense OR MIT | `regex` dependency (linked) |
 | `windows` | 0.62.2 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |
 | `windows-core` | 0.62.2 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |
 | `windows-result` | 0.4.1 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |

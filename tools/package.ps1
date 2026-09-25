@@ -62,6 +62,7 @@ $Sources = [ordered]@{
     "LICENSES.md"            = Join-Path $RepositoryRoot "LICENSES.md"
     "licenses\Scintilla.txt" = Join-Path $RepositoryRoot "licenses\Scintilla.txt"
     "licenses\Lexilla.txt"   = Join-Path $RepositoryRoot "licenses\Lexilla.txt"
+    "licenses\material-icon-theme.txt" = Join-Path $RepositoryRoot "licenses\material-icon-theme.txt"
     "licenses\rust-crates.txt" = $RustCrateLicenses
 }
 if ((@($Sources.Keys | Sort-Object) -join "|") -ne (@($PackageFiles | Sort-Object) -join "|")) {

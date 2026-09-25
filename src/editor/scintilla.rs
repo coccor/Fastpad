@@ -2,26 +2,28 @@ use crate::editor::scintilla_constants::{
     SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY,
     SCI_CREATEDOCUMENT, SCI_CUT, SCI_EMPTYUNDOBUFFER, SCI_ENDUNDOACTION, SCI_GETDIRECTFUNCTION,
     SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETLENGTH, SCI_GETSELECTIONEND,
-    SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTEXT, SCI_GETTEXTLENGTH, SCI_PASTE, SCI_REDO,
-    SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET, SCI_SEARCHINTARGET, SCI_SETCODEPAGE,
-    SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETSEL,
-    SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_STYLECLEARALL, SCI_STYLESETBACK,
-    SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
+    SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTARGETEND, SCI_GETTEXT, SCI_GETTEXTLENGTH,
+    SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET,
+    SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETSAVEPOINT,
+    SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION,
+    SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
+    SCI_UNDO,
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{
     SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
     SC_ELEMENT_SELECTION_INACTIVE_TEXT, SC_ELEMENT_SELECTION_TEXT, SC_WRAP_NONE, SC_WRAP_WORD,
-    SCI_RESETELEMENTCOLOUR, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR, SCI_SETMARGINLEFT,
-    SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING,
-    SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
+    SCI_GOTOLINE, SCI_RESETELEMENTCOLOUR, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR,
+    SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
+    SCI_SETSCROLLWIDTHTRACKING, SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL,
+    STYLE_DEFAULT,
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
 use crate::editor::scintilla_constants::{
-    SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCOLUMN, SCI_GETCURRENTPOS,
-    SCI_GETFIRSTVISIBLELINE, SCI_GETRANGEPOINTER, SCI_LINEFROMPOSITION, SCI_SETFIRSTVISIBLELINE,
-    SCI_VISIBLEFROMDOCLINE,
+    SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCHARACTERPOINTER, SCI_GETCODEPAGE,
+    SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER,
+    SCI_LINEFROMPOSITION, SCI_LINELENGTH, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
 };
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
@@ -356,6 +358,41 @@ impl Editor {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
+    /// Runs `f` on the whole document's text, borrowed straight out of Scintilla's buffer
+    /// (`SCI_GETCHARACTERPOINTER`, which closes the gap once and then costs nothing until the
+    /// next edit). Byte offsets into it are Scintilla positions. `f` sees the text only for the
+    /// call, so no edit can move the buffer under it. A document that isn't in the UTF-8 code
+    /// page, or whose bytes aren't valid UTF-8, is an error: every FastPad document is UTF-8
+    /// (`initialize_view`), so nothing is converted.
+    #[cfg(windows)]
+    pub fn with_document_text<R>(&self, f: impl FnOnce(&str) -> R) -> Result<R> {
+        let code_page = self.endpoint.send_direct_checked(SCI_GETCODEPAGE, 0, 0)?;
+        if code_page != SC_CP_UTF8 as isize {
+            return Err(FastPadError::Invariant("The document is not UTF-8"));
+        }
+        let length = self.length()?;
+        if length == 0 {
+            return Ok(f(""));
+        }
+        let pointer = self
+            .endpoint
+            .send_direct_checked(SCI_GETCHARACTERPOINTER, 0, 0)?;
+        if pointer == 0 {
+            return Err(FastPadError::Invariant(
+                "Scintilla returned no character pointer",
+            ));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(pointer as *const u8, length) };
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| FastPadError::Invariant("Scintilla returned invalid UTF-8"))?;
+        Ok(f(text))
+    }
+
+    #[cfg(not(windows))]
+    pub fn with_document_text<R>(&self, _f: impl FnOnce(&str) -> R) -> Result<R> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
     #[cfg(windows)]
     pub fn line_from_position(&self, position: usize) -> Result<usize> {
         Ok(self
@@ -366,6 +403,43 @@ impl Editor {
 
     #[cfg(not(windows))]
     pub fn line_from_position(&self, _position: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// Where `line` starts.
+    #[cfg(windows)]
+    pub fn line_count(&self) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_GETLINECOUNT, 0, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn line_count(&self) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// The text of `line` without its CR/LF, or empty past the last line.
+    #[cfg(windows)]
+    pub fn line_text(&self, line: usize) -> Result<String> {
+        if line >= self.line_count()? {
+            return Ok(String::new());
+        }
+        let length = self
+            .endpoint
+            .send_direct_checked(SCI_LINELENGTH, line, 0)?
+            .max(0) as usize;
+        let mut buffer = vec![0_u8; length + 1];
+        self.endpoint
+            .send_direct_checked(SCI_GETLINE, line, buffer.as_mut_ptr() as isize)?;
+        buffer.truncate(length);
+        let text = String::from_utf8_lossy(&buffer);
+        Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    #[cfg(not(windows))]
+    pub fn line_text(&self, _line: usize) -> Result<String> {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
@@ -425,6 +499,27 @@ impl Editor {
         let _ = self.endpoint.send_direct_if_alive(SCI_SCROLLCARET, 0, 0);
     }
 
+    /// Moves the caret to the start of 0-based `line`, removing any selection, and scrolls it
+    /// into view. A line past the end goes to the last line (Scintilla clamps it).
+    #[cfg(windows)]
+    pub fn go_to_line(&self, line: usize) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_GOTOLINE, line, 0)?;
+        self.scroll_caret_into_view();
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn go_to_line(&self, _line: usize) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Searches `range` for `needle` with `search_flags`. A backward search passes a range whose
+    /// start is after its end. The match's end is Scintilla's own target end, so a regular
+    /// expression's match is as long as the text it matched, not as long as the pattern.
+    /// Scintilla reports a pattern it can't compile as a miss (-1, or -2 in some versions), and
+    /// so does this: `Ok(None)`, never an error.
     #[cfg(windows)]
     pub fn search_in_target(
         &self,
@@ -447,9 +542,11 @@ impl Editor {
         if found < 0 {
             return Ok(None);
         }
-
-        let start = found as usize;
-        Ok(Some(start..start + needle.as_bytes().len()))
+        let end = self
+            .endpoint
+            .send_direct_checked(SCI_GETTARGETEND, 0, 0)?
+            .max(found);
+        Ok(Some(found as usize..end as usize))
     }
 
     #[cfg(not(windows))]
@@ -486,6 +583,8 @@ impl Editor {
 
     /// Replaces every occurrence of `query` with `replacement`, as one undo action. Searches
     /// incrementally via `search_in_target`/`replace_target`; never retrieves the full document.
+    /// For plain search flags (the find bar's regex mode uses `replace_ranges_with`); an empty
+    /// match ends it rather than being replaced forever.
     #[cfg(windows)]
     pub fn replace_all(&self, query: &str, replacement: &str, search_flags: u32) -> Result<usize> {
         if query.is_empty() {
@@ -504,6 +603,9 @@ impl Editor {
                 else {
                     break;
                 };
+                if found.is_empty() {
+                    break;
+                }
                 let replaced = self.replace_target(found, replacement)?;
                 count += 1;
                 position = replaced.end;
@@ -521,6 +623,31 @@ impl Editor {
         _replacement: &str,
         _search_flags: u32,
     ) -> Result<usize> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Replaces each edit's range with its text, as one undo action, and returns how many. The
+    /// ranges come in ascending order, none overlapping, as `Matcher::replacements` gives them;
+    /// they are applied from the last backwards so the earlier positions stay valid. An empty
+    /// list returns `Ok(0)` without opening an undo action.
+    #[cfg(windows)]
+    pub fn replace_ranges_with(&self, edits: &[(Range<usize>, String)]) -> Result<usize> {
+        if edits.is_empty() {
+            return Ok(0);
+        }
+        self.begin_undo_action();
+        let result = edits
+            .iter()
+            .rev()
+            .try_for_each(|(range, text)| self.replace_target(range.clone(), text).map(drop));
+        self.end_undo_action();
+        result.map(|()| edits.len())
+    }
+
+    #[cfg(not(windows))]
+    pub fn replace_ranges_with(&self, _edits: &[(Range<usize>, String)]) -> Result<usize> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
@@ -1437,12 +1564,13 @@ mod tests {
     use crate::editor::scintilla_constants::{
         SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
         SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
-        SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_PASTE,
-        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETDOCPOINTER,
-        SCI_SETELEMENTCOLOUR, SCI_SETILEXER, SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT,
-        SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS,
-        SCI_SETSEL, SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
-        SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
+        SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT,
+        SCI_GETTARGETEND, SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET,
+        SCI_SEARCHINTARGET, SCI_SETDOCPOINTER, SCI_SETELEMENTCOLOUR, SCI_SETILEXER,
+        SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
+        SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
+        SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
+        SCI_UNDO,
     };
     use crate::editor::scintilla_constants::{
         SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_SETZOOM, SCI_STYLEGETBACK,
@@ -1543,6 +1671,41 @@ mod tests {
     }
 
     #[test]
+    fn document_text_is_the_whole_buffer_even_after_an_edit_moves_the_gap() {
+        // Break caught: a pointer read before the gap is closed (text after the caret missing
+        // or garbled), a stale length, or an empty document refused.
+        let editor = test_editor();
+        editor.set_text("o mașină nouă").unwrap();
+        editor.set_selection(2..2).unwrap();
+        editor.replace_target(2..2, "altă ").unwrap();
+        assert_eq!(
+            editor.with_document_text(str::to_owned).unwrap(),
+            "o altă mașină nouă"
+        );
+        editor.set_text("").unwrap();
+        assert_eq!(editor.with_document_text(str::len).unwrap(), 0);
+    }
+
+    #[test]
+    fn replace_ranges_with_puts_each_text_in_its_range_from_the_end_as_one_undo_step() {
+        // Break caught: ascending edits (as `Matcher::replacements` gives them) replaced front to
+        // back (later ranges shifted onto the wrong text), an edit given another edit's text,
+        // one undo step per range, or an empty list failing instead of replacing nothing.
+        let editor = test_editor();
+        editor.populate_clean("foo bar foo baz foo").unwrap();
+        let edits = [
+            (0..3, "a".to_owned()),
+            (8..11, "ță".to_owned()),
+            (16..19, "quux".to_owned()),
+        ];
+        assert_eq!(editor.replace_ranges_with(&edits).unwrap(), 3);
+        assert_eq!(editor.text().unwrap(), "a bar ță baz quux");
+        editor.undo().unwrap();
+        assert_eq!(editor.text().unwrap(), "foo bar foo baz foo");
+        assert_eq!(editor.replace_ranges_with(&[]).unwrap(), 0);
+    }
+
+    #[test]
     fn line_queries_map_positions_and_visible_lines() {
         let editor = test_editor();
         editor.set_text("a\nb\nc\nd\n").unwrap();
@@ -1626,11 +1789,42 @@ mod tests {
         assert_eq!(found, Some(7..13));
         assert_eq!(
             harness.messages(),
-            vec![SCI_SETTARGETRANGE, SCI_SETSEARCHFLAGS, SCI_SEARCHINTARGET]
+            vec![
+                SCI_SETTARGETRANGE,
+                SCI_SETSEARCHFLAGS,
+                SCI_SEARCHINTARGET,
+                SCI_GETTARGETEND
+            ]
         );
         assert_eq!(harness.target_range(), Some((3, 15)));
         assert_eq!(harness.search_flags(), Some(99));
         assert_eq!(harness.search_needle(), Some(b"needle".to_vec()));
+    }
+
+    #[test]
+    fn search_in_target_reports_the_length_scintilla_matched() {
+        // Break caught: a regex hit reported as long as the pattern, so `\d+` over "12345"
+        // selects three characters, or a find-next that starts inside the previous match.
+        let harness = TestDirectHarness::new();
+        harness.push_response(2);
+        harness.push_target_end(7);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert_eq!(
+            editor.search_in_target(r"\d+", 0..10, 0).unwrap(),
+            Some(2..7)
+        );
+    }
+
+    #[test]
+    fn a_pattern_scintilla_cannot_compile_is_a_miss_not_an_error() {
+        // Break caught: Scintilla's -2 (a bad regex in some versions) turned into an error or a
+        // bogus range, which the find bar would report or panic on.
+        let harness = TestDirectHarness::new();
+        harness.push_response(-2);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert_eq!(editor.search_in_target("(", 0..10, 0).unwrap(), None);
     }
 
     #[test]
@@ -2170,6 +2364,10 @@ mod tests {
         target_range: Option<(usize, isize)>,
         search_flags: Option<usize>,
         search_needle: Option<Vec<u8>>,
+        /// Where the last hit's target ends: its position plus the needle's length, as a plain
+        /// search reports it, unless `target_ends` scripts another end (a regex match).
+        last_target_end: isize,
+        target_ends: VecDeque<isize>,
         replace_bytes: Vec<Vec<u8>>,
         set_sel_calls: Vec<(usize, isize)>,
         selected_text: Option<Vec<u8>>,
@@ -2201,6 +2399,11 @@ mod tests {
 
         fn push_response(&self, response: isize) {
             self.state.lock().unwrap().responses.push_back(response);
+        }
+
+        /// Scripts `SCI_GETTARGETEND` for the next hit, as a regex match of another length would.
+        fn push_target_end(&self, end: isize) {
+            self.state.lock().unwrap().target_ends.push_back(end);
         }
 
         fn messages(&self) -> Vec<u32> {
@@ -2295,7 +2498,15 @@ mod tests {
             SCI_SEARCHINTARGET => {
                 let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };
                 state.search_needle = Some(bytes.to_vec());
-                state.responses.pop_front().unwrap_or(-1)
+                let found = state.responses.pop_front().unwrap_or(-1);
+                if found >= 0 {
+                    state.last_target_end = found + wparam as isize;
+                }
+                found
+            }
+            SCI_GETTARGETEND => {
+                let scripted = state.target_ends.pop_front();
+                scripted.unwrap_or(state.last_target_end)
             }
             SCI_REPLACETARGET => {
                 let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };

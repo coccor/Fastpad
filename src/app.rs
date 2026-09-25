@@ -14,7 +14,7 @@ use crate::window::menus::{AcceleratorTable, MenuBar};
 use crate::window::notification::NotificationCenter;
 use crate::window::status::StatusModel;
 use crate::window::tabs::Tabs;
-use crate::window::titlebar::{PointerState, TitleFonts};
+use crate::window::titlebar::{LogoIcon, PointerState, TitleFonts};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::rc::Rc;
@@ -48,6 +48,7 @@ pub struct App {
     /// Where focus returns when menu mode ends; the frame holds it meanwhile for the key handling.
     pub(crate) menu_return_focus: HWND,
     pub(crate) find_bar: Option<FindBar>,
+    pub(crate) name_box: Option<crate::window::name_box::NameBox>,
     pub(crate) command_palette: Option<CommandPalette>,
     pub(crate) preview: crate::window::preview_host::PreviewHost,
     pub(crate) language_manager: Option<LanguageManager>,
@@ -56,14 +57,23 @@ pub struct App {
     pub(crate) status: Option<StatusModel>,
     pub(crate) title_fonts: Option<TitleFonts>,
     pub(crate) title_pointer: PointerState,
+    /// The activity bar's logo icon, loaded for the window's DPI by the post-first-paint deferred
+    /// chrome step (`main_window::build_chrome`) and reloaded on a DPI change.
+    pub(crate) logo_icon: Option<LogoIcon>,
     /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
     pub(crate) tab_thumb_grab: Option<i32>,
+    /// Between a middle-button press on a tab and its release: the tab's strip index and the
+    /// document it showed then (quick-open spec §5).
+    pub(crate) middle_press: Option<(usize, crate::document::DocumentId)>,
     pub(crate) dark_frame_applied: bool,
     pub(crate) notifications: NotificationCenter,
     pub(crate) launch_open_completed: bool,
     pub(crate) populating_file: bool,
     pub(crate) modal_depth: u32,
     pub(crate) held_messages: Vec<u32>,
+    /// The last tab click (its document and message time), so a second click on the same tab
+    /// within the double-click time keeps a preview tab. The class has no `CS_DBLCLKS`.
+    pub(crate) last_tab_click: Option<(crate::document::DocumentId, u32)>,
     identity: WindowIdentity,
     first_paint_completed: bool,
     deferred_start_pending: bool,
@@ -82,6 +92,21 @@ pub struct App {
     pub(crate) ipc_requests: Vec<crate::ipc::IpcRequest>,
     pub(crate) last_snapshot_duration: Option<std::time::Duration>,
     pub(crate) last_snapshot_attempt: Option<DocumentId>,
+    pub(crate) library: crate::window::library_host::LibraryHost,
+    /// The Search view's text search: its debounce, generation, cancel flag and narrowing record.
+    pub(crate) text_search: crate::window::text_search_host::TextSearchHost,
+    /// The activity bar and side panel; present only in notes mode.
+    pub(crate) sidebar: Option<crate::window::side_panel::Sidebar>,
+    /// The warnings of the `fastpad.ini` that `bootstrap::run` read into `settings` before the
+    /// window existed. `Some` until `WM_FASTPAD_LOAD_SETTINGS` reports them.
+    pub(crate) preloaded_settings_warnings: Option<Vec<crate::config::SettingWarning>>,
+    /// The sidebar's focused note when the command palette most recently opened while the panel
+    /// had the keyboard focus (spec §6.3). Taken once by `run_command_palette_selection`, or
+    /// discarded when the palette closes without running a command.
+    pub(crate) palette_note_target: Option<std::path::PathBuf>,
+    /// Where focus returns when the command palette closes, since opening it took focus away
+    /// from the sidebar panel. `std::ptr::null_mut()` restores focus to the editor as before.
+    pub(crate) palette_focus_return: HWND,
     next_document_id: u64,
     process_start: u64,
 }
@@ -90,6 +115,7 @@ static NEXT_RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl App {
     pub fn new(launch: LaunchOptions, startup: StartupMetrics) -> Self {
+        let process_start = startup.start_tick() as u64;
         Self {
             hwnd: std::ptr::null_mut(),
             editor: None,
@@ -101,6 +127,7 @@ impl App {
             menu_mode: None,
             menu_return_focus: std::ptr::null_mut(),
             find_bar: None,
+            name_box: None,
             command_palette: None,
             preview: Default::default(),
             language_manager: None,
@@ -109,13 +136,16 @@ impl App {
             status: None,
             title_fonts: None,
             title_pointer: PointerState::default(),
+            logo_icon: None,
             tab_thumb_grab: None,
+            middle_press: None,
             dark_frame_applied: false,
             notifications: NotificationCenter::new(),
             launch_open_completed: false,
             populating_file: false,
             modal_depth: 0,
             held_messages: Vec::new(),
+            last_tab_click: None,
             identity: WindowIdentity {
                 state: Rc::new(Cell::new(WindowIdentityState::Unbound)),
             },
@@ -133,7 +163,13 @@ impl App {
             last_snapshot_duration: None,
             last_snapshot_attempt: None,
             next_document_id: 2,
-            process_start: startup.start_tick() as u64,
+            library: crate::window::library_host::LibraryHost::new(process_start),
+            text_search: Default::default(),
+            sidebar: None,
+            preloaded_settings_warnings: None,
+            palette_note_target: None,
+            palette_focus_return: std::ptr::null_mut(),
+            process_start,
             startup,
         }
     }

@@ -916,12 +916,13 @@ fn native_layout(item: &AccessibleProvider, tabs: usize) -> TitleBarLayout {
     unsafe {
         GetClientRect(item.hwnd, &mut client);
     }
-    TitleBarLayout::calculate_with_preview(
+    TitleBarLayout::calculate_with_offset(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(item.hwnd) }.max(96),
         tabs,
         item.selection.scroll_offset(),
         item.view.snapshot().preview_buttons,
+        item.selection.strip_left(),
     )
 }
 
@@ -943,7 +944,8 @@ mod tests {
     use super::{
         AccessibilityState, AccessibleChild, AccessibleDefaultAction, RawVariant, VariantValue,
         accessible_children, accessible_default_action, accessible_get_default_action,
-        accessible_get_focus, accessible_get_selection, accessible_get_state, accessible_select,
+        accessible_get_focus, accessible_get_selection, accessible_get_state, accessible_location,
+        accessible_select,
     };
     use crate::document::{Document, DocumentId};
     use crate::window::tabs::Tabs;
@@ -1144,6 +1146,58 @@ mod tests {
                 crate::window::titlebar::HitTarget::PreviewFull
             ))
         );
+    }
+
+    #[test]
+    fn tab_locations_start_at_the_published_sidebar_edge_without_reading_the_app() {
+        // Break caught: accessible tab rectangles still starting at x = 0 under the sidebar, or a
+        // provider that reads the App (it may run on an RPC thread). This window has no App.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_OVERLAPPEDWINDOW,
+        };
+        let class = crate::platform::wide_null("STATIC");
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                1200,
+                800,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!window.is_null());
+        let mut state = AccessibilityState::default();
+        let tabs = fixture_tabs(2);
+        let provider = state.ensure(window, tabs.view(), tabs.selection());
+        let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window, &mut origin) };
+        let first_tab_left = || {
+            let (mut left, mut top, mut width, mut height) = (0, 0, 0, 0);
+            let result = unsafe {
+                accessible_location(
+                    provider,
+                    &mut left,
+                    &mut top,
+                    &mut width,
+                    &mut height,
+                    RawVariant::integer(1),
+                )
+            };
+            assert_eq!(result, S_OK);
+            left - origin.x
+        };
+        assert_eq!(first_tab_left(), 0);
+        tabs.set_strip_left(304);
+        assert_eq!(first_tab_left(), 304);
+        drop(state);
+        unsafe { DestroyWindow(window) };
     }
 
     fn fixture_tabs(count: u64) -> Tabs {

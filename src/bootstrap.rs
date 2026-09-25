@@ -54,6 +54,11 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
 
     let mut app = App::new(options, startup);
     app.instance_mutex = instance_mutex;
+    // The sidebar's first frame uses the saved view and width, so fastpad.ini is read before the
+    // window exists. Its warnings are reported by WM_FASTPAD_LOAD_SETTINGS, once chrome is up.
+    let (settings, warnings) = crate::config::load();
+    app.settings = settings;
+    app.preloaded_settings_warnings = Some(warnings);
     let identity = app.window_identity();
     let mut create_context = WindowCreateContext::new(Box::new(app));
     let hwnd = window_class.create(&mut create_context)?;

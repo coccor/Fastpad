@@ -423,6 +423,83 @@ fn title_strip_owns_the_top_edge_and_its_caption_buttons_still_work() -> TestRes
     Ok(())
 }
 
+#[test]
+fn the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_square_stays_caption()
+-> TestResult<()> {
+    // Break caught: the corner staying empty forever (the deferred load never ran or never
+    // repainted), or something drawn there stealing the drag/caption hit test from the window.
+    use windows_sys::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTTRANSPARENT};
+
+    let _dpi = DpiContext::per_monitor_v2()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+
+    let bar_class = wide_null("FastPadActivityBar");
+    let bar = unsafe {
+        FindWindowExW(
+            hwnd,
+            std::ptr::null_mut(),
+            bar_class.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    assert!(
+        !bar.is_null(),
+        "notes mode is on by default: the bar exists"
+    );
+
+    let (_, origin, layout) = frame_geometry(hwnd)?;
+    let mut bar_client = RECT::default();
+    assert_ne!(unsafe { GetClientRect(bar, &mut bar_client) }, 0);
+    let mut bar_origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    assert_ne!(unsafe { ClientToScreen(bar, &mut bar_origin) }, 0);
+    // The bar sits at the main window's client origin (spec: `side_panel::layout`), so bar-local
+    // and main-window-local coordinates coincide.
+    assert_eq!((bar_origin.x, bar_origin.y), (origin.x, origin.y));
+    // Centred in the top square: `x` is the bar's own centre, `y` is half the title strip's
+    // height regardless of the logo's size (a size `s` centred in `[0, height)` sits at
+    // `(height - s) / 2 .. (height + s) / 2`, whose midpoint is always `height / 2`).
+    let logo_x = (bar_client.right - bar_client.left) / 2;
+    let logo_y = layout.height / 2;
+
+    // A hit test at the logo's centre still gives the caption: the bar answers HTTRANSPARENT and
+    // the main window answers HTCAPTION.
+    assert_eq!(
+        hit_test(bar, bar_origin, Point::new(logo_x, logo_y)),
+        HTTRANSPARENT as isize
+    );
+    assert_eq!(
+        hit_test(hwnd, origin, Point::new(logo_x, logo_y)),
+        HTCAPTION as isize
+    );
+
+    // The icon has been loaded and drawn by then: its centre differs from the strip's plain fill,
+    // sampled a few pixels into the square's corner (well clear of the centred, smaller icon).
+    let sample = |x: i32, y: i32| unsafe {
+        let dc = GetDC(bar);
+        assert!(!dc.is_null());
+        let pixel = GetPixel(dc, x, y);
+        ReleaseDC(bar, dc);
+        pixel
+    };
+    let background = sample(2, 2);
+    // A few points near, not exactly on, the centre: the icon's own artwork (a notebook with a
+    // cutout bolt) can put the exact centre pixel back over the background.
+    let near_centre = [(-4, -3), (4, -3), (-4, 3), (4, 3)];
+    wait_until(
+        "the logo icon painted over the strip background",
+        Duration::from_secs(3),
+        || {
+            near_centre
+                .iter()
+                .any(|(dx, dy)| sample(logo_x + dx, logo_y + dy) != background)
+        },
+    )?;
+
+    process.close()
+}
+
 fn frame_geometry(
     hwnd: windows_sys::Win32::Foundation::HWND,
 ) -> TestResult<(RECT, windows_sys::Win32::Foundation::POINT, TitleBarLayout)> {
@@ -705,4 +782,115 @@ impl Drop for Accessible {
             (self.vtable().release)(self.0);
         }
     }
+}
+
+/// One frame of an icon: its size in pixels and its image bytes.
+#[derive(Debug, Eq, PartialEq)]
+struct IconFrame {
+    width: u32,
+    height: u32,
+    image: Vec<u8>,
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// An `ICONDIR` / `GRPICONDIR` size byte: 0 means 256.
+fn icon_side(byte: u8) -> u32 {
+    if byte == 0 { 256 } else { u32::from(byte) }
+}
+
+/// The frames of an `.ico` file: its `ICONDIR`, then 16-byte entries pointing at each image.
+fn ico_frames(ico: &[u8]) -> Vec<IconFrame> {
+    assert_eq!(u16_at(ico, 2), 1, "an icon file");
+    (0..usize::from(u16_at(ico, 4)))
+        .map(|index| {
+            let entry = 6 + index * 16;
+            let size = u32_at(ico, entry + 8) as usize;
+            let offset = u32_at(ico, entry + 12) as usize;
+            IconFrame {
+                width: icon_side(ico[entry]),
+                height: icon_side(ico[entry + 1]),
+                image: ico[offset..offset + size].to_vec(),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn the_exe_carries_the_logo_as_its_icon() -> TestResult<()> {
+    // Break caught: `build.rs` embedding a stale or other icon (or none) as resource 1, so the
+    // exe's icon in Explorer, the taskbar and Alt+Tab is not the logo in `assets/fastpad.ico`.
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::{
+        FindResourceW, LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE, LoadLibraryExW,
+        LoadResource, LockResource, SizeofResource,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{RT_GROUP_ICON, RT_ICON};
+
+    let ico = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fastpad.ico"))?;
+    let expected = ico_frames(&ico);
+    assert_eq!(expected.len(), 8, "the logo has 8 frames");
+    let sides = expected.iter().map(|frame| frame.width).collect::<Vec<_>>();
+    assert_eq!(sides.iter().min(), Some(&16));
+    assert_eq!(sides.iter().max(), Some(&256));
+
+    let exe = wide_null(env!("CARGO_BIN_EXE_fastpad"));
+    let module = unsafe {
+        LoadLibraryExW(
+            exe.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+        )
+    };
+    assert!(!module.is_null(), "fastpad.exe did not load as a data file");
+    // The bytes of resource `id` of `kind`, copied out while the module is loaded.
+    let resource = |id: u16, kind: *const u16| -> Option<Vec<u8>> {
+        let found = unsafe { FindResourceW(module, id as usize as *const u16, kind) };
+        if found.is_null() {
+            return None;
+        }
+        let size = unsafe { SizeofResource(module, found) } as usize;
+        let data = unsafe { LockResource(LoadResource(module, found)) };
+        (!data.is_null())
+            .then(|| unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size) }.to_vec())
+    };
+    let frames = resource(1, RT_GROUP_ICON).map(|group| {
+        assert_eq!(u16_at(&group, 2), 1, "an icon group");
+        (0..usize::from(u16_at(&group, 4)))
+            .map(|index| {
+                // A GRPICONDIRENTRY is 14 bytes: the ICONDIRENTRY's first 12, then the RT_ICON ID.
+                let entry = 6 + index * 14;
+                let image = resource(u16_at(&group, entry + 12), RT_ICON).unwrap_or_default();
+                assert_eq!(
+                    image.len(),
+                    u32_at(&group, entry + 8) as usize,
+                    "frame {index}'s size"
+                );
+                IconFrame {
+                    width: icon_side(group[entry]),
+                    height: icon_side(group[entry + 1]),
+                    image,
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    unsafe { FreeLibrary(module) };
+
+    let frames = frames.ok_or("fastpad.exe has no icon group 1")?;
+    assert_eq!(frames.len(), expected.len(), "the frame count");
+    for (index, (frame, expected)) in frames.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            (frame.width, frame.height),
+            (expected.width, expected.height),
+            "frame {index}'s size in pixels"
+        );
+        assert!(frame.image == expected.image, "frame {index}'s image bytes");
+    }
+    Ok(())
 }

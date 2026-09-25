@@ -74,6 +74,24 @@ pub struct Document {
     pub generation: u64,
     pub recovery_generation: Option<u64>,
     pub recovery_origin: Option<RecoveryOrigin>,
+    /// Label taken from an untitled tab's first non-blank scanned line (see `library::title`),
+    /// shown in place of the bare "Untitled" title until the tab is saved or renamed.
+    pub untitled_label: Option<String>,
+    /// The label an untitled tab's first line gives, kept up to date whether or not notes mode
+    /// shows it, so turning notes mode on labels every tab without reading its text again.
+    pub first_line_label: Option<String>,
+    /// How many lines of this untitled tab's text have already been scanned for its label.
+    pub label_watch: usize,
+    /// Size and write time last observed on disk, to notice edits made outside FastPad.
+    pub disk_stamp: Option<crate::library::DiskStamp>,
+    /// Autosave is suspended for this document (e.g. after an on-disk conflict is detected).
+    pub autosave_paused: bool,
+    /// The preview tab (spec §6.4): opened by a single click in the sidebar and replaced in
+    /// place by the next one. Never dirty: the first edit makes it a normal tab.
+    pub preview: bool,
+    /// Where this untitled note's first save goes (spec §6.7): the folder selected in the
+    /// sidebar when it was created. `None` means the notebook root.
+    pub save_folder: Option<PathBuf>,
 }
 
 impl PartialEq for Document {
@@ -105,6 +123,13 @@ impl Document {
             generation: 0,
             recovery_generation: None,
             recovery_origin: None,
+            untitled_label: None,
+            first_line_label: None,
+            label_watch: crate::library::title::LABEL_SCAN_LINES - 1,
+            disk_stamp: None,
+            autosave_paused: false,
+            preview: false,
+            save_folder: None,
         }
     }
 
@@ -115,8 +140,12 @@ impl Document {
             }
             // A session tab reopened unbound, because its file was already open elsewhere,
             // still names that file.
-            (None, Some(origin)) => origin.display_name(),
-            (path, _) => file_name_or_untitled(path.as_deref()),
+            (None, Some(origin)) if origin.original_path.is_some() => origin.display_name(),
+            (None, _) => self
+                .untitled_label
+                .clone()
+                .unwrap_or_else(|| "Untitled".to_owned()),
+            (Some(path), _) => file_name_or_untitled(Some(path)),
         };
         if self.dirty {
             format!("{base} *")
@@ -209,6 +238,29 @@ mod tests {
             from_session: true,
         });
         assert_eq!(document.title(), "notes.md *");
+    }
+
+    #[test]
+    fn an_untitled_tab_shows_its_label_but_recovered_and_file_tabs_keep_their_names() {
+        // Break caught: a crash-recovered tab losing its "Recovered:" prefix, or a saved file
+        // showing its first line instead of its filename.
+        let mut document = Document::test_fixture(DocumentId(1), false);
+        document.path = None;
+        assert_eq!(document.title(), "Untitled");
+        document.untitled_label = Some("Meeting notes".into());
+        assert_eq!(document.title(), "Meeting notes");
+        document.dirty = true;
+        assert_eq!(document.title(), "Meeting notes *");
+        document.recovery_origin = Some(super::RecoveryOrigin {
+            snapshot_path: "x.fps".into(),
+            original_path: None,
+            from_session: false,
+        });
+        assert_eq!(document.title(), "Recovered: Untitled *");
+        document.recovery_origin.as_mut().unwrap().from_session = true;
+        assert_eq!(document.title(), "Meeting notes *");
+        document.path = Some(r"D:\Notes\plan.md".into());
+        assert_eq!(document.title(), "plan.md *");
     }
 
     #[test]

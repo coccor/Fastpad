@@ -10,6 +10,29 @@ pub const WM_FASTPAD_START_IPC: u32 = WM_APP + 5;
 pub const WM_FASTPAD_BUILD_CHROME: u32 = WM_APP + 6;
 // Deferred chain, between LOAD_SETTINGS and OPEN_REQUEST; numbered last because it was added last.
 pub const WM_FASTPAD_RESTORE_SESSION: u32 = WM_APP + 8;
+// Deferred chain, between RESTORE_SESSION and OPEN_REQUEST.
+pub const WM_FASTPAD_OPEN_LIBRARY: u32 = WM_APP + 9;
+// Not part of the deferred chain: the library worker's result, as a `Box` the receiver frees.
+pub const WM_FASTPAD_LIBRARY_READY: u32 = WM_APP + 10;
+// Not part of the deferred chain: files dropped on the editor, as a `Box<Vec<PathBuf>>` the
+// receiver frees. Posted so the drag source is not kept waiting while the files open.
+pub const WM_FASTPAD_FILES_DROPPED: u32 = WM_APP + 11;
+// Not part of the deferred chain: whether a notebook picked from a list exists, checked on a
+// worker because an offline drive can stall, as a `Box` the receiver frees.
+pub const WM_FASTPAD_NOTEBOOK_CHECKED: u32 = WM_APP + 12;
+// Not part of the deferred chain: a text search worker's batch of hits, as a `Box` the receiver
+// frees. A post that fails because the window is gone is freed on the worker.
+pub const WM_FASTPAD_TEXT_SEARCH_BATCH: u32 = WM_APP + 13;
+// Not part of the deferred chain: a replace's count, then its write report, then the files of
+// clean tabs open on a note it wrote, each a `Box` the receiver frees. A post that fails because
+// the window is gone is freed on the worker.
+pub const WM_FASTPAD_REPLACE_COUNTED: u32 = WM_APP + 14;
+pub const WM_FASTPAD_REPLACE_WRITTEN: u32 = WM_APP + 15;
+pub const WM_FASTPAD_REPLACE_RELOADED: u32 = WM_APP + 16;
+/// Posted to the main window when the Notebook tree's inline name field lost the focus, to
+/// another window of this thread (wparam 0) or out of FastPad (wparam
+/// `inline_name::LEFT_FASTPAD`) (inline naming spec §5.3).
+pub const WM_FASTPAD_INLINE_NAME_LEFT: u32 = WM_APP + 17;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.
@@ -40,7 +63,8 @@ pub fn deferred_start_message() -> u32 {
 pub fn classify_deferred_message(message: u32, input_pending: bool) -> Option<DeferredAction> {
     let action = match message {
         WM_FASTPAD_LOAD_SETTINGS => next_action(message, WM_FASTPAD_RESTORE_SESSION, input_pending),
-        WM_FASTPAD_RESTORE_SESSION => next_action(message, WM_FASTPAD_OPEN_REQUEST, input_pending),
+        WM_FASTPAD_RESTORE_SESSION => next_action(message, WM_FASTPAD_OPEN_LIBRARY, input_pending),
+        WM_FASTPAD_OPEN_LIBRARY => next_action(message, WM_FASTPAD_OPEN_REQUEST, input_pending),
         WM_FASTPAD_OPEN_REQUEST => next_action(message, WM_FASTPAD_APPLY_LANGUAGE, input_pending),
         WM_FASTPAD_APPLY_LANGUAGE => next_action(message, WM_FASTPAD_RECOVERY, input_pending),
         WM_FASTPAD_RECOVERY => next_action(message, WM_FASTPAD_START_IPC, input_pending),
@@ -78,8 +102,10 @@ fn next_action(message: u32, next: u32, input_pending: bool) -> DeferredAction {
 mod tests {
     use super::{
         DeferredAction, WM_FASTPAD_APPLY_LANGUAGE, WM_FASTPAD_BUILD_CHROME,
-        WM_FASTPAD_LOAD_SETTINGS, WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_RECOVERY,
-        WM_FASTPAD_RESTORE_SESSION, WM_FASTPAD_START_IPC, classify_deferred_message,
+        WM_FASTPAD_LIBRARY_READY, WM_FASTPAD_LOAD_SETTINGS, WM_FASTPAD_OPEN_LIBRARY,
+        WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_RECOVERY, WM_FASTPAD_REPLACE_COUNTED,
+        WM_FASTPAD_REPLACE_RELOADED, WM_FASTPAD_REPLACE_WRITTEN, WM_FASTPAD_RESTORE_SESSION,
+        WM_FASTPAD_START_IPC, WM_FASTPAD_TEXT_SEARCH_BATCH, classify_deferred_message,
         completed_milestone,
     };
     use crate::perf::Milestone;
@@ -94,7 +120,19 @@ mod tests {
         );
         assert_eq!(
             classify_deferred_message(WM_FASTPAD_RESTORE_SESSION, false),
+            Some(DeferredAction::PostNext(WM_FASTPAD_OPEN_LIBRARY))
+        );
+        assert_eq!(
+            classify_deferred_message(WM_FASTPAD_OPEN_LIBRARY, false),
             Some(DeferredAction::PostNext(WM_FASTPAD_OPEN_REQUEST))
+        );
+        assert_eq!(
+            classify_deferred_message(WM_FASTPAD_OPEN_LIBRARY, true),
+            Some(DeferredAction::RepostSelf(WM_FASTPAD_OPEN_LIBRARY))
+        );
+        assert_eq!(
+            classify_deferred_message(WM_FASTPAD_LIBRARY_READY, false),
+            None
         );
         assert_eq!(
             classify_deferred_message(WM_FASTPAD_OPEN_REQUEST, false),
@@ -156,5 +194,24 @@ mod tests {
             completed_milestone(DeferredAction::RecordFullyReady),
             Some(Milestone::FullyReady)
         );
+    }
+
+    #[test]
+    fn the_replace_messages_follow_the_search_batch_and_are_never_deferred() {
+        // Break caught: a replace payload renumbered onto another message (whose handler would
+        // free the wrong Box), or held as a deferred unit and re-posted with its lparam lost.
+        assert_eq!(WM_FASTPAD_REPLACE_COUNTED, WM_FASTPAD_TEXT_SEARCH_BATCH + 1);
+        assert_eq!(WM_FASTPAD_REPLACE_WRITTEN, WM_FASTPAD_TEXT_SEARCH_BATCH + 2);
+        assert_eq!(
+            WM_FASTPAD_REPLACE_RELOADED,
+            WM_FASTPAD_TEXT_SEARCH_BATCH + 3
+        );
+        for message in [
+            WM_FASTPAD_REPLACE_COUNTED,
+            WM_FASTPAD_REPLACE_WRITTEN,
+            WM_FASTPAD_REPLACE_RELOADED,
+        ] {
+            assert_eq!(classify_deferred_message(message, false), None);
+        }
     }
 }

@@ -9,10 +9,12 @@ pub mod file;
 pub mod ipc;
 pub mod languages;
 pub mod launch;
+pub mod library;
 pub mod perf;
 pub mod platform;
 pub mod preview;
 pub mod recovery;
+pub mod search;
 pub mod session;
 pub mod window;
 

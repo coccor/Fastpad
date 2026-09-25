@@ -96,18 +96,63 @@ typing. Both panes scroll together.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
 
+### Notes and notebooks
+
+Open any folder with **Ctrl+Shift+O** and it becomes your notebook. The sidebar on the left
+shows it as a tree: folders as they are on disk, pinned notes first. Click a note to open it
+in a preview tab that the next click replaces. Double-click it, or start typing, to keep it.
+Hover a note to pin it.
+
+- **Ctrl+N** gives you a new note, labelled by its first line as you type. The first Ctrl+S asks
+  for its name inline and saves it into the notebook. Notes in the notebook save themselves
+  from then on.
+- **+** in the Notebook view's header, or **New note here** on a folder's menu, names a new note
+  right in the tree, where it will be: type `todo` and Enter makes `todo.md` and opens it. Type
+  an extension such as `data.json` to pick another kind.
+- **Ctrl+Shift+F** searches the text of every note in the notebook as you type, with match
+  case (**Alt+C**), whole word (**Alt+W**) and regular expression (**Alt+R**) toggles. Select
+  a word first and it becomes the search. Opening a result puts your search in the find bar,
+  so **F3** steps through every match in that note. Nothing is indexed: the notes are read
+  when you search, and results stream in as they're found.
+- **Ctrl+Shift+H** opens a replace field under the search; pressed in the field, it closes it.
+  **Replace all** (or **Ctrl+Alt+Enter**) replaces in every listed note after asking, and each result has its own
+  replace button (**Ctrl+Shift+1** on the selected one). Notes open in tabs change in the
+  editor, where one Ctrl+Z undoes it; the others are saved, skipping any that changed since the
+  search. With regular expressions on, `$1` inserts a group, in the find bar's Replace too.
+- **Ctrl+P** opens a note by typing part of its name or folder, its letters in order, as in
+  VS Code. With nothing typed it lists the notes open in tabs, the most recent first, so
+  Ctrl+P then Enter goes back to the previous note. Add `:42` to open a note at line 42, or
+  type `:42` alone to go to that line in the current tab.
+- **New folder** in the header, or **New folder here**, names a folder the same way. **F2**
+  renames a note or a folder in place, without opening it, and **Del** sends it to the Recycle
+  Bin. A name that is taken says so as you type. Empty folders show in the tree, and each note
+  has a coloured icon for its type.
+- Drag a note or a folder onto another folder in the tree to move it there, or onto empty
+  space to move it to the notebook's top level. A label with its name follows the pointer while
+  you drag. Open tabs and pins follow it, nothing is ever overwritten, and Esc cancels the drag.
+- The tree's icons come from Material Icon Theme. **File icons: Minimal** in the palette switches
+  to single-colour outlines, and **File icons: Solid** to filled shapes. Designers can edit both
+  as SVGs (`assets/icons/README.md`).
+- Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
+- **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
+  Everything is reachable from the keyboard and exposed to screen readers.
+
+Pins are stored in `.fastpad\library.ini` inside the notebook, so they travel with it. Nothing
+is written into a folder until you pin something. Turn it all off with `notes_mode=false` in
+`fastpad.ini`.
+
 ### JSON you can trust
 
 <img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
 
 Syntax highlighting as soon as you open a `.json` file. **Validate JSON** points to the exact line
-and column of a mistake; **Format JSON** (Ctrl+Shift+F) pretty-prints the whole document in one step you can undo. Neither will touch a
+and column of a mistake; **Format JSON** (Shift+Alt+F) pretty-prints the whole document in one step you can undo. Neither will touch a
 file that doesn't parse.
 
 ### Tabs, done right
 
 Open as many files as you like in one window. **Ctrl+Tab** and **Ctrl+1…9** to jump, double-click
-the empty tab bar for a new tab, scroll the wheel over the tabs to browse them. Open a file from
+the empty tab bar for a new tab, scroll the wheel over the tabs to browse them, and close one with **Ctrl+W** or a middle-click. Open a file from
 Explorer or the command line and it lands as a tab in the FastPad window you already have open, not
 in a new window.
 
@@ -116,7 +161,8 @@ in a new window.
 <img src="docs/images/command-palette.png" alt="The command palette filtering theme commands" width="800">
 
 **Ctrl+Shift+P** and start typing. Switch theme, toggle word wrap or line numbers, change font size
-or tab width, all without leaving the keyboard. Every change is saved instantly.
+or tab width, all without leaving the keyboard. Every change is saved instantly. The
+**Settings** button at the bottom of the sidebar opens the palette with just the settings.
 
 ### Themes that match your desk
 
@@ -145,7 +191,9 @@ before closing again.
   leaves you with a half-written file.
 - **Encodings preserved.** UTF-8, UTF-8 with BOM, UTF-16 LE and UTF-16 BE are detected on open and
   kept on save.
-- **Find and replace**, zoom, word wrap, line numbers, and left-to-right or right-to-left text.
+- **Find and replace**, with match case, whole word and regular expressions (Alt+C, Alt+W,
+  Alt+R) and F3 / Shift+F3, plus zoom, word wrap, line numbers, and left-to-right or
+  right-to-left text.
 - **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive
   technology and can be followed from it.
 
@@ -155,12 +203,19 @@ before closing again.
 |---|---|---|---|---|
 | New tab | `Ctrl+N` or `Ctrl+T` | | Command palette | `Ctrl+Shift+P` |
 | Open | `Ctrl+O` | | Markdown preview modes | `Ctrl+Shift+V` |
-| Save | `Ctrl+S` | | Format JSON | `Ctrl+Shift+F` |
+| Save | `Ctrl+S` | | Format JSON | `Shift+Alt+F` |
 | Save as | `Ctrl+Shift+S` | | Word wrap | `Alt+Z` |
 | Find | `Ctrl+F` | | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Ctrl+1` … `Ctrl+9` |
 | Left-to-right text | `Ctrl+L` | | Right-to-left text | `Ctrl+R` |
+| Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` |
+| Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+Shift+F` |
+| Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |
+| Find next / previous | `F3` / `Shift+F3` | | Match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` |
+| Replace in notes | `Ctrl+Shift+H` | | Replace all (in Search) | `Ctrl+Alt+Enter` |
+| Replace in the selected result | `Ctrl+Shift+1` | | Go to note | `Ctrl+P` |
+| Close tab | `Ctrl+W` or middle-click | | | |
 
 ## Make it yours
 
@@ -178,6 +233,9 @@ line in a notification and applies the rest.
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
+| `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
+| `file_icons` | `material`, `minimal` or `solid` | `material` |
 
 Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
 

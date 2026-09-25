@@ -1,4 +1,5 @@
-//! A painted child window that hosts native controls for the command palette and the find bar.
+//! A painted child window that hosts native controls for the command palette, the find bar and
+//! the name box.
 //! It draws its own background through the main window (which owns both widgets) and passes its
 //! controls' notifications on to the main window unchanged, so they are handled exactly as if the
 //! controls were the main window's own children.
@@ -13,10 +14,12 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, RegisterClassW,
-    SendMessageW, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, OBJID_CLIENT,
+    RegisterClassW, SendMessageW, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
 pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
@@ -110,17 +113,62 @@ unsafe extern "system" fn panel_proc(
         }
         WM_ERASEBKGND => 1,
         WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONUP => {
-            super::main_window::panel_pointer(main, hwnd, message, lparam);
+            super::main_window::panel_pointer(main, hwnd, message, wparam, lparam);
             0
         }
-        WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {
+        WM_COMMAND | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {
             SendMessageW(main, message, wparam, lparam)
         },
+        // Only the find bar's panel answers with its own object. The palette and the name box
+        // keep the system's, which lists their native controls. `find_bar_owns` lets go of the
+        // App before `object_result` runs, as its contract requires.
+        WM_GETOBJECT
+            if lparam as i32 == OBJID_CLIENT && super::main_window::find_bar_owns(main, hwnd) =>
+        unsafe {
+            super::sidebar_accessibility::object_result(
+                hwnd,
+                &super::find_bar::FIND_BAR_ACCESSIBLE,
+                wparam,
+            )
+        },
+        super::sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACCESSIBLE => unsafe {
+            super::sidebar_accessibility::answer(hwnd, lparam)
+        },
+        super::sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACTION
+            if super::main_window::find_bar_owns(main, hwnd) =>
+        {
+            super::sidebar_accessibility::run_action(
+                hwnd,
+                &super::find_bar::FIND_BAR_ACCESSIBLE,
+                wparam,
+                lparam,
+            );
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
 
 pub(crate) fn create_child(parent: HWND, class: &[u16], style: u32) -> crate::Result<HWND> {
+    create_child_with_menu(parent, class, style, std::ptr::null_mut())
+}
+
+/// Like `create_child`, but with a control ID so `WM_COMMAND` can tell the child apart.
+pub(crate) fn create_child_with_id(
+    parent: HWND,
+    class: &[u16],
+    style: u32,
+    id: u16,
+) -> crate::Result<HWND> {
+    create_child_with_menu(parent, class, style, id as usize as HMENU)
+}
+
+fn create_child_with_menu(
+    parent: HWND,
+    class: &[u16],
+    style: u32,
+    menu: HMENU,
+) -> crate::Result<HWND> {
     let hwnd = unsafe {
         CreateWindowExW(
             0,
@@ -132,7 +180,7 @@ pub(crate) fn create_child(parent: HWND, class: &[u16], style: u32) -> crate::Re
             0,
             0,
             parent,
-            std::ptr::null_mut(),
+            menu,
             std::ptr::null_mut(),
             std::ptr::null(),
         )

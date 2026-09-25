@@ -8,10 +8,9 @@ pub enum SearchDirection {
 
 /// Wrap-once-then-stop search progression: bookkeeping only, independent of what actually looks
 /// for the query in a given range. `next_range` is a pure, dependency-free reference
-/// implementation driven by a plain string, used both for unit testing this algorithm and by the
-/// window layer for the (rare) case a plain string is already in hand; live document navigation
-/// instead drives the same shape of search via `Editor::search_in_target`, never materializing
-/// the full document text.
+/// implementation driven by a plain string, used for unit testing this algorithm; live plain-mode
+/// navigation drives the same shape of search via `Editor::search_in_target`, never materializing
+/// the full document text. Regex mode doesn't use it (`regex_match`).
 #[derive(Debug)]
 pub struct SearchState {
     query: String,
@@ -82,8 +81,7 @@ impl SearchState {
     }
 
     /// Pure reference implementation of the wrap progression over an in-memory string. Never used
-    /// for live editor navigation (see the struct docs); exists for testing and for any caller
-    /// that already holds the text (e.g. a prefilled query match against a short selection).
+    /// for live editor navigation (see the struct docs); exists for testing.
     pub fn next_range(&mut self, haystack: &str) -> Option<Range<usize>> {
         let query = self.query.clone();
         let direction = self.direction;
@@ -113,10 +111,10 @@ impl SearchState {
     }
 
     /// Drives the same wrap-once progression against a live Scintilla document via
-    /// `Editor::search_in_target`, never materializing the full document text.
+    /// `Editor::search_in_target`, never materializing the full document text. For plain mode.
     pub(crate) fn next_editor_match(
         &mut self,
-        editor: &crate::editor::Editor,
+        editor: &Editor,
         flags: u32,
         doc_len: usize,
     ) -> crate::Result<Option<Range<usize>>> {
@@ -124,7 +122,8 @@ impl SearchState {
             return Ok(None);
         }
         let bounds = self.scintilla_bounds(doc_len);
-        if let Some(found) = editor.search_in_target(&self.query, bounds, flags)? {
+        let found = editor.search_in_target(&self.query, bounds, flags)?;
+        if let Some(found) = found {
             self.record_match(found.clone());
             return Ok(Some(found));
         }
@@ -141,20 +140,160 @@ impl SearchState {
     }
 }
 
+use crate::editor::Editor;
+use crate::editor::scintilla_constants::{SCFIND_MATCHCASE, SCFIND_NONE, SCFIND_WHOLEWORD};
+use crate::search::{MatchOptions, Matcher, SearchOption};
+
+/// The Scintilla search flags for plain mode (spec §8). Regex mode doesn't search with Scintilla
+/// but with `Matcher` (`regex_matcher`).
+pub(crate) fn search_flags(options: MatchOptions) -> u32 {
+    let mut flags = SCFIND_NONE;
+    if options.case {
+        flags |= SCFIND_MATCHCASE;
+    }
+    if options.whole_word {
+        flags |= SCFIND_WHOLEWORD;
+    }
+    flags
+}
+
+/// The find bar's regex mode: the same `Matcher` Search uses, so a result opens to the match
+/// Search showed (spec §8). `None` for a pattern error or a pattern that matches empty text,
+/// which the bar shows as its no-match state, as Search shows its pattern error.
+pub(crate) fn regex_matcher(query: &str, options: MatchOptions) -> Option<Matcher> {
+    Matcher::new(
+        query,
+        MatchOptions {
+            regex: true,
+            ..options
+        },
+    )
+    .ok()
+}
+
+/// Forward, the first match starting at or after `origin`, else (wrapping once) the first in the
+/// text. Backward, the last match ending at or before `origin`, else the last in the text.
+pub(crate) fn regex_match(
+    matcher: &Matcher,
+    text: &str,
+    origin: usize,
+    direction: SearchDirection,
+) -> Option<Range<usize>> {
+    match direction {
+        SearchDirection::Forward => matcher
+            .find_at(text, origin)
+            .or_else(|| matcher.find_at(text, 0)),
+        SearchDirection::Backward => matcher
+            .last_before(text, origin)
+            .or_else(|| matcher.last_before(text, text.len())),
+    }
+}
+
+/// The match of `query` under `options` that find next (or previous) selects from `origin`,
+/// wrapping once. Plain mode searches with Scintilla; regex mode runs `Matcher` over the
+/// document's text, borrowed without a copy. A pattern error is `None`, a miss.
+pub(crate) fn find_in_editor(
+    editor: &Editor,
+    query: &str,
+    options: MatchOptions,
+    origin: usize,
+    direction: SearchDirection,
+) -> Option<Range<usize>> {
+    if query.is_empty() {
+        return None;
+    }
+    if options.regex {
+        let matcher = regex_matcher(query, options)?;
+        return editor
+            .with_document_text(|text| regex_match(&matcher, text, origin, direction))
+            .ok()
+            .flatten();
+    }
+    let doc_len = editor.length().ok()?;
+    SearchState::new(query, direction, origin)
+        .next_editor_match(editor, search_flags(options), doc_len)
+        .ok()
+        .flatten()
+}
+
+/// The text Replace puts in place of `selection` when the selection is exactly a match of
+/// `query` under `options`, else `None`, as Replace checks before it replaces the selection.
+///
+/// - Plain mode: the match is Scintilla's, found where the selection starts, and the text is
+///   `replacement` as it is.
+/// - Regex mode: the match is one of `Matcher::find_iter`'s over the document, and the text is
+///   `replacement` expanded with that match's captures (`$1`, `${name}`, `$$`). Only that match
+///   is expanded (`Matcher::replacement_at`), not every match in the document.
+pub(crate) fn replacement_for(
+    editor: &Editor,
+    query: &str,
+    replacement: &str,
+    options: MatchOptions,
+    selection: Range<usize>,
+) -> Option<String> {
+    if query.is_empty() || selection.is_empty() {
+        return None;
+    }
+    if options.regex {
+        let matcher = regex_matcher(query, options)?;
+        return editor
+            .with_document_text(|text| matcher.replacement_at(text, selection, replacement))
+            .ok()
+            .flatten();
+    }
+    let found = editor
+        .search_in_target(query, selection.clone(), search_flags(options))
+        .ok()
+        .flatten();
+    (found == Some(selection)).then(|| replacement.to_owned())
+}
+
+/// Replaces every match of `query` under `options` as one undo action, and returns how many.
+/// Plain mode puts `replacement` in as it is, through Scintilla's search. Regex mode replaces
+/// `Matcher`'s matches from the end backwards, each with `replacement` expanded with its own
+/// captures (`Matcher::replacements`).
+pub(crate) fn replace_all(
+    editor: &Editor,
+    query: &str,
+    replacement: &str,
+    options: MatchOptions,
+) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+    if !options.regex {
+        return editor
+            .replace_all(query, replacement, search_flags(options))
+            .unwrap_or(0);
+    }
+    let Some(matcher) = regex_matcher(query, options) else {
+        return 0;
+    };
+    let Ok(edits) = editor.with_document_text(|text| matcher.replacements(text, replacement))
+    else {
+        return 0;
+    };
+    editor.replace_ranges_with(&edits).unwrap_or(0)
+}
+
 // --- Window integration: native child controls hosting Find/Replace ---
 
 use crate::platform::{last_error, wide_null};
+use crate::window::option_toggles;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSource};
+use crate::window::tooltip::Tooltip;
 use std::cell::Cell;
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT,
     RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow, SelectObject, SetBkColor, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
+use windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_TOOLBAR;
 use windows_sys::Win32::UI::Controls::{
     EM_GETMARGINS, EM_REPLACESEL, EM_SETSEL, EM_UNDO, WM_MOUSELEAVE,
 };
@@ -221,6 +360,7 @@ fn bar_layout(width: i32, dpi: u32, text_height: i32, mode: FindBarMode) -> BarL
 }
 
 /// The fields across `width` (the right padding included), starting `top` pixels down the bar.
+/// The query field's right end holds the three option toggles (spec §8).
 fn field_layouts(
     width: i32,
     dpi: u32,
@@ -232,7 +372,9 @@ fn field_layouts(
     let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
     let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
     let text_height = text_height.clamp(1, (field_height - 2).max(1));
-    let field = |left: i32, right: i32| {
+    let toggles = option_toggles::reserved_width(dpi);
+    // `reserve` is how far the Edit stops short of the field's right edge.
+    let field = |left: i32, right: i32, reserve: i32| {
         let field = RECT {
             left,
             top,
@@ -245,19 +387,19 @@ fn field_layouts(
             edit: RECT {
                 left: left + inset_x,
                 top: edit_top,
-                right: (field.right - inset_x).max(left + inset_x),
+                right: (field.right - reserve).max(left + inset_x),
                 bottom: edit_top + text_height,
             },
         }
     };
     match mode {
-        FindBarMode::Find => (field(padding, width - padding), None),
+        FindBarMode::Find => (field(padding, width - padding, toggles), None),
         FindBarMode::Replace => {
             let half = (width - 3 * padding) / 2;
             (
-                field(padding, padding + half),
+                field(padding, padding + half, toggles),
                 // An odd leftover pixel stays at the right edge so both fields match.
-                Some(field(2 * padding + half, 2 * padding + 2 * half)),
+                Some(field(2 * padding + half, 2 * padding + 2 * half, inset_x)),
             )
         }
     }
@@ -276,6 +418,40 @@ pub(crate) struct FindBar {
     colors: Palette,
     field_brush: HBRUSH,
     close_hovered: Cell<bool>,
+    /// Match case, whole word and regex (spec §8). They last for the session, and opening a
+    /// Search result replaces them with Search's.
+    options: MatchOptions,
+    /// The last search found nothing. Cleared when the query changes or a search finds a match.
+    no_match: Cell<bool>,
+    hovered_toggle: Cell<Option<SearchOption>>,
+    /// The toggles' tooltip, made the first time the pointer moves over the bar.
+    tooltip: Cell<Option<Tooltip>>,
+    tooltip_failed: Cell<bool>,
+    /// The fields' text, kept at each `EN_CHANGE` (`field_changed`), so screen readers read it
+    /// without a `WM_GETTEXT` under the App borrow.
+    query_value: String,
+    replace_value: String,
+}
+
+/// What a click released on the bar hit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BarClick {
+    Close,
+    Toggle(SearchOption),
+}
+
+/// Text to put in the query field once nothing of the `App` is borrowed. Setting it sends
+/// `EN_CHANGE`, and the main window handles that by borrowing the find bar again.
+#[must_use = "the text only reaches the field when applied"]
+pub(crate) struct PendingText {
+    edit: HWND,
+    text: String,
+}
+
+impl PendingText {
+    pub(crate) fn apply(self) {
+        set_control_text(self.edit, &self.text);
+    }
 }
 
 impl FindBar {
@@ -307,6 +483,13 @@ impl FindBar {
             colors,
             field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
             close_hovered: Cell::new(false),
+            options: MatchOptions::default(),
+            no_match: Cell::new(false),
+            hovered_toggle: Cell::new(None),
+            tooltip: Cell::new(None),
+            tooltip_failed: Cell::new(false),
+            query_value: String::new(),
+            replace_value: String::new(),
         })
     }
 
@@ -319,6 +502,11 @@ impl FindBar {
             && (hwnd == self.panel || hwnd == self.query_edit || hwnd == self.replace_edit)
     }
 
+    /// Whether `hwnd` is the query field, whose edits clear the no-match state.
+    pub(crate) fn is_query(&self, hwnd: HWND) -> bool {
+        !hwnd.is_null() && hwnd == self.query_edit
+    }
+
     pub(crate) fn query_text(&self) -> String {
         control_text(self.query_edit)
     }
@@ -327,13 +515,66 @@ impl FindBar {
         control_text(self.replace_edit)
     }
 
-    pub(crate) fn show(&mut self, mode: FindBarMode, prefill: Option<&str>, colors: Palette) {
+    /// Keeps `text`, read from `control` with nothing borrowed at its `EN_CHANGE`, as that
+    /// field's accessible value.
+    pub(crate) fn field_changed(&mut self, control: HWND, text: String) {
+        if control == self.query_edit {
+            self.query_value = text;
+        } else if control == self.replace_edit {
+            self.replace_value = text;
+        }
+    }
+
+    /// The bar's MSAA children, in order: the Find field, the three toggles, the Replace field
+    /// in Replace mode, and the close button.
+    pub(crate) fn accessible_items(&self) -> Vec<AccessibleItem> {
+        let (layout, dpi) = self.current_layout();
+        let focus = unsafe { GetFocus() };
+        let mut items = vec![sidebar_accessibility::field_item(
+            "Find",
+            self.query_value.clone(),
+            focus == self.query_edit,
+            layout.query.field,
+            self.query_edit,
+        )];
+        let rects = option_toggles::toggle_rects(layout.query.field, dpi);
+        for (option, rect) in SearchOption::ALL.into_iter().zip(rects) {
+            items.push(sidebar_accessibility::check_item(
+                option_toggles::label(option),
+                self.options.get(option),
+                rect,
+            ));
+        }
+        if let Some(replace) = layout.replace {
+            items.push(sidebar_accessibility::field_item(
+                "Replace",
+                self.replace_value.clone(),
+                focus == self.replace_edit,
+                replace.field,
+                self.replace_edit,
+            ));
+        }
+        items.push(sidebar_accessibility::button_item(
+            "Close",
+            false,
+            false,
+            layout.close,
+        ));
+        items
+    }
+
+    /// Shows the bar in `mode`. The caller applies the returned prefill once it holds no `App`
+    /// borrow.
+    pub(crate) fn show(
+        &mut self,
+        mode: FindBarMode,
+        prefill: Option<&str>,
+        colors: Palette,
+    ) -> Option<PendingText> {
         self.set_colors(colors);
         self.mode = mode;
         self.visible = true;
-        if let Some(text) = prefill {
-            set_control_text(self.query_edit, text);
-        }
+        self.no_match.set(false);
         unsafe {
             ShowWindow(
                 self.replace_edit,
@@ -344,6 +585,85 @@ impl FindBar {
                 },
             );
         }
+        prefill.map(|text| PendingText {
+            edit: self.query_edit,
+            text: text.to_owned(),
+        })
+    }
+
+    /// Shows the bar with `query` and `options`, as opening a Search result does (spec §8).
+    pub(crate) fn show_with(
+        &mut self,
+        mode: FindBarMode,
+        query: &str,
+        options: MatchOptions,
+        colors: Palette,
+    ) -> PendingText {
+        self.options = options;
+        let _ = self.show(mode, None, colors);
+        PendingText {
+            edit: self.query_edit,
+            text: query.to_owned(),
+        }
+    }
+
+    pub(crate) fn options(&self) -> MatchOptions {
+        self.options
+    }
+
+    pub(crate) fn toggle_option(&mut self, option: SearchOption) {
+        self.options = self.options.toggled(option);
+        self.no_match.set(false);
+        unsafe {
+            InvalidateRect(self.panel, std::ptr::null(), 0);
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the window tests"))]
+    pub(crate) fn no_match(&self) -> bool {
+        self.no_match.get()
+    }
+
+    /// Shows or clears the no-match outline on the query field.
+    pub(crate) fn set_no_match(&self, no_match: bool) {
+        if self.no_match.replace(no_match) != no_match {
+            unsafe {
+                InvalidateRect(self.panel, std::ptr::null(), 0);
+            }
+        }
+    }
+
+    /// The three toggles, in bar coordinates, in `SearchOption::ALL` order.
+    pub(crate) fn toggle_rects(&self) -> [RECT; 3] {
+        let (layout, dpi) = self.current_layout();
+        option_toggles::toggle_rects(layout.query.field, dpi)
+    }
+
+    /// Whether the pointer's first move over the bar should make the toggles' tooltip.
+    pub(crate) fn wants_tooltip(&self) -> bool {
+        self.tooltip.get().is_none() && !self.tooltip_failed.get()
+    }
+
+    /// Keeps the tooltip made for the bar. `None` means it couldn't be made, and that is not
+    /// tried again.
+    pub(crate) fn set_tooltip(&self, tooltip: Option<Tooltip>) {
+        self.tooltip.set(tooltip);
+        self.tooltip_failed.set(tooltip.is_none());
+    }
+
+    /// The tooltip and each toggle's tool, to set with nothing of the `App` borrowed.
+    pub(crate) fn toggle_tools(&self) -> Option<(Tooltip, [(RECT, &'static str); 3])> {
+        let tooltip = self.tooltip.get()?;
+        let rects = self.toggle_rects();
+        Some((
+            tooltip,
+            std::array::from_fn(|index| {
+                (
+                    rects[index],
+                    option_toggles::tooltip(SearchOption::ALL[index]),
+                )
+            }),
+        ))
     }
 
     pub(crate) fn hide(&mut self) {
@@ -376,8 +696,8 @@ impl FindBar {
         }
     }
 
-    /// Places the bar across `width` at `top` and its fields inside it.
-    pub(crate) fn layout(&self, width: i32, top: i32, dpi: u32, font: HFONT) {
+    /// Places the bar across `width` from `left`, at `top`, and its fields inside it.
+    pub(crate) fn layout(&self, left: i32, width: i32, top: i32, dpi: u32, font: HFONT) {
         if !self.visible {
             return;
         }
@@ -407,13 +727,20 @@ impl FindBar {
             SetWindowPos(
                 self.panel,
                 HWND_TOP,
-                0,
+                left,
                 top,
                 width.max(0),
                 find_bar_height(dpi),
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             InvalidateRect(self.panel, std::ptr::null(), 0);
+        }
+        // Keeps the tooltip's tools on the toggles. The tooltip is a control of this thread, and
+        // setting its tools calls nothing back in the main window.
+        if let Some((tooltip, tools)) = self.toggle_tools() {
+            for (index, (rect, text)) in tools.into_iter().enumerate() {
+                tooltip.set_tool(index, rect, text);
+            }
         }
     }
 
@@ -433,17 +760,28 @@ impl FindBar {
         self.field_brush
     }
 
-    /// `WM_MOUSEMOVE`, `WM_MOUSELEAVE` and `WM_LBUTTONUP` on the bar; returns true when the close
-    /// button was clicked.
-    pub(crate) fn pointer(&self, message: u32, lparam: LPARAM) -> bool {
-        let layout = self.current_layout();
-        let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-        let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
-        let over_close = message != WM_MOUSELEAVE
-            && x >= layout.close.left
-            && x < layout.close.right
-            && y >= layout.close.top
-            && y < layout.close.bottom;
+    /// `WM_MOUSEMOVE`, `WM_MOUSELEAVE` and `WM_LBUTTONUP` on the bar: tracks hovering over the
+    /// close button and the toggles, and reports a click released on one of them.
+    pub(crate) fn pointer(&self, message: u32, lparam: LPARAM) -> Option<BarClick> {
+        let (layout, dpi) = self.current_layout();
+        let point = POINT {
+            x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+            y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+        };
+        let leaving = message == WM_MOUSELEAVE;
+        let over_close = !leaving
+            && point.x >= layout.close.left
+            && point.x < layout.close.right
+            && point.y >= layout.close.top
+            && point.y < layout.close.bottom;
+        let over_toggle = if leaving {
+            None
+        } else {
+            option_toggles::hit(
+                &option_toggles::toggle_rects(layout.query.field, dpi),
+                point,
+            )
+        };
         if message == WM_MOUSEMOVE {
             let mut track = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -460,16 +798,28 @@ impl FindBar {
                 InvalidateRect(self.panel, &layout.close, 0);
             }
         }
-        message == WM_LBUTTONUP && over_close
+        if self.hovered_toggle.replace(over_toggle) != over_toggle {
+            unsafe {
+                InvalidateRect(self.panel, &layout.query.field, 0);
+            }
+        }
+        if message != WM_LBUTTONUP {
+            return None;
+        }
+        if over_close {
+            Some(BarClick::Close)
+        } else {
+            over_toggle.map(BarClick::Toggle)
+        }
     }
 
-    fn current_layout(&self) -> BarLayout {
+    fn current_layout(&self) -> (BarLayout, u32) {
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.panel, &mut client);
         }
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(self.panel) }.max(96);
-        bar_layout(client.right, dpi, 0, self.mode)
+        (bar_layout(client.right, dpi, 0, self.mode), dpi)
     }
 
     /// `WM_PAINT` for an empty field: its placeholder in the muted color where typed text starts.
@@ -522,7 +872,7 @@ impl FindBar {
 
     /// `WM_PAINT` for the bar: strip background, a hairline above the editor, each visible
     /// field's box (outlined with the accent while it has the focus), and the close button.
-    pub(crate) fn paint_panel(&self, panel: HWND, glyph_font: HFONT) {
+    pub(crate) fn paint_panel(&self, panel: HWND, glyph_font: HFONT, text_font: HFONT) {
         let mut paint = PAINTSTRUCT::default();
         let dc = unsafe { BeginPaint(panel, &mut paint) };
         if dc.is_null() {
@@ -554,13 +904,26 @@ impl FindBar {
                 let Some(layout) = layout else {
                     continue;
                 };
-                let outline = if focus == edit {
+                let outline = if edit == self.query_edit && self.no_match.get() {
+                    // A miss is outlined in the Search view's error color.
+                    colors.error_foreground
+                } else if focus == edit {
                     colors.selection_background
                 } else {
                     colors.pressed_background
                 };
                 fill(dc, layout.field, outline);
                 fill(dc, inset(layout.field, 1), colors.editor_background);
+            }
+            if !text_font.is_null() {
+                option_toggles::paint(
+                    dc,
+                    &option_toggles::toggle_rects(query.field, dpi),
+                    self.options,
+                    self.hovered_toggle.get(),
+                    &colors,
+                    text_font,
+                );
             }
             let hovered = self.close_hovered.get();
             if hovered {
@@ -612,7 +975,6 @@ impl FindBar {
         self.replace_edit
     }
 
-    #[cfg(test)]
     pub(crate) fn panel_hwnd(&self) -> HWND {
         self.panel
     }
@@ -620,11 +982,105 @@ impl FindBar {
 
 impl Drop for FindBar {
     fn drop(&mut self) {
+        // The tooltip's popup is owned by the main window, not by the bar, so it goes by hand.
+        if let Some(tooltip) = self.tooltip.get() {
+            tooltip.destroy();
+        }
         unsafe {
             DeleteObject(self.field_brush);
         }
     }
 }
+
+/// The 0-based MSAA child of `option`'s toggle: right after the Find field.
+pub(crate) fn toggle_child(option: SearchOption) -> usize {
+    1 + SearchOption::ALL
+        .iter()
+        .position(|shown| *shown == option)
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the find bar whose panel is `panel`. Called on the window's own thread
+/// (`sidebar_accessibility` sends every query there), under a shared App borrow: `f` reads kept
+/// state and sends no messages.
+fn with_bar<R>(panel: HWND, f: impl FnOnce(&FindBar) -> R) -> Option<R> {
+    let main = unsafe { GetParent(panel) };
+    let app = unsafe { super::main_window::app_ptr(main) }?;
+    let bar = unsafe { app.as_ref() }
+        .find_bar
+        .as_ref()
+        .filter(|bar| bar.panel == panel)?;
+    Some(f(bar))
+}
+
+fn accessible_container(panel: HWND) -> (String, u32) {
+    let replace = with_bar(panel, |bar| bar.mode == FindBarMode::Replace).unwrap_or(false);
+    let name = if replace { "Find and replace" } else { "Find" };
+    (name.to_owned(), ROLE_SYSTEM_TOOLBAR)
+}
+
+fn accessible_count(panel: HWND) -> usize {
+    with_bar(panel, |bar| bar.accessible_items().len()).unwrap_or(0)
+}
+
+fn accessible_item(panel: HWND, index: usize) -> Option<AccessibleItem> {
+    with_bar(panel, |bar| bar.accessible_items().into_iter().nth(index)).flatten()
+}
+
+/// The toggles sit inside the Find field, so the last child under the point wins.
+fn accessible_hit(panel: HWND, point: POINT) -> Option<usize> {
+    with_bar(panel, |bar| {
+        bar.accessible_items().iter().rposition(|item| {
+            point.x >= item.rect.left
+                && point.x < item.rect.right
+                && point.y >= item.rect.top
+                && point.y < item.rect.bottom
+        })
+    })
+    .flatten()
+}
+
+fn accessible_current(_panel: HWND) -> Option<usize> {
+    None
+}
+
+fn accessible_select(_panel: HWND, _index: usize) {}
+
+/// A field's default action focuses it. A toggle's or the close button's is a click on its
+/// center, which `main_window::panel_pointer` handles as the mouse's. Both run with nothing of
+/// the App borrowed.
+fn accessible_activate(panel: HWND, index: usize) {
+    let Some(item) = accessible_item(panel, index) else {
+        return;
+    };
+    if item.window.is_null() {
+        sidebar_accessibility::click_item(panel, item.rect);
+    } else {
+        unsafe {
+            SetFocus(item.window);
+        }
+    }
+}
+
+fn accessible_identity(_panel: HWND, index: usize) -> Option<u64> {
+    Some(index as u64)
+}
+
+fn accessible_generation(_panel: HWND) -> u64 {
+    0
+}
+
+pub(crate) static FIND_BAR_ACCESSIBLE: AccessibleSource = AccessibleSource {
+    container: accessible_container,
+    count: accessible_count,
+    item: accessible_item,
+    hit: accessible_hit,
+    current: accessible_current,
+    select: accessible_select,
+    activate: accessible_activate,
+    identity: accessible_identity,
+    generation: accessible_generation,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FindField {
@@ -672,6 +1128,15 @@ unsafe extern "system" fn find_field_proc(
     }
     // A single-line Edit beeps at Enter and Escape characters; both are handled on key down.
     if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b) {
+        return 0;
+    }
+    // Alt+C, Alt+W and Alt+R flip the options while a field has the focus (spec §8). The key
+    // down flips; its WM_SYSCHAR is swallowed, so the menu band never sees the letter.
+    if let Some(option) = option_toggles::alt_option(message, wparam, lparam) {
+        super::main_window::toggle_find_option(hook.parent, option);
+        return 0;
+    }
+    if option_toggles::is_toggle_char(message, wparam, lparam) {
         return 0;
     }
     if message == WM_PAINT
@@ -734,7 +1199,7 @@ fn create_edit_child(panel: HWND) -> crate::Result<HWND> {
     )
 }
 
-fn control_text(hwnd: HWND) -> String {
+pub(crate) fn control_text(hwnd: HWND) -> String {
     unsafe {
         let length = GetWindowTextLengthW(hwnd);
         if length <= 0 {
@@ -765,7 +1230,7 @@ mod tests {
     use super::{SearchDirection, SearchState};
     use crate::editor::Editor;
     use crate::editor::scintilla_constants::{
-        SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
+        SCI_GETTARGETEND, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -836,6 +1301,9 @@ mod tests {
     struct TargetLog {
         responses: VecDeque<isize>,
         ranges: Vec<(usize, isize)>,
+        /// Scripted target ends; otherwise a hit ends one needle-length after it starts.
+        ends: VecDeque<isize>,
+        last_end: isize,
     }
 
     unsafe extern "C" fn target_range_stub(
@@ -852,7 +1320,17 @@ mod tests {
                 0
             }
             SCI_SETSEARCHFLAGS => 0,
-            SCI_SEARCHINTARGET => log.responses.pop_front().unwrap_or(-1),
+            SCI_SEARCHINTARGET => {
+                let found = log.responses.pop_front().unwrap_or(-1);
+                if found >= 0 {
+                    log.last_end = found + wparam as isize;
+                }
+                found
+            }
+            SCI_GETTARGETEND => {
+                let scripted = log.ends.pop_front();
+                scripted.unwrap_or(log.last_end)
+            }
             _ => 0,
         }
     }
@@ -864,7 +1342,7 @@ mod tests {
         // wrong range or never find the wrapped match.
         let log = Mutex::new(TargetLog {
             responses: VecDeque::from([8_isize, -1, 0, -1]),
-            ranges: Vec::new(),
+            ..TargetLog::default()
         });
         let editor =
             Editor::test_fixture(target_range_stub, &log as *const Mutex<TargetLog> as isize);
@@ -881,6 +1359,101 @@ mod tests {
             log.lock().unwrap().ranges,
             vec![(8, 11), (11, 11), (0, 8), (3, 8)]
         );
+    }
+
+    #[test]
+    fn plain_options_map_to_scintilla_flags_and_regex_adds_none() {
+        // Break caught: the toggles changing nothing in plain mode, or a Scintilla regex flag
+        // left in, so regex mode would search with a second dialect.
+        use super::search_flags;
+        use crate::editor::scintilla_constants::{SCFIND_MATCHCASE, SCFIND_WHOLEWORD};
+        use crate::search::MatchOptions;
+        let plain = MatchOptions::default();
+        let case = MatchOptions {
+            case: true,
+            ..plain
+        };
+        let word = MatchOptions {
+            whole_word: true,
+            ..plain
+        };
+        let all = MatchOptions {
+            case: true,
+            whole_word: true,
+            regex: true,
+        };
+        assert_eq!(search_flags(plain), 0);
+        assert_eq!(search_flags(case), SCFIND_MATCHCASE);
+        assert_eq!(search_flags(word), SCFIND_WHOLEWORD);
+        assert_eq!(search_flags(all), SCFIND_MATCHCASE | SCFIND_WHOLEWORD);
+    }
+
+    #[test]
+    fn regex_mode_wraps_once_each_way_and_a_pattern_error_is_no_matcher() {
+        // Break caught: find next restarting at the caret's own match, find previous taking a
+        // match that ends after the caret, no wrap, or `\d*` (empty-capable) or `(` searched
+        // at all instead of shown as no match.
+        use super::{regex_match, regex_matcher};
+        use crate::search::MatchOptions;
+        let options = MatchOptions::default();
+        let matcher = regex_matcher(r"\d+", options).unwrap();
+        let text = "a1 b22\nc333";
+        let find = |origin, direction| regex_match(&matcher, text, origin, direction);
+        assert_eq!(find(0, SearchDirection::Forward), Some(1..2));
+        assert_eq!(find(2, SearchDirection::Forward), Some(4..6));
+        assert_eq!(find(6, SearchDirection::Forward), Some(8..11), "next line");
+        assert_eq!(find(11, SearchDirection::Forward), Some(1..2), "wrapped");
+        assert_eq!(find(8, SearchDirection::Backward), Some(4..6));
+        assert_eq!(find(5, SearchDirection::Backward), Some(1..2));
+        assert_eq!(find(1, SearchDirection::Backward), Some(8..11), "wrapped");
+        assert!(regex_matcher(r"\d*", options).is_none());
+        assert!(regex_matcher("(", options).is_none());
+        assert!(regex_matcher("", options).is_none());
+    }
+
+    #[test]
+    fn a_regex_find_next_in_a_megabyte_note_takes_well_under_a_frame() {
+        // Break caught: a regex find next that copies, recompiles per step or rescans the text
+        // more than once, putting F3 in a 1 MB note past one 16 ms frame. The worst case is a
+        // miss: the whole text after the caret, then the whole text again after the wrap.
+        // Measured in release only (`cargo test --release`), like the matcher's own budget test.
+        use super::{regex_match, regex_matcher};
+        use crate::search::MatchOptions;
+        let line = "Plain text with a café, some numbers 12345 and Îndemn words.\r\n";
+        let text = line.repeat(1_048_576 / line.len());
+        let options = MatchOptions {
+            whole_word: true,
+            ..MatchOptions::default()
+        };
+        let started = std::time::Instant::now();
+        let matcher = regex_matcher(r"invoice\s+\d{4}", options).unwrap();
+        assert_eq!(
+            regex_match(&matcher, &text, text.len() / 2, SearchDirection::Forward),
+            None
+        );
+        let elapsed = started.elapsed();
+        eprintln!("regex find next over {} bytes: {elapsed:?}", text.len());
+        if !cfg!(debug_assertions) {
+            assert!(elapsed < std::time::Duration::from_millis(8), "{elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn the_query_field_leaves_room_for_the_three_toggles() {
+        // Break caught: typed text running under the toggles, or toggles outside the field.
+        use super::{FindBarMode, bar_layout};
+        use crate::window::option_toggles::toggle_rects;
+        for dpi in [96, 144] {
+            for mode in [FindBarMode::Find, FindBarMode::Replace] {
+                let query = bar_layout(800, dpi, 16, mode).query;
+                let rects = toggle_rects(query.field, dpi);
+                assert!(query.edit.right <= rects[0].left, "{dpi} {mode:?}");
+                assert!(rects[2].right <= query.field.right, "{dpi} {mode:?}");
+                for rect in rects {
+                    assert!(rect.top >= query.field.top && rect.bottom <= query.field.bottom);
+                }
+            }
+        }
     }
 
     #[test]
