@@ -123,10 +123,18 @@ fn wait_within(wait: Duration, what: &str, done: impl Fn() -> bool) {
     }
 }
 
-/// The worker has installed the folder once it writes the per-PC local file.
+/// The load worker writes the per-PC local file (atomically: a temp file renamed into place) and
+/// then posts the folder's state to the window, which has it by the time a forwarded launch or a
+/// posted command arrives. The `libraries` folder alone appears before that write, and on a slow
+/// disk long before it: a step taken then finds no state, so an edit is not autosaved and a
+/// command does nothing.
 fn wait_for_library(data: &Scratch) {
     wait_until("the folder to load", || {
-        data.data().join("libraries").is_dir()
+        std::fs::read_dir(data.data().join("libraries")).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "ini"))
+        })
     });
 }
 

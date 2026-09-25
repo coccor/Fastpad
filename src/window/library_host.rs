@@ -483,6 +483,9 @@ fn install(hwnd: HWND, fresh: LibraryState) {
             force: rewrite,
         },
     );
+    // An edit made while the folder loaded found no state, so it armed no timer: the dirty tab
+    // autosaves now that autosave is known to apply.
+    schedule_autosave(hwnd);
     // A load or rescan may have seen outside edits: the Search view's query runs again.
     crate::window::text_search_host::notes_reloaded(hwnd);
     // A folder box whose folder the rescan no longer finds closes.
