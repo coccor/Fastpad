@@ -481,6 +481,9 @@ fn install(hwnd: HWND, fresh: LibraryState) {
             force: rewrite,
         },
     );
+    // An edit made while the folder loaded found no state, so it armed no timer: the dirty tab
+    // autosaves now that autosave is known to apply.
+    schedule_autosave(hwnd);
     super::side_panel::refresh(hwnd);
     // A notebook's first load reveals the (restored) active note: its row is selected and its
     // folders expand (spec §6.1). A rescan leaves the user's selection where it was.
