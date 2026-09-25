@@ -2750,6 +2750,27 @@ fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
     }
 }
 
+/// Whether the Notebook view's Open Editors section is expanded (open editors spec §3.3).
+#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
+pub(crate) fn open_editors_expanded(hwnd: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }
+        .is_none_or(|app| unsafe { app.as_ref() }.settings.open_editors_expanded)
+}
+
+/// Collapses or expands the Open Editors section and saves it. Only the panel repaints.
+#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
+pub(crate) fn set_open_editors_expanded(hwnd: HWND, expanded: bool) {
+    change_setting(hwnd, |settings| {
+        (settings.open_editors_expanded != expanded).then(|| {
+            settings.open_editors_expanded = expanded;
+            ("open_editors_expanded", expanded.to_string())
+        })
+    });
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+    }
+}
+
 /// Applies one settings change from a command and saves it to `fastpad.ini`. `change` edits the
 /// in-memory settings and names the `key=value` it made, or returns `None` when nothing changed.
 pub(crate) fn change_setting(
@@ -2767,7 +2788,10 @@ pub(crate) fn change_setting(
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
     // The sidebar's view, width and icon set change only the sidebar, which their callers redo;
     // the editor and the Markdown preview are not restyled for them.
-    let sidebar_only = matches!(key, "sidebar_view" | "sidebar_width" | "file_icons");
+    let sidebar_only = matches!(
+        key,
+        "sidebar_view" | "sidebar_width" | "file_icons" | "open_editors_expanded"
+    );
     if theme_changed {
         apply_theme(hwnd);
         unsafe {

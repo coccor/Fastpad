@@ -578,6 +578,31 @@ pub(crate) fn expansion_revision(hwnd: HWND) -> u64 {
     host(hwnd, |host| host.expansion_revision).unwrap_or(0)
 }
 
+/// Whether the open notebook's root row is expanded (open editors spec §3.3). True while no
+/// notebook state is loaded, so the loading and failed states show under it.
+#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
+pub(crate) fn root_expanded(hwnd: HWND) -> bool {
+    with_state(hwnd, |state| !state.local.root_collapsed).unwrap_or(true)
+}
+
+/// Expands or collapses the notebook's root row and remembers it in the per-PC file, the way
+/// `set_expanded` does for a folder.
+#[expect(dead_code, reason = "wired to the panel by a later open editors task")]
+pub(crate) fn set_root_expanded(hwnd: HWND, expanded: bool) {
+    let changed = with_state(hwnd, |state| {
+        let changed = state.local.root_collapsed == expanded;
+        state.local.root_collapsed = !expanded;
+        changed
+    })
+    .unwrap_or(false);
+    if changed {
+        host(hwnd, |host| {
+            host.expansion_revision = host.expansion_revision.wrapping_add(1);
+        });
+        save_local_soon(hwnd);
+    }
+}
+
 /// The open notebook's expanded folders, relative to it.
 #[cfg_attr(not(test), expect(dead_code, reason = "read by the window tests"))]
 pub(crate) fn expanded(hwnd: HWND) -> Vec<PathBuf> {

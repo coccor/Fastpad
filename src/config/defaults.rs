@@ -20,6 +20,7 @@ pub const DEFAULT_SIDEBAR_WIDTH: u16 = 260;
 pub const MIN_SIDEBAR_WIDTH: u16 = 180;
 pub const MAX_SIDEBAR_WIDTH: u16 = 480;
 pub const DEFAULT_FILE_ICONS: FileIconSet = FileIconSet::Material;
+pub const DEFAULT_OPEN_EDITORS_EXPANDED: bool = true;
 
 /// `width` pulled into `MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH`.
 pub const fn clamp_sidebar_width(width: u16) -> u16 {
@@ -50,6 +51,7 @@ pub fn default_settings() -> Settings {
         sidebar_view: DEFAULT_SIDEBAR_VIEW,
         sidebar_width: DEFAULT_SIDEBAR_WIDTH,
         file_icons: DEFAULT_FILE_ICONS,
+        open_editors_expanded: DEFAULT_OPEN_EDITORS_EXPANDED,
     }
 }
 

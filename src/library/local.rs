@@ -30,6 +30,8 @@ pub struct LocalState {
     pub expanded: Vec<PathBuf>,
     pub missing: Vec<(u64, NoteId)>,
     pub files: Vec<CachedFile>,
+    /// The notebook's root row is collapsed in the Notebook view (open editors spec §3.3).
+    pub root_collapsed: bool,
 }
 
 /// Everything in the local file except the scan cache: what the UI thread changes.
@@ -38,6 +40,8 @@ pub struct Conveniences {
     pub autosave: bool,
     pub expanded: Vec<PathBuf>,
     pub missing: Vec<(u64, NoteId)>,
+    /// The notebook's root row is collapsed in the Notebook view (open editors spec §3.3).
+    pub root_collapsed: bool,
 }
 
 impl LocalState {
@@ -46,6 +50,7 @@ impl LocalState {
             autosave: self.autosave,
             expanded: self.expanded.clone(),
             missing: self.missing.clone(),
+            root_collapsed: self.root_collapsed,
         }
     }
 
@@ -56,6 +61,7 @@ impl LocalState {
             expanded: Vec::new(),
             missing: Vec::new(),
             files: Vec::new(),
+            root_collapsed: false,
         }
     }
 
@@ -67,6 +73,9 @@ impl LocalState {
         );
         for path in &self.expanded {
             output.push_str(&format!("expanded={}\r\n", path.to_string_lossy()));
+        }
+        if self.root_collapsed {
+            output.push_str("root=collapsed\r\n");
         }
         for (time, id) in &self.missing {
             output.push_str(&format!("missing={time}|{}\r\n", id.to_hex()));
@@ -99,6 +108,7 @@ impl LocalState {
                 "folder" => stored_folder = Some(PathBuf::from(value)),
                 "autosave" => state.autosave = value != "false",
                 "expanded" if !value.is_empty() => state.expanded.push(PathBuf::from(value)),
+                "root" => state.root_collapsed = value == "collapsed",
                 "missing" => {
                     if let Some((time, id)) = value.split_once('|')
                         && let (Ok(time), Some(id)) = (time.parse(), NoteId::parse_hex(id))
@@ -591,6 +601,26 @@ mod tests {
                 ("Plans".to_owned(), Some(r"E:\A".to_owned())),
                 (r"D:\".to_owned(), None),
             ]
+        );
+    }
+
+    #[test]
+    fn a_collapsed_root_round_trips_and_an_expanded_one_writes_nothing() {
+        // Break caught: the notebook's root row reopening expanded after a restart, or every
+        // local file gaining a root= line (open editors spec §3.3).
+        let folder = PathBuf::from(r"C:\notes");
+        let mut state = LocalState::new(folder.clone());
+        assert!(!state.encode().contains("root="));
+        state.root_collapsed = true;
+        let encoded = state.encode();
+        assert!(encoded.contains("root=collapsed\r\n"));
+        assert!(LocalState::parse(&encoded, &folder).unwrap().root_collapsed);
+        let before = state.conveniences();
+        state.root_collapsed = false;
+        assert_ne!(
+            state.conveniences(),
+            before,
+            "a change is a change to write"
         );
     }
 
