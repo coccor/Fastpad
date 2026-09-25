@@ -130,6 +130,13 @@ Hover a note to pin it.
 - Drag a note or a folder onto another folder in the tree to move it there, or onto empty
   space to move it to the notebook's top level. A label with its name follows the pointer while
   you drag. Open tabs and pins follow it, nothing is ever overwritten, and Esc cancels the drag.
+- **Open Editors.** The top of the Notebook view lists every open tab, the notebook's own notes
+  and any other file alike. Click a row to switch to it; its ✕ or a middle-click closes it. The
+  notebook itself is the collapsible row below.
+- **Adding a file to the notebook.** Drag its row from Open Editors onto a folder in the tree, or
+  drag files and folders from Explorer onto the tree. They are copied there; the original stays
+  where it is. If the name is taken, FastPad asks before replacing it, and the replaced item goes
+  to the Recycle Bin.
 - The tree's icons come from Material Icon Theme. **File icons: Minimal** in the palette switches
   to single-colour outlines, and **File icons: Solid** to filled shapes. Designers can edit both
   as SVGs (`assets/icons/README.md`).

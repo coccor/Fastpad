@@ -199,3 +199,38 @@ An Explorer drop with several items is refused only if every item is refused. Ot
 - Dragging notes out of FastPad to Explorer or other apps.
 - A progress indicator for large copies.
 - Keeping both on a clash (`name (2).md`).
+
+## 10. Decisions made while implementing
+
+- **The title band stays.** It holds "NOTEBOOK" and is all caption, because it sits in the
+  window's title strip.
+- **The root row's buttons don't move the keyboard selection.** New note and New folder still
+  create in the tree's selected folder, the same folder a header button used to. Only a click on
+  the root row itself moves the selection there.
+- **One keyboard selection moves through the whole panel.** With no notebook open, the RECENT
+  list is the last part of it, after Open Editors. Page Up and Page Down move within the section
+  that holds the selection, Open Editors included.
+- **The Open Editors list can't be dragged by its scroll thumb.** Its rows have no thumb hit
+  test, unlike the tree's. Wheel and keyboard are the only way to scroll it.
+- **A new refusal:** "it would replace the folder it is in."
+- **A source with no file name is refused too.** A drive or a UNC share root, such as `D:\` or
+  `\\server\share\`, is refused before anything else runs: "<source> was not copied: a whole
+  drive or share can't be copied into the notebook."
+- **The copy plan normalizes every path first.** A trailing separator, a `/`, and `.`/`..`
+  components are resolved before the refusal checks run, so any spelling of the same location is
+  caught the same way.
+- **Replace recycles on the UI thread.** The Recycle Bin step runs right after its prompt, as
+  Delete does.
+- **A replace is refused by disk identity, not by spelling.** Before recycling the destination,
+  FastPad compares its volume serial number and file index with the source's, and with every
+  folder above the source, both as its path was given and as it really is once `subst` drives,
+  mapped drives and junctions are resolved. A match refuses the copy. A destination whose
+  identity can't be read isn't recycled either: it gets the Recycle Bin failure notice instead.
+- **Closing FastPad during a copy waits for the file in hand, then stops.** The rest of the queue
+  is dropped; nothing is left half-written.
+- **An Open Editors drag copies the path it had when it armed.** If its tab closes mid-drag, the
+  drop still copies that file from disk.
+- **An Explorer drag over the tree is a real drag, not just borrowed hover logic.** It's kept as
+  a started `DragSource::Files` drag, with no capture and no label, so the highlight band, the
+  auto-expand and the auto-scroll behave exactly as an in-window drag's do. This amends §4.3's
+  "never becomes a `Drag`."

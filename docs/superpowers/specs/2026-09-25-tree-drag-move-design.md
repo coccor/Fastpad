@@ -146,7 +146,7 @@ All notices use the existing notice bar (`main_window::push_notice`).
 
 ## 9. Out of scope
 
-- Dropping files or folders from Explorer into a tree folder. A drop on the window still opens the file or notebook, as today.
+- Dropping files or folders from Explorer into a tree folder: now in the Open Editors spec (`2026-09-25-open-editors-design.md`), where it copies.
 - Dragging notes out of FastPad (to Explorer or other apps).
 - Copying on drag (Ctrl+drag).
 - Dragging several rows at once.
