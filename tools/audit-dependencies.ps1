@@ -10,7 +10,8 @@ $AllowedRoots = @(
     [pscustomobject]@{ Name = "serde_json"; Version = "1.0.151" },
     [pscustomobject]@{ Name = "pulldown-cmark"; Version = "0.13.4" },
     [pscustomobject]@{ Name = "windows"; Version = "0.62.2" },
-    [pscustomobject]@{ Name = "windows-numerics"; Version = "0.3.1" }
+    [pscustomobject]@{ Name = "windows-numerics"; Version = "0.3.1" },
+    [pscustomobject]@{ Name = "regex"; Version = "1.13.1" }
 )
 # The `windows` crate is allowed only as the pinned direct dependency, with exactly these features.
 # Win32/Win32_Graphics/Win32_Graphics_Dxgi/Win32_System are namespace features that cargo metadata
