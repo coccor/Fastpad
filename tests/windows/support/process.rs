@@ -306,18 +306,27 @@ pub fn wait_and_cancel_dialog(process_id: u32, timeout: Duration) -> TestResult<
     })
 }
 
+/// How long an answered dialog may take to close. The first file dialog on a fresh CI runner
+/// sets up the shell on FastPad's UI thread before it handles the answer: in hosted runs the Save
+/// As cancel took up to 11.5 s and once over 15 s, against under a second on a warm machine.
+#[cfg(windows)]
+const ANSWERED_DIALOG_CLOSE_WAIT: Duration = Duration::from_secs(60);
+
 /// Waits for a dialog to appear, then calls `answer` on it until the dialog window is gone.
 /// `answer` returns false while it could not act yet.
 ///
 /// Answering is repeated because a slow runner can list the `#32770` window before its buttons
 /// exist or before it handles commands, so a single attempt could silently do nothing.
+///
+/// `timeout` bounds the wait for the dialog to appear; once answered, it gets
+/// `ANSWERED_DIALOG_CLOSE_WAIT` to close.
 #[cfg(windows)]
 fn wait_and_answer_dialog(
     process_id: u32,
     timeout: Duration,
     answer: impl Fn(HWND) -> bool,
 ) -> TestResult<()> {
-    let deadline = Deadline::after(timeout);
+    let mut deadline = Deadline::after(timeout);
     let mut answered: Option<HWND> = None;
     loop {
         if let Some(dialog) = answered
@@ -332,16 +341,87 @@ fn wait_and_answer_dialog(
         if let Some(dialog) = dialog
             && answer(dialog)
         {
+            if answered.is_none() {
+                deadline = Deadline::after(ANSWERED_DIALOG_CLOSE_WAIT);
+            }
             answered = Some(dialog);
         }
         if deadline.expired() {
-            return Err(match answered {
-                Some(_) => "timed out waiting for an answered dialog to close".into(),
-                None => "timed out waiting for a dialog to appear".into(),
-            });
+            let what = match answered {
+                Some(_) => "timed out waiting for an answered dialog to close",
+                None => "timed out waiting for a dialog to appear",
+            };
+            return Err(format!(
+                "{what}; answered {answered:?}; {}",
+                describe_windows(process_id)
+            )
+            .into());
         }
         deadline.sleep_step();
     }
+}
+
+/// Every top-level window of the process, and whether its thread answers, for a dialog wait that
+/// timed out.
+#[cfg(windows)]
+fn describe_windows(process_id: u32) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GetWindow, IsHungAppWindow, IsWindowVisible, SMTO_ABORTIFHUNG,
+        SendMessageTimeoutW, WM_NULL,
+    };
+    struct Found {
+        process_id: u32,
+        windows: Vec<HWND>,
+    }
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(lparam as *mut Found) };
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+        if process_id == found.process_id {
+            found.windows.push(hwnd);
+        }
+        1
+    }
+    unsafe extern "system" fn count(_: HWND, lparam: LPARAM) -> BOOL {
+        unsafe { *(lparam as *mut u32) += 1 };
+        1
+    }
+    let text = |hwnd: HWND, class: bool| {
+        let mut buffer = [0_u16; 128];
+        let length = unsafe {
+            if class {
+                GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32)
+            } else {
+                GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32)
+            }
+        };
+        String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+    };
+    let mut found = Found {
+        process_id,
+        windows: Vec::new(),
+    };
+    unsafe { EnumWindows(Some(collect), &mut found as *mut Found as isize) };
+    let mut out = String::from("windows:");
+    for hwnd in found.windows {
+        let mut children = 0_u32;
+        let mut result = 0;
+        let answers = unsafe {
+            EnumChildWindows(hwnd, Some(count), &mut children as *mut u32 as isize);
+            SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2_000, &mut result)
+        };
+        out += &format!(
+            "\n  {hwnd:?} class={:?} title={:?} visible={} enabled={} owner={:?} hung={} answers={} children={children}",
+            text(hwnd, true),
+            text(hwnd, false),
+            unsafe { IsWindowVisible(hwnd) },
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd) },
+            unsafe { GetWindow(hwnd, GW_OWNER) },
+            unsafe { IsHungAppWindow(hwnd) },
+            answers,
+        );
+    }
+    out
 }
 
 #[cfg(windows)]
