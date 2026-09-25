@@ -6,6 +6,6 @@ pub use defaults::{
     default_settings,
 };
 pub use persisted::{
-    SettingWarning, Settings, SettingsDelta, SidebarView, ThemePreference, load, parse,
-    save_setting, save_setting_to,
+    FileIconSet, SettingWarning, Settings, SettingsDelta, SidebarView, ThemePreference, load,
+    parse, save_setting, save_setting_to,
 };

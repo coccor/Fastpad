@@ -2517,6 +2517,8 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::NoteNew => crate::window::inline_name::new_note(hwnd, None),
         CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
+        CommandId::FileIconsMaterial => set_file_icons(hwnd, crate::config::FileIconSet::Material),
+        CommandId::FileIconsMinimal => set_file_icons(hwnd, crate::config::FileIconSet::Minimal),
         CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
         CommandId::ThemeCatppuccin => set_theme(hwnd, crate::config::ThemePreference::Catppuccin),
         CommandId::ThemeCatppuccinLatte => {
@@ -2722,6 +2724,19 @@ fn set_theme(hwnd: HWND, theme: crate::config::ThemePreference) {
     });
 }
 
+/// Switches the Notebook tree's icon set and repaints the tree (icon sets spec §4). No rescan.
+fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
+    change_setting(hwnd, |settings| {
+        (settings.file_icons != set).then(|| {
+            settings.file_icons = set;
+            ("file_icons", set.token().to_owned())
+        })
+    });
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+    }
+}
+
 /// Applies one settings change from a command and saves it to `fastpad.ini`. `change` edits the
 /// in-memory settings and names the `key=value` it made, or returns `None` when nothing changed.
 pub(crate) fn change_setting(
@@ -2737,9 +2752,9 @@ pub(crate) fn change_setting(
     };
     let theme_changed = unsafe { app_ptr(hwnd) }
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
-    // The sidebar's view and width change only the layout, which their callers redo; the editor
-    // and the Markdown preview are not restyled for them.
-    let sidebar_only = matches!(key, "sidebar_view" | "sidebar_width");
+    // The sidebar's view, width and icon set change only the sidebar, which their callers redo;
+    // the editor and the Markdown preview are not restyled for them.
+    let sidebar_only = matches!(key, "sidebar_view" | "sidebar_width" | "file_icons");
     if theme_changed {
         apply_theme(hwnd);
         unsafe {
@@ -7193,6 +7208,39 @@ mod tests {
         assert!(shown.contains(&CommandId::Open));
         assert!(shown.contains(&CommandId::ThemeDark));
         assert!(!shown.contains(&CommandId::Save));
+    }
+
+    #[test]
+    fn file_icon_commands_save_the_set_and_repaint_the_tree_without_restyling_the_editor() {
+        // Break caught: a set that is lost on restart, a tree left showing the old set until
+        // something else repaints it, or fastpad.ini rewritten beyond its own line
+        // (icon sets spec §4).
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("file-icons");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::FileIconsMinimal);
+        assert_eq!(
+            app_mut(window.hwnd).settings.file_icons,
+            crate::config::FileIconSet::Minimal
+        );
+        execute_command(window.hwnd, CommandId::FileIconsMinimal);
+        execute_command(window.hwnd, CommandId::FileIconsMaterial);
+        super::save_settings_to(None);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nfile_icons=material\r\n"
+        );
+        assert!(
+            crate::window::command_palette::SETTINGS_COMMANDS
+                .contains(&CommandId::FileIconsMaterial)
+                && crate::window::command_palette::SETTINGS_COMMANDS
+                    .contains(&CommandId::FileIconsMinimal)
+        );
+        assert!(!CommandId::FileIconsMaterial.needs_document());
     }
 
     #[test]

@@ -127,6 +127,8 @@ Hover a note to pin it.
   renames a note or a folder in place, without opening it, and **Del** sends it to the Recycle
   Bin. A name that is taken says so as you type. Empty folders show in the tree, and each note
   has a coloured icon for its type.
+- The tree's icons come from Material Icon Theme; **File icons: Minimal** in the palette switches
+  to plain glyphs.
 - Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
 - **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
   Everything is reachable from the keyboard and exposed to screen readers.
@@ -229,6 +231,7 @@ line in a notification and applies the rest.
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
+| `file_icons` | `material` or `minimal` | `material` |
 
 Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
 

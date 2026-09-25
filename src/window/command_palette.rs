@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 72] = [
+pub(crate) const ENTRIES: [PaletteEntry; 74] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -144,6 +144,8 @@ pub(crate) const ENTRIES: [PaletteEntry; 72] = [
         CommandId::ThemeCatppuccinMacchiato,
     ),
     entry("Theme: Catppuccin Mocha", CommandId::ThemeCatppuccinMocha),
+    entry("File icons: Material", CommandId::FileIconsMaterial),
+    entry("File icons: Minimal", CommandId::FileIconsMinimal),
     entry("Editor: Tab width 2", CommandId::TabWidth2),
     entry("Editor: Tab width 4", CommandId::TabWidth4),
     entry("Editor: Tab width 8", CommandId::TabWidth8),
@@ -169,6 +171,8 @@ pub(crate) const SETTINGS_COMMANDS: &[CommandId] = &[
     CommandId::ThemeCatppuccinFrappe,
     CommandId::ThemeCatppuccinMacchiato,
     CommandId::ThemeCatppuccinMocha,
+    CommandId::FileIconsMaterial,
+    CommandId::FileIconsMinimal,
     CommandId::TabWidth2,
     CommandId::TabWidth4,
     CommandId::TabWidth8,
@@ -1433,7 +1437,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 72);
+        assert_eq!(ENTRIES.len(), 74);
     }
 
     #[test]

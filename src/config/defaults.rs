@@ -1,4 +1,4 @@
-use super::persisted::{Settings, SidebarView, ThemePreference};
+use super::persisted::{FileIconSet, Settings, SidebarView, ThemePreference};
 
 /// FastPad's compiled fallback font face, used until a settings file overrides it. Kept separate
 /// from `languages::DEFAULT_FONT_FACE` (the per-lexer-style face used while highlighting is
@@ -19,6 +19,7 @@ pub const DEFAULT_SIDEBAR_VIEW: SidebarView = SidebarView::Notebook;
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 260;
 pub const MIN_SIDEBAR_WIDTH: u16 = 180;
 pub const MAX_SIDEBAR_WIDTH: u16 = 480;
+pub const DEFAULT_FILE_ICONS: FileIconSet = FileIconSet::Material;
 
 /// `width` pulled into `MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH`.
 pub const fn clamp_sidebar_width(width: u16) -> u16 {
@@ -32,9 +33,9 @@ pub const fn clamp_sidebar_width(width: u16) -> u16 {
 }
 
 /// FastPad's compiled defaults: Consolas 11pt, 4-wide tabs, word wrap off, line numbers on, system
-/// theme, a 30-second crash-recovery interval, session restore on, notes mode on, and the side
-/// panel showing the Notebook view at 260 pixels. Every value a settings file does not (validly)
-/// specify keeps whatever `default_settings()` produced.
+/// theme, a 30-second crash-recovery interval, session restore on, notes mode on, the side
+/// panel showing the Notebook view at 260 pixels, and Material Icon Theme file icons. Every value
+/// a settings file does not (validly) specify keeps whatever `default_settings()` produced.
 pub fn default_settings() -> Settings {
     Settings {
         font_face: DEFAULT_FONT_FACE.to_owned(),
@@ -48,6 +49,7 @@ pub fn default_settings() -> Settings {
         notes_mode: DEFAULT_NOTES_MODE,
         sidebar_view: DEFAULT_SIDEBAR_VIEW,
         sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+        file_icons: DEFAULT_FILE_ICONS,
     }
 }
 

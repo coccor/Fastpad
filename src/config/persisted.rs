@@ -55,6 +55,32 @@ impl SidebarView {
     }
 }
 
+/// Which icon set the Notebook tree draws (icon sets spec §4).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FileIconSet {
+    #[default]
+    Material,
+    Minimal,
+}
+
+impl FileIconSet {
+    const ALL: [Self; 2] = [Self::Material, Self::Minimal];
+
+    /// The `file_icons=` value that parses back to this set.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Material => "material",
+            Self::Minimal => "minimal",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|set| value.eq_ignore_ascii_case(set.token()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub font_face: String,
@@ -74,6 +100,8 @@ pub struct Settings {
     /// The side panel's width in 96-DPI pixels, within `MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH`.
     /// Saved when a resize drag ends.
     pub sidebar_width: u16,
+    /// Which icon set the Notebook tree draws.
+    pub file_icons: FileIconSet,
 }
 
 impl Settings {
@@ -114,6 +142,9 @@ impl Settings {
         if let Some(sidebar_width) = delta.sidebar_width {
             self.sidebar_width = sidebar_width;
         }
+        if let Some(file_icons) = delta.file_icons {
+            self.file_icons = file_icons;
+        }
     }
 }
 
@@ -143,6 +174,7 @@ pub struct SettingsDelta {
     pub notes_mode: Option<bool>,
     pub sidebar_view: Option<SidebarView>,
     pub sidebar_width: Option<u16>,
+    pub file_icons: Option<FileIconSet>,
     pub warnings: Vec<SettingWarning>,
 }
 
@@ -150,9 +182,10 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
-/// `sidebar_view` and `sidebar_width` are recognized. `sidebar_view` is `notebook`, `search`,
-/// `favorites` or `none` (any case); `sidebar_width` is an unsigned integer in 96-DPI pixels,
-/// pulled into 180–480 when it is outside. Every line is handled independently: a line with an
+/// `sidebar_view`, `sidebar_width` and `file_icons` are recognized. `sidebar_view` is `notebook`,
+/// `search`, `favorites` or `none` (any case); `sidebar_width` is an unsigned integer in 96-DPI
+/// pixels, pulled into 180–480 when it is outside; `file_icons` is `material` or `minimal` (any
+/// case). Every line is handled independently: a line with an
 /// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
 /// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
@@ -226,6 +259,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         "sidebar_width" => match value.parse::<u16>() {
             Ok(width) => delta.sidebar_width = Some(clamp_sidebar_width(width)),
             Err(_) => warn(delta, line_number, key, value),
+        },
+        "file_icons" => match FileIconSet::parse(value) {
+            Some(set) => delta.file_icons = Some(set),
+            None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
             line: line_number,
@@ -688,6 +725,32 @@ mod tests {
             );
         }
         assert_eq!(SidebarView::Hidden.token(), "none");
+    }
+
+    #[test]
+    fn file_icons_accepts_its_two_tokens_in_any_case_and_warns_on_anything_else() {
+        // Break caught: a hand-edited "file_icons=Minimal" ignored, or a typo silently switching
+        // sets (icon sets spec §4).
+        for (value, set) in [
+            ("material", FileIconSet::Material),
+            ("Minimal", FileIconSet::Minimal),
+            ("MATERIAL", FileIconSet::Material),
+        ] {
+            assert_eq!(parse(&format!("file_icons={value}")).file_icons, Some(set));
+        }
+        let delta = parse("file_icons=seti");
+        assert_eq!(delta.file_icons, None);
+        assert_eq!(delta.warnings.len(), 1);
+        for set in [FileIconSet::Material, FileIconSet::Minimal] {
+            assert_eq!(
+                parse(&format!("file_icons={}", set.token())).file_icons,
+                Some(set)
+            );
+        }
+        let mut settings = default_settings();
+        assert_eq!(settings.file_icons, FileIconSet::Material);
+        settings.apply_delta(&parse("file_icons=minimal"));
+        assert_eq!(settings.file_icons, FileIconSet::Minimal);
     }
 
     #[test]
