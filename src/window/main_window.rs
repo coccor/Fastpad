@@ -11911,6 +11911,7 @@ mod tests {
 
     use crate::library::tree::RowKind;
     use crate::window::notebook_view::{Activation, Mode, NotebookView};
+    use crate::window::tree_drag::DragSource;
 
     /// Task 6 creates the sidebar with the window when notes mode is on; this makes sure of it.
     fn ensure_sidebar(hwnd: HWND) {
@@ -18529,6 +18530,103 @@ mod tests {
         client_lparam(client.right / 2, bottom + 40)
     }
 
+    /// Presses on Open Editors row `index` and moves past the drag distance.
+    fn start_tab_drag(hwnd: HWND, panel: HWND, index: usize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let rect = notebook_view(hwnd).editor_rect_at(index).unwrap();
+        let (x, y) = ((rect.left + rect.right) / 3, (rect.top + rect.bottom) / 2);
+        mouse(panel, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+        mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x, y + 40));
+    }
+
+    #[test]
+    fn open_editors_drag_onto_a_folder_copies_the_file_and_leaves_the_tab_on_it() {
+        // Break caught: the drop moving the file, the tab following the copy, or the copied row
+        // not selected (open editors spec §4.1, §4.5).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        drop_at(panel, work);
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+            "draft"
+        );
+        assert!(outside.exists());
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(outside.as_path())
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"work\draft.txt".into())),
+            "a .txt is a note type, listed and selected"
+        );
+    }
+
+    #[test]
+    fn open_editors_drag_onto_its_own_folder_copies_nothing_and_asks_nothing() {
+        // Break caught (Review Focus 1).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-self");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let b = scratch.note(r"work\b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &b).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        let row = row_lparam(window.hwnd, &RowKind::Note(r"work\b.md".into()));
+        drag_over(panel, row);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            None
+        );
+        drop_at(panel, row);
+        assert!(crate::window::modal::take_last_confirm().is_none());
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b");
+    }
+
+    #[test]
+    fn open_editors_an_untitled_row_does_not_start_a_drag() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-untitled");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        assert!(notebook_view(window.hwnd).drag.is_none());
+    }
+
+    #[test]
+    fn open_editors_drag_survives_its_tab_closing_mid_drag() {
+        // Break caught (Review Focus 5): a stale DocumentId panicking the drop, or the drop
+        // copying nothing though the pressed file is still on disk.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-closed");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("gone.md");
+        std::fs::write(&outside, "g").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        drop_at(panel, work);
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(scratch.folder().join(r"work\gone.md").exists());
+    }
+
     fn drag_cursor_is(cursor: windows_sys::core::PCWSTR) -> bool {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursor, LoadCursorW};
         unsafe { GetCursor() == LoadCursorW(std::ptr::null_mut(), cursor) }
@@ -18637,7 +18735,7 @@ mod tests {
         start_drag(window.hwnd, panel, &RowKind::Folder(r"work\inner".into()));
         assert_eq!(
             notebook_view(window.hwnd).drag.as_ref().unwrap().source,
-            RowKind::Folder(r"work\inner".into())
+            DragSource::Row(RowKind::Folder(r"work\inner".into()))
         );
         let below = below_rows(window.hwnd, panel);
         drag_over(panel, below);
@@ -19045,7 +19143,7 @@ mod tests {
                 .drag
                 .as_ref()
                 .map(|drag| drag.source.clone()),
-            Some(RowKind::Note("a.md".into())),
+            Some(DragSource::Row(RowKind::Note("a.md".into()))),
             "the pressed row's drag armed only once the edit had closed"
         );
         assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);

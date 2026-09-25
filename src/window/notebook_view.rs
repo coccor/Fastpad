@@ -23,7 +23,7 @@ use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::sidebar_accessibility::MK_LBUTTON;
 use crate::window::tooltip::Tooltip;
-use crate::window::tree_drag::{self, Drag, Hover};
+use crate::window::tree_drag::{self, Drag, DragSource, Hover};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -411,9 +411,12 @@ const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
 
 /// Whether row `index` is the one a started drag carries (tree drag spec §3.2): both sides
 /// absent (no drag, and `index` past the rows the list actually has, such as the truncated row)
-/// must not read as a match.
-fn is_dragged_row(dragged: Option<&RowKind>, rows: &[TreeRow], index: usize) -> bool {
-    dragged.is_some_and(|dragged| rows.get(index).is_some_and(|row| &row.kind == dragged))
+/// must not read as a match. Only a dragged row matches: a tab or files are not tree rows.
+fn is_dragged_row(dragged: Option<&DragSource>, rows: &[TreeRow], index: usize) -> bool {
+    let Some(DragSource::Row(dragged)) = dragged else {
+        return false;
+    };
+    rows.get(index).is_some_and(|row| &row.kind == dragged)
 }
 
 /// Draws `item`'s icon from `set` at `px` square, centred in `rect` and clipped to it (a deep row
@@ -1272,7 +1275,8 @@ impl NotebookView {
         let Some(drag) = self.drag.as_mut() else {
             return false;
         };
-        let changed = drag.hover(&self.rows, (x, y), hover, now);
+        let root = self.root.clone().unwrap_or_default();
+        let changed = drag.hover(&self.rows, &root, (x, y), hover, now);
         let accepted = drag.target.is_some();
         if changed {
             self.invalidate();
@@ -1291,8 +1295,9 @@ impl NotebookView {
         point
     }
 
-    /// The started drag's label painted with `paint`, and the dragged row's name (tree drag spec
-    /// §3.2). `None` without a started drag, or if GDI can't make the image.
+    /// The started drag's label painted with `paint`, and the dragged row's or tab's name (tree
+    /// drag spec §3.2). `None` without a started drag, for dropped files, or if GDI can't make
+    /// the image.
     fn drag_label_image(&mut self, paint: &ViewPaint) -> Option<(LabelImage, String)> {
         let source = self
             .drag
@@ -1300,13 +1305,23 @@ impl NotebookView {
             .filter(|drag| drag.started)?
             .source
             .clone();
-        let item = drag_item(&source)?;
-        let name = self
-            .rows
-            .iter()
-            .find(|row| row.kind == source)?
-            .name
-            .clone();
+        let (item, name) = match &source {
+            DragSource::Row(kind) => {
+                let item = drag_item(kind)?;
+                let name = self.rows.iter().find(|row| &row.kind == kind)?.name.clone();
+                (item, name)
+            }
+            DragSource::Tab { path, .. } => {
+                let extension = path
+                    .extension()
+                    .map(|extension| extension.to_string_lossy());
+                (
+                    TreeItem::Note(note_kind(extension.as_deref())),
+                    super::tree_copy::item_name(path),
+                )
+            }
+            DragSource::Files(_) => return None,
+        };
         let text = self
             .text_width(&name, paint.fonts.text)
             .min(scale(LABEL_MAX_TEXT, paint.dpi));
@@ -1963,10 +1978,12 @@ pub(crate) fn rebuild(hwnd: HWND) {
         view.apply(snapshot, names);
         view.invalidate();
         // A drag whose row went ends; a target folder that went is found again at the next
-        // move.
+        // move. A tab or files are not tree rows: a rebuild never loses them.
         let rows = &view.rows;
         let lost = view.drag.as_mut().is_some_and(|drag| {
-            if root_changed || tree::row_index(rows, &drag.source).is_none() {
+            if let DragSource::Row(kind) = &drag.source
+                && (root_changed || tree::row_index(rows, kind).is_none())
+            {
                 return true;
             }
             if drag.target.as_ref().is_some_and(|folder| {
@@ -2639,9 +2656,9 @@ fn end_drag_label(hwnd: HWND) {
     }
 }
 
-/// A press on a row's body arms a drag of `source` (tree drag spec §3.1), unless an inline
-/// edit is still open.
-fn arm_drag(hwnd: HWND, source: RowKind, x: i32, y: i32) {
+/// A press on a row's body or an Open Editors row arms a drag of `source` (tree drag spec §3.1,
+/// open editors spec §4.3), unless an inline edit is still open.
+fn arm_drag(hwnd: HWND, source: DragSource, x: i32, y: i32) {
     if super::inline_name::is_open(hwnd) {
         return;
     }
@@ -2713,7 +2730,13 @@ fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
     end_drag_input(panel);
     end_drag_label(hwnd);
     if let Some(folder) = drag.target {
-        super::tree_move::drop_into(hwnd, &drag.source, &folder);
+        match &drag.source {
+            DragSource::Row(kind) => super::tree_move::drop_into(hwnd, kind, &folder),
+            DragSource::Tab { id, path } => {
+                super::copy_host::copy_tab_into(hwnd, *id, path, &folder);
+            }
+            DragSource::Files(_) => {}
+        }
     }
     true
 }
@@ -2936,6 +2959,11 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
                 super::main_window::close_document_tab(hwnd, row.id);
             } else {
                 super::main_window::activate_document_by_id(hwnd, row.id);
+                // The path is taken now, so the drag outlives its tab closing (open editors spec
+                // §4.3). An untitled tab has no file to copy: no drag.
+                if let Some(path) = row.path {
+                    arm_drag(hwnd, DragSource::Tab { id: row.id, path }, x, y);
+                }
             }
         }
         Hit::Root => {
@@ -2971,7 +2999,7 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
                 .flatten();
             row_clicked(hwnd, index, part, false);
             if let Some(source) = source {
-                arm_drag(hwnd, source, x, y);
+                arm_drag(hwnd, DragSource::Row(source), x, y);
             }
         }
         Hit::Empty => {}
@@ -4158,10 +4186,10 @@ mod tests {
         let rows = vec![row(RowKind::Note("a.md".into()), 0)];
         assert!(!is_dragged_row(None, &rows, 0));
         assert!(!is_dragged_row(None, &rows, 5), "past the last row too");
-        let dragged = RowKind::Note("a.md".into());
+        let dragged = DragSource::Row(RowKind::Note("a.md".into()));
         assert!(is_dragged_row(Some(&dragged), &rows, 0));
         assert!(!is_dragged_row(Some(&dragged), &rows, 5), "no row there");
-        let other = RowKind::Note("b.md".into());
+        let other = DragSource::Row(RowKind::Note("b.md".into()));
         assert!(!is_dragged_row(Some(&other), &rows, 0), "a different row");
     }
 }

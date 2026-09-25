@@ -1,10 +1,13 @@
-//! Dragging a note or folder in the Notebook tree onto another folder (tree drag spec §3): the
-//! drag's state, what the pointer is over, which folder a drop there goes into, whether that
-//! folder takes the dragged item, how fast an edge scrolls and when a resting folder expands.
+//! Dragging onto a folder of the Notebook tree (tree drag spec §3): a tree row, which moves, or
+//! an Open Editors tab or dropped files, which copy (open editors spec §4.3). The drag's state,
+//! what the pointer is over, which folder a drop there goes into, whether that folder takes the
+//! dragged item, how fast an edge scrolls and when a resting folder expands.
 //! Pure: no window, no disk. Folder paths are relative to the notebook; empty is the root.
 
+use crate::document::DocumentId;
 use crate::library::model::same_path;
 use crate::library::tree::{self, RowKind, TreeRow};
+use crate::window::tree_copy;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -26,10 +29,25 @@ pub(crate) enum Hover {
     Outside,
 }
 
+/// What a drag carries (open editors spec §4.3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DragSource {
+    /// A tree row: a drop moves it.
+    Row(RowKind),
+    /// An Open Editors tab, with its file's path taken when the drag armed: a drop copies it.
+    Tab { id: DocumentId, path: PathBuf },
+    /// Files dragged in from outside: a drop copies them.
+    #[expect(
+        dead_code,
+        reason = "built by the Explorer drop of a later open editors task"
+    )]
+    Files(Vec<PathBuf>),
+}
+
 /// A drag armed by a press on a row, and under way once `started`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Drag {
-    pub(crate) source: RowKind,
+    pub(crate) source: DragSource,
     /// Where the press landed, in panel coordinates.
     pub(crate) origin: (i32, i32),
     /// The pointer went past the system drag distance: the panel has the capture.
@@ -44,8 +62,11 @@ pub(crate) struct Drag {
 
 impl Drag {
     /// A drag of `source` armed by a press at `x`, `y`; `None` for a row that cannot be dragged.
-    pub(crate) fn armed(source: RowKind, x: i32, y: i32) -> Option<Self> {
-        draggable(&source).then_some(Self {
+    /// A tab or files always arm.
+    pub(crate) fn armed(source: DragSource, x: i32, y: i32) -> Option<Self> {
+        let arms = matches!(&source, DragSource::Row(kind) if draggable(kind))
+            || !matches!(source, DragSource::Row(_));
+        arms.then_some(Self {
             source,
             origin: (x, y),
             started: false,
@@ -56,16 +77,19 @@ impl Drag {
     }
 
     /// The pointer moved to `point`, over `hover`: the target and the resting folder follow.
-    /// True when the target changed, so the highlight repaints.
+    /// `root` is the notebook's folder on disk. True when the target changed, so the highlight
+    /// repaints.
     pub(crate) fn hover(
         &mut self,
         rows: &[TreeRow],
+        root: &Path,
         point: (i32, i32),
         hover: Hover,
         now: Instant,
     ) -> bool {
         self.pointer = point;
-        let target = drop_folder(rows, hover).filter(|folder| accepts(&self.source, folder));
+        let target =
+            drop_folder(rows, hover).filter(|folder| source_accepts(&self.source, root, folder));
         self.resting = rest_on(self.resting.take(), rows, hover, target.as_deref(), now);
         let changed = target != self.target;
         self.target = target;
@@ -122,6 +146,31 @@ pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
         return false;
     }
     !(matches!(source, RowKind::Folder(_)) && crate::library::at_or_under(folder, path))
+}
+
+/// Whether `folder` takes a drag of `source`: a row by `accepts`, a tab or files when a copy
+/// there copies anything, so not onto itself, into itself or over its holder (open editors spec
+/// §4.3). `root` is the notebook's folder on disk.
+pub(crate) fn source_accepts(source: &DragSource, root: &Path, folder: &Path) -> bool {
+    match source {
+        DragSource::Row(kind) => accepts(kind, folder),
+        DragSource::Tab { path, .. } => {
+            tree_copy::any_accepted(std::slice::from_ref(path), root, folder)
+        }
+        DragSource::Files(paths) => tree_copy::any_accepted(paths, root, folder),
+    }
+}
+
+/// Whether a drop of `source` copies rather than moves (open editors spec §4.3).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "read by the Explorer drop of a later open editors task"
+    )
+)]
+pub(crate) fn copies(source: &DragSource) -> bool {
+    !matches!(source, DragSource::Row(_))
 }
 
 /// Where `source` lands when dropped into `folder`: the same name in that folder.
@@ -241,10 +290,10 @@ mod tests {
 
     #[test]
     fn only_notes_and_folders_arm_a_drag() {
-        assert!(Drag::armed(note("a.md"), 1, 2).is_some());
-        assert!(Drag::armed(folder("work"), 1, 2).is_some());
-        assert!(Drag::armed(RowKind::Draft, 1, 2).is_none());
-        let drag = Drag::armed(note("a.md"), 1, 2).unwrap();
+        assert!(Drag::armed(DragSource::Row(note("a.md")), 1, 2).is_some());
+        assert!(Drag::armed(DragSource::Row(folder("work")), 1, 2).is_some());
+        assert!(Drag::armed(DragSource::Row(RowKind::Draft), 1, 2).is_none());
+        let drag = Drag::armed(DragSource::Row(note("a.md")), 1, 2).unwrap();
         assert!(!drag.started);
         assert_eq!(
             (drag.origin, drag.pointer, drag.target),
@@ -331,29 +380,31 @@ mod tests {
     #[test]
     fn hovering_sets_the_target_only_where_the_folder_takes_the_item() {
         let rows = rows();
+        let root = Path::new(r"C:\notes");
         let now = Instant::now();
-        let mut drag = Drag::armed(note("a.md"), 0, 0).unwrap();
-        assert!(drag.hover(&rows, (5, 5), Hover::Row(2), now));
+        let mut drag = Drag::armed(DragSource::Row(note("a.md")), 0, 0).unwrap();
+        assert!(drag.hover(&rows, root, (5, 5), Hover::Row(2), now));
         assert_eq!(drag.target, Some("work".into()));
         assert_eq!(drag.pointer, (5, 5));
         assert!(
-            !drag.hover(&rows, (5, 6), Hover::Row(0), now),
+            !drag.hover(&rows, root, (5, 6), Hover::Row(0), now),
             "same target, no repaint"
         );
         assert!(
-            drag.hover(&rows, (5, 7), Hover::Below, now),
+            drag.hover(&rows, root, (5, 7), Hover::Below, now),
             "the root is a.md's own folder"
         );
         assert_eq!(drag.target, None);
-        assert!(!drag.hover(&rows, (5, 8), Hover::Outside, now));
+        assert!(!drag.hover(&rows, root, (5, 8), Hover::Outside, now));
     }
 
     #[test]
     fn a_collapsed_target_folder_expands_after_resting_700_ms_on_it() {
         let rows = rows();
+        let root = Path::new(r"C:\notes");
         let start = Instant::now();
-        let mut drag = Drag::armed(note("a.md"), 0, 0).unwrap();
-        drag.hover(&rows, (0, 0), Hover::Row(1), start);
+        let mut drag = Drag::armed(DragSource::Row(note("a.md")), 0, 0).unwrap();
+        drag.hover(&rows, root, (0, 0), Hover::Row(1), start);
         assert_eq!(
             drag.resting.as_ref().map(|(path, _)| path.clone()),
             Some(r"work\inner".into())
@@ -361,6 +412,7 @@ mod tests {
         // Moving within the same row keeps the first time.
         drag.hover(
             &rows,
+            root,
             (1, 0),
             Hover::Row(1),
             start + Duration::from_millis(300),
@@ -369,11 +421,11 @@ mod tests {
         assert_eq!(at(699), None);
         assert_eq!(at(700), Some(r"work\inner".into()));
         // An expanded folder, a note row or a refused folder does not rest.
-        let mut drag = Drag::armed(note("a.md"), 0, 0).unwrap();
-        drag.hover(&rows, (0, 0), Hover::Row(0), start);
+        let mut drag = Drag::armed(DragSource::Row(note("a.md")), 0, 0).unwrap();
+        drag.hover(&rows, root, (0, 0), Hover::Row(0), start);
         assert_eq!(drag.resting, None, "work is expanded");
-        let mut drag = Drag::armed(folder("work"), 0, 0).unwrap();
-        drag.hover(&rows, (0, 0), Hover::Row(1), start);
+        let mut drag = Drag::armed(DragSource::Row(folder("work")), 0, 0).unwrap();
+        drag.hover(&rows, root, (0, 0), Hover::Row(1), start);
         assert_eq!(drag.resting, None, "work refuses to go inside itself");
     }
 
@@ -395,6 +447,28 @@ mod tests {
             highlight(&last, Path::new("z")),
             Some(Highlight::Rows { start: 0, end: 2 })
         );
+    }
+
+    #[test]
+    fn a_tab_drag_takes_any_folder_but_its_own_files_folder() {
+        // Break caught (Review Focus 1): a tab inside the notebook offered its own folder, so a
+        // "copy" would ask to replace the file with itself.
+        let root = Path::new(r"C:\notes");
+        let inside = DragSource::Tab {
+            id: DocumentId(1),
+            path: PathBuf::from(r"C:\notes\work\b.md"),
+        };
+        assert!(!source_accepts(&inside, root, Path::new("work")));
+        assert!(source_accepts(&inside, root, Path::new("")));
+        let outside = DragSource::Tab {
+            id: DocumentId(2),
+            path: PathBuf::from(r"D:\x\draft.txt"),
+        };
+        assert!(source_accepts(&outside, root, Path::new("work")));
+        assert!(copies(&outside) && !copies(&DragSource::Row(note("a.md"))));
+        let mut drag = Drag::armed(outside, 1, 2).unwrap();
+        assert!(drag.hover(&rows(), root, (5, 5), Hover::Row(0), Instant::now()));
+        assert_eq!(drag.target, Some(PathBuf::from("work")));
     }
 
     #[test]

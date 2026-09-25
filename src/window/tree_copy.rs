@@ -90,13 +90,6 @@ pub(crate) fn plan(
 
 /// Whether dropping `sources` into `folder` copies anything: the drag's target test, in memory.
 /// Normalized the same way `plan` is, so the same spellings agree with it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired to the copy host by a later open editors task"
-    )
-)]
 pub(crate) fn any_accepted(sources: &[PathBuf], root: &Path, folder: &Path) -> bool {
     let target = normalize_folder(&root.join(folder));
     sources.iter().any(|source| {

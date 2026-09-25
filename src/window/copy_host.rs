@@ -282,10 +282,6 @@ pub(crate) fn copy_into(
 
 /// An Open Editors row dropped on `folder`: its file on disk is copied. A dirty tab's saved
 /// version goes, and the notice says so.
-#[expect(
-    dead_code,
-    reason = "wired to the Open Editors drag by a later open editors task"
-)]
 pub(crate) fn copy_tab_into(hwnd: HWND, id: DocumentId, path: &Path, folder: &Path) {
     let dirty = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
