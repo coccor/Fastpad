@@ -6,8 +6,7 @@
 use super::main_window::{OpenMode, app_ptr};
 use super::side_panel::{UiFonts, ViewPaint, draw_text, point_of};
 use crate::config::FileIconSet;
-use crate::document::{Document, DocumentId};
-use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
+use crate::library::tree::{self, NoteTree, RowKind, TreeRow};
 use crate::window::commands::CommandId;
 use crate::window::drag_label::{DragLabel, LabelImage};
 use crate::window::file_icons::note_kind;
@@ -69,7 +68,6 @@ const LABEL_MAX_TEXT: i32 = 300;
 const GLYPH_CHEVRON_RIGHT: &str = "\u{E76C}";
 const GLYPH_CHEVRON_DOWN: &str = "\u{E70D}";
 const GLYPH_FOLDER: &str = "\u{E8B7}";
-const GLYPH_NOTE: &str = "\u{E8A5}";
 /// The tilted pin's outline (Segoe's Pinned), needle included.
 const GLYPH_PIN: &str = "\u{E840}";
 /// The tilted pin's head fill (PinFill), with no needle: drawn under `GLYPH_PIN`.
@@ -95,7 +93,7 @@ pub(crate) enum Mode {
     NoNotebook,
     /// A notebook is open but its state has not arrived from the worker.
     Loading,
-    /// Loaded, with no notes and no untitled tabs.
+    /// Loaded, with no notes.
     Empty,
     Tree,
     /// The notebook's load failed: a message, "Retry" and "Open notebook…".
@@ -316,28 +314,6 @@ pub(crate) fn follow(
     Some(old.unwrap_or(0).min(last))
 }
 
-/// An untitled tab's row name: its tab label, else its first line, else "Untitled".
-pub(crate) fn unsaved_label(document: &Document) -> String {
-    document
-        .untitled_label
-        .clone()
-        .or_else(|| document.first_line_label.clone())
-        .unwrap_or_else(|| "Untitled".to_owned())
-}
-
-/// One entry per untitled tab, keyed by its `DocumentId`, labelled like its tab (spec §6.2).
-pub(crate) fn unsaved_entries<'a>(
-    documents: impl Iterator<Item = &'a Document>,
-) -> Vec<UnsavedEntry> {
-    documents
-        .filter(|document| document.path.is_none())
-        .map(|document| UnsavedEntry {
-            key: document.id.0,
-            label: unsaved_label(document),
-        })
-        .collect()
-}
-
 /// How `flatten` keys an expanded folder: the same lowercasing as `model::same_path`.
 fn expanded_key(path: &Path) -> String {
     path.as_os_str().to_string_lossy().to_lowercase()
@@ -345,16 +321,9 @@ fn expanded_key(path: &Path) -> String {
 
 /// The visible rows of `tree` with `expanded` folders open. The expanded set is hashed once, so
 /// each folder row costs one lookup, not a scan of every expanded entry.
-pub(crate) fn flatten(
-    tree: &NoteTree,
-    expanded: &[PathBuf],
-    unsaved: &[UnsavedEntry],
-) -> Vec<TreeRow> {
+pub(crate) fn flatten(tree: &NoteTree, expanded: &[PathBuf]) -> Vec<TreeRow> {
     let open: HashSet<String> = expanded.iter().map(|path| expanded_key(path)).collect();
-    tree.rows(
-        &|path: &Path| !open.is_empty() && open.contains(&expanded_key(path)),
-        unsaved,
-    )
+    tree.rows(&|path: &Path| !open.is_empty() && open.contains(&expanded_key(path)))
 }
 
 /// Letters typed into the tree within a second of each other form one prefix.
@@ -389,7 +358,6 @@ struct RebuildKey {
     failed: bool,
     /// `library_host::expansion_revision`, bumped whenever a folder is expanded or collapsed.
     expansion: u64,
-    unsaved: Vec<UnsavedEntry>,
 }
 
 /// The Notebook view's state, owned by `side_panel::Sidebar`.
@@ -576,9 +544,6 @@ fn draw_tree_row(
                 .map(|extension| extension.to_string_lossy());
             draw_icon(TreeItem::Note(note_kind(extension.as_deref())));
         }
-        RowKind::Unsaved(_) => {
-            unsafe { draw_text(dc, GLYPH_NOTE, parts.icon, fonts.glyph, muted, CENTERED) };
-        }
         RowKind::Draft => {
             if let Some(item) = editing {
                 draw_icon(item);
@@ -602,11 +567,7 @@ fn draw_tree_row(
     if editing.is_some() {
         return;
     }
-    let font = if matches!(row.kind, RowKind::Unsaved(_)) {
-        fonts.italic
-    } else {
-        fonts.text
-    };
+    let font = fonts.text;
     let color = if dimmed {
         palette.muted_foreground
     } else {
@@ -662,7 +623,7 @@ fn drag_item(kind: &RowKind) -> Option<TreeItem> {
                 .map(|extension| extension.to_string_lossy());
             Some(TreeItem::Note(note_kind(extension.as_deref())))
         }
-        RowKind::Unsaved(_) | RowKind::Draft => None,
+        RowKind::Draft => None,
     }
 }
 
@@ -1308,11 +1269,7 @@ impl NotebookView {
                     return none;
                 };
                 let parts = row_parts(rect, row.depth, self.dpi());
-                let font = if matches!(row.kind, RowKind::Unsaved(_)) {
-                    fonts.italic
-                } else {
-                    fonts.text
-                };
+                let font = fonts.text;
                 if self.text_width(&row.name, font) > parts.name.right - parts.name.left {
                     (parts.name, row.name)
                 } else {
@@ -1694,20 +1651,11 @@ pub(crate) fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -
 
 /// What the rows would be built from now. Cheap: no flattening, no disk.
 fn rebuild_key(hwnd: HWND) -> RebuildKey {
-    let root = super::library_host::folder(hwnd);
-    let unsaved = if root.is_some() {
-        unsafe { app_ptr(hwnd) }
-            .map(|app| unsaved_entries(unsafe { app.as_ref() }.tabs.documents()))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     RebuildKey {
+        root: super::library_host::folder(hwnd),
         loaded: super::library_host::with_state(hwnd, |_| ()).is_some(),
         failed: super::library_host::load_failed(hwnd),
         expansion: super::library_host::expansion_revision(hwnd),
-        root,
-        unsaved,
     }
 }
 
@@ -1727,7 +1675,7 @@ fn snapshot(hwnd: HWND) -> Snapshot {
     };
     let favorite = super::library_host::is_favorite(hwnd);
     let built = super::library_host::with_state(hwnd, |state| {
-        let rows = flatten(&state.tree, &state.local.expanded, &key.unsaved);
+        let rows = flatten(&state.tree, &state.local.expanded);
         (rows, state.truncated)
     });
     let (mode, rows, truncated) = match built {
@@ -1790,23 +1738,18 @@ pub(crate) fn rebuild(hwnd: HWND) {
     super::inline_name::place(hwnd);
 }
 
-/// The row for the active tab: its note inside the open notebook, or its unsaved entry.
+/// The row for the active tab: its note inside the open notebook. `None` for an untitled tab.
 fn active_target(hwnd: HWND) -> Option<RowKind> {
     let root = super::library_host::folder(hwnd)?;
-    let (id, path) = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let active = unsafe { app.as_ref() }.tabs.active()?;
-        Some((active.id, active.path.clone()))
-    })?;
-    match path {
-        None => Some(RowKind::Unsaved(id.0)),
-        Some(path) => crate::library::is_inside(&root, &path)
-            .then(|| RowKind::Note(crate::library::record_path(&root, &path))),
-    }
+    let path = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())?;
+    crate::library::is_inside(&root, &path)
+        .then(|| RowKind::Note(crate::library::record_path(&root, &path)))
 }
 
 /// Whether something the rows are built from, besides the library itself, changed since the
-/// last rebuild: another notebook, its state arriving, a folder expanded or collapsed, or an
-/// untitled tab added, closed, relabelled or saved. Cheap: no flattening.
+/// last rebuild: another notebook, its state arriving, or a folder expanded or collapsed. Cheap:
+/// no flattening.
 pub(crate) fn stale(hwnd: HWND) -> bool {
     let key = rebuild_key(hwnd);
     with_view(hwnd, |view| view.built.as_ref() != Some(&key)).unwrap_or(false)
@@ -1814,8 +1757,8 @@ pub(crate) fn stale(hwnd: HWND) -> bool {
 
 /// Every tab switch: the active note's row is selected and its folders expand (remembered per
 /// PC), without moving the keyboard focus (spec §6.1). The tree is flattened again only when
-/// something the rows depend on changed (a folder newly expanded, an untitled tab added, closed
-/// or relabelled, another notebook); otherwise the row is just selected.
+/// something the rows depend on changed (a folder newly expanded, another notebook); otherwise
+/// the row is just selected.
 pub(crate) fn active_tab_changed(hwnd: HWND) {
     let target = active_target(hwnd);
     if let Some(RowKind::Note(relative)) = &target {
@@ -1836,30 +1779,6 @@ pub(crate) fn active_tab_changed(hwnd: HWND) {
         view.invalidate();
     });
     super::inline_name::place(hwnd);
-}
-
-/// An untitled tab's label changed (`library_host::refresh_label`): its row is renamed in place,
-/// with no rebuild. A row that is not there yet (its tab is new) comes with a rebuild.
-pub(crate) fn unsaved_label_changed(hwnd: HWND, id: DocumentId, label: &str) {
-    let renamed = with_view(hwnd, |view| {
-        if let Some(entry) = view
-            .built
-            .as_mut()
-            .and_then(|built| built.unsaved.iter_mut().find(|entry| entry.key == id.0))
-        {
-            entry.label = label.to_owned();
-        }
-        let Some(index) = tree::row_index(&view.rows, &RowKind::Unsaved(id.0)) else {
-            // Without a notebook, or while it loads, there are no rows to rename.
-            return !matches!(view.mode, Mode::Tree | Mode::Empty);
-        };
-        label.clone_into(&mut view.rows[index].name);
-        view.invalidate();
-        true
-    });
-    if renamed == Some(false) {
-        rebuild(hwnd);
-    }
 }
 
 /// The panel's `WM_PAINT` while the Notebook view shows (`side_panel::paint_view`). The panel
@@ -1918,7 +1837,7 @@ pub(crate) fn focused_folder(hwnd: HWND) -> Option<PathBuf> {
 }
 
 /// The folder a new note goes to (spec §6.7): a selected folder row's own folder, or a
-/// selected note's parent. `None` (the root) for an unsaved row or no selection.
+/// selected note's parent. `None` (the root) for a draft row or no selection.
 pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
     let root = super::library_host::folder(hwnd)?;
     let target = with_view(hwnd, |view| {
@@ -2079,14 +1998,6 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                     super::library_host::delete_folder(hwnd, relative);
                 }
                 _ => {}
-            }
-        }
-        RowKind::Unsaved(key) => {
-            let entries = [MenuEntry::command("Close tab", CommandId::CloseTab)];
-            if super::menus::track_popup(hwnd, &entries, point) == Some(CommandId::CloseTab)
-                && super::main_window::activate_document_by_id(hwnd, DocumentId(*key))
-            {
-                run(hwnd, CommandId::CloseTab);
             }
         }
         RowKind::Draft => {}
@@ -2728,8 +2639,8 @@ fn set_folder_expanded(hwnd: HWND, relative: &Path, expanded: bool) {
     rebuild(hwnd);
 }
 
-/// Opens or toggles row `index` (spec §6.4). A folder toggles, a note opens, an unsaved row
-/// switches to its tab, and a recent notebook opens.
+/// Opens or toggles row `index` (spec §6.4). A folder toggles, a note opens, and a recent
+/// notebook opens.
 pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
     let Some(target) = with_view(hwnd, |view| view.target(index)) else {
         return;
@@ -2751,13 +2662,6 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
                 };
                 if let Err(error) = super::main_window::open_note(hwnd, &path, mode, focus) {
                     super::main_window::report_open_failure(hwnd, &path, &error);
-                }
-            }
-            RowKind::Unsaved(key) => {
-                if super::main_window::activate_document_by_id(hwnd, DocumentId(key))
-                    && how != Activation::Enter
-                {
-                    super::main_window::focus_content(hwnd);
                 }
             }
             RowKind::Draft => {}
@@ -3195,23 +3099,6 @@ mod tests {
     }
 
     #[test]
-    fn unsaved_rows_come_from_untitled_tabs_labelled_by_their_first_line() {
-        // Break caught: saved tabs listed twice (as a note and as unsaved), or untitled tabs
-        // with a blank first line shown with no label at all.
-        let mut labelled = Document::test_fixture(DocumentId(4), true);
-        labelled.first_line_label = Some("Groceries".to_owned());
-        let blank = Document::test_fixture(DocumentId(5), false);
-        let mut saved = Document::test_fixture(DocumentId(6), false);
-        saved.path = Some(PathBuf::from(r"C:\n\a.md"));
-        let entries = unsaved_entries([&labelled, &blank, &saved].into_iter());
-        let entries: Vec<_> = entries.into_iter().map(|e| (e.key, e.label)).collect();
-        assert_eq!(
-            entries,
-            [(4, "Groceries".to_owned()), (5, "Untitled".to_owned())]
-        );
-    }
-
-    #[test]
     fn type_ahead_extends_the_prefix_within_a_second_and_starts_over_after() {
         // Break caught: a prefix that never resets, so a second search a minute later matches
         // nothing.
@@ -3238,11 +3125,11 @@ mod tests {
             .map(|folder| PathBuf::from(format!("folder {folder}")))
             .collect();
         let started = Instant::now();
-        let rows = flatten(&tree, &expanded, &[]);
+        let rows = flatten(&tree, &expanded);
         let elapsed = started.elapsed();
         assert_eq!(rows.len(), 11_000);
         assert!(rows[0].expanded);
-        assert_eq!(flatten(&tree, &[], &[]).len(), 1_000);
+        assert_eq!(flatten(&tree, &[]).len(), 1_000);
         if !cfg!(debug_assertions) {
             assert!(elapsed < Duration::from_millis(16), "{elapsed:?}");
         }

@@ -2002,7 +2002,7 @@ mod tests {
     }
 
     fn tree_rows(tree: &tree::NoteTree) -> Vec<tree::TreeRow> {
-        tree.rows(&|_| true, &[])
+        tree.rows(&|_| true)
     }
 
     /// What a fresh build of the state's notes, folders and pins shows.

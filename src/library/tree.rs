@@ -16,17 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
-/// An untitled tab, listed first at the root.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnsavedEntry {
-    /// Identifies the tab to the caller (its document ID).
-    pub key: u64,
-    pub label: String,
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RowKind {
-    Unsaved(u64),
     Folder(PathBuf),
     Note(PathBuf),
     /// The Notebook view's row for a note or folder being named in the tree (inline naming spec
@@ -40,7 +31,7 @@ pub struct TreeRow {
     pub kind: RowKind,
     /// 0 for the root's contents.
     pub depth: u16,
-    /// A folder's name, a note's file name with its extension, or an unsaved tab's label.
+    /// A folder's name, or a note's file name with its extension.
     pub name: String,
     pub pinned: bool,
     /// For a folder row: whether its contents follow it.
@@ -665,24 +656,16 @@ impl NoteTree {
         folder.place_note(note);
     }
 
-    /// The visible rows: `unsaved` first, then the root's contents, and inside each folder that
-    /// `expanded` says is open, its contents one level deeper.
-    pub fn rows(&self, expanded: &dyn Fn(&Path) -> bool, unsaved: &[UnsavedEntry]) -> Vec<TreeRow> {
+    /// The visible rows: the root's contents, then inside each folder that `expanded` says is
+    /// open, its contents one level deeper.
+    pub fn rows(&self, expanded: &dyn Fn(&Path) -> bool) -> Vec<TreeRow> {
         struct Frame<'a> {
             folder: &'a Folder,
             path: PathBuf,
             depth: u16,
             next: usize,
         }
-        let mut rows =
-            Vec::with_capacity(unsaved.len() + self.root.folders.len() + self.root.notes.len());
-        rows.extend(unsaved.iter().map(|entry| TreeRow {
-            kind: RowKind::Unsaved(entry.key),
-            depth: 0,
-            name: entry.label.clone(),
-            pinned: false,
-            expanded: false,
-        }));
+        let mut rows = Vec::with_capacity(self.root.folders.len() + self.root.notes.len());
         push_notes(&mut rows, &self.root, Path::new(""), 0, true);
         let mut stack = vec![Frame {
             folder: &self.root,
@@ -797,7 +780,6 @@ pub fn row_in_place_of(rows: &[TreeRow], index: usize) -> Option<&TreeRow> {
 
 pub fn row_index(rows: &[TreeRow], kind: &RowKind) -> Option<usize> {
     rows.iter().position(|row| match (&row.kind, kind) {
-        (RowKind::Unsaved(a), RowKind::Unsaved(b)) => a == b,
         (RowKind::Folder(a), RowKind::Folder(b)) | (RowKind::Note(a), RowKind::Note(b)) => {
             same_row_path(a, b)
         }
@@ -861,13 +843,12 @@ mod tests {
         build_with(notes, &[], pinned)
     }
 
-    /// Each row as `<indent><name><marker>`: `/` a folder, `*` a pinned note, `?` unsaved.
+    /// Each row as `<indent><name><marker>`: `/` a folder, `*` a pinned note.
     fn outline(rows: &[TreeRow]) -> Vec<String> {
         rows.iter()
             .map(|row| {
                 let marker = match (&row.kind, row.pinned) {
                     (RowKind::Folder(_), _) => "/",
-                    (RowKind::Unsaved(_), _) => "?",
                     (RowKind::Draft, _) => "+",
                     (RowKind::Note(_), true) => "*",
                     (RowKind::Note(_), false) => "",
@@ -917,7 +898,7 @@ mod tests {
             &["z.md", r"Alpha\pinned.md"],
         );
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             [
                 "z.md*",
                 "Alpha/",
@@ -941,7 +922,7 @@ mod tests {
     fn ties_are_broken_by_extension_then_by_exact_name() {
         let tree = build(&["a.txt", "A2.md", "a1.md", "a.md", "a01.md"], &[]);
         let paths: Vec<PathBuf> = tree
-            .rows(&all, &[])
+            .rows(&all)
             .into_iter()
             .map(|row| match row.kind {
                 RowKind::Note(path) => path,
@@ -962,8 +943,8 @@ mod tests {
         let mut reversed = notes;
         reversed.reverse();
         assert_eq!(
-            build(&notes, &["b.md"]).rows(&all, &[]),
-            build(&reversed, &["b.md"]).rows(&all, &[])
+            build(&notes, &["b.md"]).rows(&all),
+            build(&reversed, &["b.md"]).rows(&all)
         );
     }
 
@@ -971,31 +952,12 @@ mod tests {
     fn collapsed_folders_hide_their_rows_and_the_root_is_always_open() {
         let tree = build(&["top.md", r"a\one.md", r"a\b\two.md"], &[]);
         let only_a = |path: &Path| path == Path::new("a");
-        let rows = tree.rows(&only_a, &[]);
+        let rows = tree.rows(&only_a);
         assert_eq!(outline(&rows), ["a/", "  b/", "  one.md", "top.md"]);
         assert!(rows[0].expanded && !rows[1].expanded);
         assert_eq!(rows[1].kind, RowKind::Folder(PathBuf::from(r"a\b")));
         assert_eq!(rows[2].kind, RowKind::Note(PathBuf::from(r"a\one.md")));
-        assert_eq!(outline(&tree.rows(&|_| false, &[])), ["a/", "top.md"]);
-    }
-
-    #[test]
-    fn unsaved_entries_come_first_at_the_root() {
-        let tree = build(&["a.md"], &["a.md"]);
-        let unsaved = [
-            UnsavedEntry {
-                key: 7,
-                label: "Idea".into(),
-            },
-            UnsavedEntry {
-                key: 3,
-                label: "Untitled".into(),
-            },
-        ];
-        let rows = tree.rows(&all, &unsaved);
-        assert_eq!(outline(&rows), ["Idea?", "Untitled?", "a.md*"]);
-        assert_eq!(rows[1].kind, RowKind::Unsaved(3));
-        assert_eq!(rows[1].depth, 0);
+        assert_eq!(outline(&tree.rows(&|_| false)), ["a/", "top.md"]);
     }
 
     #[test]
@@ -1003,16 +965,13 @@ mod tests {
         // Break caught: `Sub\a.md` and `sub\b.md` showing as two folders, or a case-only rename
         // leaving the old row behind.
         let mut tree = build(&[r"Sub\a.md", r"sub\b.md"], &[]);
-        assert_eq!(outline(&tree.rows(&all, &[])), ["Sub/", "  a.md", "  b.md"]);
+        assert_eq!(outline(&tree.rows(&all)), ["Sub/", "  a.md", "  b.md"]);
         tree.insert_note(Path::new(r"SUB\A.MD"), true);
-        assert_eq!(
-            outline(&tree.rows(&all, &[])),
-            ["Sub/", "  A.MD*", "  b.md"]
-        );
+        assert_eq!(outline(&tree.rows(&all)), ["Sub/", "  A.MD*", "  b.md"]);
         assert_eq!(tree.note_count(), 2);
         tree.remove_note(Path::new(r"sub\b.MD"));
         tree.set_pinned(Path::new(r"sub\a.md"), false);
-        assert_eq!(outline(&tree.rows(&all, &[])), ["Sub/", "  A.MD"]);
+        assert_eq!(outline(&tree.rows(&all)), ["Sub/", "  A.MD"]);
         assert_eq!(tree.note_count(), 1);
     }
 
@@ -1084,8 +1043,8 @@ mod tests {
                 .map(|(path, _)| path.clone())
                 .collect();
             assert_eq!(
-                tree.rows(&all, &[]),
-                NoteTree::build(&notes, &folders, &pinned).rows(&all, &[]),
+                tree.rows(&all),
+                NoteTree::build(&notes, &folders, &pinned).rows(&all),
                 "step {step}"
             );
             assert_eq!(tree.note_count(), model.len(), "step {step}");
@@ -1099,12 +1058,12 @@ mod tests {
         let mut tree = build(&[r"a\b\c\n.md", r"a\keep.md", "top.md"], &[]);
         tree.remove_note(Path::new(r"a\b\c\n.md"));
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             ["a/", "  b/", "    c/", "  keep.md", "top.md"]
         );
         tree.remove_note(Path::new(r"a\keep.md"));
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             ["a/", "  b/", "    c/", "top.md"]
         );
         tree.remove_note(Path::new("missing.md"));
@@ -1121,7 +1080,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             [
                 "empty/", "notes/", "  inner/", "  a.md", "Sub/", "  x.md", "Zeta/", "b.md"
             ]
@@ -1136,7 +1095,7 @@ mod tests {
     fn a_folder_the_list_left_out_still_gets_a_row_from_its_notes() {
         // Break caught: a folder past the scan's folder cap hiding the notes inside it.
         let tree = build_with(&[r"c\n.md"], &["a", "b"], &[]);
-        assert_eq!(outline(&tree.rows(&all, &[])), ["a/", "b/", "c/", "  n.md"]);
+        assert_eq!(outline(&tree.rows(&all)), ["a/", "b/", "c/", "  n.md"]);
     }
 
     #[test]
@@ -1146,7 +1105,7 @@ mod tests {
         let mut tree = build(&["top.md"], &[]);
         tree.insert_folder(Path::new(r"x\y\z"));
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             ["x/", "  y/", "    z/", "top.md"]
         );
         tree.insert_folder(Path::new(r"X\Y"));
@@ -1154,7 +1113,7 @@ mod tests {
             tree.insert_folder(Path::new(bad));
         }
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             ["x/", "  y/", "    z/", "top.md"]
         );
         assert_eq!(tree.note_count(), 1);
@@ -1166,7 +1125,7 @@ mod tests {
         // when the folder was the last row.
         let tree = build_with(&[r"a\x\n.md", r"a\m.md", "top.md"], &["a", r"a\x"], &[]);
         let expanded = [PathBuf::from("a"), PathBuf::from(r"a\x")];
-        let rows = tree.rows(&|path| expanded.iter().any(|entry| entry == path), &[]);
+        let rows = tree.rows(&|path| expanded.iter().any(|entry| entry == path));
         let kind = |index| row_in_place_of(&rows, index).map(|row| row.kind.clone());
         let a = row_index(&rows, &RowKind::Folder("a".into())).unwrap();
         let x = row_index(&rows, &RowKind::Folder(r"a\x".into())).unwrap();
@@ -1201,13 +1160,13 @@ mod tests {
             &[r"a\b\two.md"],
         );
         tree.remove_folder(Path::new(r"A\B"));
-        assert_eq!(outline(&tree.rows(&all, &[])), ["a/", "  one.md", "top.md"]);
+        assert_eq!(outline(&tree.rows(&all)), ["a/", "  one.md", "top.md"]);
         assert_eq!(tree.note_count(), 2);
         tree.remove_folder(Path::new("missing"));
         tree.remove_folder(Path::new("top.md"));
         assert_eq!(tree.note_count(), 2);
         tree.remove_folder(Path::new("a"));
-        assert_eq!(outline(&tree.rows(&all, &[])), ["top.md"]);
+        assert_eq!(outline(&tree.rows(&all)), ["top.md"]);
         assert_eq!(tree.note_count(), 1);
     }
 
@@ -1222,7 +1181,7 @@ mod tests {
         );
         tree.rename_folder(Path::new("work"), Path::new("Archive"));
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             [
                 "Archive/",
                 "  plan.md*",
@@ -1234,12 +1193,12 @@ mod tests {
             ]
         );
         assert_eq!(tree.note_count(), 3);
-        let rows = tree.rows(&all, &[]);
+        let rows = tree.rows(&all);
         assert!(row_index(&rows, &RowKind::Note(PathBuf::from(r"Archive\sub\deep.md"))).is_some());
         assert!(!tree.contains_folder(Path::new("work")));
 
         tree.rename_folder(Path::new("archive"), Path::new("ARCHIVE"));
-        assert_eq!(tree.rows(&all, &[])[0].name, "ARCHIVE");
+        assert_eq!(tree.rows(&all)[0].name, "ARCHIVE");
         assert_eq!(tree.note_count(), 3);
 
         tree.rename_folder(Path::new("gone"), Path::new("Made"));
@@ -1250,10 +1209,7 @@ mod tests {
 
         let mut merged = build_with(&[r"a\x.md", r"b\y.md"], &[], &[r"a\x.md"]);
         merged.rename_folder(Path::new("a"), Path::new("b"));
-        assert_eq!(
-            outline(&merged.rows(&all, &[])),
-            ["b/", "  x.md*", "  y.md"]
-        );
+        assert_eq!(outline(&merged.rows(&all)), ["b/", "  x.md*", "  y.md"]);
         assert_eq!(merged.note_count(), 2);
     }
 
@@ -1261,10 +1217,10 @@ mod tests {
     fn pins_and_renames_move_rows_and_renames_keep_the_pin() {
         let mut tree = build(&["a.md", "b.md", "c.md"], &[]);
         tree.set_pinned(Path::new("c.md"), true);
-        assert_eq!(outline(&tree.rows(&all, &[])), ["c.md*", "a.md", "b.md"]);
+        assert_eq!(outline(&tree.rows(&all)), ["c.md*", "a.md", "b.md"]);
         tree.rename_note(Path::new("c.md"), Path::new(r"sub\c2.md"));
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             ["sub/", "  c2.md*", "a.md", "b.md"]
         );
         tree.rename_note(Path::new("gone.md"), Path::new("new.md"));
@@ -1280,7 +1236,7 @@ mod tests {
         // Break caught: Left on a nested note jumping to the wrong folder, or type-ahead stuck
         // on the current row instead of moving on.
         let tree = build(&[r"a\one.md", r"a\b\two.md", "top.md"], &[]);
-        let rows = tree.rows(&all, &[]);
+        let rows = tree.rows(&all);
         assert_eq!(
             outline(&rows),
             ["a/", "  b/", "    two.md", "  one.md", "top.md"]
@@ -1293,7 +1249,6 @@ mod tests {
             row_index(&rows, &RowKind::Folder(PathBuf::from(r"a\b"))),
             Some(1)
         );
-        assert_eq!(row_index(&rows, &RowKind::Unsaved(3)), None);
         assert_eq!(parent_index(&rows, 2), Some(1));
         assert_eq!(parent_index(&rows, 3), Some(0));
         assert_eq!(parent_index(&rows, 1), Some(0));
@@ -1324,7 +1279,7 @@ mod tests {
             expanded: false,
         }];
         assert_eq!(row_index(&rows, &RowKind::Draft), Some(0));
-        assert_eq!(row_index(&rows, &RowKind::Unsaved(0)), None);
+        assert_eq!(row_index(&rows, &RowKind::Note(PathBuf::new())), None);
     }
 
     #[test]
@@ -1337,7 +1292,7 @@ mod tests {
         let pinned = vec![PathBuf::from(r"big\Note 9999.md")];
         let started = std::time::Instant::now();
         let tree = NoteTree::build(&notes, &[], &pinned);
-        let rows = tree.rows(&all, &[]);
+        let rows = tree.rows(&all);
         let elapsed = started.elapsed();
         assert_eq!(tree.note_count(), 10_000);
         assert_eq!(rows.len(), 10_001);
@@ -1346,7 +1301,7 @@ mod tests {
             ["big/", "  Note 9999.md*", "  Note 0.md", "  Note 1.md"]
         );
         assert_eq!(rows[10_000].name, "Note 9998.md");
-        assert_eq!(tree.rows(&|_| false, &[]).len(), 1);
+        assert_eq!(tree.rows(&|_| false).len(), 1);
         if !cfg!(debug_assertions) {
             assert!(
                 elapsed < std::time::Duration::from_millis(100),
@@ -1363,18 +1318,14 @@ mod tests {
         let folder: PathBuf = (0..depth).map(|index| format!("d{index}")).collect();
         let note = folder.join("deep.md");
         let mut tree = NoteTree::build(std::slice::from_ref(&note), &[], &[]);
-        let rows = tree.rows(&all, &[]);
+        let rows = tree.rows(&all);
         assert_eq!(rows.len(), depth + 1);
         assert_eq!(usize::from(rows[depth].depth), depth);
         assert_eq!(rows[depth].kind, RowKind::Note(note.clone()));
         tree.remove_note(&note);
-        assert_eq!(
-            tree.rows(&all, &[]).len(),
-            depth,
-            "the emptied folders stay"
-        );
+        assert_eq!(tree.rows(&all).len(), depth, "the emptied folders stay");
         tree.remove_folder(Path::new("d0"));
-        assert!(tree.rows(&all, &[]).is_empty());
+        assert!(tree.rows(&all).is_empty());
         let deep = NoteTree::build(std::slice::from_ref(&note), &[], &[]);
         drop(deep);
     }
@@ -1386,7 +1337,7 @@ mod tests {
             &[],
         );
         tree.insert_note(Path::new(r"\rooted.md"), false);
-        assert_eq!(outline(&tree.rows(&all, &[])), ["ok.md"]);
+        assert_eq!(outline(&tree.rows(&all)), ["ok.md"]);
         assert_eq!(tree.note_count(), 1);
     }
 
@@ -1399,7 +1350,7 @@ mod tests {
             &["X.MD"],
         );
         assert_eq!(
-            outline(&tree.rows(&all, &[])),
+            outline(&tree.rows(&all)),
             ["x.md*", "Sub/", "  B.md", "*.md"]
         );
         assert_eq!(tree.note_count(), 3);
@@ -1432,7 +1383,7 @@ mod tests {
             &[],
             &[PathBuf::from(r"f\Later.md"), PathBuf::from(r"f\Note 17.md")],
         );
-        assert_eq!(tree.rows(&all, &[]), fresh.rows(&all, &[]));
+        assert_eq!(tree.rows(&all), fresh.rows(&all));
         assert_eq!(tree.note_count(), 11);
     }
 
@@ -1441,7 +1392,7 @@ mod tests {
         let long = PathBuf::from("f").join("n".repeat(70_000));
         let mut tree = NoteTree::build(std::slice::from_ref(&long), &[], &[]);
         tree.insert_note(&long, false);
-        assert!(tree.rows(&all, &[]).is_empty());
+        assert!(tree.rows(&all).is_empty());
         assert_eq!(tree.note_count(), 0);
     }
 }

@@ -55,10 +55,6 @@ pub(crate) struct EditorRow {
 }
 
 /// An untitled tab's name: its tab label, else its first line, else "Untitled".
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn unsaved_label(document: &Document) -> String {
     document
         .untitled_label

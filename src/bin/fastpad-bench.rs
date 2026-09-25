@@ -412,7 +412,7 @@ fn run_library_scan(
     let tree = fastpad::library::tree::NoteTree::build(&paths, &state.folders, &pinned);
     // Every folder expanded: the fixture's folders hold 500 notes each.
     let tree_rows_expanded_ms = median_ms(|| {
-        std::hint::black_box(tree.rows(&|_| true, &[]));
+        std::hint::black_box(tree.rows(&|_| true));
     });
     let quick_open_ms = median_ms(|| {
         std::hint::black_box(fastpad::library::quick_open::search(&paths, "nt 12", 50));

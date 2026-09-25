@@ -73,7 +73,7 @@ impl Drag {
     }
 }
 
-/// Notes and folders can be dragged; unsaved rows and the draft row cannot (spec §3.1).
+/// Notes and folders can be dragged; the draft row cannot (spec §3.1).
 pub(crate) fn draggable(kind: &RowKind) -> bool {
     matches!(kind, RowKind::Note(_) | RowKind::Folder(_))
 }
@@ -88,7 +88,7 @@ pub(crate) fn past_threshold(origin: (i32, i32), point: (i32, i32), cx: i32, cy:
 pub(crate) fn source_path(kind: &RowKind) -> Option<&Path> {
     match kind {
         RowKind::Note(path) | RowKind::Folder(path) => Some(path),
-        RowKind::Unsaved(_) | RowKind::Draft => None,
+        RowKind::Draft => None,
     }
 }
 
@@ -97,14 +97,14 @@ fn parent_of(path: &Path) -> PathBuf {
 }
 
 /// The folder a drop over `hover` goes into (spec §3.2): a folder row's folder, a note row's
-/// folder, the root for an unsaved row, the truncated row, the space below the rows and the
-/// header; `None` outside the panel and on the draft row.
+/// folder, the root for the truncated row, the space below the rows and the header; `None`
+/// outside the panel and on the draft row.
 pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
     match hover {
         Hover::Row(index) => match rows.get(index).map(|row| &row.kind) {
             Some(RowKind::Folder(path)) => Some(path.clone()),
             Some(RowKind::Note(path)) => Some(parent_of(path)),
-            Some(RowKind::Unsaved(_)) | None => Some(PathBuf::new()),
+            None => Some(PathBuf::new()),
             Some(RowKind::Draft) => None,
         },
         Hover::Below | Hover::Header => Some(PathBuf::new()),
@@ -229,10 +229,9 @@ mod tests {
         RowKind::Folder(path.into())
     }
 
-    /// untitled, work (expanded) { inner (collapsed), b.md }, a.md
+    /// work (expanded) { inner (collapsed), b.md }, a.md
     fn rows() -> Vec<TreeRow> {
         vec![
-            row(RowKind::Unsaved(7), 0, false),
             row(folder("work"), 0, true),
             row(folder(r"work\inner"), 1, false),
             row(note(r"work\b.md"), 1, false),
@@ -244,7 +243,6 @@ mod tests {
     fn only_notes_and_folders_arm_a_drag() {
         assert!(Drag::armed(note("a.md"), 1, 2).is_some());
         assert!(Drag::armed(folder("work"), 1, 2).is_some());
-        assert!(Drag::armed(RowKind::Unsaved(7), 1, 2).is_none());
         assert!(Drag::armed(RowKind::Draft, 1, 2).is_none());
         let drag = Drag::armed(note("a.md"), 1, 2).unwrap();
         assert!(!drag.started);
@@ -265,23 +263,18 @@ mod tests {
     fn each_place_under_the_pointer_names_its_drop_folder() {
         let rows = rows();
         let at = |hover| drop_folder(&rows, hover);
-        assert_eq!(at(Hover::Row(1)), Some("work".into()), "a folder row");
+        assert_eq!(at(Hover::Row(0)), Some("work".into()), "a folder row");
         assert_eq!(
-            at(Hover::Row(3)),
+            at(Hover::Row(2)),
             Some("work".into()),
             "a note row: its folder"
         );
         assert_eq!(
-            at(Hover::Row(4)),
+            at(Hover::Row(3)),
             Some(PathBuf::new()),
             "a top-level note: the root"
         );
-        assert_eq!(
-            at(Hover::Row(0)),
-            Some(PathBuf::new()),
-            "an unsaved row: the root"
-        );
-        assert_eq!(at(Hover::Row(5)), Some(PathBuf::new()), "the truncated row");
+        assert_eq!(at(Hover::Row(4)), Some(PathBuf::new()), "the truncated row");
         assert_eq!(at(Hover::Below), Some(PathBuf::new()));
         assert_eq!(at(Hover::Header), Some(PathBuf::new()));
         assert_eq!(at(Hover::Outside), None);
@@ -320,7 +313,6 @@ mod tests {
             accepts(&folder("work"), Path::new("workshop")),
             "a name prefix is not inside"
         );
-        assert!(!accepts(&RowKind::Unsaved(7), Path::new("work")));
     }
 
     #[test]
@@ -341,11 +333,11 @@ mod tests {
         let rows = rows();
         let now = Instant::now();
         let mut drag = Drag::armed(note("a.md"), 0, 0).unwrap();
-        assert!(drag.hover(&rows, (5, 5), Hover::Row(3), now));
+        assert!(drag.hover(&rows, (5, 5), Hover::Row(2), now));
         assert_eq!(drag.target, Some("work".into()));
         assert_eq!(drag.pointer, (5, 5));
         assert!(
-            !drag.hover(&rows, (5, 6), Hover::Row(1), now),
+            !drag.hover(&rows, (5, 6), Hover::Row(0), now),
             "same target, no repaint"
         );
         assert!(
@@ -361,7 +353,7 @@ mod tests {
         let rows = rows();
         let start = Instant::now();
         let mut drag = Drag::armed(note("a.md"), 0, 0).unwrap();
-        drag.hover(&rows, (0, 0), Hover::Row(2), start);
+        drag.hover(&rows, (0, 0), Hover::Row(1), start);
         assert_eq!(
             drag.resting.as_ref().map(|(path, _)| path.clone()),
             Some(r"work\inner".into())
@@ -370,7 +362,7 @@ mod tests {
         drag.hover(
             &rows,
             (1, 0),
-            Hover::Row(2),
+            Hover::Row(1),
             start + Duration::from_millis(300),
         );
         let at = |ms| expand_due(drag.resting.as_ref(), start + Duration::from_millis(ms));
@@ -378,10 +370,10 @@ mod tests {
         assert_eq!(at(700), Some(r"work\inner".into()));
         // An expanded folder, a note row or a refused folder does not rest.
         let mut drag = Drag::armed(note("a.md"), 0, 0).unwrap();
-        drag.hover(&rows, (0, 0), Hover::Row(1), start);
+        drag.hover(&rows, (0, 0), Hover::Row(0), start);
         assert_eq!(drag.resting, None, "work is expanded");
         let mut drag = Drag::armed(folder("work"), 0, 0).unwrap();
-        drag.hover(&rows, (0, 0), Hover::Row(2), start);
+        drag.hover(&rows, (0, 0), Hover::Row(1), start);
         assert_eq!(drag.resting, None, "work refuses to go inside itself");
     }
 
@@ -391,11 +383,11 @@ mod tests {
         assert_eq!(highlight(&rows, Path::new("")), Some(Highlight::Root));
         assert_eq!(
             highlight(&rows, Path::new("work")),
-            Some(Highlight::Rows { start: 1, end: 4 })
+            Some(Highlight::Rows { start: 0, end: 3 })
         );
         assert_eq!(
             highlight(&rows, Path::new(r"work\inner")),
-            Some(Highlight::Rows { start: 2, end: 3 })
+            Some(Highlight::Rows { start: 1, end: 2 })
         );
         assert_eq!(highlight(&rows, Path::new("gone")), None);
         let last = vec![row(folder("z"), 0, true), row(note(r"z\n.md"), 1, false)];

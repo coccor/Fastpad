@@ -217,16 +217,11 @@ pub(crate) fn sibling_names(
 }
 
 /// Puts the draft row in `rows` as the first child of the folder at row `parent`, one level
-/// deeper, or at the root below the unsaved rows (spec §3.1). `None`, changing nothing, when
-/// that folder is collapsed or gone. Returns the draft row's index.
+/// deeper, or first at the root (spec §3.1). `None`, changing nothing, when that folder is
+/// collapsed or gone. Returns the draft row's index.
 pub(crate) fn insert_draft(rows: &mut Vec<TreeRow>, parent: Option<usize>) -> Option<usize> {
     let (at, depth) = match parent {
-        None => (
-            rows.iter()
-                .take_while(|row| matches!(row.kind, RowKind::Unsaved(_)))
-                .count(),
-            0,
-        ),
+        None => (0, 0),
         Some(index) => {
             let folder = rows.get(index)?;
             if !folder.expanded {
@@ -753,7 +748,7 @@ pub(crate) fn rename(hwnd: HWND, row: &RowKind) {
     let purpose = match row {
         RowKind::Note(relative) => Purpose::RenameNote(relative.clone()),
         RowKind::Folder(relative) => Purpose::RenameFolder(relative.clone()),
-        RowKind::Unsaved(_) | RowKind::Draft => return,
+        RowKind::Draft => return,
     };
     start(hwnd, purpose);
 }
@@ -1458,10 +1453,9 @@ mod tests {
 
     #[test]
     fn siblings_are_the_rows_directly_in_the_folder_without_the_own_row() {
-        // Break caught: a name in a subfolder, an unsaved tab's label or the renamed row itself
-        // counted as taken, or a sibling below a nested folder missed.
+        // Break caught: a name in a subfolder or the renamed row itself counted as taken, or a
+        // sibling below a nested folder missed.
         let rows = vec![
-            row(RowKind::Unsaved(1), "Untitled", 0, false),
             row(RowKind::Folder("sub".into()), "sub", 0, true),
             row(RowKind::Note(r"sub\A.md".into()), "A.md", 1, false),
             row(RowKind::Folder(r"sub\deep".into()), "deep", 1, true),
@@ -1469,38 +1463,37 @@ mod tests {
             row(RowKind::Note(r"sub\b.md".into()), "b.md", 1, false),
             row(RowKind::Note("top.md".into()), "top.md", 0, false),
         ];
-        assert_eq!(parent_row(&rows, Path::new("sub")), Some(Some(1)));
+        assert_eq!(parent_row(&rows, Path::new("sub")), Some(Some(0)));
         assert_eq!(parent_row(&rows, Path::new("")), Some(None));
         assert_eq!(parent_row(&rows, Path::new("gone")), None);
         assert_eq!(
-            sibling_names(&rows, Some(1), None),
+            sibling_names(&rows, Some(0), None),
             names(&["a.md", "deep", "b.md"])
         );
         assert_eq!(
-            sibling_names(&rows, Some(1), Some(2)),
+            sibling_names(&rows, Some(0), Some(1)),
             names(&["deep", "b.md"])
         );
         assert_eq!(sibling_names(&rows, None, None), names(&["sub", "top.md"]));
     }
 
     #[test]
-    fn the_draft_row_is_the_first_child_of_an_expanded_folder_or_below_the_unsaved_rows() {
-        // Break caught: a draft row at the end of its folder, at the wrong depth, above the
-        // unsaved rows, or inside a collapsed folder (spec §3.1).
+    fn the_draft_row_is_the_first_child_of_an_expanded_folder_or_first_at_the_root() {
+        // Break caught: a draft row at the end of its folder, at the wrong depth, or inside a
+        // collapsed folder (spec §3.1).
         let mut rows = vec![
-            row(RowKind::Unsaved(1), "Untitled", 0, false),
             row(RowKind::Folder("sub".into()), "sub", 0, true),
             row(RowKind::Note(r"sub\a.md".into()), "a.md", 1, false),
             row(RowKind::Folder("shut".into()), "shut", 0, false),
         ];
-        assert_eq!(insert_draft(&mut rows, Some(1)), Some(2));
-        assert_eq!((rows[2].kind.clone(), rows[2].depth), (RowKind::Draft, 1));
-        rows.remove(2);
-        assert_eq!(insert_draft(&mut rows, None), Some(1));
-        assert_eq!((rows[1].kind.clone(), rows[1].depth), (RowKind::Draft, 0));
+        assert_eq!(insert_draft(&mut rows, Some(0)), Some(1));
+        assert_eq!((rows[1].kind.clone(), rows[1].depth), (RowKind::Draft, 1));
         rows.remove(1);
-        assert_eq!(insert_draft(&mut rows, Some(3)), None, "collapsed");
-        assert_eq!(rows.len(), 4);
+        assert_eq!(insert_draft(&mut rows, None), Some(0));
+        assert_eq!((rows[0].kind.clone(), rows[0].depth), (RowKind::Draft, 0));
+        rows.remove(0);
+        assert_eq!(insert_draft(&mut rows, Some(2)), None, "collapsed");
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]

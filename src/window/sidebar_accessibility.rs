@@ -261,8 +261,8 @@ pub(crate) fn list_item(
     }
 }
 
-/// A Notebook-view row. The name carries a note's type, then ", pinned" or ", unsaved", so none
-/// is conveyed by the icon alone.
+/// A Notebook-view row. The name carries a note's type, then ", pinned", so none is conveyed by
+/// the icon alone.
 pub(crate) fn tree_item(
     row: &TreeRow,
     selected: bool,
@@ -281,9 +281,6 @@ pub(crate) fn tree_item(
     }
     if row.pinned {
         name.push_str(", pinned");
-    }
-    if matches!(row.kind, RowKind::Unsaved(_)) {
-        name.push_str(", unsaved");
     }
     let mut state = row_state(selected, focused, visible);
     if matches!(row.kind, RowKind::Folder(_)) {
@@ -1198,9 +1195,9 @@ mod tests {
     }
 
     #[test]
-    fn tree_rows_are_outline_items_with_expansion_pin_and_unsaved_in_their_names() {
-        // Break caught: a folder's expanded state missing, a pin conveyed only by the filled
-        // icon, or an unsaved tab's row indistinguishable from a saved note.
+    fn tree_rows_are_outline_items_with_expansion_and_pin_in_their_names() {
+        // Break caught: a folder's expanded state missing, or a pin conveyed only by the filled
+        // icon.
         let folder = tree_item(
             &row(
                 RowKind::Folder(PathBuf::from("Work")),
@@ -1250,19 +1247,6 @@ mod tests {
         assert_ne!(pinned.state & STATE_FOCUSED, 0);
         assert_ne!(pinned.state & STATE_OFFSCREEN, 0);
 
-        let unsaved = tree_item(
-            &row(RowKind::Unsaved(7), "Groceries", 0, false, false),
-            false,
-            true,
-            ROW,
-            true,
-        );
-        assert_eq!(unsaved.name, "Groceries, unsaved");
-        assert_eq!(
-            unsaved.state & STATE_FOCUSED,
-            0,
-            "focus follows selection only"
-        );
         // Break caught: a note's type conveyed by its coloured icon alone (spec §5.4).
         let csv = tree_item(
             &row(

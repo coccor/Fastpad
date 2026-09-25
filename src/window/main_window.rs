@@ -12283,27 +12283,17 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_notebook_says_so_until_an_untitled_tab_appears_as_an_unsaved_row() {
-        // Break caught: a blank panel for a notebook with no notes, or a new untitled tab that the
-        // tree does not show until it is saved.
+    fn an_empty_notebook_stays_empty_with_untitled_tabs_open() {
+        // Break caught: untitled tabs still listed in the tree as well as in Open Editors, or an
+        // empty notebook's state hidden by them (open editors spec §3.4).
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("view-empty");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
-        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
-
+        let scratch = LibraryScratch::new("empty-untitled");
+        let (window, _editor) = notebook_window(&scratch);
         execute_command(window.hwnd, CommandId::New);
         crate::window::notebook_view::rebuild(window.hwnd);
-        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
         let view = notebook_view(window.hwnd);
-        assert_eq!(view.mode, Mode::Tree);
-        assert_eq!(view.rows[0].kind, RowKind::Unsaved(id.0));
-        assert_eq!(view.rows[0].name, "Untitled");
+        assert_eq!(view.mode, crate::window::notebook_view::Mode::Empty);
+        assert!(view.rows.is_empty());
     }
 
     #[test]
@@ -12347,15 +12337,15 @@ mod tests {
     }
 
     #[test]
-    fn switching_tabs_in_an_unchanged_notebook_and_typing_a_first_line_do_not_reflatten() {
-        // Break caught: every tab switch, and every keystroke in an untitled tab's first line,
-        // flattening the whole tree again (tens of milliseconds in a big, expanded notebook).
+    fn switching_tabs_in_an_unchanged_notebook_does_not_reflatten() {
+        // Break caught: every tab switch flattening the whole tree again (tens of milliseconds
+        // in a big, expanded notebook).
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("view-no-reflatten");
         let a = scratch.note("a.md", "a");
         let b = scratch.note("b.md", "b");
         let window = ProductionWindow::new(make_app());
-        let editor = install_test_editor(&window);
+        let _editor = install_test_editor(&window);
         ensure_sidebar(window.hwnd);
         scratch.install(window.hwnd);
         super::open_path(window.hwnd, &a).unwrap();
@@ -12378,24 +12368,6 @@ mod tests {
             Some(RowKind::Note("b.md".into()))
         );
         assert_eq!(notebook_view(window.hwnd).rebuilds, before, "no re-flatten");
-
-        // A new untitled tab adds a row, so that switch does rebuild; typing its first line
-        // then only renames the row.
-        execute_command(window.hwnd, CommandId::New);
-        let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
-        let after_new = notebook_view(window.hwnd).rebuilds;
-        assert_eq!(after_new, before + 1, "Ctrl+N flattens the tree once");
-        editor.set_text("Groceries").unwrap();
-        pump_posted_messages(window.hwnd);
-        let row = row_of(window.hwnd, &RowKind::Unsaved(untitled.0));
-        assert_eq!(notebook_view(window.hwnd).rows[row].name, "Groceries");
-        assert_eq!(notebook_view(window.hwnd).rebuilds, after_new);
-        assert!(super::activate_document_by_id(window.hwnd, a_id));
-        assert_eq!(
-            notebook_view(window.hwnd).rebuilds,
-            after_new,
-            "the renamed row's label is part of the key, so switching away does not rebuild"
-        );
     }
 
     #[test]
@@ -12629,8 +12601,8 @@ mod tests {
 
     #[test]
     fn the_context_menu_acts_on_its_row_not_the_active_tab() {
-        // Break caught: Pin from a row's menu pinning the active tab's note instead, "New note
-        // here" ignoring the folder, or Close tab on an unsaved row closing another tab.
+        // Break caught: Pin from a row's menu pinning the active tab's note instead, or "New
+        // note here" ignoring the folder.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("context-menu");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
@@ -12659,13 +12631,6 @@ mod tests {
             Some(crate::window::inline_name::Purpose::NewNote("sub".into()))
         );
         crate::window::inline_name::cancel(window.hwnd);
-        execute_command(window.hwnd, CommandId::New);
-        let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
-
-        let before = super::tab_count(window.hwnd);
-        menu(&RowKind::Unsaved(untitled.0), CommandId::CloseTab);
-        assert_eq!(super::tab_count(window.hwnd), before - 1);
-        assert!(app_mut(window.hwnd).tabs.document(untitled).is_none());
 
         menu(
             &RowKind::Folder("sub".into()),
@@ -16394,11 +16359,9 @@ mod tests {
             .iter()
             .filter(|item| {
                 item.role == windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM
-                    && !item.name.ends_with(", unsaved")
             })
             .collect::<Vec<_>>();
-        // The window's untitled tab is an unsaved row, left out above. "sub" is collapsed, so b
-        // is not a row: pinned a first, then the folder.
+        // "sub" is collapsed, so b is not a row: pinned a first, then the folder.
         assert_eq!(rows.len(), 2, "{items:?}");
         assert_eq!(rows[0].name, "a.md, Markdown, pinned");
         assert_eq!(rows[1].name, "sub");
@@ -17779,9 +17742,7 @@ mod tests {
             crate::window::inline_name::purpose(window.hwnd),
             Some(Purpose::NewNote(std::path::PathBuf::new()))
         );
-        // The test editor's own untitled tab is an unsaved row at index 0; the root draft goes
-        // below it (spec §3.1).
-        assert_eq!(draft_row(window.hwnd), Some((1, 0)));
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)));
         assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
         assert_eq!(super::tab_count(window.hwnd), tabs, "no untitled tab");
         field_key(window.hwnd, VK_ESCAPE);
@@ -17958,10 +17919,6 @@ mod tests {
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("inline-new-note-empty");
         let (window, _editor) = notebook_window(&scratch);
-        // The test editor's own untitled tab would otherwise show as an unsaved row.
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
         assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
 
         crate::window::notebook_view::header_clicked(
@@ -17983,10 +17940,6 @@ mod tests {
         let scratch = LibraryScratch::new("inline-draft-empty-gone");
         std::fs::create_dir(scratch.folder().join("Fresh")).unwrap();
         let (window, _editor) = notebook_window(&scratch);
-        // The test editor's own untitled tab would otherwise show as an unsaved row.
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
         crate::window::inline_name::new_note(window.hwnd, Some("Fresh".into()));
         assert!(inline_open(window.hwnd));
         assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
@@ -18011,10 +17964,6 @@ mod tests {
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("inline-empty-state-button");
         let (window, _editor) = notebook_window(&scratch);
-        // The test editor's own untitled tab would otherwise show as an unsaved row.
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
         assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
         let tabs = super::tab_count(window.hwnd);
 

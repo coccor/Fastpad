@@ -1195,12 +1195,10 @@ pub(crate) fn refresh_label(hwnd: HWND) {
             return None;
         }
         document.untitled_label = document.first_line_label.clone();
-        Some((id, crate::window::notebook_view::unsaved_label(document)))
+        Some((id, crate::window::open_editors::unsaved_label(document)))
     });
-    if let Some((id, label)) = changed {
+    if changed.is_some() {
         super::main_window::refresh_tab_view(hwnd);
-        // Typing in the first line renames the unsaved row in place, without a rebuild.
-        crate::window::notebook_view::unsaved_label_changed(hwnd, id, &label);
     }
 }
 

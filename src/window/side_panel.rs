@@ -65,7 +65,7 @@ pub(crate) struct UiFonts {
     pub(crate) text_bold: HFONT,
     /// Header titles in small capitals: Segoe UI semibold, 11 px.
     pub(crate) bold: HFONT,
-    /// Unsaved rows and notices inside the list: Segoe UI italic, 12 px.
+    /// Notices inside the list: Segoe UI italic, 12 px.
     pub(crate) italic: HFONT,
     /// Row and header-button icons: Segoe MDL2 Assets, 12 px.
     pub(crate) glyph: HFONT,
