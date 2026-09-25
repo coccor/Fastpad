@@ -2872,8 +2872,13 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
 /// Editors, or with no notebook, it opens (COPY, no highlight); over the tree, the root row or
 /// the body, it copies into the folder under it when that folder takes one of `paths` (the
 /// band shows); elsewhere nothing. The drag is kept as a started `DragSource::Files` drag with
-/// no capture and no label, so the tree drag's band, auto-expand and auto-scroll apply.
+/// no capture and no label, so the tree drag's band, auto-expand and auto-scroll apply. While a
+/// modal dialog runs nothing takes it: its posted drop could not run until the dialog closed.
 pub(crate) fn external_over(hwnd: HWND, x: i32, y: i32, paths: &[PathBuf]) -> bool {
+    if super::modal::modal_active(hwnd) {
+        external_leave(hwnd);
+        return false;
+    }
     let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
     if opens {
         external_leave(hwnd);
@@ -2920,8 +2925,13 @@ pub(crate) fn external_leave(hwnd: HWND) {
 }
 
 /// An Explorer drop at panel point `x`, `y`: posts what to do and returns at once, so Explorer
-/// never waits on a prompt (spec §6). False when nothing here takes it.
+/// never waits on a prompt (spec §6). False when nothing here takes it, as while a modal dialog
+/// runs.
 pub(crate) fn external_drop(hwnd: HWND, x: i32, y: i32, paths: Vec<PathBuf>) -> bool {
+    if super::modal::modal_active(hwnd) {
+        external_leave(hwnd);
+        return false;
+    }
     let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
     let folder = if opens {
         None

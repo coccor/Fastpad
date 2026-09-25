@@ -324,7 +324,8 @@ pub(crate) fn post_panel_drop(hwnd: HWND, paths: Vec<PathBuf>, folder: Option<Pa
 }
 
 /// `WM_FASTPAD_PANEL_DROPPED`: opens or copies. Ignored while a modal dialog runs, as
-/// `WM_DROPFILES` is for a disabled window.
+/// `WM_DROPFILES` is for a disabled window. The panel refuses a drop while one runs
+/// (`notebook_view::external_drop`), so only a drop posted just before a dialog opened ends here.
 pub(crate) fn panel_dropped(hwnd: HWND, lparam: LPARAM) {
     if lparam == 0 {
         return;

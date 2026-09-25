@@ -21077,4 +21077,39 @@ mod tests {
             "a copy that worked still says so"
         );
     }
+
+    #[test]
+    fn panel_drop_while_a_modal_runs_is_refused_rather_than_lost() {
+        // Break caught: an Explorer drop answered COPY during a modal dialog, then dropped
+        // silently when its posted message arrived (open editors spec §4.3).
+        use windows_sys::Win32::System::Ole::DROPEFFECT_NONE;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("panel-drop-modal");
+        scratch.note("a.md", "a");
+        let outside = scratch.root.join("x.md");
+        std::fs::write(&outside, "x").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let header = notebook_view(window.hwnd).editors_header_rect();
+        let modal = crate::window::modal::ModalScope::enter(window.hwnd);
+        let effects = explorer_drop(
+            panel,
+            root.left + 40,
+            (root.top + root.bottom) / 2,
+            &[&outside],
+        );
+        assert_eq!(effects, [DROPEFFECT_NONE; 3]);
+        assert_eq!(
+            explorer_drop(panel, header.left + 40, header.top + 5, &[&outside]),
+            [DROPEFFECT_NONE; 3],
+            "nor does Open Editors open it"
+        );
+        assert!(notebook_view(window.hwnd).drag.is_none(), "no band left");
+        drop(modal);
+        pump_posted_messages(window.hwnd);
+        assert!(!scratch.folder().join("x.md").exists());
+        assert!(!tab_paths(window.hwnd).contains(&Some(outside.clone())));
+    }
 }
