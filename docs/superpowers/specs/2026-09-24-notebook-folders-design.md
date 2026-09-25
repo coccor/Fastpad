@@ -143,6 +143,8 @@
 - The pinned glyph and the unsaved row keep their current look.
 - **Unsaved tabs** in the tree keep the muted document glyph.
 
+The icon sets spec (`2026-09-25-icon-sets-design.md`) keeps these as the Minimal set; Material Icon Theme is the default.
+
 ### 5.2 Colours
 
 - **Source:**
@@ -152,6 +154,8 @@
 - **Where they live:** a new `FileIcons` palette of the six colours, built next to `Palette` in `src/window/palette.rs` as compiled static data per theme.
 - **High contrast** uses `muted_foreground` for every icon.
 - **Selected rows:** a selected or hovered row keeps the icon's colour. That colour is a mid-tone, readable on the selection background.
+
+The icon sets spec (`2026-09-25-icon-sets-design.md`) keeps these as the Minimal set; Material Icon Theme is the default.
 
 ### 5.3 Code
 

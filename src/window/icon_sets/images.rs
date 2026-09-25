@@ -233,4 +233,72 @@ mod tests {
             "the second draw reuses the cached bitmap"
         );
     }
+
+    #[test]
+    #[ignore = "timing; run at the final review: cargo test --lib material_icons_paint -- --ignored"]
+    fn material_icons_paint_no_slower_than_minimal_glyphs() {
+        // Break caught: a per-draw DC or bitmap creation that makes the tree's paint slower than
+        // the glyphs it replaces (icon sets spec §7).
+        use crate::window::file_icons::file_icon;
+        use crate::window::side_panel::draw_text;
+        use crate::window::titlebar::create_ui_font;
+        use windows_sys::Win32::Graphics::Gdi::{
+            DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
+        };
+
+        const BANDS: i32 = 1_000;
+        const RUNS: usize = 20;
+
+        let band = |i: i32| RECT {
+            left: 0,
+            top: i * 24,
+            right: 24,
+            bottom: (i + 1) * 24,
+        };
+        let target = TestTarget::new(24, BANDS * 24);
+
+        let mut images = IconImages::new();
+        // Warms the memory DC and all 12 cached bitmaps, so the measured runs pay only the blend.
+        for i in 0..BANDS {
+            images.draw(target.dc, MaterialIcon::ALL[(i % 12) as usize], band(i), 16);
+        }
+        let mut material_us: Vec<u64> = (0..RUNS)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for i in 0..BANDS {
+                    images.draw(target.dc, MaterialIcon::ALL[(i % 12) as usize], band(i), 16);
+                }
+                started.elapsed().as_micros() as u64
+            })
+            .collect();
+        material_us.sort_unstable();
+        let material_median = material_us[RUNS / 2];
+
+        let font = create_ui_font(12, "Segoe MDL2 Assets", FW_NORMAL as i32, false);
+        let text = file_icon(Some("md")).text;
+        let flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
+        for i in 0..BANDS {
+            unsafe { draw_text(target.dc, text, band(i), font, 0x00FF_8800, flags) };
+        }
+        let mut minimal_us: Vec<u64> = (0..RUNS)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for i in 0..BANDS {
+                    unsafe { draw_text(target.dc, text, band(i), font, 0x00FF_8800, flags) };
+                }
+                started.elapsed().as_micros() as u64
+            })
+            .collect();
+        minimal_us.sort_unstable();
+        let minimal_median = minimal_us[RUNS / 2];
+
+        println!(
+            "material paint median {material_median} us over {BANDS} draws, \
+             minimal paint median {minimal_median} us over {BANDS} draws"
+        );
+        assert!(
+            (material_median as f64) <= (minimal_median as f64) * 1.10,
+            "material {material_median} us > minimal {minimal_median} us * 1.10"
+        );
+    }
 }

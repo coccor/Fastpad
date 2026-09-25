@@ -120,7 +120,7 @@
   - `TreeIcon` is either `Glyph(FileIcon)` (today's type) or `Image(MaterialIcon)`.
   - `MaterialIcon` lists the 12 icons, each with its SVG file name. The list is written by hand, and the generator reads it.
 - **`file_icons::type_name`** (screen readers) doesn't change and doesn't depend on the set.
-- **`file_icons::file_icon` and `FOLDER_ICON`** stay: they are the Minimal set, and they're also the fallback.
+- **`file_icons::minimal_icon`** (by `NoteKind`) **and `FOLDER_ICON`** stay: they are the Minimal set, and they're also the fallback.
 
 ## 6. Drawing
 
@@ -141,7 +141,7 @@
   - Selected and hover backgrounds show through the transparent parts.
 - **If creating a DIB fails:**
   - That row draws the Minimal glyph for the same type.
-  - The failure is logged once per session.
+  - Nothing is logged: FastPad has no log.
   - The next paint tries again. Nothing is shown to the user.
 
 ## 7. Latency
@@ -200,3 +200,23 @@
 - icons for files that aren't notes;
 - icons in tabs, Ctrl+P or Favorites;
 - replacing the Segoe chevrons, pin or header buttons.
+
+## 11. Decisions made while implementing
+
+- **No log facility exists.** A failed DIB falls back to the Minimal glyph silently; there is no
+  once-per-session log line (§6).
+- **`MaterialIcon::ALL` and `file_name`, and `file_icons::file_icon`, are test-only** (`#[cfg(test)]`).
+  Production code looks up icons through `tree_icon` and `file_icons::minimal_icon`, never by
+  walking every icon or every extension.
+- **Resampled sizes and the bitmap cache are built as this spec describes:** `pick_size` picks the
+  exact stored size, else the next one up, else 48; `resample` area-averages premultiplied BGRA.
+  The cache is a `HashMap<(MaterialIcon, u32), HBITMAP>` with no eviction code — since there are
+  only 12 icons, it can never hold more than 12 bitmaps per pixel size, so the "no eviction needed"
+  design falls out of the map itself.
+- **Blending goes through `GdiAlphaBlend`, gdi32's export of `AlphaBlend`,** so no static import of
+  msimg32.dll is added.
+- **The generator (`window::icon_sets::generate`) is an ignored test,** not a `src/bin/` tool, run
+  by `tools/generate-file-icons.ps1`. It renders through `preview::svg::decode_svg`, which is
+  Direct2D's SVG renderer wrapped behind a WIC imaging factory.
+- **`.gitattributes`** marks the SVGs and `icons.source-hash` `-text` (no line-ending rewriting) and
+  `*.bin` binary, so the committed sources and blob stay byte-exact.
