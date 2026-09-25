@@ -114,7 +114,7 @@
 ### 5.2 In the exe
 
 - `icons.bin` is embedded with `include_bytes!`, so reading it involves no file access.
-- **`src/window/icon_sets.rs`:**
+- **`src/window/icon_sets/`** (a module directory: `mod.rs`, `material.rs`, `resample.rs`, `images.rs`, `generate.rs`):
   - `IconSet { Material, Minimal }`;
   - the lookup: `(set, note type or folder state, light theme) → TreeIcon`;
   - `TreeIcon` is either `Glyph(FileIcon)` (today's type) or `Image(MaterialIcon)`.

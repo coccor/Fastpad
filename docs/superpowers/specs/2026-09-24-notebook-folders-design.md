@@ -159,7 +159,7 @@ The icon sets spec (`2026-09-25-icon-sets-design.md`) keeps these as the Minimal
 
 ### 5.3 Code
 
-- A pure `file_icon(extension: Option<&str>) -> FileIcon { text: &'static str, font: IconFont, color: IconColor }` in a new `src/window/file_icons.rs`, with unit tests for every row of the table and for mixed-case extensions.
+- A pure `minimal_icon(kind: NoteKind) -> FileIcon { text: &'static str, font: IconFont, color: IconColor }` in a new `src/window/file_icons.rs`, with unit tests for every row of the table and for mixed-case extensions. (The icon sets spec, `2026-09-25-icon-sets-design.md`, later adds the Material set alongside it; `minimal_icon` is the Minimal set's production API, and `draw_tree_row` falls back to it whenever Material can't draw.)
 - `draw_tree_row` uses it for note rows and folder rows.
 - The note's extension comes from its path. The tree's rows keep the extension-stripped name for display, and `RowKind::Note(path)` still has the full path.
 
