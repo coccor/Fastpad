@@ -16,7 +16,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 static LIBRARY_TEST_LOCK: Mutex<()> = Mutex::new(());
-const WAIT: Duration = Duration::from_secs(5);
+/// How long a step may take before the test fails: generous, because a hosted CI runner can
+/// stall a launch, a folder load or a one-second autosave for several seconds, and a longer wait
+/// costs nothing when the step is quick.
+const WAIT: Duration = Duration::from_secs(15);
 
 /// A scratch `LOCALAPPDATA` (`<root>`, with `FastPad\` inside) and a notes folder beside it.
 struct Scratch {
