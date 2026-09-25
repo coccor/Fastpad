@@ -1,0 +1,37 @@
+# Temporary: repeats the flaky library and session e2e tests to capture their diagnostics.
+name: diag-e2e
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
+      - shell: pwsh
+        run: ./tools/fetch-native.ps1
+      - shell: pwsh
+        run: ./tools/build-native.ps1
+      - shell: pwsh
+        run: |
+          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AntivirusEnabled, OnAccessProtectionEnabled | Format-List
+          $env:TEMP
+          cargo test --locked --target x86_64-pc-windows-msvc --test library --test session --no-run
+          $failed = 0
+          foreach ($i in 1..5) {
+            cargo test --locked --target x86_64-pc-windows-msvc --test library --test session -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { $failed++ }
+          }
+          "failed rounds: $failed"
