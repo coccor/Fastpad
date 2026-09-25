@@ -813,6 +813,12 @@ impl NotebookView {
         self.mode == Mode::Tree && self.root_expanded
     }
 
+    /// Whether the tree has rows the collapsed root hides, which the keyboard must not reach
+    /// (open editors spec §3.5).
+    fn tree_hidden(&self) -> bool {
+        self.mode == Mode::Tree && !self.root_expanded
+    }
+
     /// How many rows the keyboard selection runs through in each part (`panel_cursor::step`).
     fn shape(&self) -> panel_cursor::Shape {
         panel_cursor::Shape {
@@ -1109,8 +1115,12 @@ impl NotebookView {
         self.root_expanded = snapshot.root_expanded;
         let expanding = snapshot.editors_expanded && !self.editors_expanded;
         self.editors_expanded = snapshot.editors_expanded;
-        // The keyboard selection leaves a row that is gone: the root row with its notebook, a
-        // tab row with its section. The Open Editors header is always there.
+        // The keyboard selection leaves a row that is gone: a tree row hidden by its collapsed
+        // root to the root row (open editors spec §3.5); the root row with its notebook and a tab
+        // row with its section to the Open Editors header, which is always there.
+        if self.cursor == Cursor::Tree && self.tree_hidden() {
+            self.cursor = Cursor::Root;
+        }
         let gone = match self.cursor {
             Cursor::Root => self.mode == Mode::NoNotebook,
             Cursor::Editor(_) => !self.editors_expanded,
@@ -3285,11 +3295,16 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         });
         return true;
     }
-    let cursor = with_view(hwnd, |view| view.cursor).unwrap_or(Cursor::Tree);
+    let (cursor, hidden) =
+        with_view(hwnd, |view| (view.cursor, view.tree_hidden())).unwrap_or((Cursor::Tree, false));
     if cursor != Cursor::Tree {
         return section_key(hwnd, cursor, key);
     }
-    let Some(selected) = with_view(hwnd, |view| view.list.selected).flatten() else {
+    // A row the collapsed root hides is not acted on.
+    let selected = with_view(hwnd, |view| view.list.selected)
+        .flatten()
+        .filter(|_| !hidden);
+    let Some(selected) = selected else {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
     match key {
@@ -3437,7 +3452,7 @@ fn left(hwnd: HWND, index: usize) {
 /// letter searches from the row after the selection, so repeating it steps through matches.
 fn typed(hwnd: HWND, ch: char) {
     with_view(hwnd, |view| {
-        if view.mode != Mode::Tree {
+        if !view.tree_shown() {
             return;
         }
         let prefix = view.typed.push(ch, Instant::now()).to_owned();

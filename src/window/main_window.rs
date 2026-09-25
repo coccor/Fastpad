@@ -20945,4 +20945,43 @@ mod tests {
             "the revealed row's field shows"
         );
     }
+
+    #[test]
+    fn open_editors_a_collapsed_root_takes_the_keyboard_off_the_hidden_tree() {
+        // Break caught: with the root collapsed, the keyboard selection left on a tree row that
+        // isn't shown, type-ahead selecting hidden rows, and Del deleting one (open editors spec
+        // §3.3, §3.5).
+        use crate::window::panel_cursor::Cursor;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-root-keys");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+
+        crate::window::library_host::set_root_expanded(window.hwnd, false);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Root);
+
+        // Even a selection left in the tree some other way acts on nothing hidden.
+        notebook_view(window.hwnd).cursor = Cursor::Tree;
+        let panel = sidebar_windows(window.hwnd).1;
+        unsafe { SendMessageW(panel, WM_CHAR, 'b' as usize, 0) };
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into())),
+            "type-ahead selects no hidden row"
+        );
+        let _ = crate::window::modal::take_last_confirm();
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::notebook_view::key_down(window.hwnd, VK_DELETE);
+        assert!(
+            crate::window::modal::take_last_confirm().is_none(),
+            "no prompt"
+        );
+        assert!(a.exists() && b.exists());
+    }
 }
