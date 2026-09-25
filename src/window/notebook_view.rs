@@ -819,10 +819,12 @@ impl NotebookView {
                 0
             },
             root: self.mode != Mode::NoNotebook,
-            tree: if self.tree_shown() {
-                self.rows.len()
-            } else {
-                0
+            // The list after the root row: the RECENT notebooks without a notebook, else the
+            // tree's rows while it shows.
+            tree: match self.mode {
+                Mode::NoNotebook => self.recent.len(),
+                _ if self.tree_shown() => self.rows.len(),
+                _ => 0,
             },
         }
     }
@@ -1104,6 +1106,16 @@ impl NotebookView {
         self.root_expanded = snapshot.root_expanded;
         let expanding = snapshot.editors_expanded && !self.editors_expanded;
         self.editors_expanded = snapshot.editors_expanded;
+        // The keyboard selection leaves a row that is gone: the root row with its notebook, a
+        // tab row with its section. The Open Editors header is always there.
+        let gone = match self.cursor {
+            Cursor::Root => self.mode == Mode::NoNotebook,
+            Cursor::Editor(_) => !self.editors_expanded,
+            Cursor::EditorsHeader | Cursor::Tree => false,
+        };
+        if gone {
+            self.cursor = Cursor::EditorsHeader;
+        }
         // The section's rows fit its height again, the active row in view once it shows.
         self.fit_editors(expanding);
         self.name = snapshot
@@ -2897,9 +2909,11 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
     let cursor = match hit {
         Hit::EditorsHeader => Some(Cursor::EditorsHeader),
         Hit::Editor { index, .. } => Some(Cursor::Editor(index)),
-        Hit::Root | Hit::Header(_) => Some(Cursor::Root),
+        Hit::Root => Some(Cursor::Root),
         Hit::Row { .. } => Some(Cursor::Tree),
-        Hit::StateButton | Hit::SecondButton | Hit::Thumb(_) | Hit::Empty => None,
+        // A root row button acts as the header's did (open editors spec §3.3): New note and New
+        // folder still go to the tree's selected folder.
+        Hit::Header(_) | Hit::StateButton | Hit::SecondButton | Hit::Thumb(_) | Hit::Empty => None,
     };
     if let Some(cursor) = cursor {
         with_view(hwnd, |view| {
@@ -3099,20 +3113,19 @@ pub(crate) fn state_button(hwnd: HWND) {
 pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
     if let Some(list_key) = ListKey::from_virtual_key(u32::from(key)) {
         with_view(hwnd, |view| {
-            // The RECENT list without a notebook, and a tree with nothing selected yet, move as
-            // one list does: the first press selects a row in view.
+            let shape = view.shape();
+            // A list with nothing selected yet moves as one list does: the first Up or Down
+            // selects a row in view.
             let own_list = view.cursor == Cursor::Tree
-                && (view.mode == Mode::NoNotebook
-                    || (view.tree_shown()
-                        && view.list.selected.is_none()
-                        && matches!(list_key, ListKey::Up | ListKey::Down)));
+                && shape.tree > 0
+                && view.list.selected.is_none()
+                && matches!(list_key, ListKey::Up | ListKey::Down);
             if own_list {
                 let height = view.list_height();
                 view.list.move_selection(list_key, height);
                 view.invalidate();
                 return;
             }
-            let shape = view.shape();
             match panel_cursor::step(view.cursor, view.list.selected, list_key, shape) {
                 Some((cursor, tree)) => {
                     view.cursor = cursor;
@@ -3128,7 +3141,19 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
                     let height = view.list_height();
                     view.list.move_selection(list_key, height);
                 }
-                None => {}
+                // Page Up and Page Down move within the Open Editors rows (open editors spec
+                // §3.5). The list's own selection is the active tab's row, so it is put back.
+                None => {
+                    if let Cursor::Editor(index) = view.cursor {
+                        let height = height(view.layout(view.client(), view.dpi()).editors_list);
+                        let list = &mut view.editors.list;
+                        let active = list.selected.replace(index);
+                        list.move_selection(list_key, height);
+                        let moved = list.selected.unwrap_or(index);
+                        list.selected = active;
+                        view.cursor = Cursor::Editor(moved);
+                    }
+                }
             }
             view.invalidate();
         });

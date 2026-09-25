@@ -19505,6 +19505,144 @@ mod tests {
     }
 
     #[test]
+    fn a_note_command_with_a_tab_row_selected_leaves_the_trees_selected_note_alone() {
+        // Break caught: Delete run while the keyboard selection is on an Open Editors row
+        // deleting the tree's selected note instead of the active tab's (open editors spec
+        // §3.5).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-delete");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row1));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row1));
+        assert_eq!(
+            notebook_view(window.hwnd).cursor,
+            crate::window::panel_cursor::Cursor::Editor(1)
+        );
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            panel
+        );
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        crate::window::modal::answer_next_confirm(|_| true);
+        execute_command(window.hwnd, CommandId::NoteDelete);
+        assert!(a.exists(), "the tree's selected note stays");
+        assert!(!b.exists(), "the active tab's note goes");
+    }
+
+    #[test]
+    fn the_root_rows_new_note_button_still_makes_the_note_in_the_selected_folder() {
+        // Break caught: a click on the root row's New note moving the keyboard selection off the
+        // tree, so the note went to the notebook's root (open editors spec §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-root-new-note");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        select_row(window.hwnd, &RowKind::Folder("sub".into()));
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
+            .buttons
+            .into_iter()
+            .find(|(button, _)| *button == crate::window::notebook_view::HeaderButton::NewNote)
+            .unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(new_note));
+        mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::NewNote("sub".into()))
+        );
+    }
+
+    #[test]
+    fn without_a_notebook_the_arrows_cross_between_open_editors_and_recent() {
+        // Break caught: the keyboard stuck in RECENT or in Open Editors while no notebook is
+        // open (open editors spec §3.5).
+        use crate::window::panel_cursor::Cursor;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_HOME, VK_UP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-recent-a");
+        let other = LibraryScratch::new("editors-recent-b");
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(&scratch.data()),
+            &crate::library::local::RecentFolders {
+                folders: vec![scratch.folder(), other.folder()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
+        assert!(!notebook_view(window.hwnd).recent.is_empty());
+        let tabs = notebook_view(window.hwnd).editors.rows.len();
+        assert!(tabs >= 1);
+        let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+        key(VK_HOME);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::EditorsHeader);
+        for _ in 0..tabs {
+            key(VK_DOWN);
+        }
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(tabs - 1));
+        key(VK_DOWN);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+        assert_eq!(
+            notebook_view(window.hwnd).list.selected,
+            Some(0),
+            "RECENT's first row"
+        );
+        key(VK_UP);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(tabs - 1));
+    }
+
+    #[test]
+    fn page_keys_move_within_the_open_editors_rows() {
+        // Break caught: Page Up and Page Down dropped on an Open Editors row, or moving the
+        // active tab's row instead of the keyboard selection (open editors spec §3.5).
+        use crate::window::panel_cursor::Cursor;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DOWN, VK_HOME, VK_NEXT, VK_PRIOR,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-page");
+        let paths: Vec<_> = (0..12)
+            .map(|index| scratch.note(&format!("n{index:02}.md"), "x"))
+            .collect();
+        let (window, _editor) = notebook_window(&scratch);
+        for path in &paths {
+            super::open_path(window.hwnd, path).unwrap();
+        }
+        let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+        key(VK_HOME);
+        key(VK_DOWN);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(0));
+        key(VK_NEXT);
+        let Cursor::Editor(paged) = notebook_view(window.hwnd).cursor else {
+            panic!("{:?}", notebook_view(window.hwnd).cursor);
+        };
+        assert!(paged > 1 && paged < 12, "{paged}");
+        assert!(
+            notebook_view(window.hwnd).editor_rect_at(paged).is_some(),
+            "the paged-to row is in view"
+        );
+        assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(11));
+        assert_eq!(notebook_view(window.hwnd).editors.list.selected, Some(11));
+        key(VK_PRIOR);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(0));
+    }
+
+    #[test]
     fn screen_readers_see_the_sections_and_the_tab_rows() {
         // Break caught: Open Editors rows invisible to screen readers, or headers without their
         // expanded state (open editors spec §7).
