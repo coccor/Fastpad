@@ -19369,6 +19369,11 @@ mod tests {
             app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
             Some(a.as_path())
         );
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            panel,
+            "the focus stays in the panel, as a click on a tree row leaves it"
+        );
 
         let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
         let close = crate::window::open_editors::close_rect(row1, 96);
@@ -19380,6 +19385,52 @@ mod tests {
         mouse(panel, WM_MBUTTONDOWN, 4, centre(row1));
         mouse(panel, WM_MBUTTONUP, 0, centre(row1));
         assert_eq!(tab_paths(window.hwnd), [Some(a)]);
+    }
+
+    #[test]
+    fn open_editors_expanded_after_a_switch_while_collapsed_shows_every_row() {
+        // Break caught: a tab switch while the section was collapsed (a list 0 px high) scrolling
+        // the rows to the active one, so expanding showed one row and blank space below, with
+        // clicks landing on the wrong row.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-collapsed-switch");
+        let paths: Vec<_> = (0..6)
+            .map(|index| scratch.note(&format!("n{index}.md"), "x"))
+            .collect();
+        let (window, _editor) = notebook_window(&scratch);
+        for path in &paths {
+            super::open_path(window.hwnd, path).unwrap();
+        }
+        assert_eq!(notebook_view(window.hwnd).editors.rows.len(), 6);
+        let panel = sidebar_windows(window.hwnd).1;
+        let toggle = || {
+            let header = notebook_view(window.hwnd).editors_header_rect();
+            mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+            mouse(panel, WM_LBUTTONUP, 0, centre(header));
+        };
+        toggle();
+        assert!(!super::open_editors_expanded(window.hwnd));
+        let fifth = notebook_view(window.hwnd).editors.rows[4].id;
+        super::activate_document_by_id(window.hwnd, fifth);
+        assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(4));
+        toggle();
+        assert!(super::open_editors_expanded(window.hwnd));
+        assert_eq!(notebook_view(window.hwnd).editors.list.top, 0);
+        for index in 0..6 {
+            assert!(
+                notebook_view(window.hwnd).editor_rect_at(index).is_some(),
+                "row {index} is in view"
+            );
+        }
+        let row0 = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row0));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row0));
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(paths[0].as_path()),
+            "a click lands on the row drawn there"
+        );
     }
 
     #[test]

@@ -801,6 +801,20 @@ impl NotebookView {
         self.mode == Mode::Tree && self.root_expanded
     }
 
+    /// Keeps the Open Editors rows' scroll within their list as it is now, the active row in
+    /// view. Not while the list has no height (collapsed, or a panel not yet sized): a 0 px list
+    /// would scroll the active row to the top and leave the rows above it off screen once shown.
+    fn fit_editors(&mut self, active_in_view: bool) {
+        let height = height(self.layout(self.client(), self.dpi()).editors_list);
+        if height <= 0 {
+            return;
+        }
+        if active_in_view && let Some(active) = self.editors.active_index() {
+            self.editors.list.ensure_visible(active, height);
+        }
+        self.editors.list.scroll_lines(0, height);
+    }
+
     fn editors_row_rect(&self, list: RECT, index: usize) -> Option<RECT> {
         let top = self.editors.list.row_top(index)?;
         Some(RECT {
@@ -1062,7 +1076,10 @@ impl NotebookView {
         }
         self.mode = snapshot.mode;
         self.root_expanded = snapshot.root_expanded;
+        let expanding = snapshot.editors_expanded && !self.editors_expanded;
         self.editors_expanded = snapshot.editors_expanded;
+        // The section's rows fit its height again, the active row in view once it shows.
+        self.fit_editors(expanding);
         self.name = snapshot
             .root
             .as_deref()
@@ -1388,6 +1405,11 @@ impl NotebookView {
         self.list.row_height = scale(ROW_HEIGHT, dpi);
         self.editors.list.row_height = scale(ROW_HEIGHT, dpi);
         let sections = self.layout(area, dpi);
+        // A panel sized after the rows came (startup) or resized: the scroll stays in range.
+        let editors_height = height(sections.editors_list);
+        if editors_height > 0 {
+            self.editors.list.scroll_lines(0, editors_height);
+        }
         self.paint_sections(paint, sections);
         let layout = state_layout(sections.body, dpi);
         match self.mode {
@@ -1901,11 +1923,7 @@ pub(crate) fn editors_changed(hwnd: HWND) {
     let changed = with_view(hwnd, |view| {
         let changed = view.editors.set_rows(rows);
         if changed {
-            let area = view.client();
-            let height = height(view.layout(area, view.dpi()).editors_list);
-            if let Some(active) = view.editors.active_index() {
-                view.editors.list.ensure_visible(active, height);
-            }
+            view.fit_editors(true);
             view.invalidate();
         }
         changed
