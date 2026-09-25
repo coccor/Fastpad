@@ -138,63 +138,6 @@ fn wait_for_library(data: &Scratch) {
     });
 }
 
-/// Like `wait_until`, but a timeout also reports what FastPad shows and what is on disk, so a
-/// step that never happens on a CI runner says why.
-fn wait_or_report(what: &str, data: &Scratch, hwnd: HWND, editor: HWND, done: impl Fn() -> bool) {
-    let deadline = Deadline::after(WAIT);
-    while !done() {
-        assert!(
-            !deadline.expired(),
-            "timed out waiting for {what}\n{}",
-            report(data, hwnd, editor)
-        );
-        deadline.sleep_step();
-    }
-}
-
-/// The window title, the editor's text and every file under the notes folder and the data
-/// folder, with sizes, write times and (for the small ones) contents.
-fn report(data: &Scratch, hwnd: HWND, editor: HWND) -> String {
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
-    let mut title = [0_u16; 260];
-    let length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
-    let mut out = format!(
-        "title: {:?}\neditor: {:?}\n",
-        String::from_utf16_lossy(&title[..length.max(0) as usize]),
-        scintilla_text(editor)
-    );
-    fn walk(dir: &Path, out: &mut String) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_dir() {
-                walk(&path, out);
-                continue;
-            }
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |since| since.as_millis());
-            out.push_str(&format!(
-                "{} ({} bytes, modified {modified})\n",
-                path.display(),
-                meta.len()
-            ));
-            if meta.len() < 2_000 && path.extension().is_none_or(|ext| ext != "bin") {
-                out.push_str(&format!("    {:?}\n", read(&path)));
-            }
-        }
-    }
-    walk(&data.root, &mut out);
-    out
-}
-
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -579,7 +522,7 @@ fn a_note_in_the_folder_autosaves_but_never_overwrites_an_outside_edit() {
         scintilla_text(editor).is_ok_and(|t| t == "one")
     });
     type_more(editor, "x");
-    wait_or_report("autosave", &data, hwnd, editor, || {
+    wait_until("autosave", || {
         scintilla_text(editor).is_ok_and(|t| read(&note) == t)
     });
 
@@ -615,9 +558,7 @@ fn a_note_keeps_its_pin_after_being_renamed_in_explorer() {
     command(hwnd, CommandId::NoteTogglePin);
     // A record made by a command carries no fingerprint until a rescan fills it; the rename below
     // is followed by the file ID the load cached.
-    wait_or_report("library.ini", &data, hwnd, editor, || {
-        read(&data.library_ini()).contains("|p|")
-    });
+    wait_until("library.ini", || read(&data.library_ini()).contains("|p|"));
     assert!(read(&data.library_ini()).ends_with("|a.md\r\n"));
 
     std::fs::rename(&note, data.folder().join("b.md")).unwrap();
