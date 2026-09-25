@@ -150,3 +150,11 @@ All notices use the existing notice bar (`main_window::push_notice`).
 - Dragging several rows at once.
 - A "Move to folder…" command.
 - Undoing a move from the palette. You undo it by dragging the item back.
+
+## 10. Decisions made while implementing
+
+- **The press still clicks.** A press on a row selects it and opens the note or toggles the folder, as before; the drag is armed after that. The dragged item is followed by its path, since toggling a folder moves the rows below it.
+- **No capture until the drag starts.** A release the tree never sees (over another window before the drag distance) is noticed at the next mouse move without the button, which disarms.
+- **Highlight colours:** the band uses the theme's inactive-selection colour; in high contrast, a 1 px (scaled) outline in the system highlight colour.
+- **Shared move code:** the inline renames and the drop use the same moves (`window::tree_move`), so a rename and a move fail, undo and report stuck tabs the same way. A move whose undo failed names the new path in the existing "could not undo renaming" notice.
+- **A right press that cancels a drag** swallows its release, so no context menu opens.

@@ -213,7 +213,7 @@ The icon sets spec (`2026-09-25-icon-sets-design.md`) keeps these as the Minimal
 
 ## 8. Out of scope
 
-- Moving notes or folders: drag and drop, or a "Move to folder" command.
+- A "Move to folder" command. Dragging in the tree moves notes and folders (tree drag spec, `2026-09-25-tree-drag-move-design.md`).
 - Listing files other than notes.
 - Icon themes, or user-chosen colours.
 - Pinning folders.

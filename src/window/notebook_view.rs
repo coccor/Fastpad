@@ -468,6 +468,8 @@ fn draw_tree_row(
     images: &mut IconImages,
     set: FileIconSet,
     light_theme: bool,
+    // The row being dragged: its name draws muted (tree drag spec §3.2).
+    dimmed: bool,
 ) {
     let foreground = row_foreground(look, palette);
     let muted = if look.selected && look.focused {
@@ -563,7 +565,12 @@ fn draw_tree_row(
     } else {
         fonts.text
     };
-    unsafe { draw_text(dc, &row.name, parts.name, font, foreground, LINE) };
+    let color = if dimmed {
+        palette.muted_foreground
+    } else {
+        foreground
+    };
+    unsafe { draw_text(dc, &row.name, parts.name, font, color, LINE) };
 }
 
 fn draw_recent_row(
@@ -600,6 +607,62 @@ fn draw_recent_row(
         None => name.clone(),
     };
     unsafe { draw_text(dc, &label, text, fonts.text, foreground, LINE) };
+}
+
+/// Where `highlight` shows in the tree's `list` area (tree drag spec §3.2): the whole list for
+/// the root, else the part of the folder's rows in view; `None` when none of them is.
+pub(crate) fn band_rect(
+    list: RECT,
+    state: &RowListState,
+    highlight: tree_drag::Highlight,
+) -> Option<RECT> {
+    match highlight {
+        tree_drag::Highlight::Root => Some(list),
+        tree_drag::Highlight::Rows { start, end } => {
+            let visible = state.visible_rows(height(list));
+            let first = start.max(state.top);
+            let last = end.min(state.top + visible);
+            (first < last).then(|| RECT {
+                left: list.left,
+                top: list.top + (first - state.top) as i32 * state.row_height,
+                right: list.right,
+                bottom: (list.top + (last - state.top) as i32 * state.row_height).min(list.bottom),
+            })
+        }
+    }
+}
+
+/// The drop target's band (tree drag spec §3.2). Called before the rows paint
+/// (`before_rows`), it fills the band with the softer selection colour; after, in high
+/// contrast only, it outlines the band in the system highlight, since a blend is not allowed
+/// there.
+fn paint_band(dc: HDC, band: RECT, palette: &Palette, dpi: u32, before_rows: bool) {
+    if before_rows && !palette.high_contrast {
+        unsafe { fill(dc, band, palette.inactive_selection_background) };
+    } else if !before_rows && palette.high_contrast {
+        let t = scale(1, dpi).max(1);
+        let color = palette.selection_background;
+        for edge in [
+            RECT {
+                bottom: band.top + t,
+                ..band
+            },
+            RECT {
+                top: band.bottom - t,
+                ..band
+            },
+            RECT {
+                right: band.left + t,
+                ..band
+            },
+            RECT {
+                left: band.right - t,
+                ..band
+            },
+        ] {
+            unsafe { fill(dc, edge, color) };
+        }
+    }
 }
 
 impl NotebookView {
@@ -1253,6 +1316,15 @@ impl NotebookView {
                 let (icon_set, light_theme) = (paint.icon_set, paint.light_theme);
                 let hover_pin = self.hover_pin;
                 let icons = &paint.icons;
+                let drag = self.drag.as_ref().filter(|drag| drag.started);
+                let dragged = drag.map(|drag| drag.source.clone());
+                let band = drag
+                    .and_then(|drag| drag.target.as_deref())
+                    .and_then(|folder| tree_drag::highlight(rows, folder))
+                    .and_then(|highlight| band_rect(list, &self.list, highlight));
+                if let Some(band) = band {
+                    paint_band(dc, band, palette, dpi, true);
+                }
                 // The edited row leaves its name to the field; a draft row shows the icon for
                 // what is typed so far (inline naming spec §3.1, §3.3).
                 let edited = self
@@ -1282,9 +1354,13 @@ impl NotebookView {
                             images,
                             icon_set,
                             light_theme,
+                            dragged.as_ref() == rows.get(index).map(|row| &row.kind),
                         );
                     },
                 );
+                if let Some(band) = band {
+                    paint_band(dc, band, palette, dpi, false);
+                }
                 if let Some(layout) = self.inline_layout_in(area, dpi) {
                     self.paint_inline(dc, layout, list, palette, fonts, dpi);
                 }
@@ -2918,6 +2994,7 @@ mod tests {
                 &mut images,
                 set,
                 true,
+                false,
             );
             target.area(icon_box)
         };
@@ -3012,6 +3089,7 @@ mod tests {
                 &mut images,
                 set,
                 true,
+                false,
             );
             target.area(icon_box)
         };
@@ -3028,5 +3106,171 @@ mod tests {
         for font in [fonts.text, fonts.bold, fonts.italic, fonts.glyph] {
             unsafe { DeleteObject(font) };
         }
+    }
+
+    #[test]
+    fn the_drop_band_covers_the_folders_rows_in_view_or_the_whole_list() {
+        use crate::window::tree_drag::Highlight;
+        let list_rect = RECT {
+            left: 0,
+            top: 100,
+            right: 200,
+            bottom: 230,
+        };
+        let mut state = RowListState::new(26);
+        state.set_count(20);
+        state.top = 3;
+        let band = |highlight| band_rect(list_rect, &state, highlight);
+        assert_eq!(band(Highlight::Root).map(edges), Some((0, 100, 200, 230)));
+        assert_eq!(
+            band(Highlight::Rows { start: 4, end: 6 }).map(edges),
+            Some((0, 126, 200, 178))
+        );
+        assert_eq!(
+            band(Highlight::Rows { start: 0, end: 5 }).map(edges),
+            Some((0, 100, 200, 152)),
+            "clipped at the top of the view"
+        );
+        assert_eq!(
+            band(Highlight::Rows { start: 6, end: 20 }).map(edges),
+            Some((0, 178, 200, 230)),
+            "clipped at the bottom of the list"
+        );
+        assert!(
+            band(Highlight::Rows { start: 0, end: 2 }).is_none(),
+            "above the view"
+        );
+    }
+
+    #[test]
+    fn the_drop_band_fills_outside_high_contrast_and_outlines_in_it() {
+        use crate::window::icon_sets::images::TestTarget;
+        let target = TestTarget::new(60, 40);
+        let whole = RECT {
+            left: 0,
+            top: 0,
+            right: 60,
+            bottom: 40,
+        };
+        let band = RECT {
+            left: 10,
+            top: 10,
+            right: 50,
+            bottom: 30,
+        };
+        let inside = RECT {
+            left: 20,
+            top: 15,
+            right: 21,
+            bottom: 16,
+        };
+        let edge = RECT {
+            left: 10,
+            top: 20,
+            right: 11,
+            bottom: 21,
+        };
+        let reference = |color: u32| {
+            let target = TestTarget::new(1, 1);
+            unsafe {
+                fill(
+                    target.dc,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: 1,
+                    },
+                    color,
+                )
+            };
+            target.area(RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            })[0]
+        };
+        let palette = Palette::neutral();
+        unsafe { fill(target.dc, whole, palette.editor_background) };
+        paint_band(target.dc, band, &palette, 96, true);
+        paint_band(target.dc, band, &palette, 96, false);
+        assert_eq!(
+            target.area(inside)[0],
+            reference(palette.inactive_selection_background)
+        );
+
+        let contrast = Palette {
+            high_contrast: true,
+            ..palette
+        };
+        unsafe { fill(target.dc, whole, contrast.editor_background) };
+        paint_band(target.dc, band, &contrast, 96, true);
+        assert_eq!(
+            target.area(inside)[0],
+            reference(contrast.editor_background),
+            "no blend"
+        );
+        paint_band(target.dc, band, &contrast, 96, false);
+        assert_eq!(
+            target.area(edge)[0],
+            reference(contrast.selection_background)
+        );
+        assert_eq!(
+            target.area(inside)[0],
+            reference(contrast.editor_background)
+        );
+    }
+
+    #[test]
+    fn the_dragged_row_draws_its_name_dimmed() {
+        use crate::window::icon_sets::images::TestTarget;
+        use crate::window::titlebar::create_ui_font;
+        use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL};
+        let fonts = UiFonts {
+            text: create_ui_font(12, "Segoe UI", FW_NORMAL as i32, false),
+            ..UiFonts::default()
+        };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 22,
+        };
+        let name = row_parts(rect, 0, 96).name;
+        let look = RowLook {
+            selected: false,
+            hover: false,
+            focused: false,
+        };
+        let palette = Palette::neutral();
+        let note = TreeRow {
+            name: "dragged".into(),
+            ..row(RowKind::Note("a.md".into()), 0)
+        };
+        let mut images = IconImages::new();
+        let mut draw = |dimmed: bool| {
+            let target = TestTarget::new(200, 22);
+            unsafe { fill(target.dc, rect, palette.editor_background) };
+            draw_tree_row(
+                target.dc,
+                Some(&note),
+                rect,
+                look,
+                &palette,
+                &FileIcons::neutral(),
+                fonts,
+                96,
+                false,
+                None,
+                &mut images,
+                FileIconSet::Minimal,
+                true,
+                dimmed,
+            );
+            target.area(name)
+        };
+        assert_ne!(draw(true), draw(false));
+        unsafe { DeleteObject(fonts.text) };
     }
 }

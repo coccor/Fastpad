@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 /// How long the pointer rests on a collapsed folder row before it expands (spec §3.3).
 pub(crate) const EXPAND_DELAY: Duration = Duration::from_millis(700);
 /// The drag timer's period: one auto-scroll step and one auto-expand check (spec §3.3).
-#[cfg_attr(test, allow(dead_code))]
 pub(crate) const TICK: Duration = Duration::from_millis(50);
 
 /// What a drag's pointer is over (spec §3.2).
@@ -132,13 +131,6 @@ pub(crate) fn destination(source: &RowKind, folder: &Path) -> Option<PathBuf> {
 
 /// The rows a drop target highlights (spec §3.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag in notebook_view (next tasks)"
-    )
-)]
 pub(crate) enum Highlight {
     /// The whole list.
     Root,
@@ -147,13 +139,6 @@ pub(crate) enum Highlight {
 }
 
 /// What dropping into `folder` highlights; `None` when the folder has no row now.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the tree drag in notebook_view (next tasks)"
-    )
-)]
 pub(crate) fn highlight(rows: &[TreeRow], folder: &Path) -> Option<Highlight> {
     if folder.as_os_str().is_empty() {
         return Some(Highlight::Root);

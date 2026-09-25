@@ -127,6 +127,9 @@ Hover a note to pin it.
   renames a note or a folder in place, without opening it, and **Del** sends it to the Recycle
   Bin. A name that is taken says so as you type. Empty folders show in the tree, and each note
   has a coloured icon for its type.
+- Drag a note or a folder onto another folder in the tree to move it there, or onto empty
+  space to move it to the notebook's top level. Open tabs and pins follow it, nothing is
+  ever overwritten, and Esc cancels the drag.
 - The tree's icons come from Material Icon Theme; **File icons: Minimal** in the palette switches
   to plain glyphs.
 - Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
