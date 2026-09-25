@@ -22,6 +22,7 @@ pub(crate) mod open_editors;
 pub(crate) mod option_toggles;
 pub mod palette;
 pub(crate) mod panel;
+pub(crate) mod panel_cursor;
 pub(crate) mod preview_host;
 pub(crate) mod row_list;
 pub(crate) mod search_view;

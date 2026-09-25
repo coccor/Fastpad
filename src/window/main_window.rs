@@ -16374,6 +16374,8 @@ mod tests {
             .filter(|item| {
                 item.role == windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM
             })
+            // The Open Editors header and the notebook's root row come before the tree's rows.
+            .skip(2)
             .collect::<Vec<_>>();
         // "sub" is collapsed, so b is not a row: pinned a first, then the folder.
         assert_eq!(rows.len(), 2, "{items:?}");
@@ -19458,6 +19460,75 @@ mod tests {
             std::fs::read_to_string(local)
                 .unwrap()
                 .contains("root=collapsed")
+        );
+    }
+
+    #[test]
+    fn the_arrow_keys_cross_from_open_editors_into_the_tree_and_del_on_a_tab_row_deletes_nothing() {
+        // Break caught: the keyboard stuck in the tree, Enter on a tab row doing nothing, or Del
+        // on a tab row deleting the tree's selected note (open editors spec §3.5).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DELETE, VK_DOWN, VK_HOME, VK_RETURN,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-keys");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+        key(VK_HOME);
+        assert_eq!(
+            notebook_view(window.hwnd).cursor,
+            crate::window::panel_cursor::Cursor::EditorsHeader
+        );
+        key(VK_DOWN);
+        key(VK_DELETE);
+        assert!(a.exists() && b.exists(), "Del on a tab row deletes nothing");
+        key(VK_RETURN);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path())
+        );
+        for _ in 0..3 {
+            key(VK_DOWN);
+        }
+        assert_eq!(
+            notebook_view(window.hwnd).cursor,
+            crate::window::panel_cursor::Cursor::Tree
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into()))
+        );
+    }
+
+    #[test]
+    fn screen_readers_see_the_sections_and_the_tab_rows() {
+        // Break caught: Open Editors rows invisible to screen readers, or headers without their
+        // expanded state (open editors spec §7).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-msaa");
+        let a = scratch.note("a.md", "a");
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        editor.set_text("changed").unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        let count = crate::window::side_panel::accessible_item_count(panel);
+        let names: Vec<String> = (0..count)
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .map(|item| item.name)
+            .collect();
+        assert!(names.contains(&"Open editors, 1".to_owned()), "{names:?}");
+        assert!(
+            names.contains(&"a.md, open editor, modified".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == &crate::window::library_host::notebook_name(&scratch.folder()))
         );
     }
 

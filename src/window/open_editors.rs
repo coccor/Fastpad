@@ -81,10 +81,6 @@ pub(crate) fn snapshot(hwnd: HWND) -> Vec<EditorRow> {
 }
 
 /// What screen readers hear for a row (spec §7).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the panel by a later open editors task")
-)]
 pub(crate) fn accessible_name(row: &EditorRow) -> String {
     let mut name = format!("{}, open editor", row.name);
     if row.dirty {

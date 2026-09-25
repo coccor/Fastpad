@@ -19,6 +19,7 @@ use crate::window::notebook_layout::{self, PanelLayout, ROW_HEIGHT};
 use crate::window::open_editors::OpenEditors;
 use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset, scale};
+use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::sidebar_accessibility::MK_LBUTTON;
 use crate::window::tooltip::Tooltip;
@@ -377,6 +378,9 @@ pub(crate) struct NotebookView {
     root_expanded: bool,
     /// The tab under a middle press on an Open Editors row: its release there closes it.
     middle_press: Option<DocumentId>,
+    /// The one keyboard selection through the header rows, the Open Editors rows and the tree
+    /// (open editors spec §3.5). `Cursor::Tree` leaves it to `list.selected`.
+    pub(crate) cursor: Cursor,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -714,28 +718,32 @@ fn paint_band(dc: HDC, band: RECT, palette: &Palette, dpi: u32, before_rows: boo
     if before_rows && !palette.high_contrast {
         unsafe { fill(dc, band, palette.inactive_selection_background) };
     } else if !before_rows && palette.high_contrast {
-        let t = scale(1, dpi).max(1);
-        let color = palette.selection_background;
-        for edge in [
-            RECT {
-                bottom: band.top + t,
-                ..band
-            },
-            RECT {
-                top: band.bottom - t,
-                ..band
-            },
-            RECT {
-                right: band.left + t,
-                ..band
-            },
-            RECT {
-                left: band.right - t,
-                ..band
-            },
-        ] {
-            unsafe { fill(dc, edge, color) };
-        }
+        paint_outline(dc, band, palette.selection_background, dpi);
+    }
+}
+
+/// A 1 px (scaled) outline just inside `rect`.
+fn paint_outline(dc: HDC, rect: RECT, color: u32, dpi: u32) {
+    let t = scale(1, dpi).max(1);
+    for edge in [
+        RECT {
+            bottom: rect.top + t,
+            ..rect
+        },
+        RECT {
+            top: rect.bottom - t,
+            ..rect
+        },
+        RECT {
+            right: rect.left + t,
+            ..rect
+        },
+        RECT {
+            left: rect.right - t,
+            ..rect
+        },
+    ] {
+        unsafe { fill(dc, edge, color) };
     }
 }
 
@@ -771,6 +779,7 @@ impl NotebookView {
             editors_expanded: true,
             root_expanded: true,
             middle_press: None,
+            cursor: Cursor::Tree,
             #[cfg(test)]
             rebuilds: 0,
         }
@@ -799,6 +808,23 @@ impl NotebookView {
     /// The tree is painted and hit: loaded rows under an expanded root.
     pub(crate) fn tree_shown(&self) -> bool {
         self.mode == Mode::Tree && self.root_expanded
+    }
+
+    /// How many rows the keyboard selection runs through in each part (`panel_cursor::step`).
+    fn shape(&self) -> panel_cursor::Shape {
+        panel_cursor::Shape {
+            editors: if self.editors_expanded {
+                self.editors.rows.len()
+            } else {
+                0
+            },
+            root: self.mode != Mode::NoNotebook,
+            tree: if self.tree_shown() {
+                self.rows.len()
+            } else {
+                0
+            },
+        }
     }
 
     /// Keeps the Open Editors rows' scroll within their list as it is now, the active row in
@@ -1688,6 +1714,26 @@ impl NotebookView {
                 unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
             }
         }
+        // The keyboard selection on a header or tab row; the tree shows its own.
+        if paint.focused {
+            let outlined = match self.cursor {
+                Cursor::EditorsHeader => Some(layout.editors_header),
+                Cursor::Editor(index) if self.editors_expanded => {
+                    let list = layout.editors_list;
+                    self.editors_row_rect(list, index)
+                        .filter(|row| row.top < list.bottom)
+                        .map(|row| RECT {
+                            bottom: row.bottom.min(list.bottom),
+                            ..row
+                        })
+                }
+                Cursor::Root if self.mode != Mode::NoNotebook => Some(layout.root),
+                Cursor::Root | Cursor::Editor(_) | Cursor::Tree => None,
+            };
+            if let Some(rect) = outlined {
+                paint_outline(dc, rect, palette.selection_background, dpi);
+            }
+        }
     }
 
     fn paint_button(
@@ -1727,6 +1773,27 @@ impl NotebookView {
     /// The tree rows screen readers see: all but the draft row (inline naming spec §6).
     fn accessible_rows(&self) -> usize {
         self.rows.len() - usize::from(self.inline.draft_at().is_some())
+    }
+
+    /// The children after the push buttons, in order: the Open Editors header, its rows, the
+    /// root row, then the RECENT notebooks or the tree rows.
+    fn accessible_parts(&self) -> (usize, usize, usize) {
+        let editors = if self.editors_expanded {
+            self.editors.rows.len()
+        } else {
+            0
+        };
+        let root = usize::from(self.mode != Mode::NoNotebook);
+        (1, editors, root)
+    }
+
+    /// The tree rows screen readers see: `accessible_rows`, while the tree shows.
+    fn accessible_tree_rows(&self) -> usize {
+        if self.tree_shown() {
+            self.accessible_rows()
+        } else {
+            0
+        }
     }
 
     /// The row that accessible tree row `index` stands for.
@@ -1921,7 +1988,25 @@ pub(crate) fn rebuild(hwnd: HWND) {
 pub(crate) fn editors_changed(hwnd: HWND) {
     let rows = super::open_editors::snapshot(hwnd);
     let changed = with_view(hwnd, |view| {
+        let reordered = rows.len() != view.editors.rows.len()
+            || rows
+                .iter()
+                .zip(&view.editors.rows)
+                .any(|(new, old)| new.id != old.id);
         let changed = view.editors.set_rows(rows);
+        if reordered {
+            // Screen readers hear the reorder (`accessible_generation`).
+            view.order = view.order.wrapping_add(1);
+        }
+        // A tab row that went takes the keyboard selection to the row in its place.
+        if let Cursor::Editor(index) = view.cursor
+            && index >= view.editors.rows.len()
+        {
+            view.cursor = match view.editors.rows.len().checked_sub(1) {
+                Some(last) => Cursor::Editor(last),
+                None => Cursor::EditorsHeader,
+            };
+        }
         if changed {
             view.fit_editors(true);
             view.invalidate();
@@ -1992,12 +2077,12 @@ fn run(hwnd: HWND, command: CommandId) {
     }
 }
 
-/// The selected note's absolute path while the panel has the keyboard focus, so palette and
-/// accelerator commands act on it rather than on the active tab (spec §6.3).
+/// The selected note's absolute path while the panel has the keyboard focus on the tree, so
+/// palette and accelerator commands act on it rather than on the active tab (spec §6.3).
 pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
     let root = super::library_host::folder(hwnd)?;
     with_view(hwnd, |view| {
-        let focused = unsafe { GetFocus() } == view.panel;
+        let focused = unsafe { GetFocus() } == view.panel && view.cursor == Cursor::Tree;
         match view.list.selected.map(|index| view.target(index)) {
             Some(Target::Row(TreeRow {
                 kind: RowKind::Note(relative),
@@ -2010,10 +2095,10 @@ pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
 }
 
 /// The selected folder row's path, relative to the notebook, while the panel has the keyboard
-/// focus: Rename and Delete act on it (notebook folders spec §4.2, §4.3).
+/// focus on the tree: Rename and Delete act on it (notebook folders spec §4.2, §4.3).
 pub(crate) fn focused_folder(hwnd: HWND) -> Option<PathBuf> {
     with_view(hwnd, |view| {
-        let focused = unsafe { GetFocus() } == view.panel;
+        let focused = unsafe { GetFocus() } == view.panel && view.cursor == Cursor::Tree;
         match view.list.selected.map(|index| view.target(index)) {
             Some(Target::Row(TreeRow {
                 kind: RowKind::Folder(relative),
@@ -2026,11 +2111,14 @@ pub(crate) fn focused_folder(hwnd: HWND) -> Option<PathBuf> {
 }
 
 /// The folder a new note goes to (spec §6.7): a selected folder row's own folder, or a
-/// selected note's parent. `None` (the root) for a draft row or no selection.
+/// selected note's parent. `None` (the root) for a draft row, no selection, or the keyboard
+/// selection outside the tree.
 pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
     let root = super::library_host::folder(hwnd)?;
     let target = with_view(hwnd, |view| {
-        view.list.selected.map(|index| view.target(index))
+        (view.cursor == Cursor::Tree)
+            .then(|| view.list.selected.map(|index| view.target(index)))
+            .flatten()
     })
     .flatten()?;
     match target {
@@ -2064,6 +2152,10 @@ pub(crate) fn select_row(hwnd: HWND, kind: &RowKind) -> bool {
 /// Gives the tree the keyboard focus, after an inline name edit ended with Enter or Esc
 /// (inline naming spec §5.1).
 pub(crate) fn focus_tree(hwnd: HWND) {
+    with_view(hwnd, |view| {
+        view.cursor = Cursor::Tree;
+        view.invalidate();
+    });
     focus_panel(hwnd);
 }
 
@@ -2199,6 +2291,10 @@ fn context_menu(hwnd: HWND, lparam: LPARAM) {
     let keyboard = lparam as u32 == u32::MAX;
     let target = with_view(hwnd, |view| {
         if keyboard {
+            // A row's menu is for the tree's row, not a header or a tab row.
+            if view.cursor != Cursor::Tree {
+                return None;
+            }
             return view.list.selected.map(|index| (index, None));
         }
         let (x, y) = point_of(lparam);
@@ -2312,7 +2408,10 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             let hit = hit_after_commit(hwnd, x, y);
             focus_panel_for(hwnd, hit.as_ref());
             if let Some(Hit::Row { index, .. }) = hit {
-                with_view(hwnd, |view| view.select(index));
+                with_view(hwnd, |view| {
+                    view.cursor = Cursor::Tree;
+                    view.select(index);
+                });
             }
             Some(0)
         }
@@ -2794,6 +2893,20 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
     let Some(hit) = hit else {
         return;
     };
+    // The keyboard selection follows the click (open editors spec §3.5).
+    let cursor = match hit {
+        Hit::EditorsHeader => Some(Cursor::EditorsHeader),
+        Hit::Editor { index, .. } => Some(Cursor::Editor(index)),
+        Hit::Root | Hit::Header(_) => Some(Cursor::Root),
+        Hit::Row { .. } => Some(Cursor::Tree),
+        Hit::StateButton | Hit::SecondButton | Hit::Thumb(_) | Hit::Empty => None,
+    };
+    if let Some(cursor) = cursor {
+        with_view(hwnd, |view| {
+            view.cursor = cursor;
+            view.invalidate();
+        });
+    }
     match hit {
         Hit::EditorsHeader => {
             let expanded = with_view(hwnd, |view| view.editors_expanded).unwrap_or(true);
@@ -2980,16 +3093,50 @@ pub(crate) fn state_button(hwnd: HWND) {
     }
 }
 
-/// The tree's keys (spec §10). Returns false for keys it leaves to the panel.
+/// The panel's keys (spec §10, open editors spec §3.5): the arrows run one selection through
+/// the header rows, the Open Editors rows and the tree. Returns false for keys it leaves to the
+/// panel.
 pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
     if let Some(list_key) = ListKey::from_virtual_key(u32::from(key)) {
         with_view(hwnd, |view| {
-            let height = view.list_height();
-            if view.list.move_selection(list_key, height) {
+            // The RECENT list without a notebook, and a tree with nothing selected yet, move as
+            // one list does: the first press selects a row in view.
+            let own_list = view.cursor == Cursor::Tree
+                && (view.mode == Mode::NoNotebook
+                    || (view.tree_shown()
+                        && view.list.selected.is_none()
+                        && matches!(list_key, ListKey::Up | ListKey::Down)));
+            if own_list {
+                let height = view.list_height();
+                view.list.move_selection(list_key, height);
                 view.invalidate();
+                return;
             }
+            let shape = view.shape();
+            match panel_cursor::step(view.cursor, view.list.selected, list_key, shape) {
+                Some((cursor, tree)) => {
+                    view.cursor = cursor;
+                    if let Some(index) = tree {
+                        view.select(index);
+                    }
+                    if let Cursor::Editor(index) = cursor {
+                        let height = height(view.layout(view.client(), view.dpi()).editors_list);
+                        view.editors.list.ensure_visible(index, height);
+                    }
+                }
+                None if view.cursor == Cursor::Tree => {
+                    let height = view.list_height();
+                    view.list.move_selection(list_key, height);
+                }
+                None => {}
+            }
+            view.invalidate();
         });
         return true;
+    }
+    let cursor = with_view(hwnd, |view| view.cursor).unwrap_or(Cursor::Tree);
+    if cursor != Cursor::Tree {
+        return section_key(hwnd, cursor, key);
     }
     let Some(selected) = with_view(hwnd, |view| view.list.selected).flatten() else {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
@@ -3040,6 +3187,54 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
     }
 }
 
+/// A key on a header row or an Open Editors row. F2 and Del do nothing there: they act on tree
+/// rows only.
+fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
+    match (cursor, key) {
+        (Cursor::Editor(index), VK_RETURN) => {
+            let Some(id) =
+                with_view(hwnd, |view| view.editors.rows.get(index).map(|row| row.id)).flatten()
+            else {
+                return true;
+            };
+            super::main_window::activate_document_by_id(hwnd, id);
+            super::main_window::focus_content(hwnd);
+        }
+        (Cursor::EditorsHeader, VK_RETURN | VK_LEFT | VK_RIGHT) => {
+            let expanded = super::main_window::open_editors_expanded(hwnd);
+            let wanted = expanded_after(key, expanded);
+            if wanted != expanded {
+                super::main_window::set_open_editors_expanded(hwnd, wanted);
+                rebuild(hwnd);
+            }
+        }
+        (Cursor::Root, VK_RETURN | VK_LEFT | VK_RIGHT) => {
+            if super::library_host::folder(hwnd).is_none() {
+                return true;
+            }
+            let expanded = super::library_host::root_expanded(hwnd);
+            let wanted = expanded_after(key, expanded);
+            if wanted != expanded {
+                super::library_host::set_root_expanded(hwnd, wanted);
+                rebuild(hwnd);
+            }
+        }
+        (_, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE) => {}
+        _ => return false,
+    }
+    true
+}
+
+/// Whether a header row is expanded after `key`: Left collapses it, Right expands it, Enter
+/// toggles it.
+fn expanded_after(key: u16, expanded: bool) -> bool {
+    match key {
+        VK_LEFT => false,
+        VK_RIGHT => true,
+        _ => !expanded,
+    }
+}
+
 /// Right expands a folder, or moves into an expanded one.
 fn right(hwnd: HWND, index: usize) {
     let Some(Target::Row(row)) = with_view(hwnd, |view| view.target(index)) else {
@@ -3075,8 +3270,14 @@ fn left(hwnd: HWND, index: usize) {
         return;
     }
     with_view(hwnd, |view| {
-        if let Some(parent) = tree::parent_index(&view.rows, index) {
-            view.select(parent);
+        match tree::parent_index(&view.rows, index) {
+            Some(parent) => view.select(parent),
+            // A top-level row: the notebook's root row is its parent (open editors spec §3.5).
+            None if view.mode == Mode::Tree => {
+                view.cursor = Cursor::Root;
+                view.invalidate();
+            }
+            None => {}
         }
     });
 }
@@ -3095,16 +3296,23 @@ fn typed(hwnd: HWND, ch: char) {
             None => 0,
         };
         if let Some(index) = tree::type_ahead(&view.rows, from, &prefix) {
+            view.cursor = Cursor::Tree;
             view.select(index);
         }
     });
 }
 
 impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
-    /// Push buttons first, then the RECENT notebooks (no-notebook state), then the tree rows,
-    /// the draft row left out.
+    /// Push buttons first, then the Open Editors header and its rows, the notebook's root row,
+    /// then the RECENT notebooks (no-notebook state) or the tree rows, the draft row left out.
     fn accessible_count(&self, client: RECT, dpi: u32) -> usize {
-        self.buttons(client, dpi).len() + self.recent.len() + self.accessible_rows()
+        let (header, editors, root) = self.accessible_parts();
+        self.buttons(client, dpi).len()
+            + header
+            + editors
+            + root
+            + self.recent.len()
+            + self.accessible_tree_rows()
     }
 
     fn accessible_item(
@@ -3114,12 +3322,50 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         dpi: u32,
         focused: bool,
     ) -> Option<crate::window::sidebar_accessibility::AccessibleItem> {
-        use crate::window::sidebar_accessibility::{button_item, list_item, row_rect, tree_item};
+        use crate::window::sidebar_accessibility::{
+            button_item, list_item, row_rect, section_item, tree_item,
+        };
         let buttons = self.buttons(client, dpi);
         if let Some((name, rect)) = buttons.get(index) {
             return Some(button_item(name, false, false, *rect));
         }
+        let layout = self.layout(client, dpi);
+        let (header, editors, root) = self.accessible_parts();
         let index = index - buttons.len();
+        if index < header {
+            return Some(section_item(
+                &format!("Open editors, {}", self.editors.rows.len()),
+                self.editors_expanded,
+                self.cursor == Cursor::EditorsHeader,
+                focused,
+                layout.editors_header,
+            ));
+        }
+        let index = index - header;
+        if index < editors {
+            let row = self.editors.rows.get(index)?;
+            let (rect, visible) = row_rect(layout.editors_list, &self.editors.list, index);
+            return Some(list_item(
+                &super::open_editors::accessible_name(row),
+                self.cursor == Cursor::Editor(index),
+                focused,
+                rect,
+                visible,
+            ));
+        }
+        let index = index - editors;
+        if index < root {
+            return Some(section_item(
+                &self.name,
+                self.root_expanded,
+                self.cursor == Cursor::Root,
+                focused,
+                layout.root,
+            ));
+        }
+        let index = index - root;
+        // The list's selection has the focus only while the keyboard selection is in it.
+        let focused = focused && self.cursor == Cursor::Tree;
         if index < self.recent.len() {
             // The no-notebook list holds the RECENT rows, indexed by list position.
             let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
@@ -3131,7 +3377,11 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                 visible,
             ));
         }
-        let index = self.row_of_accessible(index - self.recent.len());
+        let index = index - self.recent.len();
+        if index >= self.accessible_tree_rows() {
+            return None;
+        }
+        let index = self.row_of_accessible(index);
         let row = self.rows().get(index)?;
         let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
         Some(tree_item(
@@ -3144,51 +3394,91 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
     }
 
     fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
-        let inside = |rect: &RECT| {
-            point.x >= rect.left
-                && point.x < rect.right
-                && point.y >= rect.top
-                && point.y < rect.bottom
-        };
+        let inside = |rect: &RECT| contains(*rect, point.x, point.y);
         let buttons = self.buttons(client, dpi);
         if let Some(index) = buttons.iter().position(|(_, rect)| inside(rect)) {
             return Some(index);
+        }
+        let layout = self.layout(client, dpi);
+        let (header, editors, root) = self.accessible_parts();
+        let start = buttons.len();
+        if inside(&layout.editors_header) {
+            return Some(start);
+        }
+        if inside(&layout.editors_list) {
+            let row = self
+                .editors
+                .list
+                .row_at(point.y - layout.editors_list.top)?;
+            return (row < editors).then_some(start + header + row);
+        }
+        if inside(&layout.root) {
+            return (root == 1).then_some(start + header + editors);
         }
         let area = self.list_area(client, dpi);
         if !inside(&area) {
             return None;
         }
         let row = self.list().row_at(point.y - area.top)?;
+        let rows = start + header + editors + root;
         if self.mode == Mode::NoNotebook {
-            (row < self.recent.len()).then_some(buttons.len() + row)
+            (row < self.recent.len()).then_some(rows + row)
         } else {
-            (row < self.rows().len())
+            (self.tree_shown() && row < self.rows().len())
                 .then(|| self.accessible_of_row(row))
                 .flatten()
-                .map(|row| buttons.len() + self.recent.len() + row)
+                .map(|row| rows + self.recent.len() + row)
         }
     }
 
     fn accessible_current(&self, client: RECT, dpi: u32) -> Option<usize> {
-        let buttons = self.buttons(client, dpi).len();
+        let start = self.buttons(client, dpi).len();
+        let (header, editors, root) = self.accessible_parts();
+        match self.cursor {
+            Cursor::EditorsHeader => return Some(start),
+            Cursor::Editor(index) => return (index < editors).then_some(start + header + index),
+            Cursor::Root => return (root == 1).then_some(start + header + editors),
+            Cursor::Tree => {}
+        }
+        let rows = start + header + editors + root;
         let selected = self.list().selected?;
         // In the no-notebook state the list's selection is a RECENT row, not a tree row.
         if self.mode == Mode::NoNotebook {
-            (selected < self.recent.len()).then_some(buttons + selected)
+            (selected < self.recent.len()).then_some(rows + selected)
         } else {
-            (selected < self.rows().len())
+            (self.tree_shown() && selected < self.rows().len())
                 .then(|| self.accessible_of_row(selected))
                 .flatten()
-                .map(|row| buttons + self.recent.len() + row)
+                .map(|row| rows + self.recent.len() + row)
         }
     }
 
     fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
-        let buttons = self.buttons(client, dpi).len();
+        let (header, editors, root) = self.accessible_parts();
+        let Some(index) = index.checked_sub(self.buttons(client, dpi).len()) else {
+            return;
+        };
+        if index < header {
+            self.cursor = Cursor::EditorsHeader;
+            return;
+        }
+        let index = index - header;
+        if index < editors {
+            self.cursor = Cursor::Editor(index);
+            let list = self.layout(client, dpi).editors_list;
+            self.editors.list.ensure_visible(index, height(list));
+            return;
+        }
+        let index = index - editors;
+        if index < root {
+            self.cursor = Cursor::Root;
+            return;
+        }
+        let index = index - root;
         let (offset, rows) = if self.mode == Mode::NoNotebook {
-            (buttons, self.recent.len())
+            (0, self.recent.len())
         } else {
-            (buttons + self.recent.len(), self.accessible_rows())
+            (self.recent.len(), self.accessible_tree_rows())
         };
         let Some(row) = index.checked_sub(offset).filter(|&row| row < rows) else {
             return;
@@ -3198,19 +3488,36 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         } else {
             self.row_of_accessible(row)
         };
+        self.cursor = Cursor::Tree;
         let area = self.list_area(client, dpi);
         self.list_mut().select(row, area.bottom - area.top);
     }
 
     fn accessible_identity(&self, index: usize, client: RECT, dpi: u32) -> Option<u64> {
         use crate::window::sidebar_accessibility::identity_of;
+        let (header, editors, root) = self.accessible_parts();
         let index = index.checked_sub(self.buttons(client, dpi).len())?;
+        if index < header {
+            return Some(identity_of(&"open-editors"));
+        }
+        let index = index - header;
+        if index < editors {
+            let row = self.editors.rows.get(index)?;
+            return Some(identity_of(&("editor", row.id.0)));
+        }
+        let index = index - editors;
+        if index < root {
+            return Some(identity_of(&"notebook-root"));
+        }
+        let index = index - root;
         if let Some(folder) = self.recent.get(index) {
             return Some(identity_of(folder));
         }
-        let row = self
-            .rows()
-            .get(self.row_of_accessible(index - self.recent.len()))?;
+        let index = index - self.recent.len();
+        if index >= self.accessible_tree_rows() {
+            return None;
+        }
+        let row = self.rows().get(self.row_of_accessible(index))?;
         Some(identity_of(&row.kind))
     }
 

@@ -261,6 +261,31 @@ pub(crate) fn list_item(
     }
 }
 
+/// A section header in a sidebar view (the Notebook view's Open Editors and notebook rows): an
+/// outline item that is expanded or collapsed, selectable with the keyboard.
+pub(crate) fn section_item(
+    name: &str,
+    expanded: bool,
+    selected: bool,
+    focused: bool,
+    rect: RECT,
+) -> AccessibleItem {
+    let mut state = row_state(selected, focused, true);
+    state |= if expanded {
+        STATE_EXPANDED
+    } else {
+        STATE_COLLAPSED
+    };
+    AccessibleItem {
+        name: name.to_owned(),
+        role: ROLE_SYSTEM_OUTLINEITEM,
+        state,
+        rect,
+        value: "0".to_owned(),
+        window: std::ptr::null_mut(),
+    }
+}
+
 /// A Notebook-view row. The name carries a note's type, then ", pinned", so none is conveyed by
 /// the icon alone.
 pub(crate) fn tree_item(
