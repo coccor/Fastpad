@@ -5,7 +5,10 @@
 
 use crate::platform::wide_null;
 use crate::window::panel::scale;
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
+use std::sync::atomic::{AtomicBool, Ordering};
+use windows_sys::Win32::Foundation::{
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetMonitorInfoW, HBITMAP, HDC,
@@ -117,16 +120,22 @@ impl DragLabel {
     ) -> Option<Self> {
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let class = wide_null(CLASS);
-        static REGISTERED: std::sync::Once = std::sync::Once::new();
-        REGISTERED.call_once(|| {
+        // Registered once, on the UI thread; a failed registration is tried again next drag.
+        static REGISTERED: AtomicBool = AtomicBool::new(false);
+        if !REGISTERED.load(Ordering::Relaxed) {
             let window_class = WNDCLASSW {
                 lpfnWndProc: Some(DefWindowProcW),
                 hInstance: instance,
                 lpszClassName: class.as_ptr(),
                 ..Default::default()
             };
-            unsafe { RegisterClassW(&window_class) };
-        });
+            if unsafe { RegisterClassW(&window_class) } == 0
+                && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
+            {
+                return None;
+            }
+            REGISTERED.store(true, Ordering::Relaxed);
+        }
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED

@@ -2376,8 +2376,11 @@ fn show_drag_label(hwnd: HWND, panel: HWND, x: i32, y: i32) {
     let Some(label) = DragLabel::show(hwnd, &image, &name, pointer, paint.dpi) else {
         return;
     };
-    if with_view(hwnd, |view| view.drag_label = Some(label)).is_none() {
-        label.destroy();
+    match with_view(hwnd, |view| view.drag_label.replace(label)) {
+        // A label no drag end took (none is known): it must not stay on screen.
+        Some(Some(stale)) => stale.destroy(),
+        Some(None) => {}
+        None => label.destroy(),
     }
 }
 
@@ -2632,8 +2635,9 @@ fn focus_panel_for(hwnd: HWND, hit: Option<&Hit>) {
 }
 
 fn left_down(hwnd: HWND, x: i32, y: i32) {
-    // A drag armed by an earlier press whose release never came here.
-    with_view(hwnd, |view| view.drag = None);
+    // A drag armed by an earlier press whose release never came here. `cancel_drag` also ends
+    // one that had started, label and all, though its capture should have ended it already.
+    cancel_drag(hwnd);
     // A right press's cancel whose own release never came here either: stale by now.
     with_view(hwnd, |view| view.eat_right_up = false);
     let hit = hit_after_commit(hwnd, x, y);
