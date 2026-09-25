@@ -37,8 +37,9 @@
 
 ### 3.1 Layout
 
-- Both sections are painted into the existing sidebar panel window. The notebook header band (`HEADER_HEIGHT`, `header_layout`) goes away.
+- Both sections are painted into the existing sidebar panel window.
 - From the top:
+  0. **The title band** (38 px, `side_panel::HEADER_HEIGHT_96`): only the view's name, "NOTEBOOK", like VS Code's "EXPLORER". The band sits in the window's title strip, so all of it stays caption: it drags the window and has no buttons, tooltip or click. The notebook's name and the four buttons move from here to the root row.
   1. **The Open Editors header row:** chevron, "OPEN EDITORS" and the tab count.
   2. **Open Editors rows**, when the section is expanded: at most 9 rows are visible. Past that the section scrolls on its own, with its own scroll bar.
   3. **The notebook root row:** chevron, the notebook's name, and the four buttons on the right.
@@ -119,7 +120,7 @@ An Explorer drop with several items is refused only if every item is refused. Ot
 
 - Before copying, the drop is planned on the UI thread (a pure function): for each item, its destination path, or why it is refused.
 - For each item whose destination already exists, one confirmation: "<name> already exists in <folder>. Replace it?" (`modal::confirm`, OK and Cancel). A folder clashing with a file, or the reverse, asks the same way.
-- OK: the existing item goes to the Recycle Bin (the same helper Delete uses), then the copy is made. If the Recycle Bin step fails, that item isn't copied and the notice says so.
+- OK: the existing item goes to the Recycle Bin right after its prompt, on the UI thread, as Delete does (the shell may show its "delete permanently?" warning, owned by the window). Then the copy is made on the worker. If the Recycle Bin step fails, that item isn't copied and the notice says so.
 - Cancel: that item is skipped. The rest of the drop carries on.
 
 ### 4.5 The copy
@@ -157,7 +158,8 @@ An Explorer drop with several items is refused only if every item is refused. Ot
 - Nothing new runs before first paint or first input. The Open Editors rows are built from the tab list that already exists.
 - The OLE drop target is one `RegisterDragDrop` call on the panel window, made after first paint.
 - Hover work during an Explorer drag happens in memory, the same as the tree drag.
-- All copying and Recycle Bin work runs on the worker. Only the clash prompts and the plan run on the UI thread, and the plan does one `exists` check per top-level item.
+- All copying runs on the worker. The plan, the clash prompts and the Recycle Bin step of an answered prompt run on the UI thread, as Delete does. The plan does one `exists` check per top-level item.
+- An Explorer drop never waits on the UI thread: `Drop` posts the paths and the target folder to the window and returns, as the editor's file drop does. The prompts and the copy start from that posted message.
 
 ## 7. Screen readers
 
