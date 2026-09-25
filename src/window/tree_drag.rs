@@ -37,10 +37,6 @@ pub(crate) enum DragSource {
     /// An Open Editors tab, with its file's path taken when the drag armed: a drop copies it.
     Tab { id: DocumentId, path: PathBuf },
     /// Files dragged in from outside: a drop copies them.
-    #[expect(
-        dead_code,
-        reason = "built by the Explorer drop of a later open editors task"
-    )]
     Files(Vec<PathBuf>),
 }
 

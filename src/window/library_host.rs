@@ -1075,13 +1075,18 @@ pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
 }
 
 /// Scintilla's own OLE drop target refuses files and wins over `WM_DROPFILES`, so the editor gets
-/// a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`. Runs in `BUILD_CHROME`.
+/// a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`. The sidebar panel's own
+/// drop target is registered here too. Runs in `BUILD_CHROME`.
 pub(crate) fn accept_editor_file_drops(hwnd: HWND) {
-    let Some(editor) = unsafe { app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.editor.as_ref().map(|e| e.hwnd()))
-    else {
-        return;
-    };
+    let editor = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.editor.as_ref().map(|e| e.hwnd()));
+    if let Some(editor) = editor {
+        wrap_editor_drop_target(hwnd, editor);
+    }
+    super::side_panel::accept_file_drops(hwnd);
+}
+
+fn wrap_editor_drop_target(hwnd: HWND, editor: HWND) {
     let target = hwnd as isize;
     // Text drag-and-drop still works without the wrapper; only file drops on the editor are lost.
     let _ = crate::editor::file_drop::accept_file_drops(editor, move |paths| {

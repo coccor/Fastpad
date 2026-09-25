@@ -295,6 +295,47 @@ pub(crate) fn copy_tab_into(hwnd: HWND, id: DocumentId, path: &Path, folder: &Pa
     copy_into(hwnd, vec![path.to_path_buf()], folder, dirty_tab);
 }
 
+/// `WM_FASTPAD_PANEL_DROPPED`'s payload: what an Explorer drop on the panel does.
+pub(crate) struct PanelDrop {
+    paths: Vec<PathBuf>,
+    /// `None` opens the paths, as a drop on the window does.
+    folder: Option<PathBuf>,
+}
+
+/// Posts an Explorer drop on the panel to the window, so Drop returns before anything is asked
+/// (open editors spec §6). False when the post failed; its payload is freed here then.
+pub(crate) fn post_panel_drop(hwnd: HWND, paths: Vec<PathBuf>, folder: Option<PathBuf>) -> bool {
+    let payload = Box::into_raw(Box::new(PanelDrop { paths, folder }));
+    let posted = unsafe {
+        PostMessageW(
+            hwnd,
+            crate::window::WM_FASTPAD_PANEL_DROPPED,
+            0,
+            payload as isize,
+        )
+    } != 0;
+    if !posted {
+        drop(unsafe { Box::from_raw(payload) });
+    }
+    posted
+}
+
+/// `WM_FASTPAD_PANEL_DROPPED`: opens or copies. Ignored while a modal dialog runs, as
+/// `WM_DROPFILES` is for a disabled window.
+pub(crate) fn panel_dropped(hwnd: HWND, lparam: LPARAM) {
+    if lparam == 0 {
+        return;
+    }
+    let drop = *unsafe { Box::from_raw(lparam as *mut PanelDrop) };
+    if super::modal::modal_active(hwnd) {
+        return;
+    }
+    match drop.folder {
+        Some(folder) => copy_into(hwnd, drop.paths, &folder, None),
+        None => library_host::files_dropped(hwnd, drop.paths),
+    }
+}
+
 /// Clean tabs open on `replaced` files or on files under `replaced` folders.
 fn clean_tabs_on(hwnd: HWND, replaced: &[PathBuf]) -> Vec<(DocumentId, PathBuf, TabMark)> {
     unsafe { app_ptr(hwnd) }

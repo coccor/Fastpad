@@ -429,6 +429,9 @@ fn sync_presence(hwnd: HWND, enabled: bool) {
 /// runs once `fastpad.ini` has been applied, when that changed the notes mode or the sidebar.
 pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     sync_presence(hwnd, enabled);
+    if enabled {
+        accept_file_drops(hwnd);
+    }
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
 }
@@ -440,14 +443,30 @@ pub(crate) fn create_for_first_frame(hwnd: HWND, enabled: bool) {
     sync_presence(hwnd, enabled);
 }
 
+/// Registers the panel's drop target for files dragged from Explorer (open editors spec §4.1,
+/// §4.3). Never before first paint: it runs in `BUILD_CHROME`, or when notes mode turns on
+/// later. Does nothing without a sidebar or when the panel already has it.
+pub(crate) fn accept_file_drops(hwnd: HWND) {
+    if let Some((_, panel)) = windows(hwnd)
+        && let Err(error) = crate::window::panel_drop::register(hwnd, panel)
+    {
+        push_notice(
+            hwnd,
+            format!("FastPad could not accept files dropped on the sidebar: {error}"),
+        );
+    }
+}
+
 /// Destroys the sidebar's windows. The tooltips are owned by the main window, not the bar or the
-/// panel, so they are destroyed explicitly.
+/// panel, so they are destroyed explicitly. The panel's drop target is revoked first, which
+/// releases it.
 fn destroy_windows(sidebar: &Sidebar) {
     if let Some(tooltip) = sidebar.tooltip {
         tooltip.destroy();
     }
     sidebar.notebook.destroy_tooltip();
     sidebar.search.destroy_tooltip();
+    crate::window::panel_drop::revoke(sidebar.panel);
     unsafe {
         DestroyWindow(sidebar.panel);
         DestroyWindow(sidebar.bar);

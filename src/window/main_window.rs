@@ -243,6 +243,11 @@ unsafe extern "system" fn main_window_proc(
             // A copy into the notebook stops after the file in hand, and is waited for the same
             // way, so no copied file is left half written.
             crate::window::copy_host::stop(hwnd);
+            // The panel goes with this window, not through `side_panel::destroy_windows`: its
+            // drop target is revoked first, which releases it.
+            if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+                crate::window::panel_drop::revoke(panel);
+            }
             // Dropping it here destroys the icon (`LogoIcon::drop`); `WM_NCDESTROY` still frees
             // the rest of App, but the logo shouldn't wait for that.
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
@@ -756,6 +761,10 @@ unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_COPY_DONE {
                 crate::window::copy_host::copy_done(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_PANEL_DROPPED {
+                crate::window::copy_host::panel_dropped(hwnd, lparam);
                 return 0;
             }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
@@ -20735,6 +20744,94 @@ mod tests {
         assert!(
             notices(window.hwnd)
                 .contains(&"work was not copied: it would replace the folder it is in.".to_owned())
+        );
+    }
+
+    /// A drag from Explorer onto panel point `x`, `y`: DragEnter, DragOver, then Drop or
+    /// DragLeave, as OLE runs them. The effects each answered.
+    fn explorer_drop(panel: HWND, x: i32, y: i32, paths: &[&std::path::Path]) -> [u32; 3] {
+        let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(panel, &mut point) };
+        crate::editor::file_drop::test_support::drag_and_drop_at(
+            panel,
+            paths,
+            windows_sys::Win32::Foundation::POINTL {
+                x: point.x,
+                y: point.y,
+            },
+        )
+    }
+
+    #[test]
+    fn panel_drop_onto_the_root_row_copies_and_onto_open_editors_opens() {
+        // Break caught: Explorer drops refused on the panel, dropped on the wrong folder, or
+        // Open Editors copying instead of opening (open editors spec §4.1, §4.3).
+        use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_NONE};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("panel-drop");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let outside = scratch.root.join("x.md");
+        std::fs::write(&outside, "x").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let effects = explorer_drop(
+            panel,
+            root.left + 40,
+            (root.top + root.bottom) / 2,
+            &[&outside],
+        );
+        assert_eq!(effects, [DROPEFFECT_COPY; 3]);
+        pump_until(window.hwnd, || scratch.folder().join("x.md").exists());
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+
+        let header = notebook_view(window.hwnd).editors_header_rect();
+        explorer_drop(panel, header.left + 40, header.top + 5, &[&outside]);
+        pump_until(window.hwnd, || {
+            tab_paths(window.hwnd).contains(&Some(outside.clone()))
+        });
+
+        let title = 10;
+        assert_eq!(
+            explorer_drop(panel, 40, title, &[&outside])[1],
+            DROPEFFECT_NONE,
+            "the title band takes nothing"
+        );
+    }
+
+    #[test]
+    fn panel_drop_returns_before_asking_and_the_posted_drop_asks() {
+        // Break caught (Review Focus 4): the clash prompt shown inside Drop, which keeps
+        // Explorer's drag waiting on FastPad.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("panel-drop-post");
+        scratch.note("x.md", "old");
+        let outside = scratch.root.join("x.md");
+        std::fs::write(&outside, "new").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let _ = crate::window::modal::take_last_confirm();
+        explorer_drop(
+            panel,
+            root.left + 40,
+            (root.top + root.bottom) / 2,
+            &[&outside],
+        );
+        assert!(
+            crate::window::modal::take_last_confirm().is_none(),
+            "nothing asked during Drop"
+        );
+        crate::window::modal::answer_next_confirm(|_| true);
+        pump_until(window.hwnd, || {
+            crate::window::modal::take_last_confirm().is_some()
+        });
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("x.md")).unwrap(),
+            "new"
         );
     }
 }

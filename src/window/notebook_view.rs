@@ -1268,6 +1268,18 @@ impl NotebookView {
             .map_or(Hover::Below, Hover::Row)
     }
 
+    /// Whether an Explorer drop at panel point `x`, `y` opens its files rather than copying them
+    /// (open editors spec §4.1): over Open Editors, or anywhere below the title band with no
+    /// notebook.
+    fn opens_at(&self, x: i32, y: i32) -> bool {
+        let area = self.client();
+        let layout = self.layout(area, self.dpi());
+        if self.root.is_none() {
+            return contains(area, x, y) && y >= layout.title.bottom;
+        }
+        contains(layout.editors_header, x, y) || contains(layout.editors_list, x, y)
+    }
+
     /// The drag moved to `x`, `y`: the target follows, and the highlight repaints when it
     /// changed. Whether a release there moves the item.
     fn drag_to(&mut self, x: i32, y: i32, now: Instant) -> bool {
@@ -2578,17 +2590,25 @@ fn drag_started(hwnd: HWND) -> bool {
 /// rebuild, a mouse-wheel scroll — the band and cursor should still match what is now under the
 /// pointer. Does nothing without a started drag.
 fn retarget_drag(hwnd: HWND, now: Instant) {
-    let Some(pointer) = with_view(hwnd, |view| {
+    let Some((pointer, external)) = with_view(hwnd, |view| {
         view.drag
             .as_ref()
             .filter(|drag| drag.started)
-            .map(|drag| drag.pointer)
+            .map(|drag| (drag.pointer, is_external(&drag.source)))
     })
     .flatten() else {
         return;
     };
     let accepted = with_view(hwnd, |view| view.drag_to(pointer.0, pointer.1, now)).unwrap_or(false);
-    set_drag_cursor(accepted);
+    // OLE owns the cursor during an Explorer drag.
+    if !external {
+        set_drag_cursor(accepted);
+    }
+}
+
+/// Whether a drag of `source` came from outside FastPad, through OLE.
+fn is_external(source: &DragSource) -> bool {
+    matches!(source, DragSource::Files(_))
 }
 
 /// Ends a drag's timer, with nothing of the App borrowed. Leaves the capture alone: most cancels
@@ -2804,9 +2824,10 @@ pub(crate) fn drop_right_release_wait(hwnd: HWND) -> bool {
 /// and a collapsed folder the pointer has rested on long enough expands. `now` comes in so the
 /// tests need not wait.
 pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
-    let Some((scrolled, expand, pointer)) = with_view(hwnd, |view| {
+    let Some((scrolled, expand, pointer, external)) = with_view(hwnd, |view| {
         let drag = view.drag.as_ref().filter(|drag| drag.started)?;
         let pointer = drag.pointer;
+        let external = is_external(&drag.source);
         let expand = tree_drag::expand_due(drag.resting.as_ref(), now);
         let list = view.list_rect(view.client());
         let lines = tree_drag::scroll_step(pointer.1, list.top, list.bottom, view.list.row_height);
@@ -2814,7 +2835,7 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
         if scrolled {
             view.invalidate();
         }
-        Some((scrolled, expand, pointer))
+        Some((scrolled, expand, pointer, external))
     })
     .flatten() else {
         return;
@@ -2830,8 +2851,84 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
     if scrolled || expand.is_some() {
         let accepted =
             with_view(hwnd, |view| view.drag_to(pointer.0, pointer.1, now)).unwrap_or(false);
-        set_drag_cursor(accepted);
+        if !external {
+            set_drag_cursor(accepted);
+        }
     }
+}
+
+/// What an Explorer drag at panel point `x`, `y` does (open editors spec §4.1, §4.3): over Open
+/// Editors, or with no notebook, it opens (COPY, no highlight); over the tree, the root row or
+/// the body, it copies into the folder under it when that folder takes one of `paths` (the
+/// band shows); elsewhere nothing. The drag is kept as a started `DragSource::Files` drag with
+/// no capture and no label, so the tree drag's band, auto-expand and auto-scroll apply.
+pub(crate) fn external_over(hwnd: HWND, x: i32, y: i32, paths: &[PathBuf]) -> bool {
+    let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
+    if opens {
+        external_leave(hwnd);
+        return true;
+    }
+    let started = with_view(hwnd, |view| {
+        if !view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| is_external(&drag.source))
+        {
+            view.drag = Drag::armed(DragSource::Files(paths.to_vec()), x, y).map(|mut drag| {
+                drag.started = true;
+                drag
+            });
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false);
+    if started && let Some(panel) = with_view(hwnd, |view| view.panel) {
+        unsafe { SetTimer(panel, DRAG_TIMER, tree_drag::TICK.as_millis() as u32, None) };
+    }
+    with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false)
+}
+
+/// The Explorer drag left the panel or was cancelled: its band and timer go.
+pub(crate) fn external_leave(hwnd: HWND) {
+    let panel = with_view(hwnd, |view| {
+        let external = view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| is_external(&drag.source));
+        if external {
+            view.drag = None;
+            view.invalidate();
+        }
+        external.then_some(view.panel)
+    })
+    .flatten();
+    if let Some(panel) = panel {
+        end_drag_timer(panel);
+    }
+}
+
+/// An Explorer drop at panel point `x`, `y`: posts what to do and returns at once, so Explorer
+/// never waits on a prompt (spec §6). False when nothing here takes it.
+pub(crate) fn external_drop(hwnd: HWND, x: i32, y: i32, paths: Vec<PathBuf>) -> bool {
+    let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
+    let folder = if opens {
+        None
+    } else {
+        with_view(hwnd, |view| view.drag_to(x, y, Instant::now()))
+            .filter(|&accepted| accepted)
+            .and_then(|_| {
+                with_view(hwnd, |view| {
+                    view.drag.as_ref().and_then(|drag| drag.target.clone())
+                })
+                .flatten()
+            })
+    };
+    external_leave(hwnd);
+    if !opens && folder.is_none() {
+        return false;
+    }
+    super::copy_host::post_panel_drop(hwnd, paths, folder)
 }
 
 /// Gives the tooltip `tools`, making the tooltip first if the view has none yet. Runs with
