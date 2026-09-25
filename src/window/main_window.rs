@@ -11075,6 +11075,30 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_made_while_the_folder_loads_autosaves_once_it_has_loaded() {
+        // Break caught: a keystroke that arrived before the folder's state never being autosaved,
+        // because it found no state to arm the idle timer and nothing armed it after the load.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("edit-while-loading");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let path = open_note(&window, &scratch, "a.md", "one");
+        app_mut(window.hwnd).library.state = None;
+        editor.replace_target(0..0, "x").unwrap();
+        let waited = std::time::Instant::now();
+        while waited.elapsed() < std::time::Duration::from_millis(1_300) {
+            pump_posted_messages(window.hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+        scratch.install(window.hwnd);
+        pump_until(window.hwnd, || {
+            std::fs::read_to_string(&path).is_ok_and(|text| text == "xone")
+        });
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
     fn keep_my_version_on_an_untitled_tab_does_nothing() {
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("keep-untitled");
