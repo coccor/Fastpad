@@ -21030,4 +21030,51 @@ mod tests {
             "{said:?}"
         );
     }
+
+    #[test]
+    fn copy_host_a_dirty_tab_whose_copy_fails_gets_only_the_failure_notice() {
+        // Break caught: "Copied the saved version of…" shown for a copy that failed, next to its
+        // failure notice (open editors spec §4.6).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-dirty-fails");
+        let outside = scratch.root.join("draft.md");
+        std::fs::write(&outside, "saved").unwrap();
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        editor.set_text("changed").unwrap();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let lock = locked(&outside);
+        crate::window::copy_host::copy_tab_into(
+            window.hwnd,
+            id,
+            &outside,
+            std::path::Path::new(""),
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        drop(lock);
+        let said = notices(window.hwnd);
+        assert!(
+            said.iter()
+                .any(|notice| notice.starts_with("draft.md could not be copied: ")),
+            "{said:?}"
+        );
+        assert!(
+            !said
+                .iter()
+                .any(|notice| notice.starts_with("Copied the saved")),
+            "{said:?}"
+        );
+
+        crate::window::copy_host::copy_tab_into(
+            window.hwnd,
+            id,
+            &outside,
+            std::path::Path::new(""),
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(
+            notices(window.hwnd).contains(&crate::window::tree_copy::dirty_notice("draft.md")),
+            "a copy that worked still says so"
+        );
+    }
 }

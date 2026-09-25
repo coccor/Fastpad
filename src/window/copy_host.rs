@@ -23,8 +23,10 @@ struct CopyJob {
     items: Vec<(PathBuf, PathBuf)>,
     /// Clean tabs open on a replaced file, to read again once it is copied.
     reloads: Vec<(DocumentId, PathBuf, TabMark)>,
-    /// Notices known before the copy: refusals, failed recycles, the dirty tab's.
+    /// Notices known before the copy: refusals, failed recycles.
     notices: Vec<String>,
+    /// The dirty tab whose saved version is copied, named once its copy worked.
+    dirty_tab: Option<String>,
     /// The notebook copied into, and the folder in it, relative to it (empty is the root).
     root: PathBuf,
     folder: PathBuf,
@@ -44,6 +46,7 @@ pub(crate) struct CopyDone {
     items: Vec<ItemDone>,
     reloads: Vec<Reload>,
     notices: Vec<String>,
+    dirty_tab: Option<String>,
     root: PathBuf,
     folder: PathBuf,
 }
@@ -141,6 +144,7 @@ fn run_worker(jobs: Receiver<CopyJob>, cancel: Arc<AtomicBool>) {
             items,
             reloads,
             notices: job.notices,
+            dirty_tab: job.dirty_tab,
             root: job.root,
             folder: job.folder,
         }));
@@ -210,7 +214,8 @@ fn kept_by_identity(source: &Path, destination: &Path, name: &str) -> Option<Str
 
 /// Copies `sources` (absolute) into `folder` (relative to the notebook; empty is the root):
 /// plans, asks about each clash, recycles each answered replace, and queues the copies.
-/// `dirty_tab` names the tab whose saved version is copied.
+/// `dirty_tab` names the tab whose saved version is copied: its notice comes once that copy
+/// worked.
 pub(crate) fn copy_into(
     hwnd: HWND,
     sources: Vec<PathBuf>,
@@ -257,9 +262,6 @@ pub(crate) fn copy_into(
             Outcome::Copy => items.push((source, destination)),
         }
     }
-    if let Some(name) = dirty_tab.filter(|_| !items.is_empty()) {
-        notices.push(tree_copy::dirty_notice(&name));
-    }
     if items.is_empty() {
         for notice in notices {
             push_notice(hwnd, notice);
@@ -274,6 +276,7 @@ pub(crate) fn copy_into(
             items,
             reloads,
             notices,
+            dirty_tab,
             root,
             folder: folder.to_path_buf(),
         },
@@ -391,6 +394,12 @@ pub(crate) fn copy_done(hwnd: HWND, lparam: LPARAM) {
 
 fn apply(hwnd: HWND, mut done: CopyDone) {
     let mut notices = std::mem::take(&mut done.notices);
+    // The dirty tab's drop is its one item: the notice goes with a copy that worked.
+    if let Some(name) = done.dirty_tab.take()
+        && done.items.iter().all(|item| item.copied.error.is_none())
+    {
+        notices.push(tree_copy::dirty_notice(&name));
+    }
     let mut hidden = Vec::new();
     let mut rescan = false;
     let mut listed = Vec::new();
@@ -532,6 +541,7 @@ mod tests {
                 .collect(),
             reloads: Vec::new(),
             notices: Vec::new(),
+            dirty_tab: None,
             root: dir.clone(),
             folder: PathBuf::new(),
         });
