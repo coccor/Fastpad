@@ -40,6 +40,7 @@ fn a_closed_session_reopens_its_tabs_and_unsaved_text_on_the_next_launch() {
         .expect("closing with session restore on must not prompt");
     first.close().unwrap();
     assert!(data.session().exists());
+    let after_close = listing(&data.root);
 
     let mut second =
         FastPadProcess::spawn_with_local_app_data(std::iter::empty::<&str>(), &data.root).unwrap();
@@ -55,7 +56,8 @@ fn a_closed_session_reopens_its_tabs_and_unsaved_text_on_the_next_launch() {
     assert_eq!(
         scintilla_text(editor).unwrap(),
         "saved text",
-        "a third tab exists"
+        "a third tab exists\nafter the first close:\n{after_close}now:\n{}",
+        listing(&data.root)
     );
     assert!(
         !data.session().exists(),
@@ -95,6 +97,30 @@ fn with_session_restore_off_closing_asks_and_nothing_is_kept() {
     wait_for_process_exit(process.id(), WAIT).unwrap();
     process.close().unwrap();
     assert!(!data.session().exists());
+}
+
+/// Every file under `dir`, with its size and (for the small text ones) its contents: what a
+/// failure on a CI runner needs to show which snapshot came back twice.
+fn listing(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push_str(&listing(&path));
+            continue;
+        }
+        let size = entry.metadata().map_or(0, |meta| meta.len());
+        out.push_str(&format!("{} ({size} bytes)\n", path.display()));
+        if size < 2_000
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            out.push_str(&format!("    {text:?}\n"));
+        }
+    }
+    out
 }
 
 struct Scratch {
