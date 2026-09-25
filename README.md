@@ -106,9 +106,9 @@ Hover a note to pin it.
 - **Ctrl+N** gives you a new note, labelled by its first line as you type. The first Ctrl+S asks
   for its name inline and saves it into the notebook. Notes in the notebook save themselves
   from then on.
-- **+** in the Notebook view's header, or **New note here** on a folder's menu, names a new note
-  right in the tree, where it will be: type `todo` and Enter makes `todo.md` and opens it. Type
-  an extension such as `data.json` to pick another kind.
+- **+** on the notebook's row at the top of the tree, or **New note here** on a folder's menu,
+  names a new note right in the tree, where it will be: type `todo` and Enter makes `todo.md`
+  and opens it. Type an extension such as `data.json` to pick another kind.
 - **Ctrl+Shift+F** searches the text of every note in the notebook as you type, with match
   case (**Alt+C**), whole word (**Alt+W**) and regular expression (**Alt+R**) toggles. Select
   a word first and it becomes the search. Opening a result puts your search in the find bar,
@@ -123,9 +123,9 @@ Hover a note to pin it.
   VS Code. With nothing typed it lists the notes open in tabs, the most recent first, so
   Ctrl+P then Enter goes back to the previous note. Add `:42` to open a note at line 42, or
   type `:42` alone to go to that line in the current tab.
-- **New folder** in the header, or **New folder here**, names a folder the same way. **F2**
-  renames a note or a folder in place, without opening it, and **Del** sends it to the Recycle
-  Bin. A name that is taken says so as you type. Empty folders show in the tree, and each note
+- **New folder** on the notebook's row, or **New folder here**, names a folder the same way.
+  **F2** renames a note or a folder in place, without opening it, and **Del** sends it to the
+  Recycle Bin. A name that is taken says so as you type. Empty folders show in the tree, and each note
   has a coloured icon for its type.
 - Drag a note or a folder onto another folder in the tree to move it there, or onto empty
   space to move it to the notebook's top level. A label with its name follows the pointer while

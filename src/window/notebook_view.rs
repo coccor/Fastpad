@@ -353,8 +353,9 @@ pub(crate) struct NotebookView {
     tooltip_failed: bool,
     typed: TypeAhead,
     thumb_grab: Option<i32>,
-    /// A drag of a row, armed by a press and under way past the drag distance (tree drag spec
-    /// §3).
+    /// A drag of a tree or Open Editors row, armed by a press and under way past the drag
+    /// distance, which moves or copies (tree drag spec §3, open editors spec §4.3); or an
+    /// Explorer drag over the panel.
     pub(crate) drag: Option<Drag>,
     /// The right press that cancelled a drag: its release opens no menu.
     pub(crate) eat_right_up: bool,
@@ -1292,7 +1293,7 @@ impl NotebookView {
     }
 
     /// The drag moved to `x`, `y`: the target follows, and the highlight repaints when it
-    /// changed. Whether a release there moves the item.
+    /// changed. Whether a release there moves or copies the item.
     fn drag_to(&mut self, x: i32, y: i32, now: Instant) -> bool {
         let hover = self.drag_hover(x, y);
         let Some(drag) = self.drag.as_mut() else {
@@ -2785,7 +2786,7 @@ fn take_started_drag(hwnd: HWND) -> Option<HWND> {
     drag.is_some_and(|drag| drag.started).then_some(panel)
 }
 
-/// Ends a drag without moving anything (tree drag spec §3.3): Esc, a lost capture, another view,
+/// Ends a drag without moving or copying anything (tree drag spec §3.3): Esc, a lost capture, another view,
 /// the sidebar hiding, or the dragged row gone. An armed drag just goes. True when a drag was
 /// under way.
 pub(crate) fn cancel_drag(hwnd: HWND) -> bool {

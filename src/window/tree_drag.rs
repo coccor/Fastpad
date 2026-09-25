@@ -23,7 +23,7 @@ pub(crate) enum Hover {
     Row(usize),
     /// The list below its last row.
     Below,
-    /// The view's header, above the list.
+    /// The notebook's root row, above the list.
     Header,
     /// Outside the panel.
     Outside,
@@ -40,7 +40,8 @@ pub(crate) enum DragSource {
     Files(Vec<PathBuf>),
 }
 
-/// A drag armed by a press on a row, and under way once `started`.
+/// A drag armed by a press on a tree or Open Editors row, and under way once `started`: a drop
+/// moves a tree row and copies anything else. An Explorer drag is one too, started at once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Drag {
     pub(crate) source: DragSource,
@@ -50,7 +51,7 @@ pub(crate) struct Drag {
     pub(crate) started: bool,
     /// The last pointer position, for the timer's scroll and re-targeting.
     pub(crate) pointer: (i32, i32),
-    /// The folder a release now moves the item into, when that folder takes it.
+    /// The folder a release now moves or copies the item into, when that folder takes it.
     pub(crate) target: Option<PathBuf>,
     /// The collapsed folder row the pointer rests on, and since when (spec §3.3).
     pub(crate) resting: Option<(PathBuf, Instant)>,
@@ -117,7 +118,7 @@ fn parent_of(path: &Path) -> PathBuf {
 }
 
 /// The folder a drop over `hover` goes into (spec §3.2): a folder row's folder, a note row's
-/// folder, the root for the truncated row, the space below the rows and the header; `None`
+/// folder, the root for the truncated row, the space below the rows and the root row; `None`
 /// outside the panel and on the draft row.
 pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
     match hover {
@@ -155,18 +156,6 @@ pub(crate) fn source_accepts(source: &DragSource, root: &Path, folder: &Path) ->
         }
         DragSource::Files(paths) => tree_copy::any_accepted(paths, root, folder),
     }
-}
-
-/// Whether a drop of `source` copies rather than moves (open editors spec §4.3).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by the Explorer drop of a later open editors task"
-    )
-)]
-pub(crate) fn copies(source: &DragSource) -> bool {
-    !matches!(source, DragSource::Row(_))
 }
 
 /// Where `source` lands when dropped into `folder`: the same name in that folder.
@@ -461,7 +450,6 @@ mod tests {
             path: PathBuf::from(r"D:\x\draft.txt"),
         };
         assert!(source_accepts(&outside, root, Path::new("work")));
-        assert!(copies(&outside) && !copies(&DragSource::Row(note("a.md"))));
         let mut drag = Drag::armed(outside, 1, 2).unwrap();
         assert!(drag.hover(&rows(), root, (5, 5), Hover::Row(0), Instant::now()));
         assert_eq!(drag.target, Some(PathBuf::from("work")));
