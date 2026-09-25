@@ -473,7 +473,7 @@ fn is_dragged_row(dragged: Option<&RowKind>, rows: &[TreeRow], index: usize) -> 
     clippy::too_many_arguments,
     reason = "one icon's paint inputs, shared by a tree row and the drag label"
 )]
-fn draw_item_icon(
+pub(crate) fn draw_item_icon(
     dc: HDC,
     item: TreeItem,
     rect: RECT,

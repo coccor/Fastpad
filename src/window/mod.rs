@@ -18,6 +18,7 @@ pub(crate) mod name_box;
 pub(crate) mod notebook_layout;
 pub(crate) mod notebook_view;
 pub mod notification;
+pub(crate) mod open_editors;
 pub(crate) mod option_toggles;
 pub mod palette;
 pub(crate) mod panel;
