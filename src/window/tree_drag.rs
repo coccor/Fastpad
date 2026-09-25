@@ -9,15 +9,34 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How long the pointer rests on a collapsed folder row before it expands (spec §3.3).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) const EXPAND_DELAY: Duration = Duration::from_millis(700);
 /// The drag timer's period: one auto-scroll step and one auto-expand check (spec §3.3).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) const TICK: Duration = Duration::from_millis(50);
 
 /// What a drag's pointer is over (spec §3.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) enum Hover {
     /// A list row: a tree row, or the "truncated" row just past the last one.
     Row(usize),
@@ -31,7 +50,13 @@ pub(crate) enum Hover {
 
 /// A drag armed by a press on a row, and under way once `started`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) struct Drag {
     pub(crate) source: RowKind,
     /// Where the press landed, in panel coordinates.
@@ -48,7 +73,13 @@ pub(crate) struct Drag {
 
 impl Drag {
     /// A drag of `source` armed by a press at `x`, `y`; `None` for a row that cannot be dragged.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the tree drag in notebook_view (next tasks)"
+        )
+    )]
     pub(crate) fn armed(source: RowKind, x: i32, y: i32) -> Option<Self> {
         draggable(&source).then_some(Self {
             source,
@@ -62,7 +93,13 @@ impl Drag {
 
     /// The pointer moved to `point`, over `hover`: the target and the resting folder follow.
     /// True when the target changed, so the highlight repaints.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the tree drag in notebook_view (next tasks)"
+        )
+    )]
     pub(crate) fn hover(
         &mut self,
         rows: &[TreeRow],
@@ -80,20 +117,38 @@ impl Drag {
 }
 
 /// Notes and folders can be dragged; unsaved rows and the draft row cannot (spec §3.1).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn draggable(kind: &RowKind) -> bool {
     matches!(kind, RowKind::Note(_) | RowKind::Folder(_))
 }
 
 /// Whether the pointer moved more than the system drag distance (`SM_CXDRAG`, `SM_CYDRAG`: the
 /// pixels on either side of the press) from `origin`.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn past_threshold(origin: (i32, i32), point: (i32, i32), cx: i32, cy: i32) -> bool {
     (point.0 - origin.0).abs() > cx || (point.1 - origin.1).abs() > cy
 }
 
 /// A note's or folder's path, relative to the notebook.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn source_path(kind: &RowKind) -> Option<&Path> {
     match kind {
         RowKind::Note(path) | RowKind::Folder(path) => Some(path),
@@ -101,7 +156,13 @@ pub(crate) fn source_path(kind: &RowKind) -> Option<&Path> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 fn parent_of(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
@@ -109,7 +170,13 @@ fn parent_of(path: &Path) -> PathBuf {
 /// The folder a drop over `hover` goes into (spec §3.2): a folder row's folder, a note row's
 /// folder, the root for an unsaved row, the truncated row, the space below the rows and the
 /// header; `None` outside the panel and on the draft row.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
     match hover {
         Hover::Row(index) => match rows.get(index).map(|row| &row.kind) {
@@ -125,7 +192,13 @@ pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
 
 /// Whether `folder` takes `source` (spec §3.2): not its own folder, where nothing would change,
 /// and for a folder, not itself or a folder inside it. Ignores letter case, as NTFS does.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
     let Some(path) = source_path(source) else {
         return false;
@@ -137,14 +210,26 @@ pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
 }
 
 /// Where `source` lands when dropped into `folder`: the same name in that folder.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn destination(source: &RowKind, folder: &Path) -> Option<PathBuf> {
     Some(folder.join(source_path(source)?.file_name()?))
 }
 
 /// The rows a drop target highlights (spec §3.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) enum Highlight {
     /// The whole list.
     Root,
@@ -153,7 +238,13 @@ pub(crate) enum Highlight {
 }
 
 /// What dropping into `folder` highlights; `None` when the folder has no row now.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn highlight(rows: &[TreeRow], folder: &Path) -> Option<Highlight> {
     if folder.as_os_str().is_empty() {
         return Some(Highlight::Root);
@@ -170,7 +261,13 @@ pub(crate) fn highlight(rows: &[TreeRow], folder: &Path) -> Option<Highlight> {
 /// Lines to scroll per tick with the pointer at `y`, for a list from `top` to `bottom` (spec
 /// §3.3): negative in the top zone, positive in the bottom zone, 0 between. Each zone is one row
 /// high: 1 line in its outer half, 2 in its inner half, 3 past the list's edge.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn scroll_step(y: i32, top: i32, bottom: i32, row_height: i32) -> i32 {
     let zone = row_height.max(1);
     let speed = |depth: i32| {
@@ -193,7 +290,13 @@ pub(crate) fn scroll_step(y: i32, top: i32, bottom: i32, row_height: i32) -> i32
 
 /// The collapsed folder the pointer rests on, keeping its first time while it stays the same
 /// row. Only a folder that takes the drag rests: expanding a refused one would help nothing.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 fn rest_on(
     resting: Option<(PathBuf, Instant)>,
     rows: &[TreeRow],
@@ -218,7 +321,13 @@ fn rest_on(
 }
 
 /// The resting folder to expand at `now`, once it has rested `EXPAND_DELAY`.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the tree drag in notebook_view (next tasks)"
+    )
+)]
 pub(crate) fn expand_due(resting: Option<&(PathBuf, Instant)>, now: Instant) -> Option<PathBuf> {
     resting
         .filter(|(_, since)| now.saturating_duration_since(*since) >= EXPAND_DELAY)
