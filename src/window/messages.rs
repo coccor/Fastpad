@@ -33,6 +33,13 @@ pub const WM_FASTPAD_REPLACE_RELOADED: u32 = WM_APP + 16;
 /// another window of this thread (wparam 0) or out of FastPad (wparam
 /// `inline_name::LEFT_FASTPAD`) (inline naming spec §5.3).
 pub const WM_FASTPAD_INLINE_NAME_LEFT: u32 = WM_APP + 17;
+// Not part of the deferred chain: the copy worker's result for one drop, as a `Box` the receiver
+// frees. A post that fails because the window is gone is freed on the worker.
+pub const WM_FASTPAD_COPY_DONE: u32 = WM_APP + 18;
+// Not part of the deferred chain: files dropped from Explorer on the sidebar panel and what they
+// do there, as a `Box` the receiver frees. Posted so the drag source is not kept waiting on a
+// prompt; a post that fails is freed on the sender.
+pub const WM_FASTPAD_PANEL_DROPPED: u32 = WM_APP + 19;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.
@@ -101,12 +108,12 @@ fn next_action(message: u32, next: u32, input_pending: bool) -> DeferredAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeferredAction, WM_FASTPAD_APPLY_LANGUAGE, WM_FASTPAD_BUILD_CHROME,
+        DeferredAction, WM_FASTPAD_APPLY_LANGUAGE, WM_FASTPAD_BUILD_CHROME, WM_FASTPAD_COPY_DONE,
         WM_FASTPAD_LIBRARY_READY, WM_FASTPAD_LOAD_SETTINGS, WM_FASTPAD_OPEN_LIBRARY,
-        WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_RECOVERY, WM_FASTPAD_REPLACE_COUNTED,
-        WM_FASTPAD_REPLACE_RELOADED, WM_FASTPAD_REPLACE_WRITTEN, WM_FASTPAD_RESTORE_SESSION,
-        WM_FASTPAD_START_IPC, WM_FASTPAD_TEXT_SEARCH_BATCH, classify_deferred_message,
-        completed_milestone,
+        WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_PANEL_DROPPED, WM_FASTPAD_RECOVERY,
+        WM_FASTPAD_REPLACE_COUNTED, WM_FASTPAD_REPLACE_RELOADED, WM_FASTPAD_REPLACE_WRITTEN,
+        WM_FASTPAD_RESTORE_SESSION, WM_FASTPAD_START_IPC, WM_FASTPAD_TEXT_SEARCH_BATCH,
+        classify_deferred_message, completed_milestone,
     };
     use crate::perf::Milestone;
 
@@ -210,6 +217,8 @@ mod tests {
             WM_FASTPAD_REPLACE_COUNTED,
             WM_FASTPAD_REPLACE_WRITTEN,
             WM_FASTPAD_REPLACE_RELOADED,
+            WM_FASTPAD_COPY_DONE,
+            WM_FASTPAD_PANEL_DROPPED,
         ] {
             assert_eq!(classify_deferred_message(message, false), None);
         }

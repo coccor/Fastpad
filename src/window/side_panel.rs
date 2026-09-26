@@ -43,9 +43,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     OBJID_CLIENT, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor,
     SetWindowPos, ShowWindow, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU,
     WM_CTLCOLOREDIT, WM_ERASEBKGND, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_VISIBLE,
 };
 
 /// Sizes at 96 DPI, scaled with `panel::scale`.
@@ -65,7 +66,7 @@ pub(crate) struct UiFonts {
     pub(crate) text_bold: HFONT,
     /// Header titles in small capitals: Segoe UI semibold, 11 px.
     pub(crate) bold: HFONT,
-    /// Unsaved rows and notices inside the list: Segoe UI italic, 12 px.
+    /// Notices inside the list: Segoe UI italic, 12 px.
     pub(crate) italic: HFONT,
     /// Row and header-button icons: Segoe MDL2 Assets, 12 px.
     pub(crate) glyph: HFONT,
@@ -428,6 +429,9 @@ fn sync_presence(hwnd: HWND, enabled: bool) {
 /// runs once `fastpad.ini` has been applied, when that changed the notes mode or the sidebar.
 pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     sync_presence(hwnd, enabled);
+    if enabled {
+        accept_file_drops(hwnd);
+    }
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
 }
@@ -439,14 +443,30 @@ pub(crate) fn create_for_first_frame(hwnd: HWND, enabled: bool) {
     sync_presence(hwnd, enabled);
 }
 
+/// Registers the panel's drop target for files dragged from Explorer (open editors spec §4.1,
+/// §4.3). Never before first paint: it runs in `BUILD_CHROME`, or when notes mode turns on
+/// later. Does nothing without a sidebar or when the panel already has it.
+pub(crate) fn accept_file_drops(hwnd: HWND) {
+    if let Some((_, panel)) = windows(hwnd)
+        && let Err(error) = crate::window::panel_drop::register(hwnd, panel)
+    {
+        push_notice(
+            hwnd,
+            format!("FastPad could not accept files dropped on the sidebar: {error}"),
+        );
+    }
+}
+
 /// Destroys the sidebar's windows. The tooltips are owned by the main window, not the bar or the
-/// panel, so they are destroyed explicitly.
+/// panel, so they are destroyed explicitly. The panel's drop target is revoked first, which
+/// releases it.
 fn destroy_windows(sidebar: &Sidebar) {
     if let Some(tooltip) = sidebar.tooltip {
         tooltip.destroy();
     }
     sidebar.notebook.destroy_tooltip();
     sidebar.search.destroy_tooltip();
+    crate::window::panel_drop::revoke(sidebar.panel);
     unsafe {
         DestroyWindow(sidebar.panel);
         DestroyWindow(sidebar.bar);
@@ -555,6 +575,7 @@ fn refresh_now(hwnd: HWND) {
     let Some((bar, panel)) = windows(hwnd) else {
         return;
     };
+    crate::window::notebook_view::editors_changed(hwnd);
     crate::window::notebook_view::rebuild(hwnd);
     crate::window::favorites_view::refresh(hwnd, panel);
     crate::window::search_view::library_changed(hwnd);
@@ -975,6 +996,8 @@ unsafe extern "system" fn panel_proc(
             | WM_LBUTTONDOWN
             | WM_LBUTTONUP
             | WM_LBUTTONDBLCLK
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
             | WM_MOUSEWHEEL
             | WM_COMMAND
             | sidebar_accessibility::WM_FASTPAD_SIDEBAR_ACTION
@@ -1036,8 +1059,10 @@ unsafe extern "system" fn panel_proc(
         // Everything else a view may want goes to it first. Wheel and context-menu positions are
         // screen coordinates; the view converts them.
         WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_CAPTURECHANGED
-        | WM_MOUSELEAVE | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_CONTEXTMENU | WM_MOUSEWHEEL
-        | WM_KEYDOWN | WM_CHAR | WM_TIMER => route(main, panel, message, wparam, lparam),
+        | WM_MOUSELEAVE | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP
+        | WM_CONTEXTMENU | WM_MOUSEWHEEL | WM_KEYDOWN | WM_CHAR | WM_TIMER => {
+            route(main, panel, message, wparam, lparam)
+        }
         WM_SETFOCUS | WM_KILLFOCUS => {
             unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
             0
@@ -1117,7 +1142,12 @@ fn paint_panel(main: HWND, panel: HWND) {
 /// Paints `view` over the panel's background.
 fn paint_view(main: HWND, view: PanelView, paint: &ViewPaint) {
     match view {
-        PanelView::Notebook => crate::window::notebook_view::paint(main, paint),
+        PanelView::Notebook => {
+            // A paint never shows stale rows. `editors_changed` repaints only when they changed,
+            // so this doesn't loop.
+            crate::window::notebook_view::editors_changed(main);
+            crate::window::notebook_view::paint(main, paint);
+        }
         PanelView::Search => crate::window::search_view::paint(main, paint),
         PanelView::Favorites => crate::window::favorites_view::paint(main, paint),
     }
@@ -1158,11 +1188,11 @@ fn view_key(
 }
 
 /// Whether header point `x`, `y` (panel client coordinates) is empty, so the window drags from
-/// it: not the Notebook header's title and buttons, the Search header's field (the search box
+/// it: all of the Notebook view's title band, but not the Search header's field (the search box
 /// and the padding painted around it), nor the Favorites header's Open notebook… button.
 fn header_is_caption(main: HWND, view: PanelView, panel: HWND, x: i32, y: i32) -> bool {
     match view {
-        PanelView::Notebook => !crate::window::notebook_view::header_hit(main, x, y),
+        PanelView::Notebook => true,
         PanelView::Search => !crate::window::search_view::header_hit(main, panel, x, y),
         PanelView::Favorites => {
             let mut client = RECT::default();

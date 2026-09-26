@@ -228,7 +228,7 @@ struct AccessibleVtable {
     get_acc_child_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
     get_acc_child: unsafe extern "system" fn(*mut c_void, VARIANT, *mut *mut c_void) -> HRESULT,
     get_acc_name: unsafe extern "system" fn(*mut c_void, VARIANT, *mut BSTR) -> HRESULT,
-    get_acc_value: usize,
+    get_acc_value: unsafe extern "system" fn(*mut c_void, VARIANT, *mut BSTR) -> HRESULT,
     get_acc_description: usize,
     get_acc_role: unsafe extern "system" fn(*mut c_void, VARIANT, *mut VARIANT) -> HRESULT,
     get_acc_state: unsafe extern "system" fn(*mut c_void, VARIANT, *mut VARIANT) -> HRESULT,
@@ -279,16 +279,28 @@ impl Accessible {
     }
 
     fn name(&self, child: i32) -> Option<String> {
+        self.text(child, self.vtable().get_acc_name)
+    }
+
+    /// An outline item's level, as tree views report it in the value.
+    fn value(&self, child: i32) -> Option<String> {
+        self.text(child, self.vtable().get_acc_value)
+    }
+
+    fn text(
+        &self,
+        child: i32,
+        read: unsafe extern "system" fn(*mut c_void, VARIANT, *mut BSTR) -> HRESULT,
+    ) -> Option<String> {
         let mut value: BSTR = std::ptr::null();
-        let result =
-            unsafe { (self.vtable().get_acc_name)(self.0, child_variant(child), &mut value) };
+        let result = unsafe { read(self.0, child_variant(child), &mut value) };
         if result < 0 || value.is_null() {
             return None;
         }
         let length = unsafe { SysStringLen(value) } as usize;
-        let name = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) });
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) });
         unsafe { SysFreeString(value) };
-        Some(name)
+        Some(text)
     }
 
     fn role(&self, child: i32) -> Option<u32> {
@@ -371,16 +383,27 @@ fn panel_lists(panel: HWND, name: &str) -> bool {
         .is_some_and(|accessible| accessible.children().iter().any(|(_, n)| n == name))
 }
 
-/// The note and folder rows the panel lists, in order. Rows for untitled tabs (", unsaved") are
-/// left out: every launch starts with one.
+/// The note and folder rows the panel's tree lists, in order. The section rows (the Open Editors
+/// header and the notebook's root row) are outline items at level 0, each with its rows under it,
+/// so the tree's rows are the outline items after the root row. No root row (no notebook open),
+/// no tree rows.
 fn tree_rows(panel: HWND) -> Vec<String> {
     let Some(accessible) = Accessible::from_window(panel) else {
         return Vec::new();
     };
-    (1..=accessible.child_count())
+    let outline: Vec<(String, Option<String>)> = (1..=accessible.child_count())
         .filter(|&id| accessible.role(id) == Some(ROLE_SYSTEM_OUTLINEITEM))
-        .filter_map(|id| accessible.name(id))
-        .filter(|name| !name.ends_with(", unsaved"))
+        .filter_map(|id| Some((accessible.name(id)?, accessible.value(id))))
+        .collect();
+    let Some(root) = outline.iter().position(|(name, level)| {
+        level.as_deref() == Some("0") && !name.starts_with("Open editors, ")
+    }) else {
+        return Vec::new();
+    };
+    outline
+        .into_iter()
+        .skip(root + 1)
+        .map(|(name, _)| name)
         .collect()
 }
 

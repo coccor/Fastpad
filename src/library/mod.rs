@@ -424,6 +424,7 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
     // The UI thread owns these conveniences: what it set while the rescan ran wins.
     fresh.local.autosave = previous_local.autosave;
     fresh.local.expanded = previous_local.expanded;
+    fresh.local.root_collapsed = previous_local.root_collapsed;
 
     if fresh.metadata == Metadata::Busy {
         // The rescan could not read library.ini: what the live state knows still stands, and the
@@ -1031,6 +1032,18 @@ mod tests {
         assert!(merged.record_for(&a).unwrap().pinned);
         assert_eq!(merged.pending.len(), 1);
         assert!(merged.local.is_expanded(Path::new("SUB")));
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_root_collapsed_state_the_ui_set_while_it_ran() {
+        // Break caught: a rescan reopening the root row the user just collapsed.
+        let scratch = Scratch::new("rescan-root");
+        std::fs::write(scratch.folder().join("a.md"), "a").unwrap();
+        let mut previous = load(&scratch.folder(), &scratch.local(), 100).unwrap();
+        let fresh = load(&scratch.folder(), &scratch.local(), 101).unwrap();
+        previous.local.root_collapsed = true;
+        let merged = merge_rescan(previous, fresh);
+        assert!(merged.local.root_collapsed);
     }
 
     #[test]
@@ -1989,7 +2002,7 @@ mod tests {
     }
 
     fn tree_rows(tree: &tree::NoteTree) -> Vec<tree::TreeRow> {
-        tree.rows(&|_| true, &[])
+        tree.rows(&|_| true)
     }
 
     /// What a fresh build of the state's notes, folders and pins shows.

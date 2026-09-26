@@ -240,6 +240,14 @@ unsafe extern "system" fn main_window_proc(
             // an offline drive this can hold the close for one save's I/O timeout.
             crate::window::text_search_host::cancel_replace(hwnd);
             crate::window::text_search_host::join_writers(hwnd);
+            // A copy into the notebook stops after the file in hand, and is waited for the same
+            // way, so no copied file is left half written.
+            crate::window::copy_host::stop(hwnd);
+            // The panel goes with this window, not through `side_panel::destroy_windows`: its
+            // drop target is revoked first, which releases it.
+            if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+                crate::window::panel_drop::revoke(panel);
+            }
             // Dropping it here destroys the icon (`LogoIcon::drop`); `WM_NCDESTROY` still frees
             // the rest of App, but the logo shouldn't wait for that.
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
@@ -749,6 +757,14 @@ unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_REPLACE_RELOADED {
                 crate::window::text_search_host::replace_reloaded(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_COPY_DONE {
+                crate::window::copy_host::copy_done(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_PANEL_DROPPED {
+                crate::window::copy_host::panel_dropped(hwnd, lparam);
                 return 0;
             }
             // A nested modal loop dispatches whatever is queued. Deferred startup units and the
@@ -2744,6 +2760,25 @@ fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
     }
 }
 
+/// Whether the Notebook view's Open Editors section is expanded (open editors spec §3.3).
+pub(crate) fn open_editors_expanded(hwnd: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }
+        .is_none_or(|app| unsafe { app.as_ref() }.settings.open_editors_expanded)
+}
+
+/// Collapses or expands the Open Editors section and saves it. Only the panel repaints.
+pub(crate) fn set_open_editors_expanded(hwnd: HWND, expanded: bool) {
+    change_setting(hwnd, |settings| {
+        (settings.open_editors_expanded != expanded).then(|| {
+            settings.open_editors_expanded = expanded;
+            ("open_editors_expanded", expanded.to_string())
+        })
+    });
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+    }
+}
+
 /// Applies one settings change from a command and saves it to `fastpad.ini`. `change` edits the
 /// in-memory settings and names the `key=value` it made, or returns `None` when nothing changed.
 pub(crate) fn change_setting(
@@ -2761,7 +2796,10 @@ pub(crate) fn change_setting(
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
     // The sidebar's view, width and icon set change only the sidebar, which their callers redo;
     // the editor and the Markdown preview are not restyled for them.
-    let sidebar_only = matches!(key, "sidebar_view" | "sidebar_width" | "file_icons");
+    let sidebar_only = matches!(
+        key,
+        "sidebar_view" | "sidebar_width" | "file_icons" | "open_editors_expanded"
+    );
     if theme_changed {
         apply_theme(hwnd);
         unsafe {
@@ -3905,6 +3943,19 @@ fn close_active_document(hwnd: HWND) {
         review
     };
     close_reviewed_document(hwnd, &identity, &editor, review, decision);
+}
+
+/// Closes tab `id` as a middle-click on it does (open editors spec §3.2), if it is still open.
+pub(crate) fn close_document_tab(hwnd: HWND, id: DocumentId) {
+    let index = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .documents()
+            .position(|document| document.id == id)
+    });
+    if let Some(index) = index {
+        close_tab_at(hwnd, index);
+    }
 }
 
 /// Closes the tab at strip `index` (quick-open spec §5). A clean tab that isn't the active one
@@ -5602,12 +5653,15 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if changed {
         invalidate_title_strip(hwnd);
     }
+    crate::window::notebook_view::editors_changed(hwnd);
 }
 
 pub(crate) fn invalidate_title_strip(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+    // The Open Editors rows show what the strip does.
+    crate::window::notebook_view::editors_changed(hwnd);
 }
 
 /// Refreshes the retained tab-view snapshot after a document's title-affecting field (e.g. its
@@ -5957,12 +6011,26 @@ fn store_app(hwnd: HWND, value: Box<App>) {
     }
 }
 
+/// Dispatches everything already posted to `hwnd`, leaving any WM_QUIT for the harness.
+#[cfg(test)]
+pub(crate) fn pump_posted_messages(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
+    };
+    let mut message = MSG::default();
+    while unsafe { PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
+        unsafe {
+            DispatchMessageW(&message);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MainWindowClass, WindowCreateContext, execute_command, handle_paint_with,
-        mark_first_paint_complete, sidebar_command_runs, take_deferred_start_pending,
-        with_command_palette,
+        mark_first_paint_complete, pump_posted_messages, sidebar_command_runs,
+        take_deferred_start_pending, with_command_palette,
     };
     use crate::app::App;
     use crate::document::{CloseDecision, Language, RecoveryId};
@@ -5990,16 +6058,6 @@ mod tests {
         DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow,
         MSG, PM_REMOVE, PeekMessageW, SendMessageW, WM_CLOSE, WM_PAINT,
     };
-
-    /// Dispatches everything already posted to `hwnd`, leaving any WM_QUIT for the harness.
-    fn pump_posted_messages(hwnd: HWND) {
-        let mut message = MSG::default();
-        while unsafe { PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
-            unsafe {
-                DispatchMessageW(&message);
-            }
-        }
-    }
 
     #[test]
     fn the_main_window_has_a_title_for_the_taskbar() {
@@ -8540,13 +8598,13 @@ mod tests {
         let header_y = layout.resize_border + 2;
         let header = crate::window::panel::scale(crate::window::side_panel::HEADER_HEIGHT_96, dpi);
         assert!(header_y < header);
-        // Left of the Notebook header's title (which starts 12 px in and stays client area, so
-        // its tooltip works): empty header, a drag area.
+        // The Notebook view's title band holds only its caption, "NOTEBOOK": all of it is a
+        // drag area, the old title point included.
         let panel_x = crate::window::panel::scale(4, dpi);
         assert_eq!(
             hit(panel, client_size(panel).0 / 2, header_y),
-            HTCLIENT as LRESULT,
-            "the notebook's name is not a drag area"
+            HTTRANSPARENT as LRESULT,
+            "the whole title band is caption"
         );
         assert_eq!(hit(panel, panel_x, header_y), HTTRANSPARENT as LRESULT);
         assert_eq!(
@@ -11843,6 +11901,7 @@ mod tests {
 
     use crate::library::tree::RowKind;
     use crate::window::notebook_view::{Activation, Mode, NotebookView};
+    use crate::window::tree_drag::DragSource;
 
     /// Task 6 creates the sidebar with the window when notes mode is on; this makes sure of it.
     fn ensure_sidebar(hwnd: HWND) {
@@ -12240,27 +12299,17 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_notebook_says_so_until_an_untitled_tab_appears_as_an_unsaved_row() {
-        // Break caught: a blank panel for a notebook with no notes, or a new untitled tab that the
-        // tree does not show until it is saved.
+    fn an_empty_notebook_stays_empty_with_untitled_tabs_open() {
+        // Break caught: untitled tabs still listed in the tree as well as in Open Editors, or an
+        // empty notebook's state hidden by them (open editors spec §3.4).
         let _scintilla = load_native_scintilla();
-        let scratch = LibraryScratch::new("view-empty");
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        ensure_sidebar(window.hwnd);
-        scratch.install(window.hwnd);
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
-        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
-
+        let scratch = LibraryScratch::new("empty-untitled");
+        let (window, _editor) = notebook_window(&scratch);
         execute_command(window.hwnd, CommandId::New);
         crate::window::notebook_view::rebuild(window.hwnd);
-        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
         let view = notebook_view(window.hwnd);
-        assert_eq!(view.mode, Mode::Tree);
-        assert_eq!(view.rows[0].kind, RowKind::Unsaved(id.0));
-        assert_eq!(view.rows[0].name, "Untitled");
+        assert_eq!(view.mode, crate::window::notebook_view::Mode::Empty);
+        assert!(view.rows.is_empty());
     }
 
     #[test]
@@ -12304,15 +12353,15 @@ mod tests {
     }
 
     #[test]
-    fn switching_tabs_in_an_unchanged_notebook_and_typing_a_first_line_do_not_reflatten() {
-        // Break caught: every tab switch, and every keystroke in an untitled tab's first line,
-        // flattening the whole tree again (tens of milliseconds in a big, expanded notebook).
+    fn switching_tabs_in_an_unchanged_notebook_does_not_reflatten() {
+        // Break caught: every tab switch flattening the whole tree again (tens of milliseconds
+        // in a big, expanded notebook).
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("view-no-reflatten");
         let a = scratch.note("a.md", "a");
         let b = scratch.note("b.md", "b");
         let window = ProductionWindow::new(make_app());
-        let editor = install_test_editor(&window);
+        let _editor = install_test_editor(&window);
         ensure_sidebar(window.hwnd);
         scratch.install(window.hwnd);
         super::open_path(window.hwnd, &a).unwrap();
@@ -12335,24 +12384,6 @@ mod tests {
             Some(RowKind::Note("b.md".into()))
         );
         assert_eq!(notebook_view(window.hwnd).rebuilds, before, "no re-flatten");
-
-        // A new untitled tab adds a row, so that switch does rebuild; typing its first line
-        // then only renames the row.
-        execute_command(window.hwnd, CommandId::New);
-        let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
-        let after_new = notebook_view(window.hwnd).rebuilds;
-        assert_eq!(after_new, before + 1, "Ctrl+N flattens the tree once");
-        editor.set_text("Groceries").unwrap();
-        pump_posted_messages(window.hwnd);
-        let row = row_of(window.hwnd, &RowKind::Unsaved(untitled.0));
-        assert_eq!(notebook_view(window.hwnd).rows[row].name, "Groceries");
-        assert_eq!(notebook_view(window.hwnd).rebuilds, after_new);
-        assert!(super::activate_document_by_id(window.hwnd, a_id));
-        assert_eq!(
-            notebook_view(window.hwnd).rebuilds,
-            after_new,
-            "the renamed row's label is part of the key, so switching away does not rebuild"
-        );
     }
 
     #[test]
@@ -12586,8 +12617,8 @@ mod tests {
 
     #[test]
     fn the_context_menu_acts_on_its_row_not_the_active_tab() {
-        // Break caught: Pin from a row's menu pinning the active tab's note instead, "New note
-        // here" ignoring the folder, or Close tab on an unsaved row closing another tab.
+        // Break caught: Pin from a row's menu pinning the active tab's note instead, or "New
+        // note here" ignoring the folder.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("context-menu");
         std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
@@ -12616,13 +12647,6 @@ mod tests {
             Some(crate::window::inline_name::Purpose::NewNote("sub".into()))
         );
         crate::window::inline_name::cancel(window.hwnd);
-        execute_command(window.hwnd, CommandId::New);
-        let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
-
-        let before = super::tab_count(window.hwnd);
-        menu(&RowKind::Unsaved(untitled.0), CommandId::CloseTab);
-        assert_eq!(super::tab_count(window.hwnd), before - 1);
-        assert!(app_mut(window.hwnd).tabs.document(untitled).is_none());
 
         menu(
             &RowKind::Folder("sub".into()),
@@ -16347,18 +16371,27 @@ mod tests {
             .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
             .collect::<Vec<_>>();
         assert_eq!(items.len(), count);
-        let rows = items
+        let outline = items
             .iter()
             .filter(|item| {
                 item.role == windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM
-                    && !item.name.ends_with(", unsaved")
             })
             .collect::<Vec<_>>();
-        // The window's untitled tab is an unsaved row, left out above. "sub" is collapsed, so b
-        // is not a row: pinned a first, then the folder.
+        // The tree's rows are the outline items after the notebook's root row: the section rows
+        // (the Open Editors header and the root row) are at level 0, each with its rows under it.
+        let root = outline
+            .iter()
+            .position(|item| item.value == "0" && !item.name.starts_with("Open editors, "))
+            .expect("the notebook's root row");
+        let rows = &outline[root + 1..];
+        // "sub" is collapsed, so b is not a row: pinned a first, then the folder.
         assert_eq!(rows.len(), 2, "{items:?}");
         assert_eq!(rows[0].name, "a.md, Markdown, pinned");
         assert_eq!(rows[1].name, "sub");
+        assert!(
+            rows.iter().all(|row| row.value == "1"),
+            "top-level rows sit one level under the root row: {items:?}"
+        );
         assert_ne!(
             rows[1].state & crate::window::sidebar_accessibility::STATE_COLLAPSED,
             0
@@ -17290,8 +17323,7 @@ mod tests {
         };
 
         press();
-        // The test editor's untitled tab keeps its row above the draft (spec §3.1).
-        assert_eq!(draft_row(window.hwnd), Some((1, 0)), "first at the root");
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
         assert_eq!(
             crate::window::inline_name::purpose(window.hwnd),
             Some(crate::window::inline_name::Purpose::NewFolder(
@@ -17736,9 +17768,7 @@ mod tests {
             crate::window::inline_name::purpose(window.hwnd),
             Some(Purpose::NewNote(std::path::PathBuf::new()))
         );
-        // The test editor's own untitled tab is an unsaved row at index 0; the root draft goes
-        // below it (spec §3.1).
-        assert_eq!(draft_row(window.hwnd), Some((1, 0)));
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)));
         assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
         assert_eq!(super::tab_count(window.hwnd), tabs, "no untitled tab");
         field_key(window.hwnd, VK_ESCAPE);
@@ -17915,10 +17945,6 @@ mod tests {
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("inline-new-note-empty");
         let (window, _editor) = notebook_window(&scratch);
-        // The test editor's own untitled tab would otherwise show as an unsaved row.
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
         assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
 
         crate::window::notebook_view::header_clicked(
@@ -17940,10 +17966,6 @@ mod tests {
         let scratch = LibraryScratch::new("inline-draft-empty-gone");
         std::fs::create_dir(scratch.folder().join("Fresh")).unwrap();
         let (window, _editor) = notebook_window(&scratch);
-        // The test editor's own untitled tab would otherwise show as an unsaved row.
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
         crate::window::inline_name::new_note(window.hwnd, Some("Fresh".into()));
         assert!(inline_open(window.hwnd));
         assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
@@ -17968,10 +17990,6 @@ mod tests {
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("inline-empty-state-button");
         let (window, _editor) = notebook_window(&scratch);
-        // The test editor's own untitled tab would otherwise show as an unsaved row.
-        let start = app_mut(window.hwnd).tabs.active().unwrap().id;
-        super::close_document_without_prompt(window.hwnd, start);
-        crate::window::notebook_view::rebuild(window.hwnd);
         assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
         let tabs = super::tab_count(window.hwnd);
 
@@ -18511,6 +18529,103 @@ mod tests {
         client_lparam(client.right / 2, bottom + 40)
     }
 
+    /// Presses on Open Editors row `index` and moves past the drag distance.
+    fn start_tab_drag(hwnd: HWND, panel: HWND, index: usize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let rect = notebook_view(hwnd).editor_rect_at(index).unwrap();
+        let (x, y) = ((rect.left + rect.right) / 3, (rect.top + rect.bottom) / 2);
+        mouse(panel, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+        mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x, y + 40));
+    }
+
+    #[test]
+    fn open_editors_drag_onto_a_folder_copies_the_file_and_leaves_the_tab_on_it() {
+        // Break caught: the drop moving the file, the tab following the copy, or the copied row
+        // not selected (open editors spec §4.1, §4.5).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        drop_at(panel, work);
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+            "draft"
+        );
+        assert!(outside.exists());
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(outside.as_path())
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"work\draft.txt".into())),
+            "a .txt is a note type, listed and selected"
+        );
+    }
+
+    #[test]
+    fn open_editors_drag_onto_its_own_folder_copies_nothing_and_asks_nothing() {
+        // Break caught (Review Focus 1).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-self");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let b = scratch.note(r"work\b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &b).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        let row = row_lparam(window.hwnd, &RowKind::Note(r"work\b.md".into()));
+        drag_over(panel, row);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            None
+        );
+        drop_at(panel, row);
+        assert!(crate::window::modal::take_last_confirm().is_none());
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b");
+    }
+
+    #[test]
+    fn open_editors_an_untitled_row_does_not_start_a_drag() {
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-untitled");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        assert!(notebook_view(window.hwnd).drag.is_none());
+    }
+
+    #[test]
+    fn open_editors_drag_survives_its_tab_closing_mid_drag() {
+        // Break caught (Review Focus 5): a stale DocumentId panicking the drop, or the drop
+        // copying nothing though the pressed file is still on disk.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-closed");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("gone.md");
+        std::fs::write(&outside, "g").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        start_tab_drag(window.hwnd, panel, 0);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        drop_at(panel, work);
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(scratch.folder().join(r"work\gone.md").exists());
+    }
+
     fn drag_cursor_is(cursor: windows_sys::core::PCWSTR) -> bool {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursor, LoadCursorW};
         unsafe { GetCursor() == LoadCursorW(std::ptr::null_mut(), cursor) }
@@ -18619,7 +18734,7 @@ mod tests {
         start_drag(window.hwnd, panel, &RowKind::Folder(r"work\inner".into()));
         assert_eq!(
             notebook_view(window.hwnd).drag.as_ref().unwrap().source,
-            RowKind::Folder(r"work\inner".into())
+            DragSource::Row(RowKind::Folder(r"work\inner".into()))
         );
         let below = below_rows(window.hwnd, panel);
         drag_over(panel, below);
@@ -19027,7 +19142,7 @@ mod tests {
                 .drag
                 .as_ref()
                 .map(|drag| drag.source.clone()),
-            Some(RowKind::Note("a.md".into())),
+            Some(DragSource::Row(RowKind::Note("a.md".into()))),
             "the pressed row's drag armed only once the edit had closed"
         );
         assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);
@@ -19299,6 +19414,376 @@ mod tests {
             false,
         );
         assert!(gone(shown), "another view");
+    }
+
+    /// The centre of `rect` as a panel `lParam`.
+    fn centre(rect: RECT) -> super::LPARAM {
+        client_lparam((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+    }
+
+    #[test]
+    fn open_editors_lists_the_tabs_and_follows_opening_closing_and_saving() {
+        // Break caught: a tab opened or closed without its row following, a dirty tab without
+        // its dot, or the active tab's row not the selected one (open editors spec §3.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-follow");
+        let a = scratch.note("a.md", "a");
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        let outside = scratch.root.join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        super::open_path(window.hwnd, &outside).unwrap();
+        let names = |hwnd| {
+            notebook_view(hwnd)
+                .editors
+                .rows
+                .iter()
+                .map(|row| (row.name.clone(), row.dirty, row.active))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(window.hwnd),
+            [
+                ("a.md".into(), false, false),
+                ("outside.txt".into(), false, true)
+            ]
+        );
+        editor.set_text("changed").unwrap();
+        assert!(names(window.hwnd)[1].1, "the dirty dot follows the edit");
+        crate::window::modal::answer_next_close_prompt(|_| CloseDecision::Discard);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert_eq!(names(window.hwnd).len(), 1);
+    }
+
+    #[test]
+    fn open_editors_click_switches_close_box_and_middle_click_close() {
+        // Break caught: a click that opens nothing, the close box closing the wrong tab, or a
+        // middle-click ignored in the panel (open editors spec §3.2).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-click");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let c = scratch.note("c.md", "c");
+        let (window, _editor) = notebook_window(&scratch);
+        for path in [&a, &b, &c] {
+            super::open_path(window.hwnd, path).unwrap();
+        }
+        let panel = sidebar_windows(window.hwnd).1;
+        let row0 = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row0));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row0));
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path())
+        );
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            panel,
+            "the focus stays in the panel, as a click on a tree row leaves it"
+        );
+
+        let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        let close = crate::window::open_editors::close_rect(row1, 96);
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(close));
+        mouse(panel, WM_LBUTTONUP, 0, centre(close));
+        assert_eq!(tab_paths(window.hwnd), [Some(a.clone()), Some(c.clone())]);
+
+        let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        mouse(panel, WM_MBUTTONDOWN, 4, centre(row1));
+        mouse(panel, WM_MBUTTONUP, 0, centre(row1));
+        assert_eq!(tab_paths(window.hwnd), [Some(a)]);
+    }
+
+    #[test]
+    fn open_editors_expanded_after_a_switch_while_collapsed_shows_every_row() {
+        // Break caught: a tab switch while the section was collapsed (a list 0 px high) scrolling
+        // the rows to the active one, so expanding showed one row and blank space below, with
+        // clicks landing on the wrong row.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-collapsed-switch");
+        let paths: Vec<_> = (0..6)
+            .map(|index| scratch.note(&format!("n{index}.md"), "x"))
+            .collect();
+        let (window, _editor) = notebook_window(&scratch);
+        for path in &paths {
+            super::open_path(window.hwnd, path).unwrap();
+        }
+        assert_eq!(notebook_view(window.hwnd).editors.rows.len(), 6);
+        let panel = sidebar_windows(window.hwnd).1;
+        let toggle = || {
+            let header = notebook_view(window.hwnd).editors_header_rect();
+            mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+            mouse(panel, WM_LBUTTONUP, 0, centre(header));
+        };
+        toggle();
+        assert!(!super::open_editors_expanded(window.hwnd));
+        let fifth = notebook_view(window.hwnd).editors.rows[4].id;
+        super::activate_document_by_id(window.hwnd, fifth);
+        assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(4));
+        toggle();
+        assert!(super::open_editors_expanded(window.hwnd));
+        assert_eq!(notebook_view(window.hwnd).editors.list.top, 0);
+        for index in 0..6 {
+            assert!(
+                notebook_view(window.hwnd).editor_rect_at(index).is_some(),
+                "row {index} is in view"
+            );
+        }
+        let row0 = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row0));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row0));
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(paths[0].as_path()),
+            "a click lands on the row drawn there"
+        );
+    }
+
+    #[test]
+    fn open_editors_and_the_root_collapse_and_stay_so() {
+        // Break caught: the chevrons doing nothing, the tree still hit-tested while the root is
+        // collapsed, or either state lost (open editors spec §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-collapse");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let panel = sidebar_windows(window.hwnd).1;
+        let header = notebook_view(window.hwnd).editors_header_rect();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+        mouse(panel, WM_LBUTTONUP, 0, centre(header));
+        assert!(!super::open_editors_expanded(window.hwnd));
+        let root = notebook_view(window.hwnd).root_rect();
+        let chevron = crate::window::notebook_layout::root_parts(root, 96).chevron;
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(chevron));
+        mouse(panel, WM_LBUTTONUP, 0, centre(chevron));
+        assert!(!crate::window::library_host::root_expanded(window.hwnd));
+        assert!(!notebook_view(window.hwnd).tree_shown());
+        let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
+        assert!(
+            std::fs::read_to_string(local)
+                .unwrap()
+                .contains("root=collapsed")
+        );
+    }
+
+    #[test]
+    fn the_arrow_keys_cross_from_open_editors_into_the_tree_and_del_on_a_tab_row_deletes_nothing() {
+        // Break caught: the keyboard stuck in the tree, Enter on a tab row doing nothing, or Del
+        // on a tab row deleting the tree's selected note (open editors spec §3.5).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DELETE, VK_DOWN, VK_HOME, VK_RETURN,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-keys");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+        key(VK_HOME);
+        assert_eq!(
+            notebook_view(window.hwnd).cursor,
+            crate::window::panel_cursor::Cursor::EditorsHeader
+        );
+        key(VK_DOWN);
+        key(VK_DELETE);
+        assert!(a.exists() && b.exists(), "Del on a tab row deletes nothing");
+        key(VK_RETURN);
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(a.as_path())
+        );
+        for _ in 0..3 {
+            key(VK_DOWN);
+        }
+        assert_eq!(
+            notebook_view(window.hwnd).cursor,
+            crate::window::panel_cursor::Cursor::Tree
+        );
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into()))
+        );
+    }
+
+    #[test]
+    fn a_note_command_with_a_tab_row_selected_leaves_the_trees_selected_note_alone() {
+        // Break caught: Delete run while the keyboard selection is on an Open Editors row
+        // deleting the tree's selected note instead of the active tab's (open editors spec
+        // §3.5).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-delete");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        super::open_path(window.hwnd, &b).unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row1));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row1));
+        assert_eq!(
+            notebook_view(window.hwnd).cursor,
+            crate::window::panel_cursor::Cursor::Editor(1)
+        );
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            panel
+        );
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        crate::window::modal::answer_next_confirm(|_| true);
+        execute_command(window.hwnd, CommandId::NoteDelete);
+        assert!(a.exists(), "the tree's selected note stays");
+        assert!(!b.exists(), "the active tab's note goes");
+    }
+
+    #[test]
+    fn the_root_rows_new_note_button_still_makes_the_note_in_the_selected_folder() {
+        // Break caught: a click on the root row's New note moving the keyboard selection off the
+        // tree, so the note went to the notebook's root (open editors spec §3.3).
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-root-new-note");
+        std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+        scratch.note(r"sub\a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        select_row(window.hwnd, &RowKind::Folder("sub".into()));
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
+            .buttons
+            .into_iter()
+            .find(|(button, _)| *button == crate::window::notebook_view::HeaderButton::NewNote)
+            .unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(new_note));
+        mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
+        assert_eq!(
+            crate::window::inline_name::purpose(window.hwnd),
+            Some(crate::window::inline_name::Purpose::NewNote("sub".into()))
+        );
+    }
+
+    #[test]
+    fn without_a_notebook_the_arrows_cross_between_open_editors_and_recent() {
+        // Break caught: the keyboard stuck in RECENT or in Open Editors while no notebook is
+        // open (open editors spec §3.5).
+        use crate::window::panel_cursor::Cursor;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_HOME, VK_UP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-recent-a");
+        let other = LibraryScratch::new("editors-recent-b");
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+        crate::library::local::write_folders(
+            &crate::library::local::folders_file(&scratch.data()),
+            &crate::library::local::RecentFolders {
+                folders: vec![scratch.folder(), other.folder()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::CloseNotebook);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
+        assert!(!notebook_view(window.hwnd).recent.is_empty());
+        let tabs = notebook_view(window.hwnd).editors.rows.len();
+        assert!(tabs >= 1);
+        let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+        key(VK_HOME);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::EditorsHeader);
+        for _ in 0..tabs {
+            key(VK_DOWN);
+        }
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(tabs - 1));
+        key(VK_DOWN);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+        assert_eq!(
+            notebook_view(window.hwnd).list.selected,
+            Some(0),
+            "RECENT's first row"
+        );
+        key(VK_UP);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(tabs - 1));
+    }
+
+    #[test]
+    fn page_keys_move_within_the_open_editors_rows() {
+        // Break caught: Page Up and Page Down dropped on an Open Editors row, or moving the
+        // active tab's row instead of the keyboard selection (open editors spec §3.5).
+        use crate::window::panel_cursor::Cursor;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DOWN, VK_HOME, VK_NEXT, VK_PRIOR,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-page");
+        let paths: Vec<_> = (0..12)
+            .map(|index| scratch.note(&format!("n{index:02}.md"), "x"))
+            .collect();
+        let (window, _editor) = notebook_window(&scratch);
+        for path in &paths {
+            super::open_path(window.hwnd, path).unwrap();
+        }
+        let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+        key(VK_HOME);
+        key(VK_DOWN);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(0));
+        key(VK_NEXT);
+        let Cursor::Editor(paged) = notebook_view(window.hwnd).cursor else {
+            panic!("{:?}", notebook_view(window.hwnd).cursor);
+        };
+        assert!(paged > 1 && paged < 12, "{paged}");
+        assert!(
+            notebook_view(window.hwnd).editor_rect_at(paged).is_some(),
+            "the paged-to row is in view"
+        );
+        assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(11));
+        assert_eq!(notebook_view(window.hwnd).editors.list.selected, Some(11));
+        key(VK_PRIOR);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(0));
+    }
+
+    #[test]
+    fn screen_readers_see_the_sections_and_the_tab_rows() {
+        // Break caught: Open Editors rows invisible to screen readers, or headers without their
+        // expanded state (open editors spec §7).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-msaa");
+        let a = scratch.note("a.md", "a");
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        editor.set_text("changed").unwrap();
+        let panel = sidebar_windows(window.hwnd).1;
+        let count = crate::window::side_panel::accessible_item_count(panel);
+        let items: Vec<_> = (0..count)
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .collect();
+        // Break caught (spec §7): tab rows exposed unlike tree rows, or a flat outline where the
+        // tree's top rows sit at the level of the rows that hold them.
+        let outline = |name: &str| {
+            let item = items
+                .iter()
+                .find(|item| item.name == name)
+                .unwrap_or_else(|| panic!("{name} in {items:?}"));
+            assert_eq!(
+                item.role,
+                windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM,
+                "{name}"
+            );
+            item.value.clone()
+        };
+        assert_eq!(outline("Open editors, 1"), "0");
+        assert_eq!(outline("a.md, open editor, modified"), "1");
+        let notebook = crate::window::library_host::notebook_name(&scratch.folder());
+        assert_eq!(outline(&notebook), "0");
+        assert_eq!(outline("a.md, Markdown"), "1", "a top-level tree row");
     }
 
     #[test]
@@ -19873,11 +20358,7 @@ mod tests {
         };
 
         crate::window::inline_name::new_note(window.hwnd, None);
-        assert_eq!(
-            draft_row(window.hwnd),
-            Some((1, 0)),
-            "after the untitled tab's row"
-        );
+        assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
         click(row_lparam(window.hwnd, &RowKind::Note("b.md".into())));
         assert!(!inline_open(window.hwnd));
         assert_eq!(
@@ -20051,5 +20532,574 @@ mod tests {
         assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
         assert!(scratch.folder().join("n00.md").exists());
         assert!(!scratch.folder().join("half.md").exists());
+    }
+
+    #[test]
+    fn copy_host_copies_files_and_folders_indexes_notes_and_says_what_is_hidden() {
+        // Break caught: a copied note missing from the tree until a rescan, a copied folder not
+        // listed, a non-note copied silently, or the single copied row not selected
+        // (open editors spec §4.5, §4.6).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-into");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(outside.join(r"pics\deep")).unwrap();
+        std::fs::write(outside.join("draft.md"), "d").unwrap();
+        std::fs::write(outside.join(r"pics\deep\x.png"), [1u8]).unwrap();
+        std::fs::write(outside.join("photo.png"), [1u8]).unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![outside.join("draft.md")],
+            std::path::Path::new("work"),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(scratch.folder().join(r"work\draft.md").exists());
+        assert!(outside.join("draft.md").exists(), "a copy, not a move");
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note(r"work\draft.md".into()))
+        );
+
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![outside.join("pics"), outside.join("photo.png")],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(scratch.folder().join(r"pics\deep\x.png").exists());
+        assert!(scratch.folder().join("photo.png").exists());
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.contains("isn't shown") || notice.contains("aren't shown"))
+        );
+    }
+
+    #[test]
+    fn copy_host_a_clash_asks_ok_replaces_and_cancel_skips() {
+        // Break caught: a clash replaced without asking, Cancel stopping the whole drop, or a
+        // replaced clean tab left showing the old text (open editors spec §4.4, §4.7).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-clash");
+        let a = scratch.note("a.md", "old a");
+        scratch.note("b.md", "old b");
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.md"), "new a").unwrap();
+        std::fs::write(outside.join("b.md"), "new b").unwrap();
+        std::fs::write(outside.join("c.md"), "new c").unwrap();
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::modal::answer_next_confirm(|_| false);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![
+                outside.join("a.md"),
+                outside.join("b.md"),
+                outside.join("c.md"),
+            ],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        let folder = crate::window::library_host::notebook_name(&scratch.folder());
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some(format!("b.md already exists in {folder}. Replace it?").as_str())
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("b.md")).unwrap(),
+            "old b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("c.md")).unwrap(),
+            "new c"
+        );
+        assert_eq!(editor.text().unwrap(), "new a", "the clean tab reloaded");
+    }
+
+    #[test]
+    fn copy_host_a_failed_recycle_skips_that_item_and_says_so() {
+        // Break caught (Review Focus 3): an item copied (or half-copied) after its Recycle Bin
+        // step failed, or the rest of the drop abandoned.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-recycle-fails");
+        scratch.note("a.md", "old a");
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.md"), "new a").unwrap();
+        std::fs::write(outside.join("b.md"), "new b").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::copy_host::fail_next_recycle();
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![outside.join("a.md"), outside.join("b.md")],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("a.md")).unwrap(),
+            "old a"
+        );
+        assert!(scratch.folder().join("b.md").exists());
+        assert!(notices(window.hwnd).contains(
+            &"a.md was not copied: it could not be moved to the Recycle Bin.".to_owned()
+        ));
+    }
+
+    #[test]
+    fn copy_host_an_alias_of_the_source_is_refused_and_nothing_is_recycled() {
+        // Break caught: a `\\?\` or 8.3 spelling of the item itself, or of the folder holding it,
+        // passing the lexical plan as a clash, so answering OK recycled the very item being copied.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-alias");
+        let note = scratch.note("a-long-note-name.md", "keep");
+        std::fs::create_dir_all(scratch.folder().join(r"work\work")).unwrap();
+        std::fs::write(scratch.folder().join(r"work\work\in.md"), "in").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        let verbatim = |path: &std::path::Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![
+                verbatim(&note),
+                verbatim(&scratch.folder().join(r"work\work")),
+            ],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "keep");
+        assert!(scratch.folder().join(r"work\work\in.md").exists());
+        let said = notices(window.hwnd);
+        assert!(
+            said.contains(&"a-long-note-name.md was not copied: it is already there.".to_owned())
+        );
+        assert!(
+            said.contains(&"work was not copied: it would replace the folder it is in.".to_owned())
+        );
+
+        let short = crate::platform::files::short_path_for_test(&note);
+        if short.file_name() == note.file_name() {
+            // The scratch volume makes no 8.3 names: the `\\?\` spelling above stands in.
+            return;
+        }
+        let short_name = crate::window::tree_copy::item_name(&short);
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![short],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "keep");
+        assert!(notices(window.hwnd).contains(&format!(
+            "{short_name} was not copied: it is already there."
+        )));
+    }
+
+    #[test]
+    fn copy_host_a_junction_in_the_source_path_does_not_hide_the_folder_holding_it() {
+        // Break caught: the identity check walking only the folders of the source as spelled, so
+        // with a junction on the way the real folder holding it was not seen, and answering OK
+        // recycled that folder with the source inside it.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-junction");
+        let inner = scratch.folder().join("work").join("x").join("work");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("in.md"), "in").unwrap();
+        let link = scratch.root.join("j");
+        crate::platform::files::junction_for_test(&link, &scratch.folder().join("work").join("x"));
+        let (window, _editor) = notebook_window(&scratch);
+
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![link.join("work")],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        let folder = crate::window::library_host::notebook_name(&scratch.folder());
+        assert_eq!(
+            crate::window::modal::take_last_confirm().as_deref(),
+            Some(format!("work already exists in {folder}. Replace it?").as_str()),
+            "the plan saw a clash, not the refusal"
+        );
+        assert_eq!(std::fs::read_to_string(inner.join("in.md")).unwrap(), "in");
+        assert!(
+            notices(window.hwnd)
+                .contains(&"work was not copied: it would replace the folder it is in.".to_owned())
+        );
+    }
+
+    /// A drag from Explorer onto panel point `x`, `y`: DragEnter, DragOver, then Drop or
+    /// DragLeave, as OLE runs them. The effects each answered.
+    fn explorer_drop(panel: HWND, x: i32, y: i32, paths: &[&std::path::Path]) -> [u32; 3] {
+        let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(panel, &mut point) };
+        crate::editor::file_drop::test_support::drag_and_drop_at(
+            panel,
+            paths,
+            windows_sys::Win32::Foundation::POINTL {
+                x: point.x,
+                y: point.y,
+            },
+        )
+    }
+
+    #[test]
+    fn panel_drop_onto_the_root_row_copies_and_onto_open_editors_opens() {
+        // Break caught: Explorer drops refused on the panel, dropped on the wrong folder, or
+        // Open Editors copying instead of opening (open editors spec §4.1, §4.3).
+        use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_NONE};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("panel-drop");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        let outside = scratch.root.join("x.md");
+        std::fs::write(&outside, "x").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let effects = explorer_drop(
+            panel,
+            root.left + 40,
+            (root.top + root.bottom) / 2,
+            &[&outside],
+        );
+        assert_eq!(effects, [DROPEFFECT_COPY; 3]);
+        pump_until(window.hwnd, || scratch.folder().join("x.md").exists());
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+
+        let header = notebook_view(window.hwnd).editors_header_rect();
+        explorer_drop(panel, header.left + 40, header.top + 5, &[&outside]);
+        pump_until(window.hwnd, || {
+            tab_paths(window.hwnd).contains(&Some(outside.clone()))
+        });
+
+        let title = 10;
+        assert_eq!(
+            explorer_drop(panel, 40, title, &[&outside])[1],
+            DROPEFFECT_NONE,
+            "the title band takes nothing"
+        );
+    }
+
+    #[test]
+    fn panel_drop_returns_before_asking_and_the_posted_drop_asks() {
+        // Break caught (Review Focus 4): the clash prompt shown inside Drop, which keeps
+        // Explorer's drag waiting on FastPad.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("panel-drop-post");
+        scratch.note("x.md", "old");
+        let outside = scratch.root.join("x.md");
+        std::fs::write(&outside, "new").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let _ = crate::window::modal::take_last_confirm();
+        explorer_drop(
+            panel,
+            root.left + 40,
+            (root.top + root.bottom) / 2,
+            &[&outside],
+        );
+        assert!(
+            crate::window::modal::take_last_confirm().is_none(),
+            "nothing asked during Drop"
+        );
+        crate::window::modal::answer_next_confirm(|_| true);
+        pump_until(window.hwnd, || {
+            crate::window::modal::take_last_confirm().is_some()
+        });
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join("x.md")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn open_editors_a_tab_and_an_explorer_file_copy_into_an_empty_notebook() {
+        // Break caught: a notebook with no notes refusing every copy, because the drag's hover
+        // only looked for a tree (open editors spec §4.1: the root row or empty space copies into
+        // the root).
+        use windows_sys::Win32::System::Ole::DROPEFFECT_COPY;
+        let _scintilla = load_native_scintilla();
+        // The root row of an empty notebook takes a tab.
+        {
+            let scratch = LibraryScratch::new("empty-copy");
+            let outside = scratch.root.join("tab.md");
+            std::fs::write(&outside, "t").unwrap();
+            let (window, _editor) = notebook_window(&scratch);
+            super::open_path(window.hwnd, &outside).unwrap();
+            assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+            let panel = sidebar_windows(window.hwnd).1;
+
+            let tab = notebook_view(window.hwnd)
+                .editors
+                .rows
+                .iter()
+                .position(|row| row.path.as_deref() == Some(outside.as_path()))
+                .unwrap();
+            start_tab_drag(window.hwnd, panel, tab);
+            let root = notebook_view(window.hwnd).root_rect();
+            let on_root = client_lparam(root.left + 40, (root.top + root.bottom) / 2);
+            drag_over(panel, on_root);
+            assert_eq!(
+                notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+                Some(PathBuf::new()),
+                "the root row takes the tab"
+            );
+            drop_at(panel, on_root);
+            crate::window::copy_host::wait_for_copies(window.hwnd);
+            assert!(scratch.folder().join("tab.md").exists());
+        }
+
+        // Another empty notebook, and the space under its root row.
+        let scratch = LibraryScratch::new("empty-copy-body");
+        let dropped = scratch.root.join("dropped.md");
+        std::fs::write(&dropped, "d").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+        let panel = sidebar_windows(window.hwnd).1;
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let root = notebook_view(window.hwnd).root_rect();
+        let effects = explorer_drop(panel, root.left + 40, root.bottom + 40, &[&dropped]);
+        assert_eq!(effects, [DROPEFFECT_COPY; 3]);
+        pump_until(window.hwnd, || scratch.folder().join("dropped.md").exists());
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+    }
+
+    #[test]
+    fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows_the_field() {
+        // Break caught: New note, New folder or Rename opening their name field in a collapsed
+        // root, hidden, with the keyboard focus in it (open editors spec §3.3).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("inline-root-collapsed");
+        scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        let collapse = || {
+            crate::window::library_host::set_root_expanded(window.hwnd, false);
+            crate::window::notebook_view::rebuild(window.hwnd);
+            assert!(!notebook_view(window.hwnd).tree_shown());
+        };
+        collapse();
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
+            .buttons
+            .into_iter()
+            .find(|(button, _)| *button == crate::window::notebook_view::HeaderButton::NewNote)
+            .unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(new_note));
+        mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
+        assert!(inline_open(window.hwnd));
+        assert!(crate::window::library_host::root_expanded(window.hwnd));
+        assert!(notebook_view(window.hwnd).tree_shown());
+        assert!(is_shown(inline_field(window.hwnd)), "the name field shows");
+        field_key(window.hwnd, VK_ESCAPE);
+
+        collapse();
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+        assert!(inline_open(window.hwnd));
+        assert!(notebook_view(window.hwnd).tree_shown());
+        assert!(
+            is_shown(inline_field(window.hwnd)),
+            "the rename field shows"
+        );
+        field_key(window.hwnd, VK_ESCAPE);
+
+        collapse();
+        crate::window::inline_name::rename_note_at(window.hwnd, &scratch.folder().join("a.md"));
+        assert!(inline_open(window.hwnd));
+        assert!(notebook_view(window.hwnd).tree_shown());
+        assert!(
+            is_shown(inline_field(window.hwnd)),
+            "the revealed row's field shows"
+        );
+    }
+
+    #[test]
+    fn open_editors_a_collapsed_root_takes_the_keyboard_off_the_hidden_tree() {
+        // Break caught: with the root collapsed, the keyboard selection left on a tree row that
+        // isn't shown, type-ahead selecting hidden rows, and Del deleting one (open editors spec
+        // §3.3, §3.5).
+        use crate::window::panel_cursor::Cursor;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-root-keys");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+
+        crate::window::library_host::set_root_expanded(window.hwnd, false);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Root);
+
+        // Even a selection left in the tree some other way acts on nothing hidden.
+        notebook_view(window.hwnd).cursor = Cursor::Tree;
+        let panel = sidebar_windows(window.hwnd).1;
+        unsafe { SendMessageW(panel, WM_CHAR, 'b' as usize, 0) };
+        assert_eq!(
+            selected_kind(window.hwnd),
+            Some(RowKind::Note("a.md".into())),
+            "type-ahead selects no hidden row"
+        );
+        let _ = crate::window::modal::take_last_confirm();
+        crate::window::modal::answer_next_confirm(|_| true);
+        crate::window::notebook_view::key_down(window.hwnd, VK_DELETE);
+        assert!(
+            crate::window::modal::take_last_confirm().is_none(),
+            "no prompt"
+        );
+        assert!(a.exists() && b.exists());
+    }
+
+    /// Opens `path` with no sharing, so a copy of it fails, until the handle is dropped.
+    fn locked(path: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn copy_host_a_failure_part_way_through_a_folder_says_how_many_files_were_copied() {
+        // Break caught: a folder's failure without its count, or "1 files" (open editors spec
+        // §4.6, §8).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-part-way");
+        let pack = scratch.root.join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(pack.join(name), name).unwrap();
+        }
+        let (window, _editor) = notebook_window(&scratch);
+        let lock = locked(&pack.join("b.md"));
+        crate::window::copy_host::copy_into(
+            window.hwnd,
+            vec![pack.clone()],
+            std::path::Path::new(""),
+            None,
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        drop(lock);
+        assert!(scratch.folder().join(r"pack\a.md").exists());
+        assert!(
+            !scratch.folder().join(r"pack\c.md").exists(),
+            "the rest stops"
+        );
+        let said = notices(window.hwnd);
+        assert!(
+            said.iter().any(|notice| {
+                notice.starts_with("pack could not be copied: ")
+                    && notice.ends_with(". 1 file was copied before the failure.")
+            }),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn copy_host_a_dirty_tab_whose_copy_fails_gets_only_the_failure_notice() {
+        // Break caught: "Copied the saved version of…" shown for a copy that failed, next to its
+        // failure notice (open editors spec §4.6).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("copy-dirty-fails");
+        let outside = scratch.root.join("draft.md");
+        std::fs::write(&outside, "saved").unwrap();
+        let (window, editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        editor.set_text("changed").unwrap();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let lock = locked(&outside);
+        crate::window::copy_host::copy_tab_into(
+            window.hwnd,
+            id,
+            &outside,
+            std::path::Path::new(""),
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        drop(lock);
+        let said = notices(window.hwnd);
+        assert!(
+            said.iter()
+                .any(|notice| notice.starts_with("draft.md could not be copied: ")),
+            "{said:?}"
+        );
+        assert!(
+            !said
+                .iter()
+                .any(|notice| notice.starts_with("Copied the saved")),
+            "{said:?}"
+        );
+
+        crate::window::copy_host::copy_tab_into(
+            window.hwnd,
+            id,
+            &outside,
+            std::path::Path::new(""),
+        );
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(
+            notices(window.hwnd).contains(&crate::window::tree_copy::dirty_notice("draft.md")),
+            "a copy that worked still says so"
+        );
+    }
+
+    #[test]
+    fn panel_drop_while_a_modal_runs_is_refused_rather_than_lost() {
+        // Break caught: an Explorer drop answered COPY during a modal dialog, then dropped
+        // silently when its posted message arrived (open editors spec §4.3).
+        use windows_sys::Win32::System::Ole::DROPEFFECT_NONE;
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("panel-drop-modal");
+        scratch.note("a.md", "a");
+        let outside = scratch.root.join("x.md");
+        std::fs::write(&outside, "x").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        crate::window::side_panel::accept_file_drops(window.hwnd);
+        let panel = sidebar_windows(window.hwnd).1;
+        let root = notebook_view(window.hwnd).root_rect();
+        let header = notebook_view(window.hwnd).editors_header_rect();
+        let modal = crate::window::modal::ModalScope::enter(window.hwnd);
+        let effects = explorer_drop(
+            panel,
+            root.left + 40,
+            (root.top + root.bottom) / 2,
+            &[&outside],
+        );
+        assert_eq!(effects, [DROPEFFECT_NONE; 3]);
+        assert_eq!(
+            explorer_drop(panel, header.left + 40, header.top + 5, &[&outside]),
+            [DROPEFFECT_NONE; 3],
+            "nor does Open Editors open it"
+        );
+        assert!(notebook_view(window.hwnd).drag.is_none(), "no band left");
+        drop(modal);
+        pump_posted_messages(window.hwnd);
+        assert!(!scratch.folder().join("x.md").exists());
+        assert!(!tab_paths(window.hwnd).contains(&Some(outside.clone())));
     }
 }

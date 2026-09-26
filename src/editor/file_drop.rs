@@ -7,47 +7,22 @@
 //! Scintilla revokes whatever target is registered when its window is destroyed, which releases the
 //! wrapper, and the wrapper releases Scintilla's target and the callback.
 
+use crate::platform::ole_drop::{
+    DropTargetVtbl, Unknown, dropped_files, is_drop_target_iid, offers_files,
+};
 use crate::{FastPadError, Result};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{E_NOINTERFACE, E_POINTER, HWND, POINTL, S_OK};
-use windows_sys::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, STGMEDIUM, TYMED_HGLOBAL};
 use windows_sys::Win32::System::Ole::{
-    CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_NONE, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
+    DROPEFFECT_COPY, DROPEFFECT_NONE, RegisterDragDrop, RevokeDragDrop,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::GetPropW;
 use windows_sys::core::{GUID, HRESULT};
 
-const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
-const IID_IDROPTARGET: GUID = GUID::from_u128(0x00000122_0000_0000_c000_000000000046);
-
 /// The window property where OLE keeps the `IDropTarget` that `RegisterDragDrop` registered.
 const DROP_TARGET_PROPERTY: &str = "OleDropTargetInterface";
-
-type Unknown = *mut c_void;
-
-#[repr(C)]
-struct DropTargetVtbl {
-    query_interface: unsafe extern "system" fn(Unknown, *const GUID, *mut Unknown) -> HRESULT,
-    add_ref: unsafe extern "system" fn(Unknown) -> u32,
-    release: unsafe extern "system" fn(Unknown) -> u32,
-    drag_enter: unsafe extern "system" fn(Unknown, Unknown, u32, POINTL, *mut u32) -> HRESULT,
-    drag_over: unsafe extern "system" fn(Unknown, u32, POINTL, *mut u32) -> HRESULT,
-    drag_leave: unsafe extern "system" fn(Unknown) -> HRESULT,
-    drop: unsafe extern "system" fn(Unknown, Unknown, u32, POINTL, *mut u32) -> HRESULT,
-}
-
-/// The leading `IDataObject` slots this module calls; the rest are never read.
-#[repr(C)]
-struct DataObjectVtbl {
-    query_interface: usize,
-    add_ref: usize,
-    release: usize,
-    get_data: unsafe extern "system" fn(Unknown, *const FORMATETC, *mut STGMEDIUM) -> HRESULT,
-    get_data_here: usize,
-    query_get_data: unsafe extern "system" fn(Unknown, *const FORMATETC) -> HRESULT,
-}
 
 #[repr(C)]
 struct FileDropTarget {
@@ -128,39 +103,6 @@ fn this<'a>(object: Unknown) -> &'a FileDropTarget {
     unsafe { &*(object as *const FileDropTarget) }
 }
 
-fn hdrop_format() -> FORMATETC {
-    FORMATETC {
-        cfFormat: CF_HDROP,
-        ptd: std::ptr::null_mut(),
-        dwAspect: DVASPECT_CONTENT,
-        lindex: -1,
-        tymed: TYMED_HGLOBAL as u32,
-    }
-}
-
-fn offers_files(data: Unknown) -> bool {
-    if data.is_null() {
-        return false;
-    }
-    let data_vtbl = unsafe { &**(data as *const *const DataObjectVtbl) };
-    unsafe { (data_vtbl.query_get_data)(data, &hdrop_format()) == S_OK }
-}
-
-fn dropped_files(data: Unknown) -> Vec<PathBuf> {
-    let data_vtbl = unsafe { &**(data as *const *const DataObjectVtbl) };
-    let mut medium = STGMEDIUM::default();
-    if unsafe { (data_vtbl.get_data)(data, &hdrop_format(), &mut medium) } < 0 {
-        return Vec::new();
-    }
-    let paths = if medium.tymed == TYMED_HGLOBAL as u32 {
-        crate::platform::win32::dropped_paths(unsafe { medium.u.hGlobal })
-    } else {
-        Vec::new()
-    };
-    unsafe { ReleaseStgMedium(&mut medium) };
-    paths
-}
-
 /// Copy is the only effect a file drop offers, and only when the source allows it.
 fn copy_effect(effect: *mut u32) {
     if !effect.is_null() {
@@ -182,14 +124,7 @@ unsafe extern "system" fn query_interface(
     if iid.is_null() || out.is_null() {
         return E_POINTER;
     }
-    let iid = unsafe { &*iid };
-    let known = |other: &GUID| {
-        iid.data1 == other.data1
-            && iid.data2 == other.data2
-            && iid.data3 == other.data3
-            && iid.data4 == other.data4
-    };
-    if known(&IID_IUNKNOWN) || known(&IID_IDROPTARGET) {
+    if is_drop_target_iid(unsafe { &*iid }) {
         unsafe {
             add_ref(object);
             *out = object;
@@ -279,7 +214,8 @@ unsafe extern "system" fn drop_on(
 /// is empty.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{DataObjectVtbl, Unknown, vtbl};
+    use super::vtbl;
+    use crate::platform::ole_drop::{DataObjectVtbl, Unknown};
     use std::path::{Path, PathBuf};
     use windows_sys::Win32::Foundation::{DV_E_FORMATETC, POINTL, S_OK};
     use windows_sys::Win32::System::Com::{FORMATETC, STGMEDIUM, TYMED_HGLOBAL};
@@ -340,6 +276,16 @@ pub(crate) mod test_support {
         hwnd: windows_sys::Win32::Foundation::HWND,
         paths: &[&Path],
     ) -> [u32; 3] {
+        drag_and_drop_at(hwnd, paths, POINTL { x: 1, y: 1 })
+    }
+
+    /// `drag_and_drop` with the pointer at screen point `point`. A refused DragOver ends in
+    /// DragLeave, as OLE's does when the button goes up there.
+    pub(crate) fn drag_and_drop_at(
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        paths: &[&Path],
+        point: POINTL,
+    ) -> [u32; 3] {
         let target = super::registered_target(hwnd);
         assert!(!target.is_null(), "no drop target is registered");
         let mut data = FakeData {
@@ -347,7 +293,6 @@ pub(crate) mod test_support {
             paths: paths.iter().map(|path| path.to_path_buf()).collect(),
         };
         let data = (&mut data as *mut FakeData).cast::<std::ffi::c_void>();
-        let point = POINTL { x: 1, y: 1 };
         let target_vtbl = vtbl(target);
         let mut effects = [super::DROPEFFECT_COPY; 3];
         unsafe {

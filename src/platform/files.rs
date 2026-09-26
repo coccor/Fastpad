@@ -1,5 +1,6 @@
 //! File operations the note library needs that `std` does not offer safely: a rename that never
-//! replaces its target, and deleting to the Recycle Bin.
+//! replaces its target, deleting to the Recycle Bin, copying without replacing, and a file's
+//! identity whatever its path is spelled like.
 
 use crate::Result;
 use crate::platform::last_error;
@@ -7,7 +8,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    BY_HANDLE_FILE_INFORMATION, COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, CreateFileW,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW, MOVEFILE_COPY_ALLOWED,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -99,6 +103,200 @@ fn shell_recycle(owner: HWND, path: &Path) -> Result<()> {
         return Err(crate::FastPadError::Win32(status as u32));
     }
     Ok(())
+}
+
+/// `CopyFileExW` with `COPY_FILE_FAIL_IF_EXISTS`: fails if `to` already exists.
+pub fn copy_file_no_replace(from: &Path, to: &Path) -> Result<()> {
+    let (from_wide, to_wide) = (wide(from), wide(to));
+    let copied = unsafe {
+        CopyFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            None,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            COPY_FILE_FAIL_IF_EXISTS,
+        )
+    };
+    if copied == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// What `copy_tree` did: the files copied, and the first error with the path it happened at.
+#[derive(Debug)]
+pub struct Copied {
+    pub files: usize,
+    pub error: Option<(std::path::PathBuf, crate::FastPadError)>,
+}
+
+/// Copies the file or folder `from` to `to`, which must not exist: a folder is created with
+/// everything in it, never merged into one that is there. Stops at the first error, and after
+/// the file in hand once `cancel` is set. An explicit stack, so a deep folder can't overflow.
+pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool) -> Copied {
+    use std::sync::atomic::Ordering;
+    let mut copied = Copied {
+        files: 0,
+        error: None,
+    };
+    let fail = |copied: &mut Copied, path: &Path, error: crate::FastPadError| {
+        copied.error = Some((path.to_path_buf(), error));
+    };
+    if !from.is_dir() {
+        match copy_file_no_replace(from, to) {
+            Ok(()) => copied.files = 1,
+            Err(error) => fail(&mut copied, from, error),
+        }
+        return copied;
+    }
+    let mut stack = vec![(from.to_path_buf(), to.to_path_buf())];
+    while let Some((source, target)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(error) = std::fs::create_dir(&target) {
+            fail(&mut copied, &target, error.into());
+            break;
+        }
+        let entries = match std::fs::read_dir(&source) {
+            Ok(entries) => entries,
+            Err(error) => {
+                fail(&mut copied, &source, error.into());
+                break;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    fail(&mut copied, &source, error.into());
+                    return copied;
+                }
+            };
+            let (inner, outer) = (entry.path(), target.join(entry.file_name()));
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                stack.push((inner, outer));
+            } else {
+                if cancel.load(Ordering::Relaxed) {
+                    return copied;
+                }
+                match copy_file_no_replace(&inner, &outer) {
+                    Ok(()) => copied.files += 1,
+                    Err(error) => {
+                        fail(&mut copied, &inner, error);
+                        return copied;
+                    }
+                }
+            }
+        }
+    }
+    copied
+}
+
+/// Opens the file or folder at `path` for its attributes only: no access asked for, any sharing
+/// allowed, and backup semantics so folders open. A junction or symlink on the way is followed.
+fn open_for_attributes(path: &Path) -> Option<crate::platform::OwnedHandle> {
+    let path_wide = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    // CreateFileW returns INVALID_HANDLE_VALUE on failure, which from_raw_owned rejects.
+    unsafe { crate::platform::OwnedHandle::from_raw_owned(handle) }.ok()
+}
+
+/// Where the file or folder at `path` really is (`GetFinalPathNameByHandleW`): every junction,
+/// symlink, `subst` drive and 8.3 name on the way resolved, as a drive-letter path, or as a
+/// `\\server\share` path on a network. `None` when it can't be opened or resolved.
+pub fn final_path(path: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let handle = open_for_attributes(path)?;
+    let mut buffer = vec![0u16; 512];
+    let length = loop {
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle.as_raw(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if length == 0 {
+            return None;
+        }
+        // Too small: `length` is then the size needed, its terminating NUL included.
+        if length < buffer.len() {
+            break length;
+        }
+        buffer.resize(length + 1, 0);
+    };
+    let resolved = &buffer[..length];
+    let unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let plain = if let Some(rest) = resolved.strip_prefix(unc.as_slice()) {
+        [&[u16::from(b'\\'); 2][..], rest].concat()
+    } else {
+        resolved
+            .strip_prefix(verbatim.as_slice())
+            .unwrap_or(resolved)
+            .to_vec()
+    };
+    Some(std::ffi::OsString::from_wide(&plain).into())
+}
+
+/// The volume serial number and file index of the file or folder at `path`: the same for every
+/// spelling of one item (an 8.3 short name, a `subst` drive, a `\\?\` prefix, a junction), and
+/// different for two items that both exist. `None` when it can't be opened or asked.
+pub fn file_id(path: &Path) -> Option<(u32, u64)> {
+    let handle = open_for_attributes(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.as_raw(), &mut info) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, index))
+}
+
+/// Makes `link` a directory junction to `target`, as `mklink /J` does (no admin needed).
+#[cfg(test)]
+pub fn junction_for_test(link: &Path, target: &Path) {
+    let status = std::process::Command::new("cmd")
+        .arg("/c")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J failed");
+}
+
+/// `path` spelled with 8.3 short names where the volume has them; `path` itself otherwise.
+#[cfg(test)]
+pub fn short_path_for_test(path: &Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let long = wide(path);
+    let mut short = vec![0u16; 1024];
+    let length = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            long.as_ptr(),
+            short.as_mut_ptr(),
+            short.len() as u32,
+        )
+    } as usize;
+    if length == 0 || length >= short.len() {
+        return path.to_path_buf();
+    }
+    std::ffi::OsString::from_wide(&short[..length]).into()
 }
 
 #[cfg(test)]
@@ -201,6 +399,87 @@ mod tests {
             std::fs::read_to_string(dir.join("other").join("a.md")).unwrap(),
             "a"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copying_a_file_never_replaces_and_a_folder_copies_whole() {
+        // Break caught: a copy over an existing note, a nested folder copied flat or partly, or
+        // non-note files left behind (open editors spec §4.5).
+        let dir = scratch("copy");
+        std::fs::write(dir.join("a.md"), "a").unwrap();
+        std::fs::write(dir.join("taken.md"), "keep").unwrap();
+        assert!(copy_file_no_replace(&dir.join("a.md"), &dir.join("taken.md")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("taken.md")).unwrap(),
+            "keep"
+        );
+        copy_file_no_replace(&dir.join("a.md"), &dir.join("b.md")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b.md")).unwrap(), "a");
+
+        let from = dir.join("pics");
+        std::fs::create_dir_all(from.join(r"deep\er")).unwrap();
+        std::fs::write(from.join("x.png"), [1u8, 2]).unwrap();
+        std::fs::write(from.join(r"deep\er\y.md"), "y").unwrap();
+        std::fs::create_dir_all(from.join("empty")).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let copied = copy_tree(&from, &dir.join("copy"), &cancel);
+        assert!(copied.error.is_none());
+        assert_eq!(copied.files, 2);
+        assert_eq!(std::fs::read(dir.join(r"copy\x.png")).unwrap(), [1, 2]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(r"copy\deep\er\y.md")).unwrap(),
+            "y"
+        );
+        assert!(dir.join(r"copy\empty").is_dir());
+        let again = copy_tree(&from, &dir.join("copy"), &cancel);
+        assert!(
+            again.error.is_some() && again.files == 0,
+            "an existing folder is never merged into"
+        );
+        let single = copy_tree(&dir.join("a.md"), &dir.join("c.md"), &cancel);
+        assert_eq!((single.files, single.error.is_none()), (1, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_id_is_the_same_for_every_spelling_and_differs_between_files() {
+        // Break caught: a clash check that trusts the spelling, so an alias of the item being
+        // copied (a `\\?\` prefix, an 8.3 name) was recycled as if it were another file.
+        let dir = scratch("file-id");
+        let first = dir.join("a-long-file-name.md");
+        let second = dir.join("b.md");
+        std::fs::write(&first, "a").unwrap();
+        std::fs::write(&second, "b").unwrap();
+        let id = file_id(&first).expect("an existing file has an id");
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", first.display()));
+        assert_eq!(file_id(&verbatim), Some(id));
+        assert_eq!(file_id(&short_path_for_test(&first)), Some(id));
+        assert_ne!(file_id(&second), Some(id));
+        let folder = file_id(&dir).expect("a folder opens too");
+        assert_ne!(folder, id);
+        assert_eq!(file_id(&dir.join("never-existed.md")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_final_path_resolves_junctions_and_other_spellings() {
+        // Break caught: the clash check walking only the spelled path's folders, so a junction in
+        // the source's path hid the real folder holding it, and that folder was recycled.
+        let dir = scratch("final-path");
+        let file = dir.join("real").join("inner").join("a-long-file-name.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "a").unwrap();
+        junction_for_test(&dir.join("link"), &dir.join("real"));
+        let real = final_path(&file).unwrap();
+        assert!(!real.to_string_lossy().starts_with(r"\\?\"), "{real:?}");
+        assert!(real.is_absolute() && real.ends_with(r"real\inner\a-long-file-name.md"));
+        let through_link = dir.join("link").join("inner").join("a-long-file-name.md");
+        assert_eq!(final_path(&through_link), Some(real.clone()));
+        assert_eq!(final_path(&short_path_for_test(&file)), Some(real.clone()));
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", file.display()));
+        assert_eq!(final_path(&verbatim), Some(real.clone()));
+        assert_eq!(final_path(&dir.join("never-existed.md")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

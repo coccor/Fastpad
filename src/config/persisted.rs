@@ -104,6 +104,8 @@ pub struct Settings {
     pub sidebar_width: u16,
     /// Which icon set the Notebook tree draws.
     pub file_icons: FileIconSet,
+    /// Whether the Notebook view's Open Editors section is expanded.
+    pub open_editors_expanded: bool,
 }
 
 impl Settings {
@@ -147,6 +149,9 @@ impl Settings {
         if let Some(file_icons) = delta.file_icons {
             self.file_icons = file_icons;
         }
+        if let Some(expanded) = delta.open_editors_expanded {
+            self.open_editors_expanded = expanded;
+        }
     }
 }
 
@@ -177,6 +182,7 @@ pub struct SettingsDelta {
     pub sidebar_view: Option<SidebarView>,
     pub sidebar_width: Option<u16>,
     pub file_icons: Option<FileIconSet>,
+    pub open_editors_expanded: Option<bool>,
     pub warnings: Vec<SettingWarning>,
 }
 
@@ -184,10 +190,10 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
-/// `sidebar_view`, `sidebar_width` and `file_icons` are recognized. `sidebar_view` is `notebook`,
-/// `search`, `favorites` or `none` (any case); `sidebar_width` is an unsigned integer in 96-DPI
-/// pixels, pulled into 180–480 when it is outside; `file_icons` is `material` or `minimal` (any
-/// case). Every line is handled independently: a line with an
+/// `sidebar_view`, `sidebar_width`, `file_icons` and `open_editors_expanded` are recognized.
+/// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
+/// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `file_icons` is
+/// `material` or `minimal` (any case). Every line is handled independently: a line with an
 /// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
 /// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
@@ -264,6 +270,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "file_icons" => match FileIconSet::parse(value) {
             Some(set) => delta.file_icons = Some(set),
+            None => warn(delta, line_number, key, value),
+        },
+        "open_editors_expanded" => match parse_bool(value) {
+            Some(expanded) => delta.open_editors_expanded = Some(expanded),
             None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
@@ -787,6 +797,27 @@ mod tests {
             SidebarView::Hidden,
             "absent keys keep theirs"
         );
+    }
+
+    #[test]
+    fn open_editors_expanded_parses_as_a_bool_and_defaults_to_true() {
+        // Break caught: the collapsed Open Editors section forgotten on restart, or a typo
+        // collapsing it silently (open editors spec §3.3).
+        assert_eq!(
+            parse("open_editors_expanded=false").open_editors_expanded,
+            Some(false)
+        );
+        assert_eq!(
+            parse("open_editors_expanded=On").open_editors_expanded,
+            Some(true)
+        );
+        let delta = parse("open_editors_expanded=maybe");
+        assert_eq!(delta.open_editors_expanded, None);
+        assert_eq!(delta.warnings.len(), 1);
+        let mut settings = crate::config::defaults::default_settings();
+        assert!(settings.open_editors_expanded);
+        settings.apply_delta(&parse("open_editors_expanded=false"));
+        assert!(!settings.open_editors_expanded);
     }
 
     #[test]

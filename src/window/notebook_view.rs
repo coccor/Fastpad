@@ -6,8 +6,8 @@
 use super::main_window::{OpenMode, app_ptr};
 use super::side_panel::{UiFonts, ViewPaint, draw_text, point_of};
 use crate::config::FileIconSet;
-use crate::document::{Document, DocumentId};
-use crate::library::tree::{self, NoteTree, RowKind, TreeRow, UnsavedEntry};
+use crate::document::DocumentId;
+use crate::library::tree::{self, NoteTree, RowKind, TreeRow};
 use crate::window::commands::CommandId;
 use crate::window::drag_label::{DragLabel, LabelImage};
 use crate::window::file_icons::note_kind;
@@ -15,12 +15,15 @@ use crate::window::icon_sets::images::IconImages;
 use crate::window::icon_sets::{TreeIcon, TreeItem, minimal, tree_icon};
 use crate::window::inline_name::{FieldLayout, InlineName};
 use crate::window::menus::MenuEntry;
+use crate::window::notebook_layout::{self, PanelLayout, ROW_HEIGHT};
+use crate::window::open_editors::OpenEditors;
 use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset, scale};
+use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::sidebar_accessibility::MK_LBUTTON;
 use crate::window::tooltip::Tooltip;
-use crate::window::tree_drag::{self, Drag, Hover};
+use crate::window::tree_drag::{self, Drag, DragSource, Hover};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -37,21 +40,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, GetSystemMetrics, IDC_ARROW, IDC_NO, KillTimer, LoadCursorW,
-    SM_CXDRAG, SM_CYDRAG, SendMessageW, SetCursor, SetTimer, WM_CAPTURECHANGED, WM_CHAR,
-    WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    GetClientRect, GetCursorPos, GetParent, GetSystemMetrics, IDC_ARROW, IDC_NO, KillTimer,
+    LoadCursorW, SM_CXDRAG, SM_CYDRAG, SendMessageW, SetCursor, SetTimer, WM_CAPTURECHANGED,
+    WM_CHAR, WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_TIMER,
 };
 
 // Sizes at 96 DPI; everything is scaled with `panel::scale`.
-const ROW_HEIGHT: i32 = 26;
-const HEADER_HEIGHT: i32 = 38;
 const INDENT: i32 = 12;
 const LEFT_PAD: i32 = 8;
 const GLYPH_BOX: i32 = 16;
 const GAP: i32 = 6;
 const PIN_BOX: i32 = 24;
-const HEADER_BUTTON: i32 = 28;
 const TYPE_AHEAD_RESET: Duration = Duration::from_secs(1);
 
 pub(crate) const TRUNCATED_ROW: &str = "Showing the first 10,000 notes";
@@ -69,7 +70,6 @@ const LABEL_MAX_TEXT: i32 = 300;
 const GLYPH_CHEVRON_RIGHT: &str = "\u{E76C}";
 const GLYPH_CHEVRON_DOWN: &str = "\u{E70D}";
 const GLYPH_FOLDER: &str = "\u{E8B7}";
-const GLYPH_NOTE: &str = "\u{E8A5}";
 /// The tilted pin's outline (Segoe's Pinned), needle included.
 const GLYPH_PIN: &str = "\u{E840}";
 /// The tilted pin's head fill (PinFill), with no needle: drawn under `GLYPH_PIN`.
@@ -95,7 +95,7 @@ pub(crate) enum Mode {
     NoNotebook,
     /// A notebook is open but its state has not arrived from the worker.
     Loading,
-    /// Loaded, with no notes and no untitled tabs.
+    /// Loaded, with no notes.
     Empty,
     Tree,
     /// The notebook's load failed: a message, "Retry" and "Open notebook…".
@@ -132,8 +132,17 @@ enum RowPart {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Hit {
+    /// The Open Editors header row: toggles the section.
+    EditorsHeader,
+    /// An Open Editors row; `close` on a clean tab's close box.
+    Editor {
+        index: usize,
+        close: bool,
+    },
+    /// The root row's chevron or name: toggles the tree.
+    Root,
+    /// A root row button.
     Header(HeaderButton),
-    Title,
     /// "Open notebook…" (no notebook), "New note" (empty notebook) or "Retry" (failed load).
     StateButton,
     /// "Open notebook…" under "Retry", after a failed load.
@@ -201,48 +210,6 @@ pub(crate) fn row_parts(row: RECT, depth: u16, dpi: u32) -> RowParts {
         icon,
         name,
         pin,
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct HeaderLayout {
-    pub title: RECT,
-    /// Left to right: star, New note, New folder, "…".
-    pub buttons: [(HeaderButton, RECT); 4],
-}
-
-pub(crate) fn header_layout(area: RECT, dpi: u32) -> HeaderLayout {
-    let height = scale(HEADER_HEIGHT, dpi);
-    let size = scale(HEADER_BUTTON, dpi);
-    let top = area.top + (height - size) / 2;
-    let right = area.right - scale(6, dpi);
-    let slot = |from_right: i32| RECT {
-        left: right - (from_right + 1) * size,
-        top,
-        right: right - from_right * size,
-        bottom: top + size,
-    };
-    let buttons = [
-        (HeaderButton::Favorite, slot(3)),
-        (HeaderButton::NewNote, slot(2)),
-        (HeaderButton::NewFolder, slot(1)),
-        (HeaderButton::More, slot(0)),
-    ];
-    let title_left = area.left + scale(12, dpi);
-    let title = RECT {
-        left: title_left,
-        top: area.top,
-        right: (buttons[0].1.left - scale(4, dpi)).max(title_left),
-        bottom: area.top + height,
-    };
-    HeaderLayout { title, buttons }
-}
-
-/// Everything below the header.
-pub(crate) fn body_rect(area: RECT, dpi: u32) -> RECT {
-    RECT {
-        top: (area.top + scale(HEADER_HEIGHT, dpi)).min(area.bottom),
-        ..area
     }
 }
 
@@ -316,28 +283,6 @@ pub(crate) fn follow(
     Some(old.unwrap_or(0).min(last))
 }
 
-/// An untitled tab's row name: its tab label, else its first line, else "Untitled".
-pub(crate) fn unsaved_label(document: &Document) -> String {
-    document
-        .untitled_label
-        .clone()
-        .or_else(|| document.first_line_label.clone())
-        .unwrap_or_else(|| "Untitled".to_owned())
-}
-
-/// One entry per untitled tab, keyed by its `DocumentId`, labelled like its tab (spec §6.2).
-pub(crate) fn unsaved_entries<'a>(
-    documents: impl Iterator<Item = &'a Document>,
-) -> Vec<UnsavedEntry> {
-    documents
-        .filter(|document| document.path.is_none())
-        .map(|document| UnsavedEntry {
-            key: document.id.0,
-            label: unsaved_label(document),
-        })
-        .collect()
-}
-
 /// How `flatten` keys an expanded folder: the same lowercasing as `model::same_path`.
 fn expanded_key(path: &Path) -> String {
     path.as_os_str().to_string_lossy().to_lowercase()
@@ -345,16 +290,9 @@ fn expanded_key(path: &Path) -> String {
 
 /// The visible rows of `tree` with `expanded` folders open. The expanded set is hashed once, so
 /// each folder row costs one lookup, not a scan of every expanded entry.
-pub(crate) fn flatten(
-    tree: &NoteTree,
-    expanded: &[PathBuf],
-    unsaved: &[UnsavedEntry],
-) -> Vec<TreeRow> {
+pub(crate) fn flatten(tree: &NoteTree, expanded: &[PathBuf]) -> Vec<TreeRow> {
     let open: HashSet<String> = expanded.iter().map(|path| expanded_key(path)).collect();
-    tree.rows(
-        &|path: &Path| !open.is_empty() && open.contains(&expanded_key(path)),
-        unsaved,
-    )
+    tree.rows(&|path: &Path| !open.is_empty() && open.contains(&expanded_key(path)))
 }
 
 /// Letters typed into the tree within a second of each other form one prefix.
@@ -389,7 +327,8 @@ struct RebuildKey {
     failed: bool,
     /// `library_host::expansion_revision`, bumped whenever a folder is expanded or collapsed.
     expansion: u64,
-    unsaved: Vec<UnsavedEntry>,
+    /// `library_host::root_expanded`: collapsing the root row is a rebuild.
+    root_expanded: bool,
 }
 
 /// The Notebook view's state, owned by `side_panel::Sidebar`.
@@ -414,8 +353,9 @@ pub(crate) struct NotebookView {
     tooltip_failed: bool,
     typed: TypeAhead,
     thumb_grab: Option<i32>,
-    /// A drag of a row, armed by a press and under way past the drag distance (tree drag spec
-    /// §3).
+    /// A drag of a tree or Open Editors row, armed by a press and under way past the drag
+    /// distance, which moves or copies (tree drag spec §3, open editors spec §4.3); or an
+    /// Explorer drag over the panel.
     pub(crate) drag: Option<Drag>,
     /// The right press that cancelled a drag: its release opens no menu.
     pub(crate) eat_right_up: bool,
@@ -431,6 +371,17 @@ pub(crate) struct NotebookView {
     pub(crate) inline: InlineName,
     /// The tree's Material bitmaps, made on first draw (icon sets spec §6).
     images: IconImages,
+    /// The Open Editors section's rows (open editors spec §3.2).
+    pub(crate) editors: OpenEditors,
+    /// The Open Editors section is expanded (`main_window::open_editors_expanded`).
+    editors_expanded: bool,
+    /// The notebook's root row is expanded (`library_host::root_expanded`).
+    root_expanded: bool,
+    /// The tab under a middle press on an Open Editors row: its release there closes it.
+    middle_press: Option<DocumentId>,
+    /// The one keyboard selection through the header rows, the Open Editors rows and the tree
+    /// (open editors spec §3.5). `Cursor::Tree` leaves it to `list.selected`.
+    pub(crate) cursor: Cursor,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -461,9 +412,12 @@ const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
 
 /// Whether row `index` is the one a started drag carries (tree drag spec §3.2): both sides
 /// absent (no drag, and `index` past the rows the list actually has, such as the truncated row)
-/// must not read as a match.
-fn is_dragged_row(dragged: Option<&RowKind>, rows: &[TreeRow], index: usize) -> bool {
-    dragged.is_some_and(|dragged| rows.get(index).is_some_and(|row| &row.kind == dragged))
+/// must not read as a match. Only a dragged row matches: a tab or files are not tree rows.
+fn is_dragged_row(dragged: Option<&DragSource>, rows: &[TreeRow], index: usize) -> bool {
+    let Some(DragSource::Row(dragged)) = dragged else {
+        return false;
+    };
+    rows.get(index).is_some_and(|row| &row.kind == dragged)
 }
 
 /// Draws `item`'s icon from `set` at `px` square, centred in `rect` and clipped to it (a deep row
@@ -473,7 +427,7 @@ fn is_dragged_row(dragged: Option<&RowKind>, rows: &[TreeRow], index: usize) -> 
     clippy::too_many_arguments,
     reason = "one icon's paint inputs, shared by a tree row and the drag label"
 )]
-fn draw_item_icon(
+pub(crate) fn draw_item_icon(
     dc: HDC,
     item: TreeItem,
     rect: RECT,
@@ -576,9 +530,6 @@ fn draw_tree_row(
                 .map(|extension| extension.to_string_lossy());
             draw_icon(TreeItem::Note(note_kind(extension.as_deref())));
         }
-        RowKind::Unsaved(_) => {
-            unsafe { draw_text(dc, GLYPH_NOTE, parts.icon, fonts.glyph, muted, CENTERED) };
-        }
         RowKind::Draft => {
             if let Some(item) = editing {
                 draw_icon(item);
@@ -602,11 +553,7 @@ fn draw_tree_row(
     if editing.is_some() {
         return;
     }
-    let font = if matches!(row.kind, RowKind::Unsaved(_)) {
-        fonts.italic
-    } else {
-        fonts.text
-    };
+    let font = fonts.text;
     let color = if dimmed {
         palette.muted_foreground
     } else {
@@ -662,7 +609,7 @@ fn drag_item(kind: &RowKind) -> Option<TreeItem> {
                 .map(|extension| extension.to_string_lossy());
             Some(TreeItem::Note(note_kind(extension.as_deref())))
         }
-        RowKind::Unsaved(_) | RowKind::Draft => None,
+        RowKind::Draft => None,
     }
 }
 
@@ -775,28 +722,32 @@ fn paint_band(dc: HDC, band: RECT, palette: &Palette, dpi: u32, before_rows: boo
     if before_rows && !palette.high_contrast {
         unsafe { fill(dc, band, palette.inactive_selection_background) };
     } else if !before_rows && palette.high_contrast {
-        let t = scale(1, dpi).max(1);
-        let color = palette.selection_background;
-        for edge in [
-            RECT {
-                bottom: band.top + t,
-                ..band
-            },
-            RECT {
-                top: band.bottom - t,
-                ..band
-            },
-            RECT {
-                right: band.left + t,
-                ..band
-            },
-            RECT {
-                left: band.right - t,
-                ..band
-            },
-        ] {
-            unsafe { fill(dc, edge, color) };
-        }
+        paint_outline(dc, band, palette.selection_background, dpi);
+    }
+}
+
+/// A 1 px (scaled) outline just inside `rect`.
+fn paint_outline(dc: HDC, rect: RECT, color: u32, dpi: u32) {
+    let t = scale(1, dpi).max(1);
+    for edge in [
+        RECT {
+            bottom: rect.top + t,
+            ..rect
+        },
+        RECT {
+            top: rect.bottom - t,
+            ..rect
+        },
+        RECT {
+            right: rect.left + t,
+            ..rect
+        },
+        RECT {
+            left: rect.right - t,
+            ..rect
+        },
+    ] {
+        unsafe { fill(dc, edge, color) };
     }
 }
 
@@ -828,6 +779,11 @@ impl NotebookView {
             order: 0,
             inline: InlineName::new(),
             images: IconImages::new(),
+            editors: OpenEditors::new(scale(ROW_HEIGHT, dpi)),
+            editors_expanded: true,
+            root_expanded: true,
+            middle_press: None,
+            cursor: Cursor::Tree,
             #[cfg(test)]
             rebuilds: 0,
         }
@@ -836,15 +792,75 @@ impl NotebookView {
     /// The list's rectangle for the current mode, in the panel's `client` coordinates at `dpi`:
     /// the tree rows, the RECENT rows, or an empty band while there are none.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
-        let body = body_rect(client, dpi);
+        let body = self.layout(client, dpi).body;
+        let empty = RECT {
+            bottom: body.top,
+            ..body
+        };
         match self.mode {
-            Mode::Tree => body,
+            Mode::Tree if self.root_expanded => body,
             Mode::NoNotebook => state_layout(body, dpi).list,
-            Mode::Loading | Mode::Empty | Mode::Failed => RECT {
-                bottom: body.top,
-                ..body
+            _ => empty,
+        }
+    }
+
+    /// The panel's bands for the view as it is (open editors spec §3.1).
+    pub(crate) fn layout(&self, client: RECT, dpi: u32) -> PanelLayout {
+        notebook_layout::panel_layout(client, dpi, self.editors.rows.len(), self.editors_expanded)
+    }
+
+    /// The tree is painted and hit: loaded rows under an expanded root.
+    pub(crate) fn tree_shown(&self) -> bool {
+        self.mode == Mode::Tree && self.root_expanded
+    }
+
+    /// Whether the tree has rows the collapsed root hides, which the keyboard must not reach
+    /// (open editors spec §3.5).
+    fn tree_hidden(&self) -> bool {
+        self.mode == Mode::Tree && !self.root_expanded
+    }
+
+    /// How many rows the keyboard selection runs through in each part (`panel_cursor::step`).
+    fn shape(&self) -> panel_cursor::Shape {
+        panel_cursor::Shape {
+            editors: if self.editors_expanded {
+                self.editors.rows.len()
+            } else {
+                0
+            },
+            root: self.mode != Mode::NoNotebook,
+            // The list after the root row: the RECENT notebooks without a notebook, else the
+            // tree's rows while it shows.
+            tree: match self.mode {
+                Mode::NoNotebook => self.recent.len(),
+                _ if self.tree_shown() => self.rows.len(),
+                _ => 0,
             },
         }
+    }
+
+    /// Keeps the Open Editors rows' scroll within their list as it is now, the active row in
+    /// view. Not while the list has no height (collapsed, or a panel not yet sized): a 0 px list
+    /// would scroll the active row to the top and leave the rows above it off screen once shown.
+    fn fit_editors(&mut self, active_in_view: bool) {
+        let height = height(self.layout(self.client(), self.dpi()).editors_list);
+        if height <= 0 {
+            return;
+        }
+        if active_in_view && let Some(active) = self.editors.active_index() {
+            self.editors.list.ensure_visible(active, height);
+        }
+        self.editors.list.scroll_lines(0, height);
+    }
+
+    fn editors_row_rect(&self, list: RECT, index: usize) -> Option<RECT> {
+        let top = self.editors.list.row_top(index)?;
+        Some(RECT {
+            left: list.left,
+            top: list.top + top,
+            right: list.right,
+            bottom: list.top + top + self.editors.list.row_height,
+        })
     }
 
     fn dpi(&self) -> u32 {
@@ -888,7 +904,7 @@ impl NotebookView {
     /// edited row's name, clipped to the list. `None` while nothing is edited or the row is out
     /// of view.
     fn inline_layout_in(&self, area: RECT, dpi: u32) -> Option<FieldLayout> {
-        if self.mode != Mode::Tree {
+        if !self.tree_shown() {
             return None;
         }
         let index = self.inline.row()?;
@@ -933,6 +949,25 @@ impl NotebookView {
     #[cfg(test)]
     pub(crate) fn row_rect_at(&self, index: usize) -> Option<RECT> {
         self.row_rect(self.list_rect(self.client()), index)
+    }
+
+    /// Open Editors row `index`'s rectangle in panel coordinates, for tests that click it.
+    #[cfg(test)]
+    pub(crate) fn editor_rect_at(&self, index: usize) -> Option<RECT> {
+        let list = self.layout(self.client(), self.dpi()).editors_list;
+        self.editors_row_rect(list, index)
+    }
+
+    /// The Open Editors header row, in panel coordinates.
+    #[cfg(test)]
+    pub(crate) fn editors_header_rect(&self) -> RECT {
+        self.layout(self.client(), self.dpi()).editors_header
+    }
+
+    /// The notebook's root row, in panel coordinates.
+    #[cfg(test)]
+    pub(crate) fn root_rect(&self) -> RECT {
+        self.layout(self.client(), self.dpi()).root
     }
 
     /// A point on the scroll thumb in panel coordinates, while the list scrolls: its left edge,
@@ -1078,6 +1113,25 @@ impl NotebookView {
             self.order = self.order.wrapping_add(1);
         }
         self.mode = snapshot.mode;
+        self.root_expanded = snapshot.root_expanded;
+        let expanding = snapshot.editors_expanded && !self.editors_expanded;
+        self.editors_expanded = snapshot.editors_expanded;
+        // The keyboard selection leaves a row that is gone: a tree row hidden by its collapsed
+        // root to the root row (open editors spec §3.5); the root row with its notebook and a tab
+        // row with its section to the Open Editors header, which is always there.
+        if self.cursor == Cursor::Tree && self.tree_hidden() {
+            self.cursor = Cursor::Root;
+        }
+        let gone = match self.cursor {
+            Cursor::Root => self.mode == Mode::NoNotebook,
+            Cursor::Editor(_) => !self.editors_expanded,
+            Cursor::EditorsHeader | Cursor::Tree => false,
+        };
+        if gone {
+            self.cursor = Cursor::EditorsHeader;
+        }
+        // The section's rows fit its height again, the active row in view once it shows.
+        self.fit_editors(expanding);
         self.name = snapshot
             .root
             .as_deref()
@@ -1113,23 +1167,39 @@ impl NotebookView {
     fn hit_test(&self, x: i32, y: i32) -> Hit {
         let area = self.client();
         let dpi = self.dpi();
-        if y < area.top + scale(HEADER_HEIGHT, dpi) {
-            let header = header_layout(area, dpi);
+        let layout = self.layout(area, dpi);
+        if y < layout.title.bottom {
+            return Hit::Empty;
+        }
+        if contains(layout.editors_header, x, y) {
+            return Hit::EditorsHeader;
+        }
+        if contains(layout.editors_list, x, y) {
+            let Some(index) = self.editors.list.row_at(y - layout.editors_list.top) else {
+                return Hit::Empty;
+            };
+            let row = self.editors_row_rect(layout.editors_list, index);
+            let clean = self.editors.rows.get(index).is_some_and(|row| !row.dirty);
+            let close = clean
+                && row.is_some_and(|row| contains(super::open_editors::close_rect(row, dpi), x, y));
+            return Hit::Editor { index, close };
+        }
+        if contains(layout.root, x, y) {
             if self.mode != Mode::NoNotebook {
-                for (button, rect) in header.buttons {
+                let parts = notebook_layout::root_parts(layout.root, dpi);
+                for (button, rect) in parts.buttons {
                     if contains(rect, x, y) {
                         return Hit::Header(button);
                     }
                 }
+                return Hit::Root;
             }
-            return if contains(header.title, x, y) {
-                Hit::Title
-            } else {
-                Hit::Empty
-            };
+            return Hit::Empty;
         }
-        let body = body_rect(area, dpi);
+        let body = layout.body;
         match self.mode {
+            // The states under a collapsed root are not painted.
+            Mode::Empty | Mode::Failed if !self.root_expanded => Hit::Empty,
             Mode::NoNotebook | Mode::Empty | Mode::Failed => {
                 let layout = state_layout(body, dpi);
                 if contains(layout.button, x, y) {
@@ -1150,6 +1220,7 @@ impl NotebookView {
                 Hit::Empty
             }
             Mode::Loading => Hit::Empty,
+            Mode::Tree if !self.tree_shown() => Hit::Empty,
             Mode::Tree => {
                 let list = self.list_rect(area);
                 if let Some(grab) = self.list.thumb_hit(
@@ -1182,11 +1253,23 @@ impl NotebookView {
     }
 
     /// What a drag at panel point `x`, `y` is over (tree drag spec §3.2). The scroll thumb
-    /// counts as the row under it.
+    /// counts as the row under it. A notebook with no notes has the root row and the space under
+    /// it, both the root (open editors spec §4.1); a tree row can't be dragged there.
     fn drag_hover(&self, x: i32, y: i32) -> Hover {
         let area = self.client();
-        if self.mode != Mode::Tree || !contains(area, x, y) {
+        if !matches!(self.mode, Mode::Tree | Mode::Empty) || !contains(area, x, y) {
             return Hover::Outside;
+        }
+        // The title band and Open Editors take no drop; the root row is the notebook's root.
+        let layout = self.layout(area, self.dpi());
+        if y < layout.root.top {
+            return Hover::Outside;
+        }
+        if y < layout.root.bottom {
+            return Hover::Header;
+        }
+        if !self.tree_shown() {
+            return Hover::Below;
         }
         let list = self.list_rect(area);
         if y < list.top {
@@ -1197,14 +1280,27 @@ impl NotebookView {
             .map_or(Hover::Below, Hover::Row)
     }
 
+    /// Whether an Explorer drop at panel point `x`, `y` opens its files rather than copying them
+    /// (open editors spec §4.1): over Open Editors, or anywhere below the title band with no
+    /// notebook.
+    fn opens_at(&self, x: i32, y: i32) -> bool {
+        let area = self.client();
+        let layout = self.layout(area, self.dpi());
+        if self.root.is_none() {
+            return contains(area, x, y) && y >= layout.title.bottom;
+        }
+        contains(layout.editors_header, x, y) || contains(layout.editors_list, x, y)
+    }
+
     /// The drag moved to `x`, `y`: the target follows, and the highlight repaints when it
-    /// changed. Whether a release there moves the item.
+    /// changed. Whether a release there moves or copies the item.
     fn drag_to(&mut self, x: i32, y: i32, now: Instant) -> bool {
         let hover = self.drag_hover(x, y);
         let Some(drag) = self.drag.as_mut() else {
             return false;
         };
-        let changed = drag.hover(&self.rows, (x, y), hover, now);
+        let root = self.root.clone().unwrap_or_default();
+        let changed = drag.hover(&self.rows, &root, (x, y), hover, now);
         let accepted = drag.target.is_some();
         if changed {
             self.invalidate();
@@ -1223,8 +1319,9 @@ impl NotebookView {
         point
     }
 
-    /// The started drag's label painted with `paint`, and the dragged row's name (tree drag spec
-    /// §3.2). `None` without a started drag, or if GDI can't make the image.
+    /// The started drag's label painted with `paint`, and the dragged row's or tab's name (tree
+    /// drag spec §3.2). `None` without a started drag, for dropped files, or if GDI can't make
+    /// the image.
     fn drag_label_image(&mut self, paint: &ViewPaint) -> Option<(LabelImage, String)> {
         let source = self
             .drag
@@ -1232,13 +1329,23 @@ impl NotebookView {
             .filter(|drag| drag.started)?
             .source
             .clone();
-        let item = drag_item(&source)?;
-        let name = self
-            .rows
-            .iter()
-            .find(|row| row.kind == source)?
-            .name
-            .clone();
+        let (item, name) = match &source {
+            DragSource::Row(kind) => {
+                let item = drag_item(kind)?;
+                let name = self.rows.iter().find(|row| &row.kind == kind)?.name.clone();
+                (item, name)
+            }
+            DragSource::Tab { path, .. } => {
+                let extension = path
+                    .extension()
+                    .map(|extension| extension.to_string_lossy());
+                (
+                    TreeItem::Note(note_kind(extension.as_deref())),
+                    super::tree_copy::item_name(path),
+                )
+            }
+            DragSource::Files(_) => return None,
+        };
         let text = self
             .text_width(&name, paint.fonts.text)
             .min(scale(LABEL_MAX_TEXT, paint.dpi));
@@ -1308,11 +1415,7 @@ impl NotebookView {
                     return none;
                 };
                 let parts = row_parts(rect, row.depth, self.dpi());
-                let font = if matches!(row.kind, RowKind::Unsaved(_)) {
-                    fonts.italic
-                } else {
-                    fonts.text
-                };
+                let font = fonts.text;
                 if self.text_width(&row.name, font) > parts.name.right - parts.name.left {
                     (parts.name, row.name)
                 } else {
@@ -1328,7 +1431,9 @@ impl NotebookView {
     /// no tip.
     fn tooltip_tools(&mut self, fonts: UiFonts) -> Vec<(usize, RECT, String)> {
         let area = self.client();
-        let header = header_layout(area, self.dpi());
+        let dpi = self.dpi();
+        let layout = self.layout(area, dpi);
+        let parts = notebook_layout::root_parts(layout.root, dpi);
         let title = self
             .root
             .as_ref()
@@ -1340,9 +1445,18 @@ impl NotebookView {
             "Add to favorites"
         };
         let buttons_shown = self.mode != Mode::NoNotebook;
-        let (row_rect, row_text) = self.row_tip(fonts);
-        let mut tools = vec![(TOOL_TITLE, header.title, title)];
-        for (button, rect) in header.buttons {
+        // An Open Editors row shows its path; a tree row its cut-off name.
+        let editor_tip = self.editors.list.hover.and_then(|index| {
+            let rect = self.editors_row_rect(layout.editors_list, index)?;
+            let row = self.editors.rows.get(index)?;
+            Some((rect, super::open_editors::tooltip(row)))
+        });
+        let (row_rect, row_text) = match editor_tip {
+            Some(tip) => tip,
+            None => self.row_tip(fonts),
+        };
+        let mut tools = vec![(TOOL_TITLE, parts.name, title)];
+        for (button, rect) in parts.buttons {
             let (id, text) = match button {
                 HeaderButton::Favorite => (TOOL_FAVORITE, favorite),
                 HeaderButton::NewNote => (TOOL_NEW, "New note"),
@@ -1366,10 +1480,19 @@ impl NotebookView {
         );
         let palette = &paint.palette;
         self.list.row_height = scale(ROW_HEIGHT, dpi);
-        self.paint_header(dc, area, palette, fonts, dpi);
-        let body = body_rect(area, dpi);
-        let layout = state_layout(body, dpi);
+        self.editors.list.row_height = scale(ROW_HEIGHT, dpi);
+        let sections = self.layout(area, dpi);
+        // A panel sized after the rows came (startup) or resized: the scroll stays in range.
+        let editors_height = height(sections.editors_list);
+        if editors_height > 0 {
+            self.editors.list.scroll_lines(0, editors_height);
+        }
+        self.paint_sections(paint, sections);
+        let layout = state_layout(sections.body, dpi);
         match self.mode {
+            // The states under the root show only while it is expanded; without a notebook there
+            // is no root to collapse.
+            Mode::Loading | Mode::Empty | Mode::Failed | Mode::Tree if !self.root_expanded => {}
             Mode::Loading => {
                 unsafe {
                     draw_text(
@@ -1529,43 +1652,138 @@ impl NotebookView {
         }
     }
 
-    fn paint_header(&self, dc: HDC, area: RECT, palette: &Palette, fonts: UiFonts, dpi: u32) {
-        let layout = header_layout(area, dpi);
-        let title = match self.mode {
-            Mode::NoNotebook => "NOTEBOOK".to_owned(),
-            _ => self.name.to_uppercase(),
+    fn paint_sections(&mut self, paint: &ViewPaint, layout: PanelLayout) {
+        let (dc, palette, fonts, dpi) = (paint.hdc, &paint.palette, paint.fonts, paint.dpi);
+        let bold = |text: &str, rect: RECT, color: u32| unsafe {
+            draw_text(dc, text, rect, fonts.bold, color, LINE)
+        };
+        let title = RECT {
+            left: layout.title.left + scale(12, dpi),
+            ..layout.title
+        };
+        bold("NOTEBOOK", title, palette.muted_foreground);
+        // Open Editors header: chevron, label and count.
+        let chevron = notebook_layout::section_chevron(layout.editors_header, dpi);
+        let glyph = if self.editors_expanded {
+            GLYPH_CHEVRON_DOWN
+        } else {
+            GLYPH_CHEVRON_RIGHT
         };
         unsafe {
             draw_text(
                 dc,
-                &title,
-                layout.title,
-                fonts.bold,
+                glyph,
+                chevron,
+                fonts.glyph,
                 palette.muted_foreground,
-                LINE,
+                CENTERED,
             )
         };
+        let label = RECT {
+            left: chevron.right,
+            ..layout.editors_header
+        };
+        let count = self.editors.rows.len();
+        bold(
+            &format!("OPEN EDITORS  {count}"),
+            label,
+            palette.muted_foreground,
+        );
+        // The rows.
+        let editors = &self.editors;
+        let images = &mut self.images;
+        let hover_close = editors.hover_close;
+        row_list::paint(
+            dc,
+            layout.editors_list,
+            &editors.list,
+            palette,
+            paint.focused,
+            &mut |dc, index, rect, look| {
+                if let Some(row) = editors.rows.get(index) {
+                    super::open_editors::draw_editor_row(
+                        dc,
+                        row,
+                        rect,
+                        look,
+                        paint,
+                        images,
+                        hover_close && look.hover,
+                    );
+                }
+            },
+        );
+        // The root row: chevron, name, and its buttons (not without a notebook).
+        let parts = notebook_layout::root_parts(layout.root, dpi);
         if self.mode == Mode::NoNotebook {
-            return;
-        }
-        for (button, rect) in layout.buttons {
-            let hot = self.hover == Some(Hit::Header(button));
-            if hot {
-                unsafe { fill(dc, rect, palette.hover_background) };
-            }
-            let glyph = match button {
-                HeaderButton::Favorite if self.favorite => GLYPH_STAR_FILLED,
-                HeaderButton::Favorite => GLYPH_STAR,
-                HeaderButton::NewNote => GLYPH_ADD,
-                HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
-                HeaderButton::More => GLYPH_MORE,
-            };
-            let color = if hot {
-                palette.hover_foreground
+            bold(
+                "NO NOTEBOOK",
+                RECT {
+                    left: parts.chevron.right,
+                    ..layout.root
+                },
+                palette.muted_foreground,
+            );
+        } else {
+            let glyph = if self.root_expanded {
+                GLYPH_CHEVRON_DOWN
             } else {
-                palette.muted_foreground
+                GLYPH_CHEVRON_RIGHT
             };
-            unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
+            unsafe {
+                draw_text(
+                    dc,
+                    glyph,
+                    parts.chevron,
+                    fonts.glyph,
+                    palette.muted_foreground,
+                    CENTERED,
+                )
+            };
+            bold(
+                &self.name.to_uppercase(),
+                parts.name,
+                palette.muted_foreground,
+            );
+            for (button, rect) in parts.buttons {
+                let hot = self.hover == Some(Hit::Header(button));
+                if hot {
+                    unsafe { fill(dc, rect, palette.hover_background) };
+                }
+                let glyph = match button {
+                    HeaderButton::Favorite if self.favorite => GLYPH_STAR_FILLED,
+                    HeaderButton::Favorite => GLYPH_STAR,
+                    HeaderButton::NewNote => GLYPH_ADD,
+                    HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
+                    HeaderButton::More => GLYPH_MORE,
+                };
+                let color = if hot {
+                    palette.hover_foreground
+                } else {
+                    palette.muted_foreground
+                };
+                unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
+            }
+        }
+        // The keyboard selection on a header or tab row; the tree shows its own.
+        if paint.focused {
+            let outlined = match self.cursor {
+                Cursor::EditorsHeader => Some(layout.editors_header),
+                Cursor::Editor(index) if self.editors_expanded => {
+                    let list = layout.editors_list;
+                    self.editors_row_rect(list, index)
+                        .filter(|row| row.top < list.bottom)
+                        .map(|row| RECT {
+                            bottom: row.bottom.min(list.bottom),
+                            ..row
+                        })
+                }
+                Cursor::Root if self.mode != Mode::NoNotebook => Some(layout.root),
+                Cursor::Root | Cursor::Editor(_) | Cursor::Tree => None,
+            };
+            if let Some(rect) = outlined {
+                paint_outline(dc, rect, palette.selection_background, dpi);
+            }
         }
     }
 
@@ -1608,6 +1826,27 @@ impl NotebookView {
         self.rows.len() - usize::from(self.inline.draft_at().is_some())
     }
 
+    /// The children after the push buttons, in order: the Open Editors header, its rows, the
+    /// root row, then the RECENT notebooks or the tree rows.
+    fn accessible_parts(&self) -> (usize, usize, usize) {
+        let editors = if self.editors_expanded {
+            self.editors.rows.len()
+        } else {
+            0
+        };
+        let root = usize::from(self.mode != Mode::NoNotebook);
+        (1, editors, root)
+    }
+
+    /// The tree rows screen readers see: `accessible_rows`, while the tree shows.
+    fn accessible_tree_rows(&self) -> usize {
+        if self.tree_shown() {
+            self.accessible_rows()
+        } else {
+            0
+        }
+    }
+
     /// The row that accessible tree row `index` stands for.
     fn row_of_accessible(&self, index: usize) -> usize {
         match self.inline.draft_at() {
@@ -1638,7 +1877,8 @@ impl NotebookView {
     pub(crate) fn buttons(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
         let mut buttons = Vec::new();
         if self.mode != Mode::NoNotebook {
-            for (button, rect) in header_layout(client, dpi).buttons {
+            let root = self.layout(client, dpi).root;
+            for (button, rect) in notebook_layout::root_parts(root, dpi).buttons {
                 let name = match button {
                     HeaderButton::Favorite if self.favorite => "Remove from favorites",
                     HeaderButton::Favorite => "Add to favorites",
@@ -1649,8 +1889,10 @@ impl NotebookView {
                 buttons.push((name.to_owned(), rect));
             }
         }
-        let state = state_layout(body_rect(client, dpi), dpi);
+        let state = state_layout(self.layout(client, dpi).body, dpi);
         match self.mode {
+            // The states under a collapsed root are not painted.
+            Mode::Empty | Mode::Failed if !self.root_expanded => {}
             Mode::NoNotebook => buttons.push(("Open notebook…".to_owned(), state.button)),
             Mode::Empty => buttons.push(("New note".to_owned(), state.button)),
             Mode::Failed => {
@@ -1680,6 +1922,10 @@ struct Snapshot {
     recent: Vec<PathBuf>,
     root: Option<PathBuf>,
     favorite: bool,
+    /// The notebook's root row is expanded (true without a notebook).
+    root_expanded: bool,
+    /// The Open Editors section is expanded.
+    editors_expanded: bool,
     key: RebuildKey,
 }
 
@@ -1694,26 +1940,19 @@ pub(crate) fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -
 
 /// What the rows would be built from now. Cheap: no flattening, no disk.
 fn rebuild_key(hwnd: HWND) -> RebuildKey {
-    let root = super::library_host::folder(hwnd);
-    let unsaved = if root.is_some() {
-        unsafe { app_ptr(hwnd) }
-            .map(|app| unsaved_entries(unsafe { app.as_ref() }.tabs.documents()))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     RebuildKey {
+        root: super::library_host::folder(hwnd),
         loaded: super::library_host::with_state(hwnd, |_| ()).is_some(),
         failed: super::library_host::load_failed(hwnd),
         expansion: super::library_host::expansion_revision(hwnd),
-        root,
-        unsaved,
+        root_expanded: super::library_host::root_expanded(hwnd),
     }
 }
 
 /// Reads everything the rows need. Each call borrows the App on its own, never nested.
 fn snapshot(hwnd: HWND) -> Snapshot {
     let key = rebuild_key(hwnd);
+    let editors_expanded = super::main_window::open_editors_expanded(hwnd);
     let Some(root) = key.root.clone() else {
         return Snapshot {
             mode: Mode::NoNotebook,
@@ -1722,12 +1961,14 @@ fn snapshot(hwnd: HWND) -> Snapshot {
             recent: super::library_host::recent_notebooks(hwnd),
             root: None,
             favorite: false,
+            root_expanded: true,
+            editors_expanded,
             key,
         };
     };
     let favorite = super::library_host::is_favorite(hwnd);
     let built = super::library_host::with_state(hwnd, |state| {
-        let rows = flatten(&state.tree, &state.local.expanded, &key.unsaved);
+        let rows = flatten(&state.tree, &state.local.expanded);
         (rows, state.truncated)
     });
     let (mode, rows, truncated) = match built {
@@ -1743,6 +1984,8 @@ fn snapshot(hwnd: HWND) -> Snapshot {
         recent: Vec::new(),
         root: Some(root),
         favorite,
+        root_expanded: key.root_expanded,
+        editors_expanded,
         key,
     }
 }
@@ -1759,10 +2002,12 @@ pub(crate) fn rebuild(hwnd: HWND) {
         view.apply(snapshot, names);
         view.invalidate();
         // A drag whose row went ends; a target folder that went is found again at the next
-        // move.
+        // move. A tab or files are not tree rows: a rebuild never loses them.
         let rows = &view.rows;
         let lost = view.drag.as_mut().is_some_and(|drag| {
-            if root_changed || tree::row_index(rows, &drag.source).is_none() {
+            if let DragSource::Row(kind) = &drag.source
+                && (root_changed || tree::row_index(rows, kind).is_none())
+            {
                 return true;
             }
             if drag.target.as_ref().is_some_and(|folder| {
@@ -1790,23 +2035,56 @@ pub(crate) fn rebuild(hwnd: HWND) {
     super::inline_name::place(hwnd);
 }
 
-/// The row for the active tab: its note inside the open notebook, or its unsaved entry.
-fn active_target(hwnd: HWND) -> Option<RowKind> {
-    let root = super::library_host::folder(hwnd)?;
-    let (id, path) = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let active = unsafe { app.as_ref() }.tabs.active()?;
-        Some((active.id, active.path.clone()))
-    })?;
-    match path {
-        None => Some(RowKind::Unsaved(id.0)),
-        Some(path) => crate::library::is_inside(&root, &path)
-            .then(|| RowKind::Note(crate::library::record_path(&root, &path))),
+/// The tabs changed in some way the Open Editors rows show (a tab opened, closed, switched,
+/// renamed, saved, made dirty or clean): the rows follow, and the panel repaints only if they
+/// changed. Cheap: the tab list in memory, no rebuild of the tree.
+pub(crate) fn editors_changed(hwnd: HWND) {
+    let rows = super::open_editors::snapshot(hwnd);
+    let changed = with_view(hwnd, |view| {
+        let reordered = rows.len() != view.editors.rows.len()
+            || rows
+                .iter()
+                .zip(&view.editors.rows)
+                .any(|(new, old)| new.id != old.id);
+        let changed = view.editors.set_rows(rows);
+        if reordered {
+            // Screen readers hear the reorder (`accessible_generation`).
+            view.order = view.order.wrapping_add(1);
+        }
+        // A tab row that went takes the keyboard selection to the row in its place.
+        if let Cursor::Editor(index) = view.cursor
+            && index >= view.editors.rows.len()
+        {
+            view.cursor = match view.editors.rows.len().checked_sub(1) {
+                Some(last) => Cursor::Editor(last),
+                None => Cursor::EditorsHeader,
+            };
+        }
+        if changed {
+            view.fit_editors(true);
+            view.invalidate();
+        }
+        changed
+    })
+    .unwrap_or(false);
+    // A row more or less moves the tree, and an inline field with it (inline naming spec §5.4).
+    if changed {
+        super::inline_name::place(hwnd);
     }
 }
 
+/// The row for the active tab: its note inside the open notebook. `None` for an untitled tab.
+fn active_target(hwnd: HWND) -> Option<RowKind> {
+    let root = super::library_host::folder(hwnd)?;
+    let path = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())?;
+    crate::library::is_inside(&root, &path)
+        .then(|| RowKind::Note(crate::library::record_path(&root, &path)))
+}
+
 /// Whether something the rows are built from, besides the library itself, changed since the
-/// last rebuild: another notebook, its state arriving, a folder expanded or collapsed, or an
-/// untitled tab added, closed, relabelled or saved. Cheap: no flattening.
+/// last rebuild: another notebook, its state arriving, or a folder expanded or collapsed. Cheap:
+/// no flattening.
 pub(crate) fn stale(hwnd: HWND) -> bool {
     let key = rebuild_key(hwnd);
     with_view(hwnd, |view| view.built.as_ref() != Some(&key)).unwrap_or(false)
@@ -1814,9 +2092,10 @@ pub(crate) fn stale(hwnd: HWND) -> bool {
 
 /// Every tab switch: the active note's row is selected and its folders expand (remembered per
 /// PC), without moving the keyboard focus (spec §6.1). The tree is flattened again only when
-/// something the rows depend on changed (a folder newly expanded, an untitled tab added, closed
-/// or relabelled, another notebook); otherwise the row is just selected.
+/// something the rows depend on changed (a folder newly expanded, another notebook); otherwise
+/// the row is just selected.
 pub(crate) fn active_tab_changed(hwnd: HWND) {
+    editors_changed(hwnd);
     let target = active_target(hwnd);
     if let Some(RowKind::Note(relative)) = &target {
         for folder in tree::ancestors(relative) {
@@ -1838,43 +2117,10 @@ pub(crate) fn active_tab_changed(hwnd: HWND) {
     super::inline_name::place(hwnd);
 }
 
-/// An untitled tab's label changed (`library_host::refresh_label`): its row is renamed in place,
-/// with no rebuild. A row that is not there yet (its tab is new) comes with a rebuild.
-pub(crate) fn unsaved_label_changed(hwnd: HWND, id: DocumentId, label: &str) {
-    let renamed = with_view(hwnd, |view| {
-        if let Some(entry) = view
-            .built
-            .as_mut()
-            .and_then(|built| built.unsaved.iter_mut().find(|entry| entry.key == id.0))
-        {
-            entry.label = label.to_owned();
-        }
-        let Some(index) = tree::row_index(&view.rows, &RowKind::Unsaved(id.0)) else {
-            // Without a notebook, or while it loads, there are no rows to rename.
-            return !matches!(view.mode, Mode::Tree | Mode::Empty);
-        };
-        label.clone_into(&mut view.rows[index].name);
-        view.invalidate();
-        true
-    });
-    if renamed == Some(false) {
-        rebuild(hwnd);
-    }
-}
-
 /// The panel's `WM_PAINT` while the Notebook view shows (`side_panel::paint_view`). The panel
 /// has already filled its background.
 pub(crate) fn paint(hwnd: HWND, paint: &ViewPaint) {
     with_view(hwnd, |view| view.paint(paint));
-}
-
-/// Whether panel point (`x`, `y`) is over the header's name or a header button, which must stay
-/// client area. The rest of the header is a window drag area (spec §6.5).
-pub(crate) fn header_hit(hwnd: HWND, x: i32, y: i32) -> bool {
-    with_view(hwnd, |view| {
-        matches!(view.hit_test(x, y), Hit::Header(_) | Hit::Title)
-    })
-    .unwrap_or(false)
 }
 
 /// Runs a main-window command as the menus do.
@@ -1884,12 +2130,12 @@ fn run(hwnd: HWND, command: CommandId) {
     }
 }
 
-/// The selected note's absolute path while the panel has the keyboard focus, so palette and
-/// accelerator commands act on it rather than on the active tab (spec §6.3).
+/// The selected note's absolute path while the panel has the keyboard focus on the tree, so
+/// palette and accelerator commands act on it rather than on the active tab (spec §6.3).
 pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
     let root = super::library_host::folder(hwnd)?;
     with_view(hwnd, |view| {
-        let focused = unsafe { GetFocus() } == view.panel;
+        let focused = unsafe { GetFocus() } == view.panel && view.cursor == Cursor::Tree;
         match view.list.selected.map(|index| view.target(index)) {
             Some(Target::Row(TreeRow {
                 kind: RowKind::Note(relative),
@@ -1902,10 +2148,10 @@ pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
 }
 
 /// The selected folder row's path, relative to the notebook, while the panel has the keyboard
-/// focus: Rename and Delete act on it (notebook folders spec §4.2, §4.3).
+/// focus on the tree: Rename and Delete act on it (notebook folders spec §4.2, §4.3).
 pub(crate) fn focused_folder(hwnd: HWND) -> Option<PathBuf> {
     with_view(hwnd, |view| {
-        let focused = unsafe { GetFocus() } == view.panel;
+        let focused = unsafe { GetFocus() } == view.panel && view.cursor == Cursor::Tree;
         match view.list.selected.map(|index| view.target(index)) {
             Some(Target::Row(TreeRow {
                 kind: RowKind::Folder(relative),
@@ -1918,11 +2164,14 @@ pub(crate) fn focused_folder(hwnd: HWND) -> Option<PathBuf> {
 }
 
 /// The folder a new note goes to (spec §6.7): a selected folder row's own folder, or a
-/// selected note's parent. `None` (the root) for an unsaved row or no selection.
+/// selected note's parent. `None` (the root) for a draft row, no selection, or the keyboard
+/// selection outside the tree.
 pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
     let root = super::library_host::folder(hwnd)?;
     let target = with_view(hwnd, |view| {
-        view.list.selected.map(|index| view.target(index))
+        (view.cursor == Cursor::Tree)
+            .then(|| view.list.selected.map(|index| view.target(index)))
+            .flatten()
     })
     .flatten()?;
     match target {
@@ -1956,6 +2205,10 @@ pub(crate) fn select_row(hwnd: HWND, kind: &RowKind) -> bool {
 /// Gives the tree the keyboard focus, after an inline name edit ended with Enter or Esc
 /// (inline naming spec §5.1).
 pub(crate) fn focus_tree(hwnd: HWND) {
+    with_view(hwnd, |view| {
+        view.cursor = Cursor::Tree;
+        view.invalidate();
+    });
     focus_panel(hwnd);
 }
 
@@ -2081,14 +2334,6 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 _ => {}
             }
         }
-        RowKind::Unsaved(key) => {
-            let entries = [MenuEntry::command("Close tab", CommandId::CloseTab)];
-            if super::menus::track_popup(hwnd, &entries, point) == Some(CommandId::CloseTab)
-                && super::main_window::activate_document_by_id(hwnd, DocumentId(*key))
-            {
-                run(hwnd, CommandId::CloseTab);
-            }
-        }
         RowKind::Draft => {}
     }
 }
@@ -2099,6 +2344,10 @@ fn context_menu(hwnd: HWND, lparam: LPARAM) {
     let keyboard = lparam as u32 == u32::MAX;
     let target = with_view(hwnd, |view| {
         if keyboard {
+            // A row's menu is for the tree's row, not a header or a tab row.
+            if view.cursor != Cursor::Tree {
+                return None;
+            }
             return view.list.selected.map(|index| (index, None));
         }
         let (x, y) = point_of(lparam);
@@ -2138,6 +2387,8 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             with_view(hwnd, |view| {
                 view.tracking_leave = false;
                 view.list.hover = None;
+                view.editors.list.hover = None;
+                view.editors.hover_close = false;
                 view.hover = None;
                 view.hover_pin = false;
                 view.invalidate();
@@ -2147,6 +2398,29 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_LBUTTONDOWN => {
             let (x, y) = point_of(lparam);
             left_down(hwnd, x, y);
+            Some(0)
+        }
+        WM_MBUTTONDOWN => {
+            let (x, y) = point_of(lparam);
+            let pressed = with_view(hwnd, |view| match view.hit_test(x, y) {
+                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                _ => None,
+            })
+            .flatten();
+            with_view(hwnd, |view| view.middle_press = pressed);
+            Some(0)
+        }
+        WM_MBUTTONUP => {
+            let (x, y) = point_of(lparam);
+            let pressed = with_view(hwnd, |view| view.middle_press.take()).flatten();
+            let released = with_view(hwnd, |view| match view.hit_test(x, y) {
+                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                _ => None,
+            })
+            .flatten();
+            if let Some(id) = pressed.filter(|id| Some(*id) == released) {
+                super::main_window::close_document_tab(hwnd, id);
+            }
             Some(0)
         }
         WM_LBUTTONUP => {
@@ -2187,7 +2461,10 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             let hit = hit_after_commit(hwnd, x, y);
             focus_panel_for(hwnd, hit.as_ref());
             if let Some(Hit::Row { index, .. }) = hit {
-                with_view(hwnd, |view| view.select(index));
+                with_view(hwnd, |view| {
+                    view.cursor = Cursor::Tree;
+                    view.select(index);
+                });
             }
             Some(0)
         }
@@ -2218,7 +2495,18 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_MOUSEWHEEL => {
             let delta = i32::from((wparam >> 16) as u16 as i16);
             let lines = row_list::wheel_lines();
+            // Over the Open Editors rows the section scrolls; anywhere else the tree does.
+            let mut pointer = POINT::default();
+            unsafe { GetCursorPos(&mut pointer) };
             let scrolled = with_view(hwnd, |view| {
+                unsafe { ScreenToClient(view.panel, &mut pointer) };
+                let editors = view.layout(view.client(), view.dpi()).editors_list;
+                if contains(editors, pointer.x, pointer.y) {
+                    if view.editors.list.wheel(delta, lines, height(editors)) {
+                        view.invalidate();
+                    }
+                    return false;
+                }
                 let height = view.list_height();
                 let scrolled = view.list.wheel(delta, lines, height);
                 if scrolled {
@@ -2258,11 +2546,25 @@ fn mouse_move(hwnd: HWND, x: i32, y: i32) {
             Hit::Row { index, part } => (Some(index), part == RowPart::Pin),
             _ => (None, false),
         };
-        let hot =
-            matches!(hit, Hit::Header(_) | Hit::StateButton | Hit::SecondButton).then_some(hit);
+        let (editor, close) = match hit {
+            Hit::Editor { index, close } => (Some(index), close),
+            _ => (None, false),
+        };
+        let hot = matches!(
+            hit,
+            Hit::Header(_) | Hit::StateButton | Hit::SecondButton | Hit::EditorsHeader | Hit::Root
+        )
+        .then_some(hit);
         let row_changed = view.list.set_hover(row);
-        if row_changed || view.hover_pin != pin || view.hover != hot {
+        let editor_changed = view.editors.list.set_hover(editor);
+        if row_changed
+            || editor_changed
+            || view.hover_pin != pin
+            || view.editors.hover_close != close
+            || view.hover != hot
+        {
             view.hover_pin = pin;
+            view.editors.hover_close = close;
             view.hover = hot;
             view.invalidate();
             return (Some(view.tooltip_tools(fonts)), false);
@@ -2300,17 +2602,25 @@ fn drag_started(hwnd: HWND) -> bool {
 /// rebuild, a mouse-wheel scroll — the band and cursor should still match what is now under the
 /// pointer. Does nothing without a started drag.
 fn retarget_drag(hwnd: HWND, now: Instant) {
-    let Some(pointer) = with_view(hwnd, |view| {
+    let Some((pointer, external)) = with_view(hwnd, |view| {
         view.drag
             .as_ref()
             .filter(|drag| drag.started)
-            .map(|drag| drag.pointer)
+            .map(|drag| (drag.pointer, is_external(&drag.source)))
     })
     .flatten() else {
         return;
     };
     let accepted = with_view(hwnd, |view| view.drag_to(pointer.0, pointer.1, now)).unwrap_or(false);
-    set_drag_cursor(accepted);
+    // OLE owns the cursor during an Explorer drag.
+    if !external {
+        set_drag_cursor(accepted);
+    }
+}
+
+/// Whether a drag of `source` came from outside FastPad, through OLE.
+fn is_external(source: &DragSource) -> bool {
+    matches!(source, DragSource::Files(_))
 }
 
 /// Ends a drag's timer, with nothing of the App borrowed. Leaves the capture alone: most cancels
@@ -2378,9 +2688,9 @@ fn end_drag_label(hwnd: HWND) {
     }
 }
 
-/// A press on a row's body arms a drag of `source` (tree drag spec §3.1), unless an inline
-/// edit is still open.
-fn arm_drag(hwnd: HWND, source: RowKind, x: i32, y: i32) {
+/// A press on a row's body or an Open Editors row arms a drag of `source` (tree drag spec §3.1,
+/// open editors spec §4.3), unless an inline edit is still open.
+fn arm_drag(hwnd: HWND, source: DragSource, x: i32, y: i32) {
     if super::inline_name::is_open(hwnd) {
         return;
     }
@@ -2452,7 +2762,13 @@ fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
     end_drag_input(panel);
     end_drag_label(hwnd);
     if let Some(folder) = drag.target {
-        super::tree_move::drop_into(hwnd, &drag.source, &folder);
+        match &drag.source {
+            DragSource::Row(kind) => super::tree_move::drop_into(hwnd, kind, &folder),
+            DragSource::Tab { id, path } => {
+                super::copy_host::copy_tab_into(hwnd, *id, path, &folder);
+            }
+            DragSource::Files(_) => {}
+        }
     }
     true
 }
@@ -2470,7 +2786,7 @@ fn take_started_drag(hwnd: HWND) -> Option<HWND> {
     drag.is_some_and(|drag| drag.started).then_some(panel)
 }
 
-/// Ends a drag without moving anything (tree drag spec §3.3): Esc, a lost capture, another view,
+/// Ends a drag without moving or copying anything (tree drag spec §3.3): Esc, a lost capture, another view,
 /// the sidebar hiding, or the dragged row gone. An armed drag just goes. True when a drag was
 /// under way.
 pub(crate) fn cancel_drag(hwnd: HWND) -> bool {
@@ -2520,9 +2836,10 @@ pub(crate) fn drop_right_release_wait(hwnd: HWND) -> bool {
 /// and a collapsed folder the pointer has rested on long enough expands. `now` comes in so the
 /// tests need not wait.
 pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
-    let Some((scrolled, expand, pointer)) = with_view(hwnd, |view| {
+    let Some((scrolled, expand, pointer, external)) = with_view(hwnd, |view| {
         let drag = view.drag.as_ref().filter(|drag| drag.started)?;
         let pointer = drag.pointer;
+        let external = is_external(&drag.source);
         let expand = tree_drag::expand_due(drag.resting.as_ref(), now);
         let list = view.list_rect(view.client());
         let lines = tree_drag::scroll_step(pointer.1, list.top, list.bottom, view.list.row_height);
@@ -2530,7 +2847,7 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
         if scrolled {
             view.invalidate();
         }
-        Some((scrolled, expand, pointer))
+        Some((scrolled, expand, pointer, external))
     })
     .flatten() else {
         return;
@@ -2546,8 +2863,94 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
     if scrolled || expand.is_some() {
         let accepted =
             with_view(hwnd, |view| view.drag_to(pointer.0, pointer.1, now)).unwrap_or(false);
-        set_drag_cursor(accepted);
+        if !external {
+            set_drag_cursor(accepted);
+        }
     }
+}
+
+/// What an Explorer drag at panel point `x`, `y` does (open editors spec §4.1, §4.3): over Open
+/// Editors, or with no notebook, it opens (COPY, no highlight); over the tree, the root row or
+/// the body, it copies into the folder under it when that folder takes one of `paths` (the
+/// band shows); elsewhere nothing. The drag is kept as a started `DragSource::Files` drag with
+/// no capture and no label, so the tree drag's band, auto-expand and auto-scroll apply. While a
+/// modal dialog runs nothing takes it: its posted drop could not run until the dialog closed.
+pub(crate) fn external_over(hwnd: HWND, x: i32, y: i32, paths: &[PathBuf]) -> bool {
+    if super::modal::modal_active(hwnd) {
+        external_leave(hwnd);
+        return false;
+    }
+    let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
+    if opens {
+        external_leave(hwnd);
+        return true;
+    }
+    let started = with_view(hwnd, |view| {
+        if !view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| is_external(&drag.source))
+        {
+            view.drag = Drag::armed(DragSource::Files(paths.to_vec()), x, y).map(|mut drag| {
+                drag.started = true;
+                drag
+            });
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false);
+    if started && let Some(panel) = with_view(hwnd, |view| view.panel) {
+        unsafe { SetTimer(panel, DRAG_TIMER, tree_drag::TICK.as_millis() as u32, None) };
+    }
+    with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false)
+}
+
+/// The Explorer drag left the panel or was cancelled: its band and timer go.
+pub(crate) fn external_leave(hwnd: HWND) {
+    let panel = with_view(hwnd, |view| {
+        let external = view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| is_external(&drag.source));
+        if external {
+            view.drag = None;
+            view.invalidate();
+        }
+        external.then_some(view.panel)
+    })
+    .flatten();
+    if let Some(panel) = panel {
+        end_drag_timer(panel);
+    }
+}
+
+/// An Explorer drop at panel point `x`, `y`: posts what to do and returns at once, so Explorer
+/// never waits on a prompt (spec §6). False when nothing here takes it, as while a modal dialog
+/// runs.
+pub(crate) fn external_drop(hwnd: HWND, x: i32, y: i32, paths: Vec<PathBuf>) -> bool {
+    if super::modal::modal_active(hwnd) {
+        external_leave(hwnd);
+        return false;
+    }
+    let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
+    let folder = if opens {
+        None
+    } else {
+        with_view(hwnd, |view| view.drag_to(x, y, Instant::now()))
+            .filter(|&accepted| accepted)
+            .and_then(|_| {
+                with_view(hwnd, |view| {
+                    view.drag.as_ref().and_then(|drag| drag.target.clone())
+                })
+                .flatten()
+            })
+    };
+    external_leave(hwnd);
+    if !opens && folder.is_none() {
+        return false;
+    }
+    super::copy_host::post_panel_drop(hwnd, paths, folder)
 }
 
 /// Gives the tooltip `tools`, making the tooltip first if the view has none yet. Runs with
@@ -2644,7 +3047,49 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
     let Some(hit) = hit else {
         return;
     };
+    // The keyboard selection follows the click (open editors spec §3.5).
+    let cursor = match hit {
+        Hit::EditorsHeader => Some(Cursor::EditorsHeader),
+        Hit::Editor { index, .. } => Some(Cursor::Editor(index)),
+        Hit::Root => Some(Cursor::Root),
+        Hit::Row { .. } => Some(Cursor::Tree),
+        // A root row button acts as the header's did (open editors spec §3.3): New note and New
+        // folder still go to the tree's selected folder.
+        Hit::Header(_) | Hit::StateButton | Hit::SecondButton | Hit::Thumb(_) | Hit::Empty => None,
+    };
+    if let Some(cursor) = cursor {
+        with_view(hwnd, |view| {
+            view.cursor = cursor;
+            view.invalidate();
+        });
+    }
     match hit {
+        Hit::EditorsHeader => {
+            let expanded = with_view(hwnd, |view| view.editors_expanded).unwrap_or(true);
+            super::main_window::set_open_editors_expanded(hwnd, !expanded);
+            rebuild(hwnd);
+        }
+        Hit::Editor { index, close } => {
+            let Some(row) = with_view(hwnd, |view| view.editors.rows.get(index).cloned()).flatten()
+            else {
+                return;
+            };
+            if close {
+                super::main_window::close_document_tab(hwnd, row.id);
+            } else {
+                super::main_window::activate_document_by_id(hwnd, row.id);
+                // The path is taken now, so the drag outlives its tab closing (open editors spec
+                // §4.3). An untitled tab has no file to copy: no drag.
+                if let Some(path) = row.path {
+                    arm_drag(hwnd, DragSource::Tab { id: row.id, path }, x, y);
+                }
+            }
+        }
+        Hit::Root => {
+            let expanded = super::library_host::root_expanded(hwnd);
+            super::library_host::set_root_expanded(hwnd, !expanded);
+            rebuild(hwnd);
+        }
         Hit::Header(button) => header_clicked(hwnd, button),
         Hit::StateButton => state_button(hwnd),
         Hit::SecondButton => super::library_host::choose_and_open_folder(hwnd),
@@ -2673,10 +3118,10 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
                 .flatten();
             row_clicked(hwnd, index, part, false);
             if let Some(source) = source {
-                arm_drag(hwnd, source, x, y);
+                arm_drag(hwnd, DragSource::Row(source), x, y);
             }
         }
-        Hit::Title | Hit::Empty => {}
+        Hit::Empty => {}
     }
 }
 
@@ -2728,8 +3173,8 @@ fn set_folder_expanded(hwnd: HWND, relative: &Path, expanded: bool) {
     rebuild(hwnd);
 }
 
-/// Opens or toggles row `index` (spec §6.4). A folder toggles, a note opens, an unsaved row
-/// switches to its tab, and a recent notebook opens.
+/// Opens or toggles row `index` (spec §6.4). A folder toggles, a note opens, and a recent
+/// notebook opens.
 pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
     let Some(target) = with_view(hwnd, |view| view.target(index)) else {
         return;
@@ -2753,13 +3198,6 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
                     super::main_window::report_open_failure(hwnd, &path, &error);
                 }
             }
-            RowKind::Unsaved(key) => {
-                if super::main_window::activate_document_by_id(hwnd, DocumentId(key))
-                    && how != Activation::Enter
-                {
-                    super::main_window::focus_content(hwnd);
-                }
-            }
             RowKind::Draft => {}
         },
         Target::Truncated | Target::Nothing => {}
@@ -2779,7 +3217,9 @@ pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
 /// "…": the notebook's own actions.
 fn more_menu(hwnd: HWND) {
     let Some(at) = with_view(hwnd, |view| {
-        let rect = header_layout(view.client(), view.dpi()).buttons[3].1;
+        let dpi = view.dpi();
+        let root = view.layout(view.client(), dpi).root;
+        let rect = notebook_layout::root_parts(root, dpi).buttons[3].1;
         view.to_main(POINT {
             x: rect.left,
             y: rect.bottom,
@@ -2814,18 +3254,68 @@ pub(crate) fn state_button(hwnd: HWND) {
     }
 }
 
-/// The tree's keys (spec §10). Returns false for keys it leaves to the panel.
+/// The panel's keys (spec §10, open editors spec §3.5): the arrows run one selection through
+/// the header rows, the Open Editors rows and the tree. Returns false for keys it leaves to the
+/// panel.
 pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
     if let Some(list_key) = ListKey::from_virtual_key(u32::from(key)) {
         with_view(hwnd, |view| {
-            let height = view.list_height();
-            if view.list.move_selection(list_key, height) {
+            let shape = view.shape();
+            // A list with nothing selected yet moves as one list does: the first Up or Down
+            // selects a row in view.
+            let own_list = view.cursor == Cursor::Tree
+                && shape.tree > 0
+                && view.list.selected.is_none()
+                && matches!(list_key, ListKey::Up | ListKey::Down);
+            if own_list {
+                let height = view.list_height();
+                view.list.move_selection(list_key, height);
                 view.invalidate();
+                return;
             }
+            match panel_cursor::step(view.cursor, view.list.selected, list_key, shape) {
+                Some((cursor, tree)) => {
+                    view.cursor = cursor;
+                    if let Some(index) = tree {
+                        view.select(index);
+                    }
+                    if let Cursor::Editor(index) = cursor {
+                        let height = height(view.layout(view.client(), view.dpi()).editors_list);
+                        view.editors.list.ensure_visible(index, height);
+                    }
+                }
+                None if view.cursor == Cursor::Tree => {
+                    let height = view.list_height();
+                    view.list.move_selection(list_key, height);
+                }
+                // Page Up and Page Down move within the Open Editors rows (open editors spec
+                // §3.5). The list's own selection is the active tab's row, so it is put back.
+                None => {
+                    if let Cursor::Editor(index) = view.cursor {
+                        let height = height(view.layout(view.client(), view.dpi()).editors_list);
+                        let list = &mut view.editors.list;
+                        let active = list.selected.replace(index);
+                        list.move_selection(list_key, height);
+                        let moved = list.selected.unwrap_or(index);
+                        list.selected = active;
+                        view.cursor = Cursor::Editor(moved);
+                    }
+                }
+            }
+            view.invalidate();
         });
         return true;
     }
-    let Some(selected) = with_view(hwnd, |view| view.list.selected).flatten() else {
+    let (cursor, hidden) =
+        with_view(hwnd, |view| (view.cursor, view.tree_hidden())).unwrap_or((Cursor::Tree, false));
+    if cursor != Cursor::Tree {
+        return section_key(hwnd, cursor, key);
+    }
+    // A row the collapsed root hides is not acted on.
+    let selected = with_view(hwnd, |view| view.list.selected)
+        .flatten()
+        .filter(|_| !hidden);
+    let Some(selected) = selected else {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
     match key {
@@ -2874,6 +3364,54 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
     }
 }
 
+/// A key on a header row or an Open Editors row. F2 and Del do nothing there: they act on tree
+/// rows only.
+fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
+    match (cursor, key) {
+        (Cursor::Editor(index), VK_RETURN) => {
+            let Some(id) =
+                with_view(hwnd, |view| view.editors.rows.get(index).map(|row| row.id)).flatten()
+            else {
+                return true;
+            };
+            super::main_window::activate_document_by_id(hwnd, id);
+            super::main_window::focus_content(hwnd);
+        }
+        (Cursor::EditorsHeader, VK_RETURN | VK_LEFT | VK_RIGHT) => {
+            let expanded = super::main_window::open_editors_expanded(hwnd);
+            let wanted = expanded_after(key, expanded);
+            if wanted != expanded {
+                super::main_window::set_open_editors_expanded(hwnd, wanted);
+                rebuild(hwnd);
+            }
+        }
+        (Cursor::Root, VK_RETURN | VK_LEFT | VK_RIGHT) => {
+            if super::library_host::folder(hwnd).is_none() {
+                return true;
+            }
+            let expanded = super::library_host::root_expanded(hwnd);
+            let wanted = expanded_after(key, expanded);
+            if wanted != expanded {
+                super::library_host::set_root_expanded(hwnd, wanted);
+                rebuild(hwnd);
+            }
+        }
+        (_, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE) => {}
+        _ => return false,
+    }
+    true
+}
+
+/// Whether a header row is expanded after `key`: Left collapses it, Right expands it, Enter
+/// toggles it.
+fn expanded_after(key: u16, expanded: bool) -> bool {
+    match key {
+        VK_LEFT => false,
+        VK_RIGHT => true,
+        _ => !expanded,
+    }
+}
+
 /// Right expands a folder, or moves into an expanded one.
 fn right(hwnd: HWND, index: usize) {
     let Some(Target::Row(row)) = with_view(hwnd, |view| view.target(index)) else {
@@ -2909,8 +3447,14 @@ fn left(hwnd: HWND, index: usize) {
         return;
     }
     with_view(hwnd, |view| {
-        if let Some(parent) = tree::parent_index(&view.rows, index) {
-            view.select(parent);
+        match tree::parent_index(&view.rows, index) {
+            Some(parent) => view.select(parent),
+            // A top-level row: the notebook's root row is its parent (open editors spec §3.5).
+            None if view.mode == Mode::Tree => {
+                view.cursor = Cursor::Root;
+                view.invalidate();
+            }
+            None => {}
         }
     });
 }
@@ -2919,7 +3463,7 @@ fn left(hwnd: HWND, index: usize) {
 /// letter searches from the row after the selection, so repeating it steps through matches.
 fn typed(hwnd: HWND, ch: char) {
     with_view(hwnd, |view| {
-        if view.mode != Mode::Tree {
+        if !view.tree_shown() {
             return;
         }
         let prefix = view.typed.push(ch, Instant::now()).to_owned();
@@ -2929,16 +3473,23 @@ fn typed(hwnd: HWND, ch: char) {
             None => 0,
         };
         if let Some(index) = tree::type_ahead(&view.rows, from, &prefix) {
+            view.cursor = Cursor::Tree;
             view.select(index);
         }
     });
 }
 
 impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
-    /// Push buttons first, then the RECENT notebooks (no-notebook state), then the tree rows,
-    /// the draft row left out.
+    /// Push buttons first, then the Open Editors header and its rows, the notebook's root row,
+    /// then the RECENT notebooks (no-notebook state) or the tree rows, the draft row left out.
     fn accessible_count(&self, client: RECT, dpi: u32) -> usize {
-        self.buttons(client, dpi).len() + self.recent.len() + self.accessible_rows()
+        let (header, editors, root) = self.accessible_parts();
+        self.buttons(client, dpi).len()
+            + header
+            + editors
+            + root
+            + self.recent.len()
+            + self.accessible_tree_rows()
     }
 
     fn accessible_item(
@@ -2948,12 +3499,50 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         dpi: u32,
         focused: bool,
     ) -> Option<crate::window::sidebar_accessibility::AccessibleItem> {
-        use crate::window::sidebar_accessibility::{button_item, list_item, row_rect, tree_item};
+        use crate::window::sidebar_accessibility::{
+            button_item, editor_item, list_item, row_rect, section_item, tree_item,
+        };
         let buttons = self.buttons(client, dpi);
         if let Some((name, rect)) = buttons.get(index) {
             return Some(button_item(name, false, false, *rect));
         }
+        let layout = self.layout(client, dpi);
+        let (header, editors, root) = self.accessible_parts();
         let index = index - buttons.len();
+        if index < header {
+            return Some(section_item(
+                &format!("Open editors, {}", self.editors.rows.len()),
+                self.editors_expanded,
+                self.cursor == Cursor::EditorsHeader,
+                focused,
+                layout.editors_header,
+            ));
+        }
+        let index = index - header;
+        if index < editors {
+            let row = self.editors.rows.get(index)?;
+            let (rect, visible) = row_rect(layout.editors_list, &self.editors.list, index);
+            return Some(editor_item(
+                &super::open_editors::accessible_name(row),
+                self.cursor == Cursor::Editor(index),
+                focused,
+                rect,
+                visible,
+            ));
+        }
+        let index = index - editors;
+        if index < root {
+            return Some(section_item(
+                &self.name,
+                self.root_expanded,
+                self.cursor == Cursor::Root,
+                focused,
+                layout.root,
+            ));
+        }
+        let index = index - root;
+        // The list's selection has the focus only while the keyboard selection is in it.
+        let focused = focused && self.cursor == Cursor::Tree;
         if index < self.recent.len() {
             // The no-notebook list holds the RECENT rows, indexed by list position.
             let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
@@ -2965,7 +3554,11 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                 visible,
             ));
         }
-        let index = self.row_of_accessible(index - self.recent.len());
+        let index = index - self.recent.len();
+        if index >= self.accessible_tree_rows() {
+            return None;
+        }
+        let index = self.row_of_accessible(index);
         let row = self.rows().get(index)?;
         let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
         Some(tree_item(
@@ -2978,51 +3571,91 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
     }
 
     fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
-        let inside = |rect: &RECT| {
-            point.x >= rect.left
-                && point.x < rect.right
-                && point.y >= rect.top
-                && point.y < rect.bottom
-        };
+        let inside = |rect: &RECT| contains(*rect, point.x, point.y);
         let buttons = self.buttons(client, dpi);
         if let Some(index) = buttons.iter().position(|(_, rect)| inside(rect)) {
             return Some(index);
+        }
+        let layout = self.layout(client, dpi);
+        let (header, editors, root) = self.accessible_parts();
+        let start = buttons.len();
+        if inside(&layout.editors_header) {
+            return Some(start);
+        }
+        if inside(&layout.editors_list) {
+            let row = self
+                .editors
+                .list
+                .row_at(point.y - layout.editors_list.top)?;
+            return (row < editors).then_some(start + header + row);
+        }
+        if inside(&layout.root) {
+            return (root == 1).then_some(start + header + editors);
         }
         let area = self.list_area(client, dpi);
         if !inside(&area) {
             return None;
         }
         let row = self.list().row_at(point.y - area.top)?;
+        let rows = start + header + editors + root;
         if self.mode == Mode::NoNotebook {
-            (row < self.recent.len()).then_some(buttons.len() + row)
+            (row < self.recent.len()).then_some(rows + row)
         } else {
-            (row < self.rows().len())
+            (self.tree_shown() && row < self.rows().len())
                 .then(|| self.accessible_of_row(row))
                 .flatten()
-                .map(|row| buttons.len() + self.recent.len() + row)
+                .map(|row| rows + self.recent.len() + row)
         }
     }
 
     fn accessible_current(&self, client: RECT, dpi: u32) -> Option<usize> {
-        let buttons = self.buttons(client, dpi).len();
+        let start = self.buttons(client, dpi).len();
+        let (header, editors, root) = self.accessible_parts();
+        match self.cursor {
+            Cursor::EditorsHeader => return Some(start),
+            Cursor::Editor(index) => return (index < editors).then_some(start + header + index),
+            Cursor::Root => return (root == 1).then_some(start + header + editors),
+            Cursor::Tree => {}
+        }
+        let rows = start + header + editors + root;
         let selected = self.list().selected?;
         // In the no-notebook state the list's selection is a RECENT row, not a tree row.
         if self.mode == Mode::NoNotebook {
-            (selected < self.recent.len()).then_some(buttons + selected)
+            (selected < self.recent.len()).then_some(rows + selected)
         } else {
-            (selected < self.rows().len())
+            (self.tree_shown() && selected < self.rows().len())
                 .then(|| self.accessible_of_row(selected))
                 .flatten()
-                .map(|row| buttons + self.recent.len() + row)
+                .map(|row| rows + self.recent.len() + row)
         }
     }
 
     fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
-        let buttons = self.buttons(client, dpi).len();
+        let (header, editors, root) = self.accessible_parts();
+        let Some(index) = index.checked_sub(self.buttons(client, dpi).len()) else {
+            return;
+        };
+        if index < header {
+            self.cursor = Cursor::EditorsHeader;
+            return;
+        }
+        let index = index - header;
+        if index < editors {
+            self.cursor = Cursor::Editor(index);
+            let list = self.layout(client, dpi).editors_list;
+            self.editors.list.ensure_visible(index, height(list));
+            return;
+        }
+        let index = index - editors;
+        if index < root {
+            self.cursor = Cursor::Root;
+            return;
+        }
+        let index = index - root;
         let (offset, rows) = if self.mode == Mode::NoNotebook {
-            (buttons, self.recent.len())
+            (0, self.recent.len())
         } else {
-            (buttons + self.recent.len(), self.accessible_rows())
+            (self.recent.len(), self.accessible_tree_rows())
         };
         let Some(row) = index.checked_sub(offset).filter(|&row| row < rows) else {
             return;
@@ -3032,19 +3665,36 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         } else {
             self.row_of_accessible(row)
         };
+        self.cursor = Cursor::Tree;
         let area = self.list_area(client, dpi);
         self.list_mut().select(row, area.bottom - area.top);
     }
 
     fn accessible_identity(&self, index: usize, client: RECT, dpi: u32) -> Option<u64> {
         use crate::window::sidebar_accessibility::identity_of;
+        let (header, editors, root) = self.accessible_parts();
         let index = index.checked_sub(self.buttons(client, dpi).len())?;
+        if index < header {
+            return Some(identity_of(&"open-editors"));
+        }
+        let index = index - header;
+        if index < editors {
+            let row = self.editors.rows.get(index)?;
+            return Some(identity_of(&("editor", row.id.0)));
+        }
+        let index = index - editors;
+        if index < root {
+            return Some(identity_of(&"notebook-root"));
+        }
+        let index = index - root;
         if let Some(folder) = self.recent.get(index) {
             return Some(identity_of(folder));
         }
-        let row = self
-            .rows()
-            .get(self.row_of_accessible(index - self.recent.len()))?;
+        let index = index - self.recent.len();
+        if index >= self.accessible_tree_rows() {
+            return None;
+        }
+        let row = self.rows().get(self.row_of_accessible(index))?;
         Some(identity_of(&row.kind))
     }
 
@@ -3105,43 +3755,6 @@ mod tests {
     }
 
     #[test]
-    fn the_header_buttons_sit_right_to_left_and_the_title_stops_before_them() {
-        // Break caught: the notebook name drawn under the star, or buttons that do not follow
-        // the panel's right edge when it is resized.
-        let area = RECT {
-            left: 0,
-            top: 0,
-            right: 260,
-            bottom: 600,
-        };
-        let layout = header_layout(area, 96);
-        let [
-            (first, star),
-            (second, new),
-            (third, folder),
-            (fourth, more),
-        ] = layout.buttons;
-        assert_eq!(
-            (first, second, third, fourth),
-            (
-                HeaderButton::Favorite,
-                HeaderButton::NewNote,
-                HeaderButton::NewFolder,
-                HeaderButton::More
-            )
-        );
-        assert_eq!(edges(more), (226, 5, 254, 33));
-        assert_eq!(
-            (star.right, new.right, folder.right),
-            (new.left, folder.left, more.left),
-            "New folder sits right of New note"
-        );
-        assert!(layout.title.right <= star.left);
-        assert_eq!(layout.title.bottom, 38);
-        assert_eq!(body_rect(area, 96).top, 38);
-    }
-
-    #[test]
     fn the_no_notebook_state_lists_recent_notebooks_below_its_button() {
         // Break caught: the RECENT rows painted over the Open notebook… button, or a list rect
         // that turns inside out in a short panel.
@@ -3195,23 +3808,6 @@ mod tests {
     }
 
     #[test]
-    fn unsaved_rows_come_from_untitled_tabs_labelled_by_their_first_line() {
-        // Break caught: saved tabs listed twice (as a note and as unsaved), or untitled tabs
-        // with a blank first line shown with no label at all.
-        let mut labelled = Document::test_fixture(DocumentId(4), true);
-        labelled.first_line_label = Some("Groceries".to_owned());
-        let blank = Document::test_fixture(DocumentId(5), false);
-        let mut saved = Document::test_fixture(DocumentId(6), false);
-        saved.path = Some(PathBuf::from(r"C:\n\a.md"));
-        let entries = unsaved_entries([&labelled, &blank, &saved].into_iter());
-        let entries: Vec<_> = entries.into_iter().map(|e| (e.key, e.label)).collect();
-        assert_eq!(
-            entries,
-            [(4, "Groceries".to_owned()), (5, "Untitled".to_owned())]
-        );
-    }
-
-    #[test]
     fn type_ahead_extends_the_prefix_within_a_second_and_starts_over_after() {
         // Break caught: a prefix that never resets, so a second search a minute later matches
         // nothing.
@@ -3238,11 +3834,11 @@ mod tests {
             .map(|folder| PathBuf::from(format!("folder {folder}")))
             .collect();
         let started = Instant::now();
-        let rows = flatten(&tree, &expanded, &[]);
+        let rows = flatten(&tree, &expanded);
         let elapsed = started.elapsed();
         assert_eq!(rows.len(), 11_000);
         assert!(rows[0].expanded);
-        assert_eq!(flatten(&tree, &[], &[]).len(), 1_000);
+        assert_eq!(flatten(&tree, &[]).len(), 1_000);
         if !cfg!(debug_assertions) {
             assert!(elapsed < Duration::from_millis(16), "{elapsed:?}");
         }
@@ -3714,10 +4310,10 @@ mod tests {
         let rows = vec![row(RowKind::Note("a.md".into()), 0)];
         assert!(!is_dragged_row(None, &rows, 0));
         assert!(!is_dragged_row(None, &rows, 5), "past the last row too");
-        let dragged = RowKind::Note("a.md".into());
+        let dragged = DragSource::Row(RowKind::Note("a.md".into()));
         assert!(is_dragged_row(Some(&dragged), &rows, 0));
         assert!(!is_dragged_row(Some(&dragged), &rows, 5), "no row there");
-        let other = RowKind::Note("b.md".into());
+        let other = DragSource::Row(RowKind::Note("b.md".into()));
         assert!(!is_dragged_row(Some(&other), &rows, 0), "a different row");
     }
 }

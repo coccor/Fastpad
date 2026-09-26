@@ -75,6 +75,8 @@ pub(crate) struct LibraryHost {
     /// The last load of the open notebook failed, so the sidebar offers Retry instead of saying
     /// "Loading…" forever. Starting a load clears it.
     pub(crate) load_failed: bool,
+    /// Copies into the tree, queued on one worker thread (open editors spec §4.5).
+    pub(crate) copy_worker: super::copy_host::CopyWorker,
 }
 
 impl LibraryHost {
@@ -97,6 +99,7 @@ impl LibraryHost {
             expansion_revision: 0,
             shown_move: None,
             load_failed: false,
+            copy_worker: super::copy_host::CopyWorker::default(),
         }
     }
 }
@@ -139,6 +142,14 @@ pub(crate) fn folder(hwnd: HWND) -> Option<PathBuf> {
 
 pub(crate) fn with_state<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryState) -> R) -> Option<R> {
     host(hwnd, |host| host.state.as_mut().map(f)).flatten()
+}
+
+/// Runs `f` on the window's copy worker.
+pub(crate) fn with_copy_worker<R>(
+    hwnd: HWND,
+    f: impl FnOnce(&mut super::copy_host::CopyWorker) -> R,
+) -> Option<R> {
+    host(hwnd, |host| f(&mut host.copy_worker))
 }
 
 fn data_dir(hwnd: HWND) -> Option<PathBuf> {
@@ -576,6 +587,29 @@ pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
 /// Changes whenever a folder is expanded or collapsed.
 pub(crate) fn expansion_revision(hwnd: HWND) -> u64 {
     host(hwnd, |host| host.expansion_revision).unwrap_or(0)
+}
+
+/// Whether the open notebook's root row is expanded (open editors spec §3.3). True while no
+/// notebook state is loaded, so the loading and failed states show under it.
+pub(crate) fn root_expanded(hwnd: HWND) -> bool {
+    with_state(hwnd, |state| !state.local.root_collapsed).unwrap_or(true)
+}
+
+/// Expands or collapses the notebook's root row and remembers it in the per-PC file, the way
+/// `set_expanded` does for a folder.
+pub(crate) fn set_root_expanded(hwnd: HWND, expanded: bool) {
+    let changed = with_state(hwnd, |state| {
+        let changed = state.local.root_collapsed == expanded;
+        state.local.root_collapsed = !expanded;
+        changed
+    })
+    .unwrap_or(false);
+    if changed {
+        host(hwnd, |host| {
+            host.expansion_revision = host.expansion_revision.wrapping_add(1);
+        });
+        save_local_soon(hwnd);
+    }
 }
 
 /// The open notebook's expanded folders, relative to it.
@@ -1041,13 +1075,18 @@ pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
 }
 
 /// Scintilla's own OLE drop target refuses files and wins over `WM_DROPFILES`, so the editor gets
-/// a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`. Runs in `BUILD_CHROME`.
+/// a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`. The sidebar panel's own
+/// drop target is registered here too. Runs in `BUILD_CHROME`.
 pub(crate) fn accept_editor_file_drops(hwnd: HWND) {
-    let Some(editor) = unsafe { app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.editor.as_ref().map(|e| e.hwnd()))
-    else {
-        return;
-    };
+    let editor = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.editor.as_ref().map(|e| e.hwnd()));
+    if let Some(editor) = editor {
+        wrap_editor_drop_target(hwnd, editor);
+    }
+    super::side_panel::accept_file_drops(hwnd);
+}
+
+fn wrap_editor_drop_target(hwnd: HWND, editor: HWND) {
     let target = hwnd as isize;
     // Text drag-and-drop still works without the wrapper; only file drops on the editor are lost.
     let _ = crate::editor::file_drop::accept_file_drops(editor, move |paths| {
@@ -1170,12 +1209,11 @@ pub(crate) fn refresh_label(hwnd: HWND) {
             return None;
         }
         document.untitled_label = document.first_line_label.clone();
-        Some((id, crate::window::notebook_view::unsaved_label(document)))
+        Some((id, crate::window::open_editors::unsaved_label(document)))
     });
-    if let Some((id, label)) = changed {
+    if changed.is_some() {
         super::main_window::refresh_tab_view(hwnd);
-        // Typing in the first line renames the unsaved row in place, without a rebuild.
-        crate::window::notebook_view::unsaved_label_changed(hwnd, id, &label);
+        crate::window::notebook_view::editors_changed(hwnd);
     }
 }
 
@@ -2565,7 +2603,7 @@ fn report(hwnd: HWND, result: Result<(), LibraryError>) {
 }
 
 /// Asks `question`; false also when the window went away meanwhile.
-fn confirmed(hwnd: HWND, question: &str) -> bool {
+pub(crate) fn confirmed(hwnd: HWND, question: &str) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };

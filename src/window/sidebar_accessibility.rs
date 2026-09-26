@@ -70,8 +70,8 @@ pub(crate) struct AccessibleItem {
     pub role: u32,
     pub state: u32,
     pub rect: RECT,
-    /// An outline item's level (0 for the root's children), as tree views report it, or a
-    /// field's text. Empty otherwise.
+    /// An outline item's level, as tree views report it (the Notebook view's section rows at 0,
+    /// the rows under them one deeper), or a field's text. Empty otherwise.
     pub value: String,
     /// A native control shown as this child (the Search box, a find field). Its own MSAA object
     /// is the child's full object. Null for a painted child.
@@ -261,8 +261,52 @@ pub(crate) fn list_item(
     }
 }
 
-/// A Notebook-view row. The name carries a note's type, then ", pinned" or ", unsaved", so none
-/// is conveyed by the icon alone.
+/// A section header in a sidebar view (the Notebook view's Open Editors and notebook rows): an
+/// outline item that is expanded or collapsed, selectable with the keyboard.
+pub(crate) fn section_item(
+    name: &str,
+    expanded: bool,
+    selected: bool,
+    focused: bool,
+    rect: RECT,
+) -> AccessibleItem {
+    let mut state = row_state(selected, focused, true);
+    state |= if expanded {
+        STATE_EXPANDED
+    } else {
+        STATE_COLLAPSED
+    };
+    AccessibleItem {
+        name: name.to_owned(),
+        role: ROLE_SYSTEM_OUTLINEITEM,
+        state,
+        rect,
+        value: "0".to_owned(),
+        window: std::ptr::null_mut(),
+    }
+}
+
+/// An Open Editors row (open editors spec §7): an outline item one level under its header row,
+/// as tree rows are under the notebook's root row.
+pub(crate) fn editor_item(
+    name: &str,
+    selected: bool,
+    focused: bool,
+    rect: RECT,
+    visible: bool,
+) -> AccessibleItem {
+    AccessibleItem {
+        name: name.to_owned(),
+        role: ROLE_SYSTEM_OUTLINEITEM,
+        state: row_state(selected, focused, visible),
+        rect,
+        value: "1".to_owned(),
+        window: std::ptr::null_mut(),
+    }
+}
+
+/// A Notebook-view row, one level under the notebook's root row (open editors spec §7). The name
+/// carries a note's type, then ", pinned", so none is conveyed by the icon alone.
 pub(crate) fn tree_item(
     row: &TreeRow,
     selected: bool,
@@ -282,9 +326,6 @@ pub(crate) fn tree_item(
     if row.pinned {
         name.push_str(", pinned");
     }
-    if matches!(row.kind, RowKind::Unsaved(_)) {
-        name.push_str(", unsaved");
-    }
     let mut state = row_state(selected, focused, visible);
     if matches!(row.kind, RowKind::Folder(_)) {
         state |= if row.expanded {
@@ -298,7 +339,7 @@ pub(crate) fn tree_item(
         role: ROLE_SYSTEM_OUTLINEITEM,
         state,
         rect,
-        value: row.depth.to_string(),
+        value: (u32::from(row.depth) + 1).to_string(),
         window: std::ptr::null_mut(),
     }
 }
@@ -1198,9 +1239,9 @@ mod tests {
     }
 
     #[test]
-    fn tree_rows_are_outline_items_with_expansion_pin_and_unsaved_in_their_names() {
-        // Break caught: a folder's expanded state missing, a pin conveyed only by the filled
-        // icon, or an unsaved tab's row indistinguishable from a saved note.
+    fn tree_rows_are_outline_items_with_expansion_and_pin_in_their_names() {
+        // Break caught: a folder's expanded state missing, or a pin conveyed only by the filled
+        // icon.
         let folder = tree_item(
             &row(
                 RowKind::Folder(PathBuf::from("Work")),
@@ -1217,7 +1258,7 @@ mod tests {
         assert_eq!(folder.role, ROLE_SYSTEM_OUTLINEITEM);
         assert_ne!(folder.state & STATE_EXPANDED, 0);
         assert_eq!(folder.state & STATE_COLLAPSED, 0);
-        assert_eq!(folder.value, "0");
+        assert_eq!(folder.value, "1", "one level under the notebook's root row");
         let closed = tree_item(
             &row(
                 RowKind::Folder(PathBuf::from("Old")),
@@ -1232,7 +1273,7 @@ mod tests {
             true,
         );
         assert_ne!(closed.state & STATE_COLLAPSED, 0);
-        assert_eq!(closed.value, "1");
+        assert_eq!(closed.value, "2");
 
         let pinned = tree_item(
             &row(RowKind::Note(PathBuf::from("a.md")), "a.md", 1, true, false),
@@ -1250,19 +1291,6 @@ mod tests {
         assert_ne!(pinned.state & STATE_FOCUSED, 0);
         assert_ne!(pinned.state & STATE_OFFSCREEN, 0);
 
-        let unsaved = tree_item(
-            &row(RowKind::Unsaved(7), "Groceries", 0, false, false),
-            false,
-            true,
-            ROW,
-            true,
-        );
-        assert_eq!(unsaved.name, "Groceries, unsaved");
-        assert_eq!(
-            unsaved.state & STATE_FOCUSED,
-            0,
-            "focus follows selection only"
-        );
         // Break caught: a note's type conveyed by its coloured icon alone (spec §5.4).
         let csv = tree_item(
             &row(
