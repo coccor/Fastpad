@@ -101,27 +101,6 @@ impl Session {
         self.groups.iter().all(|group| group.entries.is_empty())
     }
 
-    /// Every entry, group after group, and the index of the active group's active entry among them.
-    pub fn flattened(&self) -> (usize, Vec<SessionEntry>) {
-        let before = self
-            .groups
-            .iter()
-            .take(self.active_group)
-            .map(|group| group.entries.len())
-            .sum::<usize>();
-        let active = before
-            + self
-                .groups
-                .get(self.active_group)
-                .map_or(0, |group| group.active);
-        let entries = self
-            .groups
-            .iter()
-            .flat_map(|group| group.entries.iter().cloned())
-            .collect();
-        (active, entries)
-    }
-
     pub fn encode(&self) -> String {
         let mut output = format!(
             "version={VERSION}\r\nlayout={}\r\nactive_group={}\r\n",
@@ -463,55 +442,116 @@ pub fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Progress through a manifest being reopened, one entry per `WM_FASTPAD_RESTORE_SESSION`. With a
-/// single editor group, every group's entries are reopened into it in order.
+/// One saved group while its entries are reopened.
+#[derive(Debug)]
+pub(crate) struct RestoreGroup {
+    /// Its number in the manifest, which the layout names it by.
+    pub(crate) number: usize,
+    /// The index in `entries` of its saved active view.
+    pub(crate) active: usize,
+    pub(crate) entries: Vec<SessionEntry>,
+    /// The live group its entries go into; `None` when its window could not be made, and they go
+    /// to the first group instead (split editors spec §9).
+    pub(crate) id: Option<crate::window::split_tree::GroupId>,
+    /// The document each processed entry became, by entry index. `None` when the entry failed.
+    pub(crate) restored: Vec<Option<DocumentId>>,
+}
+
+/// Progress through a manifest being reopened, one entry per `WM_FASTPAD_RESTORE_SESSION`, group
+/// by group in file order.
 #[derive(Debug)]
 pub struct SessionRestore {
-    pub entries: Vec<SessionEntry>,
-    /// The index in `entries` of the saved active tab.
-    pub active: usize,
-    pub next: usize,
+    pub(crate) groups: Vec<RestoreGroup>,
+    pub layout: SessionLayout,
+    /// The index in `groups` of the saved active group.
+    pub active_group: usize,
+    /// The group and entry index to reopen next.
+    pub next: (usize, usize),
     pub failed: usize,
-    /// The tab each processed entry became, by entry index. `None` when the entry failed.
-    pub restored: Vec<Option<DocumentId>>,
     /// The empty startup tab, closed at the end once something else was restored.
     pub placeholder: Option<DocumentId>,
+    /// Snapshots already reopened, and the document each became: a document shown in two groups
+    /// has one snapshot, named under both, and comes back as one document with two views.
+    pub snapshots: Vec<(RecoveryId, DocumentId)>,
 }
 
 impl SessionRestore {
     pub fn new(session: &Session, placeholder: Option<DocumentId>) -> Self {
-        let (active, entries) = session.flattened();
         Self {
-            entries,
-            active,
-            next: 0,
+            groups: session
+                .groups
+                .iter()
+                .map(|group| RestoreGroup {
+                    number: group.number,
+                    active: group.active,
+                    entries: group.entries.clone(),
+                    id: None,
+                    restored: Vec::new(),
+                })
+                .collect(),
+            layout: session.layout.clone(),
+            active_group: session.active_group,
+            next: (0, 0),
             failed: 0,
-            restored: Vec::new(),
             placeholder,
+            snapshots: Vec::new(),
         }
     }
 
-    pub fn next_entry(&self) -> Option<&SessionEntry> {
-        self.entries.get(self.next)
+    /// Where the next entry is, skipping groups with nothing left.
+    fn position(&self) -> Option<(usize, usize)> {
+        let (mut group, mut entry) = self.next;
+        while let Some(restore) = self.groups.get(group) {
+            if entry < restore.entries.len() {
+                return Some((group, entry));
+            }
+            group += 1;
+            entry = 0;
+        }
+        None
+    }
+
+    /// The next entry to reopen and the index of its group.
+    pub fn next_entry(&self) -> Option<(usize, &SessionEntry)> {
+        let (group, entry) = self.position()?;
+        Some((group, &self.groups[group].entries[entry]))
     }
 
     pub fn record(&mut self, restored: Option<DocumentId>) {
+        let Some((group, entry)) = self.position() else {
+            return;
+        };
         if restored.is_none() {
             self.failed += 1;
         }
-        self.restored.push(restored);
-        self.next += 1;
+        self.groups[group].restored.push(restored);
+        self.next = (group, entry + 1);
     }
 
-    /// The tab the saved active entry became, if that entry was restored.
-    pub fn saved_active_restored(&self) -> Option<DocumentId> {
-        self.restored.get(self.active).copied().flatten()
+    /// Whether any entry came back.
+    pub fn restored_any(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|group| group.restored.iter().any(Option::is_some))
     }
 
-    /// The tab to show at the end: the saved active one, else the last one restored.
-    pub fn active_tab(&self) -> Option<DocumentId> {
-        self.saved_active_restored()
-            .or_else(|| self.restored.iter().rev().find_map(|id| *id))
+    /// The document group `group`'s saved active entry became, if that entry was restored.
+    pub fn saved_active_restored(&self, group: usize) -> Option<DocumentId> {
+        let restore = self.groups.get(group)?;
+        restore.restored.get(restore.active).copied().flatten()
+    }
+
+    /// The view to show in group `group` at the end: its saved active one, else the last one
+    /// restored there.
+    pub fn active_view(&self, group: usize) -> Option<DocumentId> {
+        self.saved_active_restored(group).or_else(|| {
+            self.groups
+                .get(group)?
+                .restored
+                .iter()
+                .rev()
+                .find_map(|id| *id)
+        })
     }
 }
 
@@ -609,7 +649,6 @@ mod tests {
         assert_eq!(parsed.groups.len(), 1);
         assert_eq!(parsed.groups[0].active, 1);
         assert_eq!(parsed.groups[0].entries[1].caret, 5);
-        assert_eq!(parsed.flattened().0, 1);
     }
 
     #[test]
@@ -674,14 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn flattening_puts_groups_in_order_and_finds_the_active_entry() {
-        // Break caught: a multi-group file restoring into one group with the wrong tab active.
-        let (active, entries) = sample().flattened();
-        assert_eq!(entries.len(), 3);
-        assert_eq!(active, 1);
-    }
-
-    #[test]
     fn malformed_entries_are_skipped() {
         // Break caught: one damaged line discarding the whole session.
         let parsed = Session::parse(
@@ -715,24 +746,39 @@ mod tests {
     }
 
     #[test]
-    fn restore_progress_activates_the_saved_tab_or_the_last_restored_one() {
-        // Break caught: a failed active entry leaving no tab activated, or counting successes as
-        // failures in the notice.
-        let session = sample();
+    fn restore_progress_walks_each_group_and_finds_each_saved_active_view() {
+        // Break caught: restore flattening the groups (every view in one group), or a group
+        // whose saved active view failed activating nothing.
+        let mut session = sample();
+        // Group 2 gets a second view after its active one.
+        session.groups[1]
+            .entries
+            .push(SessionEntry::new(SessionSource::File(PathBuf::from(
+                r"C:\y.md",
+            ))));
         let mut restore = SessionRestore::new(&session, None);
-        assert_eq!(restore.next_entry(), Some(&session.groups[0].entries[0]));
-        restore.record(Some(DocumentId(7)));
-        restore.record(None);
-        restore.record(Some(DocumentId(9)));
-        assert_eq!(restore.next_entry(), None);
+        assert_eq!(
+            restore.next_entry(),
+            Some((0, &session.groups[0].entries[0]))
+        );
+        let mut seen = Vec::new();
+        let mut next_id = 1;
+        while let Some((group, _)) = restore.next_entry() {
+            seen.push(group);
+            let id = (next_id != 2).then_some(DocumentId(next_id));
+            next_id += 1;
+            restore.record(id);
+        }
+        assert_eq!(seen, vec![0, 1, 1, 2]);
         assert_eq!(restore.failed, 1);
-        assert_eq!(restore.saved_active_restored(), None);
-        assert_eq!(restore.active_tab(), Some(DocumentId(9)));
-
-        let mut restore = SessionRestore::new(&session, None);
-        restore.record(Some(DocumentId(7)));
-        restore.record(Some(DocumentId(8)));
-        assert_eq!(restore.active_tab(), Some(DocumentId(8)));
+        assert_eq!(restore.active_view(0), Some(DocumentId(1)));
+        assert_eq!(
+            restore.active_view(1),
+            Some(DocumentId(3)),
+            "saved active failed: last restored"
+        );
+        assert_eq!(restore.saved_active_restored(1), None);
+        assert_eq!(restore.active_view(2), Some(DocumentId(4)));
         assert_eq!(
             restore_failure_notice(1),
             "1 item from the last session could not be reopened."
