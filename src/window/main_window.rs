@@ -20738,8 +20738,8 @@ mod tests {
     #[test]
     fn copy_host_copies_files_and_folders_indexes_notes_and_says_what_is_hidden() {
         // Break caught: a copied note missing from the tree until a rescan, a copied folder not
-        // listed, a non-note copied silently, or the single copied row not selected
-        // (open editors spec §4.5, §4.6).
+        // listed, a file that is neither a note nor an image copied silently, or the single
+        // copied row not selected (open editors spec §4.5, §4.6; image preview spec §9).
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("copy-into");
         std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
@@ -20747,7 +20747,7 @@ mod tests {
         std::fs::create_dir_all(outside.join(r"pics\deep")).unwrap();
         std::fs::write(outside.join("draft.md"), "d").unwrap();
         std::fs::write(outside.join(r"pics\deep\x.png"), [1u8]).unwrap();
-        std::fs::write(outside.join("photo.png"), [1u8]).unwrap();
+        std::fs::write(outside.join("archive.zip"), [1u8]).unwrap();
         let (window, _editor) = notebook_window(&scratch);
 
         crate::window::copy_host::copy_into(
@@ -20766,13 +20766,13 @@ mod tests {
 
         crate::window::copy_host::copy_into(
             window.hwnd,
-            vec![outside.join("pics"), outside.join("photo.png")],
+            vec![outside.join("pics"), outside.join("archive.zip")],
             std::path::Path::new(""),
             None,
         );
         crate::window::copy_host::wait_for_copies(window.hwnd);
         assert!(scratch.folder().join(r"pics\deep\x.png").exists());
-        assert!(scratch.folder().join("photo.png").exists());
+        assert!(scratch.folder().join("archive.zip").exists());
         assert!(
             notices(window.hwnd)
                 .iter()

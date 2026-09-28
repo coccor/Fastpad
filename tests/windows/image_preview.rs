@@ -307,12 +307,13 @@ fn an_image_replaces_the_empty_start_tab() {
     // Break caught: "Untitled" left beside the first image opened.
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
-    main.command(CommandId::New);
+    assert_eq!(main.with_app(|app| app.tabs.len()), 1, "the start tab");
     let dir = scratch("reuse");
     let path = dir.join("a.png");
     std::fs::write(&path, preview::images::PNG_2X2).unwrap();
     main.open(&path).unwrap();
     assert_eq!(main.with_app(|app| app.tabs.len()), 1);
+    assert!(main.with_app(|app| app.tabs.active().unwrap().is_image()));
 }
 
 #[test]

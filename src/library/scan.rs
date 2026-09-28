@@ -288,11 +288,13 @@ mod tests {
 
     #[test]
     fn notes_are_found_in_subfolders_and_other_files_and_folders_are_skipped() {
-        // Break caught: a repo folder listing node_modules, build output or images as notes.
+        // Break caught: a repo folder listing node_modules, build output or binaries, or an
+        // image left out of the tree (image preview spec §9).
         let scratch = Scratch::new("rules");
         scratch.file("a.md", "a");
         scratch.file(r"sub\deeper\b.TXT", "bb");
         scratch.file("picture.png", "x");
+        scratch.file("archive.zip", "x");
         scratch.file(r".git\c.md", "x");
         scratch.file(r"node_modules\d.md", "x");
         scratch.file(r"target\e.json", "x");
@@ -306,7 +308,7 @@ mod tests {
             );
         }
         let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
-        assert_eq!(paths(&scan), [r"a.md", r"sub\deeper\b.TXT"]);
+        assert_eq!(paths(&scan), [r"a.md", r"picture.png", r"sub\deeper\b.TXT"]);
         let b = scan
             .entries
             .iter()
