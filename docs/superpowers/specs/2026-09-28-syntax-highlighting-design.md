@@ -53,7 +53,7 @@ pub(crate) struct LanguageSpec {
     pub language: Language,
     pub display_name: &'static str,        // status bar, menu, palette
     pub extensions: &'static [&'static str], // lower-case, no dot; first = default save extension
-    pub file_names: &'static [&'static str], // exact names, e.g. ".env", "Dockerfile"-style cases
+    pub file_names: &'static [&'static str], // exact lower-case names, e.g. ".env", "cargo.lock"
     pub lexer: Option<&'static str>,        // Lexilla name; None = null lexer (plain text)
     pub keywords: &'static [&'static str],  // SCI_SETKEYWORDS sets, index = keyword-set number
     pub properties: &'static [(&'static str, &'static str)], // SCI_SETPROPERTY pairs
@@ -116,11 +116,11 @@ themes never leaves an unstyled token.
 ### 4. Applying a language
 
 `LanguageManager::apply` looks up the spec, calls `set_lexer`, applies `properties` (`SCI_SETPROPERTY`),
-applies `keywords` (`SCI_SETKEYWORDS`), clears styles, applies the table, then `SCI_COLOURISE(0, -1)`,
-the same flow as today. A `None` lexer installs the null lexer without touching Lexilla.
+applies `keywords` (`SCI_SETKEYWORDS`), clears styles and applies the
+table, the same flow as today. A `None` lexer installs the null lexer without touching Lexilla.
 
 `tools/generate-scintilla-constants.ps1` gains `SCI_SETKEYWORDS`, `SCI_SETPROPERTY`,
-`SCI_STYLESETITALIC`, `SCI_COLOURISE` (if not present), and the `SCE_*` prefixes for the lexers
+`SCI_STYLESETITALIC`, and the `SCE_*` prefixes for the lexers
 above (`SCE_H_`, `SCE_HJ_`, `SCE_CSS_`, `SCE_C_`, `SCE_YAML_`, `SCE_TOML_`, `SCE_PROPS_`,
 `SCE_POWERSHELL_`, `SCE_SH_`, `SCE_BAT_`, `SCE_P_`, `SCE_RUST_`, `SCE_SQL_`). The constants file is
 regenerated, not hand-edited.
