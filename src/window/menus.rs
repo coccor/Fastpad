@@ -13,10 +13,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, AppendMenuW, CallNextHookEx, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
+    ACCEL, AppendMenuW, CallNextHookEx, CheckMenuItem, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
     DestroyAcceleratorTable, DestroyMenu, EnableMenuItem, EndMenu, FALT, FCONTROL, FSHIFT,
-    FVIRTKEY, GetSubMenu, HACCEL, HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MSG, MSGF_MENU, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD,
+    FVIRTKEY, GetSubMenu, HACCEL, HMENU, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSGF_MENU, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL, TPMPARAMS, TrackPopupMenuEx,
     TranslateAcceleratorW, UnhookWindowsHookEx, WH_MSGFILTER, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_MOUSEMOVE,
@@ -180,9 +180,15 @@ impl MenuBar {
             ])?;
             append_popup(root, MENU_TITLES[2], search)?;
             let view = create_popup(&[
-                MenuEntry::command("Plain text", CommandId::LanguagePlainText),
-                MenuEntry::command("JSON", CommandId::LanguageJson),
-                MenuEntry::command("Markdown", CommandId::LanguageMarkdown),
+                MenuEntry::Submenu(
+                    "&Language",
+                    crate::languages::LANGUAGES
+                        .iter()
+                        .map(|row| {
+                            MenuEntry::command(row.name, CommandId::for_language(row.language))
+                        })
+                        .collect(),
+                ),
                 MenuEntry::Separator,
                 MenuEntry::command("Zoom &in	Ctrl++", CommandId::ZoomIn),
                 MenuEntry::command("Zoom &out	Ctrl+-", CommandId::ZoomOut),
@@ -248,6 +254,24 @@ pub(crate) fn set_text_commands_enabled(menu: HMENU, enabled: bool) {
     }
 }
 
+/// Checks the active tab's language in View → Language and clears every other language.
+pub(crate) fn set_checked_language(menu: HMENU, active: crate::document::Language) {
+    for row in crate::languages::LANGUAGES.iter() {
+        let check = if row.language == active {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        unsafe {
+            CheckMenuItem(
+                menu,
+                CommandId::for_language(row.language) as u32,
+                MF_BYCOMMAND | check,
+            )
+        };
+    }
+}
+
 /// Grays the View menu's Sidebar entry while notes mode is off and there is no sidebar.
 pub(crate) fn set_sidebar_enabled(menu: HMENU, enabled: bool) {
     let state = MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED };
@@ -264,6 +288,7 @@ impl Drop for MenuBar {
 
 pub(crate) enum MenuEntry {
     Command(&'static str, CommandId),
+    Submenu(&'static str, Vec<MenuEntry>),
     Separator,
 }
 
@@ -283,6 +308,22 @@ fn create_popup(entries: &[MenuEntry]) -> Result<HMENU> {
             MenuEntry::Command(label, command) => {
                 let label = wide_null(label);
                 unsafe { AppendMenuW(menu, MF_STRING, *command as usize, label.as_ptr()) }
+            }
+            MenuEntry::Submenu(label, children) => {
+                let child = match create_popup(children) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        unsafe { DestroyMenu(menu) };
+                        return Err(error);
+                    }
+                };
+                let label = wide_null(label);
+                // Once appended, the child belongs to `menu` and is destroyed with it.
+                let ok = unsafe { AppendMenuW(menu, MF_POPUP, child as usize, label.as_ptr()) };
+                if ok == 0 {
+                    unsafe { DestroyMenu(child) };
+                }
+                ok
             }
             MenuEntry::Separator => unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null()) },
         };
@@ -703,6 +744,34 @@ mod tests {
         assert_ne!(state() & MF_GRAYED, 0);
         set_sidebar_enabled(view, true);
         assert_eq!(state() & MF_GRAYED, 0);
+    }
+
+    #[test]
+    fn language_submenu_lists_every_language_and_checks_the_active_one() {
+        use super::{MenuBar, set_checked_language};
+        use crate::document::Language;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_CHECKED};
+        let bar = MenuBar::create().unwrap();
+        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
+        let state = |language| unsafe {
+            GetMenuState(view, CommandId::for_language(language) as u32, MF_BYCOMMAND)
+        };
+        for row in crate::languages::LANGUAGES.iter() {
+            assert_ne!(
+                state(row.language),
+                u32::MAX,
+                "{} missing from the menu",
+                row.name
+            );
+        }
+
+        set_checked_language(view, Language::Xml);
+        assert_ne!(state(Language::Xml) & MF_CHECKED, 0);
+        assert_eq!(state(Language::Json) & MF_CHECKED, 0);
+
+        set_checked_language(view, Language::Json);
+        assert_eq!(state(Language::Xml) & MF_CHECKED, 0);
+        assert_ne!(state(Language::Json) & MF_CHECKED, 0);
     }
 
     #[test]

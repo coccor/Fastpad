@@ -26,7 +26,6 @@ use lexilla::LexillaLibrary;
 use std::path::PathBuf;
 
 pub use json_commands::{JsonIssue, format_json, json_invocation_count, validate_json};
-#[cfg(test)]
 pub(crate) use registry::LANGUAGES;
 pub use registry::{default_extension, detect_language, display_name};
 

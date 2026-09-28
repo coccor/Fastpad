@@ -2688,9 +2688,33 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::TabWidth4 => set_tab_width(hwnd, 4),
         CommandId::TabWidth8 => set_tab_width(hwnd, 8),
         CommandId::Replace => open_find_bar(hwnd, find_bar::FindBarMode::Replace),
-        CommandId::LanguagePlainText => apply_language(hwnd, crate::document::Language::PlainText),
-        CommandId::LanguageJson => apply_language(hwnd, crate::document::Language::Json),
-        CommandId::LanguageMarkdown => apply_language(hwnd, crate::document::Language::Markdown),
+        CommandId::LanguagePlainText
+        | CommandId::LanguageJson
+        | CommandId::LanguageMarkdown
+        | CommandId::LanguageBash
+        | CommandId::LanguageBatch
+        | CommandId::LanguageC
+        | CommandId::LanguageCSharp
+        | CommandId::LanguageCpp
+        | CommandId::LanguageCss
+        | CommandId::LanguageEnv
+        | CommandId::LanguageHtml
+        | CommandId::LanguageIni
+        | CommandId::LanguageJavaScript
+        | CommandId::LanguagePowerShell
+        | CommandId::LanguageProperties
+        | CommandId::LanguagePython
+        | CommandId::LanguageRust
+        | CommandId::LanguageSql
+        | CommandId::LanguageSvg
+        | CommandId::LanguageToml
+        | CommandId::LanguageTypeScript
+        | CommandId::LanguageXml
+        | CommandId::LanguageYaml => {
+            if let Some(language) = command.language() {
+                apply_language(hwnd, language);
+            }
+        }
         CommandId::ValidateJson => validate_active_json(hwnd),
         CommandId::FormatJson => format_active_json(hwnd),
         CommandId::NextTab => cycle_tab(hwnd, true),
@@ -2930,6 +2954,18 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
         ),
         None => {}
     }
+}
+
+/// The active tab's language; plain text while no tab is open.
+fn active_language(hwnd: HWND) -> crate::document::Language {
+    unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            unsafe { app.as_ref() }
+                .tabs
+                .active()
+                .map(|document| document.language)
+        })
+        .unwrap_or(crate::document::Language::PlainText)
 }
 
 /// Runs only inside `WM_FASTPAD_LOAD_SETTINGS`: applies the settings `bootstrap::run` read before
@@ -5997,6 +6033,7 @@ fn open_menu(hwnd: HWND, mut index: usize) {
                 crate::window::preview_host::buttons_visible(hwnd),
             );
             menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
+            menus::set_checked_language(menu, active_language(hwnd));
         }
         menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
         set_menu_mode(
