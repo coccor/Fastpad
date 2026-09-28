@@ -1,0 +1,322 @@
+# Split editors (editor groups): design
+
+- Status: approved in conversation on 2026-09-28.
+- Branch: `feat/split-editors`, based on `main` (0.2.0).
+- Delivered as three stacked PRs (§10).
+
+## 1. Goal
+
+- **Split the editor area the way VS Code does.** The editor area becomes a grid of editor groups. Each group has its own tab strip, active tab, find bar, preview and image view. Groups nest into rows and columns, and draggable sashes separate them.
+- **The same document can be shown in several groups.** The text, undo history and dirty flag are shared. Each group keeps its own caret and scroll.
+- **Tabs move by drag and drop.** They can be reordered within a strip or moved to another strip. Dropping on an editor's edge splits it. VS Code's drop overlay shows where a tab will land.
+- **The layout survives a restart** through the session.
+- **Nothing gets slower.** One group costs what the single editor costs today. Nothing new runs before first paint.
+
+## 2. Decisions
+
+| Question | Decision |
+|---|---|
+| Scope | Core splits plus drag and drop. Not in scope: "open preview to the side" as its own group, layout presets (2 columns, 2×2 grid), maximize or join groups (§11). |
+| Same document in two groups | Yes. Ctrl+\\ opens the active document in the new group, as VS Code does. |
+| Where tab strips go | In every group, at its top, even when there is only one group. The title bar keeps the icon, the menu band, the window title and the caption buttons. |
+| Find bar | One per group, with its own query and toggles. |
+| Markdown/SVG preview | Stays as today (side or full, inside the editor area) but is per group. |
+| Preview (italic) tab | One per group. |
+| Opening a file already open in another group | A new view of it in the active group (VS Code's default). |
+| Ctrl+1..9 | Focus group N. Tab selection moves to Alt+1..9. |
+| Closing a group's last tab | Closes the group, unless it is the only one. |
+| Architecture | Each group is its own child window. Documents live in a shared store, and tabs are views onto them (§3). |
+| Session v1 (0.2.0) | Still read, as one group. 0.2.0 has shipped, so upgrading users keep their tabs (§8). |
+
+## 3. Data model
+
+### 3.1 Document store
+
+- `DocumentStore` (new, `src/window/document_store.rs`) holds each open `Document` exactly once, keyed by `DocumentId`. `Tabs` no longer owns documents.
+- **The document host.** The store owns a hidden message-only Scintilla window. It creates every Scintilla document (`SCI_CREATEDOCUMENT`) and lives as long as the app.
+  - `EditorDocument` keeps an `Rc` to the host's endpoint, not to the editor that created it.
+  - `Editor::use_document` accepts a document when the document and the editor share the same host. That check replaces the current `Rc::ptr_eq` against the editor's own endpoint (`editor/scintilla.rs`, `use_document`).
+  - Scintilla documents are global to the DLL and reference-counted (`SCI_ADDREFDOCUMENT` / `SCI_RELEASEDOCUMENT`), so any group's editor can show any of them. Destroying a group's editor releases only that view's reference.
+- **Inactive documents.** Their text is read and changed through the host editor, not by swapping them into the visible editor. This removes `with_inactive_document` and its callers' swap (`document_text`, `replace_in_document`, `reload_clean_document`, snapshots).
+- **Document-level logic** walks the store, not the tabs: autosave, recovery snapshots, disk-conflict checks, library renames and moves, labels, and the close-window prompts.
+
+### 3.2 Views and groups
+
+- `EditorTab { view: ViewId, document: DocumentId, view_state: ViewState }`.
+  - `ViewState` holds the caret, anchor, first visible line and horizontal scroll offset.
+  - It is saved whenever the tab stops being shown in its group's editor, when another tab is activated or the tab moves group, and it is restored when the tab is shown again. Today switching tabs loses the caret and scroll; after this change it keeps them.
+- `EditorGroup` (data part) holds:
+  - its tabs in strip order;
+  - the active index;
+  - a per-group MRU of `ViewId` (Ctrl+Tab);
+  - which of its tabs, if any, is the preview tab.
+- The preview flag moves from `Document` to the view. A document shown in two groups can be italic in one group and not in the other. The first edit clears the preview flag on every view of the document, as the first edit does today.
+- **Reference counting of views.** A document is removed from the store when its last view closes.
+  - Closing a view of a dirty document that has another view **does not prompt**.
+  - Closing its last view prompts as today.
+- **Accessibility.** Each strip has its own UIA provider built from its group's `TabView`/`TabSelection`. The single-strip provider in `accessibility.rs` becomes one provider per group.
+
+### 3.3 App state
+
+`App.editor` and `App.tabs` are replaced by:
+
+- `store: DocumentStore`;
+- `groups`, a map `GroupId → EditorGroup` (window plus data), so an id never refers to a different group after one is removed;
+- `layout: SplitTree` (§4.3);
+- `active_group: GroupId`;
+- `recent_views: Vec<(GroupId, ViewId)>`, the global activation order for Ctrl+P, kept in memory only as today.
+
+Helpers `active_group()`, `active_editor()`, `active_view()` and `active_document()` replace the direct `app.editor` and `tabs.active()` uses. There are about 50–60 production call sites across `main_window.rs`, `library_host.rs`, `preview_host.rs`, `image_host.rs`, `bootstrap.rs`, `open_editors.rs` and `notebook_view.rs`.
+
+### 3.4 Scintilla notifications
+
+- Every editor that shows a document sends `SCN_MODIFIED` and the save-point notifications for it.
+- **Document-level effects** run once per change: the dirty flag, generation, label watch and preview-tab promotion.
+  - Each document has one *reporting editor*: the editor of the lowest-numbered group whose active view shows that document. Notifications about that document from any other editor are ignored for document-level effects.
+  - A group's editor only ever shows its active view's document, so "the editors showing document D" is exactly "the groups whose active view is D".
+  - When no group shows the document (it is inactive everywhere), its changes come only through the host editor (replace across notes, reload from disk). The host editor sends no notifications anyone handles, so the code making that change applies the document-level effects itself, as a store call (`DocumentStore::note_text_change`).
+  - The reporting editor is recomputed whenever a group's active view changes.
+- **View-level effects** (caret position, status bar, scroll sync with the preview) run only for the active group's editor.
+- `handle_editor_notification` maps `hwndFrom` to its group instead of comparing it to the single editor.
+
+## 4. Windows and layout
+
+### 4.1 Title bar
+
+- It keeps the app icon, the menu band and the caption buttons.
+- The space the tabs used shows the window title, `<name> — FastPad`, which follows the active group's active tab (`sync_window_title`).
+- The tab strip, the preview buttons and the overflow button leave `titlebar.rs`. Its `HitTarget::Tab`/`CloseTab`/preview/overflow variants and their paint code move to the group strip.
+
+### 4.2 The group window
+
+`EditorGroup` is a child window class (`src/window/editor_group.rs`). The strip's paint and hit-testing live in `src/window/group_strip.rs`. From top to bottom the group contains:
+
+1. **The tab strip.** It is painted by the group window and is as tall as today's tabs. It keeps today's features:
+   - the look, and the close buttons;
+   - middle-click to close;
+   - wheel scrolling and the scroll thumb;
+   - the italic preview tab and double-click to promote it;
+   - double-click on empty space for New;
+   - right-click on empty space for the tab-strip menu.
+
+   The action cluster at the right end holds:
+   - **Split Right**;
+   - **Preview Side / Preview Full**, for Markdown and SVG tabs only;
+   - **"…"**, which opens the tab-strip menu plus **Close Group**.
+2. **The find bar.** It is the existing `FindBar`, one instance per group, hidden until used. It searches its own group's editor.
+3. **The content area.** It holds the group's own Scintilla, its own `PreviewHost` (side or full mode, ratio and divider) and its own `ImageHost`. `preview_host::layout` and `image_host::layout` take the group's content rectangle in place of the window's. The divider drag and editor↔preview scroll sync move with them.
+
+The group lays out its own children on `WM_SIZE`. Most of `layout_editor_and_find_bar` moves into the group.
+
+**Active group.**
+- A group becomes active when anything in it is clicked, when its editor, find bar or preview gets focus, or through Ctrl+1..9, F6 or a drop.
+- The active tab of the active group is drawn with the accent top border. The active tabs of other groups are drawn with an inactive accent.
+- The status bar, window title, Open Editors highlight and command routing all follow the active group.
+
+### 4.3 Split tree
+
+`src/window/split_tree.rs` is pure logic.
+
+- `Node = Leaf(GroupId) | Branch { axis: Row | Column, children: Vec<(Node, ratio)> }`. The ratios of a branch's children sum to 1.
+- **Splitting** a leaf in direction D:
+  - If the parent's axis matches D, insert a sibling next to the leaf. The leaf's share is halved between the leaf and the new group, and the other siblings keep their share.
+  - Otherwise, replace the leaf with a new branch on D's axis holding the leaf and the new group at 0.5 each.
+  - Left and up place the new group before the leaf; right and down place it after.
+- **Removing** a leaf gives its share to its remaining siblings in proportion to their shares. A branch with one child left is replaced by that child. If that child is a branch on the same axis as its new parent, it is flattened into the parent.
+- **`layout(rect, dpi)`** returns each group's rectangle and each sash's rectangle, together with its branch and child index. The sash is 4 px at 96 DPI, scaled.
+- **Minimum group size** is 160×100 px at 96 DPI, scaled.
+  - A sash drag is clamped so that no group on either side goes below it.
+  - A split is refused when the new pair would not fit. A status-bar hint says "Not enough room to split".
+- **Group numbering** for Ctrl+1..8 and the Open Editors headers is the leaf order in a depth-first walk: left to right in a row, top to bottom in a column.
+
+### 4.4 Sashes and the main window
+
+- The main window's layout places the sidebar and the command palette and name box. It then gives the rest, above the status bar, to `split_tree.layout` and moves each group window.
+- **The main window owns the sashes.**
+  - Hovering one shows the resize cursor.
+  - A drag uses `SetCapture`, as the preview divider does, and updates the ratios live.
+  - A double-click equalizes that branch's children.
+  - Resizing the window keeps the ratios.
+- **There is always at least one group.**
+  - When the last tab of the only group closes, that group stays and shows today's empty state.
+  - When the last tab of any other group closes, that group is destroyed, removed from the tree, and the group next to it becomes active.
+
+## 5. Commands and behaviour
+
+### 5.1 New and changed commands
+
+Each command is in the menu band (a new **View ▸ Editor Layout** submenu), the command palette and the accelerator table. Win32 accelerators have no chords, so VS Code's Ctrl+K Ctrl+\\ is not available.
+
+| Command | Key | Behaviour |
+|---|---|---|
+| Split Right | Ctrl+\\ | New group to the right of the active one, showing a new view of the active document. With no tab open, the new group is empty. |
+| Split Down | Ctrl+Shift+\\ | The same, below. |
+| Focus Group 1..8 | Ctrl+1..8 | Focuses group N. If group N doesn't exist, the active document is split into a new group to the right of the last group, as in VS Code. |
+| Focus Last Group | Ctrl+9 | |
+| Select Tab 1..8, Last Tab | Alt+1..9 | Within the active group. Moved from Ctrl+1..9, keeping the numpad variants. |
+| Move Tab to Next Group | Ctrl+Alt+Right | Moves the active view to the next group in numbering order. If there is none, a group is created on the right. |
+| Move Tab to Previous Group | Ctrl+Alt+Left | Moves the active view to the previous group. Does nothing in group 1. |
+| Close Group | "…" menu, palette | Closes each tab with the usual prompts. Cancelling a prompt stops the command and keeps the group. |
+
+These commands take the next free `CommandId` numbers.
+
+Existing commands:
+- **F6 / Shift+F6** cycle activity bar → panel → group 1 → group 2 → …. Only the parts that are visible take part.
+- **Ctrl+Tab / Ctrl+Shift+Tab** use the active group's MRU.
+- **Ctrl+W** and middle-click close one view.
+
+### 5.2 Routing
+
+- `execute_command` targets the active group. That covers the edit commands, find and replace, save, save as, close, the preview toggles, zoom, and the "needs a document" and "needs text" guards.
+- A command started from a group's strip (its context menu, "…" or preview buttons) first makes that group active. Every command therefore keeps one routing path.
+
+### 5.3 Opening files
+
+This applies to files opened from the tree, a Ctrl+P file result, an Explorer drop that misses every group, the command line and a forwarded single-instance open.
+
+- The file opens in the active group.
+- If the active group already has a view of it, that view is activated.
+- If only another group has it, a new view is added to the active group.
+- A single click in the tree replaces the active group's preview tab, if it has one. Other groups' preview tabs are left alone.
+
+### 5.4 Ctrl+P
+
+- With an empty query, it lists open views across all groups, most recent first (`recent_views`).
+- When more than one group exists, each row shows its group ("Group 2").
+- Picking a row focuses that view in its own group. It does not create a copy.
+- A typed file result opens as in §5.3.
+
+### 5.5 Open Editors
+
+- With one group it is the same flat list as today.
+- With two or more groups, the list shows `Group 1`, `Group 2`, … header rows, each followed by its views in strip order. The headers can't be dragged or selected.
+- A click focuses that view in its group, and ✕ closes that view.
+- A document open in two groups appears under each group.
+
+### 5.6 File operations and closing
+
+- **Rename, move and delete** from the tree, and external changes on disk, act on the store's document.
+  - Every view of the document updates its title.
+  - Deleting a file closes all its views.
+- **The dirty-close prompt** appears once per document, when its last view closes.
+- **Closing the window** prompts per document, as today.
+- **The status bar and window title** show the active group's active view. The caret position comes from that group's editor.
+
+## 6. Drag and drop
+
+It is an in-window `SetCapture` drag, the same pattern as `tree_drag`, not OLE. The pure decisions live in `src/window/group_drop.rs`.
+
+- **Starting.** A left press on a tab followed by movement past `SM_CXDRAG`/`SM_CYDRAG`. The existing `drag_label` popup follows the pointer, showing the tab's icon and name. Esc or a right-click cancels. A press and release without that movement is still a click.
+- **The overlay.** It is a layered, click-through popup, the same technique as `drag_label`. It tints the rectangle the tab would end up in with a translucent accent: the whole group for a middle drop, or the future half for an edge drop. On a strip it shows an accent insertion bar instead.
+
+### 6.1 Targets
+
+| Pointer over | Drop does |
+|---|---|
+| Its own strip | Reorders the tab to the insertion point. Tab reordering is new. |
+| Another group's strip | Moves the view to that position in that group. With **Ctrl** held, it copies: a new view of the same document, and the source view stays. |
+| A group's content area, middle | Moves (or with Ctrl copies) the view into that group, appended at the end and activated. |
+| A group's content area, outer third on the left, right, top or bottom | Splits that group in that direction and puts the view in the new group. |
+| Its own group's edge, when the group has only that one tab and no Ctrl | Nothing (the no-drop cursor). |
+| A notebook folder in the sidebar tree | Copies the file there, today's `copy_tab_into` behaviour for Open Editors rows, now also from a strip. |
+| Anywhere else | Nothing (the no-drop cursor). |
+
+The zone is chosen by the pointer's position in the content rectangle. The outer third is measured against the rectangle's width for left and right, and its height for top and bottom. Where the corner regions overlap, the nearer edge wins, and on a tie the horizontal edge wins.
+
+### 6.2 Rules
+
+- If the target group already has a view of the document, the drop activates that view instead of adding one. A move still removes the source view.
+- Moving a group's last tab out closes the source group after the drop completes.
+- Dropping a tab on its own current position does nothing.
+- **Open Editors rows** can be dragged onto group strips and content areas with the same targets and rules.
+- **Explorer (OLE) file drops** open the files in the group under the pointer, or in the active group if the pointer isn't over one. They have no edge zones and no overlay.
+
+## 7. Menus and the tab-strip context menu
+
+- The tab-strip menu is today's `menus::show_tab_strip_menu`, plus Split Right, Split Down and Close Group. It acts on the group that was right-clicked.
+- The tab context menu (a right-click on a tab) makes that view active in its group. It then offers today's items plus Split Right, Split Down and Move to Next Group.
+
+## 8. Session
+
+`session.ini`, version 2:
+
+```
+version=2
+layout=row(1:0.5,column(2:0.6,3:0.4):0.5)
+active_group=2
+group=1|active=0
+file=<caret>|<anchor>|<firstline>|<path>
+snapshot=<caret>|<anchor>|<firstline>|<recovery id>
+group=2|active=1
+file=...
+```
+
+- **`layout`** is the split tree.
+  - `row(...)` and `column(...)` are branches, and each child is written as `<child>:<ratio>`.
+  - A bare number is a leaf, numbered by its `group=` line.
+  - Ratios are written with up to four decimals and normalized on read.
+- Each `group=` line starts a group, and the view lines that follow belong to it in strip order.
+  - **Every view** records its caret, anchor and first line, not just the active one.
+  - `file=` and `snapshot=` have the same format as in v1.
+- **A document open in several groups** is written under each group and restored once. Its views are matched by path, or by recovery ID for dirty untitled documents, and they share the restored document.
+- The preview mode is not saved (unchanged).
+- **Restore** parses the layout first. It then creates the group windows and fills them through the existing step-by-step restore (`begin_session_restore` / `restore_session_step` / `finish_session_restore`), extended to a list of (group, entry).
+  - Every view's `ViewState` is applied, not only the active one's.
+  - A `layout` line that fails to parse, or that doesn't name exactly the groups present, is dropped. All views then go into one group in file order.
+  - Files that no longer exist are skipped, as today. A group left with no views is removed from the tree, which collapses.
+  - `active_group` and each `active=` fall back to the first group and the first view when out of range.
+- **Version 1** files (0.2.0) are read as a single group. Their entry lines are unchanged, so the reader handles `version=1` with an implicit `group=1` and `active=`. The file is always written as version 2.
+- `recent_views` is reset after restore, as the MRU is today.
+
+## 9. Errors
+
+- **Creating a group's window or Scintilla fails** during a split, a drop or a restore:
+  - on a split or drop, a notification shows the error and the layout and tabs are unchanged;
+  - during a restore, that group's views go into the first group.
+- **A drop that can't complete** (for example, the target group went away) leaves the source view where it was.
+- **The host editor can't be created** at start-up: this is fatal in the same way today's editor creation failure is.
+- **No room to split:** the split is refused with a status-bar hint (§4.3).
+
+## 10. Delivery
+
+Three PRs, stacked on `feat/split-editors`:
+
+1. **One group** (`feat/split-editors`).
+   - `DocumentStore` and the host editor, `EditorTab` and `ViewState`, and the `EditorGroup` window with its strip, find bar, preview and image view.
+   - The tab strip leaves the title bar, notifications are routed by group, and session v2 is written with a single group (the v1 reader is kept).
+   - There are no splits yet. Visible changes: the tabs move below the title bar, caret and scroll are kept per tab, and the window title is shown in the title bar.
+2. **Splits** (`feat/split-editors-grid`).
+   - The split tree, sashes, the §5.1 commands, several views of one document, per-group find and preview, Open Editors group headers, group-aware Ctrl+P, and multi-group sessions.
+3. **Drag and drop** (`feat/split-editors-dnd`).
+   - Tab drags, reordering, moves and copies between groups, edge splits, the overlay, Open Editors row drags, and Explorer drops per group.
+
+## 11. Out of scope
+
+- Opening a Markdown or SVG preview as its own group ("open preview to the side").
+- Layout presets (two columns, 2×2 grid, and so on), maximize a group, join groups, "close other groups".
+- Edge-split zones for Explorer (OLE) drops.
+- Dragging tree rows into editor groups.
+- Floating or separate-window groups.
+- Saving the preview mode in the session.
+
+## 12. Testing
+
+- **Pure unit tests:**
+  - `split_tree`: split in all four directions with the same and a different axis, removal and collapse and flatten, ratio normalization, layout at 96/144/192 DPI, sash clamping at the minimum size, refusing a split without room, and group numbering;
+  - `group_drop`: zone hit-testing including corners and ties, move and copy, the already-open-there rule, the last-tab no-op, and reordering within a strip;
+  - session v2: parse and format round-trip, corrupt and mismatched layouts, a document shared across groups, and v1 read as one group;
+  - `DocumentStore`: view reference counting, and that only the last view prompts.
+- **Window tests** in `main_window` tests (`--test-threads=1`):
+  - split and close group;
+  - commands routed to the active group;
+  - an edit in one group showing in the other group's view of the same document, and the dirty flag shared;
+  - per-group find bars;
+  - per-group preview;
+  - Open Editors headers;
+  - Ctrl+1..9 and Alt+1..9;
+  - Ctrl+Alt+Left/Right;
+  - caret and scroll kept per tab;
+  - a session round trip with three groups.
+- **Drag tests** send synthetic mouse messages to strips and content zones, as the tree-drag tests do.
+- **E2E:** split, restart, and check the restored layout.
+- **Manual checks before merge:** Narrator on multiple strips, high contrast, 150–200% DPI (sashes, overlay, strips), and a real Explorer drop onto a second group.
