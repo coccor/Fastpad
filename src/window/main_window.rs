@@ -4323,14 +4323,10 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
             "file population is already active",
         ));
     }
-    let existing = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let app = unsafe { app.as_ref() };
-        app.tabs
-            .find_path(path)
-            .map(|id| (id, app.tabs.view().snapshot().revision))
-    });
-    if let Some((id, revision)) = existing {
-        return if activate_document(hwnd, id, revision) {
+    let existing =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.find_path(path));
+    if let Some(id) = existing {
+        return if open_in_active_group(hwnd, id) {
             unsafe {
                 PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
             }
@@ -4385,10 +4381,12 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
         // A preview goes where the preview tab is. Without one it is placed like any new tab,
         // reusing an empty start tab.
         let replace_preview = preview && app.tabs.preview_id().is_some();
+        // An untitled tab another group also shows stays: that view keeps it.
         let candidate_ids = app
             .tabs
             .active()
             .filter(|active| !replace_preview && !active.dirty && active.path.is_none())
+            .filter(|active| app.tabs.views_of(active.id).len() == 1)
             .map(|active| (active.id, active.recovery_id));
         (editor, candidate_ids, replace_preview)
     };
@@ -4596,7 +4594,7 @@ pub(crate) fn open_note(
         .and_then(|app| unsafe { app.as_ref() }.tabs.find_stored_path(path));
     match open {
         Some(id) => {
-            if !activate_document_by_id(hwnd, id) {
+            if !open_in_active_group(hwnd, id) {
                 return Err(crate::FastPadError::Invariant(
                     "the note's tab could not be activated",
                 ));
@@ -5016,22 +5014,32 @@ fn tab_id_at(hwnd: HWND, index: usize) -> Option<DocumentId> {
 }
 
 /// Closes `id` without asking, discarding any unsaved edits, e.g. once its file is deleted.
+/// Every group's view of `id` closes, each without asking (split editors spec §5.6).
 pub(super) fn close_document_without_prompt(hwnd: HWND, id: DocumentId) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    if !activate_document_by_id(hwnd, id) || !identity.is_live_for(hwnd) {
-        return;
-    }
-    let reviewed = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let app = unsafe { app.as_ref() };
-        Some((app.tabs.active_close_review()?, app.editor().cloned()?))
-    });
-    let Some((review, editor)) = reviewed else {
-        return;
+    let views = || {
+        unsafe { app_ptr(hwnd) }.map_or(0, |app| unsafe { app.as_ref() }.tabs.views_of(id).len())
     };
-    if review.id == id {
+    while let before @ 1.. = views() {
+        if !activate_document_by_id(hwnd, id) || !identity.is_live_for(hwnd) {
+            return;
+        }
+        let reviewed = unsafe { app_ptr(hwnd) }.and_then(|app| {
+            let app = unsafe { app.as_ref() };
+            Some((app.tabs.active_close_review()?, app.editor().cloned()?))
+        });
+        let Some((review, editor)) = reviewed else {
+            return;
+        };
+        if review.id != id {
+            return;
+        }
         close_reviewed_document(hwnd, &identity, &editor, review, CloseDecision::Discard);
+        if !identity.is_live_for(hwnd) || views() >= before {
+            return;
+        }
     }
 }
 
@@ -5377,7 +5385,65 @@ fn save_reviewed_document(hwnd: HWND, id: DocumentId) -> bool {
 }
 
 /// Makes `id` the active document, or reports false when it no longer exists.
+/// Shows open document `id` in the active group: its view there, or a new view when only another
+/// group has one (split editors spec §5.3). A second view makes a preview tab normal.
+fn open_in_active_group(hwnd: HWND, id: DocumentId) -> bool {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return false;
+    };
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.document(id)?;
+        let group = tabs.active_group();
+        let state = tabs.group(group)?;
+        Some((group, state.contains(id), state.view().snapshot().revision))
+    });
+    let Some((group, here, revision)) = target else {
+        return false;
+    };
+    if here {
+        return activate_document(hwnd, id, revision);
+    }
+    // The tab being left saves first, as switching tabs does.
+    crate::window::library_host::autosave_active(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return false;
+    }
+    remember_view(hwnd, group);
+    let added = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        unsafe { app.as_mut() }
+            .tabs
+            .add_view(group, id, crate::editor::ViewState::default())
+    });
+    if !added || !show_group_view(hwnd, group) {
+        return false;
+    }
+    refresh_tabs(hwnd);
+    crate::window::image_host::check_disk(hwnd);
+    true
+}
+
+/// Makes `id` the active document, or reports false when it no longer exists: its view in the
+/// active group, else its view in the first group in layout order that has one, which becomes
+/// the active group.
 pub(super) fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
+    let group = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let active = app.tabs.active_group();
+        let views = app.tabs.views_of(id);
+        if views.contains(&active) {
+            return Some(active);
+        }
+        app.layout
+            .leaves()
+            .into_iter()
+            .chain(views.iter().copied())
+            .find(|group| views.contains(group))
+    });
+    let Some(group) = group else {
+        return false;
+    };
+    activate_group(hwnd, group);
     let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         if app.tabs.active().is_some_and(|active| active.id == id) {
@@ -5819,6 +5885,18 @@ struct SnapshotJob {
 /// editors spec §3.1). The host is never painted and its notifications reach no window, so the
 /// visible editor's view and the notification handler see none of this; callers record edits
 /// themselves (`Tabs::note_background_edit`).
+/// The editor of a group whose active view shows `id`: the active group's if it does, else the
+/// first in layout order.
+fn editor_showing(app: &App, id: DocumentId) -> Option<Editor> {
+    let active = app.tabs.active_group();
+    let showing = groups_showing(app, id);
+    let group = showing
+        .iter()
+        .find(|group| **group == active)
+        .or_else(|| showing.first())?;
+    app.group(*group).map(|state| state.editor.clone())
+}
+
 fn with_background_document<R>(
     hwnd: HWND,
     target: &crate::editor::EditorDocument,
@@ -5883,12 +5961,12 @@ pub(crate) fn replace_in_document(
         if app.populating_file {
             return None;
         }
-        let editor = app.editor().cloned()?;
-        let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
-        if target.id == active.id {
+        // A group showing the document edits it, so its notifications record the change once.
+        if let Some(editor) = editor_showing(app, id) {
             return Some((editor, None));
         }
+        let editor = app.editor().cloned()?;
         Some((editor, Some(target.text_handle()?.clone())))
     })?;
     // Set once Scintilla is asked to change the text: from then on it may have changed, even if
@@ -5955,8 +6033,6 @@ pub(crate) fn reload_clean_document(
         if app.populating_file {
             return None;
         }
-        let editor = app.editor().cloned()?;
-        let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
         let unchanged = TabMark {
             generation: target.generation,
@@ -5965,9 +6041,10 @@ pub(crate) fn reload_clean_document(
         if target.dirty || target.path.as_deref() != Some(path) || !unchanged {
             return None;
         }
-        if target.id == active.id {
+        if let Some(editor) = editor_showing(app, id) {
             return Some((editor, None));
         }
+        let editor = app.editor().cloned()?;
         Some((editor, Some(target.text_handle()?.clone())))
     }) else {
         return false;
@@ -7071,7 +7148,17 @@ pub(crate) fn invalidate_title_strip(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
-    if let Some(group) = group_hwnd(hwnd) {
+    // A document's title shows in every group with a view of it.
+    let groups = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .groups
+                .iter()
+                .map(|group| group.hwnd)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for group in groups {
         unsafe {
             InvalidateRect(group, std::ptr::null(), 0);
         }
@@ -8457,6 +8544,133 @@ three"
         let order = super::group_order(window.hwnd);
         assert_eq!(order.len(), 2);
         assert_eq!(app_mut(window.hwnd).tabs.views_of(first_tab), order);
+    }
+
+    #[test]
+    fn opening_a_file_open_in_another_group_adds_a_view_in_the_active_group() {
+        // Break caught: the open jumping back to group 1 (leaving group 2 where the user is
+        // working) or opening a second copy of the file.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-open");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        super::open_path(window.hwnd, &b).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        super::open_path(window.hwnd, &a).unwrap();
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![first, second]);
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, id);
+        super::open_path(window.hwnd, &a).unwrap();
+        assert_eq!(
+            app_mut(window.hwnd).tabs.group(second).unwrap().len(),
+            2,
+            "no second view in one group"
+        );
+    }
+
+    #[test]
+    fn a_tree_click_replaces_only_the_active_groups_preview() {
+        // Break caught: a click in the tree replacing group 1's italic tab while the user works
+        // in group 2.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-preview");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let c = scratch.note("c.md", "c");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        // An empty group 2, so group 1's preview is the only view of `a`.
+        let second = super::split_group(
+            window.hwnd,
+            first,
+            crate::window::split_tree::Direction::Right,
+        )
+        .unwrap();
+        super::activate_group(window.hwnd, second);
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+        super::open_note(window.hwnd, &c, super::OpenMode::Preview, false).unwrap();
+        let a_id = app_mut(window.hwnd).tabs.find_path(&a);
+        assert!(a_id.is_some(), "group 1's preview kept");
+        assert!(
+            app_mut(window.hwnd).tabs.find_path(&b).is_none(),
+            "group 2's preview replaced"
+        );
+        assert_eq!(
+            app_mut(window.hwnd).tabs.views_of(a_id.unwrap()),
+            vec![first]
+        );
+        assert_eq!(app_mut(window.hwnd).tabs.group(second).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_note_open_in_two_groups_closes_both_views() {
+        // Break caught: a view left open on a deleted file in the group that wasn't active.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-delete");
+        let a = scratch.note("a.md", "a");
+        scratch.note("keep.md", "k");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &scratch.folder().join("keep.md")).unwrap();
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        crate::window::answer_next_confirm(|_| true);
+        execute_command(window.hwnd, CommandId::NoteDelete);
+        assert!(!a.exists());
+        assert!(app_mut(window.hwnd).tabs.document(id).is_none());
+        assert!(app_mut(window.hwnd).tabs.views_of(id).is_empty());
+    }
+
+    #[test]
+    fn a_background_replace_in_a_document_shown_in_the_other_group_counts_once() {
+        // Break caught: a replace through the document host double-counting a document another
+        // group's editor shows (host edit plus that editor's notifications), or moving the
+        // active group's caret.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-replace");
+        let a = scratch.note("a.md", "alpha beta");
+        let b = scratch.note("b.md", "other");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        super::open_path(window.hwnd, &b).unwrap();
+        let first = super::group_order(window.hwnd)[0];
+        let second = super::group_order(window.hwnd)[1];
+        execute_command(window.hwnd, CommandId::FocusGroup2);
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        let before = app_mut(window.hwnd).tabs.document(id).unwrap().generation;
+        let caret = super::group_editor(window.hwnd, second)
+            .unwrap()
+            .view_state()
+            .unwrap();
+        let matcher = crate::search::Matcher::new("alpha", Default::default()).unwrap();
+        assert_eq!(
+            super::replace_in_document(window.hwnd, id, &matcher, "ALPHA"),
+            Some(1)
+        );
+        let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+        assert!(document.dirty);
+        assert!(document.generation > before);
+        assert_eq!(
+            super::group_editor(window.hwnd, first)
+                .unwrap()
+                .text()
+                .unwrap(),
+            "ALPHA beta"
+        );
+        assert_eq!(
+            super::group_editor(window.hwnd, second)
+                .unwrap()
+                .view_state()
+                .unwrap(),
+            caret
+        );
     }
 
     #[test]
