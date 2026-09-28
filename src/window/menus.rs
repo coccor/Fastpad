@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 54] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 74] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -50,24 +50,45 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 54] {
         accelerator(FSHIFT | FALT, b'F', CommandId::FormatJson),
         virtual_key(FCONTROL, VK_TAB, CommandId::NextTab),
         virtual_key(FCONTROL | FSHIFT, VK_TAB, CommandId::PreviousTab),
-        accelerator(FCONTROL, b'1', CommandId::SelectTab1),
-        accelerator(FCONTROL, b'2', CommandId::SelectTab2),
-        accelerator(FCONTROL, b'3', CommandId::SelectTab3),
-        accelerator(FCONTROL, b'4', CommandId::SelectTab4),
-        accelerator(FCONTROL, b'5', CommandId::SelectTab5),
-        accelerator(FCONTROL, b'6', CommandId::SelectTab6),
-        accelerator(FCONTROL, b'7', CommandId::SelectTab7),
-        accelerator(FCONTROL, b'8', CommandId::SelectTab8),
-        accelerator(FCONTROL, b'9', CommandId::SelectTab9),
-        virtual_key(FCONTROL, VK_NUMPAD1, CommandId::SelectTab1),
-        virtual_key(FCONTROL, VK_NUMPAD2, CommandId::SelectTab2),
-        virtual_key(FCONTROL, VK_NUMPAD3, CommandId::SelectTab3),
-        virtual_key(FCONTROL, VK_NUMPAD4, CommandId::SelectTab4),
-        virtual_key(FCONTROL, VK_NUMPAD5, CommandId::SelectTab5),
-        virtual_key(FCONTROL, VK_NUMPAD6, CommandId::SelectTab6),
-        virtual_key(FCONTROL, VK_NUMPAD7, CommandId::SelectTab7),
-        virtual_key(FCONTROL, VK_NUMPAD8, CommandId::SelectTab8),
-        virtual_key(FCONTROL, VK_NUMPAD9, CommandId::SelectTab9),
+        // Ctrl+digits focus editor groups; Alt+digits select tabs (split editors spec §6).
+        accelerator(FCONTROL, b'1', CommandId::FocusGroup1),
+        accelerator(FCONTROL, b'2', CommandId::FocusGroup2),
+        accelerator(FCONTROL, b'3', CommandId::FocusGroup3),
+        accelerator(FCONTROL, b'4', CommandId::FocusGroup4),
+        accelerator(FCONTROL, b'5', CommandId::FocusGroup5),
+        accelerator(FCONTROL, b'6', CommandId::FocusGroup6),
+        accelerator(FCONTROL, b'7', CommandId::FocusGroup7),
+        accelerator(FCONTROL, b'8', CommandId::FocusGroup8),
+        accelerator(FCONTROL, b'9', CommandId::FocusLastGroup),
+        virtual_key(FCONTROL, VK_NUMPAD1, CommandId::FocusGroup1),
+        virtual_key(FCONTROL, VK_NUMPAD2, CommandId::FocusGroup2),
+        virtual_key(FCONTROL, VK_NUMPAD3, CommandId::FocusGroup3),
+        virtual_key(FCONTROL, VK_NUMPAD4, CommandId::FocusGroup4),
+        virtual_key(FCONTROL, VK_NUMPAD5, CommandId::FocusGroup5),
+        virtual_key(FCONTROL, VK_NUMPAD6, CommandId::FocusGroup6),
+        virtual_key(FCONTROL, VK_NUMPAD7, CommandId::FocusGroup7),
+        virtual_key(FCONTROL, VK_NUMPAD8, CommandId::FocusGroup8),
+        virtual_key(FCONTROL, VK_NUMPAD9, CommandId::FocusLastGroup),
+        accelerator(FALT, b'1', CommandId::SelectTab1),
+        accelerator(FALT, b'2', CommandId::SelectTab2),
+        accelerator(FALT, b'3', CommandId::SelectTab3),
+        accelerator(FALT, b'4', CommandId::SelectTab4),
+        accelerator(FALT, b'5', CommandId::SelectTab5),
+        accelerator(FALT, b'6', CommandId::SelectTab6),
+        accelerator(FALT, b'7', CommandId::SelectTab7),
+        accelerator(FALT, b'8', CommandId::SelectTab8),
+        accelerator(FALT, b'9', CommandId::SelectTab9),
+        virtual_key(FALT, VK_NUMPAD1, CommandId::SelectTab1),
+        virtual_key(FALT, VK_NUMPAD2, CommandId::SelectTab2),
+        virtual_key(FALT, VK_NUMPAD3, CommandId::SelectTab3),
+        virtual_key(FALT, VK_NUMPAD4, CommandId::SelectTab4),
+        virtual_key(FALT, VK_NUMPAD5, CommandId::SelectTab5),
+        virtual_key(FALT, VK_NUMPAD6, CommandId::SelectTab6),
+        virtual_key(FALT, VK_NUMPAD7, CommandId::SelectTab7),
+        virtual_key(FALT, VK_NUMPAD8, CommandId::SelectTab8),
+        virtual_key(FALT, VK_NUMPAD9, CommandId::SelectTab9),
+        virtual_key(FCONTROL | FALT, VK_RIGHT, CommandId::MoveTabToNextGroup),
+        virtual_key(FCONTROL | FALT, VK_LEFT, CommandId::MoveTabToPreviousGroup),
         // "+" shares a key with "=" on most layouts, so Ctrl+Shift+= is Ctrl++ as typed.
         virtual_key(FCONTROL, VK_OEM_PLUS, CommandId::ZoomIn),
         virtual_key(FCONTROL | FSHIFT, VK_OEM_PLUS, CommandId::ZoomIn),
@@ -346,6 +367,22 @@ fn append_popup(root: HMENU, label: &str, popup: HMENU) -> Result<()> {
     }
 }
 
+/// The context menu of a tab, at client coordinates `x`, `y` (split editors plan amendment 12).
+pub(crate) fn show_tab_menu(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
+    let entries = [
+        MenuEntry::command("&Close tab\tCtrl+W", CommandId::CloseTab),
+        MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
+        MenuEntry::Separator,
+        MenuEntry::command("Split &Right\tCtrl+\\", CommandId::SplitRight),
+        MenuEntry::command("Split &Down\tCtrl+Shift+\\", CommandId::SplitDown),
+        MenuEntry::command(
+            "Move to &Next Group\tCtrl+Alt+Right",
+            CommandId::MoveTabToNextGroup,
+        ),
+    ];
+    track_popup(hwnd, &entries, POINT { x, y })
+}
+
 /// The context menu of the empty tab-strip space, at client coordinates `x`, `y`.
 pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) -> Option<CommandId> {
     let mut entries = vec![
@@ -604,7 +641,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 54);
+        assert_eq!(specs.len(), 74);
     }
 
     #[test]
@@ -661,11 +698,27 @@ mod tests {
             bound(FCONTROL | FSHIFT, VK_TAB),
             Some(CommandId::PreviousTab)
         );
+        // Split editors spec §6: Ctrl+digits focus groups, Alt+digits select tabs.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_NUMPAD2, VK_RIGHT};
         assert_eq!(
             bound(FCONTROL, u16::from(b'1')),
-            Some(CommandId::SelectTab1)
+            Some(CommandId::FocusGroup1)
         );
-        assert_eq!(bound(FCONTROL, VK_NUMPAD9), Some(CommandId::SelectTab9));
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'9')),
+            Some(CommandId::FocusLastGroup)
+        );
+        assert_eq!(bound(FCONTROL, VK_NUMPAD2), Some(CommandId::FocusGroup2));
+        assert_eq!(bound(FALT, u16::from(b'1')), Some(CommandId::SelectTab1));
+        assert_eq!(bound(FALT, VK_NUMPAD9), Some(CommandId::SelectTab9));
+        assert_eq!(
+            bound(FCONTROL | FALT, VK_RIGHT),
+            Some(CommandId::MoveTabToNextGroup)
+        );
+        assert_eq!(
+            bound(FCONTROL | FALT, VK_LEFT),
+            Some(CommandId::MoveTabToPreviousGroup)
+        );
         assert_eq!(bound(FCONTROL, VK_OEM_PLUS), Some(CommandId::ZoomIn));
         assert_eq!(bound(FCONTROL, VK_OEM_MINUS), Some(CommandId::ZoomOut));
         assert_eq!(bound(FCONTROL, u16::from(b'0')), Some(CommandId::ZoomReset));

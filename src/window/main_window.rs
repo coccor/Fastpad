@@ -1777,12 +1777,13 @@ pub(crate) fn focus_content(hwnd: HWND) {
     }
 }
 
-/// The three parts F6 moves between, in tab order (spec §10).
+/// The parts F6 moves between, in tab order (spec §10): the sidebar's two, then every editor
+/// group by its place in the layout (split editors spec §6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusPart {
     ActivityBar,
     Panel,
-    Editor,
+    Group(usize),
 }
 
 /// The part after `current`, skipping a closed panel and, with notes mode off, the sidebar.
@@ -1791,12 +1792,16 @@ pub(crate) fn next_focus_part(
     backwards: bool,
     sidebar: bool,
     panel_open: bool,
+    groups: usize,
 ) -> FocusPart {
-    let parts: &[FocusPart] = match (sidebar, panel_open) {
-        (false, _) => &[FocusPart::Editor],
-        (true, false) => &[FocusPart::ActivityBar, FocusPart::Editor],
-        (true, true) => &[FocusPart::ActivityBar, FocusPart::Panel, FocusPart::Editor],
-    };
+    let mut parts = Vec::new();
+    if sidebar {
+        parts.push(FocusPart::ActivityBar);
+        if panel_open {
+            parts.push(FocusPart::Panel);
+        }
+    }
+    parts.extend((0..groups.max(1)).map(FocusPart::Group));
     let index = parts
         .iter()
         .position(|part| *part == current)
@@ -1827,6 +1832,12 @@ pub(crate) fn cycle_focus(hwnd: HWND, backwards: bool) {
     let windows = side_panel::windows(hwnd);
     let panel_open = windows.is_some() && side_panel::current_view(hwnd) != SidebarView::Hidden;
     let focus = unsafe { GetFocus() };
+    let order = group_order(hwnd);
+    let active = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+    let group_index = |id: Option<GroupId>| {
+        id.and_then(|id| order.iter().position(|group| *group == id))
+            .unwrap_or(0)
+    };
     let current = match windows {
         Some((bar, _)) if focus == bar => FocusPart::ActivityBar,
         Some((_, panel))
@@ -1837,9 +1848,19 @@ pub(crate) fn cycle_focus(hwnd: HWND, backwards: bool) {
         {
             FocusPart::Panel
         }
-        _ => FocusPart::Editor,
+        _ => {
+            let inside = unsafe { app_ptr(hwnd) }
+                .and_then(|app| unsafe { app.as_ref() }.group_containing(focus));
+            FocusPart::Group(group_index(inside.or(active)))
+        }
     };
-    match next_focus_part(current, backwards, windows.is_some(), panel_open) {
+    match next_focus_part(
+        current,
+        backwards,
+        windows.is_some(),
+        panel_open,
+        order.len(),
+    ) {
         FocusPart::ActivityBar => {
             if let Some((bar, _)) = windows {
                 unsafe {
@@ -1848,7 +1869,12 @@ pub(crate) fn cycle_focus(hwnd: HWND, backwards: bool) {
             }
         }
         FocusPart::Panel => side_panel::show_view(hwnd, side_panel::current_view(hwnd), true),
-        FocusPart::Editor => return_focus_to_editor(hwnd),
+        FocusPart::Group(index) => {
+            if let Some(group) = order.get(index) {
+                activate_group(hwnd, *group);
+            }
+            return_focus_to_editor(hwnd);
+        }
     }
 }
 
@@ -3054,6 +3080,21 @@ pub(crate) fn group_strip_message(
             show_group_strip_menu(hwnd, group, x, y);
             Some(0)
         }
+        // A tab's menu acts on that tab, so it is activated first.
+        WM_RBUTTONUP => match strip_target(hwnd, x, y) {
+            Some(StripTarget::Tab(index) | StripTarget::CloseTab(index)) => {
+                activate_tab(hwnd, index);
+                let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+                unsafe {
+                    windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut point, 1)
+                };
+                if let Some(command) = menus::show_tab_menu(hwnd, point.x, point.y) {
+                    execute_command(hwnd, command);
+                }
+                Some(0)
+            }
+            _ => None,
+        },
         // A middle-click closes the tab under the pointer (quick-open spec §5).
         WM_MBUTTONDOWN => {
             let press = match strip_target(hwnd, x, y) {
@@ -3194,6 +3235,13 @@ fn execute_command(hwnd: HWND, command: CommandId) {
     execute_command_with_note(hwnd, command, None);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The last command `execute_command_with_note` received, for the tests that check what a
+    /// key chord runs.
+    static LAST_COMMAND: std::cell::Cell<Option<CommandId>> = const { std::cell::Cell::new(None) };
+}
+
 /// Counts `is_sidebar` commands that ran past the notes-mode guard below. The sidebar's own state
 /// (`app.sidebar`, the Search view's options) already reads as empty/default with no sidebar to
 /// hold it, so a test disabling notes mode has nothing else to observe; this hook makes the guard
@@ -3210,6 +3258,8 @@ fn sidebar_command_runs() -> u32 {
 /// row that `capture_palette_focus` recorded when the palette opened, taken by
 /// `run_command_palette_selection` before closing it moved focus off the panel (spec §6.3).
 fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathBuf>) {
+    #[cfg(test)]
+    LAST_COMMAND.with(|last| last.set(Some(command)));
     exit_menu_mode(hwnd);
     if file_population_active(hwnd) {
         return;
@@ -3250,6 +3300,10 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         if index < tab_count(hwnd) {
             activate_tab(hwnd, index);
         }
+        return;
+    }
+    if let Some(index) = command.group_index() {
+        focus_group_number(hwnd, index);
         return;
     }
     match command {
@@ -3408,6 +3462,8 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::SplitRight => {
             split_active_group(hwnd, crate::window::split_tree::Direction::Right);
         }
+        CommandId::MoveTabToNextGroup => move_active_view(hwnd, true),
+        CommandId::MoveTabToPreviousGroup => move_active_view(hwnd, false),
         CommandId::SplitDown => {
             split_active_group(hwnd, crate::window::split_tree::Direction::Down);
         }
@@ -5100,6 +5156,93 @@ fn close_all_documents(hwnd: HWND) {
 }
 
 pub(crate) const NO_ROOM_TO_SPLIT: &str = "Not enough room to split";
+
+/// Ctrl+1..8 focus group N in layout order, and Ctrl+9 (`usize::MAX`) the last group. A group
+/// that doesn't exist yet is made to the right of the last one, showing the active document, as
+/// VS Code does (split editors spec §6).
+pub(crate) fn focus_group_number(hwnd: HWND, index: usize) {
+    let order = group_order(hwnd);
+    let Some(last) = order.last().copied() else {
+        return;
+    };
+    let index = if index == usize::MAX {
+        order.len() - 1
+    } else {
+        index
+    };
+    if let Some(group) = order.get(index) {
+        activate_group(hwnd, *group);
+        focus_content(hwnd);
+        return;
+    }
+    let Some(source) =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    else {
+        return;
+    };
+    remember_view(hwnd, source);
+    let Some(new) = split_group(hwnd, last, crate::window::split_tree::Direction::Right) else {
+        return;
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        if let Some(id) = app.tabs.active().map(|document| document.id) {
+            let state = app.tabs.view_state_in(source, id);
+            app.tabs.add_view(new, id, state);
+        }
+    }
+    activate_group(hwnd, new);
+    show_group_view(hwnd, new);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+}
+
+/// Ctrl+Alt+Right and Ctrl+Alt+Left: moves the active tab to the next or previous group in layout
+/// order. Past the last group a new one opens to the right; before the first there is nowhere
+/// to go. A group left without tabs closes (spec §5.2).
+pub(crate) fn move_active_view(hwnd: HWND, forward: bool) {
+    let Some((id, source)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        Some((app.tabs.active()?.id, app.tabs.active_group()))
+    }) else {
+        return;
+    };
+    let order = group_order(hwnd);
+    let Some(position) = order.iter().position(|group| *group == source) else {
+        return;
+    };
+    let neighbour = if forward {
+        order.get(position + 1).copied()
+    } else {
+        position
+            .checked_sub(1)
+            .and_then(|previous| order.get(previous).copied())
+    };
+    let target = match neighbour {
+        Some(target) => target,
+        None if forward => {
+            match split_group(hwnd, source, crate::window::split_tree::Direction::Right) {
+                Some(new) => new,
+                None => return,
+            }
+        }
+        None => return,
+    };
+    remember_view(hwnd, source);
+    let moved = unsafe { app_ptr(hwnd) }
+        .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.move_view(source, id, target));
+    if !moved {
+        return;
+    }
+    activate_group(hwnd, target);
+    show_group_view(hwnd, source);
+    show_group_view(hwnd, target);
+    remove_empty_group(hwnd, source);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+}
 
 /// Makes an empty group beside `target`, or says why not (split editors spec §4.3, §9).
 pub(crate) fn split_group(
@@ -8208,6 +8351,112 @@ three"
         execute_command(window.hwnd, CommandId::CloseAllTabs);
         assert_eq!(super::group_order(window.hwnd), vec![first]);
         assert!(app_mut(window.hwnd).groups.len() == 1);
+    }
+
+    #[test]
+    fn ctrl_2_focuses_group_two_and_ctrl_3_without_one_splits_right_of_the_last() {
+        // Break caught: Ctrl+N still selecting tabs, or a missing group N doing nothing instead
+        // of VS Code's split to the right of the last group.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitDown);
+        let second = super::group_order(window.hwnd)[1];
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        execute_command(window.hwnd, CommandId::FocusGroup2);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        execute_command(window.hwnd, CommandId::FocusGroup3);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 3);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+        let area = super::tree_area(window.hwnd).unwrap();
+        let layout = super::tree_layout(window.hwnd).unwrap();
+        assert_eq!(layout.rect_of(order[2]).unwrap().right, area.right);
+        assert_eq!(
+            layout.rect_of(order[2]).unwrap().top,
+            layout.rect_of(second).unwrap().top,
+            "beside the last group, as in VS Code"
+        );
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        execute_command(window.hwnd, CommandId::FocusLastGroup);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+    }
+
+    #[test]
+    fn moving_a_tab_to_the_next_group_creates_one_and_the_empty_source_closes() {
+        // Break caught: Ctrl+Alt+Right doing nothing with one group, copying instead of moving,
+        // or leaving the emptied group behind.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("moved").unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::MoveTabToNextGroup);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 1, "the emptied first group closed");
+        assert_ne!(order[0], first);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![order[0]]);
+        assert_eq!(
+            super::group_editor(window.hwnd, order[0])
+                .unwrap()
+                .text()
+                .unwrap(),
+            "moved"
+        );
+        execute_command(window.hwnd, CommandId::MoveTabToPreviousGroup);
+        assert_eq!(
+            super::group_order(window.hwnd),
+            order,
+            "nothing before group 1"
+        );
+    }
+
+    #[test]
+    fn alt_digits_select_tabs_and_ctrl_digits_focus_groups_through_the_table() {
+        // Break caught: Alt+2 eaten by the menu band's mnemonic handling, or Ctrl+2 still bound
+        // to Select Tab 2.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        assert_eq!(
+            translate_key_with(window.hwnd, editor.hwnd(), b'2', true, false, false),
+            Some(CommandId::FocusGroup2)
+        );
+        assert_eq!(
+            translate_key_with(window.hwnd, editor.hwnd(), b'2', false, false, true),
+            Some(CommandId::SelectTab2)
+        );
+    }
+
+    #[test]
+    fn right_clicking_a_tab_activates_it_and_runs_the_chosen_item() {
+        // Break caught: the tab menu acting on the previously active tab.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let first_tab = app_mut(window.hwnd).tabs.ids().collect::<Vec<_>>()[0];
+        let group = app_mut(window.hwnd).active_group().unwrap().hwnd;
+        let center = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let point = client_lparam(center.x, center.y);
+        answer_next_popup_menu(|_| Some(CommandId::SplitRight));
+        unsafe {
+            SendMessageW(group, WM_RBUTTONDOWN, 0, point);
+            SendMessageW(group, WM_RBUTTONUP, 0, point);
+        }
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 2);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(first_tab), order);
     }
 
     #[test]
@@ -16603,27 +16852,45 @@ three"
     /// Runs `key` with Ctrl (and Shift) held through the accelerator table, as the message loop
     /// does for a key sent to `target`, and returns whether the table translated it.
     fn translate_key(hwnd: HWND, target: HWND, key: u8, shift: bool) -> bool {
+        translate_key_with(hwnd, target, key, true, shift, false).is_some()
+    }
+
+    /// Runs `key` with the given modifiers through the accelerator table, as the message loop
+    /// does, and reports the command it ran.
+    fn translate_key_with(
+        hwnd: HWND,
+        target: HWND,
+        key: u8,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> Option<CommandId> {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
         };
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN, WM_SYSKEYDOWN};
         let identity = unsafe { super::window_identity(hwnd).unwrap() };
         let mut keys = [0u8; 256];
         unsafe { GetKeyboardState(keys.as_mut_ptr()) };
         let original = keys;
-        keys[VK_CONTROL as usize] = 0x80;
-        keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
-        keys[VK_MENU as usize] = 0;
+        let down = |on: bool| if on { 0x80 } else { 0 };
+        keys[VK_CONTROL as usize] = down(ctrl);
+        keys[VK_SHIFT as usize] = down(shift);
+        keys[VK_MENU as usize] = down(alt);
         unsafe { SetKeyboardState(keys.as_ptr()) };
         let message = MSG {
             hwnd: target,
-            message: WM_KEYDOWN,
+            message: if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN },
             wParam: usize::from(key),
+            // Bit 29: the Alt key was down, as the system reports it.
+            lParam: if alt { 1 << 29 } else { 0 },
             ..Default::default()
         };
+        super::LAST_COMMAND.with(|last| last.set(None));
         let translated = unsafe { super::translate_accelerator(hwnd, &identity, &message) };
         unsafe { SetKeyboardState(original.as_ptr()) };
-        translated
+        let command = super::LAST_COMMAND.with(std::cell::Cell::get);
+        translated.then_some(command).flatten()
     }
 
     #[test]
@@ -18531,28 +18798,50 @@ three"
         // Break caught: F6 landing in a hidden panel, or getting stuck when notes mode is off.
         use super::{FocusPart, next_focus_part};
         assert_eq!(
-            next_focus_part(FocusPart::Editor, false, true, true),
+            next_focus_part(FocusPart::Group(0), false, true, true, 1),
             FocusPart::ActivityBar
         );
         assert_eq!(
-            next_focus_part(FocusPart::ActivityBar, false, true, true),
+            next_focus_part(FocusPart::ActivityBar, false, true, true, 1),
             FocusPart::Panel
         );
         assert_eq!(
-            next_focus_part(FocusPart::Panel, false, true, true),
-            FocusPart::Editor
+            next_focus_part(FocusPart::Panel, false, true, true, 1),
+            FocusPart::Group(0)
         );
         assert_eq!(
-            next_focus_part(FocusPart::ActivityBar, true, true, true),
-            FocusPart::Editor
+            next_focus_part(FocusPart::ActivityBar, true, true, true, 1),
+            FocusPart::Group(0)
         );
         assert_eq!(
-            next_focus_part(FocusPart::ActivityBar, false, true, false),
-            FocusPart::Editor
+            next_focus_part(FocusPart::ActivityBar, false, true, false, 1),
+            FocusPart::Group(0)
         );
         assert_eq!(
-            next_focus_part(FocusPart::Editor, false, false, false),
-            FocusPart::Editor
+            next_focus_part(FocusPart::Group(0), false, false, false, 1),
+            FocusPart::Group(0)
+        );
+    }
+
+    #[test]
+    fn f6_visits_every_group_in_order() {
+        // Break caught: F6 skipping every group after the first.
+        use super::FocusPart::*;
+        assert_eq!(
+            super::next_focus_part(Group(0), false, true, true, 3),
+            Group(1)
+        );
+        assert_eq!(
+            super::next_focus_part(Group(2), false, true, true, 3),
+            ActivityBar
+        );
+        assert_eq!(
+            super::next_focus_part(ActivityBar, true, true, true, 3),
+            Group(2)
+        );
+        assert_eq!(
+            super::next_focus_part(Group(0), false, false, false, 1),
+            Group(0)
         );
     }
 

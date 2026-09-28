@@ -158,7 +158,7 @@ file that doesn't parse.
 
 ### Tabs, done right
 
-Open as many files as you like in one window. **Ctrl+Tab** and **Ctrl+1…9** to jump, double-click
+Open as many files as you like in one window. **Ctrl+Tab** and **Alt+1…9** to jump, double-click
 the empty tab bar for a new tab, scroll the wheel over the tabs to browse them, and close one with **Ctrl+W** or a middle-click. Every tab keeps its caret and scroll position, across switches and restarts. Open a file from
 Explorer or the command line and it lands as a tab in the FastPad window you already have open, not
 in a new window.
@@ -218,14 +218,15 @@ before closing again.
 | Save as | `Ctrl+Shift+S` | | Word wrap | `Alt+Z` |
 | Find | `Ctrl+F` | | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
-| Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Ctrl+1` … `Ctrl+9` |
+| Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Alt+1` … `Alt+9` |
 | Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` |
 | Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+Shift+F` |
-| Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor focus | `F6` / `Shift+F6` |
+| Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor groups focus | `F6` / `Shift+F6` |
 | Find next / previous | `F3` / `Shift+F3` | | Match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` |
 | Replace in notes | `Ctrl+Shift+H` | | Replace all (in Search) | `Ctrl+Alt+Enter` |
 | Replace in the selected result | `Ctrl+Shift+1` | | Go to note | `Ctrl+P` |
-| Close tab | `Ctrl+W` or middle-click | | | |
+| Close tab | `Ctrl+W` or middle-click | | Split editor right / down | `Ctrl+\` / `Ctrl+Shift+\` |
+| Focus editor group 1–8 / last | `Ctrl+1` … `Ctrl+8` / `Ctrl+9` | | Move tab to next / previous group | `Ctrl+Alt+Right` / `Ctrl+Alt+Left` |
 
 ## Make it yours
 
