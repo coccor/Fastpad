@@ -178,6 +178,7 @@ impl LanguageManager {
                 style.foreground,
                 style.background,
                 style.bold,
+                false,
                 DEFAULT_FONT_FACE,
             )?;
         }
@@ -222,7 +223,10 @@ mod tests {
     use super::{LanguageManager, detect_language, rgb};
     use crate::document::Language;
     use crate::editor::Editor;
-    use crate::editor::scintilla_constants::{SCE_JSON_DEFAULT, SCI_SETILEXER, SCI_STYLESETFORE};
+    use crate::editor::scintilla_constants::{
+        SCE_JSON_DEFAULT, SCI_SETILEXER, SCI_SETKEYWORDS, SCI_SETPROPERTY, SCI_STYLESETFONT,
+        SCI_STYLESETFORE, SCI_STYLESETITALIC, STYLE_MAX,
+    };
     use crate::platform::theme::Theme;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -362,6 +366,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn view_settings_reach_every_style_number() {
+        // Break caught: HTML's embedded-JS styles (40-53) and any lexer style above
+        // STYLE_LINENUMBER kept Consolas at the default size instead of the user's font.
+        let harness = FakeHarness::new();
+        let editor = fake_editor(&harness);
+
+        let _ = editor.apply_view_settings("Cascadia Mono", 11, 4, false);
+
+        let styled = harness
+            .sent(SCI_STYLESETFONT)
+            .into_iter()
+            .map(|(style, _)| style)
+            .collect::<Vec<_>>();
+        assert!(styled.contains(&53));
+        assert!(styled.contains(&(STYLE_MAX as usize)));
+    }
+
+    #[test]
+    fn editor_sends_italic_keywords_and_properties() {
+        let harness = FakeHarness::new();
+        let editor = fake_editor(&harness);
+
+        editor
+            .set_style(1, rgb(1, 2, 3), rgb(4, 5, 6), false, true, "Consolas")
+            .unwrap();
+        editor.set_keywords(1, "true false").unwrap();
+        editor
+            .set_lexer_property("lexer.json.allow.comments", "1")
+            .unwrap();
+
+        assert_eq!(harness.sent(SCI_STYLESETITALIC), vec![(1, 1)]);
+        assert_eq!(
+            harness.strings(SCI_SETKEYWORDS),
+            vec![("1".to_owned(), "true false".to_owned())]
+        );
+        assert_eq!(
+            harness.strings(SCI_SETPROPERTY),
+            vec![("lexer.json.allow.comments".to_owned(), "1".to_owned())]
+        );
+    }
+
     fn next_unique() -> u64 {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -377,8 +423,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
-        setilexer_calls: Vec<isize>,
-        style_fore: Vec<(usize, isize)>,
+        messages: Vec<(u32, usize, isize)>,
+        /// NUL-terminated strings the fake read out of pointer arguments, in send order.
+        strings: Vec<(u32, String, String)>,
     }
 
     struct FakeHarness {
@@ -397,18 +444,40 @@ mod tests {
         }
 
         fn setilexer_calls(&self) -> Vec<isize> {
-            self.state.lock().unwrap().setilexer_calls.clone()
+            self.sent(SCI_SETILEXER)
+                .into_iter()
+                .map(|(_, lparam)| lparam)
+                .collect()
         }
 
         fn style_fore_for(&self, style: usize) -> Option<isize> {
+            self.sent(SCI_STYLESETFORE)
+                .into_iter()
+                .rev()
+                .find(|(wparam, _)| *wparam == style)
+                .map(|(_, lparam)| lparam)
+        }
+
+        fn sent(&self, message: u32) -> Vec<(usize, isize)> {
             self.state
                 .lock()
                 .unwrap()
-                .style_fore
+                .messages
                 .iter()
-                .rev()
-                .find(|(recorded_style, _)| *recorded_style == style)
-                .map(|(_, foreground)| *foreground)
+                .filter(|(sent, _, _)| *sent == message)
+                .map(|(_, wparam, lparam)| (*wparam, *lparam))
+                .collect()
+        }
+
+        fn strings(&self, message: u32) -> Vec<(String, String)> {
+            self.state
+                .lock()
+                .unwrap()
+                .strings
+                .iter()
+                .filter(|(sent, _, _)| *sent == message)
+                .map(|(_, first, second)| (first.clone(), second.clone()))
+                .collect()
         }
     }
 
@@ -424,9 +493,21 @@ mod tests {
     ) -> isize {
         let shared = unsafe { &*(direct_ptr as *const Mutex<FakeState>) };
         let mut state = shared.lock().unwrap();
+        state.messages.push((message, wparam, lparam));
+        let read = |pointer: isize| {
+            unsafe { std::ffi::CStr::from_ptr(pointer as *const std::ffi::c_char) }
+                .to_string_lossy()
+                .into_owned()
+        };
         match message {
-            SCI_SETILEXER => state.setilexer_calls.push(lparam),
-            SCI_STYLESETFORE => state.style_fore.push((wparam, lparam)),
+            SCI_SETKEYWORDS => {
+                let words = read(lparam);
+                state.strings.push((message, wparam.to_string(), words));
+            }
+            SCI_SETPROPERTY => {
+                let pair = (read(wparam as isize), read(lparam));
+                state.strings.push((message, pair.0, pair.1));
+            }
             _ => {}
         }
         0
