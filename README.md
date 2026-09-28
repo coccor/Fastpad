@@ -198,6 +198,11 @@ before closing again.
   leaves you with a half-written file.
 - **Encodings preserved.** UTF-8, UTF-8 with BOM, UTF-16 LE and UTF-16 BE are detected on open and
   kept on save.
+- **Images.** PNG, JPEG, GIF (first frame), BMP, ICO, TIFF, and WebP/HEIC/AVIF when Windows has
+  the codec, open in an image tab: it fits the window, Ctrl + wheel or Ctrl +/− zooms, Ctrl+0 fits
+  again, double-click toggles 100%, and drag or the arrow keys pan. SVG files open as text; press
+  Ctrl+Shift+V to see them rendered beside or instead of the source. The notebook lists images next
+  to notes; Search reads notes only.
 - **Find and replace**, with match case, whole word and regular expressions (Alt+C, Alt+W,
   Alt+R) and F3 / Shift+F3, plus zoom, word wrap and line numbers.
 - **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive

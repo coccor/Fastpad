@@ -131,6 +131,7 @@ pub fn detect_language(path: &Path) -> Language {
     {
         Some("json") => Language::Json,
         Some("md") => Language::Markdown,
+        Some("svg") => Language::Svg,
         _ => Language::PlainText,
     }
 }
@@ -158,7 +159,7 @@ impl LanguageManager {
     /// in hand) and the error is returned for the caller's notification.
     pub fn apply(&mut self, editor: &Editor, language: Language, theme: Theme) -> Result<()> {
         match language {
-            Language::PlainText => {
+            Language::PlainText | Language::Svg => {
                 editor.set_lexer(0)?;
                 Ok(())
             }
@@ -232,6 +233,12 @@ mod tests {
         assert_eq!(detect_language(Path::new("CONFIG.JSON")), Language::Json);
         assert_eq!(detect_language(Path::new("readme.md")), Language::Markdown);
         assert_eq!(detect_language(Path::new("notes.txt")), Language::PlainText);
+    }
+
+    #[test]
+    fn svg_files_are_detected_as_svg() {
+        // Break caught: an SVG tab without the preview buttons because it was detected as plain text.
+        assert_eq!(detect_language(Path::new(r"C:\x\Logo.SVG")), Language::Svg);
     }
 
     #[test]

@@ -1358,6 +1358,10 @@ pub(crate) fn first_save_folder(hwnd: HWND) -> Option<PathBuf> {
 
 /// Ctrl+S: an untitled tab in notes mode is named in the name box; everything else as before.
 pub(crate) fn save_command(hwnd: HWND) {
+    // The editor holds an empty placeholder for an image tab: saving would write it over the image.
+    if crate::window::image_host::active_is_image(hwnd) {
+        return;
+    }
     if notes_mode(hwnd)
         && folder(hwnd).is_some()
         && let Some(id) = active_untitled(hwnd)
@@ -1387,6 +1391,9 @@ pub(crate) fn save_command(hwnd: HWND) {
 }
 
 pub(crate) fn save_as_command(hwnd: HWND) {
+    if crate::window::image_host::active_is_image(hwnd) {
+        return;
+    }
     if notes_mode(hwnd) && folder(hwnd).is_some() && active_untitled(hwnd).is_some() {
         save_command(hwnd);
         return;
@@ -2267,8 +2274,12 @@ fn autosave_target(hwnd: HWND) -> Option<PathBuf> {
     unsafe { app_ptr(hwnd) }.and_then(|app| {
         let active = unsafe { app.as_ref() }.tabs.active()?;
         let path = active.path.clone()?;
-        (active.dirty && !active.autosave_paused && library::is_inside(&folder, &path))
-            .then_some(path)
+        // An image tab is never dirty; the check keeps a stray flag from writing over an image.
+        (active.dirty
+            && !active.is_image()
+            && !active.autosave_paused
+            && library::is_inside(&folder, &path))
+        .then_some(path)
     })
 }
 

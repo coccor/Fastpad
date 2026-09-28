@@ -61,12 +61,13 @@ pub(crate) enum MaskIcon {
     Code,
     Document,
     Log,
+    Image,
 }
 
 impl MaskIcon {
     /// Every icon, in blob order (`ALL[icon as usize] == icon`).
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::Folder,
         Self::FolderOpen,
         Self::Markdown,
@@ -76,6 +77,7 @@ impl MaskIcon {
         Self::Code,
         Self::Document,
         Self::Log,
+        Self::Image,
     ];
 
     /// The SVG in each set's `svg/` folder this icon is made from.
@@ -91,6 +93,7 @@ impl MaskIcon {
             Self::Code => "code.svg",
             Self::Document => "document.svg",
             Self::Log => "log.svg",
+            Self::Image => "image.svg",
         }
     }
 }
@@ -111,6 +114,7 @@ pub(crate) fn mask_icon(item: TreeItem) -> (MaskIcon, IconColor) {
             NoteKind::Xml => (MaskIcon::Code, IconColor::Maroon),
             NoteKind::Text => (MaskIcon::Document, IconColor::Overlay2),
             NoteKind::Log => (MaskIcon::Log, IconColor::Overlay2),
+            NoteKind::Image => (MaskIcon::Image, IconColor::Green),
         },
     }
 }
@@ -210,6 +214,7 @@ mod tests {
             MaskIcon::Settings,
             MaskIcon::Document,
             MaskIcon::Log,
+            MaskIcon::Image,
         ] {
             let ink = |set| -> u32 {
                 coverage(set, icon, 24)
@@ -242,6 +247,8 @@ mod tests {
             ("txt", (MaskIcon::Document, IconColor::Overlay2)),
             ("py", (MaskIcon::Document, IconColor::Overlay2)),
             ("log", (MaskIcon::Log, IconColor::Overlay2)),
+            ("png", (MaskIcon::Image, IconColor::Green)),
+            ("svg", (MaskIcon::Image, IconColor::Green)),
         ] {
             assert_eq!(note(extension), expected, "{extension}");
         }

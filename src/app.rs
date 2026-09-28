@@ -50,6 +50,8 @@ pub struct App {
     pub(crate) find_bar: Option<FindBar>,
     pub(crate) name_box: Option<crate::window::name_box::NameBox>,
     pub(crate) command_palette: Option<CommandPalette>,
+    /// Declared before `preview`, whose Direct2D factories the image view shares.
+    pub(crate) image: crate::window::image_host::ImageHost,
     pub(crate) preview: crate::window::preview_host::PreviewHost,
     pub(crate) language_manager: Option<LanguageManager>,
     pub(crate) settings: Settings,
@@ -129,6 +131,7 @@ impl App {
             find_bar: None,
             name_box: None,
             command_palette: None,
+            image: Default::default(),
             preview: Default::default(),
             language_manager: None,
             settings: crate::config::default_settings(),

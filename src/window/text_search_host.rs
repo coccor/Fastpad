@@ -231,15 +231,10 @@ pub(crate) fn run_now(hwnd: HWND) {
         let keep: Option<HashSet<String>> = candidate
             .filter(|previous| previous.notes == marked)
             .map(|previous| previous.paths.iter().map(|path| path_key(path)).collect());
-        let notes = state
-            .notes
-            .iter()
-            .filter(|note| {
-                keep.as_ref()
-                    .is_none_or(|keep| keep.contains(&path_key(&note.path)))
-            })
-            .map(SearchNote::from)
-            .collect::<Vec<_>>();
+        let notes = text_search::search_notes(state.notes.iter().filter(|note| {
+            keep.as_ref()
+                .is_none_or(|keep| keep.contains(&path_key(&note.path)))
+        }));
         (notes, list, marked)
     }) else {
         return;

@@ -48,13 +48,7 @@ pub fn decode_svg(wic: &IWICImagingFactory, path: &Path, max_width: u32) -> Resu
     } else {
         (natural_width, natural_height)
     };
-    let document = rewrite_for_direct2d(&source);
-    let module = load_system_library("d2d1.dll")?;
-    let pixels = {
-        let factory = create_d2d_factory(&module, D2D1_FACTORY_TYPE_MULTI_THREADED)?;
-        rasterize(wic, &factory, document.as_bytes(), natural, (width, height))?
-    };
-    drop(module);
+    let pixels = rasterize_source(wic, &source, natural, (width, height))?;
     Ok(DecodedImage {
         width,
         height,
@@ -62,6 +56,24 @@ pub fn decode_svg(wic: &IWICImagingFactory, path: &Path, max_width: u32) -> Resu
         natural_height,
         pixels,
     })
+}
+
+/// Rasterizes SVG `source` to `width`×`height` premultiplied BGRA pixels, scaling its natural
+/// size to fit exactly. Runs on a worker thread.
+pub(crate) fn rasterize_source(
+    wic: &IWICImagingFactory,
+    source: &str,
+    natural: (f32, f32),
+    (width, height): (u32, u32),
+) -> Result<Vec<u8>> {
+    let document = rewrite_for_direct2d(source);
+    let module = load_system_library("d2d1.dll")?;
+    let pixels = {
+        let factory = create_d2d_factory(&module, D2D1_FACTORY_TYPE_MULTI_THREADED)?;
+        rasterize(wic, &factory, document.as_bytes(), natural, (width, height))?
+    };
+    drop(module);
+    Ok(pixels)
 }
 
 fn rasterize(

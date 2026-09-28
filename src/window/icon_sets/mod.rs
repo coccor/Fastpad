@@ -78,6 +78,7 @@ pub(crate) fn tree_icon(
             NoteKind::Xml => MaterialIcon::Xml,
             NoteKind::Text => MaterialIcon::Document,
             NoteKind::Log => MaterialIcon::Log,
+            NoteKind::Image => MaterialIcon::Image,
         },
     })
 }
@@ -108,6 +109,8 @@ mod tests {
             ("text", MaterialIcon::Document),
             ("py", MaterialIcon::Document),
             ("log", MaterialIcon::Log),
+            ("png", MaterialIcon::Image),
+            ("SVG", MaterialIcon::Image),
         ] {
             for light in [false, true] {
                 assert_eq!(

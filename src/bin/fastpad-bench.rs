@@ -601,7 +601,7 @@ fn text_search_scratch_root() -> Result<PathBuf, String> {
 ///
 /// The `InvalidateRect` that follows a batch is not part of it: it only queues a paint.
 fn text_search_timings() -> Result<(f64, f64, f64), String> {
-    use fastpad::library::text_search::{self, BATCH_HITS, Progress, SearchNote, TextHit};
+    use fastpad::library::text_search::{self, BATCH_HITS, Progress, TextHit};
     use fastpad::search::{MatchOptions, Matcher, Snippet};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -615,7 +615,7 @@ fn text_search_timings() -> Result<(f64, f64, f64), String> {
     let local = root.0.join("library.ini");
     let state = fastpad::library::load(&notebook, &local, fastpad::library::now_unix())
         .map_err(|error| format!("could not load {}: {error}", notebook.display()))?;
-    let notes = state.notes.iter().map(SearchNote::from).collect::<Vec<_>>();
+    let notes = text_search::search_notes(&state.notes);
     let overlays = std::collections::HashMap::new();
     let common =
         Matcher::new("lazy dog", MatchOptions::default()).map_err(|error| error.to_string())?;

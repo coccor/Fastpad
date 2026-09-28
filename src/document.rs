@@ -50,6 +50,7 @@ pub enum Language {
     PlainText,
     Json,
     Markdown,
+    Svg,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,10 +63,18 @@ pub enum CloseDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CloseCancelled;
 
+/// What a tab shows: text in a Scintilla document, or an image file (image preview spec §5).
+/// An image tab has no text, so nothing can be typed into it or saved over it.
+#[derive(Debug)]
+pub enum Content {
+    Text(EditorDocument),
+    Image,
+}
+
 #[derive(Debug)]
 pub struct Document {
     pub id: DocumentId,
-    pub handle: EditorDocument,
+    pub content: Content,
     pub path: Option<PathBuf>,
     pub language: Language,
     pub encoding: Encoding,
@@ -112,9 +121,20 @@ impl Eq for Document {}
 
 impl Document {
     pub fn untitled(id: DocumentId, recovery_id: RecoveryId, handle: EditorDocument) -> Self {
+        Self::with_content(id, recovery_id, Content::Text(handle))
+    }
+
+    /// An image tab for `path`. It is never dirty and never snapshotted.
+    pub fn image(id: DocumentId, recovery_id: RecoveryId, path: PathBuf) -> Self {
+        let mut document = Self::with_content(id, recovery_id, Content::Image);
+        document.path = Some(path);
+        document
+    }
+
+    fn with_content(id: DocumentId, recovery_id: RecoveryId, content: Content) -> Self {
         Self {
             id,
-            handle,
+            content,
             path: None,
             language: Language::PlainText,
             encoding: Encoding::Utf8,
@@ -131,6 +151,23 @@ impl Document {
             preview: false,
             save_folder: None,
         }
+    }
+
+    pub fn text_handle(&self) -> Option<&EditorDocument> {
+        match &self.content {
+            Content::Text(handle) => Some(handle),
+            Content::Image => None,
+        }
+    }
+
+    pub fn expect_text(&self) -> crate::Result<&EditorDocument> {
+        self.text_handle().ok_or(crate::FastPadError::Invariant(
+            "the tab shows an image, not text",
+        ))
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self.content, Content::Image)
     }
 
     pub fn title(&self) -> String {
@@ -164,6 +201,11 @@ impl Document {
         document.dirty = dirty;
         document
     }
+
+    #[cfg(test)]
+    pub fn image_fixture(id: DocumentId, path: PathBuf) -> Self {
+        Self::image(id, RecoveryId(u128::from(id.0)), path)
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +222,20 @@ mod tests {
 
     fn dirty_document(id: u64) -> Document {
         Document::test_fixture(DocumentId(id), true)
+    }
+
+    #[test]
+    fn set_active_dirty_ignores_an_image_tab() {
+        // Break caught: a save-point notification from the editor's placeholder document marking the
+        // active image tab dirty, which would make closing it ask to save an image.
+        let mut tabs = Tabs::with_document(Document::image_fixture(
+            DocumentId(1),
+            std::path::PathBuf::from(r"C:\pictures\a.png"),
+        ));
+        assert!(!tabs.set_active_dirty(true));
+        assert!(!tabs.active().unwrap().dirty);
+        assert!(tabs.active_handle().is_none());
+        assert_eq!(tabs.active().unwrap().title(), "a.png");
     }
 
     #[test]

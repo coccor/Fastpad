@@ -240,6 +240,14 @@ pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
     }
 }
 
+/// Grays the commands that need text while an image tab is active (image preview spec §5).
+pub(crate) fn set_text_commands_enabled(menu: HMENU, enabled: bool) {
+    let state = MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED };
+    for command in crate::window::commands::TEXT_COMMANDS {
+        unsafe { EnableMenuItem(menu, command as u32, state) };
+    }
+}
+
 /// Grays the View menu's Sidebar entry while notes mode is off and there is no sidebar.
 pub(crate) fn set_sidebar_enabled(menu: HMENU, enabled: bool) {
     let state = MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED };

@@ -60,6 +60,39 @@ pub fn status_bar_text(
     StatusBarText { left, right }
 }
 
+/// The status bar of an image tab: notices on the left; size, format, file size and zoom on the
+/// right (image preview spec §5).
+pub(crate) fn image_status_bar_text(
+    notifications: &NotificationCenter,
+    image: &crate::window::image_host::ImageStatus,
+) -> StatusBarText {
+    let mut parts = Vec::new();
+    if let Some((width, height)) = image.size {
+        parts.push(format!("{width} \u{d7} {height}"));
+    }
+    if let Some(format) = image.format {
+        parts.push(format.to_owned());
+    }
+    if let Some(bytes) = image.bytes {
+        parts.push(file_size_text(bytes));
+    }
+    if let Some(zoom) = image.zoom_percent {
+        parts.push(format!("{zoom}%"));
+    }
+    StatusBarText {
+        left: status_text(notifications).unwrap_or_default(),
+        right: parts.join(" \u{b7} "),
+    }
+}
+
+pub fn file_size_text(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} bytes"),
+        1024..1_048_576 => format!("{} KB", (bytes + 512) / 1024),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
+}
+
 pub fn status_text(notifications: &NotificationCenter) -> Option<String> {
     let (first, rest) = notifications.pending().split_first()?;
     Some(if rest.is_empty() {
@@ -85,6 +118,7 @@ pub fn language_name(language: Language) -> &'static str {
         Language::PlainText => "Plain Text",
         Language::Json => "JSON",
         Language::Markdown => "Markdown",
+        Language::Svg => "SVG",
     }
 }
 
@@ -99,11 +133,32 @@ pub fn encoding_name(encoding: Encoding) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveDocumentStatus, StatusBarText, status_bar_text, status_text};
+    use super::{
+        ActiveDocumentStatus, StatusBarText, file_size_text, image_status_bar_text,
+        status_bar_text, status_text,
+    };
     use crate::document::Language;
     use crate::editor::CaretStatus;
     use crate::file::encoding::Encoding;
     use crate::window::notification::NotificationCenter;
+
+    #[test]
+    fn an_image_status_lists_size_format_file_size_and_zoom() {
+        // Break caught: an image tab showing a caret position and "Plain Text UTF-8".
+        let image = crate::window::image_host::ImageStatus {
+            size: Some((1920, 1080)),
+            format: Some("PNG"),
+            bytes: Some(250_880),
+            zoom_percent: Some(50),
+        };
+        let text = image_status_bar_text(&NotificationCenter::new(), &image);
+        assert_eq!(
+            text.right,
+            "1920 \u{d7} 1080 \u{b7} PNG \u{b7} 245 KB \u{b7} 50%"
+        );
+        assert_eq!(file_size_text(900), "900 bytes");
+        assert_eq!(file_size_text(3_250_000), "3.1 MB");
+    }
 
     #[test]
     fn status_text_is_absent_without_notifications_and_counts_extras() {
