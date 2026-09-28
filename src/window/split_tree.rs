@@ -1,7 +1,8 @@
 //! The layout of the editor groups (split editors spec §4.3): rows and columns whose leaves are
 //! groups. Pure: it computes rectangles and never touches a window.
 
-// Split, Close Group and the session use the rest from the next commits.
+// Group numbers and the session conversion are used from the Open Editors and session
+// commits; Left and Up only by the tests until a command splits that way.
 #![cfg_attr(not(test), allow(dead_code))]
 use super::titlebar::{Point, Rect, scale};
 use crate::session::{SessionAxis, SessionLayout};

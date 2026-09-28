@@ -1222,8 +1222,6 @@ pub(crate) fn tree_layout(hwnd: HWND) -> Option<crate::window::split_tree::TreeL
 }
 
 /// The groups in layout order: left to right, top to bottom (spec §4.3).
-// Tasks that walk the groups in order use it from the next commits.
-#[allow(dead_code)]
 pub(crate) fn group_order(hwnd: HWND) -> Vec<GroupId> {
     unsafe { app_ptr(hwnd) }
         .map(|app| unsafe { app.as_ref() }.layout.leaves())
@@ -1273,8 +1271,6 @@ pub(crate) fn group_editor(hwnd: HWND, id: GroupId) -> Option<Editor> {
         .map(|group| group.editor.clone())
 }
 
-// Used once splits exist (the Split commands and the session restore).
-#[cfg_attr(not(test), allow(dead_code))]
 /// Creates an empty group window with its own editor, set up like the others. The caller puts it
 /// in the layout (split editors spec §4.2).
 pub(crate) fn create_group(hwnd: HWND) -> Result<GroupId> {
@@ -1321,13 +1317,10 @@ thread_local! {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn fail_next_group_creation() {
     FAIL_NEXT_GROUP.with(|fail| fail.set(true));
 }
 
-// Used once splits exist (the Split commands and the session restore).
-#[cfg_attr(not(test), allow(dead_code))]
 /// Destroys group `id`'s window, its editor and what it showed. The caller has already emptied it
 /// and taken it out of the layout.
 pub(crate) fn destroy_group(hwnd: HWND, id: GroupId) {
@@ -1343,8 +1336,6 @@ pub(crate) fn destroy_group(hwnd: HWND, id: GroupId) {
     }
 }
 
-// Used once splits exist (the Split commands and the session restore).
-#[cfg_attr(not(test), allow(dead_code))]
 /// Applies the editor settings, the theme's colours and the shared zoom to `editor`, as every
 /// group's editor has them.
 fn configure_editor(hwnd: HWND, editor: &Editor) {
@@ -2342,6 +2333,7 @@ fn refilter_command_palette(hwnd: HWND) {
         // New note and New folder need a notebook, open or loading, to put the item in (inline
         // naming spec §3.1).
         let notebook = crate::window::library_host::folder(hwnd).is_some();
+        let groups = unsafe { app_ptr(hwnd) }.map_or(1, |app| unsafe { app.as_ref() }.groups.len());
         let subset = with_command_palette(hwnd, CommandPalette::subset).flatten();
         let entries = command_palette::filter_entries(&query, |command| {
             subset.is_none_or(|subset| subset.contains(&command))
@@ -2350,6 +2342,8 @@ fn refilter_command_palette(hwnd: HWND) {
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
                 && (notebook || !matches!(command, CommandId::NoteNew | CommandId::NoteNewFolder))
+                // Close Group with one empty group would do nothing.
+                && (has_tabs || groups > 1 || command != CommandId::CloseGroup)
         });
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
@@ -3411,6 +3405,19 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             }
         }
         CommandId::CloseNotebook => crate::window::library_host::close_notebook(hwnd),
+        CommandId::SplitRight => {
+            split_active_group(hwnd, crate::window::split_tree::Direction::Right);
+        }
+        CommandId::SplitDown => {
+            split_active_group(hwnd, crate::window::split_tree::Direction::Down);
+        }
+        CommandId::CloseGroup => {
+            if let Some(group) =
+                unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+            {
+                close_group(hwnd, group);
+            }
+        }
         CommandId::ToggleNotebookFavorite => {
             crate::window::library_host::toggle_notebook_favorite(hwnd);
         }
@@ -4827,6 +4834,17 @@ fn close_active_document(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    // Another group still shows the document: only this view closes, without asking (split
+    // editors spec §5.4). Its text and dirty state stay with the other view.
+    let shared = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let review = app.tabs.active_close_review()?;
+        (app.tabs.views_of(review.id).len() > 1).then(|| (review, app.editor().cloned()))
+    });
+    if let Some((review, Some(editor))) = shared {
+        close_reviewed_document(hwnd, &identity, &editor, review, CloseDecision::Discard);
+        return;
+    }
     // A saved note is clean now and closes without a prompt; paused or failed ones still ask.
     crate::window::library_host::autosave_active(hwnd);
     if !identity.is_live_for(hwnd) {
@@ -4970,6 +4988,7 @@ fn close_reviewed_document(
     review: crate::window::tabs::CloseReview,
     decision: CloseDecision,
 ) {
+    let group = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
     let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         // `None` when the document is still shown in another group: it stays open.
@@ -5019,6 +5038,10 @@ fn close_reviewed_document(
     crate::recovery::remove_snapshot_files(&snapshots);
     if identity.is_live_for(hwnd) {
         refresh_tabs(hwnd);
+        // A group closes with its last tab, unless it is the only one (spec §5.4).
+        if let Some(group) = group {
+            remove_empty_group(hwnd, group);
+        }
     }
 }
 
@@ -5051,20 +5074,147 @@ fn close_background_document(
 }
 
 /// Closes tabs one at a time, reviewing each dirty one, until none remain or a close is refused.
+/// Close all tabs closes the active group's tabs (split editors plan amendment 10). The group goes
+/// with its last tab, which ends the loop, unless it is the only one.
 fn close_all_documents(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    let active_group =
+        || unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+    let Some(group) = active_group() else {
+        return;
+    };
     loop {
         let before = tab_count(hwnd);
-        if before == 0 {
+        if before == 0 || active_group() != Some(group) {
             return;
         }
         close_active_document(hwnd);
-        if !identity.is_live_for(hwnd) || tab_count(hwnd) >= before {
+        if !identity.is_live_for(hwnd)
+            || (active_group() == Some(group) && tab_count(hwnd) >= before)
+        {
             return;
         }
     }
+}
+
+pub(crate) const NO_ROOM_TO_SPLIT: &str = "Not enough room to split";
+
+/// Makes an empty group beside `target`, or says why not (split editors spec §4.3, §9).
+pub(crate) fn split_group(
+    hwnd: HWND,
+    target: GroupId,
+    direction: crate::window::split_tree::Direction,
+) -> Option<GroupId> {
+    let area = tree_area(hwnd)?;
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    // A trial id: the real one is only handed out once the window exists.
+    let trial = GroupId(u32::MAX);
+    let fits = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .layout
+            .fits_split(target, direction, trial, area, dpi)
+    });
+    if !fits {
+        push_notice(hwnd, NO_ROOM_TO_SPLIT.to_owned());
+        return None;
+    }
+    let new = match create_group(hwnd) {
+        Ok(new) => new,
+        Err(error) => {
+            push_notice(
+                hwnd,
+                format!("FastPad could not open a new editor group: {error}"),
+            );
+            return None;
+        }
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.layout.split(target, direction, new);
+    }
+    Some(new)
+}
+
+/// Ctrl+\ and Ctrl+Shift+\: a new group beside the active one, showing a new view of the active
+/// document at the same position (spec §5.1).
+pub(crate) fn split_active_group(hwnd: HWND, direction: crate::window::split_tree::Direction) {
+    let Some(source) =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    else {
+        return;
+    };
+    remember_view(hwnd, source);
+    let Some(new) = split_group(hwnd, source, direction) else {
+        return;
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        if let Some(id) = app.tabs.active().map(|document| document.id) {
+            let state = app.tabs.view_state_in(source, id);
+            app.tabs.add_view(new, id, state);
+        }
+    }
+    activate_group(hwnd, new);
+    show_group_view(hwnd, new);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+}
+
+/// Closes every tab of group `id`, asking about each unsaved one only where no other group shows
+/// it, then the group itself unless it is the only one. A cancelled prompt stops there.
+pub(crate) fn close_group(hwnd: HWND, id: GroupId) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    activate_group(hwnd, id);
+    let count = || {
+        unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.group(id)?.len()))
+    };
+    while let Some(before) = count().filter(|count| *count > 0) {
+        close_active_document(hwnd);
+        if !identity.is_live_for(hwnd) || count().is_some_and(|after| after >= before) {
+            return;
+        }
+    }
+    remove_empty_group(hwnd, id);
+}
+
+/// Removes group `id` once it has no tabs, unless it is the only group, and activates its
+/// neighbour: the next group in layout order, else the previous one.
+pub(crate) fn remove_empty_group(hwnd: HWND, id: GroupId) -> bool {
+    let removable = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        let app = unsafe { app.as_ref() };
+        app.groups.len() > 1 && app.tabs.group(id).is_some_and(|group| group.is_empty())
+    });
+    if !removable {
+        return false;
+    }
+    let order = group_order(hwnd);
+    let Some(index) = order.iter().position(|group| *group == id) else {
+        return false;
+    };
+    let Some(neighbour) = order
+        .get(index + 1)
+        .or_else(|| {
+            index
+                .checked_sub(1)
+                .and_then(|previous| order.get(previous))
+        })
+        .copied()
+    else {
+        return false;
+    };
+    activate_group(hwnd, neighbour);
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.layout.remove(id);
+    }
+    destroy_group(hwnd, id);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+    true
 }
 
 /// Activates `id` (the prompt's modal loop can have activated another tab) and saves it. Reports
@@ -7943,6 +8093,121 @@ three"
         let b_rect = window_rect_in_main(window.hwnd, b);
         assert!(region_has(a, a_rect.right - a_rect.left - 2, 2));
         assert!(!region_has(b, b_rect.right - b_rect.left - 2, 2));
+    }
+
+    #[test]
+    fn split_right_opens_the_active_document_in_a_new_group_to_the_right() {
+        // Break caught: Split Right opening an empty group, a copy of the document instead of a
+        // second view, or the new group landing on the left.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("shared").unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0], first);
+        let second = order[1];
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![first, second]);
+        assert_eq!(
+            super::group_editor(window.hwnd, second)
+                .unwrap()
+                .text()
+                .unwrap(),
+            "shared"
+        );
+    }
+
+    #[test]
+    fn a_split_without_room_is_refused_with_a_notice() {
+        // Break caught: a split into a sliver narrower than the minimum group.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOZORDER, SetWindowPos};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        unsafe {
+            SetWindowPos(
+                window.hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                360,
+                400,
+                SWP_NOMOVE | SWP_NOZORDER,
+            )
+        };
+        super::layout_editor_and_find_bar(window.hwnd);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        assert_eq!(super::group_order(window.hwnd).len(), 1);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice == super::NO_ROOM_TO_SPLIT)
+        );
+    }
+
+    #[test]
+    fn a_failed_group_window_leaves_the_layout_and_tabs_unchanged() {
+        // Break caught: a half-made group left in the tree when its Scintilla can't be created.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        super::fail_next_group_creation();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        assert_eq!(super::group_order(window.hwnd).len(), 1);
+        assert_eq!(app_mut(window.hwnd).tabs.group_ids().len(), 1);
+        assert!(!notices(window.hwnd).is_empty());
+    }
+
+    #[test]
+    fn closing_a_group_with_a_dirty_document_shown_elsewhere_does_not_prompt() {
+        // Break caught: Close Group asking to save (or discarding) a document another group
+        // still shows, or leaving it clean.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("unsaved").unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(app_mut(window.hwnd).tabs.document(id).unwrap().dirty);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&prompted);
+        answer_next_close_prompt(move |_| {
+            seen.set(true);
+            CloseDecision::Cancel
+        });
+        execute_command(window.hwnd, CommandId::CloseGroup);
+        assert!(!prompted.get(), "another group still shows the document");
+        assert_eq!(super::group_order(window.hwnd), vec![first]);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+        assert!(document.dirty);
+        assert_eq!(
+            super::group_editor(window.hwnd, first)
+                .unwrap()
+                .text()
+                .unwrap(),
+            "unsaved"
+        );
+    }
+
+    #[test]
+    fn closing_a_groups_last_tab_removes_the_group_but_never_the_only_one() {
+        // Break caught: an empty second group left on screen, or the only group destroyed.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitDown);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert_eq!(super::group_order(window.hwnd), vec![first]);
+        execute_command(window.hwnd, CommandId::CloseAllTabs);
+        assert_eq!(super::group_order(window.hwnd), vec![first]);
+        assert!(app_mut(window.hwnd).groups.len() == 1);
     }
 
     #[test]

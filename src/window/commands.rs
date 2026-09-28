@@ -89,6 +89,20 @@ pub enum CommandId {
     FileIconsMaterial = 194,
     FileIconsMinimal = 195,
     FileIconsSolid = 196,
+    SplitRight = 197,
+    SplitDown = 198,
+    CloseGroup = 199,
+    FocusGroup1 = 200,
+    FocusGroup2 = 201,
+    FocusGroup3 = 202,
+    FocusGroup4 = 203,
+    FocusGroup5 = 204,
+    FocusGroup6 = 205,
+    FocusGroup7 = 206,
+    FocusGroup8 = 207,
+    FocusLastGroup = 208,
+    MoveTabToNextGroup = 209,
+    MoveTabToPreviousGroup = 210,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -167,6 +181,18 @@ impl CommandId {
                 | Self::QuickOpen
                 | Self::NoteNewFolder
                 | Self::NoteNew
+                | Self::SplitRight
+                | Self::SplitDown
+                | Self::CloseGroup
+                | Self::FocusGroup1
+                | Self::FocusGroup2
+                | Self::FocusGroup3
+                | Self::FocusGroup4
+                | Self::FocusGroup5
+                | Self::FocusGroup6
+                | Self::FocusGroup7
+                | Self::FocusGroup8
+                | Self::FocusLastGroup
         )
     }
 
@@ -217,11 +243,27 @@ impl CommandId {
     }
 }
 
+impl CommandId {
+    /// The zero-based group a `FocusGroupN` command focuses, in layout order; `usize::MAX` for
+    /// Focus Last Group.
+    pub const fn group_index(self) -> Option<usize> {
+        let first = Self::FocusGroup1 as u16;
+        let value = self as u16;
+        if value >= first && value <= Self::FocusGroup8 as u16 {
+            Some((value - first) as usize)
+        } else if value == Self::FocusLastGroup as u16 {
+            Some(usize::MAX)
+        } else {
+            None
+        }
+    }
+}
+
 impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 86] = [
+        const COMMANDS: [CommandId; 100] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -308,6 +350,20 @@ impl TryFrom<u16> for CommandId {
             CommandId::FileIconsMaterial,
             CommandId::FileIconsMinimal,
             CommandId::FileIconsSolid,
+            CommandId::SplitRight,
+            CommandId::SplitDown,
+            CommandId::CloseGroup,
+            CommandId::FocusGroup1,
+            CommandId::FocusGroup2,
+            CommandId::FocusGroup3,
+            CommandId::FocusGroup4,
+            CommandId::FocusGroup5,
+            CommandId::FocusGroup6,
+            CommandId::FocusGroup7,
+            CommandId::FocusGroup8,
+            CommandId::FocusLastGroup,
+            CommandId::MoveTabToNextGroup,
+            CommandId::MoveTabToPreviousGroup,
         ];
         COMMANDS
             .into_iter()
@@ -344,6 +400,13 @@ mod tests {
     fn native_command_values_are_stable_and_round_trip() {
         assert_eq!(CommandId::New as u16, 100);
         assert_eq!(CommandId::Exit as u16, 117);
+        assert_eq!(CommandId::SplitRight as u16, 197);
+        assert_eq!(CommandId::MoveTabToPreviousGroup as u16, 210);
+        assert_eq!(CommandId::try_from(200), Ok(CommandId::FocusGroup1));
+        assert_eq!(CommandId::FocusGroup8.group_index(), Some(7));
+        assert_eq!(CommandId::FocusLastGroup.group_index(), Some(usize::MAX));
+        assert!(!CommandId::SplitRight.needs_document());
+        assert!(CommandId::MoveTabToNextGroup.needs_document());
         assert_eq!(CommandId::try_from(103), Ok(CommandId::SaveAs));
         assert!(CommandId::try_from(99).is_err());
         assert_eq!(CommandId::try_from(118), Ok(CommandId::CloseAllTabs));

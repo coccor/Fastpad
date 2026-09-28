@@ -294,7 +294,6 @@ impl App {
     }
 
     /// The group whose window is `hwnd` or holds it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn group_containing(&self, hwnd: HWND) -> Option<GroupId> {
         self.groups
             .iter()

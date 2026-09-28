@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 73] = [
+pub(crate) const ENTRIES: [PaletteEntry; 78] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -117,6 +117,17 @@ pub(crate) const ENTRIES: [PaletteEntry; 73] = [
     entry("View: Next tab", CommandId::NextTab),
     entry("View: Previous tab", CommandId::PreviousTab),
     entry("View: Toggle sidebar", CommandId::ToggleSidebar),
+    entry("View: Split Editor Right", CommandId::SplitRight),
+    entry("View: Split Editor Down", CommandId::SplitDown),
+    entry("View: Close Editor Group", CommandId::CloseGroup),
+    entry(
+        "View: Move Editor into Next Group",
+        CommandId::MoveTabToNextGroup,
+    ),
+    entry(
+        "View: Move Editor into Previous Group",
+        CommandId::MoveTabToPreviousGroup,
+    ),
     entry("View: Show notebook", CommandId::ShowNotebookView),
     entry("View: Show search", CommandId::ShowSearchView),
     entry("View: Show favorites", CommandId::ShowFavoritesView),
@@ -350,10 +361,13 @@ pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
         }
     }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_F1, VK_F24, VK_OEM_MINUS, VK_OEM_PLUS,
+        VK_F1, VK_F24, VK_LEFT, VK_OEM_5, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT,
     };
     match spec.key {
         VK_TAB => text.push_str("Tab"),
+        VK_OEM_5 => text.push('\\'),
+        VK_LEFT => text.push_str("Left"),
+        VK_RIGHT => text.push_str("Right"),
         VK_OEM_PLUS => text.push('+'),
         VK_OEM_MINUS => text.push('-'),
         key @ VK_F1..=VK_F24 => text.push_str(&format!("F{}", key - VK_F1 + 1)),
@@ -1437,7 +1451,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 73);
+        assert_eq!(ENTRIES.len(), 78);
     }
 
     #[test]
@@ -1477,7 +1491,7 @@ mod tests {
     #[test]
     fn every_command_except_tab_positions_and_the_palette_is_listed_once() {
         // Break caught: a command added to the menus and shortcuts that the palette never offers.
-        for value in 100..200u16 {
+        for value in 100..300u16 {
             let Ok(command) = CommandId::try_from(value) else {
                 continue;
             };
@@ -1487,6 +1501,7 @@ mod tests {
                 .count();
             let expected = usize::from(
                 command.tab_index().is_none()
+                    && command.group_index().is_none()
                     && command != CommandId::CommandPalette
                     && command != CommandId::MarkdownPreviewCycle
                     && command != CommandId::FocusNextPane
@@ -1494,6 +1509,19 @@ mod tests {
             );
             assert_eq!(listed, expected, "{command:?}");
         }
+    }
+
+    #[test]
+    fn split_shortcuts_are_spelled_with_a_backslash() {
+        // Break caught: Ctrl+\ shown as "Ctrl+Ü", VK_OEM_5's code read as a character.
+        assert_eq!(
+            shortcut_text(CommandId::SplitRight).as_deref(),
+            Some("Ctrl+\\")
+        );
+        assert_eq!(
+            shortcut_text(CommandId::SplitDown).as_deref(),
+            Some("Ctrl+Shift+\\")
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_F3, VK_F6, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2,
-    VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9,
+    VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_5,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 52] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 54] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -84,6 +84,9 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 52] {
         accelerator(FALT, b'Z', CommandId::ToggleWordWrap),
         virtual_key(0, VK_F6, CommandId::FocusNextPane),
         virtual_key(FSHIFT, VK_F6, CommandId::FocusPreviousPane),
+        // The backslash key on a US layout (split editors spec §6).
+        virtual_key(FCONTROL, VK_OEM_5, CommandId::SplitRight),
+        virtual_key(FCONTROL | FSHIFT, VK_OEM_5, CommandId::SplitDown),
     ]
 }
 
@@ -139,6 +142,23 @@ impl Drop for AcceleratorTable {
 #[derive(Debug)]
 pub(crate) struct MenuBar(HMENU);
 
+/// View ▸ Editor Layout (split editors spec §7).
+const EDITOR_LAYOUT: &[MenuEntry] = &[
+    MenuEntry::command("Split &Right\tCtrl+\\", CommandId::SplitRight),
+    MenuEntry::command("Split &Down\tCtrl+Shift+\\", CommandId::SplitDown),
+    MenuEntry::Separator,
+    MenuEntry::command(
+        "Move to &Next Group\tCtrl+Alt+Right",
+        CommandId::MoveTabToNextGroup,
+    ),
+    MenuEntry::command(
+        "Move to &Previous Group\tCtrl+Alt+Left",
+        CommandId::MoveTabToPreviousGroup,
+    ),
+    MenuEntry::Separator,
+    MenuEntry::command("&Close Group", CommandId::CloseGroup),
+];
+
 impl MenuBar {
     pub(crate) fn create() -> Result<Self> {
         let root = unsafe { CreateMenu() };
@@ -155,6 +175,7 @@ impl MenuBar {
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
                 MenuEntry::command("&Close tab	Ctrl+W", CommandId::CloseTab),
                 MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
+                MenuEntry::command("Close &group", CommandId::CloseGroup),
                 MenuEntry::Separator,
                 MenuEntry::command(
                     "&Restore session on startup",
@@ -195,6 +216,7 @@ impl MenuBar {
                 MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
                 MenuEntry::Separator,
                 MenuEntry::command("Side&bar	Ctrl+B", CommandId::ToggleSidebar),
+                MenuEntry::Submenu("Editor &Layout", EDITOR_LAYOUT),
                 MenuEntry::Separator,
                 MenuEntry::command(
                     "Markdown preview &side by side",
@@ -268,6 +290,8 @@ impl Drop for MenuBar {
 pub(crate) enum MenuEntry {
     Command(&'static str, CommandId),
     Separator,
+    /// A cascading menu of its own entries.
+    Submenu(&'static str, &'static [MenuEntry]),
 }
 
 impl MenuEntry {
@@ -288,6 +312,17 @@ fn create_popup(entries: &[MenuEntry]) -> Result<HMENU> {
                 unsafe { AppendMenuW(menu, MF_STRING, *command as usize, label.as_ptr()) }
             }
             MenuEntry::Separator => unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null()) },
+            MenuEntry::Submenu(label, entries) => match create_popup(entries) {
+                Ok(popup) => {
+                    let label = wide_null(label);
+                    let ok = unsafe { AppendMenuW(menu, MF_POPUP, popup as usize, label.as_ptr()) };
+                    if ok == 0 {
+                        unsafe { DestroyMenu(popup) };
+                    }
+                    ok
+                }
+                Err(_) => 0,
+            },
         };
         if ok == 0 {
             unsafe {
@@ -323,6 +358,12 @@ pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) ->
             MenuEntry::command("Close all tabs", CommandId::CloseAllTabs),
         ]);
     }
+    entries.extend([
+        MenuEntry::Separator,
+        MenuEntry::command("Split Right\tCtrl+\\", CommandId::SplitRight),
+        MenuEntry::command("Split Down\tCtrl+Shift+\\", CommandId::SplitDown),
+        MenuEntry::command("Close group", CommandId::CloseGroup),
+    ]);
     track_popup(hwnd, &entries, POINT { x, y })
 }
 
@@ -563,7 +604,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 52);
+        assert_eq!(specs.len(), 54);
     }
 
     #[test]
@@ -672,6 +713,13 @@ mod tests {
             Some(CommandId::ReplaceInNotes)
         );
         assert_eq!(bound(FCONTROL, u16::from(b'H')), Some(CommandId::Replace));
+        // Split editors spec §6: Ctrl+\ splits right, Ctrl+Shift+\ down.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_OEM_5;
+        assert_eq!(bound(FCONTROL, VK_OEM_5), Some(CommandId::SplitRight));
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, VK_OEM_5),
+            Some(CommandId::SplitDown)
+        );
     }
 
     #[test]
