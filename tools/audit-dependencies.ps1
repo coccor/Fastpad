@@ -16,10 +16,13 @@ $AllowedRoots = @(
 # The `windows` crate is allowed only as the pinned direct dependency, with exactly these features.
 # Win32/Win32_Graphics/Win32_Graphics_Dxgi/Win32_System are namespace features that cargo metadata
 # reports as implied by the leaf features below; they add no API surface of their own.
+# Win32_System_Com_StructuredStorage and Win32_System_Variant supply PROPVARIANT and VT_UI2, which the
+# image view needs to read EXIF orientation through IWICMetadataQueryReader::GetMetadataByName.
 $AllowedWindowsFeatures = @(
     "Win32", "Win32_Foundation", "Win32_Graphics", "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Imaging", "Win32_System", "Win32_System_Com"
+    "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Imaging", "Win32_System", "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage", "Win32_System_Variant"
 )
 $RegistrySource = "registry+https://github.com/rust-lang/crates.io-index"
 
