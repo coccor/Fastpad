@@ -9290,8 +9290,8 @@ three"
         let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
         let point = client_lparam(tab.left + 10, tab.bottom / 2);
         unsafe {
-            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
-            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
         }
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
     }
@@ -9327,10 +9327,10 @@ three"
         let group = super::group_hwnd(window.hwnd).unwrap();
         let point = client_lparam(close.x, close.y);
         unsafe {
-            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
-            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
             SendMessageW(group, WM_LBUTTONDBLCLK, 1, point);
-            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
         }
         assert_eq!(super::tab_count(window.hwnd), 2);
     }
@@ -9572,8 +9572,8 @@ three"
         let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
         let point = client_lparam(tab.left + 10, tab.bottom / 2);
         unsafe {
-            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
-            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
         }
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
         assert_eq!(app_mut(window.hwnd).menu_mode, None);
