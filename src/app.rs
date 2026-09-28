@@ -68,20 +68,12 @@ pub struct App {
     /// The activity bar's logo icon, loaded for the window's DPI by the post-first-paint deferred
     /// chrome step (`main_window::build_chrome`) and reloaded on a DPI change.
     pub(crate) logo_icon: Option<LogoIcon>,
-    /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
-    pub(crate) tab_thumb_grab: Option<i32>,
-    /// Between a middle-button press on a tab and its release: the tab's strip index and the
-    /// document it showed then (quick-open spec §5).
-    pub(crate) middle_press: Option<(usize, crate::document::DocumentId)>,
     pub(crate) dark_frame_applied: bool,
     pub(crate) notifications: NotificationCenter,
     pub(crate) launch_open_completed: bool,
     pub(crate) populating_file: bool,
     pub(crate) modal_depth: u32,
     pub(crate) held_messages: Vec<u32>,
-    /// The last tab click (its document and message time), so a second click on the same tab
-    /// within the double-click time keeps a preview tab. The class has no `CS_DBLCLKS`.
-    pub(crate) last_tab_click: Option<(crate::document::DocumentId, u32)>,
     identity: WindowIdentity,
     first_paint_completed: bool,
     deferred_start_pending: bool,
@@ -148,15 +140,12 @@ impl App {
             title_fonts: None,
             title_pointer: PointerState::default(),
             logo_icon: None,
-            tab_thumb_grab: None,
-            middle_press: None,
             dark_frame_applied: false,
             notifications: NotificationCenter::new(),
             launch_open_completed: false,
             populating_file: false,
             modal_depth: 0,
             held_messages: Vec::new(),
-            last_tab_click: None,
             identity: WindowIdentity {
                 state: Rc::new(Cell::new(WindowIdentityState::Unbound)),
             },
@@ -257,8 +246,12 @@ impl App {
     }
 
     pub(crate) fn ensure_accessibility(&mut self) -> *mut c_void {
-        self.accessibility
-            .ensure(self.hwnd, self.tabs.view(), self.tabs.selection())
+        self.accessibility.ensure(
+            self.hwnd,
+            crate::window::accessibility::ProviderKind::TitleBar,
+            self.tabs.view(),
+            self.tabs.selection(),
+        )
     }
 
     pub(crate) fn window_identity(&self) -> WindowIdentity {

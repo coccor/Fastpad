@@ -8,10 +8,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateFontW, DC_BRUSH, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT,
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
     DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, ExcludeClipRect, FW_NORMAL,
-    FillRect, GetMonitorInfoW, GetStockObject, HDC, HFONT, IntersectClipRect, InvalidateRect,
+    FillRect, GetMonitorInfoW, GetStockObject, HDC, HFONT, InvalidateRect,
     MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, ScreenToClient, SelectObject, SetBkMode,
-    SetDCBrushColor, SetTextColor, TRANSPARENT,
+    PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor,
+    TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::SetWindowTheme;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
@@ -28,9 +28,9 @@ const GLYPH_MINIMIZE: &str = "\u{E921}";
 const GLYPH_MAXIMIZE: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
 pub(crate) const GLYPH_CLOSE: &str = "\u{E8BB}";
-const GLYPH_MORE: &str = "\u{E712}";
-const GLYPH_PREVIEW_SIDE: &str = "\u{E90D}";
-const GLYPH_PREVIEW_FULL: &str = "\u{E8FF}";
+pub(crate) const GLYPH_MORE: &str = "\u{E712}";
+pub(crate) const GLYPH_PREVIEW_SIDE: &str = "\u{E90D}";
+pub(crate) const GLYPH_PREVIEW_FULL: &str = "\u{E8FF}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Point {
@@ -90,7 +90,7 @@ impl Rect {
         point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
     }
 
-    fn centered_square(self, size: i32) -> Self {
+    pub(crate) fn centered_square(self, size: i32) -> Self {
         let center = self.center();
         let half = size.min(self.right - self.left).min(self.bottom - self.top) / 2;
         Self::new(
@@ -109,13 +109,8 @@ pub enum HitTarget {
     Minimize,
     Maximize,
     Close,
-    Tab(usize),
-    CloseTab(usize),
-    /// The band along the bottom of the tab viewport while the tabs overflow it.
-    ScrollBar,
+    /// The application menu ("…").
     Overflow,
-    PreviewSide,
-    PreviewFull,
     ResizeTop,
     ResizeTopLeft,
     ResizeTopRight,
@@ -130,15 +125,7 @@ impl HitTarget {
     pub const fn is_interactive(self) -> bool {
         matches!(
             self,
-            Self::Minimize
-                | Self::Maximize
-                | Self::Close
-                | Self::Tab(_)
-                | Self::CloseTab(_)
-                | Self::ScrollBar
-                | Self::Overflow
-                | Self::PreviewSide
-                | Self::PreviewFull
+            Self::Minimize | Self::Maximize | Self::Close | Self::Overflow
         )
     }
 
@@ -210,68 +197,35 @@ impl PointerState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TitleBarLayout {
-    /// The visible tab viewport; tabs scrolled outside it are clipped and never hit.
-    pub tabs: Rect,
-    /// Empty strip beside the tabs: drags the window, opens a tab on double-click.
+    /// The empty strip between the sidebar and the app menu: drags the window, maximizes it on
+    /// a double-click, and shows the window title. The tabs are in the editor group now.
     pub drag_region: Rect,
-    /// The sidebar's share of the strip, left of the tabs. It is caption (dragging, top-edge
-    /// resizing, double-click to maximize), and empty without a sidebar.
+    /// The sidebar's share of the strip. It is caption (dragging, top-edge resizing,
+    /// double-click to maximize), and empty without a sidebar.
     pub sidebar: Rect,
     pub minimize: Rect,
     pub maximize: Rect,
     pub close: Rect,
+    /// The application menu ("…").
     pub overflow: Rect,
-    /// "Open Preview to the Side" and "Open Preview", present only for Markdown tabs.
-    pub preview_side: Option<Rect>,
-    pub preview_full: Option<Rect>,
     pub height: i32,
     /// Height of the top band that resizes a restored window.
     pub resize_border: i32,
-    /// How far the tabs are scrolled left, clamped to `max_scroll`.
-    pub scroll: i32,
-    pub max_scroll: i32,
-    /// The draggable scroll band, present only while the tabs overflow the viewport.
-    pub scroll_bar: Option<Rect>,
-    min_thumb: i32,
-    tab_width: i32,
-    tab_rects: Vec<Rect>,
-    close_tab_rects: Vec<Rect>,
 }
 
-const fn scale(value: i32, dpi: u32) -> i32 {
+pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
     let dpi = if dpi == 0 { 1 } else { dpi };
     ((value as i64 * dpi as i64 + 48) / 96) as i32
 }
 
 impl TitleBarLayout {
-    pub fn calculate(client: Size, dpi: u32, tab_count: usize) -> Self {
-        Self::calculate_scrolled(client, dpi, tab_count, 0)
+    pub fn calculate(client: Size, dpi: u32) -> Self {
+        Self::calculate_with_offset(client, dpi, 0)
     }
 
-    pub fn calculate_scrolled(client: Size, dpi: u32, tab_count: usize, scroll: i32) -> Self {
-        Self::calculate_with_preview(client, dpi, tab_count, scroll, false)
-    }
-
-    pub fn calculate_with_preview(
-        client: Size,
-        dpi: u32,
-        tab_count: usize,
-        scroll: i32,
-        preview_buttons: bool,
-    ) -> Self {
-        Self::calculate_with_offset(client, dpi, tab_count, scroll, preview_buttons, 0)
-    }
-
-    /// The strip with the tabs starting at `left`, right of the sidebar. The caption buttons keep
-    /// the right edge, and everything left of `left` is caption.
-    pub fn calculate_with_offset(
-        client: Size,
-        dpi: u32,
-        tab_count: usize,
-        scroll: i32,
-        preview_buttons: bool,
-        left: i32,
-    ) -> Self {
+    /// The strip with the caption starting at `left`, right of the sidebar. The caption buttons
+    /// keep the right edge, and everything left of `left` is caption too.
+    pub fn calculate_with_offset(client: Size, dpi: u32, left: i32) -> Self {
         let width = client.width.max(0);
         let dpi = dpi.max(1);
         let height = strip_height(dpi);
@@ -287,123 +241,18 @@ impl TitleBarLayout {
         let actions_right = minimize.left.max(0);
         let overflow_left = (actions_right - scale(40, dpi)).max(0);
         let overflow = Rect::new(overflow_left, 0, actions_right, height);
-
-        let (preview_side, preview_full, buttons_left) = if preview_buttons {
-            let button = scale(40, dpi);
-            let full_left = (overflow_left - button).max(0);
-            let side_left = (full_left - button).max(0);
-            (
-                Some(Rect::new(side_left, 0, full_left, height)),
-                Some(Rect::new(full_left, 0, overflow_left, height)),
-                side_left,
-            )
-        } else {
-            (None, None, overflow_left)
-        };
-
-        let left = left.clamp(0, buttons_left);
-        // Some empty strip always stays reachable, however many tabs are open.
-        let tabs_right = (buttons_left - scale(48, dpi)).max(left);
-        let tabs = Rect::new(left, 0, tabs_right, height);
-        let viewport = tabs_right - left;
-        let preferred_tab_width = scale(200, dpi);
-        let tab_width = if tab_count == 0 {
-            0
-        } else {
-            (viewport / tab_count as i32).clamp(scale(120, dpi), preferred_tab_width)
-        };
-        let content_width = tab_width.saturating_mul(tab_count as i32);
-        let max_scroll = (content_width - viewport).max(0);
-        let scroll = scroll.clamp(0, max_scroll);
-
-        let close_size = scale(32, dpi).min(tab_width);
-        let mut tab_rects = Vec::with_capacity(tab_count);
-        let mut close_tab_rects = Vec::with_capacity(tab_count);
-        for index in 0..tab_count {
-            let tab_left = left + index as i32 * tab_width - scroll;
-            let right = tab_left + tab_width;
-            tab_rects.push(Rect::new(tab_left, 0, right, height));
-            close_tab_rects.push(Rect::new(right - close_size, 0, right, height));
-        }
-
-        let drag_region = Rect::new(
-            (left + content_width - scroll).clamp(left, tabs_right),
-            0,
-            buttons_left,
-            height,
-        );
-        let scroll_bar = (max_scroll > 0)
-            .then(|| Rect::new(tabs.left, height - scale(8, dpi), tabs.right, height));
+        let left = left.clamp(0, overflow_left);
 
         Self {
-            tabs,
-            drag_region,
+            drag_region: Rect::new(left, 0, overflow_left, height),
             sidebar: Rect::new(0, 0, left, height),
             minimize,
             maximize,
             close,
             overflow,
-            preview_side,
-            preview_full,
             height,
             resize_border,
-            scroll,
-            max_scroll,
-            scroll_bar,
-            min_thumb: scale(24, dpi),
-            tab_width,
-            tab_rects,
-            close_tab_rects,
         }
-    }
-
-    /// The scroll offset that brings the whole of tab `index` into the viewport.
-    pub fn scroll_to_reveal(&self, index: usize) -> i32 {
-        let left = index as i32 * self.tab_width;
-        let right = left + self.tab_width;
-        let viewport = self.tabs.right - self.tabs.left;
-        let scroll = if left < self.scroll {
-            left
-        } else if right > self.scroll + viewport {
-            right - viewport
-        } else {
-            self.scroll
-        };
-        scroll.clamp(0, self.max_scroll)
-    }
-
-    /// The scroll offset after a mouse wheel turn of `delta`; one notch moves half a tab.
-    pub fn scroll_by_wheel(&self, delta: i32, wheel_delta: i32) -> i32 {
-        let step = (self.tab_width / 2).max(1);
-        let pixels = (i64::from(delta) * i64::from(step) / i64::from(wheel_delta.max(1))) as i32;
-        self.scroll.saturating_add(pixels).clamp(0, self.max_scroll)
-    }
-
-    /// The thumb inside `scroll_bar`, sized by how much of the tab strip is visible.
-    pub fn scroll_thumb(&self) -> Option<Rect> {
-        let bar = self.scroll_bar?;
-        let track = bar.right - bar.left;
-        let thumb = self.thumb_width(track);
-        let left = bar.left + self.scroll * (track - thumb) / self.max_scroll;
-        Some(Rect::new(left, bar.top, left + thumb, bar.bottom))
-    }
-
-    fn thumb_width(&self, track: i32) -> i32 {
-        let content = track + self.max_scroll;
-        (track * track / content.max(1))
-            .max(self.min_thumb)
-            .min(track)
-    }
-
-    /// The scroll offset that puts the thumb's left edge at `thumb_left`.
-    pub fn scroll_for_thumb(&self, thumb_left: i32) -> i32 {
-        let Some(bar) = self.scroll_bar else {
-            return 0;
-        };
-        let track = bar.right - bar.left;
-        let travel = (track - self.thumb_width(track)).max(1);
-        let offset = i64::from((thumb_left - bar.left).clamp(0, travel));
-        (offset * i64::from(self.max_scroll) / i64::from(travel)) as i32
     }
 
     pub fn hit_test(&self, point: Point) -> HitTarget {
@@ -418,27 +267,6 @@ impl TitleBarLayout {
         }
         if self.overflow.contains(point) {
             return HitTarget::Overflow;
-        }
-        if self.preview_side.is_some_and(|rect| rect.contains(point)) {
-            return HitTarget::PreviewSide;
-        }
-        if self.preview_full.is_some_and(|rect| rect.contains(point)) {
-            return HitTarget::PreviewFull;
-        }
-        if self.scroll_bar.is_some_and(|bar| bar.contains(point)) {
-            return HitTarget::ScrollBar;
-        }
-        if self.tabs.contains(point) {
-            for (index, rect) in self.close_tab_rects.iter().enumerate() {
-                if rect.contains(point) {
-                    return HitTarget::CloseTab(index);
-                }
-            }
-            for (index, rect) in self.tab_rects.iter().enumerate() {
-                if rect.contains(point) {
-                    return HitTarget::Tab(index);
-                }
-            }
         }
         if self.sidebar.contains(point) || self.drag_region.contains(point) {
             return HitTarget::Caption;
@@ -465,14 +293,6 @@ impl TitleBarLayout {
         }
     }
 
-    pub fn tab(&self, index: usize) -> Rect {
-        self.tab_rects[index]
-    }
-
-    pub fn close_tab(&self, index: usize) -> Rect {
-        self.close_tab_rects[index]
-    }
-
     fn strip(&self) -> Rect {
         Rect::new(0, 0, self.close.right, self.height)
     }
@@ -496,12 +316,7 @@ pub fn frame_client_rect(proposed: Rect, default_client: Rect, work_area: Option
     }
 }
 
-pub(crate) fn layout_for_window(
-    hwnd: HWND,
-    tab_count: usize,
-    scroll: i32,
-    preview_buttons: bool,
-) -> TitleBarLayout {
+pub(crate) fn layout_for_window(hwnd: HWND) -> TitleBarLayout {
     let mut client = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut client);
@@ -509,15 +324,12 @@ pub(crate) fn layout_for_window(
     TitleBarLayout::calculate_with_offset(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(hwnd) }.max(96),
-        tab_count,
-        scroll,
-        preview_buttons,
         crate::window::side_panel::left_edge(hwnd),
     )
 }
 
 pub(crate) fn invalidate_strip(hwnd: HWND) {
-    let strip = native_rect(layout_for_window(hwnd, 0, 0, false).strip());
+    let strip = native_rect(layout_for_window(hwnd).strip());
     unsafe {
         InvalidateRect(hwnd, &strip, 0);
     }
@@ -668,11 +480,8 @@ pub(crate) fn strip_height(dpi: u32) -> i32 {
 }
 
 pub(crate) struct TitlePaint<'a> {
-    pub titles: &'a [&'a str],
-    pub active: usize,
-    /// The preview tab's index; its label is drawn in italics.
-    pub preview_tab: Option<usize>,
-    pub scroll: i32,
+    /// The window title, shown in the empty caption: the active tab's title and the app name.
+    pub title: &'a str,
     /// Present once deferred chrome is built; the bar is painted along the bottom edge.
     pub status: Option<&'a crate::window::status::StatusBarText>,
     pub palette: Palette,
@@ -680,8 +489,6 @@ pub(crate) struct TitlePaint<'a> {
     pub pointer: PointerState,
     /// The Alt/F10 menu band's state and heading rectangles while menu mode is active.
     pub menu: Option<(crate::window::menu_band::MenuMode, &'a [RECT])>,
-    /// The current preview mode while the preview buttons are shown; `None` hides them.
-    pub preview: Option<crate::preview::PreviewMode>,
 }
 
 pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
@@ -692,12 +499,7 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
     }
 
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-    let layout = layout_for_window(
-        hwnd,
-        input.titles.len(),
-        input.scroll,
-        input.preview.is_some(),
-    );
+    let layout = layout_for_window(hwnd);
     let mut client = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut client);
@@ -872,101 +674,21 @@ unsafe fn draw_strip(
     }
     let previous_font = unsafe { select_font(dc, input.fonts.text) };
 
-    let saved = unsafe { SaveDC(dc) };
+    let margin = scale(12, dpi);
+    let caption = layout.drag_region;
     unsafe {
-        IntersectClipRect(
+        SetTextColor(dc, palette.muted_foreground);
+        draw_text(
             dc,
-            layout.tabs.left,
-            layout.tabs.top,
-            layout.tabs.right,
-            layout.tabs.bottom,
-        );
-    }
-    for (index, title) in input.titles.iter().enumerate() {
-        let tab = layout.tab(index);
-        if tab.right <= layout.tabs.left || tab.left >= layout.tabs.right {
-            continue;
-        }
-        let close = layout.close_tab(index);
-        let selected = index == input.active;
-        let tab_hovered = matches!(
-            pointer.hovered,
-            Some(HitTarget::Tab(hovered) | HitTarget::CloseTab(hovered)) if hovered == index
-        );
-        let (background, foreground) = if selected {
-            (palette.active_tab_background(), palette.editor_foreground)
-        } else if tab_hovered {
-            (palette.hover_background, palette.hover_foreground)
-        } else {
-            (palette.strip_background, palette.muted_foreground)
-        };
-        let close_hovered = pointer.hovered == Some(HitTarget::CloseTab(index));
-        unsafe {
-            fill(dc, tab, background);
-            select_font(
-                dc,
-                if input.preview_tab == Some(index) {
-                    input.fonts.italic()
-                } else {
-                    input.fonts.text
-                },
-            );
-            SetTextColor(dc, foreground);
-            draw_text(
-                dc,
-                title,
-                Rect::new(
-                    tab.left + scale(12, dpi),
-                    tab.top,
-                    close.left.max(tab.left),
-                    tab.bottom,
-                ),
-                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
-            if close_hovered {
-                let pressed = pointer.is_pressed(HitTarget::CloseTab(index));
-                fill(
-                    dc,
-                    close.centered_square(scale(24, dpi)),
-                    if pressed {
-                        palette.pressed_background
-                    } else {
-                        palette.hover_background
-                    },
-                );
-            }
-            select_font(dc, input.fonts.glyph);
-            SetTextColor(
-                dc,
-                if close_hovered || (tab_hovered && !selected) {
-                    palette.hover_foreground
-                } else {
-                    palette.muted_foreground
-                },
-            );
-            draw_text(dc, GLYPH_CLOSE, close, centered);
-        }
-    }
-    if saved != 0 {
-        unsafe {
-            RestoreDC(dc, saved);
-        }
-    }
-    if let Some(thumb) = layout.scroll_thumb() {
-        // A slim line at rest that thickens into the full grab band under the pointer.
-        let active = pointer.hovered == Some(HitTarget::ScrollBar)
-            || pointer.is_pressed(HitTarget::ScrollBar);
-        let thumb = if active {
-            thumb
-        } else {
+            input.title,
             Rect::new(
-                thumb.left,
-                thumb.bottom - scale(3, dpi),
-                thumb.right,
-                thumb.bottom,
-            )
-        };
-        unsafe { fill(dc, thumb, palette.pressed_background) };
+                caption.left + margin,
+                caption.top,
+                (caption.right - margin).max(caption.left + margin),
+                caption.bottom,
+            ),
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
     }
 
     let overflow_hovered = pointer.hovered == Some(HitTarget::Overflow);
@@ -992,44 +714,6 @@ unsafe fn draw_strip(
             },
         );
         draw_text(dc, GLYPH_MORE, layout.overflow, centered);
-        if let Some(mode) = input.preview {
-            for (target, rect, glyph, active) in [
-                (
-                    HitTarget::PreviewSide,
-                    layout.preview_side,
-                    GLYPH_PREVIEW_SIDE,
-                    mode == crate::preview::PreviewMode::Split,
-                ),
-                (
-                    HitTarget::PreviewFull,
-                    layout.preview_full,
-                    GLYPH_PREVIEW_FULL,
-                    mode == crate::preview::PreviewMode::Full,
-                ),
-            ] {
-                let Some(rect) = rect else { continue };
-                let hovered = pointer.hovered == Some(target);
-                let background = if (hovered && pointer.is_pressed(target)) || active {
-                    Some(palette.pressed_background)
-                } else if hovered {
-                    Some(palette.hover_background)
-                } else {
-                    None
-                };
-                if let Some(background) = background {
-                    fill(dc, rect.centered_square(scale(32, dpi)), background);
-                }
-                SetTextColor(
-                    dc,
-                    if hovered || active {
-                        palette.hover_foreground
-                    } else {
-                        palette.muted_foreground
-                    },
-                );
-                draw_text(dc, glyph, rect, centered);
-            }
-        }
     }
 
     let maximize_glyph = if maximized {
@@ -1069,14 +753,7 @@ unsafe fn draw_strip(
     unsafe { restore_font(dc, previous_font) };
 }
 
-pub(crate) unsafe fn nonclient_hit_test(
-    hwnd: HWND,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    tab_count: usize,
-    scroll: i32,
-    preview_buttons: bool,
-) -> LRESULT {
+pub(crate) unsafe fn nonclient_hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let mut dwm_result = 0;
     if unsafe { DwmDefWindowProc(hwnd, WM_NCHITTEST, wparam, lparam, &mut dwm_result) } != 0 {
         return dwm_result;
@@ -1089,7 +766,7 @@ pub(crate) unsafe fn nonclient_hit_test(
     unsafe {
         ScreenToClient(hwnd, &mut point);
     }
-    let layout = layout_for_window(hwnd, tab_count, scroll, preview_buttons);
+    let layout = layout_for_window(hwnd);
     if point.x < 0 || point.x >= layout.close.right || point.y < 0 || point.y >= layout.height {
         return unsafe { DefWindowProcW(hwnd, WM_NCHITTEST, wparam, lparam) };
     }
@@ -1102,13 +779,7 @@ pub(crate) unsafe fn nonclient_hit_test(
         HitTarget::ResizeTop => HTTOP,
         HitTarget::ResizeTopLeft => HTTOPLEFT,
         HitTarget::ResizeTopRight => HTTOPRIGHT,
-        HitTarget::Client
-        | HitTarget::Tab(_)
-        | HitTarget::CloseTab(_)
-        | HitTarget::ScrollBar
-        | HitTarget::Overflow
-        | HitTarget::PreviewSide
-        | HitTarget::PreviewFull => HTCLIENT,
+        HitTarget::Client | HitTarget::Overflow => HTCLIENT,
     }) as LRESULT
 }
 
@@ -1207,21 +878,21 @@ pub(crate) fn apply_frame_theme(hwnd: HWND, editor: HWND, dark: bool) {
     }
 }
 
-unsafe fn fill(dc: HDC, rect: Rect, color: u32) {
+pub(crate) unsafe fn fill(dc: HDC, rect: Rect, color: u32) {
     unsafe {
         SetDCBrushColor(dc, color);
         FillRect(dc, &native_rect(rect), GetStockObject(DC_BRUSH));
     }
 }
 
-unsafe fn select_font(dc: HDC, font: HFONT) -> HFONT {
+pub(crate) unsafe fn select_font(dc: HDC, font: HFONT) -> HFONT {
     if font.is_null() {
         return std::ptr::null_mut();
     }
     unsafe { SelectObject(dc, font) }
 }
 
-unsafe fn restore_font(dc: HDC, previous: HFONT) {
+pub(crate) unsafe fn restore_font(dc: HDC, previous: HFONT) {
     if !previous.is_null() {
         unsafe {
             SelectObject(dc, previous);
@@ -1260,7 +931,7 @@ unsafe fn measure_text(dc: HDC, text: &str, format: u32) -> i32 {
     rect.right - rect.left
 }
 
-unsafe fn draw_text(dc: HDC, text: &str, rect: Rect, format: u32) {
+pub(crate) unsafe fn draw_text(dc: HDC, text: &str, rect: Rect, format: u32) {
     // An empty Vec's pointer is dangling, and DT_END_ELLIPSIS makes DrawTextW read through it; the
     // bottom bar's left side is empty whenever no tab is open and no notice is pending.
     if text.is_empty() {
@@ -1325,27 +996,21 @@ mod tests {
     }
 
     #[test]
-    fn a_sidebar_offset_moves_the_tabs_right_and_keeps_its_strip_as_caption() {
-        // Break caught: tabs painted under the activity bar, or a sidebar top strip that no
-        // longer drags the window or resizes it from the top edge.
+    fn a_sidebar_offset_keeps_its_strip_as_caption() {
+        // Break caught: a sidebar top strip that no longer drags the window or resizes it from
+        // the top edge.
         let client = Size::new(1200, 800);
-        let plain = TitleBarLayout::calculate_with_preview(client, 96, 3, 0, false);
-        assert_eq!(
-            TitleBarLayout::calculate_with_offset(client, 96, 3, 0, false, 0),
-            plain
-        );
-        let layout = TitleBarLayout::calculate_with_offset(client, 96, 3, 0, false, 304);
-        assert_eq!(layout.tabs.left, 304);
-        assert_eq!(layout.tab(0).left, 304);
-        assert_eq!(layout.tab(1).left, layout.tab(0).right);
+        let plain = TitleBarLayout::calculate(client, 96);
+        assert_eq!(TitleBarLayout::calculate_with_offset(client, 96, 0), plain);
+        let layout = TitleBarLayout::calculate_with_offset(client, 96, 304);
         assert_eq!(layout.sidebar, Rect::new(0, 0, 304, layout.height));
+        assert_eq!(layout.drag_region.left, 304);
+        assert_eq!(layout.drag_region.right, layout.overflow.left);
         assert_eq!(layout.close, plain.close);
-        assert!(layout.drag_region.left >= layout.tab(2).right);
         assert_eq!(
             layout.hit_test(super::Point::new(20, layout.height / 2)),
             HitTarget::Caption
         );
-        assert_eq!(layout.hit_test(layout.tab(0).center()), HitTarget::Tab(0));
         assert_eq!(
             layout.frame_hit_test(super::Point::new(20, 0), false),
             HitTarget::ResizeTop
@@ -1354,28 +1019,9 @@ mod tests {
             layout.frame_hit_test(super::Point::new(0, 0), false),
             HitTarget::ResizeTopLeft
         );
-    }
-
-    #[test]
-    fn crowded_tabs_behind_a_sidebar_scroll_inside_the_narrower_viewport() {
-        let client = Size::new(1200, 800);
-        let layout = TitleBarLayout::calculate_with_offset(client, 96, 30, 0, false, 304);
-        assert!(layout.max_scroll > 0);
-        let scrolled = TitleBarLayout::calculate_with_offset(
-            client,
-            96,
-            30,
-            layout.scroll_to_reveal(29),
-            false,
-            304,
-        );
-        assert!(scrolled.tab(29).left >= scrolled.tabs.left);
-        assert!(scrolled.tab(29).right <= scrolled.tabs.right);
-        assert_eq!(scrolled.scroll_bar.unwrap().left, 304);
-        // An offset wider than the strip leaves an empty viewport, never a negative one.
-        let squeezed =
-            TitleBarLayout::calculate_with_offset(Size::new(300, 800), 96, 2, 0, false, 5000);
-        assert!(squeezed.tabs.left <= squeezed.tabs.right);
+        // An offset wider than the strip leaves an empty caption, never a negative one.
+        let squeezed = TitleBarLayout::calculate_with_offset(Size::new(300, 800), 96, 5000);
+        assert!(squeezed.drag_region.left <= squeezed.drag_region.right);
         assert_eq!(squeezed.close.right, 300);
     }
 
@@ -1383,7 +1029,7 @@ mod tests {
     fn caption_buttons_sit_flush_with_the_top_right_edge() {
         // Break caught: a layout that starts below y=0 or leaves room right of Close recreates the
         // native caption band above/beside FastPad's own buttons.
-        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96, 2);
+        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96);
         for rect in [layout.minimize, layout.maximize, layout.close] {
             assert_eq!(rect.top, 0);
             assert_eq!(rect.bottom, layout.height);
@@ -1393,7 +1039,7 @@ mod tests {
         assert_eq!(layout.minimize.right, layout.maximize.left);
         assert_eq!(layout.close.right - layout.close.left, 46);
         assert_eq!(
-            TitleBarLayout::calculate(Size::new(1200, 800), 192, 2)
+            TitleBarLayout::calculate(Size::new(1200, 800), 192)
                 .close
                 .left,
             1200 - 92
@@ -1431,11 +1077,11 @@ mod tests {
 
     #[test]
     fn top_band_of_a_restored_window_resizes_except_over_caption_buttons() {
-        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96, 2);
+        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96);
         let band = layout.resize_border;
         assert!(band > 0 && band < layout.height);
-        let tab = layout.tab(1).center();
-        let top = super::Point::new(tab.x, 0);
+        let caption = layout.drag_region.center();
+        let top = super::Point::new(caption.x, 0);
         assert_eq!(layout.frame_hit_test(top, false), HitTarget::ResizeTop);
         assert_eq!(
             layout.frame_hit_test(super::Point::new(0, 0), false),
@@ -1451,10 +1097,10 @@ mod tests {
             layout.frame_hit_test(maximize_top, false),
             HitTarget::Maximize
         );
-        assert_eq!(layout.frame_hit_test(top, true), HitTarget::Tab(1));
+        assert_eq!(layout.frame_hit_test(top, true), HitTarget::Caption);
         assert_eq!(
-            layout.frame_hit_test(super::Point::new(tab.x, band), false),
-            HitTarget::Tab(1)
+            layout.frame_hit_test(super::Point::new(caption.x, band), false),
+            HitTarget::Caption
         );
         assert_eq!(
             layout.frame_hit_test(layout.drag_region.center(), false),
@@ -1516,19 +1162,18 @@ mod tests {
         assert_eq!(caption.leave(false), caption);
         assert_eq!(caption.leave(true), PointerState::default());
 
-        let tab = PointerState::default().hover(Some(HitTarget::CloseTab(0)));
-        assert_eq!(tab.leave(true), tab);
-        assert_eq!(tab.leave(false), PointerState::default());
+        let menu = PointerState::default().hover(Some(HitTarget::Overflow));
+        assert_eq!(menu.leave(true), menu);
+        assert_eq!(menu.leave(false), PointerState::default());
     }
 
     #[test]
     fn hit_test_preserves_drag_and_maximize_regions() {
-        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 144, 2);
+        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 144);
         assert_eq!(
             layout.hit_test(layout.maximize.center()),
             HitTarget::Maximize
         );
-        assert_eq!(layout.hit_test(layout.tab(0).center()), HitTarget::Tab(0));
         assert_eq!(
             layout.hit_test(layout.drag_region.center()),
             HitTarget::Caption
@@ -1536,14 +1181,30 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_strip_left_of_the_app_menu_is_caption() {
+        // Break caught: part of the old tab area left as client after the tabs moved into the
+        // editor group, so the window can't be dragged or double-click-maximized there.
+        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96);
+        assert_eq!(layout.drag_region.left, 0);
+        assert_eq!(layout.drag_region.right, layout.overflow.left);
+        for x in [1, 300, layout.overflow.left - 1] {
+            assert_eq!(
+                layout.hit_test(super::Point::new(x, layout.height / 2)),
+                HitTarget::Caption,
+                "x = {x}"
+            );
+        }
+    }
+
+    #[test]
     fn narrow_window_never_overlaps_caption_buttons() {
-        let layout = TitleBarLayout::calculate(Size::new(320, 600), 96, 8);
-        assert!(layout.tabs.right() <= layout.minimize.left());
+        let layout = TitleBarLayout::calculate(Size::new(320, 600), 96);
+        assert!(layout.drag_region.right() <= layout.minimize.left());
     }
 
     #[test]
     fn interactive_title_targets_are_disjoint() {
-        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 192, 1);
+        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 192);
         assert_eq!(
             layout.hit_test(layout.overflow.center()),
             HitTarget::Overflow
@@ -1553,94 +1214,5 @@ mod tests {
             HitTarget::Minimize
         );
         assert_eq!(layout.hit_test(layout.close.center()), HitTarget::Close);
-    }
-
-    #[test]
-    fn crowded_tabs_scroll_inside_the_viewport_and_keep_an_empty_strip() {
-        // Break caught: tabs shrinking to unreadable slivers or spilling over the caption buttons,
-        // and no empty strip left to drag the window or double-click for a new tab.
-        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96, 30);
-        assert!(layout.max_scroll > 0);
-        assert!(layout.tab(1).left - layout.tab(0).left >= 120);
-        assert!(layout.tabs.right < layout.overflow.left);
-        assert!(layout.drag_region.left < layout.drag_region.right);
-        assert_eq!(
-            layout.hit_test(layout.drag_region.center()),
-            HitTarget::Caption
-        );
-        assert_eq!(layout.hit_test(layout.tab(29).center()), HitTarget::Client);
-
-        let reveal = layout.scroll_to_reveal(29);
-        assert_eq!(reveal, layout.max_scroll);
-        let scrolled = TitleBarLayout::calculate_scrolled(Size::new(1200, 800), 96, 30, reveal);
-        assert!(scrolled.tab(29).right <= scrolled.tabs.right);
-        assert_eq!(
-            scrolled.hit_test(scrolled.tab(29).center()),
-            HitTarget::Tab(29)
-        );
-        assert_eq!(scrolled.scroll_to_reveal(0), 0);
-
-        let bar = layout
-            .scroll_bar
-            .expect("overflowing tabs get a scroll bar");
-        let thumb = layout.scroll_thumb().unwrap();
-        assert_eq!(layout.hit_test(thumb.center()), HitTarget::ScrollBar);
-        assert_eq!(layout.scroll_for_thumb(bar.left - 50), 0);
-        assert_eq!(layout.scroll_for_thumb(bar.right), layout.max_scroll);
-        let dragged = TitleBarLayout::calculate_scrolled(
-            Size::new(1200, 800),
-            96,
-            30,
-            layout.scroll_for_thumb(bar.right),
-        );
-        assert_eq!(dragged.scroll_thumb().unwrap().right, bar.right);
-        assert_eq!(scrolled.scroll_by_wheel(-120_000, 120), 0);
-        assert_eq!(
-            TitleBarLayout::calculate_scrolled(Size::new(1200, 800), 96, 2, 500).scroll,
-            0,
-            "tabs that fit never stay scrolled"
-        );
-    }
-
-    #[test]
-    fn no_tabs_leaves_the_whole_strip_empty() {
-        let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96, 0);
-        assert_eq!(layout.drag_region.left, 0);
-        assert_eq!(layout.max_scroll, 0);
-        assert_eq!(layout.scroll_bar, None);
-        assert_eq!(
-            layout.hit_test(super::Point::new(10, layout.height / 2)),
-            HitTarget::Caption
-        );
-    }
-
-    #[test]
-    fn preview_buttons_leave_the_layout_unchanged_when_absent() {
-        let client = Size::new(1200, 800);
-        assert_eq!(
-            TitleBarLayout::calculate_scrolled(client, 96, 3, 0),
-            TitleBarLayout::calculate_with_preview(client, 96, 3, 0, false)
-        );
-        assert!(
-            TitleBarLayout::calculate_scrolled(client, 96, 3, 0)
-                .preview_side
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn preview_buttons_sit_left_of_the_overflow_button_without_overlap() {
-        let layout = TitleBarLayout::calculate_with_preview(Size::new(1200, 800), 144, 20, 0, true);
-        let side = layout.preview_side.unwrap();
-        let full = layout.preview_full.unwrap();
-        assert_eq!(side.right, full.left);
-        assert_eq!(full.right, layout.overflow.left);
-        assert!(layout.tabs.right <= side.left);
-        assert_eq!(layout.drag_region.right, side.left);
-        assert_eq!(layout.hit_test(side.center()), HitTarget::PreviewSide);
-        assert_eq!(layout.hit_test(full.center()), HitTarget::PreviewFull);
-        let without =
-            TitleBarLayout::calculate_with_preview(Size::new(1200, 800), 144, 20, 0, false);
-        assert!(layout.tabs.right < without.tabs.right);
     }
 }

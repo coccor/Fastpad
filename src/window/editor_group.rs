@@ -1,7 +1,8 @@
-//! An editor group: the child window that holds a group's editor, find bar, Markdown/SVG preview
-//! and image view (split editors spec §4.2). Its children's notifications go on to the main
-//! window unchanged, so they are handled as if the children were the main window's own. The
-//! main window lays the group out; the group lays out its children in its own client area.
+//! An editor group: the child window that holds a group's tab strip, editor, find bar,
+//! Markdown/SVG preview and image view (split editors spec §4.2). Its children's notifications go
+//! on to the main window unchanged, so they are handled as if the children were the main window's
+//! own. The main window lays the group out; the group lays out its children in its own client
+//! area and paints the strip.
 
 use crate::platform::wide_null;
 use windows_sys::Win32::Foundation::{
@@ -9,17 +10,43 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, DefWindowProcW, IDC_ARROW, IDC_SIZEWE, LoadCursorW, RegisterClassW, SendMessageW,
-    SetCursor, WM_CAPTURECHANGED, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CS_DBLCLKS, DefWindowProcW, IDC_ARROW, IDC_SIZEWE, LoadCursorW, OBJID_CLIENT, RegisterClassW,
+    SendMessageW, SetCursor, WM_CAPTURECHANGED, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_VISIBLE,
 };
 
-/// The window of one editor group. PR 1 of the split editors work has exactly one.
+/// The window of one editor group and its tab strip's pointer state. PR 1 of the split editors
+/// work has exactly one.
 #[derive(Debug)]
 pub(crate) struct GroupWindow {
     pub(crate) hwnd: HWND,
+    pub(crate) pointer: super::group_strip::StripPointer,
+    /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
+    pub(crate) thumb_grab: Option<i32>,
+    /// Between a middle-button press on a tab and its release: the tab's strip index and the
+    /// document it showed then (quick-open spec §5).
+    pub(crate) middle_press: Option<(usize, crate::document::DocumentId)>,
+    /// The last tab click (its document and message time), so a second click on the same tab
+    /// within the double-click time keeps a preview tab.
+    pub(crate) last_tab_click: Option<(crate::document::DocumentId, u32)>,
+    /// The tab strip's accessibility provider, created on the first `WM_GETOBJECT`.
+    pub(crate) accessibility: super::accessibility::AccessibilityState,
+}
+
+impl GroupWindow {
+    pub(crate) fn new(hwnd: HWND) -> Self {
+        Self {
+            hwnd,
+            pointer: Default::default(),
+            thumb_grab: None,
+            middle_press: None,
+            last_tab_click: None,
+            accessibility: Default::default(),
+        }
+    }
 }
 
 /// Creates the group window under `main`. It is empty until the editor and its companions are
@@ -73,8 +100,20 @@ unsafe extern "system" fn group_proc(
     match message {
         // Scintilla's notifications and the controls' commands and colors are the main window's
         // to handle, exactly as before the editor moved into the group.
-        WM_NOTIFY | WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
-        | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe { SendMessageW(main, message, wparam, lparam) },
+        // The strip's accessible selection goes to the main window too, which activates the tab.
+        WM_NOTIFY
+        | WM_COMMAND
+        | WM_CTLCOLOREDIT
+        | WM_CTLCOLORSTATIC
+        | WM_CTLCOLORBTN
+        | WM_CTLCOLORLISTBOX
+        | WM_DRAWITEM
+        | super::accessibility::WM_FASTPAD_ACCESSIBLE_SELECT => unsafe {
+            SendMessageW(main, message, wparam, lparam)
+        },
+        WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => {
+            super::main_window::group_accessible_object(main, hwnd, wparam)
+        }
         WM_SIZE => {
             super::main_window::layout_group(main, hwnd);
             0
@@ -88,27 +127,27 @@ unsafe extern "system" fn group_proc(
             super::main_window::paint_group(main, hwnd);
             0
         }
-        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            let (x, y) = point(lparam);
-            super::preview_host::begin_divider_drag(main, hwnd, x, y);
+        // The preview divider takes a press first; everything else is the tab strip's.
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK
+            if {
+                let (x, y) = point(lparam);
+                super::preview_host::begin_divider_drag(main, hwnd, x, y)
+            } =>
+        {
             0
         }
-        WM_MOUSEMOVE => {
-            super::preview_host::drag_divider(main, point(lparam).0);
-            0
-        }
-        WM_LBUTTONUP => {
-            super::preview_host::end_divider_drag(main);
-            0
-        }
+        WM_MOUSEMOVE if super::preview_host::drag_divider(main, point(lparam).0) => 0,
+        WM_LBUTTONUP if super::preview_host::end_divider_drag(main) => 0,
         WM_CAPTURECHANGED => {
             super::preview_host::cancel_divider_drag(main);
+            super::main_window::group_strip_message(main, hwnd, message, wparam, lparam);
             0
         }
         WM_SETCURSOR if super::preview_host::cursor_over_divider(main, hwnd) => {
             unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_SIZEWE)) };
             1
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        _ => super::main_window::group_strip_message(main, hwnd, message, wparam, lparam)
+            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
     }
 }

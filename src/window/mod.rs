@@ -9,6 +9,7 @@ pub(crate) mod editor_group;
 pub(crate) mod favorites_view;
 pub(crate) mod file_icons;
 pub mod find_bar;
+pub mod group_strip;
 pub(crate) mod icon_sets;
 pub(crate) mod image_host;
 pub(crate) mod inline_name;

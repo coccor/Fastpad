@@ -185,7 +185,7 @@ fn side_full_and_pressed_full_move_through_split_full_and_off() {
     main.make_markdown("# Title\n\nBody\n");
     assert!(window::preview_host::buttons_visible(main.hwnd));
 
-    window::preview_host::click_button(main.hwnd, window::titlebar::HitTarget::PreviewSide);
+    window::preview_host::click_button(main.hwnd, window::group_strip::StripTarget::PreviewSide);
     assert_eq!(main.mode(), PreviewMode::Split);
     let view = main.view().expect("preview window");
     assert!(visible(view.hwnd()) && visible(main.editor));
@@ -193,12 +193,12 @@ fn side_full_and_pressed_full_move_through_split_full_and_off() {
         view.stats().block_count == 2
     });
 
-    window::preview_host::click_button(main.hwnd, window::titlebar::HitTarget::PreviewFull);
+    window::preview_host::click_button(main.hwnd, window::group_strip::StripTarget::PreviewFull);
     assert_eq!(main.mode(), PreviewMode::Full);
     assert!(!visible(main.editor));
     assert_eq!(unsafe { GetFocus() }, view.hwnd());
 
-    window::preview_host::click_button(main.hwnd, window::titlebar::HitTarget::PreviewFull);
+    window::preview_host::click_button(main.hwnd, window::group_strip::StripTarget::PreviewFull);
     assert_eq!(main.mode(), PreviewMode::Off);
     assert!(main.view().is_none());
     assert!(visible(main.editor));

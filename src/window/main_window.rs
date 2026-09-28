@@ -34,20 +34,20 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE,
-    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HICON, HTCAPTION, IMAGE_ICON,
-    IsWindow, IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadIconW, LoadImageW,
-    MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE,
-    SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_ACTIVATEAPP,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT,
-    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HICON, IMAGE_ICON, IsWindow,
+    IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MoveWindow,
+    OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE,
+    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED,
+    WM_DRAWITEM, WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
+    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -303,8 +303,7 @@ unsafe extern "system" fn main_window_proc(
         WM_PAINT => {
             sync_window_title(hwnd);
             let paint_title_strip = |hwnd, _, _, _| {
-                let (titles, active, scroll, _, preview_tab) = tab_snapshot(hwnd);
-                let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
+                let title = active_window_title(hwnd);
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
                 let headings = menu_headings(hwnd);
@@ -312,17 +311,12 @@ unsafe extern "system" fn main_window_proc(
                     crate::window::titlebar::paint(
                         hwnd,
                         &crate::window::titlebar::TitlePaint {
-                            titles: &title_refs,
-                            active,
-                            preview_tab,
-                            scroll,
+                            title: &title,
                             status: status.as_ref(),
                             palette,
                             fonts,
                             pointer,
                             menu: menu_mode(hwnd).map(|mode| (mode, headings.as_slice())),
-                            preview: preview_buttons_visible(hwnd)
-                                .then(|| crate::window::preview_host::mode(hwnd)),
                         },
                     )
                 };
@@ -343,14 +337,7 @@ unsafe extern "system" fn main_window_proc(
             }
         }
         WM_NCHITTEST => unsafe {
-            crate::window::titlebar::nonclient_hit_test(
-                hwnd,
-                wparam,
-                lparam,
-                tab_count(hwnd),
-                tab_scroll(hwnd),
-                preview_buttons_visible(hwnd),
-            )
+            crate::window::titlebar::nonclient_hit_test(hwnd, wparam, lparam)
         },
         WM_NCCALCSIZE => unsafe { crate::window::titlebar::reclaim_caption(hwnd, wparam, lparam) },
         WM_GETMINMAXINFO => unsafe {
@@ -358,20 +345,13 @@ unsafe extern "system" fn main_window_proc(
         },
         WM_MOUSEMOVE => {
             hover_menu_heading(hwnd, lparam);
-            drag_tab_thumb(hwnd, lparam);
             crate::window::titlebar::track_pointer_leave(hwnd, false);
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target));
-            crate::window::preview_host::button_hover(hwnd, target);
             0
         }
         WM_MOUSELEAVE => {
             update_title_pointer(hwnd, |pointer| pointer.leave(false));
-            crate::window::preview_host::button_hover(hwnd, None);
-            // A middle press whose release never reaches the strip must not close a tab later.
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                unsafe { app.as_mut() }.middle_press = None;
-            }
             0
         }
         WM_NCMOUSEMOVE => {
@@ -384,7 +364,6 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_NCMOUSELEAVE => {
             update_title_pointer(hwnd, |pointer| pointer.leave(true));
-            crate::window::preview_host::button_hover(hwnd, None);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_LBUTTONDOWN => {
@@ -403,52 +382,7 @@ unsafe extern "system" fn main_window_proc(
             }
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target).press(target));
-            if target == Some(HitTarget::ScrollBar) {
-                begin_tab_thumb_drag(hwnd, (lparam as u32 & 0xffff) as u16 as i16 as i32);
-            }
             0
-        }
-        WM_CAPTURECHANGED => {
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                unsafe { app.as_mut() }.tab_thumb_grab = None;
-            }
-            0
-        }
-        // The empty tab-strip space is the only caption: double-clicking it opens a tab, VSCode
-        // style, instead of maximizing. Over the sidebar's top strip it maximizes as usual.
-        WM_NCLBUTTONDBLCLK if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => {
-            execute_command(hwnd, CommandId::New);
-            0
-        }
-        // Its context menu replaces the system menu; Alt+Space still opens that.
-        WM_NCRBUTTONDOWN if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => 0,
-        WM_NCRBUTTONUP if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => {
-            let mut point = windows_sys::Win32::Foundation::POINT {
-                x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
-                y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
-            };
-            unsafe {
-                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
-            }
-            let has_tabs = tab_count(hwnd) > 0;
-            if let Some(command) = menus::show_tab_strip_menu(hwnd, point.x, point.y, has_tabs) {
-                execute_command(hwnd, command);
-            }
-            0
-        }
-        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-            let delta = i32::from((wparam >> 16) as u16 as i16);
-            // Wheel up scrolls toward the first tab; a tilt to the right toward the last.
-            let delta = if message == WM_MOUSEWHEEL {
-                -delta
-            } else {
-                delta
-            };
-            if scroll_tabs(hwnd, lparam, delta) {
-                0
-            } else {
-                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-            }
         }
         // DefWindowProc would run its own classic caption-button tracking loop over our strip.
         WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK
@@ -473,9 +407,6 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_LBUTTONUP => {
             update_title_pointer(hwnd, |pointer| pointer.release(None).0);
-            if end_tab_thumb_drag(hwnd) {
-                return 0;
-            }
             let point = crate::window::titlebar::Point::new(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
@@ -485,59 +416,10 @@ unsafe extern "system" fn main_window_proc(
                 return 0;
             }
             let layout = title_layout(hwnd);
-            match layout.hit_test(point) {
-                crate::window::titlebar::HitTarget::Overflow => {
-                    if let Some(command) = menus::show_overflow(hwnd, point.x, layout.height) {
-                        execute_command(hwnd, command);
-                    }
-                }
-                crate::window::titlebar::HitTarget::CloseTab(index) => {
-                    activate_tab(hwnd, index);
-                    execute_command(hwnd, CommandId::CloseTab);
-                }
-                crate::window::titlebar::HitTarget::Tab(index) => {
-                    activate_tab(hwnd, index);
-                    if tab_double_click(hwnd, index)
-                        && let Some(id) = unsafe { app_ptr(hwnd) }
-                            .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
-                    {
-                        promote_tab(hwnd, id);
-                    }
-                }
-                target @ (crate::window::titlebar::HitTarget::PreviewSide
-                | crate::window::titlebar::HitTarget::PreviewFull) => {
-                    crate::window::preview_host::click_button(hwnd, target)
-                }
-                _ => {}
-            }
-            0
-        }
-        // A middle-click closes the tab under the pointer (quick-open spec §5). Tabs answer
-        // HTCLIENT, so the button arrives here; the caption and the logo square are nonclient
-        // and keep the system's behavior.
-        WM_MBUTTONDOWN => {
-            let press = match client_title_target(hwnd, lparam) {
-                Some(HitTarget::Tab(index) | HitTarget::CloseTab(index)) => {
-                    tab_id_at(hwnd, index).map(|id| (index, id))
-                }
-                _ => None,
-            };
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                unsafe { app.as_mut() }.middle_press = press;
-            }
-            0
-        }
-        WM_MBUTTONUP => {
-            let press = unsafe { app_ptr(hwnd) }
-                .and_then(|mut app| unsafe { app.as_mut() }.middle_press.take());
-            // Only over the pressed tab, and only while it still shows the same document.
-            if let Some((index, id)) = press
-                && let Some(HitTarget::Tab(released) | HitTarget::CloseTab(released)) =
-                    client_title_target(hwnd, lparam)
-                && released == index
-                && tab_id_at(hwnd, index) == Some(id)
+            if layout.hit_test(point) == HitTarget::Overflow
+                && let Some(command) = menus::show_overflow(hwnd, point.x, layout.height)
             {
-                close_tab_at(hwnd, index);
+                execute_command(hwnd, command);
             }
             0
         }
@@ -1008,7 +890,7 @@ where
     // §4.2), which the main window lays out.
     let group = crate::window::editor_group::create(hwnd)?;
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_mut() }.group = Some(crate::window::editor_group::GroupWindow { hwnd: group });
+        unsafe { app.as_mut() }.group = Some(crate::window::editor_group::GroupWindow::new(group));
     }
     let editor = create_editor(group)?.with_document_host(&host);
     let editor_hwnd = editor.hwnd();
@@ -1126,10 +1008,6 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     crate::window::side_panel::layout(hwnd, rect, dpi);
     let left = crate::window::side_panel::left_edge(hwnd);
-    // The accessibility provider locates the tabs from this, never from the App.
-    if let Some(app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_ref() }.tabs.set_strip_left(left);
-    }
     layout_command_palette(hwnd);
     let Some(group) = group_hwnd(hwnd) else {
         return;
@@ -1159,7 +1037,10 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
 /// The editor group's window, once the editor exists.
 pub(crate) fn group_hwnd(hwnd: HWND) -> Option<HWND> {
     let app = unsafe { app_ptr(hwnd) }?;
-    unsafe { app.as_ref() }.group.as_ref().map(|group| group.hwnd)
+    unsafe { app.as_ref() }
+        .group
+        .as_ref()
+        .map(|group| group.hwnd)
 }
 
 /// The window the content area's children go into: the editor group, or the main window before
@@ -1168,7 +1049,8 @@ pub(crate) fn content_parent(hwnd: HWND) -> HWND {
     group_hwnd(hwnd).unwrap_or(hwnd)
 }
 
-/// Lays out the find bar, then the preview and the editor below it, in `group`'s client area.
+/// Lays out the tab strip, the find bar, then the preview and the editor below them, in `group`'s
+/// client area.
 pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
         return;
@@ -1180,18 +1062,20 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
     let font = title_chrome(hwnd).1.text();
     let width = client.right;
+    let strip_height = crate::window::group_strip::strip_height(dpi);
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
-            bar.layout(0, width, 0, dpi, font);
+            bar.layout(0, width, strip_height, dpi, font);
             bar.is_visible().then(|| find_bar::find_bar_height(dpi))
         })
         .unwrap_or(0);
+    let top = strip_height + find_bar_height;
     let area = RECT {
         left: 0,
-        top: find_bar_height,
+        top,
         right: width,
-        bottom: client.bottom.max(find_bar_height),
+        bottom: client.bottom.max(top),
     };
     let rects = crate::window::preview_host::layout(hwnd, area, dpi);
     crate::window::image_host::layout(hwnd, area);
@@ -1212,8 +1096,8 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     }
 }
 
-/// Paints what the group's children leave uncovered: the preview divider, and the empty hint
-/// while no tab is open.
+/// Paints what the group's children leave uncovered: the tab strip, the preview divider, and the
+/// empty hint while no tab is open.
 pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
     let mut paint = windows_sys::Win32::Graphics::Gdi::PAINTSTRUCT::default();
     let dc = unsafe { windows_sys::Win32::Graphics::Gdi::BeginPaint(group, &mut paint) };
@@ -1225,6 +1109,31 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
     let mut client = RECT::default();
     unsafe {
         GetClientRect(group, &mut client);
+    }
+    if let Some(layout) = strip_layout(hwnd)
+        && paint.rcPaint.top < layout.height
+    {
+        let (titles, active, _, _, preview_tab) = tab_snapshot(hwnd);
+        let titles = titles.iter().map(String::as_str).collect::<Vec<_>>();
+        let pointer = with_group(hwnd, |group| group.pointer).unwrap_or_default();
+        unsafe {
+            crate::window::group_strip::paint(
+                dc,
+                &layout,
+                dpi,
+                &crate::window::group_strip::StripPaint {
+                    titles: &titles,
+                    active,
+                    preview_tab,
+                    palette,
+                    fonts,
+                    pointer,
+                    preview: preview_buttons_visible(hwnd)
+                        .then(|| crate::window::preview_host::mode(hwnd)),
+                },
+            );
+        }
+        client.top = layout.height;
     }
     if tab_count(hwnd) == 0 {
         unsafe {
@@ -2293,22 +2202,11 @@ pub(crate) fn tab_count(hwnd: HWND) -> usize {
         .unwrap_or(1)
 }
 
-fn tab_scroll(hwnd: HWND) -> i32 {
-    unsafe { app_ptr(hwnd) }
-        .map(|app| unsafe { app.as_ref() }.tabs.scroll_offset())
-        .unwrap_or(0)
-}
-
 pub(crate) fn title_layout(hwnd: HWND) -> TitleBarLayout {
-    crate::window::titlebar::layout_for_window(
-        hwnd,
-        tab_count(hwnd),
-        tab_scroll(hwnd),
-        preview_buttons_visible(hwnd),
-    )
+    crate::window::titlebar::layout_for_window(hwnd)
 }
 
-/// Whether the title strip shows the Markdown preview buttons (the active tab is Markdown).
+/// Whether the group strip shows the Markdown preview buttons (the active tab is Markdown).
 fn preview_buttons_visible(hwnd: HWND) -> bool {
     crate::window::preview_host::buttons_visible(hwnd)
 }
@@ -2323,21 +2221,23 @@ fn window_title(active_tab: Option<&str>) -> String {
     )
 }
 
+/// The window title for the active tab, as the title bar and the taskbar show it.
+fn active_window_title(hwnd: HWND) -> String {
+    window_title(
+        unsafe { app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.active().map(Document::title))
+            .as_deref(),
+    )
+}
+
 /// Brings the window text in line with the active tab. Runs on every frame paint, since every tab
 /// change (switch, open, close, save, dirty state) repaints the title strip.
 fn sync_window_title(hwnd: HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, SetWindowTextW};
-    let Some(title) = (unsafe { app_ptr(hwnd) }).map(|app| {
-        window_title(
-            unsafe { app.as_ref() }
-                .tabs
-                .active()
-                .map(Document::title)
-                .as_deref(),
-        )
-    }) else {
+    if unsafe { app_ptr(hwnd) }.is_none() {
         return;
-    };
+    }
+    let title = active_window_title(hwnd);
     let wanted = title.encode_utf16().collect::<Vec<_>>();
     // One spare unit so a longer current title never reads as equal after truncation.
     let mut current = vec![0u16; wanted.len() + 2];
@@ -2364,21 +2264,90 @@ fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool, Option<usize>) {
         .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false, None))
 }
 
-/// Scrolls the tabs when the wheel turns over the tab strip; reports whether it was over it.
-fn scroll_tabs(hwnd: HWND, lparam: LPARAM, delta: i32) -> bool {
+/// Runs `f` on the editor group's window state.
+pub(crate) fn with_group<R>(
+    hwnd: HWND,
+    f: impl FnOnce(&mut crate::window::editor_group::GroupWindow) -> R,
+) -> Option<R> {
+    let mut app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_mut() }.group.as_mut().map(f)
+}
+
+/// The group's tab strip as laid out now, the same one it paints and hit-tests with.
+pub(crate) fn strip_layout(hwnd: HWND) -> Option<crate::window::group_strip::StripLayout> {
+    let group = group_hwnd(hwnd)?;
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(group, &mut client);
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
+    let scroll = unsafe { app_ptr(hwnd) }
+        .map(|app| unsafe { app.as_ref() }.tabs.scroll_offset())
+        .unwrap_or(0);
+    Some(crate::window::group_strip::StripLayout::calculate(
+        client.right,
+        dpi,
+        tab_count(hwnd),
+        scroll,
+        preview_buttons_visible(hwnd),
+    ))
+}
+
+fn invalidate_group_strip(hwnd: HWND) {
+    let (Some(group), Some(layout)) = (group_hwnd(hwnd), strip_layout(hwnd)) else {
+        return;
+    };
+    let bounds = layout.bounds();
+    let rect = RECT {
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+    };
+    unsafe {
+        InvalidateRect(group, &rect, 0);
+    }
+}
+
+fn update_strip_pointer(
+    hwnd: HWND,
+    update: impl FnOnce(
+        crate::window::group_strip::StripPointer,
+    ) -> crate::window::group_strip::StripPointer,
+) {
+    let changed = with_group(hwnd, |group| {
+        let next = update(group.pointer);
+        let changed = next != group.pointer;
+        group.pointer = next;
+        changed
+    })
+    .unwrap_or(false);
+    if changed {
+        invalidate_group_strip(hwnd);
+    }
+}
+
+/// What the group-client point is over in the strip; `None` below it.
+fn strip_target(hwnd: HWND, x: i32, y: i32) -> Option<crate::window::group_strip::StripTarget> {
+    let layout = strip_layout(hwnd)?;
+    (y >= 0 && y < layout.height)
+        .then(|| layout.hit_test(crate::window::titlebar::Point::new(x, y)))
+}
+
+/// Scrolls the tabs when the wheel turns over the strip; reports whether it was over it. The
+/// point is in screen coordinates, as wheel messages carry it.
+fn scroll_tabs(hwnd: HWND, group: HWND, lparam: LPARAM, delta: i32) -> bool {
     let mut point = windows_sys::Win32::Foundation::POINT {
         x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
         y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
     };
     unsafe {
-        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point);
     }
-    let layout = title_layout(hwnd);
-    if point.y < 0
-        || point.y >= layout.height
-        || point.x < layout.tabs.left
-        || point.x >= layout.overflow.left
-    {
+    let Some(layout) = strip_layout(hwnd) else {
+        return false;
+    };
+    if point.y < 0 || point.y >= layout.height || point.x < 0 || point.x >= layout.tabs.right {
         return false;
     }
     let scroll = layout.scroll_by_wheel(delta, WHEEL_DELTA as i32);
@@ -2386,16 +2355,18 @@ fn scroll_tabs(hwnd: HWND, lparam: LPARAM, delta: i32) -> bool {
         .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll));
     if changed {
         // The hovered tab moved out from under the pointer; the next mouse move finds the new one.
-        update_title_pointer(hwnd, |pointer| pointer.hover(None));
-        crate::window::titlebar::invalidate_strip(hwnd);
+        update_strip_pointer(hwnd, |pointer| pointer.hover(None));
+        invalidate_group_strip(hwnd);
     }
     true
 }
 
 /// Starts dragging the tab scroll thumb. Pressing the track beside the thumb first jumps the
 /// thumb there, centred under the pointer, so the same press can keep dragging it.
-fn begin_tab_thumb_drag(hwnd: HWND, x: i32) {
-    let layout = title_layout(hwnd);
+fn begin_tab_thumb_drag(hwnd: HWND, group: HWND, x: i32) {
+    let Some(layout) = strip_layout(hwnd) else {
+        return;
+    };
     let Some(thumb) = layout.scroll_thumb() else {
         return;
     };
@@ -2410,34 +2381,34 @@ fn begin_tab_thumb_drag(hwnd: HWND, x: i32) {
         }
         grab
     };
-    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_mut() }.tab_thumb_grab = Some(grab);
-    }
+    with_group(hwnd, |state| state.thumb_grab = Some(grab));
     unsafe {
-        SetCapture(hwnd);
+        SetCapture(group);
     }
-    crate::window::titlebar::invalidate_strip(hwnd);
+    invalidate_group_strip(hwnd);
 }
 
-fn drag_tab_thumb(hwnd: HWND, lparam: LPARAM) {
-    let Some(grab) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tab_thumb_grab)
-    else {
-        return;
+/// Follows the pointer while the thumb is dragged; reports whether a drag is in progress.
+fn drag_tab_thumb(hwnd: HWND, x: i32) -> bool {
+    let Some(grab) = with_group(hwnd, |group| group.thumb_grab).flatten() else {
+        return false;
     };
-    let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-    let scroll = title_layout(hwnd).scroll_for_thumb(x - grab);
+    let Some(layout) = strip_layout(hwnd) else {
+        return true;
+    };
+    let scroll = layout.scroll_for_thumb(x - grab);
     if unsafe { app_ptr(hwnd) }
         .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll))
     {
-        crate::window::titlebar::invalidate_strip(hwnd);
+        invalidate_group_strip(hwnd);
     }
+    true
 }
 
 /// Ends a thumb drag; reports whether one was in progress, so the release activates nothing.
 fn end_tab_thumb_drag(hwnd: HWND) -> bool {
-    let dragging = unsafe { app_ptr(hwnd) }
-        .and_then(|mut app| unsafe { app.as_mut() }.tab_thumb_grab.take())
+    let dragging = with_group(hwnd, |group| group.thumb_grab.take())
+        .flatten()
         .is_some();
     if dragging {
         unsafe {
@@ -2445,6 +2416,170 @@ fn end_tab_thumb_drag(hwnd: HWND) -> bool {
         }
     }
     dragging
+}
+
+/// Opens the tab-strip menu at group-client `x`, `y`. The menu belongs to the main window, whose
+/// modal accounting holds deferred work while it is open.
+fn show_group_strip_menu(hwnd: HWND, group: HWND, x: i32, y: i32) {
+    let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut point, 1);
+    }
+    let has_tabs = tab_count(hwnd) > 0;
+    if let Some(command) = menus::show_tab_strip_menu(hwnd, point.x, point.y, has_tabs) {
+        execute_command(hwnd, command);
+    }
+}
+
+/// The tab strip's share of the group window's pointer messages (split editors spec §4.2): what
+/// the title bar used to do for the tabs. `None` leaves the message to the window's default.
+pub(crate) fn group_strip_message(
+    hwnd: HWND,
+    group: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    use crate::window::group_strip::StripTarget;
+    let (x, y) = (
+        (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    );
+    match message {
+        WM_MOUSEMOVE => {
+            if drag_tab_thumb(hwnd, x) {
+                return Some(0);
+            }
+            let mut track = windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT,
+                >() as u32,
+                dwFlags: windows_sys::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE,
+                hwndTrack: group,
+                dwHoverTime: 0,
+            };
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut track) };
+            let target = strip_target(hwnd, x, y);
+            update_strip_pointer(hwnd, |pointer| pointer.hover(target));
+            crate::window::preview_host::button_hover(hwnd, target);
+            Some(0)
+        }
+        WM_MOUSELEAVE => {
+            update_strip_pointer(hwnd, |pointer| pointer.hover(None));
+            crate::window::preview_host::button_hover(hwnd, None);
+            // A middle press whose release never reaches the strip must not close a tab later.
+            with_group(hwnd, |state| state.middle_press = None);
+            Some(0)
+        }
+        // The class has CS_DBLCLKS, so a second click comes as a double-click: on empty strip it
+        // opens a tab (VS Code style); anywhere else it is one more press.
+        WM_LBUTTONDBLCLK if strip_target(hwnd, x, y) == Some(StripTarget::Empty) => {
+            execute_command(hwnd, CommandId::New);
+            Some(0)
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let target = strip_target(hwnd, x, y)?;
+            update_strip_pointer(hwnd, |pointer| {
+                pointer.hover(Some(target)).press(Some(target))
+            });
+            if target == StripTarget::ScrollBar {
+                begin_tab_thumb_drag(hwnd, group, x);
+            }
+            Some(0)
+        }
+        WM_LBUTTONUP => {
+            update_strip_pointer(hwnd, |pointer| pointer.release(None).0);
+            if end_tab_thumb_drag(hwnd) {
+                return Some(0);
+            }
+            match strip_target(hwnd, x, y)? {
+                StripTarget::CloseTab(index) => {
+                    activate_tab(hwnd, index);
+                    execute_command(hwnd, CommandId::CloseTab);
+                }
+                StripTarget::Tab(index) => {
+                    activate_tab(hwnd, index);
+                    if tab_double_click(hwnd, index)
+                        && let Some(id) = unsafe { app_ptr(hwnd) }
+                            .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+                    {
+                        promote_tab(hwnd, id);
+                    }
+                }
+                target @ (StripTarget::PreviewSide | StripTarget::PreviewFull) => {
+                    crate::window::preview_host::click_button(hwnd, target)
+                }
+                StripTarget::More => {
+                    let bottom = strip_layout(hwnd).map_or(y, |layout| layout.height);
+                    show_group_strip_menu(hwnd, group, x, bottom);
+                }
+                StripTarget::ScrollBar | StripTarget::Empty => {}
+            }
+            Some(0)
+        }
+        WM_RBUTTONUP if strip_target(hwnd, x, y) == Some(StripTarget::Empty) => {
+            show_group_strip_menu(hwnd, group, x, y);
+            Some(0)
+        }
+        // A middle-click closes the tab under the pointer (quick-open spec §5).
+        WM_MBUTTONDOWN => {
+            let press = match strip_target(hwnd, x, y) {
+                Some(StripTarget::Tab(index) | StripTarget::CloseTab(index)) => {
+                    tab_id_at(hwnd, index).map(|id| (index, id))
+                }
+                _ => None,
+            };
+            with_group(hwnd, |state| state.middle_press = press);
+            Some(0)
+        }
+        WM_MBUTTONUP => {
+            let press = with_group(hwnd, |state| state.middle_press.take()).flatten();
+            // Only over the pressed tab, and only while it still shows the same document.
+            if let Some((index, id)) = press
+                && let Some(StripTarget::Tab(released) | StripTarget::CloseTab(released)) =
+                    strip_target(hwnd, x, y)
+                && released == index
+                && tab_id_at(hwnd, index) == Some(id)
+            {
+                close_tab_at(hwnd, index);
+            }
+            Some(0)
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let delta = i32::from((wparam >> 16) as u16 as i16);
+            // Wheel up scrolls toward the first tab; a tilt to the right toward the last.
+            let delta = if message == WM_MOUSEWHEEL {
+                -delta
+            } else {
+                delta
+            };
+            scroll_tabs(hwnd, group, lparam, delta).then_some(0)
+        }
+        WM_CAPTURECHANGED => {
+            with_group(hwnd, |state| state.thumb_grab = None);
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// The tab strip's accessible object, for the group window's `WM_GETOBJECT`.
+pub(crate) fn group_accessible_object(hwnd: HWND, group: HWND, wparam: WPARAM) -> LRESULT {
+    let provider = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let (view, selection) = (app.tabs.view(), app.tabs.selection());
+        let state = app.group.as_mut()?;
+        Some(state.accessibility.ensure(
+            group,
+            crate::window::accessibility::ProviderKind::GroupStrip,
+            view,
+            selection,
+        ))
+    });
+    match provider {
+        Some(provider) => unsafe { crate::window::accessibility::object_result(provider, wparam) },
+        None => 0,
+    }
 }
 
 /// Follows every change to the set of tabs or the active one: scrolls the active tab into view,
@@ -2463,7 +2598,7 @@ fn refresh_tabs(hwnd: HWND) {
     let scroll = if count == 0 {
         0
     } else {
-        title_layout(hwnd).scroll_to_reveal(active)
+        strip_layout(hwnd).map_or(0, |layout| layout.scroll_to_reveal(active))
     };
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll);
@@ -3309,18 +3444,6 @@ fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
         })
 }
 
-/// Whether the screen point in a non-client mouse message's `lparam` is over the sidebar.
-fn over_sidebar(hwnd: HWND, lparam: LPARAM) -> bool {
-    let mut point = windows_sys::Win32::Foundation::POINT {
-        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
-        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
-    };
-    unsafe {
-        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
-    }
-    point.x < crate::window::side_panel::left_edge(hwnd)
-}
-
 fn client_title_target(hwnd: HWND, lparam: LPARAM) -> Option<HitTarget> {
     let point = crate::window::titlebar::Point::new(
         (lparam as u32 & 0xffff) as u16 as i16 as i32,
@@ -3984,18 +4107,17 @@ fn tab_double_click(hwnd: HWND, index: usize) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
     let now = unsafe { GetMessageTime() } as u32;
     let limit = unsafe { GetDoubleClickTime() };
-    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+    let Some(id) = tab_id_at(hwnd, index) else {
         return false;
     };
-    let app = unsafe { app.as_mut() };
-    let Some(id) = app.tabs.view().snapshot().tabs.get(index).map(|tab| tab.id) else {
-        return false;
-    };
-    let double = app
-        .last_tab_click
-        .is_some_and(|(last, at)| last == id && now.wrapping_sub(at) <= limit);
-    app.last_tab_click = if double { None } else { Some((id, now)) };
-    double
+    with_group(hwnd, |group| {
+        let double = group
+            .last_tab_click
+            .is_some_and(|(last, at)| last == id && now.wrapping_sub(at) <= limit);
+        group.last_tab_click = if double { None } else { Some((id, now)) };
+        double
+    })
+    .unwrap_or(false)
 }
 
 pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
@@ -5937,6 +6059,11 @@ pub(crate) fn invalidate_title_strip(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+    if let Some(group) = group_hwnd(hwnd) {
+        unsafe {
+            InvalidateRect(group, std::ptr::null(), 0);
+        }
+    }
     // The Open Editors rows show what the strip does.
     crate::window::notebook_view::editors_changed(hwnd);
 }
@@ -6568,7 +6695,7 @@ mod tests {
         // hidden editor still taking edits, or the empty strip's double-click and context menu
         // not reaching New and Close all tabs.
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GWL_STYLE, GetWindowLongPtrW, HTCAPTION, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP, WS_VISIBLE,
+            GWL_STYLE, GetWindowLongPtrW, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WS_VISIBLE,
         };
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
@@ -6585,21 +6712,21 @@ mod tests {
         execute_command(window.hwnd, CommandId::CloseTab);
         assert_eq!(editor.text().unwrap(), "");
 
-        // The empty strip right of the sidebar; over the sidebar the caption maximizes instead.
-        let drag = super::title_layout(window.hwnd).drag_region.center();
-        let strip = screen_lparam(window.hwnd, drag.x, drag.y);
+        // A double-click on the group's empty strip opens a tab; the caption maximizes instead.
+        // The far end of the tab viewport stays empty while two tabs fit.
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let layout = super::strip_layout(window.hwnd).unwrap();
+        let strip = client_lparam(layout.tabs.right - 10, layout.height / 2);
         unsafe {
-            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, strip);
-            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, strip);
+            SendMessageW(group, WM_LBUTTONDBLCLK, 1, strip);
+            SendMessageW(group, WM_LBUTTONDBLCLK, 1, strip);
         }
         assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
         assert!(editor_visible());
 
         answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
-        let drag = super::title_layout(window.hwnd).drag_region.center();
-        let strip = screen_lparam(window.hwnd, drag.x, drag.y);
         unsafe {
-            SendMessageW(window.hwnd, WM_NCRBUTTONUP, HTCAPTION as usize, strip);
+            SendMessageW(group, WM_RBUTTONUP, 0, strip);
         }
         assert!(app_mut(window.hwnd).tabs.is_empty());
         assert!(!editor_visible());
@@ -6731,11 +6858,7 @@ mod tests {
         assert_eq!(unsafe { GetParent(group) }, window.hwnd);
         assert_eq!(unsafe { GetParent(editor.hwnd()) }, group);
         execute_command(window.hwnd, CommandId::Find);
-        let panel = app_mut(window.hwnd)
-            .find_bar
-            .as_ref()
-            .unwrap()
-            .panel_hwnd();
+        let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
         assert_eq!(unsafe { GetParent(panel) }, group);
         let (width, height) = client_size(window.hwnd);
         let (group_width, group_height) = client_size(group);
@@ -6755,11 +6878,7 @@ mod tests {
         editor.set_text("xyz abc abc").unwrap();
         editor.set_selection(0..0).unwrap();
         execute_command(window.hwnd, CommandId::Find);
-        let query = app_mut(window.hwnd)
-            .find_bar
-            .as_ref()
-            .unwrap()
-            .query_hwnd();
+        let query = app_mut(window.hwnd).find_bar.as_ref().unwrap().query_hwnd();
         let text = crate::platform::wide_null("abc");
         unsafe { SetWindowTextW(query, text.as_ptr()) };
         editor.set_selection(0..0).unwrap();
@@ -6782,6 +6901,75 @@ mod tests {
         assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
         unsafe { SendMessageW(editor.hwnd(), WM_CHAR, usize::from(b'x'), 0) };
         assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn clicking_a_tab_in_the_group_strip_activates_it() {
+        // Break caught: strip input still handled by the main window, so clicks on the strip that
+        // moved into the group do nothing.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let tab = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(0)
+            .unwrap();
+        let point = client_lparam(tab.left + 10, tab.bottom / 2);
+        unsafe {
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+    }
+
+    #[test]
+    fn double_clicking_the_empty_strip_opens_a_tab_and_the_title_bar_does_not() {
+        // Break caught: New still bound to the title bar's double-click, which must now maximize
+        // like any caption, or the strip's empty space no longer opening a tab.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HTCAPTION, WM_LBUTTONDBLCLK, WM_NCLBUTTONDBLCLK,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let caption = super::title_layout(window.hwnd).drag_region.center();
+        unsafe {
+            SendMessageW(
+                window.hwnd,
+                WM_NCLBUTTONDBLCLK,
+                HTCAPTION as usize,
+                screen_lparam(window.hwnd, caption.x, caption.y),
+            )
+        };
+        assert_eq!(super::tab_count(window.hwnd), 1);
+
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let layout = super::strip_layout(window.hwnd).unwrap();
+        let after = layout.tab(0).unwrap().right + 20;
+        unsafe {
+            SendMessageW(
+                group,
+                WM_LBUTTONDBLCLK,
+                1,
+                client_lparam(after, layout.height / 2),
+            )
+        };
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    #[test]
+    fn the_title_bar_shows_the_window_title() {
+        // Break caught: the title bar left blank once the tabs moved out of it.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("changed").unwrap();
+        // Notes mode titles an untitled tab from its first line.
+        assert_eq!(super::active_window_title(window.hwnd), "changed * - FastPad");
     }
 
     #[test]
@@ -6994,9 +7182,7 @@ mod tests {
         // Break caught (review focus 3): a middle-click switching to the tab it closes, closing
         // the active tab instead, a press on one tab and a release on another closing either, a
         // release with no press closing anything, or a press kept after the pointer left.
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            HTCLIENT, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_NCHITTEST,
-        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDOWN, WM_MBUTTONUP};
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
@@ -7012,24 +7198,18 @@ mod tests {
         let &[first, second, third] = &ids()[..] else {
             panic!("three tabs")
         };
-        let center = |index: usize| super::title_layout(window.hwnd).tab(index).center();
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let center = |index: usize| {
+            super::strip_layout(window.hwnd)
+                .unwrap()
+                .tab(index)
+                .unwrap()
+                .center()
+        };
         let send = |message: u32, index: usize| {
             let point = center(index);
-            unsafe { SendMessageW(window.hwnd, message, 0, client_lparam(point.x, point.y)) };
+            unsafe { SendMessageW(group, message, 0, client_lparam(point.x, point.y)) };
         };
-        // Tabs answer HTCLIENT, so the middle button arrives as client WM_MBUTTON* (spec §5).
-        let tab = center(0);
-        assert_eq!(
-            unsafe {
-                SendMessageW(
-                    window.hwnd,
-                    WM_NCHITTEST,
-                    0,
-                    screen_lparam(window.hwnd, tab.x, tab.y),
-                )
-            },
-            HTCLIENT as isize
-        );
 
         send(WM_MBUTTONDOWN, 0);
         send(WM_MBUTTONUP, 1);
@@ -7037,14 +7217,7 @@ mod tests {
         send(WM_MBUTTONUP, 0);
         assert_eq!(ids(), [first, second, third], "a release with no press");
         send(WM_MBUTTONDOWN, 0);
-        unsafe {
-            SendMessageW(
-                window.hwnd,
-                windows_sys::Win32::UI::Controls::WM_MOUSELEAVE,
-                0,
-                0,
-            )
-        };
+        unsafe { SendMessageW(group, windows_sys::Win32::UI::Controls::WM_MOUSELEAVE, 0, 0) };
         send(WM_MBUTTONUP, 0);
         assert_eq!(ids(), [first, second, third], "the pointer left in between");
 
@@ -7078,21 +7251,16 @@ mod tests {
             seen.set(true);
             CloseDecision::Cancel
         });
-        let center = super::title_layout(window.hwnd).tab(0).center();
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let center = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
 
         unsafe {
-            SendMessageW(
-                window.hwnd,
-                WM_MBUTTONDOWN,
-                0,
-                client_lparam(center.x, center.y),
-            );
-            SendMessageW(
-                window.hwnd,
-                WM_MBUTTONUP,
-                0,
-                client_lparam(center.x, center.y),
-            );
+            SendMessageW(group, WM_MBUTTONDOWN, 0, client_lparam(center.x, center.y));
+            SendMessageW(group, WM_MBUTTONUP, 0, client_lparam(center.x, center.y));
         }
 
         assert!(asked.get(), "no prompt");
@@ -7508,7 +7676,9 @@ mod tests {
             )
         };
         let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
-        let title_height = super::title_layout(window.hwnd).height;
+        // The editor group's tab strip sits between the title strip and the editor.
+        let title_height = super::title_layout(window.hwnd).height
+            + crate::window::group_strip::strip_height(dpi);
         let band = super::menu_band::band_height(dpi);
 
         key_menu(0);
@@ -7592,7 +7762,9 @@ mod tests {
             (unsafe { GetWindowLongPtrW(child, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
         };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
-        let title_height = super::title_layout(window.hwnd).height;
+        // The editor group's tab strip sits between the title strip and the editor.
+        let title_height = super::title_layout(window.hwnd).height
+            + crate::window::group_strip::strip_height(dpi);
 
         execute_command(window.hwnd, CommandId::Find);
         let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
@@ -7938,7 +8110,9 @@ mod tests {
             execute_command(window.hwnd, CommandId::New);
         }
         super::activate_tab(window.hwnd, 0);
-        let layout = super::title_layout(window.hwnd);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let scroll = || app_mut(window.hwnd).tabs.scroll_offset();
+        let layout = super::strip_layout(window.hwnd).unwrap();
         assert_eq!(layout.scroll, 0);
         let thumb = layout.scroll_thumb().expect("40 tabs overflow the strip");
         let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
@@ -7946,28 +8120,31 @@ mod tests {
         let far_right = layout.tabs.right + 500;
 
         unsafe {
-            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, pack(thumb.center().x, y));
-            SendMessageW(window.hwnd, WM_MOUSEMOVE, 1, pack(far_right, y));
+            SendMessageW(group, WM_LBUTTONDOWN, 1, pack(thumb.center().x, y));
+            SendMessageW(group, WM_MOUSEMOVE, 1, pack(far_right, y));
         }
-        assert_eq!(super::tab_scroll(window.hwnd), layout.max_scroll);
+        assert_eq!(scroll(), layout.max_scroll);
         unsafe {
-            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, pack(far_right, y));
-            SendMessageW(window.hwnd, WM_MOUSEMOVE, 0, pack(layout.tabs.left, y));
+            SendMessageW(group, WM_LBUTTONUP, 0, pack(far_right, y));
+            SendMessageW(group, WM_MOUSEMOVE, 0, pack(layout.tabs.left, y));
         }
         assert_eq!(
-            super::tab_scroll(window.hwnd),
+            scroll(),
             layout.max_scroll,
             "moving after the release must not keep dragging"
         );
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
 
         // Pressing the track away from the thumb jumps there.
-        let track = super::title_layout(window.hwnd).scroll_bar.unwrap();
+        let track = super::strip_layout(window.hwnd)
+            .unwrap()
+            .scroll_bar
+            .unwrap();
         unsafe {
-            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, pack(track.left, y));
-            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, pack(track.left, y));
+            SendMessageW(group, WM_LBUTTONDOWN, 1, pack(track.left, y));
+            SendMessageW(group, WM_LBUTTONUP, 0, pack(track.left, y));
         }
-        assert_eq!(super::tab_scroll(window.hwnd), 0);
+        assert_eq!(scroll(), 0);
     }
 
     #[test]
@@ -8202,7 +8379,9 @@ mod tests {
             GetClientRect(editor_hwnd, &mut shown);
         }
         let dpi = unsafe { GetDpiForWindow(window.hwnd) };
-        let title_height = super::title_layout(window.hwnd).height;
+        // The editor group's tab strip sits between the title strip and the editor.
+        let title_height = super::title_layout(window.hwnd).height
+            + crate::window::group_strip::strip_height(dpi);
         assert_eq!(
             (client.bottom - client.top) - (shown.bottom - shown.top),
             title_height + crate::window::status::status_height(dpi),
@@ -8834,7 +9013,10 @@ mod tests {
         let editor = install_test_editor(&window);
         assert!(app_mut(window.hwnd).sidebar.is_none());
         assert_eq!(crate::window::side_panel::left_edge(window.hwnd), 0);
-        assert_eq!(super::title_layout(window.hwnd).tab(0).left, 0);
+        assert_eq!(
+            left_of(super::group_hwnd(window.hwnd).unwrap(), window.hwnd),
+            0
+        );
         assert_eq!(left_of(editor.hwnd(), window.hwnd), 0);
         assert_eq!(
             crate::window::side_panel::current_view(window.hwnd),
@@ -8896,7 +9078,10 @@ mod tests {
         assert_eq!(left_of(panel, window.hwnd), activity);
         let left = activity + panel_width;
         assert_eq!(crate::window::side_panel::left_edge(window.hwnd), left);
-        assert_eq!(super::title_layout(window.hwnd).tab(0).left, left);
+        assert_eq!(
+            left_of(super::group_hwnd(window.hwnd).unwrap(), window.hwnd),
+            left
+        );
         assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
         assert_eq!(client_size(editor.hwnd()).0, width - left);
         // Nothing before the pointer needs the tooltip, so the first frame goes without it.
@@ -10341,13 +10526,18 @@ mod tests {
 
         super::open_note(window.hwnd, &c, super::OpenMode::Preview, false).unwrap();
         let index = app_mut(window.hwnd).tabs.active_index();
-        let center = super::title_layout(window.hwnd).tab(index).center();
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let center = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(index)
+            .unwrap()
+            .center();
         let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
         // Both clicks carry the same message time, well inside the double-click time.
         for _ in 0..2 {
             unsafe {
                 SendMessageW(
-                    window.hwnd,
+                    group,
                     windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
                     0,
                     pack(center.x, center.y),

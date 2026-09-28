@@ -21,10 +21,10 @@ use crate::preview::{
 };
 use crate::window::WM_FASTPAD_PREVIEW_PARSED;
 use crate::window::commands::CommandId;
+use crate::window::group_strip::StripTarget;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
 use crate::window::panel::scale;
-use crate::window::titlebar::HitTarget;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -388,11 +388,11 @@ pub(crate) fn run_command(hwnd: HWND, command: CommandId) {
     set_mode(hwnd, next);
 }
 
-/// Title-strip buttons toggle: the pressed button turns the preview off.
-pub(crate) fn click_button(hwnd: HWND, target: HitTarget) {
+/// The group strip's preview buttons toggle: the pressed button turns the preview off.
+pub(crate) fn click_button(hwnd: HWND, target: StripTarget) {
     let button_mode = match target {
-        HitTarget::PreviewSide => PreviewMode::Split,
-        HitTarget::PreviewFull => PreviewMode::Full,
+        StripTarget::PreviewSide => PreviewMode::Split,
+        StripTarget::PreviewFull => PreviewMode::Full,
         _ => return,
     };
     set_mode(
@@ -522,7 +522,12 @@ fn ensure_view(hwnd: HWND) -> Result<PreviewView> {
     let started = Instant::now();
     let graphics = shared_graphics(hwnd)?;
     let (colors, fonts, dark) = appearance(hwnd);
-    let view = PreviewView::create(host_window::content_parent(hwnd), graphics, colors, fonts.clone())?;
+    let view = PreviewView::create(
+        host_window::content_parent(hwnd),
+        graphics,
+        colors,
+        fonts.clone(),
+    )?;
     view.set_appearance(colors, fonts, dark);
     view.mark_opened(started);
     with_host(hwnd, |host| {
@@ -1219,12 +1224,12 @@ pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
     with_host(hwnd, |host| host.dragging).unwrap_or(false) || over_divider(hwnd, point.x, point.y)
 }
 
-pub(crate) fn button_hover(hwnd: HWND, target: Option<HitTarget>) {
+pub(crate) fn button_hover(hwnd: HWND, target: Option<StripTarget>) {
     let hint = match target {
-        Some(HitTarget::PreviewSide) => {
+        Some(StripTarget::PreviewSide) => {
             Some("Open Preview to the Side (Ctrl+Shift+V cycles preview modes)")
         }
-        Some(HitTarget::PreviewFull) => Some("Open Preview (Ctrl+Shift+V cycles preview modes)"),
+        Some(StripTarget::PreviewFull) => Some("Open Preview (Ctrl+Shift+V cycles preview modes)"),
         _ => None,
     };
     let changed = with_host(hwnd, |host| {
