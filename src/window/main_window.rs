@@ -309,6 +309,9 @@ unsafe extern "system" fn main_window_proc(
             sync_window_title(hwnd);
             let paint_title_strip = |hwnd, _, _, _| {
                 let covered = group_strip_bounds(hwnd);
+                let sashes = tree_layout(hwnd)
+                    .map(|layout| layout.sashes.iter().map(|sash| sash.rect).collect())
+                    .unwrap_or_default();
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
                 let headings = menu_headings(hwnd);
@@ -317,6 +320,7 @@ unsafe extern "system" fn main_window_proc(
                         hwnd,
                         &crate::window::titlebar::TitlePaint {
                             covered,
+                            sashes,
                             status: status.as_ref(),
                             palette,
                             fonts,
@@ -348,6 +352,7 @@ unsafe extern "system" fn main_window_proc(
         WM_GETMINMAXINFO => unsafe {
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
+        WM_MOUSEMOVE if drag_sash(hwnd, lparam) => 0,
         WM_MOUSEMOVE => {
             hover_menu_heading(hwnd, lparam);
             crate::window::titlebar::track_pointer_leave(hwnd, false);
@@ -371,11 +376,15 @@ unsafe extern "system" fn main_window_proc(
             update_title_pointer(hwnd, |pointer| pointer.leave(true));
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR if set_sash_cursor(hwnd) => 1,
         WM_LBUTTONDOWN => {
             let (x, y) = (
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
+            if press_sash(hwnd, x, y) {
+                return 0;
+            }
             if menu_mode(hwnd).is_some() {
                 match menu_band::heading_at(&menu_headings(hwnd), x, y) {
                     Some(index) => {
@@ -396,6 +405,9 @@ unsafe extern "system" fn main_window_proc(
                 && caption_strip_point(hwnd, lparam).is_some() =>
         {
             exit_menu_mode(hwnd);
+            if let Some((group, ..)) = caption_strip_point(hwnd, lparam) {
+                activate_group_window(hwnd, group);
+            }
             execute_command(hwnd, CommandId::New);
             0
         }
@@ -405,6 +417,7 @@ unsafe extern "system" fn main_window_proc(
             match caption_strip_point(hwnd, lparam) {
                 Some((group, x, y)) => {
                     exit_menu_mode(hwnd);
+                    activate_group_window(hwnd, group);
                     show_group_strip_menu(hwnd, group, x, y);
                     0
                 }
@@ -430,6 +443,14 @@ unsafe extern "system" fn main_window_proc(
             if let Some(target) = activated {
                 run_caption_button(hwnd, target);
             }
+            0
+        }
+        WM_LBUTTONUP if end_sash_drag(hwnd) => {
+            unsafe { ReleaseCapture() };
+            0
+        }
+        WM_CAPTURECHANGED => {
+            end_sash_drag(hwnd);
             0
         }
         WM_LBUTTONUP => {
@@ -1049,29 +1070,172 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     crate::window::side_panel::layout(hwnd, rect, dpi);
     let left = crate::window::side_panel::left_edge(hwnd);
     layout_command_palette(hwnd);
-    let Some(group) = group_hwnd(hwnd) else {
+    if group_hwnd(hwnd).is_none() {
         return;
-    };
+    }
     let title_height = title_layout(hwnd).height + menu_band_height(hwnd);
     let width = (rect.right - rect.left - left).max(0);
     let font = title_chrome(hwnd).1.text();
-    let name_box_height = unsafe { app_ptr(hwnd) }
-        .and_then(|app| {
-            let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
-            name_box.layout(left, width, title_height, dpi, font);
-            name_box
-                .is_visible()
-                .then(|| crate::window::name_box::name_box_height(dpi))
-        })
-        .unwrap_or(0);
-    let status_height = status_bar_height(hwnd);
-    let bottom = (rect.bottom - rect.top - status_height).max(title_height + name_box_height);
-    // The group reaches up into the title row, where its tab strip is (spec §4.1).
-    unsafe {
-        MoveWindow(group, left, 0, width, bottom, 1);
+    // The name box spans the editor area under the title row, over the top groups.
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(name_box) = unsafe { app.as_ref() }.name_box.as_ref()
+    {
+        name_box.layout(left, width, title_height, dpi, font);
     }
-    // A move that keeps the group's size sends no WM_SIZE, but what is inside may have changed.
-    layout_group(hwnd, group);
+    let (Some(area), Some(layout)) = (tree_area(hwnd), tree_layout(hwnd)) else {
+        return;
+    };
+    for (id, rect) in &layout.groups {
+        let Some(group) = with_group_id(hwnd, *id, |state| state.hwnd) else {
+            continue;
+        };
+        // A top group reaches up into the title row and draws its strip there (spec §4.1); a
+        // lower group draws its strip at its own top.
+        let top = if rect.top == area.top { 0 } else { rect.top };
+        unsafe {
+            MoveWindow(
+                group,
+                rect.left,
+                top,
+                rect.right - rect.left,
+                rect.bottom - top,
+                1,
+            );
+        }
+        // A move that keeps the group's size sends no WM_SIZE, but what is inside may have
+        // changed.
+        layout_group(hwnd, group);
+    }
+    unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+}
+
+/// The sash under the cursor sets the resize cursor; false elsewhere.
+fn set_sash_cursor(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, IDC_SIZENS, IDC_SIZEWE, LoadCursorW, SetCursor,
+    };
+    let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe {
+        GetCursorPos(&mut point);
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+    }
+    let Some(axis) =
+        tree_layout(hwnd).and_then(|layout| layout.sash_at(point.x, point.y).map(|sash| sash.axis))
+    else {
+        return false;
+    };
+    let cursor = match axis {
+        crate::window::split_tree::Axis::Row => IDC_SIZEWE,
+        crate::window::split_tree::Axis::Column => IDC_SIZENS,
+    };
+    unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };
+    true
+}
+
+/// A press on a sash starts dragging it; a second press there within the double-click time
+/// shares its branch out evenly instead (spec §4.3). The main window has no `CS_DBLCLKS`, so the
+/// double-click is timed here, as the tab strip does. False when no sash is under the point.
+fn press_sash(hwnd: HWND, x: i32, y: i32) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
+    let Some(sash) = tree_layout(hwnd).and_then(|layout| layout.sash_at(x, y).cloned()) else {
+        return false;
+    };
+    let now = unsafe { GetMessageTime() } as u32;
+    let double_click_time = unsafe { GetDoubleClickTime() };
+    let equalized = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let double = app.last_sash_click.as_ref().is_some_and(|(id, time)| {
+            *id == sash.id && now.wrapping_sub(*time) <= double_click_time
+        });
+        if double {
+            app.last_sash_click = None;
+            app.layout.equalize(&sash.id);
+        } else {
+            app.last_sash_click = Some((sash.id.clone(), now));
+            app.sash_drag = Some(sash);
+        }
+        double
+    });
+    if equalized {
+        layout_editor_and_find_bar(hwnd);
+    } else {
+        unsafe { SetCapture(hwnd) };
+    }
+    true
+}
+
+/// Moves the dragged sash to the pointer; false when no sash is being dragged.
+fn drag_sash(hwnd: HWND, lparam: LPARAM) -> bool {
+    let (x, y) = (
+        (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    );
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let moved = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let sash = app.sash_drag.clone()?;
+        let at = match sash.axis {
+            crate::window::split_tree::Axis::Row => x,
+            crate::window::split_tree::Axis::Column => y,
+        };
+        Some(app.layout.set_sash(&sash, at, dpi))
+    });
+    match moved {
+        Some(changed) => {
+            if changed {
+                layout_editor_and_find_bar(hwnd);
+                unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(hwnd) };
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Ends a sash drag; returns whether one was under way.
+fn end_sash_drag(hwnd: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }
+        .is_some_and(|mut app| unsafe { app.as_mut() }.sash_drag.take().is_some())
+}
+
+/// The editor area the groups share, in the main window's client coordinates: below the title
+/// row, above the status bar, right of the sidebar.
+pub(crate) fn tree_area(hwnd: HWND) -> Option<crate::window::titlebar::Rect> {
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut client);
+    }
+    let left = crate::window::side_panel::left_edge(hwnd);
+    let top = title_layout(hwnd).height;
+    let bottom = (client.bottom - status_bar_height(hwnd)).max(top + 1);
+    (client.right > left)
+        .then(|| crate::window::titlebar::Rect::new(left, top, client.right, bottom))
+}
+
+/// Where each group and sash goes now.
+pub(crate) fn tree_layout(hwnd: HWND) -> Option<crate::window::split_tree::TreeLayout> {
+    let area = tree_area(hwnd)?;
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let app = unsafe { app_ptr(hwnd) }?;
+    Some(unsafe { app.as_ref() }.layout.layout(area, dpi))
+}
+
+/// The groups in layout order: left to right, top to bottom (spec §4.3).
+// Tasks that walk the groups in order use it from the next commits.
+#[allow(dead_code)]
+pub(crate) fn group_order(hwnd: HWND) -> Vec<GroupId> {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| unsafe { app.as_ref() }.layout.leaves())
+        .unwrap_or_default()
+}
+
+/// Whether `group`'s window starts at the top of the main window's client area, so its strip is
+/// in the title row.
+fn is_top_group(hwnd: HWND, group: HWND) -> bool {
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    origin.y == 0
 }
 
 /// The active editor group's window, once the editor exists.
@@ -1268,8 +1432,12 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let font = title_chrome(hwnd).1.text();
     let width = client.right;
     let strip_height = crate::window::group_strip::strip_height(dpi);
-    // The menu band and the name box sit under the title row, over the group's content.
-    let band = menu_band_height(hwnd) + name_box_band_height(hwnd, dpi);
+    // The menu band and the name box sit under the title row, over the top groups' content.
+    let band = if is_top_group(hwnd, group) {
+        menu_band_height(hwnd) + name_box_band_height(hwnd, dpi)
+    } else {
+        0
+    };
     let find_top = strip_height + band;
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
@@ -1323,8 +1491,15 @@ fn name_box_band_height(hwnd: HWND, dpi: u32) -> i32 {
 /// shows. The main window paints them and gets their input.
 fn set_group_region(hwnd: HWND, group: HWND, client: &RECT, strip_height: i32, band: i32) {
     use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, RGN_DIFF, SetWindowRgn};
-    let caption_left =
-        title_layout(hwnd).minimize.left - crate::window::side_panel::left_edge(hwnd);
+    // Only the group under the caption buttons gives up the part of its strip they cover.
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    let caption_left = title_layout(hwnd).minimize.left - origin.x;
+    let caption_left = if origin.y == 0 && caption_left < client.right {
+        caption_left.max(0)
+    } else {
+        client.right
+    };
     unsafe {
         let region = CreateRectRgn(0, 0, client.right, client.bottom);
         let cut = |left: i32, top: i32, right: i32, bottom: i32| {
@@ -1372,18 +1547,31 @@ pub(crate) fn group_hit_test(hwnd: HWND, group: HWND, lparam: LPARAM) -> LRESULT
 /// A caption point (screen coordinates in `lparam`) over a title-row strip's empty space, as the
 /// group window and its client coordinates.
 fn caption_strip_point(hwnd: HWND, lparam: LPARAM) -> Option<(HWND, i32, i32)> {
-    let group = group_hwnd(hwnd)?;
-    let mut point = windows_sys::Win32::Foundation::POINT {
-        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
-        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
-    };
-    unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point) };
-    let layout = strip_layout(hwnd)?;
-    (point.x >= 0
-        && point.x < layout.bounds().right
-        && strip_target(hwnd, point.x, point.y)
-            == Some(crate::window::group_strip::StripTarget::Empty))
-    .then_some((group, point.x, point.y))
+    let groups = unsafe { app_ptr(hwnd) }.map(|app| {
+        unsafe { app.as_ref() }
+            .groups
+            .iter()
+            .map(|group| (group.id, group.hwnd))
+            .collect::<Vec<_>>()
+    })?;
+    groups.into_iter().find_map(|(id, group)| {
+        if !is_top_group(hwnd, group) {
+            return None;
+        }
+        let mut point = windows_sys::Win32::Foundation::POINT {
+            x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+            y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+        };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point) };
+        let layout = strip_layout_of(hwnd, id)?;
+        (point.x >= 0
+            && point.x < layout.bounds().right
+            && point.y >= 0
+            && point.y < layout.height
+            && layout.hit_test(crate::window::titlebar::Point::new(point.x, point.y))
+                == crate::window::group_strip::StripTarget::Empty)
+            .then_some((group, point.x, point.y))
+    })
 }
 
 /// Paints what the group's children leave uncovered: the tab strip, the preview divider, and the
@@ -1410,6 +1598,12 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
         let (titles, active, _, _, preview_tab) = tab_snapshot(hwnd, id);
         let titles = titles.iter().map(String::as_str).collect::<Vec<_>>();
         let pointer = with_group_id(hwnd, id, |group| group.pointer).unwrap_or_default();
+        let (is_active_group, group_count) = unsafe { app_ptr(hwnd) }
+            .map(|app| {
+                let app = unsafe { app.as_ref() };
+                (app.tabs.active_group() == id, app.groups.len())
+            })
+            .unwrap_or((true, 1));
         unsafe {
             crate::window::group_strip::paint(
                 dc,
@@ -1422,6 +1616,11 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
                     palette,
                     fonts,
                     pointer,
+                    accent: crate::window::group_strip::tab_accent(
+                        is_active_group,
+                        group_count,
+                        &palette,
+                    ),
                 },
             );
         }
@@ -2573,14 +2772,34 @@ pub(crate) fn with_group<R>(
 
 /// The title-row strip in the main window's client coordinates, which the frame leaves to the
 /// group when it paints the title row.
-fn group_strip_bounds(hwnd: HWND) -> Option<crate::window::titlebar::Rect> {
-    let group = group_hwnd(hwnd)?;
-    let bounds = strip_layout(hwnd)?.bounds();
-    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
-    (origin.y == 0).then(|| {
-        crate::window::titlebar::Rect::new(origin.x, 0, origin.x + bounds.right, bounds.bottom)
-    })
+fn group_strip_bounds(hwnd: HWND) -> Vec<crate::window::titlebar::Rect> {
+    let groups = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .groups
+                .iter()
+                .map(|group| (group.id, group.hwnd))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    groups
+        .into_iter()
+        .filter_map(|(id, group)| {
+            let bounds = strip_layout_of(hwnd, id)?.bounds();
+            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1)
+            };
+            (origin.y == 0).then(|| {
+                crate::window::titlebar::Rect::new(
+                    origin.x,
+                    0,
+                    origin.x + bounds.right,
+                    bounds.bottom,
+                )
+            })
+        })
+        .collect()
 }
 
 /// The active group's tab strip as laid out now, the same one it paints and hit-tests with.
@@ -6426,8 +6645,16 @@ fn reporting_group(hwnd: HWND, document: DocumentId) -> Option<GroupId> {
 
 /// The groups whose active view shows `document`, in layout order.
 fn groups_showing(app: &App, document: DocumentId) -> Vec<GroupId> {
-    app.tabs
+    let mut order = app.layout.leaves();
+    // A group not in the layout yet (between its creation and its split) comes last.
+    let unplaced = app
+        .tabs
         .group_ids()
+        .into_iter()
+        .filter(|id| !order.contains(id))
+        .collect::<Vec<_>>();
+    order.extend(unplaced);
+    order
         .into_iter()
         .filter(|id| {
             app.tabs
@@ -7545,6 +7772,177 @@ three"
             style & WS_VISIBLE == 0,
             "group 2's Full preview hides its editor"
         );
+    }
+
+    fn split_for_test(hwnd: HWND, direction: crate::window::split_tree::Direction) -> GroupId {
+        let active = app_mut(hwnd).tabs.active_group();
+        let new = super::create_group(hwnd).expect("group");
+        assert!(app_mut(hwnd).layout.split(active, direction, new));
+        let id = app_mut(hwnd).tabs.active().unwrap().id;
+        app_mut(hwnd)
+            .tabs
+            .add_view(new, id, crate::editor::ViewState::default());
+        super::show_group_view(hwnd, new);
+        super::layout_editor_and_find_bar(hwnd);
+        new
+    }
+
+    fn window_rect_in_main(hwnd: HWND, child: HWND) -> RECT {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(child, &mut rect);
+            MapWindowPoints(
+                std::ptr::null_mut(),
+                hwnd,
+                &mut rect as *mut RECT as *mut POINT,
+                2,
+            );
+        }
+        rect
+    }
+
+    #[test]
+    fn groups_side_by_side_both_reach_into_the_title_row_with_a_sash_between() {
+        // Break caught: a second column pushed below the title row (wasting a row), overlapping
+        // the first, or leaving no gap for the sash.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let (a, b) = (
+            window_rect_in_main(window.hwnd, app_mut(window.hwnd).group(first).unwrap().hwnd),
+            window_rect_in_main(
+                window.hwnd,
+                app_mut(window.hwnd).group(second).unwrap().hwnd,
+            ),
+        );
+        assert_eq!((a.top, b.top), (0, 0));
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) };
+        assert_eq!(
+            b.left - a.right,
+            crate::window::titlebar::scale(crate::window::split_tree::SASH_96, dpi)
+        );
+        assert_eq!(super::tree_layout(window.hwnd).unwrap().sashes.len(), 1);
+        assert_eq!(super::group_strip_bounds(window.hwnd).len(), 2);
+    }
+
+    #[test]
+    fn a_group_below_another_draws_its_strip_at_its_own_top() {
+        // Break caught: a lower group's strip hit-tested as caption, so clicking its tabs drags
+        // the window.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_NCHITTEST};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Down);
+        let group = app_mut(window.hwnd).group(second).unwrap().hwnd;
+        let rect = window_rect_in_main(window.hwnd, group);
+        assert!(rect.top > 0);
+        let mut screen = windows_sys::Win32::Foundation::POINT {
+            x: rect.right - 20,
+            y: rect.top + 5,
+        };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut screen) };
+        let packed = ((screen.y as u32 & 0xffff) << 16 | (screen.x as u32 & 0xffff)) as LPARAM;
+        assert_eq!(
+            unsafe { SendMessageW(group, WM_NCHITTEST, 0, packed) },
+            HTCLIENT as LRESULT
+        );
+        assert_eq!(super::group_strip_bounds(window.hwnd).len(), 1);
+    }
+
+    #[test]
+    fn dragging_a_sash_resizes_both_groups_and_stops_at_the_minimum() {
+        // Break caught: a sash that doesn't follow the pointer, or one dragged over the edge
+        // collapsing a group to nothing.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+        let (x, y) = (sash.rect.left + 1, (sash.rect.top + sash.rect.bottom) / 2);
+        let area = super::tree_area(window.hwnd).unwrap();
+        unsafe {
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+            SendMessageW(window.hwnd, WM_MOUSEMOVE, 1, client_lparam(area.left, y));
+            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, client_lparam(area.left, y));
+        }
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) };
+        let a = super::tree_layout(window.hwnd)
+            .unwrap()
+            .rect_of(first)
+            .unwrap();
+        assert_eq!(
+            a.right - a.left,
+            crate::window::titlebar::scale(crate::window::split_tree::MIN_WIDTH_96, dpi)
+        );
+        let group = app_mut(window.hwnd).group(first).unwrap().hwnd;
+        let rect = window_rect_in_main(window.hwnd, group);
+        assert_eq!(rect.right - rect.left, a.right - a.left);
+    }
+
+    #[test]
+    fn a_double_click_on_a_sash_equalizes() {
+        // Break caught: a sash double-click read as two presses and ignored.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+        app_mut(window.hwnd)
+            .layout
+            .set_sash(&sash, sash.rect.left - 100, 96);
+        super::layout_editor_and_find_bar(window.hwnd);
+        let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+        let (x, y) = (sash.rect.left + 1, (sash.rect.top + sash.rect.bottom) / 2);
+        for _ in 0..2 {
+            unsafe {
+                SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+                SendMessageW(window.hwnd, WM_LBUTTONUP, 0, client_lparam(x, y));
+            }
+        }
+        let layout = super::tree_layout(window.hwnd).unwrap();
+        let area = super::tree_area(window.hwnd).unwrap();
+        let a = layout.rect_of(first).unwrap();
+        assert!(((a.right - area.left) - (area.right - area.left) / 2).abs() <= 3);
+    }
+
+    #[test]
+    fn only_the_group_under_the_caption_buttons_gives_them_up() {
+        // Break caught: every top group cutting the caption area out of its region, leaving a
+        // hole in the left group's strip.
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let region_has = |group: HWND, x: i32, y: i32| unsafe {
+            let region = CreateRectRgn(0, 0, 0, 0);
+            let kind = GetWindowRgn(group, region);
+            let inside =
+                kind == 0 /* ERROR: no region, the whole window */ || PtInRegion(region, x, y) != 0;
+            DeleteObject(region);
+            inside
+        };
+        let a = app_mut(window.hwnd).group(first).unwrap().hwnd;
+        let b = app_mut(window.hwnd).group(second).unwrap().hwnd;
+        let a_rect = window_rect_in_main(window.hwnd, a);
+        let b_rect = window_rect_in_main(window.hwnd, b);
+        assert!(region_has(a, a_rect.right - a_rect.left - 2, 2));
+        assert!(!region_has(b, b_rect.right - b_rect.left - 2, 2));
     }
 
     #[test]

@@ -465,8 +465,10 @@ pub(crate) fn strip_height(dpi: u32) -> i32 {
 }
 
 pub(crate) struct TitlePaint<'a> {
-    /// The title-row strip of the group at the top, which paints itself there (spec §4.1).
-    pub covered: Option<Rect>,
+    /// The title-row strips of the top groups, which paint themselves there (spec §4.1).
+    pub covered: Vec<Rect>,
+    /// The sashes between groups, in the frame's colour.
+    pub sashes: Vec<Rect>,
     /// Present once deferred chrome is built; the bar is painted along the bottom edge.
     pub status: Option<&'a crate::window::status::StatusBarText>,
     pub palette: Palette,
@@ -496,10 +498,13 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
             ExcludeClipRect(dc, 0, 0, left, client.bottom);
         }
     }
-    if let Some(strip) = input.covered {
+    for strip in &input.covered {
         unsafe {
             ExcludeClipRect(dc, strip.left, strip.top, strip.right, strip.bottom);
         }
+    }
+    for sash in &input.sashes {
+        unsafe { fill(dc, *sash, input.palette.strip_background) };
     }
     let maximized = unsafe { IsZoomed(hwnd) } != 0;
     if paint.rcPaint.top < layout.height {

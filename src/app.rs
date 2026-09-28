@@ -48,6 +48,13 @@ pub struct App {
     /// The editor group windows, each with its own editor, find bar, preview and image view, in
     /// creation order; the first exists once the editor does (split editors spec §4.2).
     pub(crate) groups: Vec<GroupWindow>,
+    /// How the groups are arranged: rows and columns of groups (split editors spec §4.3).
+    pub(crate) layout: crate::window::split_tree::SplitTree,
+    /// The sash being dragged, from the press to the release.
+    pub(crate) sash_drag: Option<crate::window::split_tree::Sash>,
+    /// The last press on a sash and its message time, so a second press there within the
+    /// double-click time equalizes its branch.
+    pub(crate) last_sash_click: Option<(crate::window::split_tree::SashId, u32)>,
     /// The Direct2D factories every group's preview and image view share, created on first use.
     pub(crate) graphics: Option<Rc<crate::preview::dwrite::Graphics>>,
     pub(crate) accessibility: AccessibilityState,
@@ -116,12 +123,17 @@ static NEXT_RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(1);
 impl App {
     pub fn new(launch: LaunchOptions, startup: StartupMetrics) -> Self {
         let process_start = startup.start_tick() as u64;
+        let tabs = Tabs::new();
+        let layout = crate::window::split_tree::SplitTree::new(tabs.active_group());
         Self {
             hwnd: std::ptr::null_mut(),
             launch,
-            tabs: Tabs::new(),
+            tabs,
             document_host: None,
             groups: Vec::new(),
+            layout,
+            sash_drag: None,
+            last_sash_click: None,
             graphics: None,
             accessibility: AccessibilityState::default(),
             accelerators: AcceleratorTable::create().ok(),

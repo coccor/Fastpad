@@ -253,6 +253,18 @@ pub(crate) struct StripPaint<'a> {
     pub(crate) palette: Palette,
     pub(crate) fonts: TitleFontHandles,
     pub(crate) pointer: StripPointer,
+    /// The bar along the top of the active tab, when there are several groups.
+    pub(crate) accent: Option<u32>,
+}
+
+/// The bar along the top of a group's active tab (split editors spec §4.2): only with several
+/// groups, so one group looks as it always has.
+pub(crate) fn tab_accent(active_group: bool, group_count: usize, palette: &Palette) -> Option<u32> {
+    (group_count > 1).then_some(if active_group {
+        palette.editor_foreground
+    } else {
+        palette.muted_foreground
+    })
 }
 
 /// Paints the strip into `dc` at the group's origin, through an off-screen bitmap.
@@ -328,6 +340,13 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
         let close_hovered = pointer.hovered == Some(StripTarget::CloseTab(index));
         unsafe {
             fill(dc, tab, background);
+            if selected && let Some(accent) = input.accent {
+                fill(
+                    dc,
+                    Rect::new(tab.left, tab.top, tab.right, tab.top + scale(2, dpi)),
+                    accent,
+                );
+            }
             select_font(
                 dc,
                 if input.preview_tab == Some(index) {
@@ -512,5 +531,21 @@ mod tests {
             Some(StripTarget::CloseTab(1))
         );
         assert_eq!(pressed.release(Some(StripTarget::CloseTab(2))).1, None);
+    }
+
+    #[test]
+    fn the_accent_marks_the_active_group_only_when_there_are_several() {
+        // Break caught: one group gaining a bar 0.2.0 never had, or every group's active tab
+        // looking equally active.
+        let palette = crate::window::palette::Palette::neutral();
+        assert_eq!(super::tab_accent(true, 1, &palette), None);
+        assert_eq!(
+            super::tab_accent(true, 2, &palette),
+            Some(palette.editor_foreground)
+        );
+        assert_eq!(
+            super::tab_accent(false, 2, &palette),
+            Some(palette.muted_foreground)
+        );
     }
 }
