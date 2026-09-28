@@ -1,4 +1,4 @@
-//! Material Icon Theme's 13 tree icons (icon sets spec §3, §5): premultiplied BGRA pixels at each
+//! Material Icon Theme's 26 tree icons (icon sets spec §3, §5): premultiplied BGRA pixels at each
 //! stored size, generated from `assets/icons/material/svg/` by `generate.rs` and embedded. An
 //! icon's place in the blob follows from `MaterialIcon::ALL` and `SIZES`: icons in list order,
 //! sizes smallest first, each `size * size * 4` bytes.
@@ -33,12 +33,27 @@ pub(crate) enum MaterialIcon {
     Folder,
     FolderOpen,
     Image,
+    Html,
+    Css,
+    JavaScript,
+    TypeScript,
+    Python,
+    Rust,
+    C,
+    Cpp,
+    CSharp,
+    PowerShell,
+    /// Bash and Batch, as upstream draws both.
+    Console,
+    Database,
+    /// Env files.
+    Tune,
 }
 
 impl MaterialIcon {
     /// Every icon, in blob order (`ALL[icon as usize] == icon`).
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 26] = [
         Self::Markdown,
         Self::Json,
         Self::Yaml,
@@ -52,6 +67,19 @@ impl MaterialIcon {
         Self::Folder,
         Self::FolderOpen,
         Self::Image,
+        Self::Html,
+        Self::Css,
+        Self::JavaScript,
+        Self::TypeScript,
+        Self::Python,
+        Self::Rust,
+        Self::C,
+        Self::Cpp,
+        Self::CSharp,
+        Self::PowerShell,
+        Self::Console,
+        Self::Database,
+        Self::Tune,
     ];
 
     /// The SVG in `assets/icons/material/svg/` this icon is made from.
@@ -71,6 +99,19 @@ impl MaterialIcon {
             Self::Folder => "folder.svg",
             Self::FolderOpen => "folder-open.svg",
             Self::Image => "image.svg",
+            Self::Html => "html.svg",
+            Self::Css => "css.svg",
+            Self::JavaScript => "javascript.svg",
+            Self::TypeScript => "typescript.svg",
+            Self::Python => "python.svg",
+            Self::Rust => "rust.svg",
+            Self::C => "c.svg",
+            Self::Cpp => "cpp.svg",
+            Self::CSharp => "csharp.svg",
+            Self::PowerShell => "powershell.svg",
+            Self::Console => "console.svg",
+            Self::Database => "database.svg",
+            Self::Tune => "tune.svg",
         }
     }
 }

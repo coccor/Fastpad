@@ -1,36 +1,38 @@
-use crate::editor::scintilla_constants::{
-    SCE_MARKDOWN_CODE, SCE_MARKDOWN_DEFAULT, SCE_MARKDOWN_HEADER1,
-};
-use crate::languages::{LexerStyle, SyntaxColors, per_theme_styles};
+use crate::editor::scintilla_constants::*;
+use crate::languages::{LexerStyle, Role, SyntaxColors, code, per_theme_styles, style};
 use crate::platform::theme::Theme;
 
-const fn table(colors: &SyntaxColors) -> [LexerStyle; 3] {
+const fn table(c: &SyntaxColors) -> [LexerStyle; 22] {
     [
-        LexerStyle {
-            style: SCE_MARKDOWN_DEFAULT,
-            foreground: colors.text,
-            background: colors.background,
-            bold: false,
-        },
-        LexerStyle {
-            style: SCE_MARKDOWN_HEADER1,
-            foreground: colors.heading,
-            background: colors.background,
-            bold: true,
-        },
-        LexerStyle {
-            style: SCE_MARKDOWN_CODE,
-            foreground: colors.code,
-            background: colors.code_background,
-            bold: false,
-        },
+        style(c, SCE_MARKDOWN_DEFAULT, Role::Text),
+        style(c, SCE_MARKDOWN_LINE_BEGIN, Role::Text),
+        style(c, SCE_MARKDOWN_PRECHAR, Role::Text),
+        style(c, SCE_MARKDOWN_STRONG1, Role::Emphasis).bold(),
+        style(c, SCE_MARKDOWN_STRONG2, Role::Emphasis).bold(),
+        style(c, SCE_MARKDOWN_EM1, Role::Emphasis).italic(),
+        style(c, SCE_MARKDOWN_EM2, Role::Emphasis).italic(),
+        style(c, SCE_MARKDOWN_HEADER1, Role::Heading).bold(),
+        style(c, SCE_MARKDOWN_HEADER2, Role::Heading).bold(),
+        style(c, SCE_MARKDOWN_HEADER3, Role::Heading).bold(),
+        style(c, SCE_MARKDOWN_HEADER4, Role::Heading).bold(),
+        style(c, SCE_MARKDOWN_HEADER5, Role::Heading).bold(),
+        style(c, SCE_MARKDOWN_HEADER6, Role::Heading).bold(),
+        style(c, SCE_MARKDOWN_ULIST_ITEM, Role::Operator),
+        style(c, SCE_MARKDOWN_OLIST_ITEM, Role::Operator),
+        style(c, SCE_MARKDOWN_HRULE, Role::Operator),
+        style(c, SCE_MARKDOWN_BLOCKQUOTE, Role::Comment),
+        style(c, SCE_MARKDOWN_STRIKEOUT, Role::Comment),
+        style(c, SCE_MARKDOWN_LINK, Role::Link),
+        code(c, SCE_MARKDOWN_CODE),
+        code(c, SCE_MARKDOWN_CODE2),
+        code(c, SCE_MARKDOWN_CODEBK),
     ]
 }
 
-static MARKDOWN_STYLES: [[LexerStyle; 3]; Theme::COUNT] = per_theme_styles!(table);
+static STYLES: [[LexerStyle; 22]; Theme::COUNT] = per_theme_styles!(table);
 
 pub(crate) fn styles(theme: Theme) -> &'static [LexerStyle] {
-    &MARKDOWN_STYLES[theme as usize]
+    &STYLES[theme as usize]
 }
 
 #[cfg(test)]

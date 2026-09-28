@@ -418,10 +418,7 @@ fn apply(hwnd: HWND, mut done: CopyDone) {
             listed.push(RowKind::Folder(relative));
             continue;
         }
-        let is_listed = item.destination.extension().is_some_and(|extension| {
-            library::title::is_listed_extension(&extension.to_string_lossy())
-        });
-        if is_listed {
+        if library::title::is_listed_path(&item.destination) {
             listed.push(RowKind::Note(relative));
         } else {
             hidden.push(name);

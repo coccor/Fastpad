@@ -45,12 +45,31 @@ fn file_name_or_untitled(path: Option<&std::path::Path>) -> String {
         .unwrap_or_else(|| "Untitled".to_owned())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Language {
     PlainText,
     Json,
     Markdown,
     Svg,
+    Xml,
+    Html,
+    Css,
+    JavaScript,
+    TypeScript,
+    Yaml,
+    Toml,
+    Ini,
+    Properties,
+    Env,
+    PowerShell,
+    Bash,
+    Batch,
+    Python,
+    C,
+    Cpp,
+    CSharp,
+    Rust,
+    Sql,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

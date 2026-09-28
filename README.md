@@ -156,6 +156,14 @@ Syntax highlighting as soon as you open a `.json` file. **Validate JSON** points
 and column of a mistake; **Format JSON** (Shift+Alt+F) pretty-prints the whole document in one step you can undo. Neither will touch a
 file that doesn't parse.
 
+### Syntax highlighting for the files you actually open
+
+FastPad picks the language from the file name and colours it in every theme: JSON, Markdown, XML
+(including SVG, `.csproj` and `.xaml`), HTML, CSS, JavaScript, TypeScript, YAML, TOML, INI,
+`.properties`, `.env`, PowerShell, Bash, Batch, Python, C, C++, C#, Rust and SQL. Switch it by hand
+from **View → Language** or the command palette. The notebook lists all of these files too
+(`.env`, `.bashrc` and `Cargo.lock` included), each with its own icon in every icon set.
+
 ### Tabs, done right
 
 Open as many files as you like in one window. **Ctrl+Tab** and **Ctrl+1…9** to jump, double-click

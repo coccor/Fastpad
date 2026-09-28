@@ -2688,9 +2688,33 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::TabWidth4 => set_tab_width(hwnd, 4),
         CommandId::TabWidth8 => set_tab_width(hwnd, 8),
         CommandId::Replace => open_find_bar(hwnd, find_bar::FindBarMode::Replace),
-        CommandId::LanguagePlainText => apply_language(hwnd, crate::document::Language::PlainText),
-        CommandId::LanguageJson => apply_language(hwnd, crate::document::Language::Json),
-        CommandId::LanguageMarkdown => apply_language(hwnd, crate::document::Language::Markdown),
+        CommandId::LanguagePlainText
+        | CommandId::LanguageJson
+        | CommandId::LanguageMarkdown
+        | CommandId::LanguageBash
+        | CommandId::LanguageBatch
+        | CommandId::LanguageC
+        | CommandId::LanguageCSharp
+        | CommandId::LanguageCpp
+        | CommandId::LanguageCss
+        | CommandId::LanguageEnv
+        | CommandId::LanguageHtml
+        | CommandId::LanguageIni
+        | CommandId::LanguageJavaScript
+        | CommandId::LanguagePowerShell
+        | CommandId::LanguageProperties
+        | CommandId::LanguagePython
+        | CommandId::LanguageRust
+        | CommandId::LanguageSql
+        | CommandId::LanguageSvg
+        | CommandId::LanguageToml
+        | CommandId::LanguageTypeScript
+        | CommandId::LanguageXml
+        | CommandId::LanguageYaml => {
+            if let Some(language) = command.language() {
+                apply_language(hwnd, language);
+            }
+        }
         CommandId::ValidateJson => validate_active_json(hwnd),
         CommandId::FormatJson => format_active_json(hwnd),
         CommandId::NextTab => cycle_tab(hwnd, true),
@@ -2922,14 +2946,36 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
             apply_editor_settings(hwnd);
             crate::window::preview_host::sync_visibility(hwnd);
         }
-        Some(Err(_)) => push_notice(
-            hwnd,
-            "FastPad could not enable syntax highlighting for this file. It will remain in plain \
-             text."
-                .to_owned(),
-        ),
+        Some(Err(_)) => {
+            // An SVG's preview does not need Lexilla, so the tab stays an SVG in plain text.
+            if language == crate::document::Language::Svg {
+                if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                    unsafe { app.as_mut() }.tabs.set_active_language(language);
+                }
+                invalidate_status_bar(hwnd);
+                crate::window::preview_host::sync_visibility(hwnd);
+            }
+            push_notice(
+                hwnd,
+                "FastPad could not enable syntax highlighting for this file. It will remain in \
+                 plain text."
+                    .to_owned(),
+            );
+        }
         None => {}
     }
+}
+
+/// The active tab's language; plain text while no tab is open.
+fn active_language(hwnd: HWND) -> crate::document::Language {
+    unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            unsafe { app.as_ref() }
+                .tabs
+                .active()
+                .map(|document| document.language)
+        })
+        .unwrap_or(crate::document::Language::PlainText)
 }
 
 /// Runs only inside `WM_FASTPAD_LOAD_SETTINGS`: applies the settings `bootstrap::run` read before
@@ -5997,6 +6043,7 @@ fn open_menu(hwnd: HWND, mut index: usize) {
                 crate::window::preview_host::buttons_visible(hwnd),
             );
             menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
+            menus::set_checked_language(menu, active_language(hwnd));
         }
         menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
         set_menu_mode(
@@ -7937,6 +7984,42 @@ mod tests {
             .unwrap()
             .language;
         assert_eq!(language_after, Language::PlainText);
+    }
+
+    #[test]
+    fn an_svg_keeps_its_preview_when_highlighting_cannot_load() {
+        // Break caught: SVG moved from the null lexer to Lexilla's xml lexer, so a missing
+        // Lexilla.dll left the tab as plain text and hid the SVG preview it never needed Lexilla
+        // for.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        unsafe {
+            super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+        }
+        .unwrap();
+        let missing = std::env::temp_dir().join(format!(
+            "fastpad-main-window-missing-lexilla-svg-test-{}.dll",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        unsafe {
+            super::app_ptr(window.hwnd)
+                .unwrap()
+                .as_mut()
+                .language_manager = Some(LanguageManager::with_dll_path_for_test(missing));
+        }
+
+        execute_command(window.hwnd, CommandId::LanguageSvg);
+
+        assert_eq!(notices(window.hwnd).len(), 1);
+        let language_after = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .tabs
+            .active()
+            .unwrap()
+            .language;
+        assert_eq!(language_after, Language::Svg);
+        assert!(crate::window::preview_host::buttons_visible(window.hwnd));
     }
 
     #[test]
@@ -11744,13 +11827,13 @@ mod tests {
 
     #[test]
     fn renaming_to_the_prefilled_name_keeps_a_non_note_or_extensionless_file_as_it_is() {
-        // Break caught: "script.py" prefilled and submitted as-is becoming script.py.py, and an
+        // Break caught: "script.lua" prefilled and submitted as-is becoming script.lua.lua, and an
         // extensionless README gaining ".md".
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("rename-kinds");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
-        for name in ["script.py", "README"] {
+        for name in ["script.lua", "README"] {
             let path = open_note(&window, &scratch, name, "x");
             execute_command(window.hwnd, CommandId::NoteRename);
             assert_eq!(app_mut(window.hwnd).name_box.as_ref().unwrap().text(), name);
@@ -11768,7 +11851,7 @@ mod tests {
             .filter(|name| !name.starts_with('.'))
             .collect();
         names.sort();
-        assert_eq!(names, ["README", "script.py"]);
+        assert_eq!(names, ["README", "script.lua"]);
 
         execute_command(window.hwnd, CommandId::NoteRename);
         type_into_name_box(window.hwnd, "tool");

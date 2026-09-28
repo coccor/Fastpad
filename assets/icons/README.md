@@ -13,9 +13,13 @@ High contrast always draws Minimal in the system colour.
 
 ## Editing Minimal or Solid
 
-Each set has the same ten files: `folder`, `folder-open`, `markdown` (Markdown), `braces` (JSON),
+Each set has the same 25 files: `folder`, `folder-open`, `markdown` (Markdown), `braces` (JSON),
 `settings` (YAML, TOML, INI and config), `table` (CSV), `code` (XML), `document` (text and any
 other extension), `log` and `image` (png, jpg, gif, bmp, ico, tiff, webp, heic, avif and svg).
+
+Every other highlighted language has its own shape: `html`, `css`, `javascript`, `typescript`,
+`python`, `rust`, `c`, `cpp`, `csharp`, `powershell`, `bash`, `batch`, `sql`, `env` and
+`properties`. Keep them distinct; a test fails if two languages share a shape.
 
 Draw only the shape. FastPad applies the colour when it draws: blue for Markdown, yellow for
 folders and JSON, and so on, taken from the theme.
@@ -41,5 +45,5 @@ The script renders every set into its `icons.bin` and records the sources' hash 
 tests fail if an SVG changed without a regeneration, or if an icon renders blank or fills its
 whole square.
 
-Adding an eleventh icon is a code change: add it to `MaskIcon` in `src/window/icon_sets/masks.rs`,
+Adding another icon is a code change: add it to `MaskIcon` in `src/window/icon_sets/masks.rs`,
 together with the note types that use it.

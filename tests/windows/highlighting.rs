@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(windows)]
-use fastpad::editor::scintilla_constants::SCI_SETSAVEPOINT;
+use fastpad::editor::scintilla_constants::{
+    SCE_H_ATTRIBUTE, SCE_H_TAG, SCE_JSON_KEYWORD, SCE_JSON_PROPERTYNAME, SCI_GETSTYLEAT,
+    SCI_SETSAVEPOINT,
+};
 #[cfg(windows)]
 use support::process::{FastPadProcess, process_has_module_loaded};
 #[cfg(windows)]
@@ -48,7 +51,7 @@ fn empty_launch_never_loads_lexilla() {
 #[test]
 fn opening_a_json_file_loads_lexilla_and_the_editor_stays_editable() {
     ensure_lexilla_present_next_to_fastpad_exe();
-    let fixture = JsonFixture::new();
+    let fixture = Fixture::new("sample.json", b"{\"ok\": true}");
     let mut process = FastPadProcess::spawn([
         std::ffi::OsStr::new("--new-window"),
         fixture.path.as_os_str(),
@@ -61,6 +64,14 @@ fn opening_a_json_file_loads_lexilla_and_the_editor_stays_editable() {
 
     // The launch file opens on its own once the window is ready; no keystroke unblocks it.
     wait_for_module_loaded(process.id(), LEXILLA_MODULE_NAME);
+
+    // Break caught: `true` styled as plain text because the JSON keyword set was never sent.
+    // The text is `{"ok": true}`: `o` is at 2 and `t` at 7.
+    wait_until(
+        || style_at(editor, 7) == SCE_JSON_KEYWORD && style_at(editor, 2) == SCE_JSON_PROPERTYNAME,
+        &Deadline::after(Duration::from_secs(3)),
+        "expected `true` as a JSON keyword and `ok` as a property name",
+    );
 
     // Still editable after the lexer switch: Lexilla is only ever handed an opaque pointer via
     // SCI_SETILEXER, never anything that could disable the control.
@@ -89,7 +100,7 @@ fn opening_a_json_file_loads_lexilla_and_the_editor_stays_editable() {
 #[test]
 fn missing_lexilla_leaves_the_document_editable_as_plain_text() {
     ensure_lexilla_absent_next_to_fastpad_exe();
-    let fixture = JsonFixture::new();
+    let fixture = Fixture::new("sample.json", b"{\"ok\": true}");
     let mut process = FastPadProcess::spawn([
         std::ffi::OsStr::new("--new-window"),
         fixture.path.as_os_str(),
@@ -135,6 +146,37 @@ fn missing_lexilla_leaves_the_document_editable_as_plain_text() {
         SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0);
     }
     process.close().unwrap();
+}
+
+/// Opening an `.xml` file lexes it: tags and attributes get their own styles.
+#[cfg(windows)]
+#[test]
+fn opening_an_xml_file_styles_its_tags_and_attributes() {
+    // Break caught: `.xml` detected as plain text, which is how XML "did not work" before.
+    ensure_lexilla_present_next_to_fastpad_exe();
+    let fixture = Fixture::new("sample.xml", b"<a b=\"c\"/>");
+    let mut process = FastPadProcess::spawn([
+        std::ffi::OsStr::new("--new-window"),
+        fixture.path.as_os_str(),
+    ])
+    .unwrap();
+    let hwnd = process
+        .wait_for_main_window(Duration::from_secs(2))
+        .unwrap();
+    let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
+
+    wait_until(
+        || style_at(editor, 1) == SCE_H_TAG && style_at(editor, 3) == SCE_H_ATTRIBUTE,
+        &Deadline::after(Duration::from_secs(3)),
+        "expected `a` styled as a tag and `b` as an attribute",
+    );
+
+    process.close().unwrap();
+}
+
+#[cfg(windows)]
+fn style_at(editor: HWND, position: usize) -> u32 {
+    unsafe { SendMessageW(editor, SCI_GETSTYLEAT, position, 0) as u32 }
 }
 
 #[cfg(windows)]
@@ -197,14 +239,14 @@ fn ensure_lexilla_absent_next_to_fastpad_exe() {
 }
 
 #[cfg(windows)]
-struct JsonFixture {
+struct Fixture {
     directory: PathBuf,
     path: PathBuf,
 }
 
 #[cfg(windows)]
-impl JsonFixture {
-    fn new() -> Self {
+impl Fixture {
+    fn new(file_name: &str, contents: &[u8]) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
             "fastpad-highlighting-{}-{}",
@@ -212,14 +254,14 @@ impl JsonFixture {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("sample.json");
-        std::fs::write(&path, b"{\"ok\": true}").unwrap();
+        let path = directory.join(file_name);
+        std::fs::write(&path, contents).unwrap();
         Self { directory, path }
     }
 }
 
 #[cfg(windows)]
-impl Drop for JsonFixture {
+impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
