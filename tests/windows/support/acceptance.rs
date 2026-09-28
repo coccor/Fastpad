@@ -574,13 +574,18 @@ fn wait_for_editor_eagerly(process: &mut FastPadProcess) -> TestResult<(HWND, HW
                     std::ptr::null(),
                 )
             };
-            let editor = unsafe {
-                FindWindowExW(
-                    group,
-                    std::ptr::null_mut(),
-                    scintilla_class.as_ptr(),
-                    std::ptr::null(),
-                )
+            // Until the group exists, a null parent would search the top-level windows instead.
+            let editor = if group.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe {
+                    FindWindowExW(
+                        group,
+                        std::ptr::null_mut(),
+                        scintilla_class.as_ptr(),
+                        std::ptr::null(),
+                    )
+                }
             };
             if !editor.is_null() {
                 return Ok((search.hwnd, editor));
