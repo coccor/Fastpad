@@ -159,7 +159,7 @@ file that doesn't parse.
 ### Tabs, done right
 
 Open as many files as you like in one window. **Ctrl+Tab** and **Ctrl+1…9** to jump, double-click
-the empty tab bar for a new tab, scroll the wheel over the tabs to browse them, and close one with **Ctrl+W** or a middle-click. Open a file from
+the empty tab bar for a new tab, scroll the wheel over the tabs to browse them, and close one with **Ctrl+W** or a middle-click. Every tab keeps its caret and scroll position, across switches and restarts. Open a file from
 Explorer or the command line and it lands as a tab in the FastPad window you already have open, not
 in a new window.
 

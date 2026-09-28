@@ -285,6 +285,13 @@ Three PRs, stacked on `feat/split-editors`:
    - `DocumentStore` and the host editor, `EditorTab` and `ViewState`, and the `EditorGroup` window with its strip, find bar, preview and image view.
    - The tab strip leaves the title bar, notifications are routed by group, and session v2 is written with a single group (the v1 reader is kept).
    - There are no splits yet. Visible changes: the tabs move below the title bar, caret and scroll are kept per tab, and the window title is shown in the title bar.
+   - Plan-time amendments (docs/superpowers/plans/2026-09-28-split-editors-1-one-group.md):
+     - The tab strip's accessibility is MSAA (`IAccessible`), not UIA. The group window hosts the tab list; the main window's provider keeps the app menu and the caption buttons.
+     - The title bar's "…" is the app menu and stays there. Each group's strip gets its own "…" (More actions) for the tab-strip menu.
+     - `App.tabs` stays in PR 1 as a façade over the `DocumentStore` and the one group's views. The editor, find bar, preview and image objects stay `App` fields; PR 2 moves them into the group when it has several.
+     - Double-clicking the title bar maximizes the window. Double-click for New and right-click for the tab-strip menu are on the group strip's empty space.
+     - Split Right joins the strip's action cluster in PR 2.
+     - The preview (italic) flag stays on `Document` in PR 1; with one group it behaves the same as a per-view flag. PR 2 moves it to the view.
 2. **Splits** (`feat/split-editors-grid`).
    - The split tree, sashes, the §5.1 commands, several views of one document, per-group find and preview, Open Editors group headers, group-aware Ctrl+P, and multi-group sessions.
 3. **Drag and drop** (`feat/split-editors-dnd`).
