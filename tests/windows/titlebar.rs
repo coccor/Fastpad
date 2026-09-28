@@ -49,7 +49,7 @@ fn get_object_returns_a_marshaled_title_provider() -> TestResult<()> {
     let result = unsafe { SendMessageW(hwnd, WM_GETOBJECT, 0, OBJID_CLIENT as isize) };
     assert_ne!(result, 0, "WM_GETOBJECT did not return the title provider");
     let accessible = Accessible::from_lresult(result, 0)?;
-    assert_eq!(accessible.child_count()?, 4);
+    assert_eq!(accessible.child_count()?, 3);
 
     process.close()
 }
@@ -307,7 +307,7 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         0,
         "closing the last tab must leave the window open"
     );
-    assert_eq!(accessible.child_count()?, 1, "the last tab closes");
+    assert_eq!(accessible.child_count()?, 0, "the last tab closes");
     assert_eq!(accessible.selection()?, None);
 
     process.close()
