@@ -1254,10 +1254,19 @@ pub(crate) fn show_labels(hwnd: HWND) {
 }
 
 /// `SCN_MODIFIED`: only edits at or above the label's line can change it.
-pub(crate) fn text_changed(hwnd: HWND, position: usize) {
+/// A text change at `position` in `group`'s editor; its active tab's label may follow.
+pub(crate) fn text_changed(hwnd: HWND, group: crate::window::split_tree::GroupId, position: usize) {
     let relevant = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         let app = unsafe { app.as_ref() };
-        let (Some(editor), Some(active)) = (app.editor(), app.tabs.active()) else {
+        let Some(editor) = app.group(group).map(|state| &state.editor) else {
+            return false;
+        };
+        let Some(active) = app
+            .tabs
+            .group(group)
+            .and_then(|tabs| tabs.active_document())
+            .and_then(|id| app.tabs.document(id))
+        else {
             return false;
         };
         active.path.is_none()

@@ -61,6 +61,10 @@ pub const WM_FASTPAD_IMAGE_DECODED: u32 = WM_APP + 0x58;
 /// Posted to the main window when an image view's size, zoom or state changes, so the status bar
 /// repaints. Not part of the deferred chain.
 pub const WM_FASTPAD_IMAGE_STATUS: u32 = WM_APP + 0x59;
+/// A content child (preview view, image view, find field) got the focus; wparam is its window.
+/// Posted to the main window, which makes that child's editor group active. Not part of the
+/// deferred chain.
+pub const WM_FASTPAD_CONTENT_FOCUSED: u32 = WM_APP + 0x5A;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

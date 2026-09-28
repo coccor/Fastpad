@@ -317,7 +317,7 @@ fn full_mode_reloads_keep_the_preview_position() {
     pump_for(Duration::from_millis(100));
     let before = view.top_line();
     assert!(before > 0);
-    window::preview_host::refresh(main.hwnd);
+    window::preview_host::refresh(main.hwnd, main.with_app(|app| app.tabs.active_group()));
     pump_for(Duration::from_millis(100));
     assert_eq!(view.top_line(), before, "inline reparse");
 
@@ -340,7 +340,7 @@ fn full_mode_reloads_keep_the_preview_position() {
     pump_for(Duration::from_millis(100));
     let before = view.top_line();
     assert!(before > 0);
-    window::preview_host::refresh(main.hwnd);
+    window::preview_host::refresh(main.hwnd, main.with_app(|app| app.tabs.active_group()));
     assert_eq!(
         view.stats().block_count,
         0,

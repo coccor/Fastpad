@@ -533,8 +533,11 @@ impl Tabs {
         }
     }
 
-    pub(crate) fn set_preview_buttons(&self, visible: bool) {
-        self.current().view.set_preview_buttons(visible);
+    /// Whether `group`'s strip offers the preview buttons, for its accessibility provider.
+    pub(crate) fn set_preview_buttons_in(&self, group: GroupId, visible: bool) {
+        if let Some(group) = self.group(group) {
+            group.view.set_preview_buttons(visible);
+        }
     }
 
     /// The selected document, or `None` once every tab has been closed.
@@ -854,14 +857,6 @@ impl Tabs {
         &mut self,
     ) -> Option<crate::document::RecoveryOrigin> {
         self.active_mut()?.recovery_origin.take()
-    }
-
-    /// A text change in the active tab; see `note_text_change`.
-    pub(crate) fn note_active_text_change(&mut self) -> bool {
-        let Some(id) = self.active().map(|document| document.id) else {
-            return false;
-        };
-        self.note_text_change(id)
     }
 
     /// A text change in `id`, recorded once however many views show it. The first one makes a
@@ -1250,8 +1245,8 @@ mod tests {
     fn the_first_edit_promotes_the_active_preview_once() {
         // Break caught: typing into a preview leaving it a preview, so the next click replaces it.
         let mut tabs = Tabs::with_document(preview(1));
-        assert!(tabs.note_active_text_change());
-        assert!(!tabs.note_active_text_change());
+        assert!(tabs.note_text_change(DocumentId(1)));
+        assert!(!tabs.note_text_change(DocumentId(1)));
         assert_eq!(tabs.preview_id(), None);
         assert!(!tabs.promote(DocumentId(1)));
         let mut tabs = Tabs::with_document(preview(1));

@@ -13,9 +13,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, DefWindowProcW, IDC_ARROW, IDC_SIZEWE, LoadCursorW, OBJID_CLIENT, RegisterClassW,
     SendMessageW, SetCursor, WM_CAPTURECHANGED, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
     WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_NOTIFY,
-    WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_VISIBLE,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 /// The window of one editor group, what it shows, and its tab strip's pointer state. One per
@@ -116,6 +116,13 @@ unsafe extern "system" fn group_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let main = crate::platform::win32::root_window(hwnd);
+    // A press anywhere in a group makes it the active group before anything handles the press.
+    if matches!(
+        message,
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+    ) {
+        super::main_window::activate_group_window(main, hwnd);
+    }
     match message {
         // Scintilla's notifications and the controls' commands and colors are the main window's
         // to handle, exactly as before the editor moved into the group.
@@ -139,6 +146,7 @@ unsafe extern "system" fn group_proc(
             0
         }
         WM_SETFOCUS => {
+            super::main_window::activate_group_window(main, hwnd);
             super::main_window::focus_group_content(main);
             0
         }

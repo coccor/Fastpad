@@ -1186,9 +1186,12 @@ unsafe extern "system" fn find_field_proc(
             }
         }
         // The focused field carries the accent outline the bar paints.
-        WM_SETFOCUS | WM_KILLFOCUS => unsafe {
-            InvalidateRect(GetParent(hwnd), std::ptr::null(), 0);
-        },
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            if message == WM_SETFOCUS {
+                super::main_window::post_content_focus(hwnd);
+            }
+            unsafe { InvalidateRect(GetParent(hwnd), std::ptr::null(), 0) };
+        }
         _ => {}
     }
     result

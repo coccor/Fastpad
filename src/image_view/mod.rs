@@ -912,6 +912,9 @@ unsafe extern "system" fn image_proc(
             0
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
+            if message == WM_SETFOCUS {
+                crate::window::post_content_focus(hwnd);
+            }
             invalidate(hwnd);
             0
         }

@@ -135,6 +135,7 @@ pub const SCI_UNDO: u32 = 2176;
 pub const SCI_VISIBLEFROMDOCLINE: u32 = 2220;
 pub const SCI_ZOOMIN: u32 = 2333;
 pub const SCI_ZOOMOUT: u32 = 2334;
+pub const SCN_FOCUSIN: u32 = 2028;
 pub const SCN_MODIFIED: u32 = 2008;
 pub const SCN_SAVEPOINTLEFT: u32 = 2003;
 pub const SCN_SAVEPOINTREACHED: u32 = 2002;

@@ -812,7 +812,7 @@ fn set_scroll(state: &mut ViewState, y: f32, user: bool) {
                 crate::platform::win32::root_window(*hwnd),
                 WM_FASTPAD_PREVIEW_SCROLLED,
                 line,
-                0,
+                *hwnd as isize,
             )
         };
     }
@@ -1140,7 +1140,7 @@ fn post_link(hwnd: HWND, dest: String) {
         PostMessageW(
             crate::platform::win32::root_window(hwnd),
             WM_FASTPAD_PREVIEW_LINK,
-            0,
+            hwnd as usize,
             payload as isize,
         )
     } == 0
@@ -1155,7 +1155,7 @@ fn post_hover(hwnd: HWND, dest: Option<String>) {
         PostMessageW(
             crate::platform::win32::root_window(hwnd),
             WM_FASTPAD_PREVIEW_HOVER,
-            0,
+            hwnd as usize,
             payload as isize,
         )
     } == 0
@@ -1364,6 +1364,9 @@ unsafe extern "system" fn preview_proc(
         }
         WM_GETDLGCODE => DLGC_WANTALLKEYS as LRESULT,
         WM_SETFOCUS | WM_KILLFOCUS | WM_DPICHANGED_AFTERPARENT => {
+            if message == WM_SETFOCUS {
+                crate::window::post_content_focus(hwnd);
+            }
             invalidate(hwnd);
             0
         }
@@ -1434,7 +1437,7 @@ unsafe extern "system" fn preview_proc(
                     PostMessageW(
                         crate::platform::win32::root_window(hwnd),
                         WM_FASTPAD_PREVIEW_ESCAPE,
-                        0,
+                        hwnd as usize,
                         0,
                     )
                 };
@@ -1538,7 +1541,7 @@ unsafe extern "system" fn preview_proc(
                         PostMessageW(
                             crate::platform::win32::root_window(hwnd),
                             WM_FASTPAD_PREVIEW_REFRESH,
-                            0,
+                            hwnd as usize,
                             0,
                         )
                     };

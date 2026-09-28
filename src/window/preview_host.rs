@@ -79,6 +79,8 @@ pub(crate) struct PreviewHost {
     pub(crate) sync_count: u64,
     pub(crate) hover_text: Option<String>,
     button_hint: Option<&'static str>,
+    /// Set while this preview has edits for the next `PREVIEW_TIMER_ID` flush.
+    flush_pending: bool,
 }
 
 /// Written by hand: windows-sys `RECT` implements no `Debug`.
@@ -126,6 +128,7 @@ impl Default for PreviewHost {
             sync_count: 0,
             hover_text: None,
             button_hint: None,
+            flush_pending: false,
         }
     }
 }
@@ -241,23 +244,41 @@ impl SourceText for ScintillaSource<'_> {
     }
 }
 
-pub(crate) fn with_host<R>(hwnd: HWND, action: impl FnOnce(&mut PreviewHost) -> R) -> Option<R> {
-    // SAFETY: the App pointer is used only for the immediate field access inside `action`, which
-    // never calls back into Win32.
-    unsafe { host_window::app_ptr(hwnd) }.and_then(|mut app| {
-        Some(action(
-            &mut unsafe { app.as_mut() }.active_group_mut()?.preview,
-        ))
+thread_local! {
+    /// The group the preview functions act on while `in_group` runs; the active group otherwise.
+    static TARGET: std::cell::Cell<Option<GroupId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `action` with this module's functions acting on group `id`'s preview, editor and active
+/// tab instead of the active group's: a group's notifications, posts and parse results reach its
+/// own preview (split editors spec §12).
+pub(crate) fn in_group<R>(id: GroupId, action: impl FnOnce() -> R) -> R {
+    let previous = TARGET.with(|target| target.replace(Some(id)));
+    let result = action();
+    TARGET.with(|target| target.set(previous));
+    result
+}
+
+/// The group this module acts on now.
+fn target_group(hwnd: HWND) -> Option<GroupId> {
+    TARGET.with(std::cell::Cell::get).or_else(|| {
+        unsafe { host_window::app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
     })
 }
 
-/// `with_host` for the group `id`, which need not be the active one.
+pub(crate) fn with_host<R>(hwnd: HWND, action: impl FnOnce(&mut PreviewHost) -> R) -> Option<R> {
+    let id = target_group(hwnd)?;
+    with_group_host(hwnd, id, action)
+}
+
+/// `with_host` for the group `id`, which need not be the target.
 pub(crate) fn with_group_host<R>(
     hwnd: HWND,
     id: GroupId,
     action: impl FnOnce(&mut PreviewHost) -> R,
 ) -> Option<R> {
-    // SAFETY: as in `with_host`.
+    // SAFETY: the App pointer is used only for the immediate field access inside `action`, which
+    // never calls back into Win32.
     unsafe { host_window::app_ptr(hwnd) }
         .and_then(|mut app| Some(action(&mut unsafe { app.as_mut() }.group_mut(id)?.preview)))
 }
@@ -270,19 +291,39 @@ pub(crate) fn view(hwnd: HWND) -> Option<PreviewView> {
     with_host(hwnd, |host| host.view).flatten()
 }
 
+/// The target group's editor.
 pub(crate) fn editor(hwnd: HWND) -> Option<Editor> {
-    unsafe { host_window::app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
+    host_window::group_editor(hwnd, target_group(hwnd)?)
 }
 
-/// The active tab's id, language, and folder.
+fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
+    editor(hwnd).map(|editor| editor.hwnd())
+}
+
+/// The target group's window, where its preview windows go.
+fn content_parent(hwnd: HWND) -> HWND {
+    target_group(hwnd)
+        .and_then(|id| host_window::with_group_id(hwnd, id, |group| group.hwnd))
+        .unwrap_or(hwnd)
+}
+
+/// Whether the target group's active tab is a text tab.
+fn shows_text(hwnd: HWND) -> bool {
+    let Some(id) = target_group(hwnd) else {
+        return false;
+    };
+    unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.group(id)
+            .and_then(|group| group.active_document())
+            .and_then(|document| tabs.document(document))
+            .is_some_and(|document| !document.is_image())
+    })
+}
+
+/// The target group's active tab's id, language, and folder.
 pub(crate) fn active_document(hwnd: HWND) -> Option<(DocumentId, Language, Option<PathBuf>)> {
-    let app = unsafe { host_window::app_ptr(hwnd) }?;
-    let document = unsafe { app.as_ref() }.tabs.active()?;
-    let folder = document
-        .path
-        .as_ref()
-        .and_then(|path| path.parent().map(PathBuf::from));
-    Some((document.id, document.language, folder))
+    group_document(hwnd, target_group(hwnd)?)
 }
 
 /// Group `id`'s active tab's id, language, and folder.
@@ -340,12 +381,7 @@ fn ensure_svg_view(hwnd: HWND) -> Result<ImageView> {
     }
     let graphics = shared_graphics(hwnd)?;
     let (colors, high_contrast) = image_colors(hwnd);
-    let view = ImageView::create(
-        host_window::content_parent(hwnd),
-        graphics,
-        colors,
-        high_contrast,
-    )?;
+    let view = ImageView::create(content_parent(hwnd), graphics, colors, high_contrast)?;
     with_host(hwnd, |host| {
         host.svg_view = Some(view);
         host.svg_document = None;
@@ -366,7 +402,7 @@ fn load_svg(hwnd: HWND) {
         return;
     }
     let name = unsafe { host_window::app_ptr(hwnd) }
-        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.title()))
+        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.document(id)?.title()))
         .unwrap_or_default();
     if let Ok(text) = editor.text() {
         view.show_svg(std::sync::Arc::from(text), &name, previous != Some(id));
@@ -429,10 +465,13 @@ pub(crate) fn click_button(hwnd: HWND, button: PreviewButton) {
     );
 }
 
-pub(crate) fn escape(hwnd: HWND) {
-    if mode(hwnd) == PreviewMode::Full {
-        set_mode(hwnd, PreviewMode::Split);
-    }
+/// Escape in group `id`'s Full preview goes back to Split.
+pub(crate) fn escape(hwnd: HWND, id: GroupId) {
+    in_group(id, || {
+        if mode(hwnd) == PreviewMode::Full {
+            set_mode(hwnd, PreviewMode::Split);
+        }
+    });
 }
 
 pub(crate) fn set_mode(hwnd: HWND, next: PreviewMode) {
@@ -448,7 +487,7 @@ pub(crate) fn set_mode(hwnd: HWND, next: PreviewMode) {
     sync_visibility(hwnd);
     let focus = match (previous, next) {
         (_, PreviewMode::Full) => full_view_hwnd(hwnd),
-        (PreviewMode::Full, _) => unsafe { host_window::editor_hwnd(hwnd) },
+        (PreviewMode::Full, _) => editor_hwnd(hwnd),
         _ => None,
     };
     if let Some(target) = focus {
@@ -464,10 +503,11 @@ fn close_view(hwnd: HWND) {
         host.divider = None;
         host.hover_text = None;
         host.svg_document = None;
+        host.flush_pending = false;
         (host.view.take(), host.svg_view.take())
     })
     .unwrap_or((None, None));
-    unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
+    stop_timer_when_idle(hwnd);
     let focus = unsafe { GetFocus() };
     let mut had_focus = false;
     if let Some(view) = closed.0 {
@@ -478,7 +518,7 @@ fn close_view(hwnd: HWND) {
         had_focus |= focus == view.hwnd();
         view.destroy();
     }
-    if had_focus && let Some(editor) = unsafe { host_window::editor_hwnd(hwnd) } {
+    if had_focus && let Some(editor) = editor_hwnd(hwnd) {
         unsafe { SetFocus(editor) };
     }
     host_window::invalidate_status_bar(hwnd);
@@ -550,12 +590,7 @@ fn ensure_view(hwnd: HWND) -> Result<PreviewView> {
     let started = Instant::now();
     let graphics = shared_graphics(hwnd)?;
     let (colors, fonts, dark) = appearance(hwnd);
-    let view = PreviewView::create(
-        host_window::content_parent(hwnd),
-        graphics,
-        colors,
-        fonts.clone(),
-    )?;
+    let view = PreviewView::create(content_parent(hwnd), graphics, colors, fonts.clone())?;
     view.set_appearance(colors, fonts, dark);
     view.mark_opened(started);
     with_host(hwnd, |host| {
@@ -571,10 +606,11 @@ fn ensure_view(hwnd: HWND) -> Result<PreviewView> {
 pub(crate) fn sync_visibility(hwnd: HWND) {
     let svg = active_is_svg(hwnd);
     let markdown = buttons_visible(hwnd) && !svg;
-    if let Some(app) = unsafe { host_window::app_ptr(hwnd) } {
+    let target = target_group(hwnd);
+    if let (Some(app), Some(id)) = (unsafe { host_window::app_ptr(hwnd) }, target) {
         unsafe { app.as_ref() }
             .tabs
-            .set_preview_buttons(markdown || svg);
+            .set_preview_buttons_in(id, markdown || svg);
     }
     let wanted = mode(hwnd);
     let mut view = view(hwnd);
@@ -599,8 +635,9 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
                 host.edits = EditLog::default();
                 host.full_parse_pending = false;
                 host.hover_text = None;
+                host.flush_pending = false;
             });
-            unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
+            stop_timer_when_idle(hwnd);
             // A hidden preview keeps only its window and the factories; the document (up to
             // LIVE_UPDATE_LIMIT of text) is parsed again when the preview shows.
             view.release();
@@ -638,7 +675,7 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
             view.release();
         }
     }
-    let editor_hwnd = unsafe { host_window::editor_hwnd(hwnd) };
+    let editor_hwnd = editor_hwnd(hwnd);
     let hide_editor = (shown || shown_svg.is_some()) && wanted == PreviewMode::Full;
     let focus_view = shown_svg
         .map(|view| view.hwnd())
@@ -653,12 +690,15 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
         unsafe { ShowWindow(view.hwnd(), if shown { SW_SHOWNA } else { SW_HIDE }) };
     }
     if let Some(editor) = editor_hwnd
-        && host_window::tab_count(hwnd) > 0
-        && !crate::window::image_host::active_is_image(hwnd)
+        && shows_text(hwnd)
     {
         unsafe { ShowWindow(editor, if hide_editor { SW_HIDE } else { SW_SHOWNA }) };
     }
     host_window::layout_editor_and_find_bar(hwnd);
+    let parent = content_parent(hwnd);
+    if parent != hwnd {
+        host_window::layout_group(hwnd, parent);
+    }
     host_window::invalidate_title_strip(hwnd);
 }
 
@@ -669,16 +709,17 @@ pub(crate) fn load_active_document(hwnd: HWND, force: bool) {
         return;
     };
     let started = Instant::now();
-    unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
     let (previous, mode) = with_host(hwnd, |host| {
         let previous = host.document.replace(id);
         host.edits = EditLog::default();
+        host.flush_pending = false;
         // Any worker parse still running describes older text.
         host.parse_generation += 1;
         host.full_parse_pending = false;
         (previous, host.mode)
     })
     .unwrap_or((None, PreviewMode::Off));
+    stop_timer_when_idle(hwnd);
     let length = editor.length().unwrap_or(0);
     // Full mode hides the editor, so its top line is stale: reloading the document the preview
     // already shows keeps the preview's own position there.
@@ -713,6 +754,8 @@ fn editor_top_line(editor: &Editor) -> usize {
 
 /// A finished worker parse, posted to the main window as `WM_FASTPAD_PREVIEW_PARSED`.
 pub(crate) struct ParsedPreview {
+    /// The group whose preview asked for it.
+    group: GroupId,
     document: DocumentId,
     generation: u64,
     parsed: PreviewDocument,
@@ -733,6 +776,9 @@ fn spawn_parse(
     let Ok(text) = editor.text() else {
         return false;
     };
+    let Some(group) = target_group(hwnd) else {
+        return false;
+    };
     let generation = with_host(hwnd, |host| {
         host.parse_generation += 1;
         host.full_parse_pending = true;
@@ -744,6 +790,7 @@ fn spawn_parse(
         let parsed = PreviewDocument::parse(&text);
         drop(text);
         let payload = Box::into_raw(Box::new(ParsedPreview {
+            group,
             document,
             generation,
             parsed,
@@ -765,18 +812,24 @@ fn spawn_parse(
     true
 }
 
-/// `WM_FASTPAD_PREVIEW_PARSED`: installs a worker parse unless newer text superseded it.
+/// `WM_FASTPAD_PREVIEW_PARSED`: installs a worker parse in the group that asked for it, unless
+/// newer text superseded it.
 pub(crate) fn parsed(hwnd: HWND, lparam: LPARAM) {
     if lparam == 0 {
         return;
     }
     let payload = unsafe { Box::from_raw(lparam as *mut ParsedPreview) };
+    in_group(payload.group, || install_parse(hwnd, *payload));
+}
+
+fn install_parse(hwnd: HWND, payload: ParsedPreview) {
     let (current, edits_waiting) = with_host(hwnd, |host| {
         let current = host.view.is_some()
             && host.document == Some(payload.document)
             && host.parse_generation == payload.generation;
         if current {
             host.full_parse_pending = false;
+            host.flush_pending |= !host.edits.is_empty();
         }
         (current, !host.edits.is_empty())
     })
@@ -794,7 +847,7 @@ pub(crate) fn parsed(hwnd: HWND, lparam: LPARAM) {
         started,
         full_mode_line,
         ..
-    } = *payload;
+    } = payload;
     // Split follows the editor; Full mode hides the editor, so the preview keeps its own position.
     let line = if mode(hwnd) == PreviewMode::Full {
         Some(full_mode_line.unwrap_or_else(|| view.top_line()))
@@ -807,8 +860,8 @@ pub(crate) fn parsed(hwnd: HWND, lparam: LPARAM) {
     }
 }
 
-/// `SCN_MODIFIED`: O(1) bookkeeping only; the timer does the work.
-pub(crate) fn record_edit(hwnd: HWND, notification: &ScintillaNotification) {
+/// `SCN_MODIFIED` for group `id`'s preview: O(1) bookkeeping only; the timer does the work.
+pub(crate) fn record_edit(hwnd: HWND, id: GroupId, notification: &ScintillaNotification) {
     let inserted = notification.modification_type as u32 & SC_MOD_INSERTTEXT != 0;
     let length = notification.length.max(0) as usize;
     let edit = Edit {
@@ -817,15 +870,17 @@ pub(crate) fn record_edit(hwnd: HWND, notification: &ScintillaNotification) {
         inserted: if inserted { length } else { 0 },
         lines_delta: notification.lines_added,
     };
-    let recorded = with_host(hwnd, |host| {
+    let recorded = with_group_host(hwnd, id, |host| {
         // The SVG preview renders the whole text again after the pause; it keeps no edit log.
         if host.svg_document.is_some() {
+            host.flush_pending = true;
             return true;
         }
         if host.view.is_none() || host.document.is_none() {
             return false;
         }
         host.edits.record(edit);
+        host.flush_pending = true;
         true
     })
     .unwrap_or(false);
@@ -883,13 +938,44 @@ pub(crate) fn plan_flush(
     }
 }
 
-/// `WM_TIMER` for `PREVIEW_TIMER_ID`: the typing pause has elapsed.
+/// `WM_TIMER` for `PREVIEW_TIMER_ID`: the typing pause has elapsed. Flushes every group whose
+/// preview has edits waiting.
 pub(crate) fn flush(hwnd: HWND) {
     unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
     if host_window::input_pending() {
         unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
         return;
     }
+    let waiting = unsafe { host_window::app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .groups
+                .iter()
+                .filter(|group| group.preview.flush_pending)
+                .map(|group| group.id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for id in waiting {
+        with_group_host(hwnd, id, |host| host.flush_pending = false);
+        in_group(id, || flush_group(hwnd));
+    }
+}
+
+/// Kills the preview timer unless some group's preview still has edits waiting.
+fn stop_timer_when_idle(hwnd: HWND) {
+    let waiting = unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .groups
+            .iter()
+            .any(|group| group.preview.flush_pending)
+    });
+    if !waiting {
+        unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
+    }
+}
+
+fn flush_group(hwnd: HWND) {
     if active_is_svg(hwnd) {
         if with_host(hwnd, |host| host.svg_document)
             .flatten()
@@ -915,7 +1001,10 @@ pub(crate) fn flush(hwnd: HWND) {
     match plan_flush(pending, length, view.is_paused(), full_parse_pending) {
         FlushPlan::Nothing => {}
         FlushPlan::Defer(pending) => {
-            with_host(hwnd, |host| host.edits.restore(pending));
+            with_host(hwnd, |host| {
+                host.edits.restore(pending);
+                host.flush_pending = true;
+            });
             unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
         }
         FlushPlan::Pause => view.set_paused(true),
@@ -952,9 +1041,9 @@ pub(crate) fn flush(hwnd: HWND) {
     }
 }
 
-/// `WM_FASTPAD_PREVIEW_REFRESH`: the paused bar was clicked.
-pub(crate) fn refresh(hwnd: HWND) {
-    load_active_document(hwnd, true);
+/// `WM_FASTPAD_PREVIEW_REFRESH`: group `id`'s paused bar was clicked.
+pub(crate) fn refresh(hwnd: HWND, id: GroupId) {
+    in_group(id, || load_active_document(hwnd, true));
 }
 
 /// A file finished loading into the active tab: its text replaced whatever the preview showed.
@@ -966,12 +1055,16 @@ pub(crate) fn document_reloaded(hwnd: HWND) {
     sync_visibility(hwnd);
 }
 
-/// `WM_FASTPAD_PREVIEW_LINK`: a link was clicked or activated with Enter.
-pub(crate) fn follow_link(hwnd: HWND, lparam: LPARAM) {
+/// `WM_FASTPAD_PREVIEW_LINK`: a link in group `id`'s preview was clicked or activated with Enter.
+pub(crate) fn follow_link(hwnd: HWND, id: GroupId, lparam: LPARAM) {
     if lparam == 0 {
         return;
     }
     let dest = *unsafe { Box::from_raw(lparam as *mut String) };
+    in_group(id, || follow(hwnd, dest));
+}
+
+fn follow(hwnd: HWND, dest: String) {
     let folder = active_document(hwnd).and_then(|(_, _, folder)| folder);
     match classify_link(&dest, folder.as_deref()) {
         LinkAction::External(url) => {
@@ -1057,19 +1150,23 @@ fn shell_open(hwnd: HWND, url: &str) -> bool {
     result as isize > 32
 }
 
-/// `WM_FASTPAD_PREVIEW_HOVER`: the link under the pointer changed.
-pub(crate) fn hover_link(hwnd: HWND, lparam: LPARAM) {
+/// `WM_FASTPAD_PREVIEW_HOVER`: the link under the pointer in group `id`'s preview changed.
+pub(crate) fn hover_link(hwnd: HWND, id: GroupId, lparam: LPARAM) {
     if lparam == 0 {
         return;
     }
     let dest = *unsafe { Box::from_raw(lparam as *mut Option<String>) };
-    with_host(hwnd, |host| host.hover_text = dest);
+    with_group_host(hwnd, id, |host| host.hover_text = dest);
     host_window::invalidate_status_bar(hwnd);
 }
 
-/// `SCN_UPDATEUI` with a vertical scroll: move the preview to the editor's top line, unless this
-/// scroll is the echo of a preview-initiated one.
-pub(crate) fn editor_scrolled(hwnd: HWND) {
+/// `SCN_UPDATEUI` with a vertical scroll in group `id`'s editor: move its preview to the editor's
+/// top line, unless this scroll is the echo of a preview-initiated one.
+pub(crate) fn editor_scrolled(hwnd: HWND, id: GroupId) {
+    in_group(id, || follow_editor(hwnd));
+}
+
+fn follow_editor(hwnd: HWND) {
     // Taken before the mode check so a guard can never outlive the scroll that set it.
     let echo = with_host(hwnd, |host| {
         std::mem::take(&mut host.scroll_origin) == ScrollOrigin::Preview
@@ -1090,8 +1187,12 @@ pub(crate) fn editor_scrolled(hwnd: HWND) {
     }
 }
 
-/// `WM_FASTPAD_PREVIEW_SCROLLED`: the user scrolled the preview; move the editor.
-pub(crate) fn preview_scrolled(hwnd: HWND, line: usize) {
+/// `WM_FASTPAD_PREVIEW_SCROLLED`: the user scrolled group `id`'s preview; move its editor.
+pub(crate) fn preview_scrolled(hwnd: HWND, id: GroupId, line: usize) {
+    in_group(id, || follow_preview(hwnd, line));
+}
+
+fn follow_preview(hwnd: HWND, line: usize) {
     if mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
         return;
     }
@@ -1177,6 +1278,11 @@ pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT, dpi: u32) -> ContentRe
 }
 
 impl PreviewHost {
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> PreviewMode {
+        self.mode
+    }
+
     /// The divider between the editor and a side preview, while one shows.
     pub(crate) fn divider_rect(&self) -> Option<RECT> {
         self.divider
