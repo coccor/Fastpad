@@ -40,6 +40,9 @@ pub struct App {
     pub launch: LaunchOptions,
     pub startup: StartupMetrics,
     pub(crate) tabs: Tabs,
+    /// The hidden Scintilla that creates every document and reads and edits background tabs
+    /// (split editors spec §3.1).
+    pub(crate) document_host: Option<Editor>,
     pub(crate) accessibility: AccessibilityState,
     pub(crate) accelerators: Option<AcceleratorTable>,
     pub(crate) menu_bar: Option<MenuBar>,
@@ -123,6 +126,7 @@ impl App {
             editor: None,
             launch,
             tabs: Tabs::new(),
+            document_host: None,
             accessibility: AccessibilityState::default(),
             accelerators: AcceleratorTable::create().ok(),
             menu_bar: None,

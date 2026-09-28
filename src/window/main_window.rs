@@ -1029,7 +1029,10 @@ where
         record_milestone(hwnd, Milestone::WindowCreated)?;
     }
 
-    let editor = create_editor(hwnd)?;
+    // Every document comes from the host, so any editor can show any of them (split editors
+    // spec §3.1).
+    let host = Editor::create_document_host()?;
+    let editor = create_editor(hwnd)?.with_document_host(&host);
     let editor_hwnd = editor.hwnd();
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
@@ -1042,7 +1045,12 @@ where
         .ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
         ))?;
-    let document = Document::untitled(DocumentId(1), recovery_id, editor.current_document()?);
+    let initial = editor.create_document()?;
+    editor.use_document(&initial)?;
+    let document = Document::untitled(DocumentId(1), recovery_id, initial);
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.document_host = Some(host);
+    }
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed while adopting the initial document",
@@ -4721,7 +4729,7 @@ fn snapshot_next_document(hwnd: HWND) {
         let inactive = if document.id == active.id {
             None
         } else {
-            Some(inactive_pair(&editor, document, active)?)
+            Some(document.text_handle()?.clone())
         };
         Some(SnapshotJob {
             editor,
@@ -4747,7 +4755,7 @@ fn snapshot_next_document(hwnd: HWND) {
     let started = std::time::Instant::now();
     let text = match &job.inactive {
         None => job.editor.text(),
-        Some((target, active)) => read_inactive_text(hwnd, &identity, &job.editor, target, active),
+        Some(target) => with_background_document(hwnd, target, Editor::text),
     };
     let Ok(text) = text else {
         return;
@@ -4775,22 +4783,6 @@ fn snapshot_next_document(hwnd: HWND) {
     }
 }
 
-/// The handles `with_inactive_document` swaps: `target`'s text, and the document the editor shows
-/// now. `None` when `target` is an image tab, which has no text to read or change. While an image
-/// tab is active the editor shows a placeholder that no tab owns, so it is read from the editor.
-fn inactive_pair(
-    editor: &Editor,
-    target: &Document,
-    active: &Document,
-) -> Option<(crate::editor::EditorDocument, crate::editor::EditorDocument)> {
-    let target = target.text_handle()?.clone();
-    let shown = match active.text_handle() {
-        Some(handle) => handle.clone(),
-        None => editor.current_document().ok()?,
-    };
-    Some((target, shown))
-}
-
 struct SnapshotJob {
     editor: Editor,
     id: DocumentId,
@@ -4799,69 +4791,36 @@ struct SnapshotJob {
     original_path: Option<std::path::PathBuf>,
     encoding: crate::file::encoding::Encoding,
     source_snapshot: Option<std::path::PathBuf>,
-    inactive: Option<(crate::editor::EditorDocument, crate::editor::EditorDocument)>,
+    /// A background tab's document, read through the document host.
+    inactive: Option<crate::editor::EditorDocument>,
 }
 
-/// Scintilla can only read or change the document shown in the view, so an inactive tab is
-/// swapped in, `f` runs on it, and it is swapped out again, with notifications suppressed
-/// (`populating_file`), restoring the visible selection and scroll position.
-fn with_inactive_document<R>(
+/// Runs `f` on the document host showing `target`, a document no visible editor shows (split
+/// editors spec §3.1). The host is never painted and its notifications reach no window, so the
+/// visible editor's view and the notification handler see none of this; callers record edits
+/// themselves (`Tabs::note_background_edit`).
+fn with_background_document<R>(
     hwnd: HWND,
-    identity: &WindowIdentity,
-    editor: &Editor,
     target: &crate::editor::EditorDocument,
-    active: &crate::editor::EditorDocument,
     f: impl FnOnce(&Editor) -> Result<R>,
 ) -> Result<R> {
-    use crate::editor::scintilla_constants::{SCI_GETFIRSTVISIBLELINE, SCI_SETFIRSTVISIBLELINE};
-    let selection = editor.selection();
-    let first_line = unsafe { SendMessageW(editor.hwnd(), SCI_GETFIRSTVISIBLELINE, 0, 0) };
-    set_file_population(hwnd, true);
-    let value = editor.use_document(target).and_then(|_| f(editor));
-    let restored = if identity.is_live_for(hwnd) {
-        editor.use_document(active)
-    } else {
-        Err(crate::FastPadError::Invariant(
-            "main window was destroyed while a background tab was swapped in",
-        ))
-    };
-    if restored.is_ok() {
-        if let Ok(selection) = selection {
-            let _ = editor.set_selection(selection);
-        }
-        unsafe {
-            SendMessageW(
-                editor.hwnd(),
-                SCI_SETFIRSTVISIBLELINE,
-                first_line as usize,
-                0,
-            );
-        }
+    let host = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.document_host.clone())
+        .ok_or(crate::FastPadError::Invariant("the document host is missing"))?;
+    host.use_document(target)?;
+    let result = f(&host);
+    // Leave the host on a document of its own, so it never keeps a closed tab's text alive.
+    if let Ok(blank) = host.create_document() {
+        let _ = host.use_document(&blank);
     }
-    if identity.is_live_for(hwnd) {
-        set_file_population(hwnd, false);
-    }
-    restored?;
-    value
-}
-
-/// An inactive tab's text (`with_inactive_document`).
-fn read_inactive_text(
-    hwnd: HWND,
-    identity: &WindowIdentity,
-    editor: &Editor,
-    target: &crate::editor::EditorDocument,
-    active: &crate::editor::EditorDocument,
-) -> Result<String> {
-    with_inactive_document(hwnd, identity, editor, target, active, Editor::text)
+    result
 }
 
 /// The text of tab `id` as the editor has it, for the Search view's overlays. A background tab is
-/// swapped into the editor and back (`read_inactive_text`). `None` without an editor or that tab,
-/// for a background tab while a file is being populated (the swap would end the population), or
-/// when Scintilla can't be read. Call it with nothing of the App borrowed.
+/// read through the document host (`with_background_document`). `None` without an editor or that
+/// tab, while a file is being populated, or when Scintilla can't be read. Call it with nothing of
+/// the App borrowed.
 pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
-    let identity = unsafe { window_identity(hwnd) }?;
     let (editor, inactive) = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         // While a file is populated the editor may show a document that is not the active tab's.
@@ -4874,22 +4833,19 @@ pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
         if target.id == active.id {
             return Some((editor, None));
         }
-        let pair = inactive_pair(&editor, target, active)?;
-        Some((editor, Some(pair)))
+        Some((editor, Some(target.text_handle()?.clone())))
     })?;
     match inactive {
         None => editor.text().ok(),
-        Some((target, active)) => {
-            read_inactive_text(hwnd, &identity, &editor, &target, &active).ok()
-        }
+        Some(target) => with_background_document(hwnd, &target, Editor::text).ok(),
     }
 }
 
 /// Replaces every match of `matcher` in tab `id`'s live text with `template` (expanded in regex
 /// mode), in the editor, as one undo action (note-search spec §12). The tab is not saved. The
 /// active tab's edit raises Scintilla's notifications as typing does. A background tab is
-/// swapped in (`with_inactive_document`, notifications suppressed) and then marked edited by
-/// hand (`Tabs::note_background_edit`). Returns how many matches were replaced, or `None`
+/// edited through the document host (`with_background_document`), whose notifications reach no
+/// window, and then marked edited by hand (`Tabs::note_background_edit`). Returns how many matches were replaced, or `None`
 /// without an editor or that tab, while a file is being populated, or when Scintilla fails. Call
 /// it with nothing of the App borrowed.
 pub(crate) fn replace_in_document(
@@ -4911,8 +4867,7 @@ pub(crate) fn replace_in_document(
         if target.id == active.id {
             return Some((editor, None));
         }
-        let pair = inactive_pair(&editor, target, active)?;
-        Some((editor, Some(pair)))
+        Some((editor, Some(target.text_handle()?.clone())))
     })?;
     // Set once Scintilla is asked to change the text: from then on it may have changed, even if
     // a replacement then fails partway.
@@ -4927,10 +4882,10 @@ pub(crate) fn replace_in_document(
     };
     match inactive {
         None => replace(&editor).ok(),
-        Some((target, active)) => {
-            // What the edit replaced, even if restoring the active tab then fails.
+        Some(target) => {
+            // What the edit replaced, even if a later step fails.
             let done = std::cell::Cell::new(None);
-            let result = with_inactive_document(hwnd, &identity, &editor, &target, &active, |e| {
+            let result = with_background_document(hwnd, &target, |e| {
                 let replaced = replace(e)?;
                 done.set(Some(replaced));
                 Ok(replaced)
@@ -4991,16 +4946,13 @@ pub(crate) fn reload_clean_document(
         if target.id == active.id {
             return Some((editor, None));
         }
-        let pair = inactive_pair(&editor, target, active)?;
-        Some((editor, Some(pair)))
+        Some((editor, Some(target.text_handle()?.clone())))
     }) else {
         return false;
     };
     let populate = |editor: &Editor| editor.populate_clean(&loaded.text);
     let populated = match &inactive {
-        Some((target, active)) => {
-            with_inactive_document(hwnd, &identity, &editor, target, active, populate)
-        }
+        Some(target) => with_background_document(hwnd, target, populate),
         None => {
             use crate::editor::scintilla_constants::{
                 SCI_GETFIRSTVISIBLELINE, SCI_SETFIRSTVISIBLELINE,
@@ -6655,6 +6607,39 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::SelectTab1);
         assert_eq!(editor.view_state().unwrap(), saved);
+    }
+
+    #[test]
+    fn replacing_in_a_background_tab_leaves_the_active_view_alone() {
+        // Break caught: a background replace swapping the document through the visible editor,
+        // so the active tab's caret, selection direction or scroll jumps.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text(&"line\n".repeat(2000)).unwrap();
+        let first = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::New);
+        editor.set_text("foo foo").unwrap();
+        let second = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        let shown = crate::editor::ViewState {
+            caret: 1210 * 5,
+            anchor: 1210 * 5 + 3,
+            first_line: 1200,
+            x_offset: 0,
+        };
+        editor.apply_view_state(shown).unwrap();
+
+        let matcher = crate::search::Matcher::new("foo", Default::default()).unwrap();
+        assert_eq!(
+            super::replace_in_document(window.hwnd, second, &matcher, "bar"),
+            Some(2)
+        );
+
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, first);
+        assert_eq!(editor.view_state().unwrap(), shown);
+        assert_eq!(super::document_text(window.hwnd, second).unwrap(), "bar bar");
+        assert!(app_mut(window.hwnd).tabs.document(second).unwrap().dirty);
     }
 
     #[test]
@@ -9272,6 +9257,12 @@ mod tests {
         }
         .unwrap();
         super::create_new_document(window.hwnd).unwrap();
+        // Documents belong to the document host, so their releases go through its endpoint.
+        let host = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .document_host
+            .as_ref()
+            .unwrap()
+            .hwnd();
         let (_, releases) = crate::editor::scintilla::release_observation::during(|| unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
                 window.hwnd,
@@ -9285,9 +9276,10 @@ mod tests {
         assert!(
             releases
                 .iter()
-                .all(|release| release.hwnd == editor && release.window_was_live)
+                .all(|release| release.hwnd == host && release.window_was_live)
         );
         assert_eq!(unsafe { IsWindow(editor) }, 0);
+        assert_eq!(unsafe { IsWindow(host) }, 0);
         assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
     }
 

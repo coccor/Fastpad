@@ -186,6 +186,15 @@ impl Editor {
         ))
     }
 
+    /// This editor, now creating and showing documents from `host`'s store instead of its own.
+    /// For editors made by `create` before the host existed; documents the editor already
+    /// created stay valid for it only through `host`'s reference counting, so call this before
+    /// creating any.
+    pub fn with_document_host(mut self, host: &Editor) -> Self {
+        self.documents = Rc::clone(&host.documents);
+        self
+    }
+
     /// Whether `other` shows documents from the same host, so either can show the other's.
     pub fn shares_documents_with(&self, other: &Editor) -> bool {
         Rc::ptr_eq(&self.documents, &other.documents)
