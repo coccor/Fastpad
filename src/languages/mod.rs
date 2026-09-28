@@ -136,6 +136,32 @@ pub fn detect_language(path: &Path) -> Language {
     }
 }
 
+/// `language`'s style table in `theme`: empty for the languages with no lexer.
+pub(crate) fn style_table(language: Language, theme: Theme) -> &'static [LexerStyle] {
+    match language {
+        Language::Json => json::styles(theme),
+        Language::Markdown => markdown::styles(theme),
+        Language::PlainText | Language::Svg => &[],
+    }
+}
+
+/// Gives `editor`'s view `language`'s style table without touching the document's lexer. Styles
+/// belong to each Scintilla view while the lexer belongs to the document, so a second editor
+/// showing a document needs its own table (split editors spec §3.2).
+pub(crate) fn apply_styles(editor: &Editor, language: Language, theme: Theme) -> Result<()> {
+    editor.clear_all_styles()?;
+    for style in style_table(language, theme) {
+        editor.set_style(
+            style.style,
+            style.foreground,
+            style.background,
+            style.bold,
+            DEFAULT_FONT_FACE,
+        )?;
+    }
+    Ok(())
+}
+
 /// Owns the deferred `Lexilla.dll` and applies a document's language (lexer + style table) to the
 /// live editor. `Lexilla.dll` is only ever loaded the first time `apply` is called with
 /// `Language::Json` or `Language::Markdown`; a plain-text-only session never touches it.
@@ -163,25 +189,21 @@ impl LanguageManager {
                 editor.set_lexer(0)?;
                 Ok(())
             }
-            Language::Json => self.apply_lexer(editor, "json", json::styles(theme)),
-            Language::Markdown => self.apply_lexer(editor, "markdown", markdown::styles(theme)),
+            Language::Json => self.apply_lexer(editor, "json", language, theme),
+            Language::Markdown => self.apply_lexer(editor, "markdown", language, theme),
         }
     }
 
-    fn apply_lexer(&mut self, editor: &Editor, name: &str, table: &[LexerStyle]) -> Result<()> {
+    fn apply_lexer(
+        &mut self,
+        editor: &Editor,
+        name: &str,
+        language: Language,
+        theme: Theme,
+    ) -> Result<()> {
         let lexer = self.ensure_lexilla()?.create_lexer(name)?;
         editor.set_lexer(lexer)?;
-        editor.clear_all_styles()?;
-        for style in table {
-            editor.set_style(
-                style.style,
-                style.foreground,
-                style.background,
-                style.bold,
-                DEFAULT_FONT_FACE,
-            )?;
-        }
-        Ok(())
+        apply_styles(editor, language, theme)
     }
 
     fn ensure_lexilla(&mut self) -> Result<&LexillaLibrary> {

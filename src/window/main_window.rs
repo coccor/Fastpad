@@ -4072,6 +4072,20 @@ fn apply_theme(hwnd: HWND) {
     if language != crate::document::Language::PlainText {
         apply_language(hwnd, language);
     }
+    let others: Vec<GroupId> = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let app = unsafe { app.as_ref() };
+            let active = app.tabs.active_group();
+            app.groups
+                .iter()
+                .map(|group| group.id)
+                .filter(|id| *id != active)
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in others {
+        style_group_view(hwnd, id);
+    }
     crate::window::preview_host::refresh_appearance(hwnd);
     crate::window::image_host::refresh_appearance(hwnd);
     crate::window::side_panel::refresh(hwnd);
@@ -7345,6 +7359,7 @@ pub(crate) fn show_group_view(hwnd: HWND, id: GroupId) -> bool {
     }
     if text {
         let _ = editor.apply_view_state(state);
+        style_group_view(hwnd, id);
     }
     if !active {
         unsafe { ShowWindow(editor.hwnd(), if text { SW_SHOWNA } else { SW_HIDE }) };
@@ -7353,6 +7368,25 @@ pub(crate) fn show_group_view(hwnd: HWND, id: GroupId) -> bool {
         });
     }
     true
+}
+
+/// Gives group `id`'s editor the style table of the language its active view's document has, and
+/// the configured font back. The lexer belongs to the document but the styles to each editor, so
+/// an editor that starts showing a document, or outlives a theme change, needs this.
+fn style_group_view(hwnd: HWND, id: GroupId) {
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.group(id)?.editor.clone();
+        let document = app.tabs.document(app.tabs.group(id)?.active_document()?)?;
+        let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
+        Some((editor, document.language, app.settings.clone(), palette))
+    });
+    let Some((editor, language, settings, palette)) = target else {
+        return;
+    };
+    if crate::languages::apply_styles(&editor, language, effective_theme(hwnd)).is_ok() {
+        apply_settings_to(&editor, &settings, palette);
+    }
 }
 
 /// Records where group `id`'s editor is in its active text tab, so showing that view again lands
@@ -8578,6 +8612,70 @@ three"
                 .text()
                 .unwrap(),
             "shared"
+        );
+    }
+
+    /// The foreground group `id`'s editor draws JSON strings in.
+    fn json_string_colour(hwnd: HWND, id: GroupId) -> isize {
+        const SCI_STYLEGETFORE: u32 = 2481;
+        let editor = super::group_editor(hwnd, id).unwrap();
+        unsafe {
+            SendMessageW(
+                editor.hwnd(),
+                SCI_STYLEGETFORE,
+                crate::editor::scintilla_constants::SCE_JSON_STRING as usize,
+                0,
+            )
+        }
+    }
+
+    fn theme_json_string_colour(hwnd: HWND) -> isize {
+        crate::languages::style_table(
+            crate::document::Language::Json,
+            super::effective_theme(hwnd),
+        )
+        .iter()
+        .find(|style| style.style == crate::editor::scintilla_constants::SCE_JSON_STRING)
+        .unwrap()
+        .foreground as isize
+    }
+
+    #[test]
+    fn a_split_shows_the_documents_syntax_colours_in_the_new_group() {
+        // Break caught: a new group's editor keeps only the base colour in every style, so a JSON
+        // or Markdown document shows monochrome there (styles belong to each Scintilla view).
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("{\"a\": \"b\"}").unwrap();
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Json);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert_eq!(
+            json_string_colour(window.hwnd, second),
+            theme_json_string_colour(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn a_theme_change_recolours_the_syntax_in_every_group() {
+        // Break caught: a theme change re-applies the language to the active editor only, and the
+        // other groups keep the base colour in every style.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("{\"a\": \"b\"}").unwrap();
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Json);
+        let (first, second) = second_group_showing_the_active_document(window.hwnd);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
+        assert_eq!(
+            json_string_colour(window.hwnd, second),
+            theme_json_string_colour(window.hwnd)
         );
     }
 
