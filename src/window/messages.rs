@@ -55,6 +55,12 @@ pub const WM_FASTPAD_PREVIEW_ESCAPE: u32 = WM_APP + 0x54;
 pub const WM_FASTPAD_PREVIEW_IMAGE: u32 = WM_APP + 0x55;
 pub const WM_FASTPAD_PREVIEW_PARSED: u32 = WM_APP + 0x56;
 pub const WM_FASTPAD_PREVIEW_ACTIVATE: u32 = WM_APP + 0x57;
+/// A finished image decode, sent to the image view; `lparam` is a `Box<image_view::decode::Decoded>`
+/// the receiver frees. Not part of the deferred chain.
+pub const WM_FASTPAD_IMAGE_DECODED: u32 = WM_APP + 0x58;
+/// Posted to the main window when an image view's size, zoom or state changes, so the status bar
+/// repaints. Not part of the deferred chain.
+pub const WM_FASTPAD_IMAGE_STATUS: u32 = WM_APP + 0x59;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {
