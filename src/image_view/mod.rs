@@ -41,13 +41,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CS_DBLCLKS, CreateWindowExW, DLGC_WANTARROWS, DefWindowProcW, DestroyWindow,
     EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_VALUECHANGE, GWLP_USERDATA, GetClientRect, GetParent,
     GetScrollInfo, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_SIZEALL, KillTimer, LoadCursorW,
-    OBJID_CLIENT, PostMessageW, RegisterClassW, SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP,
-    SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE,
-    SIF_POS, SIF_RANGE, SIF_TRACKPOS, SetCursor, SetTimer, SetWindowLongPtrW, WM_CAPTURECHANGED,
-    WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_GETOBJECT, WM_HSCROLL, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER,
-    WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
+    MSG, OBJID_CLIENT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SB_BOTTOM, SB_HORZ,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
+    SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SetCursor, SetTimer,
+    SetWindowLongPtrW, WM_CAPTURECHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE,
+    WM_GETOBJECT, WM_HSCROLL, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 use zoom::Zoom;
 
@@ -229,14 +230,17 @@ impl ImageView {
         finish(self.hwnd);
     }
 
-    /// Renders SVG source text. The previous render stays on screen until the new one lands.
-    pub fn show_svg(&self, text: Arc<str>, name: &str) {
+    /// Renders SVG source text. An edit of the same document keeps the previous render on screen
+    /// until the new one lands; a `new_document` starts at fit with nothing shown, so its first
+    /// failure shows the failed state rather than another document's picture.
+    pub fn show_svg(&self, text: Arc<str>, name: &str, new_document: bool) {
         self.with(|state| {
             state.name = name.to_owned();
-            if matches!(&state.shown, Some(Shown::Svg(shown)) if **shown == *text) {
+            if !new_document && matches!(&state.shown, Some(Shown::Svg(shown)) if **shown == *text)
+            {
                 return;
             }
-            if !matches!(state.shown, Some(Shown::Svg(_))) {
+            if new_document || !matches!(state.shown, Some(Shown::Svg(_))) {
                 state.zoom = Zoom::Fit;
                 state.offset = (0.0, 0.0);
                 state.image = None;
@@ -460,6 +464,20 @@ fn svg_width(state: &ViewState) -> u32 {
     })
 }
 
+/// Whether the shown SVG bitmap is more than 1% off the size the current zoom renders at, so it
+/// is drawn stretched and should be rendered again.
+fn svg_needs_render(state: &ViewState) -> bool {
+    let Some(image) = &state.image else {
+        return false;
+    };
+    let (wanted, _) = decode::svg_render_size(
+        (image.natural_width, image.natural_height),
+        svg_width(state),
+        state.max_side,
+    );
+    (wanted as f32 - image.width as f32).abs() / image.width.max(1) as f32 > 0.01
+}
+
 fn start_decode(state: &mut ViewState, source: Source) {
     state.generation += 1;
     state.error = None;
@@ -518,6 +536,19 @@ fn accept_decoded(state: &mut ViewState, decoded: Decoded) {
         }
     }
     recompute(state);
+    // An SVG render asked for with the previous document's size (an edit changed its dimensions,
+    // or the first render at natural size fits smaller) is drawn stretched: render it again at
+    // the size this zoom wants.
+    if svg && svg_needs_render(state) {
+        unsafe {
+            SetTimer(
+                state.hwnd,
+                SVG_TIMER,
+                crate::preview::PREVIEW_UPDATE_DELAY_MS,
+                None,
+            )
+        };
+    }
 }
 
 /// Applies the zoom to the current client size: sets `scale` and clamps `offset`.
@@ -667,8 +698,18 @@ fn finish(hwnd: HWND) {
     }) else {
         return;
     };
-    if let Some((horizontal, vertical)) = scroll {
-        for (bar, range) in [(SB_HORZ, horizontal), (SB_VERT, vertical)] {
+    if scroll.is_some() {
+        // Showing or hiding one bar resizes the client area, and the nested WM_SIZE publishes
+        // ranges for the new size; the other bar must not then be set from the old one. So each
+        // bar is set from ranges read just before it.
+        for bar in [SB_HORZ, SB_VERT] {
+            let Some(range) = with_state(hwnd, |state| {
+                let ranges = scroll_ranges(state);
+                state.last_scroll = Some(ranges);
+                if bar == SB_HORZ { ranges.0 } else { ranges.1 }
+            }) else {
+                return;
+            };
             let info = SCROLLINFO {
                 cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -769,6 +810,22 @@ unsafe extern "system" fn image_proc(
             if !pointer.is_null() {
                 drop(unsafe { Box::from_raw(pointer) });
             }
+            // A decode that landed after the last message was read would leak its pixels.
+            let mut queued = MSG::default();
+            while unsafe {
+                PeekMessageW(
+                    &mut queued,
+                    hwnd,
+                    WM_FASTPAD_IMAGE_DECODED,
+                    WM_FASTPAD_IMAGE_DECODED,
+                    PM_REMOVE,
+                )
+            } != 0
+            {
+                if queued.lParam != 0 {
+                    drop(unsafe { Box::from_raw(queued.lParam as *mut Decoded) });
+                }
+            }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_ERASEBKGND => 1,
@@ -861,20 +918,9 @@ unsafe extern "system" fn image_proc(
                         let Some(Shown::Svg(text)) = state.shown.clone() else {
                             return;
                         };
-                        let Some(rendered) = state.image.as_ref().map(|image| image.width) else {
-                            return;
-                        };
-                        let wanted = svg_width(state);
-                        let drift =
-                            (wanted as f32 - rendered as f32).abs() / rendered.max(1) as f32;
-                        if drift > 0.01 {
-                            start_decode(
-                                state,
-                                Source::Svg {
-                                    text,
-                                    width: wanted,
-                                },
-                            );
+                        if svg_needs_render(state) {
+                            let width = svg_width(state);
+                            start_decode(state, Source::Svg { text, width });
                         }
                     });
                 }

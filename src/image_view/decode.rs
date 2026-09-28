@@ -296,6 +296,33 @@ fn read_orientation(frame: &IWICBitmapFrameDecode) -> u16 {
     }
 }
 
+/// The pixel size an SVG of `natural` size renders at for `target_width` (0: natural): the
+/// aspect ratio kept, within `max_side`, and shrunk to at most 64 megapixels so a deep zoom
+/// renders a smaller bitmap that is drawn enlarged instead of failing.
+pub(crate) fn svg_render_size(
+    (natural_width, natural_height): (u32, u32),
+    target_width: u32,
+    max_side: u32,
+) -> (u32, u32) {
+    let width = if target_width == 0 {
+        natural_width
+    } else {
+        target_width
+    };
+    let height = ((u64::from(natural_height) * u64::from(width)) / u64::from(natural_width.max(1)))
+        .max(1) as u32;
+    let (width, height) = fit_within(width, height, max_side);
+    let area = u64::from(width) * u64::from(height);
+    if area <= MAX_IMAGE_PIXELS {
+        return (width, height);
+    }
+    let shrink = (MAX_IMAGE_PIXELS as f64 / area as f64).sqrt();
+    (
+        ((f64::from(width) * shrink).floor() as u32).max(1),
+        ((f64::from(height) * shrink).floor() as u32).max(1),
+    )
+}
+
 pub fn decode_svg_source(
     text: &str,
     target_width: u32,
@@ -309,17 +336,7 @@ pub fn decode_svg_source(
     if natural_width == 0 || natural_height == 0 {
         return Err(ImageError::Damaged);
     }
-    let width = if target_width == 0 {
-        natural_width
-    } else {
-        target_width
-    };
-    let height =
-        ((u64::from(natural_height) * u64::from(width)) / u64::from(natural_width)).max(1) as u32;
-    let (width, height) = fit_within(width, height, max_side);
-    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
-        return Err(ImageError::TooLarge);
-    }
+    let (width, height) = svg_render_size((natural_width, natural_height), target_width, max_side);
     let _com = ComScope::enter();
     let factory = wic_factory()?;
     let pixels = rasterize_source(&factory, text, natural, (width, height))
@@ -337,6 +354,16 @@ pub fn decode_svg_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deeply_zoomed_svg_renders_within_64_megapixels() {
+        // Break caught: a valid 800×600 SVG at 1600% showing "Can't render this SVG".
+        let (width, height) = svg_render_size((800, 600), 12_800, 16_384);
+        assert!(u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS);
+        assert!(width > 8_000 && (width * 3).abs_diff(height * 4) < 8);
+        assert_eq!(svg_render_size((40, 20), 0, 16_384), (40, 20));
+        assert_eq!(svg_render_size((40, 20), 80, 16_384), (80, 40));
+    }
 
     #[test]
     fn classify_maps_decoder_errors_to_messages() {

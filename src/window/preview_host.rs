@@ -330,7 +330,7 @@ fn load_svg(hwnd: HWND) {
     else {
         return;
     };
-    with_host(hwnd, |host| host.svg_document = Some(id));
+    let previous = with_host(hwnd, |host| host.svg_document.replace(id)).flatten();
     if editor.length().unwrap_or(0) as u64 > crate::preview::svg::MAX_SVG_BYTES {
         view.show_error(crate::image_view::decode::ImageError::SvgTooLarge);
         return;
@@ -339,8 +339,15 @@ fn load_svg(hwnd: HWND) {
         .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.title()))
         .unwrap_or_default();
     if let Ok(text) = editor.text() {
-        view.show_svg(std::sync::Arc::from(text), &name);
+        view.show_svg(std::sync::Arc::from(text), &name, previous != Some(id));
     }
+}
+
+/// Whether `window` is the Markdown or the SVG preview window.
+pub(crate) fn owns_view(hwnd: HWND, window: HWND) -> bool {
+    !window.is_null()
+        && (view(hwnd).is_some_and(|view| view.hwnd() == window)
+            || svg_view(hwnd).is_some_and(|view| view.hwnd() == window))
 }
 
 /// Zooms the SVG preview while it has the keyboard focus; false otherwise, so the editor zooms.

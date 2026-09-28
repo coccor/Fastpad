@@ -6,7 +6,9 @@ use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
-use windows_sys::Win32::UI::WindowsAndMessaging::{MoveWindow, SW_HIDE, SW_SHOWNA, ShowWindow};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    IsWindowVisible, MoveWindow, SW_HIDE, SW_SHOWNA, ShowWindow,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct ImageHost {
@@ -84,8 +86,12 @@ pub(crate) fn sync(hwnd: HWND) {
             let had_focus = unsafe { GetFocus() } == view.hwnd();
             unsafe { ShowWindow(view.hwnd(), SW_HIDE) };
             view.release();
-            if had_focus && let Some(editor) = unsafe { host_window::editor_hwnd(hwnd) } {
-                unsafe { SetFocus(editor) };
+            if had_focus {
+                // With no tab left the editor is hidden: typing must not reach its placeholder.
+                let target = unsafe { host_window::editor_hwnd(hwnd) }
+                    .filter(|&editor| unsafe { IsWindowVisible(editor) } != 0)
+                    .unwrap_or(hwnd);
+                unsafe { SetFocus(target) };
             }
         }
         return;
@@ -100,8 +106,13 @@ pub(crate) fn sync(hwnd: HWND) {
     view.show_file(&path, stamp, &name);
     host_window::layout_editor_and_find_bar(hwnd);
     unsafe { ShowWindow(view.hwnd(), SW_SHOWNA) };
+    // The content area's focus follows it onto the image, whether it was on the editor or on a
+    // Markdown or SVG preview that this tab hides.
     let focus = unsafe { GetFocus() };
-    if focus == hwnd || unsafe { host_window::editor_hwnd(hwnd) } == Some(focus) {
+    let in_content = focus == hwnd
+        || unsafe { host_window::editor_hwnd(hwnd) } == Some(focus)
+        || crate::window::preview_host::owns_view(hwnd, focus);
+    if in_content {
         unsafe { SetFocus(view.hwnd()) };
     }
 }
