@@ -1,16 +1,16 @@
-mod json;
-mod json_commands;
-mod lexilla;
-mod markdown;
-mod registry;
 mod bash;
 mod batch;
 mod cpp;
 mod css;
+mod json;
+mod json_commands;
 mod keywords;
+mod lexilla;
+mod markdown;
 mod powershell;
 mod props;
 mod python;
+mod registry;
 mod rust;
 mod sql;
 mod toml;
@@ -513,7 +513,12 @@ mod tests {
         assert!(keywords[0].1.split(' ').any(|word| word == "namespace"));
         assert_eq!(
             harness.strings(SCI_SETPROPERTY),
-            vec![("lexer.cpp.escape.sequence".to_owned(), "1".to_owned())]
+            vec![
+                ("lexer.cpp.escape.sequence".to_owned(), "1".to_owned()),
+                // Break caught: `#if DEBUG` blocks restyled as inactive (styles 64-91), which no
+                // table maps, so they showed as uncoloured text.
+                ("lexer.cpp.track.preprocessor".to_owned(), "0".to_owned()),
+            ]
         );
     }
 

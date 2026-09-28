@@ -33,10 +33,16 @@ fn no_styles(_: Theme) -> &'static [LexerStyle] {
     &[]
 }
 
-const CPP_PROPERTIES: &[(&str, &str)] = &[("lexer.cpp.escape.sequence", "1")];
+// Preprocessor tracking restyles inactive `#if` branches as styles 64-91, which no table maps, so
+// they would show as uncoloured text; colour every branch like the active one instead.
+const CPP_PROPERTIES: &[(&str, &str)] = &[
+    ("lexer.cpp.escape.sequence", "1"),
+    ("lexer.cpp.track.preprocessor", "0"),
+];
 const JS_PROPERTIES: &[(&str, &str)] = &[
     ("lexer.cpp.escape.sequence", "1"),
     ("lexer.cpp.backquoted.strings", "2"),
+    ("lexer.cpp.track.preprocessor", "0"),
 ];
 
 /// Plain Text first, then alphabetical by name: this is the menu and palette order.

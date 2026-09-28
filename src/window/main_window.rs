@@ -2946,12 +2946,22 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
             apply_editor_settings(hwnd);
             crate::window::preview_host::sync_visibility(hwnd);
         }
-        Some(Err(_)) => push_notice(
-            hwnd,
-            "FastPad could not enable syntax highlighting for this file. It will remain in plain \
-             text."
-                .to_owned(),
-        ),
+        Some(Err(_)) => {
+            // An SVG's preview does not need Lexilla, so the tab stays an SVG in plain text.
+            if language == crate::document::Language::Svg {
+                if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                    unsafe { app.as_mut() }.tabs.set_active_language(language);
+                }
+                invalidate_status_bar(hwnd);
+                crate::window::preview_host::sync_visibility(hwnd);
+            }
+            push_notice(
+                hwnd,
+                "FastPad could not enable syntax highlighting for this file. It will remain in \
+                 plain text."
+                    .to_owned(),
+            );
+        }
         None => {}
     }
 }
@@ -7974,6 +7984,42 @@ mod tests {
             .unwrap()
             .language;
         assert_eq!(language_after, Language::PlainText);
+    }
+
+    #[test]
+    fn an_svg_keeps_its_preview_when_highlighting_cannot_load() {
+        // Break caught: SVG moved from the null lexer to Lexilla's xml lexer, so a missing
+        // Lexilla.dll left the tab as plain text and hid the SVG preview it never needed Lexilla
+        // for.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        unsafe {
+            super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+        }
+        .unwrap();
+        let missing = std::env::temp_dir().join(format!(
+            "fastpad-main-window-missing-lexilla-svg-test-{}.dll",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        unsafe {
+            super::app_ptr(window.hwnd)
+                .unwrap()
+                .as_mut()
+                .language_manager = Some(LanguageManager::with_dll_path_for_test(missing));
+        }
+
+        execute_command(window.hwnd, CommandId::LanguageSvg);
+
+        assert_eq!(notices(window.hwnd).len(), 1);
+        let language_after = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .tabs
+            .active()
+            .unwrap()
+            .language;
+        assert_eq!(language_after, Language::Svg);
+        assert!(crate::window::preview_host::buttons_visible(window.hwnd));
     }
 
     #[test]

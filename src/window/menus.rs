@@ -13,13 +13,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, AppendMenuW, CallNextHookEx, CheckMenuItem, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
-    DestroyAcceleratorTable, DestroyMenu, EnableMenuItem, EndMenu, FALT, FCONTROL, FSHIFT,
-    FVIRTKEY, GetSubMenu, HACCEL, HMENU, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSGF_MENU, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL, TPMPARAMS, TrackPopupMenuEx,
-    TranslateAcceleratorW, UnhookWindowsHookEx, WH_MSGFILTER, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE,
+    ACCEL, AppendMenuW, CallNextHookEx, CheckMenuItem, CreateAcceleratorTableW, CreateMenu,
+    CreatePopupMenu, DestroyAcceleratorTable, DestroyMenu, EnableMenuItem, EndMenu, FALT, FCONTROL,
+    FSHIFT, FVIRTKEY, GetMenuItemCount, GetMenuState, GetSubMenu, HACCEL, HMENU, MF_BYCOMMAND,
+    MF_BYPOSITION, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_HILITE, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, MSG, MSGF_MENU, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TPM_TOPALIGN, TPM_VERTICAL, TPMPARAMS, TrackPopupMenuEx, TranslateAcceleratorW,
+    UnhookWindowsHookEx, WH_MSGFILTER, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,9 +428,61 @@ pub(crate) enum DropdownExit {
 
 struct DropdownTracking {
     current: usize,
+    /// The dropdown being tracked, read for which item and submenu are highlighted.
+    menu: HMENU,
     /// Heading rectangles in screen coordinates.
     headings: Vec<RECT>,
     exit: Option<DropdownExit>,
+}
+
+/// Where the keyboard highlight is inside a dropdown that may hold submenus.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HighlightState {
+    /// The dropdown's highlighted item opens a submenu.
+    pub(crate) on_popup_item: bool,
+    /// That submenu is open with one of its own items highlighted.
+    pub(crate) in_submenu: bool,
+}
+
+/// Reads `MF_HILITE` from `menu`'s items and, for a highlighted submenu item, from its children.
+pub(crate) fn highlight_state(menu: HMENU) -> HighlightState {
+    let highlighted = |menu: HMENU| {
+        let count = unsafe { GetMenuItemCount(menu) }.max(0) as u32;
+        (0..count).find(|&position| {
+            let state = unsafe { GetMenuState(menu, position, MF_BYPOSITION) };
+            state != u32::MAX && state & MF_HILITE != 0
+        })
+    };
+    let Some(position) = highlighted(menu) else {
+        return HighlightState::default();
+    };
+    let submenu = unsafe { GetSubMenu(menu, position as i32) };
+    if submenu.is_null() {
+        return HighlightState::default();
+    }
+    HighlightState {
+        on_popup_item: true,
+        in_submenu: highlighted(submenu).is_some(),
+    }
+}
+
+/// What Left/Right does in a dropdown: Right on a submenu item opens it and Left inside a submenu
+/// closes it (both left to Windows, `None`); otherwise the arrows move to the neighboring heading.
+pub(crate) fn arrow_exit(
+    right: bool,
+    current: usize,
+    highlight: HighlightState,
+) -> Option<DropdownExit> {
+    let submenu_owns_the_key = if right {
+        highlight.on_popup_item && !highlight.in_submenu
+    } else {
+        highlight.in_submenu
+    };
+    if submenu_owns_the_key {
+        None
+    } else {
+        Some(DropdownExit::Switch(menu_band::neighbor(current, right)))
+    }
 }
 
 thread_local! {
@@ -461,6 +513,7 @@ pub(crate) fn track_dropdown(
     DROPDOWN.with(|tracking| {
         *tracking.borrow_mut() = Some(DropdownTracking {
             current,
+            menu,
             headings,
             exit: None,
         });
@@ -532,11 +585,15 @@ unsafe extern "system" fn dropdown_filter(code: i32, wparam: WPARAM, lparam: LPA
             let state = tracking.as_mut()?;
             let under_pointer = menu_band::heading_at(&state.headings, message.pt.x, message.pt.y);
             let exit = match message.message {
-                WM_KEYDOWN if message.wParam == VK_LEFT as usize => {
-                    DropdownExit::Switch(menu_band::neighbor(state.current, false))
-                }
-                WM_KEYDOWN if message.wParam == VK_RIGHT as usize => {
-                    DropdownExit::Switch(menu_band::neighbor(state.current, true))
+                WM_KEYDOWN
+                    if message.wParam == VK_LEFT as usize
+                        || message.wParam == VK_RIGHT as usize =>
+                {
+                    arrow_exit(
+                        message.wParam == VK_RIGHT as usize,
+                        state.current,
+                        highlight_state(state.menu),
+                    )?
                 }
                 WM_KEYDOWN if message.wParam == VK_ESCAPE as usize => DropdownExit::Escape,
                 WM_MOUSEMOVE => match under_pointer {
@@ -744,6 +801,81 @@ mod tests {
         assert_ne!(state() & MF_GRAYED, 0);
         set_sidebar_enabled(view, true);
         assert_eq!(state() & MF_GRAYED, 0);
+    }
+
+    #[test]
+    fn arrows_open_and_close_a_submenu_before_switching_headings() {
+        // Break caught: Right on View → Language jumped to the next heading instead of opening
+        // the submenu, and Left inside the submenu left View instead of closing the submenu.
+        use super::{DropdownExit, HighlightState, arrow_exit};
+        use crate::window::menu_band::neighbor;
+        let plain = HighlightState::default();
+        let on_popup = HighlightState {
+            on_popup_item: true,
+            in_submenu: false,
+        };
+        let inside = HighlightState {
+            on_popup_item: true,
+            in_submenu: true,
+        };
+
+        assert_eq!(arrow_exit(true, 2, on_popup), None);
+        assert_eq!(arrow_exit(false, 2, inside), None);
+        assert_eq!(
+            arrow_exit(true, 2, plain),
+            Some(DropdownExit::Switch(neighbor(2, true)))
+        );
+        assert_eq!(
+            arrow_exit(false, 2, plain),
+            Some(DropdownExit::Switch(neighbor(2, false)))
+        );
+        assert_eq!(
+            arrow_exit(false, 2, on_popup),
+            Some(DropdownExit::Switch(neighbor(2, false)))
+        );
+        // Right on a leaf inside the submenu moves on, as Windows' own menu bar does.
+        assert_eq!(
+            arrow_exit(true, 2, inside),
+            Some(DropdownExit::Switch(neighbor(2, true)))
+        );
+    }
+
+    #[test]
+    fn highlight_state_reads_the_dropdown_and_its_open_submenu() {
+        use super::{HighlightState, MenuBar, highlight_state};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSubMenu, MENUITEMINFOW, MFS_HILITE, MIIM_STATE, SetMenuItemInfoW,
+        };
+        let bar = MenuBar::create().unwrap();
+        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
+        let hilite = |menu, position: u32| {
+            let info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_STATE,
+                fState: MFS_HILITE,
+                ..unsafe { std::mem::zeroed() }
+            };
+            assert_ne!(unsafe { SetMenuItemInfoW(menu, position, 1, &info) }, 0);
+        };
+
+        assert_eq!(highlight_state(view), HighlightState::default());
+        // View's first item is the Language submenu.
+        hilite(view, 0);
+        assert_eq!(
+            highlight_state(view),
+            HighlightState {
+                on_popup_item: true,
+                in_submenu: false
+            }
+        );
+        hilite(unsafe { GetSubMenu(view, 0) }, 3);
+        assert_eq!(
+            highlight_state(view),
+            HighlightState {
+                on_popup_item: true,
+                in_submenu: true
+            }
+        );
     }
 
     #[test]

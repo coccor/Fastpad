@@ -4,9 +4,9 @@ use crate::editor::scintilla_constants::{
     SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETLENGTH, SCI_GETSELECTIONEND,
     SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTARGETEND, SCI_GETTEXT, SCI_GETTEXTLENGTH,
     SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET,
-    SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETSAVEPOINT,
-    SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION,
-    SCI_SETKEYWORDS, SCI_SETPROPERTY, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
+    SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETKEYWORDS,
+    SCI_SETPROPERTY, SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
+    SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
     SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_STYLESETITALIC, SCI_UNDO,
 };
 #[cfg(windows)]
@@ -1123,8 +1123,11 @@ impl Editor {
             .send_direct_checked(SCI_STYLESETBACK, style as usize, background as isize)?;
         self.endpoint
             .send_direct_checked(SCI_STYLESETBOLD, style as usize, isize::from(bold))?;
-        self.endpoint
-            .send_direct_checked(SCI_STYLESETITALIC, style as usize, isize::from(italic))?;
+        self.endpoint.send_direct_checked(
+            SCI_STYLESETITALIC,
+            style as usize,
+            isize::from(italic),
+        )?;
         self.endpoint.send_direct_checked(
             SCI_STYLESETFONT,
             style as usize,
@@ -2072,7 +2075,11 @@ mod tests {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        assert!(editor.set_style(0, 0, 0, false, false, "bad\0face").is_err());
+        assert!(
+            editor
+                .set_style(0, 0, 0, false, false, "bad\0face")
+                .is_err()
+        );
     }
 
     #[test]
