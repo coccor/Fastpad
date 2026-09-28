@@ -1,6 +1,7 @@
 //! The Notebook view's Open Editors section (open editors spec §3.2): one row per tab in
 //! tab-strip order, with its type icon and name, a dot while it has unsaved changes and a close
-//! box on hover. Built from the tab list in memory: no disk.
+//! box on hover. With several editor groups, each group's tabs follow a "Group N" header (split
+//! editors spec §7). Built from the tab list in memory: no disk.
 
 use crate::document::{Document, DocumentId};
 use crate::window::file_icons::note_kind;
@@ -11,6 +12,7 @@ use crate::window::notebook_view::draw_item_icon;
 use crate::window::panel::scale;
 use crate::window::row_list::{RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{ViewPaint, draw_text};
+use crate::window::split_tree::GroupId;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -32,6 +34,8 @@ const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EditorRow {
     pub id: DocumentId,
+    /// The group whose tab this is.
+    pub group: GroupId,
     /// The file name with its extension, or an untitled tab's label.
     pub name: String,
     pub path: Option<PathBuf>,
@@ -48,37 +52,86 @@ pub(crate) fn unsaved_label(document: &Document) -> String {
         .unwrap_or_else(|| "Untitled".to_owned())
 }
 
-/// One row per document, in the order given (the strip's).
-pub(crate) fn editor_rows<'a>(
-    documents: impl Iterator<Item = &'a Document>,
-    active: Option<DocumentId>,
-) -> Vec<EditorRow> {
-    documents
-        .map(|document| EditorRow {
-            id: document.id,
-            name: match &document.path {
-                Some(path) => path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                ),
-                None => unsaved_label(document),
-            },
-            path: document.path.clone(),
-            dirty: document.dirty,
-            active: Some(document.id) == active,
-        })
-        .collect()
+/// A row of the section: a group's header, or one of its tabs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EditorEntry {
+    /// "Group N", numbered from 1 in layout order.
+    Header(usize),
+    View(EditorRow),
+}
+
+impl EditorEntry {
+    pub(crate) fn row(&self) -> Option<&EditorRow> {
+        match self {
+            Self::Header(_) => None,
+            Self::View(row) => Some(row),
+        }
+    }
+
+    /// What stays the same while the row only changes its look: the header's number, or the
+    /// view's group and document.
+    pub(crate) fn key(&self) -> (Option<usize>, Option<(GroupId, DocumentId)>) {
+        match self {
+            Self::Header(number) => (Some(*number), None),
+            Self::View(row) => (None, Some((row.group, row.id))),
+        }
+    }
+}
+
+fn editor_row(
+    document: &Document,
+    group: GroupId,
+    active: Option<(GroupId, DocumentId)>,
+) -> EditorRow {
+    EditorRow {
+        id: document.id,
+        group,
+        name: match &document.path {
+            Some(path) => path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            None => unsaved_label(document),
+        },
+        path: document.path.clone(),
+        dirty: document.dirty,
+        active: Some((group, document.id)) == active,
+    }
+}
+
+/// Every group's tabs in strip order, the groups in the order given (layout order). Headers only
+/// with two or more groups, so one group looks as it always has.
+pub(crate) fn entries(
+    groups: &[(GroupId, Vec<&Document>)],
+    active: Option<(GroupId, DocumentId)>,
+) -> Vec<EditorEntry> {
+    let headers = groups.len() > 1;
+    let mut entries = Vec::new();
+    for (number, (group, documents)) in groups.iter().enumerate() {
+        if headers {
+            entries.push(EditorEntry::Header(number + 1));
+        }
+        entries.extend(
+            documents
+                .iter()
+                .map(|document| EditorEntry::View(editor_row(document, *group, active))),
+        );
+    }
+    entries
 }
 
 /// The rows for the window's tabs now. Borrows the App on its own, never nested.
-pub(crate) fn snapshot(hwnd: HWND) -> Vec<EditorRow> {
+pub(crate) fn snapshot(hwnd: HWND) -> Vec<EditorEntry> {
+    let order = crate::window::main_window::group_order(hwnd);
     unsafe { app_ptr(hwnd) }
         .map(|app| {
             let tabs = &unsafe { app.as_ref() }.tabs;
-            editor_rows(
-                tabs.group_documents(tabs.active_group()).into_iter(),
-                tabs.active().map(|active| active.id),
-            )
+            let groups = order
+                .iter()
+                .map(|id| (*id, tabs.group_documents(*id)))
+                .collect::<Vec<_>>();
+            let active = tabs.active().map(|active| (tabs.active_group(), active.id));
+            entries(&groups, active)
         })
         .unwrap_or_default()
 }
@@ -120,7 +173,7 @@ pub(crate) fn tree_item(row: &EditorRow) -> TreeItem {
 /// The section's rows and its own list state (scroll, hover, the active row as selected).
 #[derive(Debug)]
 pub(crate) struct OpenEditors {
-    pub rows: Vec<EditorRow>,
+    pub rows: Vec<EditorEntry>,
     pub list: RowListState,
     /// The pointer is over the hovered row's close box.
     pub hover_close: bool,
@@ -136,7 +189,7 @@ impl OpenEditors {
     }
 
     /// Takes `rows`; true when anything shown changed. The list's selection is the active row.
-    pub(crate) fn set_rows(&mut self, rows: Vec<EditorRow>) -> bool {
+    pub(crate) fn set_rows(&mut self, rows: Vec<EditorEntry>) -> bool {
         if rows == self.rows {
             return false;
         }
@@ -147,8 +200,50 @@ impl OpenEditors {
     }
 
     pub(crate) fn active_index(&self) -> Option<usize> {
-        self.rows.iter().position(|row| row.active)
+        self.rows
+            .iter()
+            .position(|entry| entry.row().is_some_and(|row| row.active))
     }
+
+    /// The tab at entry `index`; `None` for a header.
+    pub(crate) fn row(&self, index: usize) -> Option<&EditorRow> {
+        self.rows.get(index)?.row()
+    }
+
+    pub(crate) fn is_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(EditorEntry::Header(_)))
+    }
+
+    /// How many tabs the section lists, headers left out.
+    pub(crate) fn view_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|entry| entry.row().is_some())
+            .count()
+    }
+}
+
+/// The label a header row shows and screen readers hear.
+pub(crate) fn header_label(number: usize) -> String {
+    format!("Group {number}")
+}
+
+/// Paints a group's header row, in the section header's style: no icon and no close box.
+pub(crate) fn draw_header(dc: HDC, number: usize, rect: RECT, paint: &ViewPaint) {
+    let text = RECT {
+        left: (rect.left + scale(LEFT_PAD, paint.dpi)).min(rect.right),
+        ..rect
+    };
+    unsafe {
+        draw_text(
+            dc,
+            &header_label(number),
+            text,
+            paint.fonts.bold,
+            paint.palette.muted_foreground,
+            LINE,
+        )
+    };
 }
 
 /// Paints one row: the icon, the name, and at the right the dot of a dirty tab or, on hover or
@@ -225,7 +320,11 @@ mod tests {
             untitled,
             document(4, None, false),
         ];
-        let rows = editor_rows(docs.iter(), Some(DocumentId(2)));
+        let entries = entries(
+            &[(GroupId(1), docs.iter().collect())],
+            Some((GroupId(1), DocumentId(2))),
+        );
+        let rows: Vec<_> = entries.iter().filter_map(EditorEntry::row).collect();
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["todo.md", "draft.txt", "Groceries", "Untitled"]);
         assert_eq!(
@@ -241,9 +340,37 @@ mod tests {
     }
 
     #[test]
+    fn several_groups_get_headers_and_one_group_stays_flat() {
+        // Break caught: a "Group 1" header shown with a single group, or a document open in two
+        // groups listed once.
+        let a = document(1, Some("a"), false);
+        let b = document(2, Some("b"), false);
+        let one = entries(&[(GroupId(1), vec![&a, &b])], Some((GroupId(1), a.id)));
+        assert!(
+            one.iter()
+                .all(|entry| matches!(entry, EditorEntry::View(_)))
+        );
+        let two = entries(
+            &[(GroupId(1), vec![&a]), (GroupId(3), vec![&a, &b])],
+            Some((GroupId(3), b.id)),
+        );
+        let shape: Vec<_> = two
+            .iter()
+            .map(|entry| match entry {
+                EditorEntry::Header(number) => format!("G{number}"),
+                EditorEntry::View(row) => {
+                    format!("{}{}", row.name, if row.active { "*" } else { "" })
+                }
+            })
+            .collect();
+        assert_eq!(shape, vec!["G1", "a", "G2", "a", "b*"]);
+    }
+
+    #[test]
     fn names_tips_and_the_close_box() {
         let row = EditorRow {
             id: DocumentId(1),
+            group: GroupId(1),
             name: "draft.txt".into(),
             path: Some(PathBuf::from(r"D:\x\draft.txt")),
             dirty: true,
@@ -274,11 +401,17 @@ mod tests {
             document(1, Some(r"C:\a.md"), false),
             document(2, Some(r"C:\b.md"), false),
         ];
+        let rows = |active: u64| {
+            entries(
+                &[(GroupId(1), docs.iter().collect())],
+                Some((GroupId(1), DocumentId(active))),
+            )
+        };
         let mut editors = OpenEditors::new(26);
-        assert!(editors.set_rows(editor_rows(docs.iter(), Some(DocumentId(2)))));
+        assert!(editors.set_rows(rows(2)));
         assert_eq!((editors.list.count, editors.list.selected), (2, Some(1)));
-        assert!(!editors.set_rows(editor_rows(docs.iter(), Some(DocumentId(2)))));
-        assert!(editors.set_rows(editor_rows(docs.iter(), Some(DocumentId(1)))));
+        assert!(!editors.set_rows(rows(2)));
+        assert!(editors.set_rows(rows(1)));
         assert_eq!(editors.list.selected, Some(0));
     }
 }

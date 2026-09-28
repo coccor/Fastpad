@@ -2719,6 +2719,21 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
         (PickerKind::QuickOpen, PickerChoice::Note { path, line }) => {
             super::main_window::open_quick_open_choice(hwnd, &path, line);
         }
+        (PickerKind::QuickOpen, PickerChoice::View { path, group }) => {
+            // The tab listed, in the group listed: never a new view (split editors spec §7).
+            let id = folder(hwnd).and_then(|folder| {
+                let app = unsafe { app_ptr(hwnd) }?;
+                unsafe { app.as_ref() }
+                    .tabs
+                    .find_stored_path(&folder.join(&path))
+            });
+            match id {
+                Some(id) if super::main_window::focus_view(hwnd, group, id) => {
+                    super::main_window::focus_content(hwnd);
+                }
+                _ => super::main_window::open_quick_open_choice(hwnd, &path, None),
+            }
+        }
         (PickerKind::QuickOpen, PickerChoice::GoToLine(line)) => {
             super::main_window::go_to_line(hwnd, line);
             // A note pick focuses the editor (`open_note(.., true)`); a `:n` pick moves the

@@ -2160,19 +2160,38 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
         let selected = (!rows.is_empty()).then_some(0);
         return (rows, selected);
     }
-    // Nothing typed: the notes open in tabs, the most recently used first (spec §3.2). Tabs
-    // outside the notebook are left out here, untitled ones by having no path.
+    // Nothing typed: the notes open in tabs, the most recently used first (spec §3.2), across
+    // groups (split editors spec §7). Tabs outside the notebook are left out here, untitled ones
+    // by having no path.
+    let order = group_order(hwnd);
+    let number = |group: GroupId| {
+        (order.len() > 1)
+            .then(|| {
+                order
+                    .iter()
+                    .position(|id| *id == group)
+                    .map(|index| index + 1)
+            })
+            .flatten()
+    };
     let open = unsafe { app_ptr(hwnd) }
         .map(|app| {
             let tabs = &unsafe { app.as_ref() }.tabs;
-            let active = tabs.active().map(|document| document.id);
+            let active = tabs
+                .active()
+                .map(|document| (tabs.active_group(), document.id));
             tabs.activation_order()
                 .iter()
-                .filter_map(|&(_, id)| {
+                .filter_map(|&(group, id)| {
                     let path = tabs.document(id)?.path.as_deref()?;
                     let relative = crate::library::record_path(&folder, path);
-                    (!relative.is_absolute())
-                        .then(|| (crate::library::path_key(&relative), Some(id) == active))
+                    (!relative.is_absolute()).then(|| {
+                        (
+                            crate::library::path_key(&relative),
+                            Some((group, id)) == active,
+                            group,
+                        )
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -2184,7 +2203,7 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
     let (rows, first_active) = crate::window::library_host::with_state(hwnd, |state| {
         let wanted = open
             .iter()
-            .map(|(key, _)| key.as_str())
+            .map(|(key, ..)| key.as_str())
             .collect::<std::collections::HashSet<_>>();
         let mut listed = std::collections::HashMap::new();
         for note in &state.notes {
@@ -2195,7 +2214,7 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
         }
         let mut rows = Vec::new();
         let mut first_active = false;
-        for (key, active) in &open {
+        for (key, active, group) in &open {
             let Some(path) = listed.get(key) else {
                 continue;
             };
@@ -2205,7 +2224,11 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
             if rows.is_empty() {
                 first_active = *active;
             }
-            rows.push(PickerRow::Note { found, line: None });
+            rows.push(PickerRow::View {
+                found,
+                group: *group,
+                number: number(*group),
+            });
         }
         (rows, first_active)
     })
@@ -2219,6 +2242,26 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
         _ => Some(0),
     };
     (rows, selected)
+}
+
+/// Shows `id`'s view in `group`, making that group active; never adds a view. False when `group`
+/// has no view of `id`. The focus stays where it is.
+pub(crate) fn focus_view(hwnd: HWND, group: GroupId, id: DocumentId) -> bool {
+    let revision = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let tabs = unsafe { app.as_ref() }.tabs.group(group)?;
+        tabs.contains(id).then(|| tabs.view().snapshot().revision)
+    });
+    let Some(revision) = revision else {
+        return false;
+    };
+    activate_group(hwnd, group);
+    let shown = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .group(group)
+            .is_some_and(|tabs| tabs.active_document() == Some(id))
+    });
+    shown || activate_document_in(hwnd, group, id, revision)
 }
 
 /// Opens a quick-open pick (spec §3.5). `relative` is resolved again against the notebook's
@@ -8674,6 +8717,67 @@ three"
     }
 
     #[test]
+    fn clicking_an_open_editors_row_focuses_that_group_and_a_header_does_nothing() {
+        // Break caught: a click on group 2's row opening a copy in the active group, or a header
+        // row acting like a tab.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-groups");
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        execute_command(window.hwnd, CommandId::New);
+        let first = super::group_order(window.hwnd)[0];
+        let panel = sidebar_windows(window.hwnd).1;
+        let header = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+        mouse(panel, WM_LBUTTONUP, 0, centre(header));
+        assert_ne!(app_mut(window.hwnd).tabs.active_group(), first);
+        let row = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row));
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        assert_eq!(
+            app_mut(window.hwnd).tabs.views_of(id).len(),
+            2,
+            "no copy made"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_lists_views_in_every_group_and_picking_one_focuses_it() {
+        // Break caught: the MRU rows only covering the active group, or a pick adding a view to
+        // the active group instead of going to the one listed.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-groups");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::FocusGroup2);
+        super::open_path(window.hwnd, &b).unwrap();
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        let (rows, _) = super::quick_open_rows(window.hwnd, "");
+        let groups: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                crate::window::command_palette::PickerRow::View { number, found, .. } => {
+                    Some((found.name.clone(), *number))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(groups.contains(&("b.md".to_owned(), Some(2))), "{groups:?}");
+        let b_id = app_mut(window.hwnd).tabs.find_path(&b).unwrap();
+        let second = super::group_order(window.hwnd)[1];
+        assert!(super::focus_view(window.hwnd, second, b_id));
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(b_id), vec![second]);
+    }
+
+    #[test]
     fn the_editor_and_find_bar_live_in_the_group_window() {
         // Break caught: a child left parented to the main window, painting over or under the
         // group and missing its layout.
@@ -9392,7 +9496,8 @@ three"
                 .shown_picker_rows()
                 .iter()
                 .map(|row| match row {
-                    crate::window::command_palette::PickerRow::Note { found, .. } => {
+                    crate::window::command_palette::PickerRow::Note { found, .. }
+                    | crate::window::command_palette::PickerRow::View { found, .. } => {
                         found.name.clone()
                     }
                     other => format!("{other:?}"),
@@ -22264,6 +22369,7 @@ three"
                 .editors
                 .rows
                 .iter()
+                .filter_map(crate::window::open_editors::EditorEntry::row)
                 .map(|row| (row.name.clone(), row.dirty, row.active))
                 .collect::<Vec<_>>()
         };
@@ -22347,7 +22453,7 @@ three"
         };
         toggle();
         assert!(!super::open_editors_expanded(window.hwnd));
-        let fifth = notebook_view(window.hwnd).editors.rows[4].id;
+        let fifth = notebook_view(window.hwnd).editors.row(4).unwrap().id;
         super::activate_document_by_id(window.hwnd, fifth);
         assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(4));
         toggle();
@@ -23680,7 +23786,11 @@ three"
                 .editors
                 .rows
                 .iter()
-                .position(|row| row.path.as_deref() == Some(outside.as_path()))
+                .position(|entry| {
+                    entry
+                        .row()
+                        .is_some_and(|row| row.path.as_deref() == Some(outside.as_path()))
+                })
                 .unwrap();
             start_tab_drag(window.hwnd, panel, tab);
             let root = notebook_view(window.hwnd).root_rect();

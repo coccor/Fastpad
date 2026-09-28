@@ -289,6 +289,13 @@ pub(crate) enum PickerRow {
     GoToLine(u32),
     /// A row that can't be picked, such as `NO_NOTEBOOK`.
     Notice(&'static str),
+    /// An empty query's open tab: the note shown in `group`, whose number the row shows while
+    /// there are several groups (split editors spec §7).
+    View {
+        found: QuickMatch,
+        group: crate::window::split_tree::GroupId,
+        number: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,6 +308,11 @@ pub(crate) enum PickerChoice {
         line: Option<u32>,
     },
     GoToLine(u32),
+    /// An open tab: the note, relative to the notebook, in `group`.
+    View {
+        path: PathBuf,
+        group: crate::window::split_tree::GroupId,
+    },
 }
 
 pub(crate) fn picker_rows(picker: &Picker, query: &str) -> Vec<PickerRow> {
@@ -345,6 +357,17 @@ pub(crate) fn picker_row_label(picker: &Picker, row: &PickerRow) -> String {
         PickerRow::Note { found, .. } => format!("{}, in {}", found.name, found.folder),
         PickerRow::GoToLine(line) => format!("Go to line {line}"),
         PickerRow::Notice(text) => (*text).to_owned(),
+        PickerRow::View { found, number, .. } => {
+            let mut label = if found.folder.is_empty() {
+                found.name.clone()
+            } else {
+                format!("{}, in {}", found.name, found.folder)
+            };
+            if let Some(number) = number {
+                label.push_str(&format!(", group {number}"));
+            }
+            label
+        }
     }
 }
 
@@ -811,6 +834,10 @@ impl CommandPalette {
             },
             PickerRow::GoToLine(line) => PickerChoice::GoToLine(*line),
             PickerRow::Notice(_) => return None,
+            PickerRow::View { found, group, .. } => PickerChoice::View {
+                path: found.path.clone(),
+                group: *group,
+            },
         })
     }
 
@@ -1002,7 +1029,7 @@ impl CommandPalette {
         }
         let previous = unsafe { SelectObject(dc, font) };
         match row {
-            PickerRow::Note { found, .. } => {
+            PickerRow::Note { found, .. } | PickerRow::View { found, .. } => {
                 draw_runs(
                     dc,
                     &mut text,
@@ -1023,6 +1050,15 @@ impl CommandPalette {
                         bold,
                         muted,
                     );
+                }
+                if let PickerRow::View {
+                    number: Some(number),
+                    ..
+                } = row
+                {
+                    text.left += padding;
+                    let group = format!("Group {number}");
+                    draw_runs(dc, &mut text, &group, &[], font, bold, muted);
                 }
             }
             PickerRow::Notice(label) => draw_runs(dc, &mut text, label, &[], font, bold, muted),

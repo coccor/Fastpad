@@ -1177,7 +1177,8 @@ impl NotebookView {
                 return Hit::Empty;
             };
             let row = self.editors_row_rect(layout.editors_list, index);
-            let clean = self.editors.rows.get(index).is_some_and(|row| !row.dirty);
+            // A header row has no close box.
+            let clean = self.editors.row(index).is_some_and(|row| !row.dirty);
             let close = clean
                 && row.is_some_and(|row| contains(super::open_editors::close_rect(row, dpi), x, y));
             return Hit::Editor { index, close };
@@ -1446,7 +1447,7 @@ impl NotebookView {
         // An Open Editors row shows its path; a tree row its cut-off name.
         let editor_tip = self.editors.list.hover.and_then(|index| {
             let rect = self.editors_row_rect(layout.editors_list, index)?;
-            let row = self.editors.rows.get(index)?;
+            let row = self.editors.row(index)?;
             Some((rect, super::open_editors::tooltip(row)))
         });
         let (row_rect, row_text) = match editor_tip {
@@ -1681,7 +1682,7 @@ impl NotebookView {
             left: chevron.right,
             ..layout.editors_header
         };
-        let count = self.editors.rows.len();
+        let count = self.editors.view_count();
         bold(
             &format!("OPEN EDITORS  {count}"),
             label,
@@ -1697,8 +1698,11 @@ impl NotebookView {
             &editors.list,
             palette,
             paint.focused,
-            &mut |dc, index, rect, look| {
-                if let Some(row) = editors.rows.get(index) {
+            &mut |dc, index, rect, look| match editors.rows.get(index) {
+                Some(super::open_editors::EditorEntry::Header(number)) => {
+                    super::open_editors::draw_header(dc, *number, rect, paint);
+                }
+                Some(super::open_editors::EditorEntry::View(row)) => {
                     super::open_editors::draw_editor_row(
                         dc,
                         row,
@@ -1709,6 +1713,7 @@ impl NotebookView {
                         hover_close && look.hover,
                     );
                 }
+                None => {}
             },
         );
         // The root row: chevron, name, and its buttons (not without a notebook).
@@ -2043,7 +2048,7 @@ pub(crate) fn editors_changed(hwnd: HWND) {
             || rows
                 .iter()
                 .zip(&view.editors.rows)
-                .any(|(new, old)| new.id != old.id);
+                .any(|(new, old)| new.key() != old.key());
         let changed = view.editors.set_rows(rows);
         if reordered {
             // Screen readers hear the reorder (`accessible_generation`).
@@ -2401,7 +2406,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_MBUTTONDOWN => {
             let (x, y) = point_of(lparam);
             let pressed = with_view(hwnd, |view| match view.hit_test(x, y) {
-                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                Hit::Editor { index, .. } => view.editors.row(index).map(|row| row.id),
                 _ => None,
             })
             .flatten();
@@ -2412,11 +2417,13 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             let (x, y) = point_of(lparam);
             let pressed = with_view(hwnd, |view| view.middle_press.take()).flatten();
             let released = with_view(hwnd, |view| match view.hit_test(x, y) {
-                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                Hit::Editor { index, .. } => view.editors.row(index).map(|row| (row.id, row.group)),
                 _ => None,
             })
             .flatten();
-            if let Some(id) = pressed.filter(|id| Some(*id) == released) {
+            if let Some((id, group)) = released.filter(|(id, _)| pressed == Some(*id)) {
+                // The row's own group loses the tab.
+                super::main_window::activate_group(hwnd, group);
                 super::main_window::close_document_tab(hwnd, id);
             }
             Some(0)
@@ -3068,14 +3075,16 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
             rebuild(hwnd);
         }
         Hit::Editor { index, close } => {
-            let Some(row) = with_view(hwnd, |view| view.editors.rows.get(index).cloned()).flatten()
+            // A header row does nothing.
+            let Some(row) = with_view(hwnd, |view| view.editors.row(index).cloned()).flatten()
             else {
                 return;
             };
             if close {
+                super::main_window::activate_group(hwnd, row.group);
                 super::main_window::close_document_tab(hwnd, row.id);
             } else {
-                super::main_window::activate_document_by_id(hwnd, row.id);
+                super::main_window::focus_view(hwnd, row.group, row.id);
                 // The path is taken now, so the drag outlives its tab closing (open editors spec
                 // §4.3). An untitled tab has no file to copy: no drag.
                 if let Some(path) = row.path {
@@ -3271,7 +3280,21 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
                 view.invalidate();
                 return;
             }
-            match panel_cursor::step(view.cursor, view.list.selected, list_key, shape) {
+            let mut stepped = panel_cursor::step(view.cursor, view.list.selected, list_key, shape);
+            // A group's header row is passed over, as a separator is.
+            for _ in 0..view.editors.rows.len() {
+                match stepped {
+                    Some((Cursor::Editor(index), tree)) if view.editors.is_header(index) => {
+                        let next = panel_cursor::step(Cursor::Editor(index), tree, list_key, shape);
+                        if next == stepped {
+                            break;
+                        }
+                        stepped = next;
+                    }
+                    _ => break,
+                }
+            }
+            match stepped {
                 Some((cursor, tree)) => {
                     view.cursor = cursor;
                     if let Some(index) = tree {
@@ -3362,12 +3385,13 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
 fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
     match (cursor, key) {
         (Cursor::Editor(index), VK_RETURN) => {
-            let Some(id) =
-                with_view(hwnd, |view| view.editors.rows.get(index).map(|row| row.id)).flatten()
-            else {
+            let Some((group, id)) = with_view(hwnd, |view| {
+                view.editors.row(index).map(|row| (row.group, row.id))
+            })
+            .flatten() else {
                 return true;
             };
-            super::main_window::activate_document_by_id(hwnd, id);
+            super::main_window::focus_view(hwnd, group, id);
             super::main_window::focus_content(hwnd);
         }
         (Cursor::EditorsHeader, VK_RETURN | VK_LEFT | VK_RIGHT) => {
@@ -3504,7 +3528,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         let index = index - buttons.len();
         if index < header {
             return Some(section_item(
-                &format!("Open editors, {}", self.editors.rows.len()),
+                &format!("Open editors, {}", self.editors.view_count()),
                 self.editors_expanded,
                 self.cursor == Cursor::EditorsHeader,
                 focused,
@@ -3513,8 +3537,16 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         }
         let index = index - header;
         if index < editors {
-            let row = self.editors.rows.get(index)?;
             let (rect, visible) = row_rect(layout.editors_list, &self.editors.list, index);
+            let row = match self.editors.rows.get(index)? {
+                super::open_editors::EditorEntry::Header(number) => {
+                    return Some(crate::window::sidebar_accessibility::text_item(
+                        &super::open_editors::header_label(*number),
+                        rect,
+                    ));
+                }
+                super::open_editors::EditorEntry::View(row) => row,
+            };
             return Some(editor_item(
                 &super::open_editors::accessible_name(row),
                 self.cursor == Cursor::Editor(index),
@@ -3672,8 +3704,14 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         }
         let index = index - header;
         if index < editors {
-            let row = self.editors.rows.get(index)?;
-            return Some(identity_of(&("editor", row.id.0)));
+            return Some(match self.editors.rows.get(index)? {
+                super::open_editors::EditorEntry::Header(number) => {
+                    identity_of(&("editor-group", *number))
+                }
+                super::open_editors::EditorEntry::View(row) => {
+                    identity_of(&("editor", row.group.0, row.id.0))
+                }
+            });
         }
         let index = index - editors;
         if index < root {
