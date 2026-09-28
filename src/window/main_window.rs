@@ -5105,6 +5105,18 @@ pub(super) fn close_document_without_prompt(hwnd: HWND, id: DocumentId) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    let previous = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+    close_every_view(hwnd, &identity, id);
+    // Closing a view elsewhere activated its group; the one the user was in stays active.
+    if let Some(previous) = previous
+        && identity.is_live_for(hwnd)
+        && with_group_id(hwnd, previous, |_| ()).is_some()
+    {
+        activate_group(hwnd, previous);
+    }
+}
+
+fn close_every_view(hwnd: HWND, identity: &WindowIdentity, id: DocumentId) {
     let views = || {
         unsafe { app_ptr(hwnd) }.map_or(0, |app| unsafe { app.as_ref() }.tabs.views_of(id).len())
     };
@@ -5122,7 +5134,7 @@ pub(super) fn close_document_without_prompt(hwnd: HWND, id: DocumentId) {
         if review.id != id {
             return;
         }
-        close_reviewed_document(hwnd, &identity, &editor, review, CloseDecision::Discard);
+        close_reviewed_document(hwnd, identity, &editor, review, CloseDecision::Discard);
         if !identity.is_live_for(hwnd) || views() >= before {
             return;
         }
@@ -7331,7 +7343,20 @@ pub(crate) fn activate_group(hwnd: HWND, id: GroupId) -> bool {
     true
 }
 
-/// A press or the focus arriving in the group window `group` makes its group active.
+/// A press on the group window `group` makes its group active, and takes the focus along when
+/// another group had it: typing then goes where the commands go.
+pub(crate) fn press_group_window(hwnd: HWND, group: HWND) {
+    let Some(id) = group_id_of(hwnd, group) else {
+        return;
+    };
+    let focused = group_of_child(hwnd, unsafe { GetFocus() });
+    activate_group(hwnd, id);
+    if focused.is_some_and(|focused| focused != id) {
+        focus_content(hwnd);
+    }
+}
+
+/// The focus arriving in the group window `group` makes its group active.
 pub(crate) fn activate_group_window(hwnd: HWND, group: HWND) {
     if let Some(id) = group_id_of(hwnd, group) {
         activate_group(hwnd, id);
@@ -8758,6 +8783,59 @@ three"
     }
 
     #[test]
+    fn a_tab_click_in_another_group_moves_the_focus_there() {
+        // Break caught: the click makes the other group active but the caret stays in the first
+        // group's editor, so typing edits one document while Ctrl+S saves another.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        unsafe { SetFocus(editor.hwnd()) };
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        let tab = super::strip_layout_of(window.hwnd, second)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let point = client_lparam(tab.x, tab.y);
+        unsafe {
+            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(
+            unsafe { GetFocus() },
+            super::group_editor(window.hwnd, second).unwrap().hwnd()
+        );
+    }
+
+    #[test]
+    fn closing_a_document_shown_only_elsewhere_leaves_the_focused_group_active() {
+        // Break caught: a file deleted on disk closes its view in another group by activating
+        // that group, and leaves it active while the caret stays in the first group.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        execute_command(window.hwnd, CommandId::New);
+        let elsewhere = app_mut(window.hwnd).tabs.active().unwrap().id;
+        unsafe { SetFocus(editor.hwnd()) };
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+
+        super::close_document_without_prompt(window.hwnd, elsewhere);
+
+        assert!(app_mut(window.hwnd).tabs.document(elsewhere).is_none());
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        assert_eq!(unsafe { GetFocus() }, editor.hwnd());
+    }
+
+    #[test]
     fn a_split_without_room_is_refused_with_a_notice() {
         // Break caught: a split into a sliver narrower than the minimum group.
         use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOZORDER, SetWindowPos};
@@ -9212,8 +9290,8 @@ three"
         let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
         let point = client_lparam(tab.left + 10, tab.bottom / 2);
         unsafe {
-            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
-            SendMessageW(group, WM_LBUTTONUP, 0, point);
+            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
         }
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
     }
@@ -9249,10 +9327,10 @@ three"
         let group = super::group_hwnd(window.hwnd).unwrap();
         let point = client_lparam(close.x, close.y);
         unsafe {
-            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
-            SendMessageW(group, WM_LBUTTONUP, 0, point);
+            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
             SendMessageW(group, WM_LBUTTONDBLCLK, 1, point);
-            SendMessageW(group, WM_LBUTTONUP, 0, point);
+            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
         }
         assert_eq!(super::tab_count(window.hwnd), 2);
     }
@@ -9494,8 +9572,8 @@ three"
         let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
         let point = client_lparam(tab.left + 10, tab.bottom / 2);
         unsafe {
-            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
-            SendMessageW(group, WM_LBUTTONUP, 0, point);
+            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
         }
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
         assert_eq!(app_mut(window.hwnd).menu_mode, None);

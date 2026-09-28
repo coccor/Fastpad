@@ -121,7 +121,7 @@ unsafe extern "system" fn group_proc(
         message,
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_MBUTTONDOWN
     ) {
-        super::main_window::activate_group_window(main, hwnd);
+        super::main_window::press_group_window(main, hwnd);
     }
     match message {
         // Scintilla's notifications and the controls' commands and colors are the main window's
