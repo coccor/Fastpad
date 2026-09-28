@@ -27,7 +27,6 @@ const GLYPH_MINIMIZE: &str = "\u{E921}";
 const GLYPH_MAXIMIZE: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
 pub(crate) const GLYPH_CLOSE: &str = "\u{E8BB}";
-pub(crate) const GLYPH_MORE: &str = "\u{E712}";
 pub(crate) const GLYPH_PREVIEW_SIDE: &str = "\u{E90D}";
 pub(crate) const GLYPH_PREVIEW_FULL: &str = "\u{E8FF}";
 
@@ -108,8 +107,6 @@ pub enum HitTarget {
     Minimize,
     Maximize,
     Close,
-    /// The application menu ("…").
-    Overflow,
     ResizeTop,
     ResizeTopLeft,
     ResizeTopRight,
@@ -122,10 +119,7 @@ impl HitTarget {
     }
 
     pub const fn is_interactive(self) -> bool {
-        matches!(
-            self,
-            Self::Minimize | Self::Maximize | Self::Close | Self::Overflow
-        )
+        matches!(self, Self::Minimize | Self::Maximize | Self::Close)
     }
 
     pub fn from_nonclient_code(code: usize) -> Option<Self> {
@@ -196,8 +190,8 @@ impl PointerState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TitleBarLayout {
-    /// The empty strip between the sidebar and the app menu: drags the window, maximizes it on
-    /// a double-click, and shows the window title. The tabs are in the editor group now.
+    /// The strip between the sidebar and the caption buttons: drags the window and maximizes it
+    /// on a double-click where the top editor group's tabs leave it empty (spec §4.1).
     pub drag_region: Rect,
     /// The sidebar's share of the strip. It is caption (dragging, top-edge resizing,
     /// double-click to maximize), and empty without a sidebar.
@@ -205,8 +199,6 @@ pub struct TitleBarLayout {
     pub minimize: Rect,
     pub maximize: Rect,
     pub close: Rect,
-    /// The application menu ("…").
-    pub overflow: Rect,
     pub height: i32,
     /// Height of the top band that resizes a restored window.
     pub resize_border: i32,
@@ -237,18 +229,15 @@ impl TitleBarLayout {
         let maximize = Rect::new(close.left - caption_width, 0, close.left, height);
         let minimize = Rect::new(maximize.left - caption_width, 0, maximize.left, height);
 
-        let actions_right = minimize.left.max(0);
-        let overflow_left = (actions_right - scale(40, dpi)).max(0);
-        let overflow = Rect::new(overflow_left, 0, actions_right, height);
-        let left = left.clamp(0, overflow_left);
+        let actions_left = minimize.left.max(0);
+        let left = left.clamp(0, actions_left);
 
         Self {
-            drag_region: Rect::new(left, 0, overflow_left, height),
+            drag_region: Rect::new(left, 0, actions_left, height),
             sidebar: Rect::new(0, 0, left, height),
             minimize,
             maximize,
             close,
-            overflow,
             height,
             resize_border,
         }
@@ -263,9 +252,6 @@ impl TitleBarLayout {
         }
         if self.minimize.contains(point) {
             return HitTarget::Minimize;
-        }
-        if self.overflow.contains(point) {
-            return HitTarget::Overflow;
         }
         if self.sidebar.contains(point) || self.drag_region.contains(point) {
             return HitTarget::Caption;
@@ -517,7 +503,7 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
     }
     let maximized = unsafe { IsZoomed(hwnd) } != 0;
     if paint.rcPaint.top < layout.height {
-        unsafe { paint_strip_buffered(dc, &layout, dpi, maximized, input) };
+        unsafe { paint_strip_buffered(dc, &layout, maximized, input) };
     }
 
     let status_height = if input.status.is_some() {
@@ -629,7 +615,6 @@ pub(crate) unsafe fn paint_divider(dc: HDC, divider: RECT, palette: Palette) {
 unsafe fn paint_strip_buffered(
     dc: HDC,
     layout: &TitleBarLayout,
-    dpi: u32,
     maximized: bool,
     input: &TitlePaint<'_>,
 ) {
@@ -645,11 +630,11 @@ unsafe fn paint_strip_buffered(
         unsafe { CreateCompatibleBitmap(dc, width, height) }
     };
     if bitmap.is_null() {
-        unsafe { draw_strip(dc, layout, dpi, maximized, input) };
+        unsafe { draw_strip(dc, layout, maximized, input) };
     } else {
         unsafe {
             let previous = SelectObject(memory, bitmap);
-            draw_strip(memory, layout, dpi, maximized, input);
+            draw_strip(memory, layout, maximized, input);
             BitBlt(dc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
             SelectObject(memory, previous);
             DeleteObject(bitmap);
@@ -662,13 +647,7 @@ unsafe fn paint_strip_buffered(
     }
 }
 
-unsafe fn draw_strip(
-    dc: HDC,
-    layout: &TitleBarLayout,
-    dpi: u32,
-    maximized: bool,
-    input: &TitlePaint<'_>,
-) {
+unsafe fn draw_strip(dc: HDC, layout: &TitleBarLayout, maximized: bool, input: &TitlePaint<'_>) {
     let palette = input.palette;
     let pointer = input.pointer;
     let centered = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
@@ -678,29 +657,8 @@ unsafe fn draw_strip(
     }
     let previous_font = unsafe { select_font(dc, input.fonts.text) };
 
-    let overflow_hovered = pointer.hovered == Some(HitTarget::Overflow);
     unsafe {
         select_font(dc, input.fonts.glyph);
-        if overflow_hovered {
-            fill(
-                dc,
-                layout.overflow.centered_square(scale(32, dpi)),
-                if pointer.is_pressed(HitTarget::Overflow) {
-                    palette.pressed_background
-                } else {
-                    palette.hover_background
-                },
-            );
-        }
-        SetTextColor(
-            dc,
-            if overflow_hovered {
-                palette.hover_foreground
-            } else {
-                palette.muted_foreground
-            },
-        );
-        draw_text(dc, GLYPH_MORE, layout.overflow, centered);
     }
 
     let maximize_glyph = if maximized {
@@ -766,7 +724,7 @@ pub(crate) unsafe fn nonclient_hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPAR
         HitTarget::ResizeTop => HTTOP,
         HitTarget::ResizeTopLeft => HTTOPLEFT,
         HitTarget::ResizeTopRight => HTTOPRIGHT,
-        HitTarget::Client | HitTarget::Overflow => HTCLIENT,
+        HitTarget::Client => HTCLIENT,
     }) as LRESULT
 }
 
@@ -992,7 +950,7 @@ mod tests {
         let layout = TitleBarLayout::calculate_with_offset(client, 96, 304);
         assert_eq!(layout.sidebar, Rect::new(0, 0, 304, layout.height));
         assert_eq!(layout.drag_region.left, 304);
-        assert_eq!(layout.drag_region.right, layout.overflow.left);
+        assert_eq!(layout.drag_region.right, layout.minimize.left);
         assert_eq!(layout.close, plain.close);
         assert_eq!(
             layout.hit_test(super::Point::new(20, layout.height / 2)),
@@ -1148,10 +1106,6 @@ mod tests {
             .press(Some(HitTarget::Minimize));
         assert_eq!(caption.leave(false), caption);
         assert_eq!(caption.leave(true), PointerState::default());
-
-        let menu = PointerState::default().hover(Some(HitTarget::Overflow));
-        assert_eq!(menu.leave(true), menu);
-        assert_eq!(menu.leave(false), PointerState::default());
     }
 
     #[test]
@@ -1168,13 +1122,13 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_strip_left_of_the_app_menu_is_caption() {
-        // Break caught: part of the old tab area left as client after the tabs moved into the
-        // editor group, so the window can't be dragged or double-click-maximized there.
+    fn the_whole_strip_left_of_the_caption_buttons_is_caption() {
+        // Break caught: an app menu button left in the title row, or part of the row left as
+        // client, so the window can't be dragged or double-click-maximized there.
         let layout = TitleBarLayout::calculate(Size::new(1200, 800), 96);
         assert_eq!(layout.drag_region.left, 0);
-        assert_eq!(layout.drag_region.right, layout.overflow.left);
-        for x in [1, 300, layout.overflow.left - 1] {
+        assert_eq!(layout.drag_region.right, layout.minimize.left);
+        for x in [1, 300, layout.minimize.left - 1] {
             assert_eq!(
                 layout.hit_test(super::Point::new(x, layout.height / 2)),
                 HitTarget::Caption,
@@ -1192,10 +1146,6 @@ mod tests {
     #[test]
     fn interactive_title_targets_are_disjoint() {
         let layout = TitleBarLayout::calculate(Size::new(1200, 800), 192);
-        assert_eq!(
-            layout.hit_test(layout.overflow.center()),
-            HitTarget::Overflow
-        );
         assert_eq!(
             layout.hit_test(layout.minimize.center()),
             HitTarget::Minimize

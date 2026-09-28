@@ -86,7 +86,8 @@ Helpers `active_group()`, `active_editor()`, `active_view()` and `active_documen
 Changed after the first look at PR 1 (2026-09-28): a separate title-bar row repeated the file name and cost a row of height, so the tabs stay in the title bar.
 
 - **Top groups' strips are the title bar.** A group whose top edge is the editor area's top (a *top group*) extends up into the title bar row, and its strip is drawn there, over its own column. In a row split every group is a top group, so Split Right adds no row. A group below another one draws its strip at its own top.
-- **What the main window keeps:** the title bar row over the sidebar, the app menu "…" and the caption buttons at the right end. The rightmost top group's strip stops before them.
+- **What the main window keeps:** the title bar row over the sidebar and the caption buttons at the right end. The rightmost top group's strip stops before them.
+- **No "…" buttons** (changed after the second look, 2026-09-28). The app menu's items are in the Alt menu band (Format JSON moved to Edit); the strip's menu is on right-click, and Close all tabs is also in File. Later group commands (Split Right, Split Down, Close Group) go in the menus, the strip's right-click menu, the palette and their shortcuts.
 - **No window-title text is drawn.** The window's caption text (taskbar, Alt+Tab) is still `<name> - FastPad`, following the active group's active tab.
 - **Caption behaviour, as in 0.2.0:**
   - Empty space in a title-row strip drags the window: the group answers `WM_NCHITTEST` with `HTTRANSPARENT` there, and the main window answers `HTCAPTION`.
@@ -106,10 +107,7 @@ Changed after the first look at PR 1 (2026-09-28): a separate title-bar row repe
    - double-click on empty space for New;
    - right-click on empty space for the tab-strip menu.
 
-   The action cluster at the right end holds:
-   - **Split Right**;
-   - **Preview Side / Preview Full**, for Markdown and SVG tabs only;
-   - **"…"**, which opens the tab-strip menu plus **Close Group**.
+   The strip holds only tabs. The Markdown/SVG **Preview Side / Preview Full** buttons float at the top-right of the content area (§4.1).
 2. **The find bar.** It is the existing `FindBar`, one instance per group, hidden until used. It searches its own group's editor.
 3. **The content area.** It holds the group's own Scintilla, its own `PreviewHost` (side or full mode, ratio and divider) and its own `ImageHost`. `preview_host::layout` and `image_host::layout` take the group's content rectangle in place of the window's. The divider drag and editor↔preview scroll sync move with them.
 
@@ -163,7 +161,7 @@ Each command is in the menu band (a new **View ▸ Editor Layout** submenu), the
 | Select Tab 1..8, Last Tab | Alt+1..9 | Within the active group. Moved from Ctrl+1..9, keeping the numpad variants. |
 | Move Tab to Next Group | Ctrl+Alt+Right | Moves the active view to the next group in numbering order. If there is none, a group is created on the right. |
 | Move Tab to Previous Group | Ctrl+Alt+Left | Moves the active view to the previous group. Does nothing in group 1. |
-| Close Group | "…" menu, palette | Closes each tab with the usual prompts. Cancelling a prompt stops the command and keeps the group. |
+| Close Group | File menu, the strip's right-click menu, palette | Closes each tab with the usual prompts. Cancelling a prompt stops the command and keeps the group. |
 
 These commands take the next free `CommandId` numbers.
 
@@ -175,7 +173,7 @@ Existing commands:
 ### 5.2 Routing
 
 - `execute_command` targets the active group. That covers the edit commands, find and replace, save, save as, close, the preview toggles, zoom, and the "needs a document" and "needs text" guards.
-- A command started from a group's strip (its context menu, "…" or preview buttons) first makes that group active. Every command therefore keeps one routing path.
+- A command started from a group's strip or content (its context menu or preview buttons) first makes that group active. Every command therefore keeps one routing path.
 
 ### 5.3 Opening files
 
@@ -293,12 +291,12 @@ Three PRs, stacked on `feat/split-editors`:
    - The tab strip leaves the title bar, notifications are routed by group, and session v2 is written with a single group (the v1 reader is kept).
    - There are no splits yet. The only visible change is that caret and scroll are kept per tab: the one group is a top group, so its tabs are where 0.2.0 draws them (§4.1).
    - Plan-time amendments (docs/superpowers/plans/2026-09-28-split-editors-1-one-group.md):
-     - The tab strip's accessibility is MSAA (`IAccessible`), not UIA. The group window hosts the tab list; the main window's provider keeps the app menu and the caption buttons.
-     - The title bar's "…" is the app menu and stays there. Each group's strip gets its own "…" (More actions) for the tab-strip menu.
+     - The tab strip's accessibility is MSAA (`IAccessible`), not UIA. The group window hosts the tab list and the preview buttons; the main window's provider keeps the caption buttons.
+     - There are no "…" buttons: the app menu's items are in the menu band and the strip's menu is on right-click (§4.1).
      - `App.tabs` stays in PR 1 as a façade over the `DocumentStore` and the one group's views. The editor, find bar, preview and image objects stay `App` fields; PR 2 moves them into the group when it has several.
      - Double-click for New and right-click for the tab-strip menu are on the group strip's empty space; double-clicking the title bar over the sidebar maximizes.
      - After the first look at PR 1 the strip went back into the title bar row (§4.1): the group window reaches up into it, so the strip still belongs to the group.
-     - Split Right joins the strip's action cluster in PR 2.
+     - Split Right is a View menu entry, a strip right-click entry and Ctrl+\\ in PR 2; the strip has no action cluster.
      - The preview (italic) flag stays on `Document` in PR 1; with one group it behaves the same as a per-view flag. PR 2 moves it to the view.
 2. **Splits** (`feat/split-editors-grid`).
    - The split tree, sashes, the §5.1 commands, several views of one document, per-group find and preview, Open Editors group headers, group-aware Ctrl+P, and multi-group sessions.

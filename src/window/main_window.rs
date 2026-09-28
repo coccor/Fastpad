@@ -439,13 +439,6 @@ unsafe extern "system" fn main_window_proc(
             );
             if notice_contains(hwnd, point.y) {
                 dismiss_notifications(hwnd);
-                return 0;
-            }
-            let layout = title_layout(hwnd);
-            if layout.hit_test(point) == HitTarget::Overflow
-                && let Some(command) = menus::show_overflow(hwnd, point.x, layout.height)
-            {
-                execute_command(hwnd, command);
             }
             0
         }
@@ -1139,13 +1132,13 @@ fn name_box_band_height(hwnd: HWND, dpi: u32) -> i32 {
         .map_or(0, |_| crate::window::name_box::name_box_height(dpi))
 }
 
-/// Leaves out of the group window what the main window keeps in its area: the app menu and the
-/// caption buttons at the right end of the title row, and the band under it while the menu band
-/// or the name box shows. The main window paints them and gets their input.
+/// Leaves out of the group window what the main window keeps in its area: the caption buttons at
+/// the right end of the title row, and the band under it while the menu band or the name box
+/// shows. The main window paints them and gets their input.
 fn set_group_region(hwnd: HWND, group: HWND, client: &RECT, strip_height: i32, band: i32) {
     use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, RGN_DIFF, SetWindowRgn};
     let caption_left =
-        title_layout(hwnd).overflow.left - crate::window::side_panel::left_edge(hwnd);
+        title_layout(hwnd).minimize.left - crate::window::side_panel::left_edge(hwnd);
     unsafe {
         let region = CreateRectRgn(0, 0, client.right, client.bottom);
         let cut = |left: i32, top: i32, right: i32, bottom: i32| {
@@ -2632,10 +2625,6 @@ pub(crate) fn group_strip_message(
                     {
                         promote_tab(hwnd, id);
                     }
-                }
-                StripTarget::More => {
-                    let bottom = strip_layout(hwnd).map_or(y, |layout| layout.height);
-                    show_group_strip_menu(hwnd, group, x, bottom);
                 }
                 StripTarget::ScrollBar | StripTarget::Empty => {}
             }
@@ -6778,7 +6767,7 @@ mod tests {
 
     #[test]
     fn queued_ipc_requests_wait_for_the_overflow_menu_to_close() {
-        // Break caught: the overflow menu's own modal loop dispatches a forwarded request, so a
+        // Break caught: a popup menu's own modal loop dispatches a forwarded request, so a
         // new tab becomes active underneath it and the command the user picks acts on that tab
         // instead of the one they opened the menu on.
         let _scintilla = load_native_scintilla();
@@ -6796,12 +6785,12 @@ mod tests {
             }
             None
         });
-        assert!(crate::window::menus::show_overflow(window.hwnd, 0, 0).is_none());
+        assert!(crate::window::menus::show_tab_strip_menu(window.hwnd, 0, 0, true).is_none());
 
         assert_eq!(
             app_mut(window.hwnd).tabs.len(),
             before,
-            "a forwarded request was handled inside the overflow menu's modal loop"
+            "a forwarded request was handled inside the popup menu's modal loop"
         );
 
         pump_posted_messages(window.hwnd);
@@ -7104,7 +7093,7 @@ mod tests {
         assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height);
         let strip = super::strip_layout(window.hwnd).unwrap();
         assert_eq!(strip.height, title.height);
-        assert_eq!(strip.bounds().right, title.overflow.left - left);
+        assert_eq!(strip.bounds().right, title.minimize.left - left);
     }
 
     #[test]
@@ -7212,7 +7201,7 @@ mod tests {
             .unwrap()
             .center();
         assert!(covers(tab.x + left, tab.y));
-        for button in [title.overflow, title.minimize, title.close] {
+        for button in [title.minimize, title.maximize, title.close] {
             let center = button.center();
             assert!(!covers(center.x, center.y));
         }
@@ -7254,8 +7243,9 @@ mod tests {
         assert_eq!(unsafe { GetParent(hwnd) }, group);
         let strip = super::strip_layout(window.hwnd).unwrap();
         assert_eq!(
-            strip.tabs.right, strip.more.left,
-            "the strip keeps only its menu button"
+            strip.tabs.right,
+            strip.bounds().right,
+            "the strip holds only tabs"
         );
         let dpi = unsafe { GetDpiForWindow(group) }.max(96);
         let (group_width, _) = client_size(group);

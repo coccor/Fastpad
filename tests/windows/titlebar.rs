@@ -267,33 +267,28 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         )
     );
 
-    // The title bar's own object lists the app menu and the caption buttons.
+    // The title bar's own object lists the caption buttons.
     let title = Accessible::from_window(hwnd)?;
     assert_eq!(std::mem::size_of::<VARIANT>(), 24);
-    assert_eq!(title.child_count()?, 4);
+    assert_eq!(title.child_count()?, 3);
     assert_eq!(title.role(0)?, ROLE_SYSTEM_TITLEBAR as i32);
-    for child in 1..=4 {
+    for child in 1..=3 {
         assert_eq!(title.role(child)?, ROLE_SYSTEM_PUSHBUTTON as i32);
     }
-    let names = (1..=4)
+    let names = (1..=3)
         .map(|child| title.name(child))
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(
-        names,
-        vec!["Application menu", "Minimize", "Maximize", "Close"]
-    );
+    assert_eq!(names, vec!["Minimize", "Maximize", "Close"]);
     assert_eq!(title.selection()?, None);
     assert_eq!(title.select(SELFLAG_TAKESELECTION as i32, 1), E_INVALIDARG);
 
-    // The tabs are the editor group's: its strip lists them and its own button.
+    // The tabs are the editor group's: its strip lists them.
     let group = support::win32::find_child_by_class(hwnd, "FastPadEditorGroup")?;
     let accessible = Accessible::from_window(group)?;
-    assert_eq!(accessible.child_count()?, 2);
+    assert_eq!(accessible.child_count()?, 1);
     assert_eq!(accessible.role(0)?, ROLE_SYSTEM_PAGETABLIST as i32);
     assert_eq!(accessible.role(1)?, ROLE_SYSTEM_PAGETAB as i32);
-    assert_eq!(accessible.role(2)?, ROLE_SYSTEM_PUSHBUTTON as i32);
     assert_eq!(accessible.name(1)?, "Untitled");
-    assert_eq!(accessible.name(2)?, "More actions");
     assert_ne!(accessible.state(1)? as u32 & STATE_SYSTEM_SELECTED, 0);
     assert_eq!(accessible.focus()?, None);
     assert_eq!(accessible.selection()?, Some(1));

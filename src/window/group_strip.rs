@@ -1,12 +1,11 @@
-//! An editor group's tab strip (split editors spec §4.2): the tabs on the left, then the group's
-//! "…" on the right. For a group at the top of the editor area the strip is the title bar row
-//! (spec §4.1). Pure geometry and hit-testing first, then painting; the group window routes the
+//! An editor group's tab strip (split editors spec §4.2): its tabs, across its whole width. For a
+//! group at the top of the editor area the strip is the title bar row (spec §4.1); its commands
+//! are on right-click and in the menus. Pure geometry and hit-testing first, then painting; the group window routes the
 //! pointer here.
 
 use crate::window::palette::Palette;
 use crate::window::titlebar::{
-    GLYPH_CLOSE, GLYPH_MORE, Point, Rect, TitleFontHandles, draw_text, fill, restore_font, scale,
-    select_font,
+    GLYPH_CLOSE, Point, Rect, TitleFontHandles, draw_text, fill, restore_font, scale, select_font,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
@@ -21,8 +20,6 @@ pub enum StripTarget {
     CloseTab(usize),
     /// The band along the bottom of the tab viewport while the tabs overflow it.
     ScrollBar,
-    /// "…": the tab-strip menu.
-    More,
     /// Strip with nothing on it: double-click opens a tab, right-click the tab-strip menu.
     Empty,
 }
@@ -82,7 +79,7 @@ pub fn strip_height(dpi: u32) -> i32 {
 }
 
 /// How wide `group`'s strip is: the group's width, except that a group at the top of the window
-/// stops its strip at the app menu, which with the caption buttons stays the main window's.
+/// stops its strip at the caption buttons, which stay the main window's.
 /// Computed from the windows alone, so the accessibility provider can call it off the UI thread.
 pub(crate) fn strip_width(group: windows_sys::Win32::Foundation::HWND) -> i32 {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -103,7 +100,7 @@ pub(crate) fn strip_width(group: windows_sys::Win32::Foundation::HWND) -> i32 {
         crate::window::titlebar::Size::new(frame.right, frame.bottom),
         dpi,
     )
-    .overflow
+    .minimize
     .left;
     client.right.min(caption - origin.x).max(0)
 }
@@ -113,7 +110,6 @@ pub struct StripLayout {
     pub height: i32,
     /// The visible tab viewport; tabs scrolled outside it are clipped and never hit.
     pub tabs: Rect,
-    pub more: Rect,
     /// How far the tabs are scrolled left, clamped to `max_scroll`.
     pub scroll: i32,
     pub max_scroll: i32,
@@ -131,9 +127,7 @@ impl StripLayout {
         let width = width.max(0);
         let dpi = dpi.max(1);
         let height = strip_height(dpi);
-        let button = scale(40, dpi);
-        let more = Rect::new((width - button).max(0), 0, width, height);
-        let tabs = Rect::new(0, 0, more.left, height);
+        let tabs = Rect::new(0, 0, width, height);
         let viewport = tabs.right;
         let tab_width = if tab_count == 0 {
             0
@@ -159,7 +153,6 @@ impl StripLayout {
         Self {
             height,
             tabs,
-            more,
             scroll,
             max_scroll,
             scroll_bar,
@@ -171,9 +164,6 @@ impl StripLayout {
     }
 
     pub fn hit_test(&self, point: Point) -> StripTarget {
-        if self.more.contains(point) {
-            return StripTarget::More;
-        }
         if self.scroll_bar.is_some_and(|bar| bar.contains(point)) {
             return StripTarget::ScrollBar;
         }
@@ -202,7 +192,7 @@ impl StripLayout {
 
     /// The whole strip, from the group's left edge to its right.
     pub fn bounds(&self) -> Rect {
-        Rect::new(0, 0, self.more.right, self.height)
+        Rect::new(0, 0, self.tabs.right, self.height)
     }
 
     /// The scroll offset that brings the whole of tab `index` into the viewport.
@@ -404,34 +394,6 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
         unsafe { fill(dc, thumb, palette.pressed_background) };
     }
 
-    unsafe { select_font(dc, input.fonts.glyph()) };
-    let buttons = [(StripTarget::More, Some(layout.more), GLYPH_MORE, false)];
-    for (target, rect, glyph, active) in buttons {
-        let Some(rect) = rect else { continue };
-        let hovered = pointer.hovered == Some(target);
-        let background = if (hovered && pointer.is_pressed(target)) || active {
-            Some(palette.pressed_background)
-        } else if hovered {
-            Some(palette.hover_background)
-        } else {
-            None
-        };
-        unsafe {
-            if let Some(background) = background {
-                fill(dc, rect.centered_square(scale(32, dpi)), background);
-            }
-            SetTextColor(
-                dc,
-                if hovered || active {
-                    palette.hover_foreground
-                } else {
-                    palette.muted_foreground
-                },
-            );
-            draw_text(dc, glyph, rect, centered);
-        }
-    }
-
     unsafe { restore_font(dc, previous_font) };
 }
 
@@ -462,8 +424,7 @@ mod tests {
                     assert_eq!(layout.hit_test(middle), StripTarget::CloseTab(index));
                 }
             }
-            assert_eq!(layout.hit_test(centre(layout.more)), StripTarget::More);
-            assert_eq!(layout.tabs.right, layout.more.left);
+            assert_eq!(layout.tabs.right, width);
         }
     }
 
@@ -481,14 +442,17 @@ mod tests {
     }
 
     #[test]
-    fn the_strip_spans_the_group_with_more_at_its_right_edge() {
-        // Break caught: the strip laid out against the window instead of the group, so the "…"
-        // button lands outside a narrower group.
+    fn the_tabs_span_the_whole_strip() {
+        // Break caught: a strip that still reserves room for a "…" button, or is laid out against
+        // the window instead of the group.
         let layout = StripLayout::calculate(700, 96, 3, 0);
         assert_eq!(layout.tabs.left, 0);
-        assert_eq!(layout.more.right, 700);
-        assert_eq!(layout.more.right - layout.more.left, 40);
-        assert_eq!(layout.tabs.right, layout.more.left);
+        assert_eq!(layout.tabs.right, 700);
+        assert_eq!(layout.bounds().right, 700);
+        assert_eq!(
+            layout.hit_test(Point::new(695, layout.height / 2)),
+            StripTarget::Empty
+        );
         assert_eq!(layout.tab(0).unwrap().left, 0);
         assert_eq!(layout.tab(1).unwrap().left, layout.tab(0).unwrap().right);
         // A group narrower than its buttons leaves an empty viewport, never a negative one.
@@ -503,7 +467,7 @@ mod tests {
         let layout = StripLayout::calculate(1200, 96, 30, 0);
         assert!(layout.max_scroll > 0);
         assert!(layout.tab(1).unwrap().left - layout.tab(0).unwrap().left >= 120);
-        assert!(layout.tabs.right <= layout.more.left);
+        assert_eq!(layout.tabs.right, 1200);
         assert_eq!(
             layout.hit_test(layout.tab(29).unwrap().center()),
             StripTarget::Empty

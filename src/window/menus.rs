@@ -154,6 +154,7 @@ impl MenuBar {
                 MenuEntry::command("&Save\tCtrl+S", CommandId::Save),
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
                 MenuEntry::command("&Close tab	Ctrl+W", CommandId::CloseTab),
+                MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
                 MenuEntry::Separator,
                 MenuEntry::command(
                     "&Restore session on startup",
@@ -170,6 +171,8 @@ impl MenuBar {
                 MenuEntry::command("Cu&t", CommandId::Cut),
                 MenuEntry::command("&Copy", CommandId::Copy),
                 MenuEntry::command("&Paste", CommandId::Paste),
+                MenuEntry::Separator,
+                MenuEntry::command("&Format JSON\tShift+Alt+F", CommandId::FormatJson),
             ])?;
             append_popup(root, MENU_TITLES[1], edit)?;
             let search = create_popup(&[
@@ -306,24 +309,6 @@ fn append_popup(root: HMENU, label: &str, popup: HMENU) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-pub(crate) fn show_overflow(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
-    track_popup(
-        hwnd,
-        &[
-            MenuEntry::command("New", CommandId::New),
-            MenuEntry::command("Open...", CommandId::Open),
-            MenuEntry::command("Save", CommandId::Save),
-            MenuEntry::Separator,
-            MenuEntry::command("Find", CommandId::Find),
-            MenuEntry::command("Format JSON", CommandId::FormatJson),
-            MenuEntry::command("Command palette...", CommandId::CommandPalette),
-            MenuEntry::Separator,
-            MenuEntry::command("Exit", CommandId::Exit),
-        ],
-        POINT { x, y },
-    )
 }
 
 /// The context menu of the empty tab-strip space, at client coordinates `x`, `y`.
@@ -687,6 +672,20 @@ mod tests {
             Some(CommandId::ReplaceInNotes)
         );
         assert_eq!(bound(FCONTROL, u16::from(b'H')), Some(CommandId::Replace));
+    }
+
+    #[test]
+    fn the_file_menu_closes_all_tabs_and_the_edit_menu_formats_json() {
+        // Break caught: commands lost with the title bar's and the strip's "…" menus, which the
+        // menu band now carries instead.
+        use super::MenuBar;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND};
+        let bar = MenuBar::create().unwrap();
+        let has = |menu: usize, command: CommandId| unsafe {
+            GetMenuState(bar.dropdown(menu), command as u32, MF_BYCOMMAND) != u32::MAX
+        };
+        assert!(has(0, CommandId::CloseAllTabs), "File: Close all tabs");
+        assert!(has(1, CommandId::FormatJson), "Edit: Format JSON");
     }
 
     #[test]

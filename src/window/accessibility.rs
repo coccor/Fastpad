@@ -64,13 +64,11 @@ pub(crate) enum ProviderKind {
     GroupStrip,
 }
 
-const APP_MENU: &str = "Application menu";
 const MINIMIZE: &str = "Minimize";
 const MAXIMIZE: &str = "Maximize";
 const CLOSE: &str = "Close";
 const PREVIEW_SIDE: &str = "Open Preview to the Side";
 const PREVIEW_FULL: &str = "Open Preview";
-const MORE: &str = "More actions";
 
 pub(crate) fn accessible_children(
     kind: ProviderKind,
@@ -78,7 +76,7 @@ pub(crate) fn accessible_children(
     preview_buttons: bool,
 ) -> Vec<AccessibleChild> {
     match kind {
-        ProviderKind::TitleBar => [APP_MENU, MINIMIZE, MAXIMIZE, CLOSE]
+        ProviderKind::TitleBar => [MINIMIZE, MAXIMIZE, CLOSE]
             .into_iter()
             .map(AccessibleChild::Button)
             .collect(),
@@ -93,7 +91,6 @@ pub(crate) fn accessible_children(
                     AccessibleChild::Button(PREVIEW_FULL),
                 ]);
             }
-            children.push(AccessibleChild::Button(MORE));
             children
         }
     }
@@ -681,13 +678,11 @@ unsafe extern "system" fn accessible_select(
     if selected != 0 { S_OK } else { E_INVALIDARG }
 }
 
-/// A button whose action is a click at its centre, posted to the provider's window.
+/// A floating preview button, whose action is a click at its centre.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClickTarget {
-    AppMenu,
     PreviewSide,
     PreviewFull,
-    More,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -708,13 +703,11 @@ fn accessible_default_action(
     match children.get(index)? {
         AccessibleChild::Tab(_) => Some(AccessibleDefaultAction::Command(CommandId::CloseTab)),
         AccessibleChild::Button(name) => match *name {
-            APP_MENU => Some(AccessibleDefaultAction::Click(ClickTarget::AppMenu)),
             MINIMIZE => Some(AccessibleDefaultAction::SystemCommand(SC_MINIMIZE as usize)),
             MAXIMIZE => Some(AccessibleDefaultAction::SystemCommand(SC_MAXIMIZE as usize)),
             CLOSE => Some(AccessibleDefaultAction::SystemCommand(SC_CLOSE as usize)),
             PREVIEW_SIDE => Some(AccessibleDefaultAction::Click(ClickTarget::PreviewSide)),
             PREVIEW_FULL => Some(AccessibleDefaultAction::Click(ClickTarget::PreviewFull)),
-            MORE => Some(AccessibleDefaultAction::Click(ClickTarget::More)),
             _ => None,
         },
     }
@@ -849,30 +842,15 @@ unsafe extern "system" fn accessible_do_default_action(
             PostMessageW(item.hwnd, WM_COMMAND, command as usize, 0)
         },
         Some(AccessibleDefaultAction::Click(target)) => {
-            // The preview buttons are their own floating window; everything else is the
-            // provider window's.
-            let preview = match target {
-                ClickTarget::PreviewSide => Some(PreviewButton::Side),
-                ClickTarget::PreviewFull => Some(PreviewButton::Full),
-                ClickTarget::AppMenu | ClickTarget::More => None,
+            // The preview buttons are their own window, floating over the group's content.
+            let button = match target {
+                ClickTarget::PreviewSide => PreviewButton::Side,
+                ClickTarget::PreviewFull => PreviewButton::Full,
             };
-            let (window, rect) = match preview {
-                Some(button) => {
-                    let Some(buttons) = crate::window::preview_buttons::find(item.hwnd) else {
-                        return E_INVALIDARG;
-                    };
-                    (
-                        buttons,
-                        crate::window::preview_buttons::button_rect(buttons, button),
-                    )
-                }
-                None => {
-                    let Some(rect) = child_client_rect(item, &children, id) else {
-                        return E_INVALIDARG;
-                    };
-                    (item.hwnd, rect)
-                }
+            let Some(window) = crate::window::preview_buttons::find(item.hwnd) else {
+                return E_INVALIDARG;
             };
+            let rect = crate::window::preview_buttons::button_rect(window, button);
             let center = rect.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
             // A whole click: the strip acts only on a release over the target it was pressed on.
@@ -983,7 +961,6 @@ fn child_client_rect(
                 dpi,
             );
             match child {
-                AccessibleChild::Button(APP_MENU) => Some(layout.overflow),
                 AccessibleChild::Button(MINIMIZE) => Some(layout.minimize),
                 AccessibleChild::Button(MAXIMIZE) => Some(layout.maximize),
                 AccessibleChild::Button(CLOSE) => Some(layout.close),
@@ -1007,7 +984,6 @@ fn child_client_rect(
                 AccessibleChild::Button(PREVIEW_FULL) => {
                     crate::window::preview_buttons::rect_in_group(item.hwnd, PreviewButton::Full)
                 }
-                AccessibleChild::Button(MORE) => Some(layout.more),
                 AccessibleChild::Button(_) => None,
             }
         }
@@ -1082,28 +1058,22 @@ mod tests {
             .iter()
             .filter_map(AccessibleChild::button_name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["Open Preview to the Side", "Open Preview", "More actions"]
-        );
+        assert_eq!(names, vec!["Open Preview to the Side", "Open Preview"]);
         let without = accessible_children(ProviderKind::GroupStrip, &["a"], false);
-        assert_eq!(without.len(), 2);
+        assert_eq!(without.len(), 1);
     }
 
     #[test]
-    fn the_title_bar_lists_the_app_menu_and_caption_buttons() {
-        // Break caught: caption buttons unreachable by Narrator once the tabs left the title bar,
-        // or tabs listed twice, once per provider.
+    fn the_title_bar_lists_the_caption_buttons() {
+        // Break caught: caption buttons unreachable by Narrator, tabs listed twice, once per
+        // provider, or a removed app menu button still announced.
         let children = accessible_children(ProviderKind::TitleBar, &["a"], true);
         let names = children
             .iter()
             .filter_map(AccessibleChild::button_name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["Application menu", "Minimize", "Maximize", "Close"]
-        );
-        assert_eq!(children.len(), 4);
+        assert_eq!(names, vec!["Minimize", "Maximize", "Close"]);
+        assert_eq!(children.len(), 3);
     }
 
     #[test]
@@ -1243,26 +1213,18 @@ mod tests {
             accessible_default_action(&strip, 3),
             Some(AccessibleDefaultAction::Click(ClickTarget::PreviewFull))
         );
-        assert_eq!(
-            accessible_default_action(&strip, 4),
-            Some(AccessibleDefaultAction::Click(ClickTarget::More))
-        );
         assert_eq!(accessible_default_action(&strip, 0), None);
-        assert_eq!(accessible_default_action(&strip, 5), None);
+        assert_eq!(accessible_default_action(&strip, 4), None);
 
         let title = accessible_children(ProviderKind::TitleBar, &[], false);
         assert_eq!(
             accessible_default_action(&title, 1),
-            Some(AccessibleDefaultAction::Click(ClickTarget::AppMenu))
-        );
-        assert_eq!(
-            accessible_default_action(&title, 2),
             Some(AccessibleDefaultAction::SystemCommand(
                 windows_sys::Win32::UI::WindowsAndMessaging::SC_MINIMIZE as usize
             ))
         );
         assert_eq!(
-            accessible_default_action(&title, 4),
+            accessible_default_action(&title, 3),
             Some(AccessibleDefaultAction::SystemCommand(
                 windows_sys::Win32::UI::WindowsAndMessaging::SC_CLOSE as usize
             ))
@@ -1331,11 +1293,6 @@ mod tests {
         );
         assert_eq!(tab_left(1), 0);
         assert_eq!(tab_left(2), layout.tab(1).unwrap().left);
-        assert_eq!(
-            tab_left(3),
-            layout.more.left,
-            "the More button follows the tabs"
-        );
         drop(state);
         unsafe { DestroyWindow(window) };
     }
