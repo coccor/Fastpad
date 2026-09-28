@@ -41,14 +41,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CS_DBLCLKS, CreateWindowExW, DLGC_WANTARROWS, DefWindowProcW, DestroyWindow,
     EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_VALUECHANGE, GWLP_USERDATA, GetClientRect, GetScrollInfo,
     GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_SIZEALL, KillTimer, LoadCursorW, MSG, OBJID_CLIENT,
-    PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SB_BOTTOM, SB_HORZ, SB_LINEDOWN,
-    SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT,
-    SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SetCursor, SetTimer, SetWindowLongPtrW,
-    WM_CAPTURECHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_GETOBJECT,
-    WM_HSCROLL, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_HSCROLL, WS_TABSTOP,
-    WS_VSCROLL,
+    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SB_BOTTOM, SB_HORZ,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
+    SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SetCursor, SetTimer,
+    SetWindowLongPtrW, WM_CAPTURECHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE,
+    WM_GETOBJECT, WM_HSCROLL, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_QUIT,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 use zoom::Zoom;
 
@@ -829,6 +829,13 @@ unsafe extern "system" fn image_proc(
                 )
             } != 0
             {
+                // PeekMessage hands out WM_QUIT whatever the filter. When the view goes with a
+                // closing window, the quit is already posted: put it back for the message loop,
+                // or the process never exits.
+                if queued.message == WM_QUIT {
+                    unsafe { PostQuitMessage(queued.wParam as i32) };
+                    break;
+                }
                 if queued.lParam != 0 {
                     drop(unsafe { Box::from_raw(queued.lParam as *mut Decoded) });
                 }
@@ -1087,4 +1094,35 @@ unsafe extern "system" fn image_proc(
 /// Whether `hwnd` holds the keyboard focus, for the focus ring.
 fn focused(hwnd: HWND) -> bool {
     (unsafe { GetFocus() }) == hwnd
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DestroyWindow, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, WM_QUIT,
+    };
+
+    #[test]
+    fn destroying_the_view_keeps_a_posted_quit_for_the_message_loop() {
+        // Break caught: the drain of late decode results taking WM_QUIT too, which PeekMessage
+        // hands out whatever the filter, so a window closed with an SVG preview never exits.
+        let parent = crate::preview::render::TestWindow::new(200, 200);
+        let view = super::create_window(parent.0).unwrap();
+        unsafe {
+            PostQuitMessage(7);
+            DestroyWindow(view);
+        }
+        let mut message = MSG::default();
+        let found = unsafe {
+            PeekMessageW(
+                &mut message,
+                std::ptr::null_mut(),
+                WM_QUIT,
+                WM_QUIT,
+                PM_REMOVE,
+            )
+        };
+        assert_ne!(found, 0, "the quit message was swallowed");
+        assert_eq!(message.wParam, 7);
+    }
 }
