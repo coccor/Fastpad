@@ -249,6 +249,17 @@ mod tests {
             let (icon, _) = mask_icon(TreeItem::Note(note_kind(Path::new(path))));
             assert!(shapes.insert(icon), "{path} shares {icon:?}");
         }
+        // Distinct entries must also be distinct drawings, not one SVG saved under two names.
+        for set in MaskSet::ALL {
+            let mut drawn = std::collections::HashSet::new();
+            for &icon in &shapes {
+                let mask = coverage(set, icon, 24).unwrap();
+                assert!(
+                    drawn.insert(mask),
+                    "{set:?} {icon:?} repeats another drawing"
+                );
+            }
+        }
     }
 
     #[test]
@@ -299,7 +310,8 @@ mod tests {
     #[test]
     fn minimal_outlines_are_lighter_than_solid_shapes() {
         // Break caught: the two sets' folders swapped, or an outline SVG filled (spec §3). Only
-        // the icons that are the same shape in both sets: Minimal's Markdown adds a frame.
+        // the icons that are the same shape in both sets: Minimal's Markdown adds a frame, and Rust
+        // is the official logo, filled in both.
         for icon in [
             MaskIcon::Folder,
             MaskIcon::FolderOpen,
@@ -312,7 +324,6 @@ mod tests {
             MaskIcon::JavaScript,
             MaskIcon::TypeScript,
             MaskIcon::Python,
-            MaskIcon::Rust,
             MaskIcon::C,
             MaskIcon::Cpp,
             MaskIcon::CSharp,

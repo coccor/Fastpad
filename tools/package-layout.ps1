@@ -29,6 +29,7 @@ $PackageFiles = @(
     "licenses\Scintilla.txt",
     "licenses\Lexilla.txt",
     "licenses\material-icon-theme.txt",
+    "licenses\rust-logo.txt",
     "licenses\rust-crates.txt"
 )
 $PackageBinaries = @("FastPad.exe", "Scintilla.dll", "Lexilla.dll")

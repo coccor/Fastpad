@@ -16,7 +16,8 @@ text is in `LICENSE`.
 
 | Artwork | Version | License | Text |
 |---|---|---|---|
-| Material Icon Theme icons (12 file and folder icons, embedded in `FastPad.exe`) | 5.38.1 | MIT License, Copyright (c) 2025 Material Extensions | `licenses/material-icon-theme.txt` |
+| Material Icon Theme icons (26 file and folder icons, embedded in `FastPad.exe`) | 5.38.1 | MIT License, Copyright (c) 2025 Material Extensions | `licenses/material-icon-theme.txt` |
+| The Rust logo (the Minimal and Solid sets' Rust icon, embedded in `FastPad.exe`) | `rust-lang/rust-artwork` | CC BY 4.0; a trademark of the Rust Foundation | `licenses/rust-logo.txt` |
 
 ## Rust crates
 

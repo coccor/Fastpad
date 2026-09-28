@@ -1,0 +1,15 @@
+The Rust logo
+
+FastPad's Minimal and Solid icon sets draw Rust files with the official Rust logo, from
+logo/rust-logo-single-path.svg in https://github.com/rust-lang/rust-artwork.
+
+The Rust logo is distributed under the terms of the Creative Commons Attribution 4.0
+International license (CC BY 4.0): https://creativecommons.org/licenses/by/4.0/
+
+Changes made: the path data is unchanged; FastPad scales it into a 24x24 canvas and fills it
+black, so the icon set can tint it with the theme's colour
+(assets/icons/minimal/svg/rust.svg and assets/icons/solid/svg/rust.svg).
+
+The Rust logo is a registered trademark of the Rust Foundation, used here only to identify Rust
+files. FastPad is not affiliated with or endorsed by the Rust project or the Rust Foundation.
+See https://rustfoundation.org/policy/rust-trademark-policy/.

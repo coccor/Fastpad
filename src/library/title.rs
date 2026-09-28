@@ -157,6 +157,9 @@ pub fn default_extension(language: Language) -> &'static str {
 /// stem and "build.ps1" is a PowerShell file.
 pub fn split_typed_name(input: &str, default_extension: &str) -> (String, String) {
     let input = input.trim();
+    if crate::languages::is_language_file_name(input) {
+        return (sanitize_stem(input), String::new());
+    }
     if let Some((stem, extension)) = input.rsplit_once('.')
         && is_note_extension(extension)
     {
@@ -170,6 +173,9 @@ pub fn split_typed_name(input: &str, default_extension: &str) -> (String, String
 /// `None` when the stem cleans to nothing, where `split_typed_name` would say "Untitled".
 pub fn new_note_name(input: &str) -> Option<String> {
     let input = input.trim();
+    if crate::languages::is_language_file_name(input) {
+        return clean_stem(input);
+    }
     let (stem, extension) = match input.rsplit_once('.') {
         Some((stem, extension)) if is_note_extension(extension) => (stem, extension),
         _ => (input, "md"),
@@ -180,6 +186,10 @@ pub fn new_note_name(input: &str) -> Option<String> {
 /// The stem and extension `split_rename` takes from `input`, before the stem is cleaned.
 fn rename_parts<'a>(input: &'a str, current: Option<&'a str>) -> (&'a str, Option<&'a str>) {
     let input = input.trim();
+    // A name a language claims whole (`.env`, `Cargo.lock`) is the entire file name.
+    if crate::languages::is_language_file_name(input) {
+        return (input, None);
+    }
     if let Some(current) = current.filter(|current| !current.is_empty())
         && let Some((stem, extension)) = input.rsplit_once('.')
         && extension.eq_ignore_ascii_case(current)
@@ -386,6 +396,38 @@ mod tests {
         for name in ["a.png", "logo.svg", "setup.exe", "README"] {
             assert!(!is_note_path(Path::new(name)), "{name}");
         }
+    }
+
+    #[test]
+    fn a_typed_whole_file_name_like_env_is_kept_as_the_entire_name() {
+        // Break caught: New note `.env` silently cancelling, a first save or rename to `.env`
+        // making `Untitled.env`, or `Cargo.lock` becoming `Cargo.lock.md`.
+        for name in [
+            ".env",
+            ".env.local",
+            ".bashrc",
+            "Cargo.lock",
+            ".EditorConfig",
+        ] {
+            assert_eq!(new_note_name(name).as_deref(), Some(name), "{name}");
+            assert_eq!(
+                split_typed_name(name, "md"),
+                (name.to_owned(), String::new()),
+                "{name}"
+            );
+            assert_eq!(split_rename(name, Some("md")), (name.to_owned(), None));
+            assert_eq!(renamed_note_name(name, Some("md")).as_deref(), Some(name));
+            assert_eq!(renamed_note_name(name, None).as_deref(), Some(name));
+        }
+        assert_eq!(new_note_name(".json"), None, "not a whole name");
+        assert_eq!(
+            renamed_note_name("b.ps1", Some("md")).as_deref(),
+            Some("b.ps1")
+        );
+        assert_eq!(
+            renamed_note_name("b", Some("ps1")).as_deref(),
+            Some("b.ps1")
+        );
     }
 
     #[test]

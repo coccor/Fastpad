@@ -6,3 +6,6 @@ control so the portable package can include the upstream license texts.
 
 `material-icon-theme.txt` is the MIT License of Material Icon Theme 5.38.1, whose icons are
 embedded in FastPad.exe (see `assets/icons/material/SOURCE.md`).
+
+`rust-logo.txt` credits the Rust logo (CC BY 4.0), which the Minimal and Solid icon sets draw for
+Rust files.
