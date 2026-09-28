@@ -20,6 +20,9 @@ use crate::editor::scintilla_constants::{
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
+#[cfg(windows)]
+use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETXOFFSET, SCI_SETXOFFSET};
+use crate::editor::ViewState;
 use crate::editor::scintilla_constants::{
     SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCHARACTERPOINTER, SCI_GETCODEPAGE,
     SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER,
@@ -508,6 +511,48 @@ impl Editor {
 
     #[cfg(not(windows))]
     pub fn set_first_visible_line(&self, _display_line: usize) -> Result<()> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// This view's selection, first visible line and horizontal scroll, to restore when the tab
+    /// is shown again.
+    #[cfg(windows)]
+    pub fn view_state(&self) -> Result<ViewState> {
+        Ok(ViewState {
+            caret: self
+                .endpoint
+                .send_direct_checked(SCI_GETCURRENTPOS, 0, 0)?
+                .max(0) as usize,
+            anchor: self
+                .endpoint
+                .send_direct_checked(SCI_GETANCHOR, 0, 0)?
+                .max(0) as usize,
+            first_line: self.first_visible_line()?,
+            x_offset: self.endpoint.send_direct_checked(SCI_GETXOFFSET, 0, 0)? as i32,
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub fn view_state(&self) -> Result<ViewState> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// Restores `state`, clamping the selection to the document, which may have shrunk since.
+    #[cfg(windows)]
+    pub fn apply_view_state(&self, state: ViewState) -> Result<()> {
+        let length = self
+            .endpoint
+            .send_direct_checked(SCI_GETLENGTH, 0, 0)?
+            .max(0) as usize;
+        self.set_selection(state.anchor.min(length)..state.caret.min(length))?;
+        self.set_first_visible_line(state.first_line)?;
+        self.endpoint
+            .send_direct_checked(SCI_SETXOFFSET, state.x_offset.max(0) as usize, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn apply_view_state(&self, _state: ViewState) -> Result<()> {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
@@ -1720,6 +1765,26 @@ mod tests {
         assert!(hosted.use_document(&foreign).is_err());
         assert!(hosted.shares_documents_with(&host));
         assert!(!hosted.shares_documents_with(&fixture));
+    }
+
+    #[test]
+    fn view_state_round_trips_and_clamps_to_a_shorter_document() {
+        // Break caught: switching back to a tab lands at the top, or a saved caret past the end of
+        // a file that shrank on disk panics or selects garbage.
+        let editor = test_editor();
+        editor.set_text(&"line\n".repeat(200)).unwrap();
+        let saved = crate::editor::ViewState {
+            caret: 500,
+            anchor: 495,
+            first_line: 90,
+            x_offset: 0,
+        };
+        editor.apply_view_state(saved).unwrap();
+        assert_eq!(editor.view_state().unwrap(), saved);
+        editor.set_text("short").unwrap();
+        editor.apply_view_state(saved).unwrap();
+        let clamped = editor.view_state().unwrap();
+        assert_eq!((clamped.caret, clamped.anchor), (5, 5));
     }
 
     #[test]

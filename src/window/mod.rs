@@ -3,6 +3,7 @@ pub(crate) mod activity_bar;
 pub(crate) mod command_palette;
 pub mod commands;
 pub(crate) mod copy_host;
+pub(crate) mod document_store;
 pub(crate) mod drag_label;
 pub(crate) mod favorites_view;
 pub(crate) mod file_icons;

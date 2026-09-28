@@ -1,4 +1,6 @@
 use crate::document::{CloseCancelled, CloseDecision, Document, DocumentId};
+use crate::editor::ViewState;
+use crate::window::document_store::DocumentStore;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -81,11 +83,11 @@ struct TabViewState {
 }
 
 impl TabView {
-    fn new(documents: &[Document]) -> Self {
+    fn new(tabs: Vec<TabViewTab>) -> Self {
         Self {
             state: Arc::new(RwLock::new(TabViewState {
                 revision: 0,
-                tabs: view_tabs(documents),
+                tabs,
                 preview_buttons: false,
             })),
         }
@@ -100,13 +102,13 @@ impl TabView {
         }
     }
 
-    fn update(&self, documents: &[Document]) {
+    fn update(&self, tabs: Vec<TabViewTab>) {
         let mut state = self
             .state
             .write()
             .unwrap_or_else(|error| error.into_inner());
         state.revision = state.revision.saturating_add(1);
-        state.tabs = view_tabs(documents);
+        state.tabs = tabs;
     }
 
     pub(crate) fn set_preview_buttons(&self, visible: bool) {
@@ -117,9 +119,8 @@ impl TabView {
     }
 }
 
-fn view_tabs(documents: &[Document]) -> Vec<TabViewTab> {
+fn view_tabs<'a>(documents: impl Iterator<Item = &'a Document>) -> Vec<TabViewTab> {
     documents
-        .iter()
         .map(|document| TabViewTab {
             id: document.id,
             title: document.title(),
@@ -128,9 +129,21 @@ fn view_tabs(documents: &[Document]) -> Vec<TabViewTab> {
         .collect()
 }
 
+/// One tab: a view onto a document in the store (split editors spec §3.2).
+#[derive(Debug)]
+pub(crate) struct EditorTab {
+    pub(crate) document: DocumentId,
+    /// Where this view was when it last stopped being shown; while it is shown, the live editor
+    /// is the truth.
+    pub(crate) view_state: ViewState,
+}
+
+/// The open documents and the strip of tabs showing them. The documents live in a
+/// [`DocumentStore`]; each tab is an [`EditorTab`] view onto one (split editors spec §3).
 #[derive(Debug)]
 pub struct Tabs {
-    documents: Vec<Document>,
+    store: DocumentStore,
+    tabs: Vec<EditorTab>,
     /// Every tab, the most recently activated first; the active tab is always first
     /// (quick-open spec §3.2). Kept in memory only, never saved.
     recent: Vec<DocumentId>,
@@ -140,23 +153,20 @@ pub struct Tabs {
 
 impl Tabs {
     pub fn new() -> Self {
-        let documents = Vec::new();
         Self {
-            view: TabView::new(&documents),
+            store: DocumentStore::default(),
+            tabs: Vec::new(),
+            view: TabView::new(Vec::new()),
             recent: Vec::new(),
-            documents,
             selection: TabSelection::new(0),
         }
     }
 
     pub fn with_document(document: Document) -> Self {
-        let documents = vec![document];
-        Self {
-            view: TabView::new(&documents),
-            recent: documents.iter().map(|document| document.id).collect(),
-            documents,
-            selection: TabSelection::new(0),
-        }
+        let mut tabs = Self::new();
+        tabs.append_unchecked(document);
+        tabs.refresh_view();
+        tabs
     }
 
     pub fn from_documents(
@@ -164,20 +174,61 @@ impl Tabs {
     ) -> Result<Self, DuplicateDocumentPath> {
         let documents = documents.into_iter().collect::<Vec<_>>();
         validate_unique_paths(&documents)?;
-        Ok(Self {
-            view: TabView::new(&documents),
-            recent: documents.iter().map(|document| document.id).collect(),
-            documents,
-            selection: TabSelection::new(0),
-        })
+        let mut tabs = Self::new();
+        for document in documents {
+            tabs.append_unchecked(document);
+        }
+        tabs.refresh_view();
+        Ok(tabs)
+    }
+
+    /// Adds a tab for `document` at the end of the strip without the path check or selecting it.
+    fn append_unchecked(&mut self, document: Document) {
+        let id = document.id;
+        self.store.insert_unchecked(document);
+        self.tabs.push(EditorTab {
+            document: id,
+            view_state: ViewState::default(),
+        });
+        self.recent.push(id);
+    }
+
+    /// The documents in strip order.
+    fn strip(&self) -> impl Iterator<Item = &Document> + '_ {
+        self.tabs
+            .iter()
+            .filter_map(|tab| self.store.get(tab.document))
+    }
+
+    fn document_at(&self, index: usize) -> Option<&Document> {
+        self.store.get(self.tabs.get(index)?.document)
+    }
+
+    fn document_at_mut(&mut self, index: usize) -> Option<&mut Document> {
+        let id = self.tabs.get(index)?.document;
+        self.store.get_mut(id)
+    }
+
+    fn position(&self, id: DocumentId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.document == id)
+    }
+
+    /// Removes the tab at `index` and returns its document, which leaves the store with its last
+    /// view.
+    fn remove_tab(&mut self, index: usize) -> Option<Document> {
+        let tab = self.tabs.remove(index);
+        if self.tabs.iter().any(|other| other.document == tab.document) {
+            return None;
+        }
+        self.store.remove(tab.document)
     }
 
     pub fn len(&self) -> usize {
-        self.documents.len()
+        self.tabs.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.documents.is_empty()
+        self.tabs.is_empty()
     }
 
     pub fn active_index(&self) -> usize {
@@ -209,7 +260,7 @@ impl Tabs {
     /// Refreshes the retained tab-view snapshot from the current documents, without otherwise
     /// changing anything (e.g. after a document's title-affecting field changes in place).
     pub(crate) fn refresh_view(&self) {
-        self.view.update(&self.documents);
+        self.view.update(view_tabs(self.strip()));
     }
 
     pub(crate) fn set_preview_buttons(&self, visible: bool) {
@@ -218,79 +269,74 @@ impl Tabs {
 
     /// The selected document, or `None` once every tab has been closed.
     pub fn active(&self) -> Option<&Document> {
-        self.documents.get(self.active_index())
+        self.document_at(self.active_index())
     }
 
     pub(crate) fn active_mut(&mut self) -> Option<&mut Document> {
-        let active = self.active_index();
-        self.documents.get_mut(active)
+        self.document_at_mut(self.active_index())
     }
 
     pub fn document(&self, id: DocumentId) -> Option<&Document> {
-        self.documents.iter().find(|document| document.id == id)
+        self.store.get(id)
     }
 
     pub fn document_mut(&mut self, id: DocumentId) -> Option<&mut Document> {
-        self.documents.iter_mut().find(|document| document.id == id)
+        self.store.get_mut(id)
     }
 
     pub(crate) fn find_path(&self, path: &Path) -> Option<DocumentId> {
-        let key = canonical_key(path).ok()?;
-        self.documents
-            .iter()
-            .find(|document| {
-                document
-                    .path
-                    .as_deref()
-                    .and_then(|path| canonical_key(path).ok())
-                    .is_some_and(|path| path == key)
-            })
-            .map(|document| document.id)
+        self.store.find_path(path)
     }
 
     /// The tab whose stored path names `path`, compared as absolute paths ignoring case, without
     /// touching the disk: unlike `find_path`, it finds a tab whose file no longer exists (renamed
     /// or moved outside FastPad).
     pub(crate) fn find_stored_path(&self, path: &Path) -> Option<DocumentId> {
-        let key = lexical_key(path);
-        self.documents
+        self.store.find_stored_path(path)
+    }
+
+    /// Where the tab showing `id` was when it was last left; the start of the document for a tab
+    /// never left.
+    pub(crate) fn view_state(&self, id: DocumentId) -> ViewState {
+        self.tabs
             .iter()
-            .find(|document| {
-                document
-                    .path
-                    .as_deref()
-                    .is_some_and(|p| lexical_key(p) == key)
-            })
-            .map(|document| document.id)
+            .find(|tab| tab.document == id)
+            .map(|tab| tab.view_state)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_view_state(&mut self, id: DocumentId, state: ViewState) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.document == id) {
+            tab.view_state = state;
+        }
     }
 
     pub(crate) fn replace_active_untitled(&mut self, document: Document) -> Option<Document> {
         let index = self.active_index();
-        let active = self.documents.get_mut(index)?;
-        let old = std::mem::replace(active, document);
-        let id = active.id;
+        let old_id = self.tabs.get(index)?.document;
+        let id = document.id;
+        let old = self.store.replace(old_id, document)?;
+        let tab = &mut self.tabs[index];
+        tab.document = id;
+        tab.view_state = ViewState::default();
         self.recent.retain(|recent| *recent != old.id);
         self.touch(id);
-        self.view.update(&self.documents);
+        self.refresh_view();
         Some(old)
     }
 
     #[cfg(test)]
     pub fn ids(&self) -> impl Iterator<Item = DocumentId> + '_ {
-        self.documents.iter().map(|document| document.id)
+        self.tabs.iter().map(|tab| tab.document)
     }
 
     pub fn titles(&self) -> impl Iterator<Item = String> + '_ {
-        self.documents.iter().map(Document::title)
+        self.strip().map(Document::title)
     }
 
     pub fn activate(&mut self, id: DocumentId) -> Result<(), UnknownDocument> {
-        let index = self
-            .documents
-            .iter()
-            .position(|document| document.id == id)
-            .ok_or(UnknownDocument(id))?;
-        self.selection.select(index, self.documents.len());
+        let index = self.position(id).ok_or(UnknownDocument(id))?;
+        self.selection.select(index, self.tabs.len());
         self.touch(id);
         Ok(())
     }
@@ -313,9 +359,9 @@ impl Tabs {
         self.recent = active
             .into_iter()
             .chain(
-                self.documents
+                self.tabs
                     .iter()
-                    .map(|document| document.id)
+                    .map(|tab| tab.document)
                     .filter(|id| Some(*id) != active),
             )
             .collect();
@@ -323,41 +369,33 @@ impl Tabs {
 
     pub fn activate_index(&mut self, index: usize) -> Result<(), UnknownDocument> {
         let id = self
-            .documents
+            .tabs
             .get(index)
-            .map(|document| document.id)
+            .map(|tab| tab.document)
             .ok_or(UnknownDocument(DocumentId(u64::MAX)))?;
         self.activate(id)
     }
 
     pub fn push(&mut self, document: Document) -> Result<(), DuplicateDocumentPath> {
-        if let Some(path) = document.path.as_deref() {
-            let candidate = canonical_key(path)?;
-            if self.documents.iter().any(|existing| {
-                existing
-                    .path
-                    .as_deref()
-                    .and_then(|path| canonical_key(path).ok())
-                    .is_some_and(|path| path == candidate)
-            }) {
-                return Err(DuplicateDocumentPath(candidate));
-            }
-        }
         let id = document.id;
-        self.documents.push(document);
-        let index = self.documents.len() - 1;
-        self.selection.select(index, self.documents.len());
+        self.store.insert(document)?;
+        self.tabs.push(EditorTab {
+            document: id,
+            view_state: ViewState::default(),
+        });
+        let index = self.tabs.len() - 1;
+        self.selection.select(index, self.tabs.len());
         self.touch(id);
-        self.view.update(&self.documents);
+        self.refresh_view();
         Ok(())
     }
 
     pub fn close_active(&mut self, decision: CloseDecision) -> Result<Document, CloseCancelled> {
-        if decision == CloseDecision::Cancel || self.documents.is_empty() {
+        if decision == CloseDecision::Cancel || self.tabs.is_empty() {
             return Err(CloseCancelled);
         }
         let index = self.active_index();
-        let closed = self.documents.remove(index);
+        let closed = self.remove_tab(index).ok_or(CloseCancelled)?;
         self.select_after_removal(index, closed.id);
         Ok(closed)
     }
@@ -365,17 +403,17 @@ impl Tabs {
     /// Keeps the successor of a removed tab selected (or its predecessor at the end of the strip).
     /// `closed` leaves the activation order and the tab now selected takes its front.
     fn select_after_removal(&mut self, removed: usize, closed: DocumentId) {
-        let active = removed.min(self.documents.len().saturating_sub(1));
+        let active = removed.min(self.tabs.len().saturating_sub(1));
         self.selection.active.store(active, Ordering::Release);
         self.recent.retain(|recent| *recent != closed);
-        if let Some(id) = self.documents.get(active).map(|document| document.id) {
+        if let Some(id) = self.tabs.get(active).map(|tab| tab.document) {
             self.touch(id);
         }
-        self.view.update(&self.documents);
+        self.refresh_view();
     }
 
     pub fn active_close_review(&self) -> Option<CloseReview> {
-        let document = self.documents.get(self.active_index())?;
+        let document = self.active()?;
         Some(CloseReview {
             id: document.id,
             generation: document.generation,
@@ -390,21 +428,20 @@ impl Tabs {
         if decision == CloseDecision::Cancel {
             return Err(CloseReviewError::Cancelled);
         }
-        let Some(index) = self
-            .documents
-            .iter()
-            .position(|document| document.id == review.id)
-        else {
+        let Some(index) = self.position(review.id) else {
             return Err(CloseReviewError::Stale);
         };
-        if index != self.active_index() || self.documents[index].generation != review.generation {
+        let Some(document) = self.document_at(index) else {
+            return Err(CloseReviewError::Stale);
+        };
+        if index != self.active_index() || document.generation != review.generation {
             return Err(CloseReviewError::Stale);
         }
         // A Save answer must never close a document whose save did not actually happen.
-        if decision == CloseDecision::Save && self.documents[index].dirty {
+        if decision == CloseDecision::Save && document.dirty {
             return Err(CloseReviewError::Unsaved);
         }
-        let closed = self.documents.remove(index);
+        let closed = self.remove_tab(index).ok_or(CloseReviewError::Stale)?;
         self.select_after_removal(index, closed.id);
         Ok(closed)
     }
@@ -417,32 +454,30 @@ impl Tabs {
         &mut self,
         review: CloseReview,
     ) -> Result<Document, CloseReviewError> {
-        let Some(index) = self
-            .documents
-            .iter()
-            .position(|document| document.id == review.id)
-        else {
+        let Some(index) = self.position(review.id) else {
+            return Err(CloseReviewError::Stale);
+        };
+        let Some(document) = self.document_at(index) else {
             return Err(CloseReviewError::Stale);
         };
         let active = self.active_index();
-        if index == active || self.documents[index].generation != review.generation {
+        if index == active || document.generation != review.generation {
             return Err(CloseReviewError::Stale);
         }
-        if self.documents[index].dirty {
+        if document.dirty {
             return Err(CloseReviewError::Unsaved);
         }
-        let closed = self.documents.remove(index);
+        let closed = self.remove_tab(index).ok_or(CloseReviewError::Stale)?;
         if index < active {
             self.selection.active.store(active - 1, Ordering::Release);
         }
         self.recent.retain(|recent| *recent != closed.id);
-        self.view.update(&self.documents);
+        self.refresh_view();
         Ok(closed)
     }
 
     pub fn next_dirty_review(&self, reviewed: &[CloseReviewKey]) -> Option<CloseReview> {
-        self.documents
-            .iter()
+        self.strip()
             .find(|document| {
                 document.dirty
                     && !reviewed.contains(&CloseReviewKey {
@@ -462,8 +497,7 @@ impl Tabs {
     }
 
     pub fn set_active_dirty(&mut self, dirty: bool) -> bool {
-        let active = self.active_index();
-        let Some(document) = self.documents.get_mut(active) else {
+        let Some(document) = self.active_mut() else {
             return false;
         };
         if document.is_image() {
@@ -475,7 +509,7 @@ impl Tabs {
         }
         document.dirty = dirty;
         document.generation = document.generation.saturating_add(1);
-        self.view.update(&self.documents);
+        self.refresh_view();
         true
     }
 
@@ -483,8 +517,7 @@ impl Tabs {
     /// detection, independent of applying the actual lexer to the live editor. Returns `false`
     /// (no-op) when the active document already has this language.
     pub(crate) fn set_active_language(&mut self, language: crate::document::Language) -> bool {
-        let active = self.active_index();
-        let Some(document) = self.documents.get_mut(active) else {
+        let Some(document) = self.active_mut() else {
             return false;
         };
         if document.language == language {
@@ -494,12 +527,13 @@ impl Tabs {
         true
     }
 
+    /// The documents in strip order.
     pub(crate) fn documents(&self) -> impl Iterator<Item = &Document> + '_ {
-        self.documents.iter()
+        self.strip()
     }
 
     pub(crate) fn record_recovery_generation(&mut self, id: DocumentId, generation: u64) {
-        if let Some(document) = self.documents.iter_mut().find(|document| document.id == id) {
+        if let Some(document) = self.store.get_mut(id) {
             document.recovery_generation = Some(generation);
         }
     }
@@ -507,36 +541,35 @@ impl Tabs {
     pub(crate) fn take_active_recovery_origin(
         &mut self,
     ) -> Option<crate::document::RecoveryOrigin> {
-        let active = self.active_index();
-        self.documents.get_mut(active)?.recovery_origin.take()
+        self.active_mut()?.recovery_origin.take()
     }
 
     /// A text change in the active tab. The first one makes a preview tab normal, so replacing
     /// the preview can never drop an edit; returns whether that happened.
     pub(crate) fn note_active_text_change(&mut self) -> bool {
-        let active = self.active_index();
-        let Some(document) = self.documents.get_mut(active) else {
+        let Some(id) = self.active().map(|document| document.id) else {
             return false;
         };
-        if document.is_image() {
+        if !self.store.note_text_change(id) {
             return false;
         }
-        document.generation = document.generation.saturating_add(1);
+        let Some(document) = self.store.get_mut(id) else {
+            return false;
+        };
         if !document.preview {
             return false;
         }
         document.preview = false;
-        self.view.update(&self.documents);
+        self.refresh_view();
         true
     }
 
-    /// A background tab's text was changed in the editor while it was swapped in with
-    /// notifications suppressed (a Search replace, note-search spec §12a). Records what
-    /// `SCN_SAVEPOINTLEFT` and `SCN_MODIFIED` would have for the active tab: dirty, a new
-    /// generation (so recovery snapshots it), and a preview kept. Returns whether the strip
-    /// changed.
+    /// A background tab's text was changed through the document host, whose notifications reach
+    /// no window (a Search replace, note-search spec §12a). Records what `SCN_SAVEPOINTLEFT` and
+    /// `SCN_MODIFIED` would have for the active tab: dirty, a new generation (so recovery
+    /// snapshots it), and a preview kept. Returns whether the strip changed.
     pub(crate) fn note_background_edit(&mut self, id: DocumentId) -> bool {
-        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+        let Some(document) = self.store.get_mut(id) else {
             return false;
         };
         document.generation = document.generation.saturating_add(1);
@@ -544,15 +577,14 @@ impl Tabs {
         document.dirty = true;
         document.preview = false;
         if changed {
-            self.view.update(&self.documents);
+            self.refresh_view();
         }
         changed
     }
 
     /// The preview tab, if one is open. There is at most one.
     pub(crate) fn preview_id(&self) -> Option<DocumentId> {
-        self.documents
-            .iter()
+        self.strip()
             .find(|document| document.preview)
             .map(|document| document.id)
     }
@@ -562,22 +594,31 @@ impl Tabs {
     /// happens when the preview somehow has unsaved edits: it is kept as a normal tab. The caller
     /// has already checked that `document`'s file is not open in another tab.
     pub(crate) fn replace_preview(&mut self, document: Document) -> Option<Document> {
-        match self.documents.iter().position(|existing| existing.preview) {
-            Some(index) if !self.documents[index].dirty => {
+        let preview = self.tabs.iter().position(|tab| {
+            self.store
+                .get(tab.document)
+                .is_some_and(|existing| existing.preview)
+        });
+        match preview {
+            Some(index) if self.document_at(index).is_some_and(|existing| !existing.dirty) => {
                 let id = document.id;
-                let old = std::mem::replace(&mut self.documents[index], document);
-                self.selection.select(index, self.documents.len());
+                let old_id = self.tabs[index].document;
+                let old = self.store.replace(old_id, document)?;
+                let tab = &mut self.tabs[index];
+                tab.document = id;
+                tab.view_state = ViewState::default();
+                self.selection.select(index, self.tabs.len());
                 self.recent.retain(|recent| *recent != old.id);
                 self.touch(id);
-                self.view.update(&self.documents);
+                self.refresh_view();
                 Some(old)
             }
             edited => {
-                if let Some(index) = edited {
-                    self.documents[index].preview = false;
+                if let Some(existing) = edited.and_then(|index| self.document_at_mut(index)) {
+                    existing.preview = false;
                 }
                 if self.push(document).is_err() {
-                    self.view.update(&self.documents);
+                    self.refresh_view();
                 }
                 None
             }
@@ -593,77 +634,54 @@ impl Tabs {
             return false;
         }
         document.preview = false;
-        self.view.update(&self.documents);
+        self.refresh_view();
         true
     }
 
     pub fn clear_for_shutdown(&mut self) {
-        self.documents.clear();
+        self.tabs.clear();
+        self.store.clear();
         self.recent.clear();
         self.selection.active.store(0, Ordering::Release);
-        self.view.update(&self.documents);
+        self.refresh_view();
     }
 
     pub(crate) fn active_handle(&self) -> Option<&crate::editor::EditorDocument> {
         self.active().and_then(Document::text_handle)
     }
 
-    /// Rejects `path` if it canonicalizes to the same file another open tab (any document other
-    /// than the one at `exclude`) already owns, preserving Task 9's
-    /// one-native-document-per-canonical-path invariant. A `path` that does not yet exist on disk
-    /// (the common brand-new Save As destination) cannot collide with any already-open document,
-    /// so it is returned unchanged without a canonicalization check. Shared by `set_active_path`
-    /// and `rebind_path`.
-    fn reject_path_collision(
-        &self,
-        exclude: usize,
-        path: PathBuf,
-    ) -> Result<PathBuf, DuplicateDocumentPath> {
-        if let Ok(candidate) = canonical_key(&path) {
-            let collides = self.documents.iter().enumerate().any(|(index, existing)| {
-                index != exclude
-                    && existing
-                        .path
-                        .as_deref()
-                        .and_then(|existing_path| canonical_key(existing_path).ok())
-                        .is_some_and(|existing_candidate| existing_candidate == candidate)
-            });
-            if collides {
-                return Err(DuplicateDocumentPath(candidate));
-            }
-        }
-        Ok(path)
-    }
-
     /// Renames the active document's path, e.g. after a successful Save As write. Rejects the
     /// rename if `path` canonicalizes to the same file another open tab already owns; see
-    /// `reject_path_collision`.
+    /// `DocumentStore::reject_path_collision`.
     pub(crate) fn set_active_path(&mut self, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
-        let active = self.active_index();
-        if active >= self.documents.len() {
+        let Some(id) = self.active().map(|document| document.id) else {
             return Err(DuplicateDocumentPath(path));
+        };
+        let path = self.store.reject_path_collision(id, path)?;
+        if let Some(document) = self.store.get_mut(id) {
+            document.path = Some(path);
         }
-        let path = self.reject_path_collision(active, path)?;
-        self.documents[active].path = Some(path);
-        self.view.update(&self.documents);
+        self.refresh_view();
         Ok(())
     }
 
     /// Rebinds `id`'s path, e.g. after a note is renamed on disk or moved between folders.
     /// Rejects the path if it canonicalizes to the same file another open tab already owns; see
-    /// `reject_path_collision`. Updates the tab view so the tab strip and accessibility see the
-    /// new title.
+    /// `DocumentStore::reject_path_collision`. Updates the tab view so the tab strip and
+    /// accessibility see the new title.
     pub fn rebind_path(
         &mut self,
         id: DocumentId,
         path: PathBuf,
     ) -> Result<(), DuplicateDocumentPath> {
-        let Some(index) = self.documents.iter().position(|document| document.id == id) else {
+        if self.store.get(id).is_none() {
             return Err(DuplicateDocumentPath(path));
-        };
-        let path = self.reject_path_collision(index, path)?;
-        self.documents[index].path = Some(path);
-        self.view.update(&self.documents);
+        }
+        let path = self.store.reject_path_collision(id, path)?;
+        if let Some(document) = self.store.get_mut(id) {
+            document.path = Some(path);
+        }
+        self.refresh_view();
         Ok(())
     }
 
@@ -673,10 +691,9 @@ impl Tabs {
     /// new location. No collision check is needed: `original` was already valid for this
     /// document, so restoring it cannot newly collide with any other tab.
     pub(crate) fn revert_active_path(&mut self, original: Option<PathBuf>) {
-        let active = self.active_index();
-        if let Some(document) = self.documents.get_mut(active) {
+        if let Some(document) = self.active_mut() {
             document.path = original;
-            self.view.update(&self.documents);
+            self.refresh_view();
         }
     }
 }
@@ -715,7 +732,7 @@ pub struct UnknownDocument(pub DocumentId);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DuplicateDocumentPath(pub PathBuf);
 
-fn canonical_key(path: &Path) -> Result<PathBuf, DuplicateDocumentPath> {
+pub(crate) fn canonical_key(path: &Path) -> Result<PathBuf, DuplicateDocumentPath> {
     let canonical = path
         .canonicalize()
         .map_err(|_| DuplicateDocumentPath(path.to_path_buf()))?;
@@ -729,7 +746,7 @@ fn canonical_key(path: &Path) -> Result<PathBuf, DuplicateDocumentPath> {
     }
 }
 
-fn lexical_key(path: &Path) -> String {
+pub(crate) fn lexical_key(path: &Path) -> String {
     std::path::absolute(path)
         .unwrap_or_else(|_| path.to_path_buf())
         .components()
@@ -1154,5 +1171,43 @@ mod tests {
         assert_eq!(order(&tabs), [3, 1, 2, 4]);
         let from = Tabs::from_documents([document(5), document(6)]).unwrap();
         assert_eq!(order(&from), [5, 6]);
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_view_state() {
+        // Break caught: switching tabs forgetting where you were, or one tab's caret landing in
+        // another.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(document(2)).unwrap();
+        let state = crate::editor::ViewState {
+            caret: 7,
+            anchor: 3,
+            first_line: 2,
+            x_offset: 0,
+        };
+        tabs.set_view_state(DocumentId(1), state);
+        assert_eq!(tabs.view_state(DocumentId(1)), state);
+        assert_eq!(
+            tabs.view_state(DocumentId(2)),
+            crate::editor::ViewState::default()
+        );
+    }
+
+    #[test]
+    fn closing_the_shown_tab_keeps_the_next_tabs_view_state() {
+        // Break caught: the tab activated by a close inheriting the closed tab's caret.
+        let mut tabs = Tabs::with_document(document(1));
+        tabs.push(document(2)).unwrap();
+        let second = crate::editor::ViewState {
+            caret: 9,
+            anchor: 9,
+            first_line: 4,
+            x_offset: 0,
+        };
+        tabs.set_view_state(DocumentId(2), second);
+        tabs.activate(DocumentId(1)).unwrap();
+        tabs.close_active(CloseDecision::Discard).unwrap();
+        assert_eq!(tabs.active().map(|document| document.id), Some(DocumentId(2)));
+        assert_eq!(tabs.view_state(DocumentId(2)), second);
     }
 }

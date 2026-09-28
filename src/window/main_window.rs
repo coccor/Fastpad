@@ -3595,6 +3595,7 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
             .map(|active| (active.id, active.recovery_id));
         (editor, candidate_ids, replace_preview)
     };
+    remember_active_view(hwnd);
     // With no tab open this is the hidden placeholder document.
     let previous = editor.current_document()?;
     let reused_ids = match candidate_ids {
@@ -3719,6 +3720,7 @@ fn open_image_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Resul
             .map(|active| (active.id, active.recovery_id));
         (editor, candidate_ids, replace_preview)
     };
+    remember_active_view(hwnd);
     let reused_ids = match candidate_ids {
         Some(ids) if editor.text()?.is_empty() => Some(ids),
         _ => None,
@@ -3954,6 +3956,7 @@ pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
         (editor, id, recovery_id)
     };
 
+    remember_active_view(hwnd);
     let document = Document::untitled(id, recovery_id, editor.create_document()?);
     document
         .expect_text()
@@ -4028,15 +4031,23 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
             return false;
         }
     }
+    if leaving {
+        remember_active_view(hwnd);
+    }
     let target = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let editor = app.editor.clone()?;
         app.tabs.activate(id).ok()?;
-        Some((editor, app.tabs.active_handle().cloned()))
+        Some((
+            editor,
+            app.tabs.active_handle().cloned(),
+            app.tabs.view_state(id),
+        ))
     });
-    let Some((editor, handle)) = target else {
+    let Some((editor, handle, view_state)) = target else {
         return false;
     };
+    let text = handle.is_some();
     // An image tab has no text: the hidden editor holds an empty placeholder, as with no tab open.
     let handle = match handle {
         Some(handle) => handle,
@@ -4048,9 +4059,28 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
     if editor.use_document(&handle).is_err() || !identity.is_live_for(hwnd) {
         return false;
     }
+    if text {
+        let _ = editor.apply_view_state(view_state);
+    }
     refresh_tabs(hwnd);
     crate::window::image_host::check_disk(hwnd);
     true
+}
+
+/// Records where the editor is in the active text tab, so showing that tab again lands there
+/// (split editors spec §3.2). Called before anything else takes over the editor.
+fn remember_active_view(hwnd: HWND) {
+    let shown = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let active = app.tabs.active().filter(|document| !document.is_image())?;
+        Some((active.id, app.editor.clone()?))
+    });
+    if let Some((id, editor)) = shown
+        && let Ok(state) = editor.view_state()
+        && let Some(mut app) = unsafe { app_ptr(hwnd) }
+    {
+        unsafe { app.as_mut() }.tabs.set_view_state(id, state);
+    }
 }
 
 fn handle_accessible_select(hwnd: HWND, lparam: LPARAM) -> LRESULT {
@@ -4222,16 +4252,34 @@ fn close_reviewed_document(
                 )
             })
             .unwrap_or_default();
-        Some((closed, app.tabs.active_handle().cloned(), snapshots))
+        let view_state = app
+            .tabs
+            .active()
+            .map(|document| app.tabs.view_state(document.id))
+            .unwrap_or_default();
+        Some((
+            closed,
+            app.tabs.active_handle().cloned(),
+            view_state,
+            snapshots,
+        ))
     });
-    let Some((closed, active, snapshots)) = switched else {
+    let Some((closed, active, view_state, snapshots)) = switched else {
         return;
     };
     // The view keeps its own reference to whatever it shows, so the last closed document is
     // swapped for an empty placeholder rather than lingering in the hidden editor.
-    let active = active.or_else(|| editor.create_document().ok());
-    if let Some(active) = active {
-        let _ = editor.use_document(&active);
+    match active {
+        Some(active) => {
+            if editor.use_document(&active).is_ok() {
+                let _ = editor.apply_view_state(view_state);
+            }
+        }
+        None => {
+            if let Ok(blank) = editor.create_document() {
+                let _ = editor.use_document(&blank);
+            }
+        }
     }
     drop(closed);
     crate::recovery::remove_snapshot_files(&snapshots);
@@ -5225,16 +5273,18 @@ fn still_empty_untitled(hwnd: HWND, id: DocumentId) -> bool {
 }
 
 fn apply_view_state(hwnd: HWND, entry: &crate::session::SessionEntry) {
-    use crate::editor::scintilla_constants::SCI_GETLENGTH;
     let Some(editor) =
         (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
     else {
         return;
     };
-    // The file may have shrunk since the session was saved.
-    let length = unsafe { SendMessageW(editor.hwnd(), SCI_GETLENGTH, 0, 0) }.max(0) as usize;
-    let _ = editor.set_selection(entry.anchor.min(length)..entry.caret.min(length));
-    let _ = editor.set_first_visible_line(entry.first_line);
+    // `apply_view_state` clamps: the file may have shrunk since the session was saved.
+    let _ = editor.apply_view_state(crate::editor::ViewState {
+        caret: entry.caret,
+        anchor: entry.anchor,
+        first_line: entry.first_line,
+        x_offset: 0,
+    });
 }
 
 /// Snapshot files a saved `session.ini` still names. They are waiting for the primary window's
@@ -5521,6 +5571,7 @@ fn open_snapshot_tab(
         let (id, recovery_id) = app.allocate_document_identity();
         (editor, id, recovery_id)
     };
+    remember_active_view(hwnd);
     let previous = editor.current_document()?;
     let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
     document.path = bound_path;
@@ -6582,6 +6633,28 @@ mod tests {
         assert_eq!(active(), 2);
         execute_command(window.hwnd, CommandId::SelectTab9);
         assert_eq!(active(), 2);
+    }
+
+    #[test]
+    fn switching_tabs_restores_each_tabs_caret_and_scroll() {
+        // Break caught: switching tabs resetting the caret and scroll to the start of the document.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text(&"line\n".repeat(2000)).unwrap();
+        let saved = crate::editor::ViewState {
+            caret: 1210 * 5 + 2,
+            anchor: 1210 * 5,
+            first_line: 1200,
+            x_offset: 0,
+        };
+        editor.apply_view_state(saved).unwrap();
+        execute_command(window.hwnd, CommandId::New);
+        editor.set_text("second").unwrap();
+        assert_eq!(editor.view_state().unwrap().first_line, 0);
+
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        assert_eq!(editor.view_state().unwrap(), saved);
     }
 
     #[test]
