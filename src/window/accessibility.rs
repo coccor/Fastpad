@@ -20,8 +20,8 @@ use windows_sys::Win32::UI::Accessibility::{
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
-    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, SendMessageW, WM_APP, WM_COMMAND, WM_LBUTTONUP,
-    WM_SYSCOMMAND,
+    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, SendMessageW, WM_APP, WM_COMMAND,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSCOMMAND,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -853,6 +853,8 @@ unsafe extern "system" fn accessible_do_default_action(
             };
             let center = rect.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
+            // A whole click: the strip acts only on a release over the target it was pressed on.
+            unsafe { PostMessageW(item.hwnd, WM_LBUTTONDOWN, 1, packed) };
             unsafe { PostMessageW(item.hwnd, WM_LBUTTONUP, 0, packed) }
         }
         Some(AccessibleDefaultAction::SystemCommand(command)) => unsafe {

@@ -206,9 +206,9 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) -> TestResult<()>
     Ok(())
 }
 
-/// Client-area accessible children are the fixed chrome items plus one per tab.
+/// The editor group's tab strip lists one accessible child per tab plus its fixed buttons.
 fn tab_count(hwnd: HWND) -> TestResult<i32> {
-    Accessible::from_window(hwnd)?.child_count()
+    Accessible::from_window(find_child_by_class(hwnd, "FastPadEditorGroup")?)?.child_count()
 }
 
 struct Scratch {

@@ -20,7 +20,7 @@ use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, IDCANCEL, IDNO,
     IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE, WM_COMMAND,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 use windows_sys::core::{BOOL, BSTR, GUID, HRESULT};
 
@@ -233,7 +233,10 @@ fn click_tab(hwnd: HWND, index: usize, tab_count: usize) -> TestResult<()> {
     let (group, layout) = strip_layout(hwnd, tab_count)?;
     let point = layout.tab(index).ok_or("no such tab")?.center();
     let packed = (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize;
-    unsafe { SendMessageW(group, WM_LBUTTONUP, 0, packed) };
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDOWN, 1, packed);
+        SendMessageW(group, WM_LBUTTONUP, 0, packed);
+    }
     Ok(())
 }
 

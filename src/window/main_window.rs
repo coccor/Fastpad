@@ -161,6 +161,10 @@ pub(crate) unsafe fn maybe_post_deferred_start(hwnd: HWND, identity: &WindowIden
     }
     let should_post = unsafe { take_deferred_start_pending(hwnd) };
     if should_post {
+        // Posted startup steps outrank WM_PAINT, so the tab strip paints now or only after them.
+        if let Some(group) = group_hwnd(hwnd) {
+            unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(group) };
+        }
         unsafe {
             PostMessageW(hwnd, deferred_start_message(), 0, 0);
         }
@@ -1404,7 +1408,8 @@ pub(crate) fn ui_fonts(hwnd: HWND) -> crate::window::side_panel::UiFonts {
         .unwrap_or_default()
 }
 
-/// The height of the visible find bar or name box band above the editor, or 0.
+/// The height of what sits between the menu band and the editor: the name box, the group's tab
+/// strip and the visible find bar.
 fn bar_band_height(hwnd: HWND) -> i32 {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     unsafe { app_ptr(hwnd) }.map_or(0, |app| {
@@ -1419,7 +1424,11 @@ fn bar_band_height(hwnd: HWND) -> i32 {
             .as_ref()
             .filter(|name_box| name_box.is_visible())
             .map_or(0, |_| crate::window::name_box::name_box_height(dpi));
-        find + name
+        let strip = app
+            .group
+            .as_ref()
+            .map_or(0, |_| crate::window::group_strip::strip_height(dpi));
+        find + name + strip
     })
 }
 
@@ -1432,7 +1441,7 @@ fn content_focus_target(hwnd: HWND) -> Option<HWND> {
 }
 
 /// Overlays the palette at the top of the editor area, even with no tab open (New and Open stay
-/// available then), below a visible find bar or name box so both stay usable.
+/// available then), below the tab strip and a visible find bar or name box so all stay usable.
 fn layout_command_palette(hwnd: HWND) {
     if !with_command_palette(hwnd, CommandPalette::is_visible).unwrap_or(false) {
         return;
@@ -2445,6 +2454,13 @@ pub(crate) fn group_strip_message(
         (lparam as u32 & 0xffff) as u16 as i16 as i32,
         ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
     );
+    // Clicking the strip leaves menu mode, as a click anywhere else off the menu band does.
+    if matches!(
+        message,
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MBUTTONDOWN | WM_RBUTTONUP
+    ) {
+        exit_menu_mode(hwnd);
+    }
     match message {
         WM_MOUSEMOVE => {
             if drag_tab_thumb(hwnd, x) {
@@ -2487,12 +2503,19 @@ pub(crate) fn group_strip_message(
             }
             Some(0)
         }
+        // A release acts only over the target its press went down on, so the release that ends
+        // a double-click on empty strip never hits the tab that double-click just opened.
         WM_LBUTTONUP => {
-            update_strip_pointer(hwnd, |pointer| pointer.release(None).0);
+            let mut activated = None;
+            update_strip_pointer(hwnd, |pointer| {
+                let (next, released) = pointer.release(strip_target(hwnd, x, y));
+                activated = released;
+                next
+            });
             if end_tab_thumb_drag(hwnd) {
                 return Some(0);
             }
-            match strip_target(hwnd, x, y)? {
+            match activated? {
                 StripTarget::CloseTab(index) => {
                     activate_tab(hwnd, index);
                     execute_command(hwnd, CommandId::CloseTab);
@@ -6914,10 +6937,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::New);
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
         let group = super::group_hwnd(window.hwnd).unwrap();
-        let tab = super::strip_layout(window.hwnd)
-            .unwrap()
-            .tab(0)
-            .unwrap();
+        let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
         let point = client_lparam(tab.left + 10, tab.bottom / 2);
         unsafe {
             SendMessageW(group, WM_LBUTTONDOWN, 1, point);
@@ -6962,6 +6982,116 @@ mod tests {
     }
 
     #[test]
+    fn double_clicking_the_empty_strip_where_the_new_tab_closes_keeps_it_open() {
+        // Break caught: the release after the double-click acting on whatever the new tab put
+        // under the pointer, so a double-click on its close box's spot opens a tab and closes it.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let close = super::strip_layout(window.hwnd)
+            .unwrap()
+            .close_tab(1)
+            .unwrap()
+            .center();
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert_eq!(super::tab_count(window.hwnd), 1);
+        assert_eq!(
+            super::strip_target(window.hwnd, close.x, close.y),
+            Some(crate::window::group_strip::StripTarget::Empty)
+        );
+
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let point = client_lparam(close.x, close.y);
+        unsafe {
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+            SendMessageW(group, WM_LBUTTONDBLCLK, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    #[test]
+    fn clicking_a_tab_in_menu_mode_leaves_menu_mode() {
+        // Break caught: the group taking strip clicks without the main window's menu-mode exit, so
+        // after Alt a tab click switches tabs while keystrokes still go to menu mnemonics.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        super::enter_menu_mode(window.hwnd, 0);
+        assert!(app_mut(window.hwnd).menu_mode.is_some());
+
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
+        let point = client_lparam(tab.left + 10, tab.bottom / 2);
+        unsafe {
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+        assert_eq!(app_mut(window.hwnd).menu_mode, None);
+    }
+
+    #[test]
+    fn the_command_palette_opens_below_the_tab_strip_and_the_find_bar() {
+        // Break caught: the palette's top still summing only the title and bar heights, so once
+        // the strip and find bar moved into the group it covers the strip and the find bar.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::Find);
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let rect = |hwnd| {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(hwnd, &mut rect) };
+            rect
+        };
+        let app = app_mut(window.hwnd);
+        let find = rect(app.find_bar.as_ref().unwrap().panel_hwnd());
+        let palette = rect(app.command_palette.as_ref().unwrap().panel_hwnd());
+        assert!(
+            palette.top >= find.bottom,
+            "palette top {} overlaps the find bar ending at {}",
+            palette.top,
+            find.bottom
+        );
+    }
+
+    #[test]
+    fn the_tab_strip_paints_before_deferred_startup_begins() {
+        // Break caught: the group's first paint queued behind the deferred startup chain, whose
+        // posted steps outrank WM_PAINT, so the first frame shows no tabs until restore finishes.
+        use windows_sys::Win32::Graphics::Gdi::{GetUpdateRect, InvalidateRect};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let identity = app_mut(window.hwnd).window_identity();
+        app_mut(window.hwnd).mark_first_paint_complete();
+        // Only a visible window has an update region to wait on.
+        unsafe {
+            ShowWindow(window.hwnd, SW_SHOWNA);
+            InvalidateRect(group, std::ptr::null(), 0);
+        }
+        assert_ne!(unsafe { GetUpdateRect(group, std::ptr::null_mut(), 0) }, 0);
+
+        unsafe { super::maybe_post_deferred_start(window.hwnd, &identity) };
+        assert_eq!(
+            unsafe { GetUpdateRect(group, std::ptr::null_mut(), 0) },
+            0,
+            "the strip still waits for a WM_PAINT"
+        );
+    }
+
+    #[test]
     fn the_title_bar_shows_the_window_title() {
         // Break caught: the title bar left blank once the tabs moved out of it.
         let _scintilla = load_native_scintilla();
@@ -6969,7 +7099,10 @@ mod tests {
         let editor = install_test_editor(&window);
         editor.set_text("changed").unwrap();
         // Notes mode titles an untitled tab from its first line.
-        assert_eq!(super::active_window_title(window.hwnd), "changed * - FastPad");
+        assert_eq!(
+            super::active_window_title(window.hwnd),
+            "changed * - FastPad"
+        );
     }
 
     #[test]
@@ -7677,8 +7810,8 @@ mod tests {
         };
         let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
         // The editor group's tab strip sits between the title strip and the editor.
-        let title_height = super::title_layout(window.hwnd).height
-            + crate::window::group_strip::strip_height(dpi);
+        let title_height =
+            super::title_layout(window.hwnd).height + crate::window::group_strip::strip_height(dpi);
         let band = super::menu_band::band_height(dpi);
 
         key_menu(0);
@@ -7763,8 +7896,8 @@ mod tests {
         };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
         // The editor group's tab strip sits between the title strip and the editor.
-        let title_height = super::title_layout(window.hwnd).height
-            + crate::window::group_strip::strip_height(dpi);
+        let title_height =
+            super::title_layout(window.hwnd).height + crate::window::group_strip::strip_height(dpi);
 
         execute_command(window.hwnd, CommandId::Find);
         let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
@@ -8380,8 +8513,8 @@ mod tests {
         }
         let dpi = unsafe { GetDpiForWindow(window.hwnd) };
         // The editor group's tab strip sits between the title strip and the editor.
-        let title_height = super::title_layout(window.hwnd).height
-            + crate::window::group_strip::strip_height(dpi);
+        let title_height =
+            super::title_layout(window.hwnd).height + crate::window::group_strip::strip_height(dpi);
         assert_eq!(
             (client.bottom - client.top) - (shown.bottom - shown.top),
             title_height + crate::window::status::status_height(dpi),
@@ -10536,6 +10669,12 @@ mod tests {
         // Both clicks carry the same message time, well inside the double-click time.
         for _ in 0..2 {
             unsafe {
+                SendMessageW(
+                    group,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN,
+                    1,
+                    pack(center.x, center.y),
+                );
                 SendMessageW(
                     group,
                     windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
