@@ -13,9 +13,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, DefWindowProcW, IDC_ARROW, IDC_SIZEWE, LoadCursorW, OBJID_CLIENT, RegisterClassW,
     SendMessageW, SetCursor, WM_CAPTURECHANGED, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
     WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_VISIBLE,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_NOTIFY,
+    WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 /// The window of one editor group and its tab strip's pointer state. PR 1 of the split editors
@@ -34,6 +34,8 @@ pub(crate) struct GroupWindow {
     pub(crate) last_tab_click: Option<(crate::document::DocumentId, u32)>,
     /// The tab strip's accessibility provider, created on the first `WM_GETOBJECT`.
     pub(crate) accessibility: super::accessibility::AccessibilityState,
+    /// The Markdown/SVG preview buttons floating over the content.
+    pub(crate) preview_buttons: super::preview_buttons::PreviewButtons,
 }
 
 impl GroupWindow {
@@ -45,6 +47,7 @@ impl GroupWindow {
             middle_press: None,
             last_tab_click: None,
             accessibility: Default::default(),
+            preview_buttons: Default::default(),
         }
     }
 }
@@ -111,6 +114,7 @@ unsafe extern "system" fn group_proc(
         | super::accessibility::WM_FASTPAD_ACCESSIBLE_SELECT => unsafe {
             SendMessageW(main, message, wparam, lparam)
         },
+        WM_NCHITTEST => super::main_window::group_hit_test(main, hwnd, lparam),
         WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => {
             super::main_window::group_accessible_object(main, hwnd, wparam)
         }

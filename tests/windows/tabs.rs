@@ -257,14 +257,24 @@ fn double_click_empty_strip(hwnd: HWND, tab_count: usize) -> TestResult<()> {
 fn strip_layout(hwnd: HWND, tab_count: usize) -> TestResult<(HWND, StripLayout)> {
     let group = find_child_by_class(hwnd, "FastPadEditorGroup")?;
     let mut client = windows_sys::Win32::Foundation::RECT::default();
-    if unsafe { GetClientRect(group, &mut client) } == 0 {
+    let mut frame = windows_sys::Win32::Foundation::RECT::default();
+    if unsafe { GetClientRect(group, &mut client) } == 0
+        || unsafe { GetClientRect(hwnd, &mut frame) } == 0
+    {
         return Err(Box::new(fastpad::platform::last_error()));
     }
+    // The strip is the title row, up to the app menu.
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
     let dpi = unsafe { GetDpiForWindow(group) };
-    Ok((
-        group,
-        StripLayout::calculate(client.right, dpi, tab_count, 0, false),
-    ))
+    let caption = fastpad::window::titlebar::TitleBarLayout::calculate(
+        fastpad::window::titlebar::Size::new(frame.right, frame.bottom),
+        dpi,
+    )
+    .overflow
+    .left;
+    let width = client.right.min(caption - origin.x);
+    Ok((group, StripLayout::calculate(width, dpi, tab_count, 0)))
 }
 
 fn wait_for_editor_text(hwnd: HWND, expected: &str, timeout: Duration) -> TestResult<()> {

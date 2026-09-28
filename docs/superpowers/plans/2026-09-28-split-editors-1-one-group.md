@@ -1311,3 +1311,41 @@ Expected: 0 failed. If FastPad is running, the end-to-end targets fail; close it
   - Dragging the window by the title bar, and double-clicking it to maximize.
   - Double-click on empty strip space for New.
   - A background Search replace while scrolled deep in another tab.
+
+## Task 10: The strip goes back into the title bar; floating preview buttons
+
+Added after the user's first look at the branch (spec §4.1, amended 2026-09-28). A separate title row repeated the file name and cost a row, so a top group's strip is drawn in the title bar row. The user also asked for the Markdown/SVG preview buttons to float at the top-right of the group's content.
+
+**Files:**
+- Modify: `src/window/main_window.rs` (group placement and window region, `layout_group`, `strip_layout`, `paint_group`, main `WM_NCLBUTTONDBLCLK`/`WM_NCRBUTTONUP` over the strip, `bar_band_height`)
+- Modify: `src/window/editor_group.rs` (`WM_NCHITTEST`)
+- Modify: `src/window/group_strip.rs` (no preview buttons; `strip_width`)
+- Modify: `src/window/titlebar.rs` (no title text)
+- Modify: `src/window/accessibility.rs` (strip width; preview buttons' rects and default actions)
+- Create: `src/window/preview_buttons.rs` (the floating button pair)
+- Modify: `src/window/preview_host.rs` (`click_button`/`button_hover` take `PreviewButton`)
+
+**Behaviour:**
+- The group window's top is the main window's client top. Its strip is the title row, stopping at the app menu "…" (`TitleBarLayout::overflow.left`).
+- The group's window region leaves out the caption cluster (the app menu and the caption buttons) and, while shown, the band below the title row (the menu band and the name box), so the main window paints them and gets their input.
+- The group lays out: strip, then the band's height of gap, then the find bar, then the content.
+- `WM_NCHITTEST` on the group answers `HTTRANSPARENT` over empty strip space and, for a restored window, in the top resize band; the main window answers `HTCAPTION`/`HTTOP` there.
+- On the main window, a caption double-click over the strip opens New, and a caption right-click over it opens the strip menu. Elsewhere, including over the sidebar, the caption behaves as before.
+- The title bar draws no window title; the window text still follows the active tab.
+- The preview buttons are a child window of the group (`FastPadPreviewButtons`), shown for Markdown and SVG tabs only, at the top-right of the content area, clear of the vertical scroll bar, above the editor and preview in z-order. The editor, preview and image views get `WS_CLIPSIBLINGS`. Hover shows the status-bar hint; a click toggles the mode as before.
+- Accessibility: the strip's rects use the same width as the paint code. The preview buttons stay in the group's accessible list, located at the floating window, and their default action runs `MarkdownPreviewSide`/`MarkdownPreviewFull`.
+
+**Tests (each written first and watched failing):**
+- `the_group_strip_is_the_title_row` (group top 0; editor top = title height; strip right edge = `overflow.left` − group left)
+- `empty_title_row_strip_space_is_caption_and_tabs_are_client`
+- `a_caption_double_click_over_the_strip_opens_a_tab_and_over_the_sidebar_does_not`
+- `a_caption_right_click_over_the_strip_opens_the_strip_menu`
+- `the_group_region_leaves_the_caption_buttons_and_the_menu_band_to_the_main_window`
+- `markdown_tabs_show_floating_preview_buttons_at_the_content_top_right`
+- `the_floating_side_button_opens_and_closes_the_side_preview`
+- existing geometry, menu-band and accessibility tests updated to the new rows
+
+- [ ] **Step 1:** write the tests; run them; they fail.
+- [ ] **Step 2:** implement; `cargo clippy --all-targets --all-features -- -D warnings`; run the tests; they pass.
+- [ ] **Step 3:** commit `feat(split-editors): the tab strip is the title bar row again, and the preview buttons float over the content`.
+- [ ] **Step 4:** full suite, with FastPad closed.

@@ -21,10 +21,10 @@ use crate::preview::{
 };
 use crate::window::WM_FASTPAD_PREVIEW_PARSED;
 use crate::window::commands::CommandId;
-use crate::window::group_strip::StripTarget;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
 use crate::window::panel::scale;
+use crate::window::preview_buttons::PreviewButton;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -389,11 +389,10 @@ pub(crate) fn run_command(hwnd: HWND, command: CommandId) {
 }
 
 /// The group strip's preview buttons toggle: the pressed button turns the preview off.
-pub(crate) fn click_button(hwnd: HWND, target: StripTarget) {
-    let button_mode = match target {
-        StripTarget::PreviewSide => PreviewMode::Split,
-        StripTarget::PreviewFull => PreviewMode::Full,
-        _ => return,
+pub(crate) fn click_button(hwnd: HWND, button: PreviewButton) {
+    let button_mode = match button {
+        PreviewButton::Side => PreviewMode::Split,
+        PreviewButton::Full => PreviewMode::Full,
     };
     set_mode(
         hwnd,
@@ -1224,13 +1223,13 @@ pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
     with_host(hwnd, |host| host.dragging).unwrap_or(false) || over_divider(hwnd, point.x, point.y)
 }
 
-pub(crate) fn button_hover(hwnd: HWND, target: Option<StripTarget>) {
-    let hint = match target {
-        Some(StripTarget::PreviewSide) => {
+pub(crate) fn button_hover(hwnd: HWND, button: Option<PreviewButton>) {
+    let hint = match button {
+        Some(PreviewButton::Side) => {
             Some("Open Preview to the Side (Ctrl+Shift+V cycles preview modes)")
         }
-        Some(StripTarget::PreviewFull) => Some("Open Preview (Ctrl+Shift+V cycles preview modes)"),
-        _ => None,
+        Some(PreviewButton::Full) => Some("Open Preview (Ctrl+Shift+V cycles preview modes)"),
+        None => None,
     };
     let changed = with_host(hwnd, |host| {
         std::mem::replace(&mut host.button_hint, hint) != hint

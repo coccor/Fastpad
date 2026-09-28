@@ -29,6 +29,7 @@ pub mod palette;
 pub(crate) mod panel;
 pub(crate) mod panel_cursor;
 pub(crate) mod panel_drop;
+pub(crate) mod preview_buttons;
 pub(crate) mod preview_host;
 pub(crate) mod row_list;
 pub(crate) mod search_view;

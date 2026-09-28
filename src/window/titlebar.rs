@@ -6,12 +6,11 @@ use windows_sys::Win32::Graphics::Dwm::{
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, DC_BRUSH, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, ExcludeClipRect, FW_NORMAL,
-    FillRect, GetMonitorInfoW, GetStockObject, HDC, HFONT, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor,
-    TRANSPARENT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, ExcludeClipRect, FW_NORMAL, FillRect,
+    GetMonitorInfoW, GetStockObject, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromRect, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY,
+    ScreenToClient, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::SetWindowTheme;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
@@ -480,8 +479,8 @@ pub(crate) fn strip_height(dpi: u32) -> i32 {
 }
 
 pub(crate) struct TitlePaint<'a> {
-    /// The window title, shown in the empty caption: the active tab's title and the app name.
-    pub title: &'a str,
+    /// The title-row strip of the group at the top, which paints itself there (spec §4.1).
+    pub covered: Option<Rect>,
     /// Present once deferred chrome is built; the bar is painted along the bottom edge.
     pub status: Option<&'a crate::window::status::StatusBarText>,
     pub palette: Palette,
@@ -509,6 +508,11 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
     if left > 0 {
         unsafe {
             ExcludeClipRect(dc, 0, 0, left, client.bottom);
+        }
+    }
+    if let Some(strip) = input.covered {
+        unsafe {
+            ExcludeClipRect(dc, strip.left, strip.top, strip.right, strip.bottom);
         }
     }
     let maximized = unsafe { IsZoomed(hwnd) } != 0;
@@ -673,23 +677,6 @@ unsafe fn draw_strip(
         SetBkMode(dc, TRANSPARENT as i32);
     }
     let previous_font = unsafe { select_font(dc, input.fonts.text) };
-
-    let margin = scale(12, dpi);
-    let caption = layout.drag_region;
-    unsafe {
-        SetTextColor(dc, palette.muted_foreground);
-        draw_text(
-            dc,
-            input.title,
-            Rect::new(
-                caption.left + margin,
-                caption.top,
-                (caption.right - margin).max(caption.left + margin),
-                caption.bottom,
-            ),
-            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-    }
 
     let overflow_hovered = pointer.hovered == Some(HitTarget::Overflow);
     unsafe {

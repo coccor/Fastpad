@@ -18,7 +18,7 @@
 |---|---|
 | Scope | Core splits plus drag and drop. Not in scope: "open preview to the side" as its own group, layout presets (2 columns, 2×2 grid), maximize or join groups (§11). |
 | Same document in two groups | Yes. Ctrl+\\ opens the active document in the new group, as VS Code does. |
-| Where tab strips go | In every group, at its top, even when there is only one group. The title bar keeps the icon, the menu band, the window title and the caption buttons. |
+| Where tab strips go | Every group has its own strip. A group whose top edge is the top of the editor area shows its strip in the title bar row, directly above its own column; any other group shows its strip at its own top. With one group this is 0.2.0's layout. There is no window-title text in the title bar, so the file name appears once, on its tab (§4.1). |
 | Find bar | One per group, with its own query and toggles. |
 | Markdown/SVG preview | Stays as today (side or full, inside the editor area) but is per group. |
 | Preview (italic) tab | One per group. |
@@ -83,15 +83,22 @@ Helpers `active_group()`, `active_editor()`, `active_view()` and `active_documen
 
 ### 4.1 Title bar
 
-- It keeps the app icon, the menu band and the caption buttons.
-- The space the tabs used shows the window title, `<name> — FastPad`, which follows the active group's active tab (`sync_window_title`).
-- The tab strip, the preview buttons and the overflow button leave `titlebar.rs`. Its `HitTarget::Tab`/`CloseTab`/preview/overflow variants and their paint code move to the group strip.
+Changed after the first look at PR 1 (2026-09-28): a separate title-bar row repeated the file name and cost a row of height, so the tabs stay in the title bar.
+
+- **Top groups' strips are the title bar.** A group whose top edge is the editor area's top (a *top group*) extends up into the title bar row, and its strip is drawn there, over its own column. In a row split every group is a top group, so Split Right adds no row. A group below another one draws its strip at its own top.
+- **What the main window keeps:** the title bar row over the sidebar, the app menu "…" and the caption buttons at the right end. The rightmost top group's strip stops before them.
+- **No window-title text is drawn.** The window's caption text (taskbar, Alt+Tab) is still `<name> - FastPad`, following the active group's active tab.
+- **Caption behaviour, as in 0.2.0:**
+  - Empty space in a title-row strip drags the window: the group answers `WM_NCHITTEST` with `HTTRANSPARENT` there, and the main window answers `HTCAPTION`.
+  - Double-clicking that space opens New in that group, and right-clicking it opens that group's tab-strip menu. Double-clicking the title bar over the sidebar maximizes.
+- **The menu band** (Alt) keeps its place directly below the title row. While it shows, top groups keep their strip in the title row and lay out their find bar and content below the band; the group paints its part of the band and passes clicks on it to the main window.
+- The tab strip, the preview buttons and the tab overflow leave `titlebar.rs`. Its `HitTarget::Tab`/`CloseTab`/preview variants and their paint code move to the group strip.
 
 ### 4.2 The group window
 
 `EditorGroup` is a child window class (`src/window/editor_group.rs`). The strip's paint and hit-testing live in `src/window/group_strip.rs`. From top to bottom the group contains:
 
-1. **The tab strip.** It is painted by the group window and is as tall as today's tabs. It keeps today's features:
+1. **The tab strip.** It is painted by the group window and is as tall as today's tabs. For a top group it sits in the title bar row (§4.1). It keeps today's features:
    - the look, and the close buttons;
    - middle-click to close;
    - wheel scrolling and the scroll thumb;
@@ -284,12 +291,13 @@ Three PRs, stacked on `feat/split-editors`:
 1. **One group** (`feat/split-editors`).
    - `DocumentStore` and the host editor, `EditorTab` and `ViewState`, and the `EditorGroup` window with its strip, find bar, preview and image view.
    - The tab strip leaves the title bar, notifications are routed by group, and session v2 is written with a single group (the v1 reader is kept).
-   - There are no splits yet. Visible changes: the tabs move below the title bar, caret and scroll are kept per tab, and the window title is shown in the title bar.
+   - There are no splits yet. The only visible change is that caret and scroll are kept per tab: the one group is a top group, so its tabs are where 0.2.0 draws them (§4.1).
    - Plan-time amendments (docs/superpowers/plans/2026-09-28-split-editors-1-one-group.md):
      - The tab strip's accessibility is MSAA (`IAccessible`), not UIA. The group window hosts the tab list; the main window's provider keeps the app menu and the caption buttons.
      - The title bar's "…" is the app menu and stays there. Each group's strip gets its own "…" (More actions) for the tab-strip menu.
      - `App.tabs` stays in PR 1 as a façade over the `DocumentStore` and the one group's views. The editor, find bar, preview and image objects stay `App` fields; PR 2 moves them into the group when it has several.
-     - Double-clicking the title bar maximizes the window. Double-click for New and right-click for the tab-strip menu are on the group strip's empty space.
+     - Double-click for New and right-click for the tab-strip menu are on the group strip's empty space; double-clicking the title bar over the sidebar maximizes.
+     - After the first look at PR 1 the strip went back into the title bar row (§4.1): the group window reaches up into it, so the strip still belongs to the group.
      - Split Right joins the strip's action cluster in PR 2.
      - The preview (italic) flag stays on `Document` in PR 1; with one group it behaves the same as a per-view flag. PR 2 moves it to the view.
 2. **Splits** (`feat/split-editors-grid`).

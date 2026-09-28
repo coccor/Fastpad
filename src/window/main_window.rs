@@ -307,7 +307,7 @@ unsafe extern "system" fn main_window_proc(
         WM_PAINT => {
             sync_window_title(hwnd);
             let paint_title_strip = |hwnd, _, _, _| {
-                let title = active_window_title(hwnd);
+                let covered = group_strip_bounds(hwnd);
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
                 let headings = menu_headings(hwnd);
@@ -315,7 +315,7 @@ unsafe extern "system" fn main_window_proc(
                     crate::window::titlebar::paint(
                         hwnd,
                         &crate::window::titlebar::TitlePaint {
-                            title: &title,
+                            covered,
                             status: status.as_ref(),
                             palette,
                             fonts,
@@ -387,6 +387,28 @@ unsafe extern "system" fn main_window_proc(
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target).press(target));
             0
+        }
+        // Over a title-row strip's empty space the caption double-click opens a tab and the
+        // right-click opens the strip menu, as the strip does (spec §4.1).
+        WM_NCLBUTTONDBLCLK
+            if wparam == windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize
+                && caption_strip_point(hwnd, lparam).is_some() =>
+        {
+            exit_menu_mode(hwnd);
+            execute_command(hwnd, CommandId::New);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_NCRBUTTONUP
+            if wparam == windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize =>
+        {
+            match caption_strip_point(hwnd, lparam) {
+                Some((group, x, y)) => {
+                    exit_menu_mode(hwnd);
+                    show_group_strip_menu(hwnd, group, x, y);
+                    0
+                }
+                None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            }
         }
         // DefWindowProc would run its own classic caption-button tracking loop over our strip.
         WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK
@@ -1028,11 +1050,11 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
                 .then(|| crate::window::name_box::name_box_height(dpi))
         })
         .unwrap_or(0);
-    let content_top = title_height + name_box_height;
     let status_height = status_bar_height(hwnd);
-    let bottom = (rect.bottom - rect.top - status_height).max(content_top);
+    let bottom = (rect.bottom - rect.top - status_height).max(title_height + name_box_height);
+    // The group reaches up into the title row, where its tab strip is (spec §4.1).
     unsafe {
-        MoveWindow(group, left, content_top, width, bottom - content_top, 1);
+        MoveWindow(group, left, 0, width, bottom, 1);
     }
     // A move that keeps the group's size sends no WM_SIZE, but what is inside may have changed.
     layout_group(hwnd, group);
@@ -1067,22 +1089,27 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let font = title_chrome(hwnd).1.text();
     let width = client.right;
     let strip_height = crate::window::group_strip::strip_height(dpi);
+    // The menu band and the name box sit under the title row, over the group's content.
+    let band = menu_band_height(hwnd) + name_box_band_height(hwnd, dpi);
+    let find_top = strip_height + band;
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
-            bar.layout(0, width, strip_height, dpi, font);
+            bar.layout(0, width, find_top, dpi, font);
             bar.is_visible().then(|| find_bar::find_bar_height(dpi))
         })
         .unwrap_or(0);
-    let top = strip_height + find_bar_height;
+    let top = find_top + find_bar_height;
     let area = RECT {
         left: 0,
         top,
         right: width,
         bottom: client.bottom.max(top),
     };
+    set_group_region(hwnd, group, &client, strip_height, band);
     let rects = crate::window::preview_host::layout(hwnd, area, dpi);
     crate::window::image_host::layout(hwnd, area);
+    crate::window::preview_buttons::layout(hwnd, group, area, dpi);
     if let Some(editor_rect) = rects.editor {
         unsafe {
             MoveWindow(
@@ -1098,6 +1125,86 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     unsafe {
         InvalidateRect(group, std::ptr::null(), 0);
     }
+}
+
+/// The visible name box's height, or 0.
+fn name_box_band_height(hwnd: HWND, dpi: u32) -> i32 {
+    unsafe { app_ptr(hwnd) }
+        .filter(|app| {
+            unsafe { app.as_ref() }
+                .name_box
+                .as_ref()
+                .is_some_and(|name_box| name_box.is_visible())
+        })
+        .map_or(0, |_| crate::window::name_box::name_box_height(dpi))
+}
+
+/// Leaves out of the group window what the main window keeps in its area: the app menu and the
+/// caption buttons at the right end of the title row, and the band under it while the menu band
+/// or the name box shows. The main window paints them and gets their input.
+fn set_group_region(hwnd: HWND, group: HWND, client: &RECT, strip_height: i32, band: i32) {
+    use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, RGN_DIFF, SetWindowRgn};
+    let caption_left =
+        title_layout(hwnd).overflow.left - crate::window::side_panel::left_edge(hwnd);
+    unsafe {
+        let region = CreateRectRgn(0, 0, client.right, client.bottom);
+        let cut = |left: i32, top: i32, right: i32, bottom: i32| {
+            let part = CreateRectRgn(left, top, right, bottom);
+            CombineRgn(region, region, part, RGN_DIFF);
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(part);
+        };
+        cut(caption_left, 0, client.right, strip_height);
+        if band > 0 {
+            cut(0, strip_height, client.right, strip_height + band);
+        }
+        // The system owns the region from here on.
+        SetWindowRgn(group, region, 1);
+    }
+}
+
+/// The group's answer to `WM_NCHITTEST`: its empty strip space, and a restored window's top
+/// resize band, are the main window's caption (spec §4.1), so the window drags and resizes there.
+pub(crate) fn group_hit_test(hwnd: HWND, group: HWND, lparam: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLIENT, HTTRANSPARENT, IsZoomed};
+    let mut point = windows_sys::Win32::Foundation::POINT {
+        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point) };
+    let Some(layout) = strip_layout(hwnd) else {
+        return HTCLIENT as LRESULT;
+    };
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    let in_title_row = origin.y == 0 && point.y >= 0 && point.y < layout.height;
+    if !in_title_row {
+        return HTCLIENT as LRESULT;
+    }
+    let resizes = unsafe { IsZoomed(hwnd) } == 0 && point.y < title_layout(hwnd).resize_border;
+    let empty = layout.hit_test(crate::window::titlebar::Point::new(point.x, point.y))
+        == crate::window::group_strip::StripTarget::Empty;
+    if resizes || empty {
+        HTTRANSPARENT as LRESULT
+    } else {
+        HTCLIENT as LRESULT
+    }
+}
+
+/// A caption point (screen coordinates in `lparam`) over a title-row strip's empty space, as the
+/// group window and its client coordinates.
+fn caption_strip_point(hwnd: HWND, lparam: LPARAM) -> Option<(HWND, i32, i32)> {
+    let group = group_hwnd(hwnd)?;
+    let mut point = windows_sys::Win32::Foundation::POINT {
+        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point) };
+    let layout = strip_layout(hwnd)?;
+    (point.x >= 0
+        && point.x < layout.bounds().right
+        && strip_target(hwnd, point.x, point.y)
+            == Some(crate::window::group_strip::StripTarget::Empty))
+    .then_some((group, point.x, point.y))
 }
 
 /// Paints what the group's children leave uncovered: the tab strip, the preview divider, and the
@@ -1132,12 +1239,10 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
                     palette,
                     fonts,
                     pointer,
-                    preview: preview_buttons_visible(hwnd)
-                        .then(|| crate::window::preview_host::mode(hwnd)),
                 },
             );
         }
-        client.top = layout.height;
+        client.top = layout.height + menu_band_height(hwnd) + name_box_band_height(hwnd, dpi);
     }
     if tab_count(hwnd) == 0 {
         unsafe {
@@ -1408,8 +1513,7 @@ pub(crate) fn ui_fonts(hwnd: HWND) -> crate::window::side_panel::UiFonts {
         .unwrap_or_default()
 }
 
-/// The height of what sits between the menu band and the editor: the name box, the group's tab
-/// strip and the visible find bar.
+/// The height of the visible find bar or name box band above the editor, or 0.
 fn bar_band_height(hwnd: HWND) -> i32 {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     unsafe { app_ptr(hwnd) }.map_or(0, |app| {
@@ -1424,11 +1528,7 @@ fn bar_band_height(hwnd: HWND) -> i32 {
             .as_ref()
             .filter(|name_box| name_box.is_visible())
             .map_or(0, |_| crate::window::name_box::name_box_height(dpi));
-        let strip = app
-            .group
-            .as_ref()
-            .map_or(0, |_| crate::window::group_strip::strip_height(dpi));
-        find + name + strip
+        find + name
     })
 }
 
@@ -2215,11 +2315,6 @@ pub(crate) fn title_layout(hwnd: HWND) -> TitleBarLayout {
     crate::window::titlebar::layout_for_window(hwnd)
 }
 
-/// Whether the group strip shows the Markdown preview buttons (the active tab is Markdown).
-fn preview_buttons_visible(hwnd: HWND) -> bool {
-    crate::window::preview_host::buttons_visible(hwnd)
-}
-
 /// Titles, active index, scroll offset, and whether the editor is hidden because no tab is open.
 /// The frame's window text, which the taskbar button and Alt+Tab show: the active tab's title as
 /// the tab strip paints it, followed by the app name.
@@ -2282,6 +2377,18 @@ pub(crate) fn with_group<R>(
     unsafe { app.as_mut() }.group.as_mut().map(f)
 }
 
+/// The title-row strip in the main window's client coordinates, which the frame leaves to the
+/// group when it paints the title row.
+fn group_strip_bounds(hwnd: HWND) -> Option<crate::window::titlebar::Rect> {
+    let group = group_hwnd(hwnd)?;
+    let bounds = strip_layout(hwnd)?.bounds();
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    (origin.y == 0).then(|| {
+        crate::window::titlebar::Rect::new(origin.x, 0, origin.x + bounds.right, bounds.bottom)
+    })
+}
+
 /// The group's tab strip as laid out now, the same one it paints and hit-tests with.
 pub(crate) fn strip_layout(hwnd: HWND) -> Option<crate::window::group_strip::StripLayout> {
     let group = group_hwnd(hwnd)?;
@@ -2294,11 +2401,10 @@ pub(crate) fn strip_layout(hwnd: HWND) -> Option<crate::window::group_strip::Str
         .map(|app| unsafe { app.as_ref() }.tabs.scroll_offset())
         .unwrap_or(0);
     Some(crate::window::group_strip::StripLayout::calculate(
-        client.right,
+        crate::window::group_strip::strip_width(group),
         dpi,
         tab_count(hwnd),
         scroll,
-        preview_buttons_visible(hwnd),
     ))
 }
 
@@ -2477,12 +2583,10 @@ pub(crate) fn group_strip_message(
             unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut track) };
             let target = strip_target(hwnd, x, y);
             update_strip_pointer(hwnd, |pointer| pointer.hover(target));
-            crate::window::preview_host::button_hover(hwnd, target);
             Some(0)
         }
         WM_MOUSELEAVE => {
             update_strip_pointer(hwnd, |pointer| pointer.hover(None));
-            crate::window::preview_host::button_hover(hwnd, None);
             // A middle press whose release never reaches the strip must not close a tab later.
             with_group(hwnd, |state| state.middle_press = None);
             Some(0)
@@ -2528,9 +2632,6 @@ pub(crate) fn group_strip_message(
                     {
                         promote_tab(hwnd, id);
                     }
-                }
-                target @ (StripTarget::PreviewSide | StripTarget::PreviewFull) => {
-                    crate::window::preview_host::click_button(hwnd, target)
                 }
                 StripTarget::More => {
                     let bottom = strip_layout(hwnd).map_or(y, |layout| layout.height);
@@ -3437,7 +3538,7 @@ fn apply_theme(hwnd: HWND) {
 
 /// Copies what a title-strip paint needs out of App, creating the per-DPI fonts on first use.
 /// Before chrome is built the palette is the neutral compiled one (no theme queries).
-fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
+pub(crate) fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     unsafe { app_ptr(hwnd) }
         .map(|mut app| {
@@ -6886,7 +6987,8 @@ mod tests {
         let (width, height) = client_size(window.hwnd);
         let (group_width, group_height) = client_size(group);
         assert_eq!(left_of(group, window.hwnd) + group_width, width);
-        assert!(group_height > 0 && group_height < height);
+        // The group reaches up into the title row, down to the status bar.
+        assert!(group_height > 0 && group_height <= height);
     }
 
     #[test]
@@ -6947,41 +7049,6 @@ mod tests {
     }
 
     #[test]
-    fn double_clicking_the_empty_strip_opens_a_tab_and_the_title_bar_does_not() {
-        // Break caught: New still bound to the title bar's double-click, which must now maximize
-        // like any caption, or the strip's empty space no longer opening a tab.
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            HTCAPTION, WM_LBUTTONDBLCLK, WM_NCLBUTTONDBLCLK,
-        };
-        let _scintilla = load_native_scintilla();
-        let window = ProductionWindow::new(make_app());
-        let _editor = install_test_editor(&window);
-        let caption = super::title_layout(window.hwnd).drag_region.center();
-        unsafe {
-            SendMessageW(
-                window.hwnd,
-                WM_NCLBUTTONDBLCLK,
-                HTCAPTION as usize,
-                screen_lparam(window.hwnd, caption.x, caption.y),
-            )
-        };
-        assert_eq!(super::tab_count(window.hwnd), 1);
-
-        let group = super::group_hwnd(window.hwnd).unwrap();
-        let layout = super::strip_layout(window.hwnd).unwrap();
-        let after = layout.tab(0).unwrap().right + 20;
-        unsafe {
-            SendMessageW(
-                group,
-                WM_LBUTTONDBLCLK,
-                1,
-                client_lparam(after, layout.height / 2),
-            )
-        };
-        assert_eq!(super::tab_count(window.hwnd), 2);
-    }
-
-    #[test]
     fn double_clicking_the_empty_strip_where_the_new_tab_closes_keeps_it_open() {
         // Break caught: the release after the double-click acting on whatever the new tab put
         // under the pointer, so a double-click on its close box's spot opens a tab and closes it.
@@ -7013,6 +7080,226 @@ mod tests {
             SendMessageW(group, WM_LBUTTONUP, 0, point);
         }
         assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    /// `child`'s top-left corner in `parent`'s client coordinates.
+    fn origin_in(child: HWND, parent: HWND) -> (i32, i32) {
+        let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(child, parent, &mut point, 1) };
+        (point.x, point.y)
+    }
+
+    #[test]
+    fn the_group_strip_is_the_title_row() {
+        // Break caught: the strip drawn in a row of its own under the title bar (the file name
+        // shown twice and a row of height lost), or running under the app menu and the caption
+        // buttons.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let title = super::title_layout(window.hwnd);
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        assert_eq!(origin_in(group, window.hwnd), (left, 0));
+        assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        assert_eq!(strip.height, title.height);
+        assert_eq!(strip.bounds().right, title.overflow.left - left);
+    }
+
+    #[test]
+    fn empty_title_row_strip_space_is_caption_and_tabs_are_client() {
+        // Break caught: a strip that swallows the caption, so the window can no longer be dragged
+        // or top-resized by the empty space beside the tabs.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HTCAPTION, HTCLIENT, HTTRANSPARENT, WM_NCHITTEST,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let title = super::title_layout(window.hwnd);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        let hit = |target: HWND, x: i32, y: i32| unsafe {
+            SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
+        };
+        let y = strip.height - 2;
+        assert!(y >= title.resize_border);
+        let tab = strip.tab(0).unwrap().center();
+        let empty = strip.tabs.right - 10;
+        assert_eq!(hit(group, tab.x, y), HTCLIENT as LRESULT);
+        assert_eq!(hit(group, empty, y), HTTRANSPARENT as LRESULT);
+        assert_eq!(hit(window.hwnd, empty + left, y), HTCAPTION as LRESULT);
+        // A restored window's top band resizes, over the tabs too.
+        assert_eq!(hit(group, tab.x, 0), HTTRANSPARENT as LRESULT);
+    }
+
+    #[test]
+    fn a_caption_double_click_over_the_strip_opens_a_tab_and_over_the_sidebar_does_not() {
+        // Break caught: the caption's double-click maximizing over the strip's empty space, where
+        // 0.2.0 opened a new tab, or opening tabs from the caption over the sidebar.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, WM_NCLBUTTONDBLCLK};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let title = super::title_layout(window.hwnd);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        let double_click = |x: i32, y: i32| unsafe {
+            SendMessageW(
+                window.hwnd,
+                WM_NCLBUTTONDBLCLK,
+                HTCAPTION as usize,
+                screen_lparam(window.hwnd, x, y),
+            )
+        };
+        double_click(strip.tabs.right - 10 + left, strip.height / 2);
+        assert_eq!(super::tab_count(window.hwnd), 2);
+        assert!(
+            title.sidebar.right > title.sidebar.left,
+            "no sidebar to test"
+        );
+        let sidebar = title.sidebar.center();
+        double_click(sidebar.x, sidebar.y);
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    #[test]
+    fn a_caption_right_click_over_the_strip_opens_the_strip_menu() {
+        // Break caught: the strip's menu lost once its empty space answers as caption.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, WM_NCRBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
+        unsafe {
+            SendMessageW(
+                window.hwnd,
+                WM_NCRBUTTONUP,
+                HTCAPTION as usize,
+                screen_lparam(window.hwnd, strip.tabs.right - 10 + left, strip.height / 2),
+            )
+        };
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+    }
+
+    #[test]
+    fn the_group_region_leaves_the_caption_buttons_and_the_menu_band_to_the_main_window() {
+        // Break caught: the group window covering the app menu and caption buttons, or the menu
+        // band shown under it, so the main window can neither paint them nor get their clicks.
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        let covers = |x: i32, y: i32| unsafe {
+            let region = CreateRectRgn(0, 0, 0, 0);
+            GetWindowRgn(group, region);
+            let inside = PtInRegion(region, x - left, y) != 0;
+            DeleteObject(region);
+            inside
+        };
+        let title = super::title_layout(window.hwnd);
+        let tab = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        assert!(covers(tab.x + left, tab.y));
+        for button in [title.overflow, title.minimize, title.close] {
+            let center = button.center();
+            assert!(!covers(center.x, center.y));
+        }
+
+        super::enter_menu_mode(window.hwnd, 0);
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let band = super::menu_band::band_height(dpi);
+        let heading = super::menu_headings(window.hwnd)[0];
+        assert!(!covers(
+            (heading.left + heading.right) / 2,
+            (heading.top + heading.bottom) / 2
+        ));
+        assert!(covers(tab.x + left, tab.y));
+        assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height + band);
+    }
+
+    #[test]
+    fn markdown_tabs_show_floating_preview_buttons_at_the_content_top_right() {
+        // Break caught: preview buttons left in the strip, shown for tabs that cannot preview,
+        // or drawn under the editor.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, GetParent, GetWindow};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let buttons = || crate::window::preview_buttons::hwnd(window.hwnd);
+        let visible = |hwnd: HWND| {
+            (unsafe { GetWindowLongPtrW(hwnd, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
+        };
+        assert!(buttons().is_none_or(|hwnd| !visible(hwnd)));
+
+        // What a successful language switch does, without loading Lexilla.
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Markdown);
+        crate::window::preview_host::sync_visibility(window.hwnd);
+        let hwnd = buttons().expect("floating preview buttons");
+        assert!(visible(hwnd));
+        assert_eq!(unsafe { GetParent(hwnd) }, group);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        assert_eq!(
+            strip.tabs.right, strip.more.left,
+            "the strip keeps only its menu button"
+        );
+        let dpi = unsafe { GetDpiForWindow(group) }.max(96);
+        let (group_width, _) = client_size(group);
+        let (x, y) = origin_in(hwnd, group);
+        let (width, _) = client_size(hwnd);
+        assert_eq!(y, strip.height + crate::window::titlebar::scale(8, dpi));
+        assert!(x + width < group_width, "clear of the vertical scroll bar");
+        assert!(x + width >= group_width - crate::window::titlebar::scale(48, dpi));
+        // Above the editor in z-order: no sibling before it.
+        assert!(unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_null());
+    }
+
+    #[test]
+    fn the_floating_side_button_opens_and_closes_the_side_preview() {
+        // Break caught: floating buttons that paint but do not act.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        // What a successful language switch does, without loading Lexilla.
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Markdown);
+        crate::window::preview_host::sync_visibility(window.hwnd);
+        let hwnd = crate::window::preview_buttons::hwnd(window.hwnd).unwrap();
+        let side = crate::window::preview_buttons::button_rect(
+            hwnd,
+            crate::window::preview_buttons::PreviewButton::Side,
+        )
+        .center();
+        let click = || unsafe {
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(side.x, side.y));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(side.x, side.y));
+        };
+        click();
+        assert_eq!(
+            crate::window::preview_host::mode(window.hwnd),
+            crate::preview::PreviewMode::Split
+        );
+        click();
+        assert_eq!(
+            crate::window::preview_host::mode(window.hwnd),
+            crate::preview::PreviewMode::Off
+        );
     }
 
     #[test]
@@ -7088,20 +7375,6 @@ mod tests {
             unsafe { GetUpdateRect(group, std::ptr::null_mut(), 0) },
             0,
             "the strip still waits for a WM_PAINT"
-        );
-    }
-
-    #[test]
-    fn the_title_bar_shows_the_window_title() {
-        // Break caught: the title bar left blank once the tabs moved out of it.
-        let _scintilla = load_native_scintilla();
-        let window = ProductionWindow::new(make_app());
-        let editor = install_test_editor(&window);
-        editor.set_text("changed").unwrap();
-        // Notes mode titles an untitled tab from its first line.
-        assert_eq!(
-            super::active_window_title(window.hwnd),
-            "changed * - FastPad"
         );
     }
 
@@ -7809,9 +8082,8 @@ mod tests {
             )
         };
         let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
-        // The editor group's tab strip sits between the title strip and the editor.
-        let title_height =
-            super::title_layout(window.hwnd).height + crate::window::group_strip::strip_height(dpi);
+        // The editor group's tab strip is the title row, so the editor starts right below it.
+        let title_height = super::title_layout(window.hwnd).height;
         let band = super::menu_band::band_height(dpi);
 
         key_menu(0);
@@ -7895,9 +8167,8 @@ mod tests {
             (unsafe { GetWindowLongPtrW(child, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
         };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
-        // The editor group's tab strip sits between the title strip and the editor.
-        let title_height =
-            super::title_layout(window.hwnd).height + crate::window::group_strip::strip_height(dpi);
+        // The editor group's tab strip is the title row, so the editor starts right below it.
+        let title_height = super::title_layout(window.hwnd).height;
 
         execute_command(window.hwnd, CommandId::Find);
         let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
@@ -8512,9 +8783,8 @@ mod tests {
             GetClientRect(editor_hwnd, &mut shown);
         }
         let dpi = unsafe { GetDpiForWindow(window.hwnd) };
-        // The editor group's tab strip sits between the title strip and the editor.
-        let title_height =
-            super::title_layout(window.hwnd).height + crate::window::group_strip::strip_height(dpi);
+        // The editor group's tab strip is the title row, so the editor starts right below it.
+        let title_height = super::title_layout(window.hwnd).height;
         assert_eq!(
             (client.bottom - client.top) - (shown.bottom - shown.top),
             title_height + crate::window::status::status_height(dpi),

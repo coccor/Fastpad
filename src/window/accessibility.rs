@@ -1,6 +1,7 @@
 use crate::document::DocumentId;
 use crate::window::commands::CommandId;
 use crate::window::group_strip::StripLayout;
+use crate::window::preview_buttons::PreviewButton;
 use crate::window::tabs::{TabSelection, TabView, TabViewSnapshot};
 use crate::window::titlebar::{Point, Rect, Size, TitleBarLayout};
 use std::ffi::c_void;
@@ -847,15 +848,36 @@ unsafe extern "system" fn accessible_do_default_action(
         Some(AccessibleDefaultAction::Command(command)) => unsafe {
             PostMessageW(item.hwnd, WM_COMMAND, command as usize, 0)
         },
-        Some(AccessibleDefaultAction::Click(_)) => {
-            let Some(rect) = child_client_rect(item, &children, id) else {
-                return E_INVALIDARG;
+        Some(AccessibleDefaultAction::Click(target)) => {
+            // The preview buttons are their own floating window; everything else is the
+            // provider window's.
+            let preview = match target {
+                ClickTarget::PreviewSide => Some(PreviewButton::Side),
+                ClickTarget::PreviewFull => Some(PreviewButton::Full),
+                ClickTarget::AppMenu | ClickTarget::More => None,
+            };
+            let (window, rect) = match preview {
+                Some(button) => {
+                    let Some(buttons) = crate::window::preview_buttons::find(item.hwnd) else {
+                        return E_INVALIDARG;
+                    };
+                    (
+                        buttons,
+                        crate::window::preview_buttons::button_rect(buttons, button),
+                    )
+                }
+                None => {
+                    let Some(rect) = child_client_rect(item, &children, id) else {
+                        return E_INVALIDARG;
+                    };
+                    (item.hwnd, rect)
+                }
             };
             let center = rect.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
             // A whole click: the strip acts only on a release over the target it was pressed on.
-            unsafe { PostMessageW(item.hwnd, WM_LBUTTONDOWN, 1, packed) };
-            unsafe { PostMessageW(item.hwnd, WM_LBUTTONUP, 0, packed) }
+            unsafe { PostMessageW(window, WM_LBUTTONDOWN, 1, packed) };
+            unsafe { PostMessageW(window, WM_LBUTTONUP, 0, packed) }
         }
         Some(AccessibleDefaultAction::SystemCommand(command)) => unsafe {
             PostMessageW(item.hwnd, WM_SYSCOMMAND, command, 0)
@@ -971,16 +993,20 @@ fn child_client_rect(
         ProviderKind::GroupStrip => {
             let tabs = tab_count(children);
             let layout = StripLayout::calculate(
-                client.right - client.left,
+                crate::window::group_strip::strip_width(item.hwnd),
                 dpi,
                 tabs,
                 item.selection.scroll_offset(),
-                item.view.snapshot().preview_buttons,
             );
+            // The preview buttons float over the group's content (spec §4.1).
             match child {
                 AccessibleChild::Tab(_) => layout.tab(index),
-                AccessibleChild::Button(PREVIEW_SIDE) => layout.preview_side,
-                AccessibleChild::Button(PREVIEW_FULL) => layout.preview_full,
+                AccessibleChild::Button(PREVIEW_SIDE) => {
+                    crate::window::preview_buttons::rect_in_group(item.hwnd, PreviewButton::Side)
+                }
+                AccessibleChild::Button(PREVIEW_FULL) => {
+                    crate::window::preview_buttons::rect_in_group(item.hwnd, PreviewButton::Full)
+                }
                 AccessibleChild::Button(MORE) => Some(layout.more),
                 AccessibleChild::Button(_) => None,
             }
@@ -1297,8 +1323,12 @@ mod tests {
         let mut client = windows_sys::Win32::Foundation::RECT::default();
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(window, &mut client) };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window) }.max(96);
-        let layout =
-            crate::window::group_strip::StripLayout::calculate(client.right, dpi, 2, 0, false);
+        let layout = crate::window::group_strip::StripLayout::calculate(
+            crate::window::group_strip::strip_width(window),
+            dpi,
+            2,
+            0,
+        );
         assert_eq!(tab_left(1), 0);
         assert_eq!(tab_left(2), layout.tab(1).unwrap().left);
         assert_eq!(
