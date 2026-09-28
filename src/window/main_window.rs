@@ -468,7 +468,7 @@ unsafe extern "system" fn main_window_proc(
             handle_editor_notification(hwnd, lparam);
             0
         }
-        WM_FASTPAD_ACCESSIBLE_SELECT => handle_accessible_select(hwnd, lparam),
+        WM_FASTPAD_ACCESSIBLE_SELECT => handle_accessible_select(hwnd, wparam, lparam),
         WM_COMMAND
             if lparam != 0
                 && ((wparam >> 16) & 0xffff) as u32 == EN_CHANGE
@@ -4958,13 +4958,18 @@ fn remember_active_view(hwnd: HWND) {
     }
 }
 
-fn handle_accessible_select(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+/// Selects a tab for the strip provider of the group window `wparam`.
+fn handle_accessible_select(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if lparam == 0 {
         return 0;
     }
     let request = unsafe { *(lparam as *const AccessibleSelectRequest) };
-    isize::from(activate_document(
+    let Some(group) = group_id_of(hwnd, wparam as HWND) else {
+        return 0;
+    };
+    isize::from(activate_document_in(
         hwnd,
+        group,
         request.document_id,
         request.revision,
     ))
@@ -8833,6 +8838,49 @@ three"
         assert!(app_mut(window.hwnd).tabs.document(elsewhere).is_none());
         assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
         assert_eq!(unsafe { GetFocus() }, editor.hwnd());
+    }
+
+    #[test]
+    fn an_accessible_tab_selection_in_another_group_selects_that_tab() {
+        // Break caught: the strip's MSAA selection is resolved against the active group, so a
+        // screen-reader user selecting a tab in another group's list gets no response.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let shared = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::New);
+        assert!(super::activate_group(window.hwnd, first));
+        let request = super::AccessibleSelectRequest {
+            document_id: shared,
+            revision: app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .view()
+                .snapshot()
+                .revision,
+        };
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let selected = unsafe {
+            SendMessageW(
+                group,
+                super::WM_FASTPAD_ACCESSIBLE_SELECT,
+                0,
+                &request as *const super::AccessibleSelectRequest as LPARAM,
+            )
+        };
+        assert_eq!(selected, 1);
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .active_document(),
+            Some(shared)
+        );
     }
 
     #[test]

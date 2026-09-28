@@ -126,16 +126,14 @@ unsafe extern "system" fn group_proc(
     match message {
         // Scintilla's notifications and the controls' commands and colors are the main window's
         // to handle, exactly as before the editor moved into the group.
-        // The strip's accessible selection goes to the main window too, which activates the tab.
-        WM_NOTIFY
-        | WM_COMMAND
-        | WM_CTLCOLOREDIT
-        | WM_CTLCOLORSTATIC
-        | WM_CTLCOLORBTN
-        | WM_CTLCOLORLISTBOX
-        | WM_DRAWITEM
-        | super::accessibility::WM_FASTPAD_ACCESSIBLE_SELECT => unsafe {
+        WM_NOTIFY | WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
+        | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {
             SendMessageW(main, message, wparam, lparam)
+        },
+        // The strip's accessible selection goes to the main window too, which activates the tab
+        // in this group: the group window rides along as `wparam`.
+        super::accessibility::WM_FASTPAD_ACCESSIBLE_SELECT => unsafe {
+            SendMessageW(main, message, hwnd as WPARAM, lparam)
         },
         WM_NCHITTEST => super::main_window::group_hit_test(main, hwnd, lparam),
         WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => {
