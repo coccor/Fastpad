@@ -1,12 +1,12 @@
 {
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A startup-latency-first text editor for Windows",
   "homepage": "https://github.com/coccor/FastPad",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/coccor/FastPad/releases/download/v0.2.0/FastPad-0.2.0-windows-x64.zip",
-      "hash": "7b45f18f6c661b912f72a05a628d8eb6579c23ca3eff2c4af76c782c64116d3c"
+      "url": "https://github.com/coccor/FastPad/releases/download/v0.2.1/FastPad-0.2.1-windows-x64.zip",
+      "hash": "d515e95d9a7c3e4d609138baf6d357ab2c9e5897cbb48cbab4852709da80a4a9"
     }
   },
   "bin": "FastPad.exe",
