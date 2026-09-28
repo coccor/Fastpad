@@ -50,6 +50,7 @@ pub enum Language {
     PlainText,
     Json,
     Markdown,
+    Svg,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

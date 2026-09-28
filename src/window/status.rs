@@ -85,6 +85,7 @@ pub fn language_name(language: Language) -> &'static str {
         Language::PlainText => "Plain Text",
         Language::Json => "JSON",
         Language::Markdown => "Markdown",
+        Language::Svg => "SVG",
     }
 }
 

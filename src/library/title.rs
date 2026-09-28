@@ -18,6 +18,34 @@ pub fn is_note_extension(extension: &str) -> bool {
         .any(|known| known.eq_ignore_ascii_case(extension))
 }
 
+/// Image files the notebook lists and FastPad shows (image preview spec §4). SVG is listed but
+/// opens as text, so `is_raster_image_extension` leaves it out.
+pub const IMAGE_EXTENSIONS: [&str; 16] = [
+    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "ico", "tif", "tiff", "webp", "heic",
+    "heif", "avif", "svg",
+];
+
+pub fn is_image_extension(extension: &str) -> bool {
+    IMAGE_EXTENSIONS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(extension))
+}
+
+/// An image that opens in an image tab rather than as text.
+pub fn is_raster_image_extension(extension: &str) -> bool {
+    is_image_extension(extension) && !extension.eq_ignore_ascii_case("svg")
+}
+
+/// A file the notebook lists: a note or an image.
+pub fn is_listed_extension(extension: &str) -> bool {
+    is_note_extension(extension) || is_image_extension(extension)
+}
+
+pub fn is_raster_image_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| is_raster_image_extension(&extension.to_string_lossy()))
+}
+
 /// An untitled tab's label, and the last line whose edits can change it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Label {
@@ -100,6 +128,7 @@ pub fn default_extension(language: Language) -> &'static str {
     match language {
         Language::Json => "json",
         Language::Markdown | Language::PlainText => "md",
+        Language::Svg => "svg",
     }
 }
 
@@ -192,6 +221,22 @@ pub fn note_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_are_listed_but_only_raster_images_open_as_images() {
+        // Break caught: an SVG opening in the image view instead of as text (user decision "a"), or
+        // a PNG missing from the notebook tree.
+        assert!(
+            is_listed_extension("PNG") && is_listed_extension("md") && is_listed_extension("svg")
+        );
+        assert!(!is_listed_extension("exe"));
+        assert!(is_raster_image_extension("JPeG") && !is_raster_image_extension("svg"));
+        assert!(is_raster_image_path(Path::new(r"C:\a\b.webp")));
+        assert!(
+            !is_raster_image_path(Path::new(r"C:\a\b.svg"))
+                && !is_raster_image_path(Path::new("png"))
+        );
+    }
 
     #[test]
     fn the_label_is_the_first_non_empty_line_without_heading_marks() {
