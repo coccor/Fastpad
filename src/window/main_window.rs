@@ -295,6 +295,9 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_ACTIVATEAPP => {
             crate::window::library_host::activation_changed(hwnd, wparam != 0);
+            if wparam != 0 {
+                crate::window::image_host::check_disk(hwnd);
+            }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_PAINT => {
@@ -787,6 +790,10 @@ unsafe extern "system" fn main_window_proc(
                     crate::window::preview_host::parsed(hwnd, lparam);
                     return 0;
                 }
+                crate::window::WM_FASTPAD_IMAGE_STATUS => {
+                    invalidate_status_bar(hwnd);
+                    return 0;
+                }
                 crate::window::WM_FASTPAD_PREVIEW_LINK => {
                     crate::window::preview_host::follow_link(hwnd, lparam);
                     return 0;
@@ -1169,6 +1176,7 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
         bottom: (rect.bottom - rect.top - status_height).max(content_top),
     };
     let rects = crate::window::preview_host::layout(hwnd, area, dpi);
+    crate::window::image_host::layout(hwnd, area);
     if let Some(editor_rect) = rects.editor {
         unsafe {
             MoveWindow(
@@ -1439,10 +1447,12 @@ fn bar_band_height(hwnd: HWND) -> i32 {
     })
 }
 
-/// Where keyboard focus belongs in the content area: the preview while it replaces the editor in
-/// Full mode, otherwise the editor.
+/// Where keyboard focus belongs in the content area: the image view for an image tab, the preview
+/// while it replaces the editor in Full mode, otherwise the editor.
 fn content_focus_target(hwnd: HWND) -> Option<HWND> {
-    crate::window::preview_host::full_view_hwnd(hwnd).or_else(|| unsafe { editor_hwnd(hwnd) })
+    crate::window::image_host::shown_view_hwnd(hwnd)
+        .or_else(|| crate::window::preview_host::full_view_hwnd(hwnd))
+        .or_else(|| unsafe { editor_hwnd(hwnd) })
 }
 
 /// Overlays the palette at the top of the editor area, even with no tab open (New and Open stay
@@ -1855,6 +1865,7 @@ fn refilter_command_palette(hwnd: HWND) {
     } else {
         let has_tabs = tab_count(hwnd) > 0;
         let markdown = crate::window::preview_host::buttons_visible(hwnd);
+        let image = crate::window::image_host::active_is_image(hwnd);
         let sidebar = notes_mode_enabled(hwnd);
         // New note and New folder need a notebook, open or loading, to put the item in (inline
         // naming spec §3.1).
@@ -1863,6 +1874,7 @@ fn refilter_command_palette(hwnd: HWND) {
         let entries = command_palette::filter_entries(&query, |command| {
             subset.is_none_or(|subset| subset.contains(&command))
                 && (has_tabs || !command.needs_document())
+                && (!image || !command.needs_text())
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
                 && (notebook || !matches!(command, CommandId::NoteNew | CommandId::NoteNewFolder))
@@ -2389,9 +2401,11 @@ fn refresh_tabs(hwnd: HWND) {
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll);
     }
+    // An image tab shows the image view instead of the editor (image preview spec §5).
+    let text_active = count > 0 && !crate::window::image_host::active_is_image(hwnd);
     if let Some(editor_hwnd) = editor_hwnd {
         let visible = unsafe { GetWindowLongPtrW(editor_hwnd, GWL_STYLE) } as u32 & WS_VISIBLE != 0;
-        if count == 0 && visible {
+        if !text_active && visible {
             close_find_bar(hwnd);
             unsafe {
                 ShowWindow(editor_hwnd, SW_HIDE);
@@ -2399,7 +2413,7 @@ fn refresh_tabs(hwnd: HWND) {
                     SetFocus(hwnd);
                 }
             }
-        } else if count > 0 && !visible {
+        } else if text_active && !visible {
             unsafe {
                 ShowWindow(editor_hwnd, SW_SHOWNA);
                 if GetFocus() == hwnd {
@@ -2412,6 +2426,7 @@ fn refresh_tabs(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+    crate::window::image_host::sync(hwnd);
     crate::window::preview_host::sync_visibility(hwnd);
     crate::window::library_host::refresh_label(hwnd);
     crate::window::side_panel::active_tab_changed(hwnd);
@@ -2476,6 +2491,13 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         && tab_count(hwnd) == 0
         && tree_note.is_none()
         && tree_folder.is_none()
+    {
+        return;
+    }
+    // An image tab has no text to save, edit, search or relabel (image preview spec §5).
+    if command.needs_text()
+        && tree_note.is_none()
+        && crate::window::image_host::active_is_image(hwnd)
     {
         return;
     }
@@ -2673,6 +2695,8 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::FormatJson => format_active_json(hwnd),
         CommandId::NextTab => cycle_tab(hwnd, true),
         CommandId::PreviousTab => cycle_tab(hwnd, false),
+        CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ZoomReset
+            if crate::window::image_host::zoom(hwnd, command) => {}
         CommandId::ZoomIn => with_editor(hwnd, |editor| {
             let _ = editor.zoom_in();
         }),
@@ -2852,6 +2876,9 @@ pub(super) fn file_population_active(hwnd: HWND) -> bool {
 /// is false for `WM_FASTPAD_APPLY_LANGUAGE` (see `handle_deferred`), so this never runs ahead of
 /// queued user input.
 fn apply_detected_language(hwnd: HWND) {
+    if crate::window::image_host::active_is_image(hwnd) {
+        return;
+    }
     let path = unsafe { app_ptr(hwnd) }
         .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
     let Some(path) = path else {
@@ -2993,6 +3020,7 @@ fn apply_editor_settings(hwnd: HWND) {
     let _ =
         editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
     crate::window::preview_host::refresh_appearance(hwnd);
+    crate::window::image_host::refresh_appearance(hwnd);
 }
 
 /// Runs only inside `WM_FASTPAD_BUILD_CHROME`: the first system theme query, the status model,
@@ -3175,6 +3203,7 @@ fn apply_theme(hwnd: HWND) {
         apply_language(hwnd, language);
     }
     crate::window::preview_host::refresh_appearance(hwnd);
+    crate::window::image_host::refresh_appearance(hwnd);
     crate::window::side_panel::refresh(hwnd);
 }
 
@@ -3267,6 +3296,15 @@ fn current_status_text(hwnd: HWND) -> Option<String> {
 
 /// Everything the bottom bar paints, or `None` before `WM_FASTPAD_BUILD_CHROME` builds it.
 fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::StatusBarText> {
+    if let Some(image) = crate::window::image_host::status(hwnd) {
+        let app = unsafe { app_ptr(hwnd) }?;
+        let app = unsafe { app.as_ref() };
+        app.status.as_ref()?;
+        return Some(crate::window::status::image_status_bar_text(
+            &app.notifications,
+            &image,
+        ));
+    }
     let app = unsafe { app_ptr(hwnd) }?;
     let app = unsafe { app.as_ref() };
     app.status.as_ref()?;
@@ -3503,6 +3541,9 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
             ))
         };
     }
+    if crate::library::title::is_raster_image_path(path) {
+        return open_image_placed(hwnd, path, preview);
+    }
 
     // The tab being left saves first; a failed or paused autosave leaves it dirty and open.
     crate::window::library_host::autosave_active(hwnd);
@@ -3514,10 +3555,24 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
     // Read before the load: a change that lands during it then still pauses the next autosave.
     let stamp = crate::library::disk_stamp(path);
     // All fallible disk/decode/text validation occurs before touching active state.
-    let loaded = crate::file::loader::load(path)?;
+    // A file that is not text but starts with an image signature opens in an image tab (image
+    // preview spec §4).
+    let loaded = match crate::file::loader::load(path) {
+        Err(crate::FastPadError::UnsupportedEncoding)
+            if crate::file::sniff::file_looks_like_image(path) =>
+        {
+            return open_image_placed(hwnd, path, preview);
+        }
+        loaded => loaded?,
+    };
     // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer: the file is unsupported.
-    std::ffi::CString::new(loaded.text.as_str())
-        .map_err(|_| crate::FastPadError::UnsupportedEncoding)?;
+    if std::ffi::CString::new(loaded.text.as_str()).is_err() {
+        return if crate::file::sniff::file_looks_like_image(path) {
+            open_image_placed(hwnd, path, preview)
+        } else {
+            Err(crate::FastPadError::UnsupportedEncoding)
+        };
+    }
     let (editor, candidate_ids, replace_preview) = {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
@@ -3619,6 +3674,99 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
     }
     // Population suppressed SCN_MODIFIED, and a reused tab keeps its document id.
     crate::window::preview_host::document_reloaded(hwnd);
+    refresh_tabs(hwnd);
+    crate::window::library_host::document_loaded(hwnd, stamp);
+    Ok(())
+}
+
+/// Opens `path` in an image tab (image preview spec §5). Like a text open it reuses an empty start
+/// tab or the preview tab, but reads no bytes: the image view decodes on a worker.
+fn open_image_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result<()> {
+    let identity = unsafe { window_identity(hwnd) }.ok_or(crate::FastPadError::Invariant(
+        "main window app state was not available",
+    ))?;
+    if !path.is_file() {
+        return Err(crate::FastPadError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+    }
+    crate::window::library_host::autosave_active(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed during file open",
+        ));
+    }
+    let stamp = crate::library::disk_stamp(path);
+    let (editor, candidate_ids, replace_preview) = {
+        let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+        let app = unsafe { app.as_mut() };
+        let editor = app
+            .editor
+            .clone()
+            .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
+        let replace_preview = preview && app.tabs.preview_id().is_some();
+        let candidate_ids = app
+            .tabs
+            .active()
+            .filter(|active| {
+                !replace_preview && !active.is_image() && !active.dirty && active.path.is_none()
+            })
+            .map(|active| (active.id, active.recovery_id));
+        (editor, candidate_ids, replace_preview)
+    };
+    let reused_ids = match candidate_ids {
+        Some(ids) if editor.text()?.is_empty() => Some(ids),
+        _ => None,
+    };
+    let reuse = reused_ids.is_some();
+    let (id, recovery_id) = match reused_ids {
+        Some(ids) => ids,
+        None => {
+            let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
+                "main window app state was not available",
+            ))?;
+            unsafe { app.as_mut() }.allocate_document_identity()
+        }
+    };
+    let mut document = Document::image(id, recovery_id, path.to_path_buf());
+    document.preview = preview;
+    document.disk_stamp = stamp;
+    let (commit, retired) = {
+        let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+        let app = unsafe { app.as_mut() };
+        if replace_preview {
+            (Ok(()), app.tabs.replace_preview(document))
+        } else if reuse {
+            let retired = app.tabs.replace_active_untitled(document);
+            let commit = if retired.is_some() {
+                Ok(())
+            } else {
+                Err(crate::FastPadError::Invariant(
+                    "the reused tab closed during file open",
+                ))
+            };
+            (commit, retired)
+        } else {
+            (
+                app.tabs
+                    .push(document)
+                    .map_err(|_| crate::FastPadError::Invariant("duplicate document path")),
+                None,
+            )
+        }
+    };
+    commit?;
+    // The retired tab's text document leaves the editor for an empty placeholder.
+    let blank = editor.create_document()?;
+    editor.use_document(&blank)?;
+    drop(retired);
+    unsafe {
+        let _ = record_milestone(hwnd, Milestone::FileLoaded);
+    }
     refresh_tabs(hwnd);
     crate::window::library_host::document_loaded(hwnd, stamp);
     Ok(())
@@ -3898,6 +4046,7 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
         return false;
     }
     refresh_tabs(hwnd);
+    crate::window::image_host::check_disk(hwnd);
     true
 }
 
@@ -4166,6 +4315,9 @@ pub(super) fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
 }
 
 pub(super) fn save_active_document(hwnd: HWND) -> bool {
+    if crate::window::image_host::active_is_image(hwnd) {
+        return false;
+    }
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
@@ -4179,6 +4331,9 @@ pub(super) fn save_active_document(hwnd: HWND) -> bool {
 }
 
 pub(super) fn save_active_document_as(hwnd: HWND) -> bool {
+    if crate::window::image_host::active_is_image(hwnd) {
+        return false;
+    }
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
@@ -4300,6 +4455,10 @@ fn save_active_to(
     create_new: bool,
     report_failure: bool,
 ) -> SaveOutcome {
+    // Every save path ends here: an image tab's editor holds an empty placeholder, never its bytes.
+    if crate::window::image_host::active_is_image(hwnd) {
+        return SaveOutcome::Failed;
+    }
     let is_save_as = new_path.is_some();
     let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
@@ -5552,7 +5711,7 @@ fn save_session_for_close(hwnd: HWND) -> bool {
 /// The manifest for the open tabs, or `None` when a dirty tab's text is in no snapshot file.
 /// Clean untitled tabs are empty and skipped. Only the shown tab has a caret and scroll
 /// position worth keeping, because switching tabs resets the view.
-fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate::session::Session> {
+pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate::session::Session> {
     use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETCURRENTPOS};
     use crate::session::{Session, SessionEntry, SessionSource};
     let app = unsafe { app_ptr(hwnd) }?;
@@ -5579,7 +5738,10 @@ fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate::session::S
         };
         if is_active {
             session.active = session.entries.len();
-            active_entry = Some(session.entries.len());
+            // An image tab has no caret: the editor holds a placeholder then.
+            if !document.is_image() {
+                active_entry = Some(session.entries.len());
+            }
         }
         session.entries.push(SessionEntry::new(source));
     }
@@ -5833,6 +5995,7 @@ fn open_menu(hwnd: HWND, mut index: usize) {
             );
             menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
         }
+        menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
         set_menu_mode(
             hwnd,
             Some(MenuMode {

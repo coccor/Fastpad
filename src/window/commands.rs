@@ -91,7 +91,34 @@ pub enum CommandId {
     FileIconsSolid = 196,
 }
 
+/// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
+pub const TEXT_COMMANDS: [CommandId; 18] = [
+    CommandId::Save,
+    CommandId::SaveAs,
+    CommandId::Undo,
+    CommandId::Redo,
+    CommandId::Cut,
+    CommandId::Copy,
+    CommandId::Paste,
+    CommandId::Find,
+    CommandId::FindNext,
+    CommandId::FindPrevious,
+    CommandId::Replace,
+    CommandId::ValidateJson,
+    CommandId::FormatJson,
+    CommandId::LanguagePlainText,
+    CommandId::LanguageJson,
+    CommandId::LanguageMarkdown,
+    CommandId::NoteReloadFromDisk,
+    CommandId::NoteKeepMine,
+];
+
 impl CommandId {
+    /// Commands that need the active tab's text, and so do nothing on an image tab.
+    pub fn needs_text(self) -> bool {
+        TEXT_COMMANDS.contains(&self)
+    }
+
     /// Commands that act on the active document, and so do nothing while no tab is open.
     pub const fn needs_document(self) -> bool {
         !matches!(

@@ -389,19 +389,34 @@ pub(crate) fn refresh_appearance(hwnd: HWND) {
     }
 }
 
+/// Loads Direct2D and DirectWrite once per window; the Markdown preview, the SVG preview and image
+/// tabs share them.
+pub(crate) fn shared_graphics(hwnd: HWND) -> Result<Rc<Graphics>> {
+    if let Some(graphics) = with_host(hwnd, |host| host.graphics.clone()).flatten() {
+        return Ok(graphics);
+    }
+    let graphics = Rc::new(Graphics::load()?);
+    with_host(hwnd, |host| host.graphics = Some(Rc::clone(&graphics)));
+    Ok(graphics)
+}
+
+/// The image view's colours: the preview palette for the current theme, and high contrast.
+pub(crate) fn image_colors(hwnd: HWND) -> (PreviewColors, bool) {
+    let (colors, ..) = appearance(hwnd);
+    let high_contrast = unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .theme
+            .is_some_and(|theme| theme.high_contrast)
+    });
+    (colors, high_contrast)
+}
+
 fn ensure_view(hwnd: HWND) -> Result<PreviewView> {
     if let Some(view) = view(hwnd) {
         return Ok(view);
     }
     let started = Instant::now();
-    let graphics = match with_host(hwnd, |host| host.graphics.clone()).flatten() {
-        Some(graphics) => graphics,
-        None => {
-            let graphics = Rc::new(Graphics::load()?);
-            with_host(hwnd, |host| host.graphics = Some(Rc::clone(&graphics)));
-            graphics
-        }
-    };
+    let graphics = shared_graphics(hwnd)?;
     let (colors, fonts, dark) = appearance(hwnd);
     let view = PreviewView::create(hwnd, graphics, colors, fonts.clone())?;
     view.set_appearance(colors, fonts, dark);
@@ -470,6 +485,7 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
     }
     if let Some(editor) = editor_hwnd
         && host_window::tab_count(hwnd) > 0
+        && !crate::window::image_host::active_is_image(hwnd)
     {
         unsafe { ShowWindow(editor, if hide_editor { SW_HIDE } else { SW_SHOWNA }) };
     }

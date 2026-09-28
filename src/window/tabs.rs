@@ -221,6 +221,11 @@ impl Tabs {
         self.documents.get(self.active_index())
     }
 
+    pub(crate) fn active_mut(&mut self) -> Option<&mut Document> {
+        let active = self.active_index();
+        self.documents.get_mut(active)
+    }
+
     pub fn document(&self, id: DocumentId) -> Option<&Document> {
         self.documents.iter().find(|document| document.id == id)
     }
