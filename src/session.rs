@@ -590,9 +590,11 @@ mod tests {
         let text = sample().encode();
         assert!(text.starts_with("version=2\r\n"));
         assert!(text.contains("layout=row(1:0.5,column(2:0.6,3:0.4):0.5)\r\n"));
-        assert!(text.contains(
-            "group=2|active=0\r\nsnapshot=12|4|3|00000000000000000000000000000abc\r\n"
-        ));
+        assert!(
+            text.contains(
+                "group=2|active=0\r\nsnapshot=12|4|3|00000000000000000000000000000abc\r\n"
+            )
+        );
         assert_eq!(Session::parse(&text), Some(sample()));
     }
 
@@ -624,7 +626,13 @@ mod tests {
     #[test]
     fn a_bad_or_mismatched_layout_falls_back_to_one_group_in_file_order() {
         // Break caught: a damaged layout line losing every tab of the session.
-        for layout in ["row(1:0.5", "row(1:0.5,9:0.5)", "column()", "row(1:x,2:1)", ""] {
+        for layout in [
+            "row(1:0.5",
+            "row(1:0.5,9:0.5)",
+            "column()",
+            "row(1:x,2:1)",
+            "",
+        ] {
             let text = format!(
                 "version=2\r\nlayout={layout}\r\nactive_group=1\r\ngroup=1|active=0\r\n\
                  file=0|0|0|C:\\a.txt\r\ngroup=2|active=0\r\nfile=0|0|0|C:\\b.txt\r\n"

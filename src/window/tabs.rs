@@ -600,7 +600,11 @@ impl Tabs {
                 .is_some_and(|existing| existing.preview)
         });
         match preview {
-            Some(index) if self.document_at(index).is_some_and(|existing| !existing.dirty) => {
+            Some(index)
+                if self
+                    .document_at(index)
+                    .is_some_and(|existing| !existing.dirty) =>
+            {
                 let id = document.id;
                 let old_id = self.tabs[index].document;
                 let old = self.store.replace(old_id, document)?;
@@ -1207,7 +1211,10 @@ mod tests {
         tabs.set_view_state(DocumentId(2), second);
         tabs.activate(DocumentId(1)).unwrap();
         tabs.close_active(CloseDecision::Discard).unwrap();
-        assert_eq!(tabs.active().map(|document| document.id), Some(DocumentId(2)));
+        assert_eq!(
+            tabs.active().map(|document| document.id),
+            Some(DocumentId(2))
+        );
         assert_eq!(tabs.view_state(DocumentId(2)), second);
     }
 }

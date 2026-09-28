@@ -1440,16 +1440,30 @@ fn wait_for_scintilla(
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
     use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowExW;
+    let group_class = fastpad::platform::wide_null("FastPadEditorGroup");
     let class = fastpad::platform::wide_null("Scintilla");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let hwnd = unsafe {
+        // The editor sits in the editor group window, a child of the main window.
+        let group = unsafe {
             FindWindowExW(
                 parent,
                 std::ptr::null_mut(),
-                class.as_ptr(),
+                group_class.as_ptr(),
                 std::ptr::null(),
             )
+        };
+        let hwnd = if group.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                FindWindowExW(
+                    group,
+                    std::ptr::null_mut(),
+                    class.as_ptr(),
+                    std::ptr::null(),
+                )
+            }
         };
         if !hwnd.is_null() {
             return Ok(hwnd);

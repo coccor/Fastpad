@@ -74,15 +74,7 @@ fn alt_and_f10_from_the_focused_editor_toggle_the_themed_menu_band() -> TestResu
     let _dpi = DpiContext::per_monitor_v2()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
-    let scintilla = wide_null("Scintilla");
-    let editor = unsafe {
-        FindWindowExW(
-            hwnd,
-            std::ptr::null_mut(),
-            scintilla.as_ptr(),
-            std::ptr::null(),
-        )
-    };
+    let editor = support::win32::find_child_by_class(hwnd, "Scintilla")?;
     assert!(!editor.is_null());
     let resting_top = editor_top(hwnd, editor);
 
@@ -116,15 +108,7 @@ fn alt_space_does_not_attach_the_transient_menu() -> TestResult<()> {
     let _dpi = DpiContext::per_monitor_v2()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
-    let scintilla = wide_null("Scintilla");
-    let editor = unsafe {
-        FindWindowExW(
-            hwnd,
-            std::ptr::null_mut(),
-            scintilla.as_ptr(),
-            std::ptr::null(),
-        )
-    };
+    let editor = support::win32::find_child_by_class(hwnd, "Scintilla")?;
     assert!(!editor.is_null());
     let resting_top = editor_top(hwnd, editor);
 

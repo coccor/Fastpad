@@ -63,7 +63,12 @@ fn ensure_view(hwnd: HWND) -> Option<ImageView> {
     }
     let created = crate::window::preview_host::shared_graphics(hwnd).and_then(|graphics| {
         let (colors, high_contrast) = crate::window::preview_host::image_colors(hwnd);
-        ImageView::create(hwnd, graphics, colors, high_contrast)
+        ImageView::create(
+            host_window::content_parent(hwnd),
+            graphics,
+            colors,
+            high_contrast,
+        )
     });
     match created {
         Ok(view) => {

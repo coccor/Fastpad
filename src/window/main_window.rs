@@ -303,7 +303,7 @@ unsafe extern "system" fn main_window_proc(
         WM_PAINT => {
             sync_window_title(hwnd);
             let paint_title_strip = |hwnd, _, _, _| {
-                let (titles, active, scroll, empty, preview_tab) = tab_snapshot(hwnd);
+                let (titles, active, scroll, _, preview_tab) = tab_snapshot(hwnd);
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
@@ -316,7 +316,6 @@ unsafe extern "system" fn main_window_proc(
                             active,
                             preview_tab,
                             scroll,
-                            empty_hint: empty.then_some(EMPTY_TABS_HINT),
                             status: status.as_ref(),
                             palette,
                             fonts,
@@ -324,7 +323,6 @@ unsafe extern "system" fn main_window_proc(
                             menu: menu_mode(hwnd).map(|mode| (mode, headings.as_slice())),
                             preview: preview_buttons_visible(hwnd)
                                 .then(|| crate::window::preview_host::mode(hwnd)),
-                            divider: crate::window::preview_host::divider_rect(hwnd),
                         },
                     )
                 };
@@ -359,12 +357,6 @@ unsafe extern "system" fn main_window_proc(
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
         WM_MOUSEMOVE => {
-            if crate::window::preview_host::drag_divider(
-                hwnd,
-                (lparam as u32 & 0xffff) as u16 as i16 as i32,
-            ) {
-                return 0;
-            }
             hover_menu_heading(hwnd, lparam);
             drag_tab_thumb(hwnd, lparam);
             crate::window::titlebar::track_pointer_leave(hwnd, false);
@@ -400,9 +392,6 @@ unsafe extern "system" fn main_window_proc(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
-            if crate::window::preview_host::begin_divider_drag(hwnd, x, y) {
-                return 0;
-            }
             if menu_mode(hwnd).is_some() {
                 match menu_band::heading_at(&menu_headings(hwnd), x, y) {
                     Some(index) => {
@@ -423,7 +412,6 @@ unsafe extern "system" fn main_window_proc(
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.tab_thumb_grab = None;
             }
-            crate::window::preview_host::cancel_divider_drag(hwnd);
             0
         }
         // The empty tab-strip space is the only caption: double-clicking it opens a tab, VSCode
@@ -484,9 +472,6 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_LBUTTONUP => {
-            if crate::window::preview_host::end_divider_drag(hwnd) {
-                return 0;
-            }
             update_title_pointer(hwnd, |pointer| pointer.release(None).0);
             if end_tab_thumb_drag(hwnd) {
                 return 0;
@@ -699,19 +684,6 @@ unsafe extern "system" fn main_window_proc(
                 InvalidateRect(hwnd, std::ptr::null(), 1);
             }
             0
-        }
-        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR
-            if crate::window::preview_host::cursor_over_divider(hwnd) =>
-        {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(
-                    windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
-                        std::ptr::null_mut(),
-                        windows_sys::Win32::UI::WindowsAndMessaging::IDC_SIZEWE,
-                    ),
-                )
-            };
-            1
         }
         WM_NCDESTROY => {
             let app = unsafe { take_app(hwnd) };
@@ -1032,7 +1004,13 @@ where
     // Every document comes from the host, so any editor can show any of them (split editors
     // spec §3.1).
     let host = Editor::create_document_host()?;
-    let editor = create_editor(hwnd)?.with_document_host(&host);
+    // The editor, find bar, preview and image view live in the editor group (split editors spec
+    // §4.2), which the main window lays out.
+    let group = crate::window::editor_group::create(hwnd)?;
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.group = Some(crate::window::editor_group::GroupWindow { hwnd: group });
+    }
+    let editor = create_editor(group)?.with_document_host(&host);
     let editor_hwnd = editor.hwnd();
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
@@ -1137,8 +1115,9 @@ fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
     action(editor);
 }
 
-/// Lays out the sidebar, then the find bar, the name box, the preview and the editor right of it,
-/// below the title strip. The sole layout choke point for all of them.
+/// Lays out the sidebar, then the name box and the editor group right of it, below the title
+/// strip. The sole layout choke point for all of them; the group lays out its own children
+/// (`layout_group`).
 pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     let mut rect = RECT::default();
     unsafe {
@@ -1152,36 +1131,67 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
         unsafe { app.as_ref() }.tabs.set_strip_left(left);
     }
     layout_command_palette(hwnd);
-    let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
+    let Some(group) = group_hwnd(hwnd) else {
         return;
     };
     let title_height = title_layout(hwnd).height + menu_band_height(hwnd);
     let width = (rect.right - rect.left - left).max(0);
     let font = title_chrome(hwnd).1.text();
-    let find_bar_height = unsafe { app_ptr(hwnd) }
-        .and_then(|app| {
-            let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
-            bar.layout(left, width, title_height, dpi, font);
-            bar.is_visible().then(|| find_bar::find_bar_height(dpi))
-        })
-        .unwrap_or(0);
-    // Opening either bar closes the other, so at most one of the two bands is ever reserved.
     let name_box_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
-            name_box.layout(left, width, title_height + find_bar_height, dpi, font);
+            name_box.layout(left, width, title_height, dpi, font);
             name_box
                 .is_visible()
                 .then(|| crate::window::name_box::name_box_height(dpi))
         })
         .unwrap_or(0);
-    let content_top = title_height + find_bar_height + name_box_height;
+    let content_top = title_height + name_box_height;
     let status_height = status_bar_height(hwnd);
+    let bottom = (rect.bottom - rect.top - status_height).max(content_top);
+    unsafe {
+        MoveWindow(group, left, content_top, width, bottom - content_top, 1);
+    }
+    // A move that keeps the group's size sends no WM_SIZE, but what is inside may have changed.
+    layout_group(hwnd, group);
+}
+
+/// The editor group's window, once the editor exists.
+pub(crate) fn group_hwnd(hwnd: HWND) -> Option<HWND> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }.group.as_ref().map(|group| group.hwnd)
+}
+
+/// The window the content area's children go into: the editor group, or the main window before
+/// the group exists.
+pub(crate) fn content_parent(hwnd: HWND) -> HWND {
+    group_hwnd(hwnd).unwrap_or(hwnd)
+}
+
+/// Lays out the find bar, then the preview and the editor below it, in `group`'s client area.
+pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
+    let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
+        return;
+    };
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(group, &mut client);
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
+    let font = title_chrome(hwnd).1.text();
+    let width = client.right;
+    let find_bar_height = unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
+            bar.layout(0, width, 0, dpi, font);
+            bar.is_visible().then(|| find_bar::find_bar_height(dpi))
+        })
+        .unwrap_or(0);
     let area = RECT {
-        left,
-        top: content_top,
-        right: left + width,
-        bottom: (rect.bottom - rect.top - status_height).max(content_top),
+        left: 0,
+        top: find_bar_height,
+        right: width,
+        bottom: client.bottom.max(find_bar_height),
     };
     let rects = crate::window::preview_host::layout(hwnd, area, dpi);
     crate::window::image_host::layout(hwnd, area);
@@ -1196,6 +1206,55 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
                 1,
             );
         }
+    }
+    unsafe {
+        InvalidateRect(group, std::ptr::null(), 0);
+    }
+}
+
+/// Paints what the group's children leave uncovered: the preview divider, and the empty hint
+/// while no tab is open.
+pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
+    let mut paint = windows_sys::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+    let dc = unsafe { windows_sys::Win32::Graphics::Gdi::BeginPaint(group, &mut paint) };
+    if dc.is_null() {
+        return;
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
+    let (palette, fonts, _) = title_chrome(hwnd);
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(group, &mut client);
+    }
+    if tab_count(hwnd) == 0 {
+        unsafe {
+            crate::window::titlebar::paint_empty_hint(
+                dc,
+                client,
+                EMPTY_TABS_HINT,
+                palette,
+                fonts.text(),
+                dpi,
+            );
+        }
+    }
+    if let Some(divider) = crate::window::preview_host::divider_rect(hwnd) {
+        unsafe { crate::window::titlebar::paint_divider(dc, divider, palette) };
+    }
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::EndPaint(group, &paint);
+    }
+}
+
+/// Focus given to the group window goes on to its content, as focus given to the frame does. With
+/// no tab open the frame keeps it, to take the menu keys.
+pub(crate) fn focus_group_content(hwnd: HWND) {
+    let target = (tab_count(hwnd) > 0)
+        .then(|| content_focus_target(hwnd))
+        .flatten()
+        .unwrap_or(hwnd);
+    unsafe {
+        SetFocus(target);
     }
 }
 
@@ -1256,7 +1315,7 @@ fn ensure_find_bar(hwnd: HWND) -> bool {
     if exists {
         return true;
     }
-    let Ok(bar) = find_bar::FindBar::create(hwnd) else {
+    let Ok(bar) = find_bar::FindBar::create(content_parent(hwnd)) else {
         return false;
     };
     unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
@@ -4806,7 +4865,9 @@ fn with_background_document<R>(
 ) -> Result<R> {
     let host = unsafe { app_ptr(hwnd) }
         .and_then(|app| unsafe { app.as_ref() }.document_host.clone())
-        .ok_or(crate::FastPadError::Invariant("the document host is missing"))?;
+        .ok_or(crate::FastPadError::Invariant(
+            "the document host is missing",
+        ))?;
     host.use_document(target)?;
     let result = f(&host);
     // Leave the host on a document of its own, so it never keeps a closed tab's text alive.
@@ -6651,8 +6712,76 @@ mod tests {
 
         assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, first);
         assert_eq!(editor.view_state().unwrap(), shown);
-        assert_eq!(super::document_text(window.hwnd, second).unwrap(), "bar bar");
+        assert_eq!(
+            super::document_text(window.hwnd, second).unwrap(),
+            "bar bar"
+        );
         assert!(app_mut(window.hwnd).tabs.document(second).unwrap().dirty);
+    }
+
+    #[test]
+    fn the_editor_and_find_bar_live_in_the_group_window() {
+        // Break caught: a child left parented to the main window, painting over or under the
+        // group and missing its layout.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetParent;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).expect("the editor group window");
+        assert_eq!(unsafe { GetParent(group) }, window.hwnd);
+        assert_eq!(unsafe { GetParent(editor.hwnd()) }, group);
+        execute_command(window.hwnd, CommandId::Find);
+        let panel = app_mut(window.hwnd)
+            .find_bar
+            .as_ref()
+            .unwrap()
+            .panel_hwnd();
+        assert_eq!(unsafe { GetParent(panel) }, group);
+        let (width, height) = client_size(window.hwnd);
+        let (group_width, group_height) = client_size(group);
+        assert_eq!(left_of(group, window.hwnd) + group_width, width);
+        assert!(group_height > 0 && group_height < height);
+    }
+
+    #[test]
+    fn find_bar_keys_still_reach_the_main_window() {
+        // Break caught: the find field hook sending to its parent, now the group, so Enter and
+        // Escape in the query field do nothing.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("xyz abc abc").unwrap();
+        editor.set_selection(0..0).unwrap();
+        execute_command(window.hwnd, CommandId::Find);
+        let query = app_mut(window.hwnd)
+            .find_bar
+            .as_ref()
+            .unwrap()
+            .query_hwnd();
+        let text = crate::platform::wide_null("abc");
+        unsafe { SetWindowTextW(query, text.as_ptr()) };
+        editor.set_selection(0..0).unwrap();
+
+        unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(VK_RETURN), 0) };
+        assert_eq!(editor.selected_text().unwrap(), "abc");
+
+        unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        assert!(!app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+    }
+
+    #[test]
+    fn typing_in_the_grouped_editor_still_marks_the_tab_dirty() {
+        // Break caught: WM_NOTIFY now going to the group, which drops it, so typing never dirties
+        // the tab and never autosaves.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+        unsafe { SendMessageW(editor.hwnd(), WM_CHAR, usize::from(b'x'), 0) };
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
     }
 
     #[test]
@@ -9605,7 +9734,10 @@ mod tests {
             2,
             "the empty untitled tab is skipped"
         );
-        assert_eq!(session.groups[0].entries[0].source, SessionSource::File(file));
+        assert_eq!(
+            session.groups[0].entries[0].source,
+            SessionSource::File(file)
+        );
         let SessionSource::Snapshot(id) = session.groups[0].entries[1].source else {
             panic!("the unsaved tab must be recorded as a snapshot");
         };
@@ -10283,7 +10415,9 @@ mod tests {
 
         let session = super::build_session(window.hwnd, recovery.path()).unwrap();
         assert_eq!(session.groups[0].entries.len(), 1);
-        assert!(matches!(&session.groups[0].entries[0].source, SessionSource::File(path) if *path == a));
+        assert!(
+            matches!(&session.groups[0].entries[0].source, SessionSource::File(path) if *path == a)
+        );
 
         let id = app_mut(window.hwnd).tabs.active().unwrap().id;
         super::close_document_without_prompt(window.hwnd, id);

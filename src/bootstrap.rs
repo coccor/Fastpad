@@ -773,7 +773,8 @@ mod tests {
         let error = unsafe {
             initialize_editor_with(window.hwnd, &window.identity, |parent| {
                 let editor = Editor::create(parent)?;
-                DestroyWindow(parent);
+                // The editor's parent is the editor group; the main window is its root.
+                DestroyWindow(crate::platform::win32::root_window(parent));
                 Ok(editor)
             })
         }

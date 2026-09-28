@@ -16,10 +16,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, OBJID_CLIENT,
-    RegisterClassW, SendMessageW, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW, OBJID_CLIENT, RegisterClassW,
+    SendMessageW, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DRAWITEM,
+    WM_ERASEBKGND, WM_GETOBJECT, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
 pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
@@ -105,7 +105,7 @@ unsafe extern "system" fn panel_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let main = unsafe { GetParent(hwnd) };
+    let main = crate::platform::win32::root_window(hwnd);
     match message {
         WM_PAINT => {
             super::main_window::paint_panel(main, hwnd);

@@ -55,7 +55,10 @@ impl DocumentStore {
 
     /// Puts `document` where `old` was; returns `old`.
     pub(crate) fn replace(&mut self, old: DocumentId, document: Document) -> Option<Document> {
-        let slot = self.documents.iter_mut().find(|existing| existing.id == old)?;
+        let slot = self
+            .documents
+            .iter_mut()
+            .find(|existing| existing.id == old)?;
         Some(std::mem::replace(slot, document))
     }
 

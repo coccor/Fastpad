@@ -460,8 +460,10 @@ impl FindBar {
         let fields = (|| {
             let query_edit = create_edit_child(panel)?;
             let replace_edit = create_edit_child(panel)?;
-            install_field_hook(query_edit, parent, FindField::Query)?;
-            install_field_hook(replace_edit, parent, FindField::Replace)?;
+            // The field hooks call into the main window, whichever window holds the bar.
+            let main = crate::platform::win32::root_window(parent);
+            install_field_hook(query_edit, main, FindField::Query)?;
+            install_field_hook(replace_edit, main, FindField::Replace)?;
             Ok((query_edit, replace_edit))
         })();
         let (query_edit, replace_edit) = match fields {
@@ -1004,7 +1006,7 @@ pub(crate) fn toggle_child(option: SearchOption) -> usize {
 /// (`sidebar_accessibility` sends every query there), under a shared App borrow: `f` reads kept
 /// state and sends no messages.
 fn with_bar<R>(panel: HWND, f: impl FnOnce(&FindBar) -> R) -> Option<R> {
-    let main = unsafe { GetParent(panel) };
+    let main = crate::platform::win32::root_window(panel);
     let app = unsafe { super::main_window::app_ptr(main) }?;
     let bar = unsafe { app.as_ref() }
         .find_bar

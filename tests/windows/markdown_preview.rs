@@ -598,8 +598,14 @@ fn losing_capture_ends_a_divider_drag() {
     main.make_markdown("# A\n");
     main.command(CommandId::MarkdownPreviewSide);
     let divider = window::preview_host::divider_rect(main.hwnd).expect("divider");
+    // The preview sits in the editor group, whose client area the divider is laid out in.
+    let group = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetParent(main.view().unwrap().hwnd())
+    };
+    assert_ne!(group, main.hwnd);
     assert!(window::preview_host::begin_divider_drag(
         main.hwnd,
+        group,
         divider.left,
         divider.top
     ));

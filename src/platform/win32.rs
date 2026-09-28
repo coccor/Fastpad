@@ -41,6 +41,17 @@ pub(crate) fn handle_is_valid(raw: HANDLE) -> bool {
     !raw.is_null() && raw != INVALID_HANDLE_VALUE
 }
 
+/// The top-level window `hwnd` belongs to: FastPad's main window for any of its children, however
+/// deeply nested. Children now sit inside editor groups, so their direct parent is no longer the
+/// main window (split editors spec §4.2).
+#[cfg(windows)]
+pub(crate) fn root_window(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+) -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+    unsafe { GetAncestor(hwnd, GA_ROOT) }
+}
+
 #[cfg(windows)]
 pub(crate) fn free_library(module: HMODULE) {
     unsafe {

@@ -1,3 +1,4 @@
+use crate::editor::ViewState;
 use crate::editor::scintilla_constants::{
     SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY,
     SCI_CREATEDOCUMENT, SCI_CUT, SCI_EMPTYUNDOBUFFER, SCI_ENDUNDOACTION, SCI_GETDIRECTFUNCTION,
@@ -20,14 +21,13 @@ use crate::editor::scintilla_constants::{
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
-#[cfg(windows)]
-use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETXOFFSET, SCI_SETXOFFSET};
-use crate::editor::ViewState;
 use crate::editor::scintilla_constants::{
     SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCHARACTERPOINTER, SCI_GETCODEPAGE,
     SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER,
     SCI_LINEFROMPOSITION, SCI_LINELENGTH, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
 };
+#[cfg(windows)]
+use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETXOFFSET, SCI_SETXOFFSET};
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
 };

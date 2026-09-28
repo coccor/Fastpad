@@ -315,7 +315,12 @@ fn ensure_svg_view(hwnd: HWND) -> Result<ImageView> {
     }
     let graphics = shared_graphics(hwnd)?;
     let (colors, high_contrast) = image_colors(hwnd);
-    let view = ImageView::create(hwnd, graphics, colors, high_contrast)?;
+    let view = ImageView::create(
+        host_window::content_parent(hwnd),
+        graphics,
+        colors,
+        high_contrast,
+    )?;
     with_host(hwnd, |host| {
         host.svg_view = Some(view);
         host.svg_document = None;
@@ -517,7 +522,7 @@ fn ensure_view(hwnd: HWND) -> Result<PreviewView> {
     let started = Instant::now();
     let graphics = shared_graphics(hwnd)?;
     let (colors, fonts, dark) = appearance(hwnd);
-    let view = PreviewView::create(hwnd, graphics, colors, fonts.clone())?;
+    let view = PreviewView::create(host_window::content_parent(hwnd), graphics, colors, fonts.clone())?;
     view.set_appearance(colors, fonts, dark);
     view.mark_opened(started);
     with_host(hwnd, |host| {
@@ -1140,7 +1145,8 @@ fn over_divider(hwnd: HWND, x: i32, y: i32) -> bool {
         .is_some_and(|rect| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
 }
 
-pub(crate) fn begin_divider_drag(hwnd: HWND, x: i32, y: i32) -> bool {
+/// A press at `x`, `y` in `group`'s client area, where the content area and divider are laid out.
+pub(crate) fn begin_divider_drag(hwnd: HWND, group: HWND, x: i32, y: i32) -> bool {
     if host_window::menu_mode(hwnd).is_some() || !over_divider(hwnd, x, y) {
         return false;
     }
@@ -1167,7 +1173,7 @@ pub(crate) fn begin_divider_drag(hwnd: HWND, x: i32, y: i32) -> bool {
     if let Some(view) = view(hwnd) {
         view.set_live_resize(true);
     }
-    unsafe { SetCapture(hwnd) };
+    unsafe { SetCapture(group) };
     true
 }
 
@@ -1204,9 +1210,9 @@ pub(crate) fn end_divider_drag(hwnd: HWND) -> bool {
     true
 }
 
-pub(crate) fn cursor_over_divider(hwnd: HWND) -> bool {
+pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
     let mut point = POINT::default();
-    if unsafe { GetCursorPos(&mut point) } == 0 || unsafe { ScreenToClient(hwnd, &mut point) } == 0
+    if unsafe { GetCursorPos(&mut point) } == 0 || unsafe { ScreenToClient(group, &mut point) } == 0
     {
         return false;
     }

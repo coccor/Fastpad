@@ -673,8 +673,6 @@ pub(crate) struct TitlePaint<'a> {
     /// The preview tab's index; its label is drawn in italics.
     pub preview_tab: Option<usize>,
     pub scroll: i32,
-    /// Shown in place of the hidden editor while no tab is open.
-    pub empty_hint: Option<&'a str>,
     /// Present once deferred chrome is built; the bar is painted along the bottom edge.
     pub status: Option<&'a crate::window::status::StatusBarText>,
     pub palette: Palette,
@@ -684,8 +682,6 @@ pub(crate) struct TitlePaint<'a> {
     pub menu: Option<(crate::window::menu_band::MenuMode, &'a [RECT])>,
     /// The current preview mode while the preview buttons are shown; `None` hides them.
     pub preview: Option<crate::preview::PreviewMode>,
-    /// The Markdown preview divider, painted between the editor and the preview.
-    pub divider: Option<RECT>,
 }
 
 pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
@@ -723,35 +719,6 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
     } else {
         0
     };
-    if let Some(hint) = input.empty_hint {
-        let content = Rect::new(
-            left,
-            layout.height,
-            client.right,
-            client.bottom - status_height,
-        );
-        let margin = scale(24, dpi);
-        let middle = (content.top + content.bottom) / 2;
-        unsafe {
-            fill(dc, content, input.palette.editor_background);
-            SetBkMode(dc, TRANSPARENT as i32);
-            let previous = select_font(dc, input.fonts.text);
-            SetTextColor(dc, input.palette.muted_foreground);
-            draw_text(
-                dc,
-                hint,
-                Rect::new(
-                    content.left + margin,
-                    middle - scale(20, dpi),
-                    (content.right - margin).max(content.left + margin),
-                    middle + scale(20, dpi),
-                ),
-                DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
-            );
-            restore_font(dc, previous);
-        }
-    }
-
     if let Some(status) = input.status {
         let bar = Rect::new(
             left,
@@ -810,13 +777,47 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
         }
     }
 
-    if let Some(divider) = input.divider {
-        unsafe { fill(dc, from_native(divider), input.palette.hover_background) };
-    }
-
     unsafe {
         EndPaint(hwnd, &paint);
     }
+}
+
+/// Fills an editor group's `content` and centers `hint` in it, shown in place of the hidden editor
+/// while no tab is open.
+pub(crate) unsafe fn paint_empty_hint(
+    dc: HDC,
+    content: RECT,
+    hint: &str,
+    palette: Palette,
+    font: HFONT,
+    dpi: u32,
+) {
+    let content = from_native(content);
+    let margin = scale(24, dpi);
+    let middle = (content.top + content.bottom) / 2;
+    unsafe {
+        fill(dc, content, palette.editor_background);
+        SetBkMode(dc, TRANSPARENT as i32);
+        let previous = select_font(dc, font);
+        SetTextColor(dc, palette.muted_foreground);
+        draw_text(
+            dc,
+            hint,
+            Rect::new(
+                content.left + margin,
+                middle - scale(20, dpi),
+                (content.right - margin).max(content.left + margin),
+                middle + scale(20, dpi),
+            ),
+            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        restore_font(dc, previous);
+    }
+}
+
+/// Fills a Markdown preview divider.
+pub(crate) unsafe fn paint_divider(dc: HDC, divider: RECT, palette: Palette) {
+    unsafe { fill(dc, from_native(divider), palette.hover_background) };
 }
 
 unsafe fn paint_strip_buffered(
