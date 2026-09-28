@@ -2,6 +2,20 @@ mod json;
 mod json_commands;
 mod lexilla;
 mod markdown;
+mod registry;
+mod bash;
+mod batch;
+mod cpp;
+mod css;
+mod keywords;
+mod powershell;
+mod props;
+mod python;
+mod rust;
+mod sql;
+mod toml;
+mod xml;
+mod yaml;
 
 use crate::Result;
 use crate::catppuccin::{self, Flavor};
@@ -9,9 +23,12 @@ use crate::document::Language;
 use crate::editor::Editor;
 use crate::platform::theme::Theme;
 use lexilla::LexillaLibrary;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub use json_commands::{JsonIssue, format_json, json_invocation_count, validate_json};
+#[cfg(test)]
+pub(crate) use registry::LANGUAGES;
+pub use registry::{default_extension, detect_language, display_name};
 
 /// One Scintilla lexer style's look: `style` is the lexer-specific `SCE_*` style number.
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +37,42 @@ pub(crate) struct LexerStyle {
     pub(crate) foreground: u32,
     pub(crate) background: u32,
     pub(crate) bold: bool,
+    pub(crate) italic: bool,
+}
+
+impl LexerStyle {
+    pub(crate) const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    pub(crate) const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+}
+
+/// What a token is, independent of language; each theme gives every role a colour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Role {
+    Text,
+    Comment,
+    Keyword,
+    String,
+    Number,
+    Operator,
+    Key,
+    Tag,
+    Attribute,
+    Type,
+    Function,
+    Preprocessor,
+    Variable,
+    Escape,
+    Heading,
+    Emphasis,
+    Link,
+    Error,
 }
 
 /// The syntax roles every language's style table draws from, one set per theme. Each language
@@ -28,43 +81,148 @@ pub(crate) struct LexerStyle {
 pub(crate) struct SyntaxColors {
     pub(crate) background: u32,
     pub(crate) text: u32,
+    pub(crate) comment: u32,
+    pub(crate) keyword: u32,
     pub(crate) string: u32,
     pub(crate) number: u32,
+    pub(crate) operator: u32,
+    pub(crate) key: u32,
+    pub(crate) tag: u32,
+    pub(crate) attribute: u32,
+    pub(crate) type_name: u32,
+    pub(crate) function: u32,
+    pub(crate) preprocessor: u32,
+    pub(crate) variable: u32,
+    pub(crate) escape: u32,
     pub(crate) heading: u32,
+    pub(crate) emphasis: u32,
+    pub(crate) link: u32,
     pub(crate) code: u32,
     pub(crate) code_background: u32,
+    pub(crate) error: u32,
 }
 
+impl SyntaxColors {
+    pub(crate) const fn role(&self, role: Role) -> u32 {
+        match role {
+            Role::Text => self.text,
+            Role::Comment => self.comment,
+            Role::Keyword => self.keyword,
+            Role::String => self.string,
+            Role::Number => self.number,
+            Role::Operator => self.operator,
+            Role::Key => self.key,
+            Role::Tag => self.tag,
+            Role::Attribute => self.attribute,
+            Role::Type => self.type_name,
+            Role::Function => self.function,
+            Role::Preprocessor => self.preprocessor,
+            Role::Variable => self.variable,
+            Role::Escape => self.escape,
+            Role::Heading => self.heading,
+            Role::Emphasis => self.emphasis,
+            Role::Link => self.link,
+            Role::Error => self.error,
+        }
+    }
+}
+
+/// Style `id` in `role`'s colour on the theme background; comments are italic.
+pub(crate) const fn style(colors: &SyntaxColors, id: u32, role: Role) -> LexerStyle {
+    LexerStyle {
+        style: id,
+        foreground: colors.role(role),
+        background: colors.background,
+        bold: false,
+        italic: matches!(role, Role::Comment),
+    }
+}
+
+/// Style `id` as code: the code colour on the code background.
+pub(crate) const fn code(colors: &SyntaxColors, id: u32) -> LexerStyle {
+    LexerStyle {
+        style: id,
+        foreground: colors.code,
+        background: colors.code_background,
+        bold: false,
+        italic: false,
+    }
+}
+
+// VS Code Light+ roles; text, background, string, number, heading and code are FastPad's originals.
 const LIGHT_SYNTAX: SyntaxColors = SyntaxColors {
     background: rgb(255, 255, 255),
     text: rgb(32, 32, 32),
+    comment: rgb(0, 128, 0),
+    keyword: rgb(0, 0, 255),
     string: rgb(163, 21, 21),
     number: rgb(9, 134, 88),
+    operator: rgb(0, 0, 0),
+    key: rgb(4, 81, 165),
+    tag: rgb(128, 0, 0),
+    attribute: rgb(229, 0, 0),
+    type_name: rgb(38, 127, 153),
+    function: rgb(121, 94, 38),
+    preprocessor: rgb(175, 0, 219),
+    variable: rgb(0, 16, 128),
+    escape: rgb(238, 0, 0),
     heading: rgb(0, 92, 197),
+    emphasis: rgb(32, 32, 32),
+    link: rgb(0, 112, 193),
     code: rgb(110, 65, 15),
     code_background: rgb(246, 248, 250),
+    error: rgb(205, 49, 49),
 };
 
+// VS Code Dark+ roles; text, background, string, number, heading and code are FastPad's originals.
 const DARK_SYNTAX: SyntaxColors = SyntaxColors {
     background: rgb(30, 30, 30),
     text: rgb(220, 220, 220),
+    comment: rgb(106, 153, 85),
+    keyword: rgb(86, 156, 214),
     string: rgb(206, 145, 120),
     number: rgb(181, 206, 168),
+    operator: rgb(212, 212, 212),
+    key: rgb(156, 220, 254),
+    tag: rgb(86, 156, 214),
+    attribute: rgb(156, 220, 254),
+    type_name: rgb(78, 201, 176),
+    function: rgb(220, 220, 170),
+    preprocessor: rgb(197, 134, 192),
+    variable: rgb(156, 220, 254),
+    escape: rgb(215, 186, 125),
     heading: rgb(86, 156, 214),
+    emphasis: rgb(220, 220, 220),
+    link: rgb(79, 193, 255),
     code: rgb(215, 186, 125),
     code_background: rgb(45, 45, 45),
+    error: rgb(244, 71, 71),
 };
 
-/// Catppuccin style guide roles: green strings, peach numbers, red first-level headings.
+/// Catppuccin style guide roles.
 const fn catppuccin_syntax(flavor: &Flavor) -> SyntaxColors {
     SyntaxColors {
         background: flavor.base,
         text: flavor.text,
+        comment: flavor.overlay2,
+        keyword: flavor.mauve,
         string: flavor.green,
         number: flavor.peach,
+        operator: flavor.sky,
+        key: flavor.blue,
+        tag: flavor.blue,
+        attribute: flavor.yellow,
+        type_name: flavor.yellow,
+        function: flavor.blue,
+        preprocessor: flavor.pink,
+        variable: flavor.flamingo,
+        escape: flavor.pink,
         heading: flavor.red,
+        emphasis: flavor.maroon,
+        link: flavor.rosewater,
         code: flavor.blue,
         code_background: flavor.mantle,
+        error: flavor.red,
     }
 }
 
@@ -119,26 +277,9 @@ const DEFAULT_FONT_FACE: &str = "Consolas";
 #[cfg(test)]
 pub(crate) static NATIVE_LEXILLA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Detects the language of a file purely from its extension, case-insensitively. Never touches
-/// disk or Win32; this is the pure-logic half of language handling, unit-testable without a
-/// window (mirrors the `SearchState` pure-logic/window-integration split).
-pub fn detect_language(path: &Path) -> Language {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("json") => Language::Json,
-        Some("md") => Language::Markdown,
-        Some("svg") => Language::Svg,
-        _ => Language::PlainText,
-    }
-}
-
 /// Owns the deferred `Lexilla.dll` and applies a document's language (lexer + style table) to the
-/// live editor. `Lexilla.dll` is only ever loaded the first time `apply` is called with
-/// `Language::Json` or `Language::Markdown`; a plain-text-only session never touches it.
+/// live editor. `Lexilla.dll` is only ever loaded the first time `apply` is called with a lexed
+/// language; a plain-text-only session never touches it.
 #[derive(Debug, Default)]
 pub struct LanguageManager {
     lexilla: Option<LexillaLibrary>,
@@ -151,34 +292,34 @@ impl LanguageManager {
         Self::default()
     }
 
-    /// Applies `language`'s lexer to `editor`. `Language::PlainText` installs Scintilla's null
-    /// lexer (`SCI_SETILEXER` with a null pointer), which never touches Lexilla. JSON/Markdown
-    /// load `Lexilla.dll` on first use, request the matching lexer by name, install it, and apply
-    /// `theme`'s compiled style table. On a Lexilla load or lexer-creation failure, the editor is
-    /// left exactly as it was (this method never calls `set_lexer` before a real lexer pointer is
-    /// in hand) and the error is returned for the caller's notification.
+    /// Applies `language`'s lexer, lexer options, keyword sets and `theme`'s style table to
+    /// `editor`. A language without a lexer installs Scintilla's null lexer (`SCI_SETILEXER` with
+    /// a null pointer) and never touches Lexilla; `Lexilla.dll` loads on the first lexed language.
+    /// On a Lexilla load or lexer-creation failure the editor is left exactly as it was (this
+    /// method never calls `set_lexer` before a real lexer pointer is in hand) and the error is
+    /// returned for the caller's notification.
     pub fn apply(&mut self, editor: &Editor, language: Language, theme: Theme) -> Result<()> {
-        match language {
-            Language::PlainText | Language::Svg => {
-                editor.set_lexer(0)?;
-                Ok(())
-            }
-            Language::Json => self.apply_lexer(editor, "json", json::styles(theme)),
-            Language::Markdown => self.apply_lexer(editor, "markdown", markdown::styles(theme)),
-        }
-    }
-
-    fn apply_lexer(&mut self, editor: &Editor, name: &str, table: &[LexerStyle]) -> Result<()> {
+        let spec = registry::spec(language);
+        let Some(name) = spec.lexer else {
+            editor.set_lexer(0)?;
+            return Ok(());
+        };
         let lexer = self.ensure_lexilla()?.create_lexer(name)?;
         editor.set_lexer(lexer)?;
+        for (key, value) in spec.properties {
+            editor.set_lexer_property(key, value)?;
+        }
+        for (set, words) in spec.keywords.iter().enumerate() {
+            editor.set_keywords(set, words)?;
+        }
         editor.clear_all_styles()?;
-        for style in table {
+        for style in (spec.styles)(theme) {
             editor.set_style(
                 style.style,
                 style.foreground,
                 style.background,
                 style.bold,
-                false,
+                style.italic,
                 DEFAULT_FONT_FACE,
             )?;
         }
@@ -220,7 +361,7 @@ impl LanguageManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{LanguageManager, detect_language, rgb};
+    use super::{LanguageManager, rgb};
     use crate::document::Language;
     use crate::editor::Editor;
     use crate::editor::scintilla_constants::{
@@ -228,22 +369,9 @@ mod tests {
         SCI_STYLESETFORE, SCI_STYLESETITALIC, STYLE_MAX,
     };
     use crate::platform::theme::Theme;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn detects_supported_languages_case_insensitively() {
-        assert_eq!(detect_language(Path::new("CONFIG.JSON")), Language::Json);
-        assert_eq!(detect_language(Path::new("readme.md")), Language::Markdown);
-        assert_eq!(detect_language(Path::new("notes.txt")), Language::PlainText);
-    }
-
-    #[test]
-    fn svg_files_are_detected_as_svg() {
-        // Break caught: an SVG tab without the preview buttons because it was detected as plain text.
-        assert_eq!(detect_language(Path::new(r"C:\x\Logo.SVG")), Language::Svg);
-    }
 
     #[test]
     fn rgb_packs_components_in_windows_colorref_byte_order() {
@@ -263,6 +391,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(harness.setilexer_calls(), vec![0]);
+        assert!(harness.strings(SCI_SETKEYWORDS).is_empty());
         assert!(!manager.is_loaded());
     }
 
@@ -364,6 +493,91 @@ mod tests {
             default_foreground(Theme::CatppuccinMocha),
             Some(crate::catppuccin::MOCHA.text as isize)
         );
+    }
+
+    #[test]
+    fn csharp_sends_its_keyword_sets_and_escape_property() {
+        let _guard = super::NATIVE_LEXILLA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let harness = FakeHarness::new();
+        let editor = fake_editor(&harness);
+        let mut manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
+
+        manager
+            .apply(&editor, Language::CSharp, Theme::Light)
+            .unwrap();
+
+        let keywords = harness.strings(SCI_SETKEYWORDS);
+        assert_eq!(keywords.len(), 2);
+        assert_eq!(keywords[0].0, "0");
+        assert!(keywords[0].1.split(' ').any(|word| word == "namespace"));
+        assert_eq!(
+            harness.strings(SCI_SETPROPERTY),
+            vec![("lexer.cpp.escape.sequence".to_owned(), "1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn every_registry_lexer_name_is_accepted_by_lexilla() {
+        // Break caught: a typo such as "html" instead of "hypertext" failing only when a user
+        // opens that file type.
+        let _guard = super::NATIVE_LEXILLA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let harness = FakeHarness::new();
+        let editor = fake_editor(&harness);
+        let mut manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
+        for row in super::LANGUAGES.iter() {
+            manager
+                .apply(&editor, row.language, Theme::Dark)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", row.name));
+        }
+    }
+
+    #[test]
+    fn reapplying_with_another_theme_restyles_xml_tags() {
+        use crate::editor::scintilla_constants::SCE_H_TAG;
+        let _guard = super::NATIVE_LEXILLA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let harness = FakeHarness::new();
+        let editor = fake_editor(&harness);
+        let mut manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
+
+        manager.apply(&editor, Language::Xml, Theme::Light).unwrap();
+        manager
+            .apply(&editor, Language::Xml, Theme::CatppuccinMocha)
+            .unwrap();
+
+        assert_eq!(
+            harness.style_fore_for(SCE_H_TAG as usize),
+            Some(crate::catppuccin::MOCHA.blue as isize)
+        );
+    }
+
+    #[test]
+    fn existing_theme_colors_are_unchanged() {
+        // Break caught: growing the palette must not repaint what users already see.
+        let light = super::syntax_colors(Theme::Light);
+        assert_eq!(light.text, rgb(32, 32, 32));
+        assert_eq!(light.string, rgb(163, 21, 21));
+        assert_eq!(light.number, rgb(9, 134, 88));
+        let mocha = super::syntax_colors(Theme::CatppuccinMocha);
+        assert_eq!(mocha.string, crate::catppuccin::MOCHA.green);
+        assert_eq!(mocha.keyword, crate::catppuccin::MOCHA.mauve);
+    }
+
+    #[test]
+    fn comments_are_italic_and_code_sits_on_the_code_background() {
+        let colors = super::syntax_colors(Theme::Dark);
+        let comment = super::style(&colors, 7, super::Role::Comment);
+        assert!(comment.italic);
+        assert_eq!(comment.foreground, colors.comment);
+        let keyword = super::style(&colors, 8, super::Role::Keyword).bold();
+        assert!(keyword.bold && !keyword.italic);
+        let code = super::code(&colors, 9);
+        assert_eq!(code.background, colors.code_background);
     }
 
     #[test]

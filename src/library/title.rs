@@ -125,11 +125,7 @@ fn clean_stem(name: &str) -> Option<String> {
 }
 
 pub fn default_extension(language: Language) -> &'static str {
-    match language {
-        Language::Json => "json",
-        Language::Markdown | Language::PlainText => "md",
-        Language::Svg => "svg",
-    }
+    crate::languages::default_extension(language)
 }
 
 /// Splits what the user typed into a sanitized stem and an extension. A typed extension is kept

@@ -1,34 +1,30 @@
-use crate::editor::scintilla_constants::{SCE_JSON_DEFAULT, SCE_JSON_NUMBER, SCE_JSON_STRING};
-use crate::languages::{LexerStyle, SyntaxColors, per_theme_styles};
+use crate::editor::scintilla_constants::*;
+use crate::languages::{LexerStyle, Role, SyntaxColors, per_theme_styles, style};
 use crate::platform::theme::Theme;
 
-const fn table(colors: &SyntaxColors) -> [LexerStyle; 3] {
+const fn table(c: &SyntaxColors) -> [LexerStyle; 14] {
     [
-        LexerStyle {
-            style: SCE_JSON_DEFAULT,
-            foreground: colors.text,
-            background: colors.background,
-            bold: false,
-        },
-        LexerStyle {
-            style: SCE_JSON_STRING,
-            foreground: colors.string,
-            background: colors.background,
-            bold: false,
-        },
-        LexerStyle {
-            style: SCE_JSON_NUMBER,
-            foreground: colors.number,
-            background: colors.background,
-            bold: false,
-        },
+        style(c, SCE_JSON_DEFAULT, Role::Text),
+        style(c, SCE_JSON_NUMBER, Role::Number),
+        style(c, SCE_JSON_STRING, Role::String),
+        style(c, SCE_JSON_STRINGEOL, Role::Error),
+        style(c, SCE_JSON_PROPERTYNAME, Role::Key),
+        style(c, SCE_JSON_ESCAPESEQUENCE, Role::Escape),
+        style(c, SCE_JSON_LINECOMMENT, Role::Comment),
+        style(c, SCE_JSON_BLOCKCOMMENT, Role::Comment),
+        style(c, SCE_JSON_OPERATOR, Role::Operator),
+        style(c, SCE_JSON_URI, Role::Link),
+        style(c, SCE_JSON_COMPACTIRI, Role::Type),
+        style(c, SCE_JSON_KEYWORD, Role::Keyword),
+        style(c, SCE_JSON_LDKEYWORD, Role::Preprocessor),
+        style(c, SCE_JSON_ERROR, Role::Error),
     ]
 }
 
-static JSON_STYLES: [[LexerStyle; 3]; Theme::COUNT] = per_theme_styles!(table);
+static STYLES: [[LexerStyle; 14]; Theme::COUNT] = per_theme_styles!(table);
 
 pub(crate) fn styles(theme: Theme) -> &'static [LexerStyle] {
-    &JSON_STYLES[theme as usize]
+    &STYLES[theme as usize]
 }
 
 #[cfg(test)]
