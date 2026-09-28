@@ -2907,8 +2907,11 @@ pub(crate) fn strip_layout_of(
     ))
 }
 
-fn invalidate_group_strip(hwnd: HWND) {
-    let (Some(group), Some(layout)) = (group_hwnd(hwnd), strip_layout(hwnd)) else {
+fn invalidate_group_strip(hwnd: HWND, id: GroupId) {
+    let (Some(group), Some(layout)) = (
+        with_group_id(hwnd, id, |state| state.hwnd),
+        strip_layout_of(hwnd, id),
+    ) else {
         return;
     };
     let bounds = layout.bounds();
@@ -2925,11 +2928,12 @@ fn invalidate_group_strip(hwnd: HWND) {
 
 fn update_strip_pointer(
     hwnd: HWND,
+    id: GroupId,
     update: impl FnOnce(
         crate::window::group_strip::StripPointer,
     ) -> crate::window::group_strip::StripPointer,
 ) {
-    let changed = with_group(hwnd, |group| {
+    let changed = with_group_id(hwnd, id, |group| {
         let next = update(group.pointer);
         let changed = next != group.pointer;
         group.pointer = next;
@@ -2937,20 +2941,25 @@ fn update_strip_pointer(
     })
     .unwrap_or(false);
     if changed {
-        invalidate_group_strip(hwnd);
+        invalidate_group_strip(hwnd, id);
     }
 }
 
-/// What the group-client point is over in the strip; `None` below it.
-fn strip_target(hwnd: HWND, x: i32, y: i32) -> Option<crate::window::group_strip::StripTarget> {
-    let layout = strip_layout(hwnd)?;
+/// What the group-client point is over in group `id`'s strip; `None` below it.
+fn strip_target(
+    hwnd: HWND,
+    id: GroupId,
+    x: i32,
+    y: i32,
+) -> Option<crate::window::group_strip::StripTarget> {
+    let layout = strip_layout_of(hwnd, id)?;
     (y >= 0 && y < layout.height)
         .then(|| layout.hit_test(crate::window::titlebar::Point::new(x, y)))
 }
 
 /// Scrolls the tabs when the wheel turns over the strip; reports whether it was over it. The
 /// point is in screen coordinates, as wheel messages carry it.
-fn scroll_tabs(hwnd: HWND, group: HWND, lparam: LPARAM, delta: i32) -> bool {
+fn scroll_tabs(hwnd: HWND, id: GroupId, group: HWND, lparam: LPARAM, delta: i32) -> bool {
     let mut point = windows_sys::Win32::Foundation::POINT {
         x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
         y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
@@ -2958,27 +2967,35 @@ fn scroll_tabs(hwnd: HWND, group: HWND, lparam: LPARAM, delta: i32) -> bool {
     unsafe {
         windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point);
     }
-    let Some(layout) = strip_layout(hwnd) else {
+    let Some(layout) = strip_layout_of(hwnd, id) else {
         return false;
     };
     if point.y < 0 || point.y >= layout.height || point.x < 0 || point.x >= layout.tabs.right {
         return false;
     }
     let scroll = layout.scroll_by_wheel(delta, WHEEL_DELTA as i32);
-    let changed = unsafe { app_ptr(hwnd) }
-        .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll));
-    if changed {
+    if set_strip_scroll(hwnd, id, scroll) {
         // The hovered tab moved out from under the pointer; the next mouse move finds the new one.
-        update_strip_pointer(hwnd, |pointer| pointer.hover(None));
-        invalidate_group_strip(hwnd);
+        update_strip_pointer(hwnd, id, |pointer| pointer.hover(None));
+        invalidate_group_strip(hwnd, id);
     }
     true
 }
 
+/// Scrolls group `id`'s tabs to `offset`; returns whether it moved.
+fn set_strip_scroll(hwnd: HWND, id: GroupId, offset: i32) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .group(id)
+            .is_some_and(|tabs| tabs.selection().set_scroll_offset(offset))
+    })
+}
+
 /// Starts dragging the tab scroll thumb. Pressing the track beside the thumb first jumps the
 /// thumb there, centred under the pointer, so the same press can keep dragging it.
-fn begin_tab_thumb_drag(hwnd: HWND, group: HWND, x: i32) {
-    let Some(layout) = strip_layout(hwnd) else {
+fn begin_tab_thumb_drag(hwnd: HWND, id: GroupId, group: HWND, x: i32) {
+    let Some(layout) = strip_layout_of(hwnd, id) else {
         return;
     };
     let Some(thumb) = layout.scroll_thumb() else {
@@ -2988,40 +3005,33 @@ fn begin_tab_thumb_drag(hwnd: HWND, group: HWND, x: i32) {
         x - thumb.left
     } else {
         let grab = (thumb.right - thumb.left) / 2;
-        if let Some(app) = unsafe { app_ptr(hwnd) } {
-            unsafe { app.as_ref() }
-                .tabs
-                .set_scroll_offset(layout.scroll_for_thumb(x - grab));
-        }
+        set_strip_scroll(hwnd, id, layout.scroll_for_thumb(x - grab));
         grab
     };
-    with_group(hwnd, |state| state.thumb_grab = Some(grab));
+    with_group_id(hwnd, id, |state| state.thumb_grab = Some(grab));
     unsafe {
         SetCapture(group);
     }
-    invalidate_group_strip(hwnd);
+    invalidate_group_strip(hwnd, id);
 }
 
 /// Follows the pointer while the thumb is dragged; reports whether a drag is in progress.
-fn drag_tab_thumb(hwnd: HWND, x: i32) -> bool {
-    let Some(grab) = with_group(hwnd, |group| group.thumb_grab).flatten() else {
+fn drag_tab_thumb(hwnd: HWND, id: GroupId, x: i32) -> bool {
+    let Some(grab) = with_group_id(hwnd, id, |group| group.thumb_grab).flatten() else {
         return false;
     };
-    let Some(layout) = strip_layout(hwnd) else {
+    let Some(layout) = strip_layout_of(hwnd, id) else {
         return true;
     };
-    let scroll = layout.scroll_for_thumb(x - grab);
-    if unsafe { app_ptr(hwnd) }
-        .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll))
-    {
-        invalidate_group_strip(hwnd);
+    if set_strip_scroll(hwnd, id, layout.scroll_for_thumb(x - grab)) {
+        invalidate_group_strip(hwnd, id);
     }
     true
 }
 
 /// Ends a thumb drag; reports whether one was in progress, so the release activates nothing.
-fn end_tab_thumb_drag(hwnd: HWND) -> bool {
-    let dragging = with_group(hwnd, |group| group.thumb_grab.take())
+fn end_tab_thumb_drag(hwnd: HWND, id: GroupId) -> bool {
+    let dragging = with_group_id(hwnd, id, |group| group.thumb_grab.take())
         .flatten()
         .is_some();
     if dragging {
@@ -3055,6 +3065,8 @@ pub(crate) fn group_strip_message(
     lparam: LPARAM,
 ) -> Option<LRESULT> {
     use crate::window::group_strip::StripTarget;
+    // Everything below acts on this strip's own group; a press has already made it active.
+    let id = group_id_of(hwnd, group)?;
     let (x, y) = (
         (lparam as u32 & 0xffff) as u16 as i16 as i32,
         ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
@@ -3068,7 +3080,7 @@ pub(crate) fn group_strip_message(
     }
     match message {
         WM_MOUSEMOVE => {
-            if drag_tab_thumb(hwnd, x) {
+            if drag_tab_thumb(hwnd, id, x) {
                 return Some(0);
             }
             let mut track = windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
@@ -3080,29 +3092,29 @@ pub(crate) fn group_strip_message(
                 dwHoverTime: 0,
             };
             unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut track) };
-            let target = strip_target(hwnd, x, y);
-            update_strip_pointer(hwnd, |pointer| pointer.hover(target));
+            let target = strip_target(hwnd, id, x, y);
+            update_strip_pointer(hwnd, id, |pointer| pointer.hover(target));
             Some(0)
         }
         WM_MOUSELEAVE => {
-            update_strip_pointer(hwnd, |pointer| pointer.hover(None));
+            update_strip_pointer(hwnd, id, |pointer| pointer.hover(None));
             // A middle press whose release never reaches the strip must not close a tab later.
-            with_group(hwnd, |state| state.middle_press = None);
+            with_group_id(hwnd, id, |state| state.middle_press = None);
             Some(0)
         }
         // The class has CS_DBLCLKS, so a second click comes as a double-click: on empty strip it
         // opens a tab (VS Code style); anywhere else it is one more press.
-        WM_LBUTTONDBLCLK if strip_target(hwnd, x, y) == Some(StripTarget::Empty) => {
+        WM_LBUTTONDBLCLK if strip_target(hwnd, id, x, y) == Some(StripTarget::Empty) => {
             execute_command(hwnd, CommandId::New);
             Some(0)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            let target = strip_target(hwnd, x, y)?;
-            update_strip_pointer(hwnd, |pointer| {
+            let target = strip_target(hwnd, id, x, y)?;
+            update_strip_pointer(hwnd, id, |pointer| {
                 pointer.hover(Some(target)).press(Some(target))
             });
             if target == StripTarget::ScrollBar {
-                begin_tab_thumb_drag(hwnd, group, x);
+                begin_tab_thumb_drag(hwnd, id, group, x);
             }
             Some(0)
         }
@@ -3110,12 +3122,12 @@ pub(crate) fn group_strip_message(
         // a double-click on empty strip never hits the tab that double-click just opened.
         WM_LBUTTONUP => {
             let mut activated = None;
-            update_strip_pointer(hwnd, |pointer| {
-                let (next, released) = pointer.release(strip_target(hwnd, x, y));
+            update_strip_pointer(hwnd, id, |pointer| {
+                let (next, released) = pointer.release(strip_target(hwnd, id, x, y));
                 activated = released;
                 next
             });
-            if end_tab_thumb_drag(hwnd) {
+            if end_tab_thumb_drag(hwnd, id) {
                 return Some(0);
             }
             match activated? {
@@ -3136,12 +3148,12 @@ pub(crate) fn group_strip_message(
             }
             Some(0)
         }
-        WM_RBUTTONUP if strip_target(hwnd, x, y) == Some(StripTarget::Empty) => {
+        WM_RBUTTONUP if strip_target(hwnd, id, x, y) == Some(StripTarget::Empty) => {
             show_group_strip_menu(hwnd, group, x, y);
             Some(0)
         }
         // A tab's menu acts on that tab, so it is activated first.
-        WM_RBUTTONUP => match strip_target(hwnd, x, y) {
+        WM_RBUTTONUP => match strip_target(hwnd, id, x, y) {
             Some(StripTarget::Tab(index) | StripTarget::CloseTab(index)) => {
                 activate_tab(hwnd, index);
                 let mut point = windows_sys::Win32::Foundation::POINT { x, y };
@@ -3157,23 +3169,23 @@ pub(crate) fn group_strip_message(
         },
         // A middle-click closes the tab under the pointer (quick-open spec §5).
         WM_MBUTTONDOWN => {
-            let press = match strip_target(hwnd, x, y) {
+            let press = match strip_target(hwnd, id, x, y) {
                 Some(StripTarget::Tab(index) | StripTarget::CloseTab(index)) => {
                     tab_id_at(hwnd, index).map(|id| (index, id))
                 }
                 _ => None,
             };
-            with_group(hwnd, |state| state.middle_press = press);
+            with_group_id(hwnd, id, |state| state.middle_press = press);
             Some(0)
         }
         WM_MBUTTONUP => {
-            let press = with_group(hwnd, |state| state.middle_press.take()).flatten();
+            let press = with_group_id(hwnd, id, |state| state.middle_press.take()).flatten();
             // Only over the pressed tab, and only while it still shows the same document.
-            if let Some((index, id)) = press
+            if let Some((index, document)) = press
                 && let Some(StripTarget::Tab(released) | StripTarget::CloseTab(released)) =
-                    strip_target(hwnd, x, y)
+                    strip_target(hwnd, id, x, y)
                 && released == index
-                && tab_id_at(hwnd, index) == Some(id)
+                && tab_id_at(hwnd, index) == Some(document)
             {
                 close_tab_at(hwnd, index);
             }
@@ -3187,10 +3199,10 @@ pub(crate) fn group_strip_message(
             } else {
                 delta
             };
-            scroll_tabs(hwnd, group, lparam, delta).then_some(0)
+            scroll_tabs(hwnd, id, group, lparam, delta).then_some(0)
         }
         WM_CAPTURECHANGED => {
-            with_group(hwnd, |state| state.thumb_grab = None);
+            with_group_id(hwnd, id, |state| state.thumb_grab = None);
             Some(0)
         }
         _ => None,
@@ -8680,6 +8692,72 @@ three"
     }
 
     #[test]
+    fn hovering_a_strip_that_is_not_active_highlights_its_own_tab() {
+        // Break caught: pointer messages on a group's strip hit-test and highlight the active
+        // group's strip instead of their own.
+        use crate::window::group_strip::StripTarget;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        let tab = super::strip_layout_of(window.hwnd, second)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        unsafe { SendMessageW(group, super::WM_MOUSEMOVE, 0, client_lparam(tab.x, tab.y)) };
+        let hovered =
+            |id| super::with_group_id(window.hwnd, id, |state| state.pointer.hovered).unwrap();
+        assert_eq!(hovered(second), Some(StripTarget::Tab(0)));
+        assert_eq!(hovered(first), None);
+    }
+
+    #[test]
+    fn the_wheel_over_a_strip_that_is_not_active_leaves_the_active_strip_alone() {
+        // Break caught: the wheel over one group's strip scrolls the active group's tabs.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        for _ in 0..40 {
+            execute_command(window.hwnd, CommandId::New);
+        }
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        let _ = app_mut(window.hwnd).tabs.set_scroll_offset(0);
+        let tab = super::strip_layout_of(window.hwnd, second)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let mut point = windows_sys::Win32::Foundation::POINT { x: tab.x, y: tab.y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(group, &mut point) };
+        let wheel_down = ((-120_i16 as u16 as usize) << 16) as super::WPARAM;
+        unsafe {
+            SendMessageW(
+                group,
+                super::WM_MOUSEWHEEL,
+                wheel_down,
+                client_lparam(point.x, point.y),
+            )
+        };
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(first)
+                .unwrap()
+                .scroll_offset(),
+            0
+        );
+    }
+
+    #[test]
     fn a_split_without_room_is_refused_with_a_notice() {
         // Break caught: a split into a sliver narrower than the minimum group.
         use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOZORDER, SetWindowPos};
@@ -9159,7 +9237,12 @@ three"
         execute_command(window.hwnd, CommandId::CloseTab);
         assert_eq!(super::tab_count(window.hwnd), 1);
         assert_eq!(
-            super::strip_target(window.hwnd, close.x, close.y),
+            super::strip_target(
+                window.hwnd,
+                app_mut(window.hwnd).tabs.active_group(),
+                close.x,
+                close.y
+            ),
             Some(crate::window::group_strip::StripTarget::Empty)
         );
 
