@@ -8,12 +8,60 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use support::process::{FastPadProcess, wait_and_dismiss_dialog, wait_for_process_exit};
-use support::win32::{Deadline, find_child_by_class, scintilla_text, send_text};
+use support::win32::{
+    Deadline, find_child_by_class, find_children_by_class, scintilla_text, send_text,
+};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE, WM_COMMAND};
 
 static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
 const WAIT: Duration = Duration::from_secs(5);
+
+#[test]
+fn a_split_layout_comes_back_on_the_next_launch() {
+    // Break caught: the layout written but not restored by a real process, or the second
+    // group's editor never created after a restart.
+    let _serial = SESSION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let data = Scratch::new("split");
+    let file = data.file("notes.txt", "split text");
+
+    let mut first = FastPadProcess::spawn_with_local_app_data([&file], &data.root).unwrap();
+    let hwnd = first
+        .wait_for_main_window(WAIT)
+        .expect("no main window: is another FastPad running in this session?");
+    let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
+    wait_for_text(editor, "split text");
+    command(hwnd, CommandId::SplitRight);
+    let deadline = Deadline::after(WAIT);
+    while find_children_by_class(hwnd, "FastPadEditorGroup").len() < 2 {
+        assert!(!deadline.expired(), "the split never showed");
+        deadline.sleep_step();
+    }
+    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+    wait_for_process_exit(first.id(), WAIT).expect("closing must not prompt");
+    first.close().unwrap();
+
+    let mut second =
+        FastPadProcess::spawn_with_local_app_data(std::iter::empty::<&str>(), &data.root).unwrap();
+    let hwnd = second.wait_for_main_window(WAIT).unwrap();
+    let deadline = Deadline::after(WAIT);
+    loop {
+        let texts: Vec<_> = find_children_by_class(hwnd, "Scintilla")
+            .into_iter()
+            .filter_map(|editor| scintilla_text(editor).ok())
+            .collect();
+        if texts.iter().filter(|text| *text == "split text").count() == 2 {
+            break;
+        }
+        assert!(!deadline.expired(), "restored editors: {texts:?}");
+        deadline.sleep_step();
+    }
+    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+    wait_for_process_exit(second.id(), WAIT).expect("the restored window closes");
+    second.close().unwrap();
+}
 
 #[test]
 fn a_closed_session_reopens_its_tabs_and_unsaved_text_on_the_next_launch() {

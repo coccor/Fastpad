@@ -1,9 +1,6 @@
 //! The layout of the editor groups (split editors spec §4.3): rows and columns whose leaves are
 //! groups. Pure: it computes rectangles and never touches a window.
 
-// Group numbers and the session conversion are used from the Open Editors and session
-// commits; Left and Up only by the tests until a command splits that way.
-#![cfg_attr(not(test), allow(dead_code))]
 use super::titlebar::{Point, Rect, scale};
 use crate::session::{SessionAxis, SessionLayout};
 
@@ -24,6 +21,8 @@ pub(crate) enum Axis {
     Column,
 }
 
+// Left and Up come with PR 3's edge drops; only the tests split that way until then.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Direction {
     Left,
@@ -117,6 +116,7 @@ impl SplitTree {
     }
 
     /// A group's number for Ctrl+1..8 and the Open Editors headers, from 1.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn number_of(&self, id: GroupId) -> Option<usize> {
         self.leaves()
             .iter()

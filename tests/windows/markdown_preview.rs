@@ -433,7 +433,7 @@ fn relative_markdown_links_open_in_a_tab() {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
             main.hwnd,
             window::WM_FASTPAD_PREVIEW_LINK,
-            0,
+            main.view().unwrap().hwnd() as usize,
             payload as isize,
         );
     }
@@ -455,7 +455,7 @@ fn unsupported_links_explain_themselves() {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
             main.hwnd,
             window::WM_FASTPAD_PREVIEW_LINK,
-            0,
+            main.view().unwrap().hwnd() as usize,
             payload as isize,
         );
     }
@@ -488,7 +488,7 @@ fn large_documents_parse_on_a_worker_and_huge_ones_pause() {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
             main.hwnd,
             window::WM_FASTPAD_PREVIEW_REFRESH,
-            0,
+            view.hwnd() as usize,
             0,
         );
     }

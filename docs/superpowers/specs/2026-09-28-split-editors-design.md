@@ -42,31 +42,29 @@
 
 ### 3.2 Views and groups
 
-- `EditorTab { view: ViewId, document: DocumentId, view_state: ViewState }`.
+- `EditorTab { document: DocumentId, view_state: ViewState }`. A view is identified by its group and its document: a group never has two views of one document (§5.3), so there is no `ViewId`.
   - `ViewState` holds the caret, anchor, first visible line and horizontal scroll offset.
   - It is saved whenever the tab stops being shown in its group's editor, when another tab is activated or the tab moves group, and it is restored when the tab is shown again. Today switching tabs loses the caret and scroll; after this change it keeps them.
 - `EditorGroup` (data part) holds:
   - its tabs in strip order;
   - the active index;
-  - a per-group MRU of `ViewId` (Ctrl+Tab);
   - which of its tabs, if any, is the preview tab.
-- The preview flag moves from `Document` to the view. A document shown in two groups can be italic in one group and not in the other. The first edit clears the preview flag on every view of the document, as the first edit does today.
+- The preview flag stays on `Document`. A document that gets a second view becomes a normal tab, so a preview tab always has exactly one view and each group has at most one preview tab. The first edit clears the flag, as today.
 - **Reference counting of views.** A document is removed from the store when its last view closes.
   - Closing a view of a dirty document that has another view **does not prompt**.
   - Closing its last view prompts as today.
-- **Accessibility.** Each strip has its own UIA provider built from its group's `TabView`/`TabSelection`. The single-strip provider in `accessibility.rs` becomes one provider per group.
+- **Accessibility.** Each strip has its own accessibility provider (MSAA, §10) built from its group's `TabView`/`TabSelection`.
 
 ### 3.3 App state
 
-`App.editor` and `App.tabs` are replaced by:
+`App.tabs` stays the one façade over the documents. It holds:
 
-- `store: DocumentStore`;
-- `groups`, a map `GroupId → EditorGroup` (window plus data), so an id never refers to a different group after one is removed;
-- `layout: SplitTree` (§4.3);
-- `active_group: GroupId`;
-- `recent_views: Vec<(GroupId, ViewId)>`, the global activation order for Ctrl+P, kept in memory only as today.
+- the `DocumentStore`;
+- one `GroupTabs` per group (its views, selection and `TabView`), keyed by `GroupId`, so an id never refers to a different group after one is removed;
+- the active group;
+- `recent`, a `Vec<(GroupId, DocumentId)>`: the global activation order for Ctrl+P, kept in memory only as today.
 
-Helpers `active_group()`, `active_editor()`, `active_view()` and `active_document()` replace the direct `app.editor` and `tabs.active()` uses. There are about 50–60 production call sites across `main_window.rs`, `library_host.rs`, `preview_host.rs`, `image_host.rs`, `bootstrap.rs`, `open_editors.rs` and `notebook_view.rs`.
+Every existing `Tabs` method acts on the active group; new methods name a group. The group windows live in `App.groups`, joined to their data by `GroupId`, and `App.layout` is the `SplitTree` (§4.3). `App::editor()`, `find_bar()` and `active_group()` return the active group's.
 
 ### 3.4 Scintilla notifications
 
@@ -115,7 +113,7 @@ The group lays out its own children on `WM_SIZE`. Most of `layout_editor_and_fin
 
 **Active group.**
 - A group becomes active when anything in it is clicked, when its editor, find bar or preview gets focus, or through Ctrl+1..9, F6 or a drop.
-- The active tab of the active group is drawn with the accent top border. The active tabs of other groups are drawn with an inactive accent.
+- With two or more groups, each group's active tab has a 2 px bar along its top edge: the editor text colour in the active group, the muted colour in the others. With one group there is no bar, as in 0.2.0.
 - The status bar, window title, Open Editors highlight and command routing all follow the active group.
 
 ### 4.3 Split tree
@@ -131,7 +129,7 @@ The group lays out its own children on `WM_SIZE`. Most of `layout_editor_and_fin
 - **`layout(rect, dpi)`** returns each group's rectangle and each sash's rectangle, together with its branch and child index. The sash is 4 px at 96 DPI, scaled.
 - **Minimum group size** is 160×100 px at 96 DPI, scaled.
   - A sash drag is clamped so that no group on either side goes below it.
-  - A split is refused when the new pair would not fit. A status-bar hint says "Not enough room to split".
+  - A split is refused when the new pair would not fit. A notice says "Not enough room to split".
 - **Group numbering** for Ctrl+1..8 and the Open Editors headers is the leaf order in a depth-first walk: left to right in a row, top to bottom in a column.
 
 ### 4.4 Sashes and the main window
@@ -167,7 +165,9 @@ These commands take the next free `CommandId` numbers.
 
 Existing commands:
 - **F6 / Shift+F6** cycle activity bar → panel → group 1 → group 2 → …. Only the parts that are visible take part.
-- **Ctrl+Tab / Ctrl+Shift+Tab** use the active group's MRU.
+- **Ctrl+Tab / Ctrl+Shift+Tab** cycle the active group's strip in order, as today.
+- **Close all tabs** closes the active group's tabs. With one group that is every tab, as today; the group closes with its last tab when it isn't the only one.
+- **Zoom** applies to every group's editor, so the zoom level stays one setting.
 - **Ctrl+W** and middle-click close one view.
 
 ### 5.2 Routing
@@ -239,7 +239,7 @@ The zone is chosen by the pointer's position in the content rectangle. The outer
 ## 7. Menus and the tab-strip context menu
 
 - The tab-strip menu is today's `menus::show_tab_strip_menu`, plus Split Right, Split Down and Close Group. It acts on the group that was right-clicked.
-- The tab context menu (a right-click on a tab) makes that view active in its group. It then offers today's items plus Split Right, Split Down and Move to Next Group.
+- The tab context menu (a right-click on a tab) is new. It makes that view active in its group, then offers Close tab, Close all tabs, Split Right, Split Down and Move to Next Group.
 
 ## 8. Session
 
@@ -280,7 +280,7 @@ file=...
   - during a restore, that group's views go into the first group.
 - **A drop that can't complete** (for example, the target group went away) leaves the source view where it was.
 - **The host editor can't be created** at start-up: this is fatal in the same way today's editor creation failure is.
-- **No room to split:** the split is refused with a status-bar hint (§4.3).
+- **No room to split:** the split is refused with a notice (§4.3).
 
 ## 10. Delivery
 
@@ -300,6 +300,22 @@ Three PRs, stacked on `feat/split-editors`:
      - The preview (italic) flag stays on `Document` in PR 1; with one group it behaves the same as a per-view flag. PR 2 moves it to the view.
 2. **Splits** (`feat/split-editors-grid`).
    - The split tree, sashes, the §5.1 commands, several views of one document, per-group find and preview, Open Editors group headers, group-aware Ctrl+P, and multi-group sessions.
+   - PR 2 plan-time amendments (docs/superpowers/plans/2026-09-28-split-editors-2-splits.md):
+     1. `Tabs` stays the façade (§3.3): the `DocumentStore`, one `GroupTabs` per group and the active group. The windows live in `App.groups`, joined by `GroupId`.
+     2. A view is identified by (group, document); there is no `ViewId` (§3.2).
+     3. The preview flag stays on `Document`; a second view promotes the document to a normal tab (§3.2).
+     4. Ctrl+Tab keeps strip order (§5.1).
+     5. "Not enough room to split" is a notice, not a status-bar hint (§4.3, §9).
+     6. Focus arriving in a group activates it: the editor reports `SCN_FOCUSIN`; the preview view, the image view and the find fields post `WM_FASTPAD_CONTENT_FOCUSED` with their window, resolved with `IsChild`.
+     7. The active-tab accent is a 2 px top bar, only with two or more groups (§4.2).
+     8. The new command ids are 197–210; the palette completeness test covers `100..300`.
+     9. Focus Group 1–8 and Focus Last Group are not palette entries, like Select Tab 1–9.
+     10. Close all tabs acts on the active group (§5.1).
+     11. Zoom applies to every group's editor (§5.1).
+     12. The tab context menu is new (§7).
+     13. The shared Direct2D graphics move from `PreviewHost` to `App.graphics`.
+     14. A sash double-click is timed with `GetDoubleClickTime`, as the tab strip does: the main window has no `CS_DBLCLKS`.
+     15. Session group numbers are the groups' positions in layout order, from 1.
 3. **Drag and drop** (`feat/split-editors-dnd`).
    - Tab drags, reordering, moves and copies between groups, edge splits, the overlay, Open Editors row drags, and Explorer drops per group.
 
