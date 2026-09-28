@@ -75,7 +75,10 @@ pub(crate) fn snapshot(hwnd: HWND) -> Vec<EditorRow> {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
             let tabs = &unsafe { app.as_ref() }.tabs;
-            editor_rows(tabs.documents(), tabs.active().map(|active| active.id))
+            editor_rows(
+                tabs.group_documents(tabs.active_group()).into_iter(),
+                tabs.active().map(|active| active.id),
+            )
         })
         .unwrap_or_default()
 }

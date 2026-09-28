@@ -323,7 +323,7 @@ mod tests {
     fn closing_the_last_tab_leaves_no_tabs_open() {
         // Break caught: the final tab being silently replaced, so its close button looks inert.
         let mut tabs = Tabs::with_document(document(1));
-        let closed = tabs.close_active(CloseDecision::Discard).unwrap();
+        let closed = tabs.close_active(CloseDecision::Discard).unwrap().unwrap();
         assert_eq!(closed.id, DocumentId(1));
         assert!(tabs.is_empty());
         assert!(tabs.active().is_none());
@@ -355,7 +355,7 @@ mod tests {
         let mut tabs = Tabs::from_documents([document(1), document(2), document(3)]).unwrap();
         tabs.activate(DocumentId(2)).unwrap();
 
-        let closed = tabs.close_active(CloseDecision::Discard).unwrap();
+        let closed = tabs.close_active(CloseDecision::Discard).unwrap().unwrap();
 
         assert_eq!(closed.id, DocumentId(2));
         assert_eq!(tabs.active().unwrap().id, DocumentId(3));
@@ -383,7 +383,10 @@ mod tests {
 
         assert!(tabs.set_active_dirty(false));
         let saved = tabs.active_close_review().unwrap();
-        let closed = tabs.close_reviewed(saved, CloseDecision::Save).unwrap();
+        let closed = tabs
+            .close_reviewed(saved, CloseDecision::Save)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(closed.id, DocumentId(1));
         assert_eq!(tabs.active().unwrap().id, DocumentId(2));
@@ -519,7 +522,7 @@ mod tests {
         let first = Document::untitled(DocumentId(1), super::RecoveryId(1), handle);
         let mut tabs = Tabs::from_documents([first, document(2)]).unwrap();
 
-        let closed = tabs.close_active(CloseDecision::Discard).unwrap();
+        let closed = tabs.close_active(CloseDecision::Discard).unwrap().unwrap();
         assert_eq!(releases.load(Ordering::SeqCst), 0);
         drop(closed);
         assert_eq!(releases.load(Ordering::SeqCst), 1);

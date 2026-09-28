@@ -1,6 +1,7 @@
 use crate::document::{CloseCancelled, CloseDecision, Document, DocumentId};
 use crate::editor::ViewState;
 use crate::window::document_store::DocumentStore;
+use crate::window::split_tree::GroupId;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -126,27 +127,118 @@ pub(crate) struct EditorTab {
     pub(crate) view_state: ViewState,
 }
 
-/// The open documents and the strip of tabs showing them. The documents live in a
-/// [`DocumentStore`]; each tab is an [`EditorTab`] view onto one (split editors spec §3).
+/// One group's tabs: views onto documents in the store, in strip order (split editors spec
+/// §3.2). A group never has two views of the same document.
 #[derive(Debug)]
-pub struct Tabs {
-    store: DocumentStore,
+pub(crate) struct GroupTabs {
+    pub(crate) id: GroupId,
     tabs: Vec<EditorTab>,
-    /// Every tab, the most recently activated first; the active tab is always first
-    /// (quick-open spec §3.2). Kept in memory only, never saved.
-    recent: Vec<DocumentId>,
     selection: TabSelection,
     view: TabView,
 }
 
+// The group API is wired into the window in the next commits.
+#[allow(dead_code)]
+impl GroupTabs {
+    fn new(id: GroupId) -> Self {
+        Self {
+            id,
+            tabs: Vec::new(),
+            selection: TabSelection::new(0),
+            view: TabView::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    pub(crate) fn active_index(&self) -> usize {
+        self.selection.active_index()
+    }
+
+    /// The document of the selected tab, or `None` in an empty group.
+    pub(crate) fn active_document(&self) -> Option<DocumentId> {
+        self.tabs.get(self.active_index()).map(|tab| tab.document)
+    }
+
+    /// The documents of this group's tabs, in strip order.
+    pub(crate) fn document_ids(&self) -> Vec<DocumentId> {
+        self.tabs.iter().map(|tab| tab.document).collect()
+    }
+
+    pub(crate) fn contains(&self, id: DocumentId) -> bool {
+        self.position(id).is_some()
+    }
+
+    fn position(&self, id: DocumentId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.document == id)
+    }
+
+    pub(crate) fn selection(&self) -> TabSelection {
+        self.selection.clone()
+    }
+
+    pub(crate) fn view(&self) -> TabView {
+        self.view.clone()
+    }
+
+    pub(crate) fn scroll_offset(&self) -> i32 {
+        self.selection.scroll_offset()
+    }
+
+    /// Where this group's view of `id` was when it was last left; the start of the document for
+    /// a view never left.
+    pub(crate) fn view_state(&self, id: DocumentId) -> ViewState {
+        self.tabs
+            .iter()
+            .find(|tab| tab.document == id)
+            .map(|tab| tab.view_state)
+            .unwrap_or_default()
+    }
+
+    fn select(&self, index: usize) -> bool {
+        self.selection.select(index, self.tabs.len())
+    }
+
+    /// Keeps the successor of a removed tab selected (or its predecessor at the end of the strip).
+    fn select_after_removal(&self, removed: usize) {
+        let active = removed.min(self.tabs.len().saturating_sub(1));
+        self.selection.active.store(active, Ordering::Release);
+    }
+}
+
+/// The open documents and the groups of tabs showing them. The documents live in a
+/// [`DocumentStore`]; each tab is an [`EditorTab`] view onto one, in one group's strip (split
+/// editors spec §3). Methods that don't name a group act on the active group.
+// The group API is wired into the window in the next commits.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Tabs {
+    store: DocumentStore,
+    groups: Vec<GroupTabs>,
+    /// Index into `groups` of the active group.
+    active: usize,
+    next_group: u32,
+    /// Every view, the most recently activated first, across groups; the active view is always
+    /// first (spec §3.3, quick-open spec §3.2). Kept in memory only, never saved.
+    recent: Vec<(GroupId, DocumentId)>,
+}
+
+// The group API is wired into the window in the next commits.
+#[allow(dead_code)]
 impl Tabs {
     pub fn new() -> Self {
         Self {
             store: DocumentStore::default(),
-            tabs: Vec::new(),
-            view: TabView::new(Vec::new()),
+            groups: vec![GroupTabs::new(GroupId(1))],
+            active: 0,
+            next_group: 2,
             recent: Vec::new(),
-            selection: TabSelection::new(0),
         }
     }
 
@@ -170,84 +262,279 @@ impl Tabs {
         Ok(tabs)
     }
 
+    fn current(&self) -> &GroupTabs {
+        &self.groups[self.active]
+    }
+
+    fn current_mut(&mut self) -> &mut GroupTabs {
+        &mut self.groups[self.active]
+    }
+
+    fn group_index(&self, id: GroupId) -> Option<usize> {
+        self.groups.iter().position(|group| group.id == id)
+    }
+
+    pub(crate) fn active_group(&self) -> GroupId {
+        self.current().id
+    }
+
+    /// Makes `id` the active group; returns whether it changed.
+    pub(crate) fn set_active_group(&mut self, id: GroupId) -> bool {
+        let Some(index) = self.group_index(id) else {
+            return false;
+        };
+        if index == self.active {
+            return false;
+        }
+        self.active = index;
+        if let Some(document) = self.current().active_document() {
+            self.touch(document);
+        }
+        true
+    }
+
+    /// A new, empty group after the others; the active group stays.
+    pub(crate) fn add_group(&mut self) -> GroupId {
+        let id = GroupId(self.next_group);
+        self.next_group += 1;
+        self.groups.push(GroupTabs::new(id));
+        id
+    }
+
+    /// Removes an empty group. The last group stays, and a group with tabs can't be removed.
+    pub(crate) fn remove_group(&mut self, id: GroupId) -> bool {
+        let Some(index) = self.group_index(id) else {
+            return false;
+        };
+        if self.groups.len() == 1 || !self.groups[index].is_empty() {
+            return false;
+        }
+        self.groups.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        } else if index == self.active {
+            self.active = index.min(self.groups.len() - 1);
+        }
+        true
+    }
+
+    /// The groups in creation order.
+    pub(crate) fn group_ids(&self) -> Vec<GroupId> {
+        self.groups.iter().map(|group| group.id).collect()
+    }
+
+    pub(crate) fn group(&self, id: GroupId) -> Option<&GroupTabs> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    /// `id`'s documents in strip order.
+    pub(crate) fn group_documents(&self, id: GroupId) -> Vec<&Document> {
+        self.group(id)
+            .map(|group| {
+                group
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| self.store.get(tab.document))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The groups with a view of `id`, in creation order.
+    pub(crate) fn views_of(&self, id: DocumentId) -> Vec<GroupId> {
+        self.groups
+            .iter()
+            .filter(|group| group.contains(id))
+            .map(|group| group.id)
+            .collect()
+    }
+
+    /// Shows the open document `id` in `group` too, selected there. A document with two or more
+    /// views is never a preview (plan amendment 3). False for an unknown group or document.
+    pub(crate) fn add_view(&mut self, group: GroupId, id: DocumentId, state: ViewState) -> bool {
+        let Some(index) = self.group_index(group) else {
+            return false;
+        };
+        if self.store.get(id).is_none() {
+            return false;
+        }
+        let target = &mut self.groups[index];
+        let position = match target.position(id) {
+            Some(position) => position,
+            None => {
+                target.tabs.push(EditorTab {
+                    document: id,
+                    view_state: state,
+                });
+                target.tabs.len() - 1
+            }
+        };
+        target.select(position);
+        self.touch_in(group, id);
+        if self.views_of(id).len() > 1
+            && let Some(document) = self.store.get_mut(id)
+        {
+            document.preview = false;
+        }
+        self.refresh_views();
+        true
+    }
+
+    /// Moves the view of `id` from one group to another, keeping its view state. When `to`
+    /// already shows `id`, its view is selected and the moved one is dropped.
+    pub(crate) fn move_view(&mut self, from: GroupId, id: DocumentId, to: GroupId) -> bool {
+        if from == to || self.group_index(to).is_none() {
+            return false;
+        }
+        let Some(source) = self.group_index(from) else {
+            return false;
+        };
+        let Some(position) = self.groups[source].position(id) else {
+            return false;
+        };
+        let tab = self.groups[source].tabs.remove(position);
+        let selected = self.groups[source].active_index();
+        if position < selected {
+            self.groups[source]
+                .selection
+                .active
+                .store(selected - 1, Ordering::Release);
+        } else {
+            self.groups[source].select_after_removal(position);
+        }
+        self.recent.retain(|recent| *recent != (from, id));
+        self.add_view(to, id, tab.view_state)
+    }
+
+    /// Selects `id` in `group` and makes it the most recent view; false when `group` has no view
+    /// of it.
+    pub(crate) fn activate_in(&mut self, group: GroupId, id: DocumentId) -> bool {
+        let Some(index) = self.group_index(group) else {
+            return false;
+        };
+        let Some(position) = self.groups[index].position(id) else {
+            return false;
+        };
+        self.groups[index].select(position);
+        self.touch_in(group, id);
+        true
+    }
+
+    pub(crate) fn view_state_in(&self, group: GroupId, id: DocumentId) -> ViewState {
+        self.group(group)
+            .map(|group| group.view_state(id))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_view_state_in(&mut self, group: GroupId, id: DocumentId, state: ViewState) {
+        let Some(index) = self.group_index(group) else {
+            return;
+        };
+        if let Some(tab) = self.groups[index]
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.document == id)
+        {
+            tab.view_state = state;
+        }
+    }
+
     /// Adds a tab for `document` at the end of the strip without the path check or selecting it.
     fn append_unchecked(&mut self, document: Document) {
         let id = document.id;
+        let group = self.active_group();
         self.store.insert_unchecked(document);
-        self.tabs.push(EditorTab {
+        self.current_mut().tabs.push(EditorTab {
             document: id,
             view_state: ViewState::default(),
         });
-        self.recent.push(id);
+        self.recent.push((group, id));
     }
 
-    /// The documents in strip order.
+    /// The active group's documents in strip order.
     fn strip(&self) -> impl Iterator<Item = &Document> + '_ {
-        self.tabs
+        self.current()
+            .tabs
             .iter()
             .filter_map(|tab| self.store.get(tab.document))
     }
 
     fn document_at(&self, index: usize) -> Option<&Document> {
-        self.store.get(self.tabs.get(index)?.document)
+        self.store.get(self.current().tabs.get(index)?.document)
     }
 
     fn document_at_mut(&mut self, index: usize) -> Option<&mut Document> {
-        let id = self.tabs.get(index)?.document;
+        let id = self.current().tabs.get(index)?.document;
         self.store.get_mut(id)
     }
 
     fn position(&self, id: DocumentId) -> Option<usize> {
-        self.tabs.iter().position(|tab| tab.document == id)
+        self.current().position(id)
     }
 
-    /// Removes the tab at `index` and returns its document, which leaves the store with its last
-    /// view.
-    fn remove_tab(&mut self, index: usize) -> Option<Document> {
-        let tab = self.tabs.remove(index);
-        if self.tabs.iter().any(|other| other.document == tab.document) {
-            return None;
+    /// Removes the active group's tab at `index`. Returns its document's id, and the document
+    /// itself when that was its last view: a document leaves the store with its last view.
+    fn remove_tab(&mut self, index: usize) -> (DocumentId, Option<Document>) {
+        let tab = self.current_mut().tabs.remove(index);
+        if !self.views_of(tab.document).is_empty() {
+            return (tab.document, None);
         }
-        self.store.remove(tab.document)
+        (tab.document, self.store.remove(tab.document))
     }
 
     pub fn len(&self) -> usize {
-        self.tabs.len()
+        self.current().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
+        self.current().is_empty()
     }
 
     pub fn active_index(&self) -> usize {
-        self.selection.active_index()
+        self.current().active_index()
     }
 
     pub(crate) fn scroll_offset(&self) -> i32 {
-        self.selection.scroll_offset()
+        self.current().scroll_offset()
     }
 
     /// Returns whether the offset changed.
     pub(crate) fn set_scroll_offset(&self, offset: i32) -> bool {
-        self.selection.set_scroll_offset(offset)
+        self.current().selection.set_scroll_offset(offset)
     }
 
     pub(crate) fn selection(&self) -> TabSelection {
-        self.selection.clone()
+        self.current().selection()
     }
 
     pub(crate) fn view(&self) -> TabView {
-        self.view.clone()
+        self.current().view()
     }
 
-    /// Refreshes the retained tab-view snapshot from the current documents, without otherwise
+    /// Refreshes the retained tab-view snapshots from the current documents, without otherwise
     /// changing anything (e.g. after a document's title-affecting field changes in place).
     pub(crate) fn refresh_view(&self) {
-        self.view.update(view_tabs(self.strip()));
+        self.refresh_views();
+    }
+
+    /// Refreshes every group's tab-view snapshot whose tabs changed: a document's title shows
+    /// in each group that has a view of it.
+    pub(crate) fn refresh_views(&self) {
+        for group in &self.groups {
+            let tabs = view_tabs(
+                group
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| self.store.get(tab.document)),
+            );
+            if group.view.snapshot().tabs != tabs {
+                group.view.update(tabs);
+            }
+        }
     }
 
     pub(crate) fn set_preview_buttons(&self, visible: bool) {
-        self.view.set_preview_buttons(visible);
+        self.current().view.set_preview_buttons(visible);
     }
 
     /// The selected document, or `None` once every tab has been closed.
@@ -278,39 +565,40 @@ impl Tabs {
         self.store.find_stored_path(path)
     }
 
-    /// Where the tab showing `id` was when it was last left; the start of the document for a tab
-    /// never left.
+    /// Where the active group's tab showing `id` was when it was last left; the start of the
+    /// document for a tab never left.
     pub(crate) fn view_state(&self, id: DocumentId) -> ViewState {
-        self.tabs
-            .iter()
-            .find(|tab| tab.document == id)
-            .map(|tab| tab.view_state)
-            .unwrap_or_default()
+        self.current().view_state(id)
     }
 
     pub(crate) fn set_view_state(&mut self, id: DocumentId, state: ViewState) {
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.document == id) {
-            tab.view_state = state;
-        }
+        let group = self.active_group();
+        self.set_view_state_in(group, id, state);
     }
 
+    /// Puts `document` in place of the active tab's untitled document. `None` when there is no
+    /// active tab, or when its document is also shown in another group, which would keep it.
     pub(crate) fn replace_active_untitled(&mut self, document: Document) -> Option<Document> {
         let index = self.active_index();
-        let old_id = self.tabs.get(index)?.document;
+        let old_id = self.current().tabs.get(index)?.document;
+        if self.views_of(old_id).len() > 1 {
+            return None;
+        }
         let id = document.id;
         let old = self.store.replace(old_id, document)?;
-        let tab = &mut self.tabs[index];
+        let group = self.active_group();
+        let tab = &mut self.current_mut().tabs[index];
         tab.document = id;
         tab.view_state = ViewState::default();
-        self.recent.retain(|recent| *recent != old.id);
+        self.recent.retain(|recent| *recent != (group, old.id));
         self.touch(id);
-        self.refresh_view();
+        self.refresh_views();
         Some(old)
     }
 
     #[cfg(test)]
     pub fn ids(&self) -> impl Iterator<Item = DocumentId> + '_ {
-        self.tabs.iter().map(|tab| tab.document)
+        self.current().tabs.iter().map(|tab| tab.document)
     }
 
     pub fn titles(&self) -> impl Iterator<Item = String> + '_ {
@@ -319,39 +607,48 @@ impl Tabs {
 
     pub fn activate(&mut self, id: DocumentId) -> Result<(), UnknownDocument> {
         let index = self.position(id).ok_or(UnknownDocument(id))?;
-        self.selection.select(index, self.tabs.len());
+        self.current().select(index);
         self.touch(id);
         Ok(())
     }
 
-    /// Moves `id` to the front of the activation order.
+    /// Moves the active group's view of `id` to the front of the activation order.
     fn touch(&mut self, id: DocumentId) {
-        self.recent.retain(|recent| *recent != id);
-        self.recent.insert(0, id);
+        let group = self.active_group();
+        self.touch_in(group, id);
     }
 
-    /// The tabs, the most recently activated first; the active tab leads (spec §3.2).
-    pub(crate) fn activation_order(&self) -> &[DocumentId] {
+    fn touch_in(&mut self, group: GroupId, id: DocumentId) {
+        self.recent.retain(|recent| *recent != (group, id));
+        self.recent.insert(0, (group, id));
+    }
+
+    /// Every view, the most recently activated first; the active view leads (spec §3.2).
+    pub(crate) fn activation_order(&self) -> &[(GroupId, DocumentId)] {
         &self.recent
     }
 
-    /// Restarts the activation order from the strip, the active tab first: how restored tabs
-    /// enter it once a session restore has reopened them all (spec §3.2).
+    /// Restarts the activation order from the strips, the active view first, then every group in
+    /// creation order: how restored tabs enter it once a session restore has reopened them all
+    /// (spec §3.2).
     pub(crate) fn reset_activation_order(&mut self) {
-        let active = self.active().map(|document| document.id);
-        self.recent = active
-            .into_iter()
-            .chain(
-                self.tabs
-                    .iter()
-                    .map(|tab| tab.document)
-                    .filter(|id| Some(*id) != active),
-            )
-            .collect();
+        let group = self.active_group();
+        let active = self
+            .current()
+            .active_document()
+            .map(|document| (group, document));
+        let rest = self
+            .groups
+            .iter()
+            .flat_map(|group| group.tabs.iter().map(|tab| (group.id, tab.document)))
+            .filter(|view| Some(*view) != active)
+            .collect::<Vec<_>>();
+        self.recent = active.into_iter().chain(rest).collect();
     }
 
     pub fn activate_index(&mut self, index: usize) -> Result<(), UnknownDocument> {
         let id = self
+            .current()
             .tabs
             .get(index)
             .map(|tab| tab.document)
@@ -362,37 +659,42 @@ impl Tabs {
     pub fn push(&mut self, document: Document) -> Result<(), DuplicateDocumentPath> {
         let id = document.id;
         self.store.insert(document)?;
-        self.tabs.push(EditorTab {
+        let group = self.current_mut();
+        group.tabs.push(EditorTab {
             document: id,
             view_state: ViewState::default(),
         });
-        let index = self.tabs.len() - 1;
-        self.selection.select(index, self.tabs.len());
+        group.select(group.tabs.len() - 1);
         self.touch(id);
-        self.refresh_view();
+        self.refresh_views();
         Ok(())
     }
 
-    pub fn close_active(&mut self, decision: CloseDecision) -> Result<Document, CloseCancelled> {
-        if decision == CloseDecision::Cancel || self.tabs.is_empty() {
+    /// Closes the active tab. `Ok(None)` when its document is still shown in another group and
+    /// so stays open.
+    pub fn close_active(
+        &mut self,
+        decision: CloseDecision,
+    ) -> Result<Option<Document>, CloseCancelled> {
+        if decision == CloseDecision::Cancel || self.is_empty() {
             return Err(CloseCancelled);
         }
         let index = self.active_index();
-        let closed = self.remove_tab(index).ok_or(CloseCancelled)?;
-        self.select_after_removal(index, closed.id);
-        Ok(closed)
+        let (closed, document) = self.remove_tab(index);
+        self.select_after_removal(index, closed);
+        Ok(document)
     }
 
     /// Keeps the successor of a removed tab selected (or its predecessor at the end of the strip).
-    /// `closed` leaves the activation order and the tab now selected takes its front.
+    /// `closed`'s view leaves the activation order and the tab now selected takes its front.
     fn select_after_removal(&mut self, removed: usize, closed: DocumentId) {
-        let active = removed.min(self.tabs.len().saturating_sub(1));
-        self.selection.active.store(active, Ordering::Release);
-        self.recent.retain(|recent| *recent != closed);
-        if let Some(id) = self.tabs.get(active).map(|tab| tab.document) {
+        let group = self.active_group();
+        self.current().select_after_removal(removed);
+        self.recent.retain(|recent| *recent != (group, closed));
+        if let Some(id) = self.current().active_document() {
             self.touch(id);
         }
-        self.refresh_view();
+        self.refresh_views();
     }
 
     pub fn active_close_review(&self) -> Option<CloseReview> {
@@ -403,11 +705,13 @@ impl Tabs {
         })
     }
 
+    /// Closes the active tab once its review is settled. `Ok(None)` when its document is still
+    /// shown in another group and so stays open.
     pub fn close_reviewed(
         &mut self,
         review: CloseReview,
         decision: CloseDecision,
-    ) -> Result<Document, CloseReviewError> {
+    ) -> Result<Option<Document>, CloseReviewError> {
         if decision == CloseDecision::Cancel {
             return Err(CloseReviewError::Cancelled);
         }
@@ -424,19 +728,20 @@ impl Tabs {
         if decision == CloseDecision::Save && document.dirty {
             return Err(CloseReviewError::Unsaved);
         }
-        let closed = self.remove_tab(index).ok_or(CloseReviewError::Stale)?;
-        self.select_after_removal(index, closed.id);
-        Ok(closed)
+        let (closed, document) = self.remove_tab(index);
+        self.select_after_removal(index, closed);
+        Ok(document)
     }
 
     /// Closes the clean tab `review` names without activating it (quick-open spec §5): the
     /// active tab stays active and keeps its place in the activation order. `Stale` when that
     /// tab has gone, is the active one or changed since `review`; `Unsaved` when it has unsaved
-    /// edits, which only the usual reviewed close may discard.
+    /// edits, which only the usual reviewed close may discard. `Ok(None)` when its document is
+    /// still shown in another group.
     pub(crate) fn close_clean_background(
         &mut self,
         review: CloseReview,
-    ) -> Result<Document, CloseReviewError> {
+    ) -> Result<Option<Document>, CloseReviewError> {
         let Some(index) = self.position(review.id) else {
             return Err(CloseReviewError::Stale);
         };
@@ -450,17 +755,22 @@ impl Tabs {
         if document.dirty {
             return Err(CloseReviewError::Unsaved);
         }
-        let closed = self.remove_tab(index).ok_or(CloseReviewError::Stale)?;
+        let group = self.active_group();
+        let (closed, document) = self.remove_tab(index);
         if index < active {
-            self.selection.active.store(active - 1, Ordering::Release);
+            self.current()
+                .selection
+                .active
+                .store(active - 1, Ordering::Release);
         }
-        self.recent.retain(|recent| *recent != closed.id);
-        self.refresh_view();
-        Ok(closed)
+        self.recent.retain(|recent| *recent != (group, closed));
+        self.refresh_views();
+        Ok(document)
     }
 
+    /// The first dirty document not yet `reviewed`, across every group (the exit review).
     pub fn next_dirty_review(&self, reviewed: &[CloseReviewKey]) -> Option<CloseReview> {
-        self.strip()
+        self.documents()
             .find(|document| {
                 document.dirty
                     && !reviewed.contains(&CloseReviewKey {
@@ -480,7 +790,15 @@ impl Tabs {
     }
 
     pub fn set_active_dirty(&mut self, dirty: bool) -> bool {
-        let Some(document) = self.active_mut() else {
+        let Some(id) = self.active().map(|document| document.id) else {
+            return false;
+        };
+        self.set_dirty(id, dirty)
+    }
+
+    /// Records `id`'s dirty state; returns whether it changed.
+    pub(crate) fn set_dirty(&mut self, id: DocumentId, dirty: bool) -> bool {
+        let Some(document) = self.store.get_mut(id) else {
             return false;
         };
         if document.is_image() {
@@ -492,7 +810,7 @@ impl Tabs {
         }
         document.dirty = dirty;
         document.generation = document.generation.saturating_add(1);
-        self.refresh_view();
+        self.refresh_views();
         true
     }
 
@@ -510,9 +828,20 @@ impl Tabs {
         true
     }
 
-    /// The documents in strip order.
+    /// Every open document once: the groups in creation order, each in strip order.
     pub(crate) fn documents(&self) -> impl Iterator<Item = &Document> + '_ {
-        self.strip()
+        let mut seen = Vec::new();
+        self.groups
+            .iter()
+            .flat_map(|group| group.tabs.iter().map(|tab| tab.document))
+            .filter(move |id| {
+                if seen.contains(id) {
+                    return false;
+                }
+                seen.push(*id);
+                true
+            })
+            .filter_map(|id| self.store.get(id))
     }
 
     pub(crate) fn record_recovery_generation(&mut self, id: DocumentId, generation: u64) {
@@ -527,12 +856,18 @@ impl Tabs {
         self.active_mut()?.recovery_origin.take()
     }
 
-    /// A text change in the active tab. The first one makes a preview tab normal, so replacing
-    /// the preview can never drop an edit; returns whether that happened.
+    /// A text change in the active tab; see `note_text_change`.
     pub(crate) fn note_active_text_change(&mut self) -> bool {
         let Some(id) = self.active().map(|document| document.id) else {
             return false;
         };
+        self.note_text_change(id)
+    }
+
+    /// A text change in `id`, recorded once however many views show it. The first one makes a
+    /// preview tab normal, so replacing the preview can never drop an edit; returns whether that
+    /// happened.
+    pub(crate) fn note_text_change(&mut self, id: DocumentId) -> bool {
         if !self.store.note_text_change(id) {
             return false;
         }
@@ -543,7 +878,7 @@ impl Tabs {
             return false;
         }
         document.preview = false;
-        self.refresh_view();
+        self.refresh_views();
         true
     }
 
@@ -560,52 +895,56 @@ impl Tabs {
         document.dirty = true;
         document.preview = false;
         if changed {
-            self.refresh_view();
+            self.refresh_views();
         }
         changed
     }
 
-    /// The preview tab, if one is open. There is at most one.
+    /// The active group's preview tab, if it has one. There is at most one per group.
     pub(crate) fn preview_id(&self) -> Option<DocumentId> {
         self.strip()
             .find(|document| document.preview)
             .map(|document| document.id)
     }
 
-    /// Puts `document` where the preview tab is, selects it and returns the document it replaced.
-    /// With no preview tab, `document` is added like any new tab and `None` is returned. The same
-    /// happens when the preview somehow has unsaved edits: it is kept as a normal tab. The caller
-    /// has already checked that `document`'s file is not open in another tab.
+    /// Puts `document` where the active group's preview tab is, selects it and returns the
+    /// document it replaced. With no preview tab, `document` is added like any new tab and `None`
+    /// is returned. The same happens when the preview somehow has unsaved edits, or is also shown
+    /// in another group: it is kept as a normal tab. The caller has already checked that
+    /// `document`'s file is not open in another tab.
     pub(crate) fn replace_preview(&mut self, document: Document) -> Option<Document> {
-        let preview = self.tabs.iter().position(|tab| {
+        let preview = self.current().tabs.iter().position(|tab| {
             self.store
                 .get(tab.document)
                 .is_some_and(|existing| existing.preview)
         });
-        match preview {
-            Some(index)
-                if self
-                    .document_at(index)
-                    .is_some_and(|existing| !existing.dirty) =>
-            {
+        let replaceable = preview.filter(|index| {
+            let id = self.current().tabs[*index].document;
+            self.views_of(id).len() == 1
+                && self.store.get(id).is_some_and(|existing| !existing.dirty)
+        });
+        match replaceable {
+            Some(index) => {
                 let id = document.id;
-                let old_id = self.tabs[index].document;
+                let group = self.active_group();
+                let old_id = self.current().tabs[index].document;
                 let old = self.store.replace(old_id, document)?;
-                let tab = &mut self.tabs[index];
+                let current = self.current_mut();
+                let tab = &mut current.tabs[index];
                 tab.document = id;
                 tab.view_state = ViewState::default();
-                self.selection.select(index, self.tabs.len());
-                self.recent.retain(|recent| *recent != old.id);
+                current.select(index);
+                self.recent.retain(|recent| *recent != (group, old.id));
                 self.touch(id);
-                self.refresh_view();
+                self.refresh_views();
                 Some(old)
             }
-            edited => {
-                if let Some(existing) = edited.and_then(|index| self.document_at_mut(index)) {
+            None => {
+                if let Some(existing) = preview.and_then(|index| self.document_at_mut(index)) {
                     existing.preview = false;
                 }
                 if self.push(document).is_err() {
-                    self.refresh_view();
+                    self.refresh_views();
                 }
                 None
             }
@@ -621,16 +960,20 @@ impl Tabs {
             return false;
         }
         document.preview = false;
-        self.refresh_view();
+        self.refresh_views();
         true
     }
 
+    /// Closes every tab and leaves one empty group.
     pub fn clear_for_shutdown(&mut self) {
-        self.tabs.clear();
+        self.groups.truncate(1);
+        let group = &mut self.groups[0];
+        group.tabs.clear();
+        group.selection.active.store(0, Ordering::Release);
+        self.active = 0;
         self.store.clear();
         self.recent.clear();
-        self.selection.active.store(0, Ordering::Release);
-        self.refresh_view();
+        self.refresh_views();
     }
 
     pub(crate) fn active_handle(&self) -> Option<&crate::editor::EditorDocument> {
@@ -648,13 +991,13 @@ impl Tabs {
         if let Some(document) = self.store.get_mut(id) {
             document.path = Some(path);
         }
-        self.refresh_view();
+        self.refresh_views();
         Ok(())
     }
 
     /// Rebinds `id`'s path, e.g. after a note is renamed on disk or moved between folders.
     /// Rejects the path if it canonicalizes to the same file another open tab already owns; see
-    /// `DocumentStore::reject_path_collision`. Updates the tab view so the tab strip and
+    /// `DocumentStore::reject_path_collision`. Updates the tab views so the tab strips and
     /// accessibility see the new title.
     pub fn rebind_path(
         &mut self,
@@ -668,7 +1011,7 @@ impl Tabs {
         if let Some(document) = self.store.get_mut(id) {
             document.path = Some(path);
         }
-        self.refresh_view();
+        self.refresh_views();
         Ok(())
     }
 
@@ -680,7 +1023,7 @@ impl Tabs {
     pub(crate) fn revert_active_path(&mut self, original: Option<PathBuf>) {
         if let Some(document) = self.active_mut() {
             document.path = original;
-            self.refresh_view();
+            self.refresh_views();
         }
     }
 }
@@ -776,12 +1119,13 @@ mod tests {
     use super::Tabs;
     use super::{CloseReview, CloseReviewError};
     use crate::document::{Document, DocumentId};
+    use crate::editor::ViewState;
     use std::fs;
 
     use crate::document::CloseDecision;
 
     fn order(tabs: &Tabs) -> Vec<u64> {
-        tabs.activation_order().iter().map(|id| id.0).collect()
+        tabs.activation_order().iter().map(|(_, id)| id.0).collect()
     }
 
     fn document(id: u64) -> Document {
@@ -801,7 +1145,7 @@ mod tests {
             generation: tabs.document(DocumentId(id)).unwrap().generation,
         };
         let first = review(&tabs, 1);
-        let closed = tabs.close_clean_background(first).unwrap();
+        let closed = tabs.close_clean_background(first).unwrap().unwrap();
         assert_eq!(closed.id, DocumentId(1));
         assert_eq!(tabs.active().unwrap().id, DocumentId(3));
         assert_eq!(tabs.active_index(), 1);
@@ -1199,5 +1543,112 @@ mod tests {
             Some(DocumentId(2))
         );
         assert_eq!(tabs.view_state(DocumentId(2)), second);
+    }
+
+    #[test]
+    fn a_document_can_have_a_view_in_each_group_and_leaves_with_its_last_view() {
+        // Break caught: a second group's tab removing the document from the store when the first
+        // group's tab closes, or a close leaving an orphan in the store.
+        let mut tabs = Tabs::new();
+        tabs.push(document(1)).unwrap();
+        let first = tabs.active_group();
+        let second = tabs.add_group();
+        assert!(tabs.add_view(second, DocumentId(1), ViewState::default()));
+        assert_eq!(tabs.views_of(DocumentId(1)), vec![first, second]);
+        let kept = tabs.close_active(CloseDecision::Discard).unwrap();
+        assert!(kept.is_none(), "not the last view: the document stays");
+        assert_eq!(tabs.views_of(DocumentId(1)), vec![second]);
+        assert!(tabs.document(DocumentId(1)).is_some());
+        tabs.set_active_group(second);
+        let closed = tabs.close_active(CloseDecision::Discard).unwrap().unwrap();
+        assert_eq!(closed.id, DocumentId(1));
+        assert!(tabs.document(DocumentId(1)).is_none());
+    }
+
+    #[test]
+    fn the_facade_methods_act_on_the_active_group() {
+        // Break caught: `active()` or `len()` reading the first group after the user moved to
+        // another one, so commands act on the wrong tab.
+        let mut tabs = Tabs::new();
+        tabs.push(document(1)).unwrap();
+        let second = tabs.add_group();
+        assert!(tabs.set_active_group(second));
+        assert!(tabs.is_empty());
+        assert!(tabs.active().is_none());
+        tabs.push(document(2)).unwrap();
+        assert_eq!(
+            tabs.active().map(|document| document.id),
+            Some(DocumentId(2))
+        );
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs.documents().count(), 2, "documents() spans every group");
+        assert_eq!(
+            tabs.activation_order(),
+            &[
+                (second, DocumentId(2)),
+                (tabs.group_ids()[0], DocumentId(1))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_view_promotes_a_preview_and_a_preview_is_replaced_only_in_its_group() {
+        // Break caught: an italic tab whose document is also open elsewhere being replaced by the
+        // next tree click, closing a view the user did not click away from.
+        let mut tabs = Tabs::new();
+        let mut preview = document(1);
+        preview.preview = true;
+        tabs.push(preview).unwrap();
+        let first = tabs.active_group();
+        let second = tabs.add_group();
+        tabs.set_active_group(second);
+        let mut other = document(2);
+        other.preview = true;
+        assert!(
+            tabs.replace_preview(other).is_none(),
+            "group 2 had no preview"
+        );
+        assert_eq!(tabs.group(first).unwrap().len(), 1);
+        assert_eq!(tabs.preview_id(), Some(DocumentId(2)));
+        assert!(tabs.add_view(first, DocumentId(2), ViewState::default()));
+        assert!(!tabs.document(DocumentId(2)).unwrap().preview);
+    }
+
+    #[test]
+    fn moving_a_view_keeps_its_state_and_the_document() {
+        // Break caught: Move to Next Group dropping the caret, or removing the document between
+        // the removal and the insertion.
+        let mut tabs = Tabs::new();
+        tabs.push(document(1)).unwrap();
+        let first = tabs.active_group();
+        let second = tabs.add_group();
+        let state = ViewState {
+            caret: 7,
+            anchor: 3,
+            first_line: 2,
+            x_offset: 0,
+        };
+        tabs.set_view_state_in(first, DocumentId(1), state);
+        assert!(tabs.move_view(first, DocumentId(1), second));
+        assert!(tabs.group(first).unwrap().is_empty());
+        assert_eq!(tabs.view_state_in(second, DocumentId(1)), state);
+        assert!(tabs.document(DocumentId(1)).is_some());
+        assert!(tabs.remove_group(first));
+        assert!(!tabs.remove_group(second), "the last group stays");
+    }
+
+    #[test]
+    fn a_text_change_is_recorded_once_on_the_document() {
+        // Break caught: a document-level change applied per view, bumping the generation twice
+        // for one keystroke.
+        let mut tabs = Tabs::new();
+        tabs.push(document(1)).unwrap();
+        let second = tabs.add_group();
+        tabs.add_view(second, DocumentId(1), ViewState::default());
+        let before = tabs.document(DocumentId(1)).unwrap().generation;
+        tabs.note_text_change(DocumentId(1));
+        assert_eq!(tabs.document(DocumentId(1)).unwrap().generation, before + 1);
+        assert!(tabs.set_dirty(DocumentId(1), true));
+        assert!(!tabs.set_dirty(DocumentId(1), true));
     }
 }

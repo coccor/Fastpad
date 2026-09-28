@@ -1757,7 +1757,7 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
             let active = tabs.active().map(|document| document.id);
             tabs.activation_order()
                 .iter()
-                .filter_map(|&id| {
+                .filter_map(|&(_, id)| {
                     let path = tabs.document(id)?.path.as_deref()?;
                     let relative = crate::library::record_path(&folder, path);
                     (!relative.is_absolute())
@@ -2355,7 +2355,10 @@ fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool, Option<usize>) {
                 app.tabs.active_index(),
                 app.tabs.scroll_offset(),
                 app.editor.is_some() && app.tabs.is_empty(),
-                app.tabs.documents().position(|document| document.preview),
+                app.tabs
+                    .group_documents(app.tabs.active_group())
+                    .into_iter()
+                    .position(|document| document.preview),
             )
         })
         .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false, None))
@@ -4443,9 +4446,9 @@ fn close_active_document(hwnd: HWND) {
 /// Closes tab `id` as a middle-click on it does (open editors spec §3.2), if it is still open.
 pub(crate) fn close_document_tab(hwnd: HWND, id: DocumentId) {
     let index = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        unsafe { app.as_ref() }
-            .tabs
-            .documents()
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.group_documents(tabs.active_group())
+            .into_iter()
             .position(|document| document.id == id)
     });
     if let Some(index) = index {
@@ -4462,7 +4465,7 @@ fn close_tab_at(hwnd: HWND, index: usize) {
     };
     let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let tabs = &unsafe { app.as_ref() }.tabs;
-        let document = tabs.documents().nth(index)?;
+        let document = *tabs.group_documents(tabs.active_group()).get(index)?;
         let background = tabs.active().is_some_and(|active| active.id != document.id);
         Some((
             crate::window::tabs::CloseReview {
@@ -4503,10 +4506,9 @@ fn refresh_quick_open_after_close(hwnd: HWND) {
 /// The document shown by tab `index` of the strip.
 fn tab_id_at(hwnd: HWND, index: usize) -> Option<DocumentId> {
     unsafe { app_ptr(hwnd) }.and_then(|app| {
-        unsafe { app.as_ref() }
-            .tabs
-            .documents()
-            .nth(index)
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.group_documents(tabs.active_group())
+            .get(index)
             .map(|document| document.id)
     })
 }
@@ -4542,14 +4544,16 @@ fn close_reviewed_document(
 ) {
     let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
+        // `None` when the document is still shown in another group: it stays open.
         let closed = app.tabs.close_reviewed(review, decision).ok()?;
         let snapshots = app
             .recovery_root
             .as_deref()
-            .map(|root| {
+            .zip(closed.as_ref())
+            .map(|(root, closed)| {
                 crate::recovery::snapshots_removed_on_close(
                     root,
-                    &closed,
+                    closed,
                     decision == CloseDecision::Discard,
                 )
             })
@@ -4603,7 +4607,8 @@ fn close_background_document(
         let snapshots = app
             .recovery_root
             .as_deref()
-            .map(|root| crate::recovery::snapshots_removed_on_close(root, &closed, true))
+            .zip(closed.as_ref())
+            .map(|(root, closed)| crate::recovery::snapshots_removed_on_close(root, closed, true))
             .unwrap_or_default();
         Some((closed, snapshots))
     });
@@ -6030,7 +6035,7 @@ pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate:
     let active_id = app.tabs.active().map(|document| document.id);
     let mut active = 0;
     let mut entries = Vec::new();
-    for document in app.tabs.documents() {
+    for document in app.tabs.group_documents(app.tabs.active_group()) {
         let is_active = Some(document.id) == active_id;
         let source = if document.dirty {
             let file = crate::recovery::current_snapshot_file(root, document)?;
@@ -10509,7 +10514,7 @@ mod tests {
             .tabs
             .activation_order()
             .iter()
-            .map(|&id| app.tabs.document(id).unwrap().path.clone().unwrap())
+            .map(|&(_, id)| app.tabs.document(id).unwrap().path.clone().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(
             paths,
