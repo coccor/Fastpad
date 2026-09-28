@@ -13116,6 +13116,43 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_note_row_opens_a_normal_tab_and_promotes_the_preview() {
+        // Break caught: Enter opening the italic preview tab, so a keyboard user has no way to
+        // keep a note open short of Ctrl+Enter, and a second Enter on the preview does nothing.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-enter");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, editor) = notebook_window(&scratch);
+        let (_, panel) = sidebar_windows(window.hwnd);
+
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        unsafe { SetFocus(panel) };
+        crate::window::notebook_view::key_down(window.hwnd, VK_RETURN);
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(a.as_path()));
+        assert!(!active.preview, "Enter opens a normal tab");
+        assert_eq!(
+            unsafe { GetFocus() },
+            editor.hwnd(),
+            "and moves to the editor"
+        );
+
+        // A note already in the preview tab becomes a normal tab on Enter.
+        let row = row_of(window.hwnd, &RowKind::Note("b.md".into()));
+        crate::window::notebook_view::activate(window.hwnd, row, Activation::Click);
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+        select_row(window.hwnd, &RowKind::Note("b.md".into()));
+        unsafe { SetFocus(panel) };
+        crate::window::notebook_view::key_down(window.hwnd, VK_RETURN);
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(b.as_path()));
+        assert!(!active.preview);
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    #[test]
     fn clicking_a_note_row_opens_the_preview_and_a_double_click_keeps_it() {
         // Break caught: a click opening a normal tab every time (tabs pile up), or a double-click
         // opening a second tab instead of keeping the preview, or a click moving the keyboard to
@@ -14369,9 +14406,9 @@ mod tests {
     }
 
     #[test]
-    fn the_search_view_finds_note_text_shows_folders_and_opens_the_preview_tab() {
+    fn the_search_view_finds_note_text_shows_folders_and_enter_opens_a_normal_tab() {
         // Break caught: a search over names instead of text, results without their folder, or
-        // Enter opening a normal tab instead of the preview tab.
+        // Enter opening the preview tab, which a keyboard user cannot then keep.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("search-view");
         scratch.note("Alpha.md", "the alpha plan");
@@ -14406,14 +14443,22 @@ mod tests {
             crate::window::search_view::summary(window.hwnd),
             Some(("3 notes".to_owned(), false))
         );
-        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+        let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        unsafe {
+            SendMessageW(
+                edit,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN),
+                0,
+            )
+        };
         let active = app_mut(window.hwnd).tabs.active().unwrap();
         assert_eq!(
             active.path.as_deref(),
             Some(scratch.folder().join("Alpha.md").as_path())
         );
-        let active_id = active.id;
-        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), Some(active_id));
+        assert!(!active.preview, "Enter opens a normal tab");
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
 
         search_for(window.hwnd, "zzz");
         assert_eq!(

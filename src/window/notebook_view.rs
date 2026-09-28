@@ -36,8 +36,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+    GetCapture, GetFocus, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetParent, GetSystemMetrics, IDC_ARROW, IDC_NO, KillTimer,
@@ -117,9 +117,7 @@ pub(crate) enum HeaderButton {
 pub(crate) enum Activation {
     /// A mouse click: the preview tab, focus stays in the tree (F2 and Del act on the row).
     Click,
-    /// Enter: the preview tab, focus stays in the tree for further browsing.
-    Enter,
-    /// Ctrl+Enter or a double-click: a normal tab, focus to the editor.
+    /// Enter, Ctrl+Enter or a double-click: a normal tab, focus to the editor.
     Permanent,
 }
 
@@ -3191,7 +3189,7 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
                 let (mode, focus) = match how {
                     // A click keeps the keyboard in the tree, as VS Code's explorer does, so F2
                     // and Del act on the row just clicked.
-                    Activation::Click | Activation::Enter => (OpenMode::Preview, false),
+                    Activation::Click => (OpenMode::Preview, false),
                     Activation::Permanent => (OpenMode::Permanent, true),
                 };
                 if let Err(error) = super::main_window::open_note(hwnd, &path, mode, focus) {
@@ -3319,14 +3317,9 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
     match key {
+        // Enter opens a normal tab: the preview tab is the mouse's (spec §6.4).
         VK_RETURN => {
-            let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
-            let how = if ctrl {
-                Activation::Permanent
-            } else {
-                Activation::Enter
-            };
-            activate(hwnd, selected, how);
+            activate(hwnd, selected, Activation::Permanent);
             true
         }
         VK_RIGHT => {
