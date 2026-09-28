@@ -73,12 +73,25 @@ pub(crate) fn tree_icon(
             NoteKind::Yaml => MaterialIcon::Yaml,
             NoteKind::Toml if light_theme => MaterialIcon::TomlLight,
             NoteKind::Toml => MaterialIcon::Toml,
-            NoteKind::Ini | NoteKind::Config => MaterialIcon::Settings,
+            NoteKind::Ini | NoteKind::Config | NoteKind::Properties => MaterialIcon::Settings,
             NoteKind::Csv => MaterialIcon::Table,
             NoteKind::Xml => MaterialIcon::Xml,
             NoteKind::Text => MaterialIcon::Document,
             NoteKind::Log => MaterialIcon::Log,
             NoteKind::Image => MaterialIcon::Image,
+            NoteKind::Html => MaterialIcon::Html,
+            NoteKind::Css => MaterialIcon::Css,
+            NoteKind::JavaScript => MaterialIcon::JavaScript,
+            NoteKind::TypeScript => MaterialIcon::TypeScript,
+            NoteKind::Python => MaterialIcon::Python,
+            NoteKind::Rust => MaterialIcon::Rust,
+            NoteKind::C => MaterialIcon::C,
+            NoteKind::Cpp => MaterialIcon::Cpp,
+            NoteKind::CSharp => MaterialIcon::CSharp,
+            NoteKind::PowerShell => MaterialIcon::PowerShell,
+            NoteKind::Bash | NoteKind::Batch => MaterialIcon::Console,
+            NoteKind::Sql => MaterialIcon::Database,
+            NoteKind::Env => MaterialIcon::Tune,
         },
     })
 }
@@ -92,25 +105,41 @@ mod tests {
     fn every_note_type_and_folder_state_draws_its_icon_in_each_set() {
         // Break caught: a config file drawn as a document, the dark TOML icon on a light theme,
         // Solid drawn with Minimal's outlines, or a Material bitmap in high contrast (spec §3).
-        let note = |extension: &str| TreeItem::Note(note_kind(Some(extension)));
+        let note = |path: &str| TreeItem::Note(note_kind(std::path::Path::new(path)));
         let material = |item, light| tree_icon(FileIconSet::Material, item, light, false);
         for (extension, icon) in [
-            ("md", MaterialIcon::Markdown),
-            ("MARKDOWN", MaterialIcon::Markdown),
-            ("json", MaterialIcon::Json),
-            ("yml", MaterialIcon::Yaml),
-            ("yaml", MaterialIcon::Yaml),
-            ("ini", MaterialIcon::Settings),
-            ("cfg", MaterialIcon::Settings),
-            ("Conf", MaterialIcon::Settings),
-            ("csv", MaterialIcon::Table),
-            ("xml", MaterialIcon::Xml),
-            ("txt", MaterialIcon::Document),
-            ("text", MaterialIcon::Document),
-            ("py", MaterialIcon::Document),
-            ("log", MaterialIcon::Log),
-            ("png", MaterialIcon::Image),
-            ("SVG", MaterialIcon::Image),
+            ("a.md", MaterialIcon::Markdown),
+            ("a.MARKDOWN", MaterialIcon::Markdown),
+            ("a.json", MaterialIcon::Json),
+            ("a.yml", MaterialIcon::Yaml),
+            ("a.yaml", MaterialIcon::Yaml),
+            ("a.ini", MaterialIcon::Settings),
+            ("a.cfg", MaterialIcon::Settings),
+            ("a.Conf", MaterialIcon::Settings),
+            ("a.csv", MaterialIcon::Table),
+            ("a.xml", MaterialIcon::Xml),
+            ("a.txt", MaterialIcon::Document),
+            ("a.text", MaterialIcon::Document),
+            ("a.exe", MaterialIcon::Document),
+            ("a.log", MaterialIcon::Log),
+            ("a.png", MaterialIcon::Image),
+            ("a.SVG", MaterialIcon::Image),
+            ("a.html", MaterialIcon::Html),
+            ("a.css", MaterialIcon::Css),
+            ("a.mjs", MaterialIcon::JavaScript),
+            ("a.ts", MaterialIcon::TypeScript),
+            ("a.py", MaterialIcon::Python),
+            ("a.rs", MaterialIcon::Rust),
+            ("a.c", MaterialIcon::C),
+            ("a.cpp", MaterialIcon::Cpp),
+            ("a.cs", MaterialIcon::CSharp),
+            ("a.ps1", MaterialIcon::PowerShell),
+            ("a.sh", MaterialIcon::Console),
+            (".bashrc", MaterialIcon::Console),
+            ("a.bat", MaterialIcon::Console),
+            ("a.sql", MaterialIcon::Database),
+            (".env", MaterialIcon::Tune),
+            ("a.properties", MaterialIcon::Settings),
         ] {
             for light in [false, true] {
                 assert_eq!(
@@ -121,15 +150,15 @@ mod tests {
             }
         }
         assert_eq!(
-            material(TreeItem::Note(note_kind(None)), false),
+            material(note("README"), false),
             TreeIcon::Image(MaterialIcon::Document)
         );
         assert_eq!(
-            material(note("toml"), true),
+            material(note("a.toml"), true),
             TreeIcon::Image(MaterialIcon::TomlLight)
         );
         assert_eq!(
-            material(note("toml"), false),
+            material(note("a.toml"), false),
             TreeIcon::Image(MaterialIcon::Toml)
         );
         let (closed, open) = (
@@ -144,7 +173,7 @@ mod tests {
             material(open, false),
             TreeIcon::Image(MaterialIcon::FolderOpen)
         );
-        for item in [closed, open, note("md"), note("csv")] {
+        for item in [closed, open, note("a.md"), note("a.csv"), note("a.rs")] {
             let (icon, color) = mask_icon(item);
             for (set, mask_set) in [
                 (FileIconSet::Minimal, MaskSet::Minimal),

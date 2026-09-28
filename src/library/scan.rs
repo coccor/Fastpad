@@ -146,9 +146,7 @@ pub fn scan_limited(folder: &Path, limit: usize, folder_limit: usize) -> Result<
                             }
                             pending.push((path, None));
                         }
-                    } else if Path::new(&name).extension().is_some_and(|ext| {
-                        super::title::is_listed_extension(&ext.to_string_lossy())
-                    }) {
+                    } else if super::title::is_listed_path(Path::new(&name)) {
                         if scan.entries.len() >= limit {
                             scan.truncated = true;
                             return Ok(scan);
@@ -226,6 +224,23 @@ mod tests {
         scratch.file("d.exe", "x");
         let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
         assert_eq!(paths(&scan), ["a.md", "c.svg", r"pics\b.PNG"]);
+    }
+
+    #[test]
+    fn scripts_source_files_and_known_dotfiles_are_listed() {
+        // Break caught: the tree hiding a highlighted file because its name has no listed
+        // extension (`.env`, `Cargo.lock`) or its extension is a language's (`deploy.ps1`).
+        let scratch = Scratch::new("languages");
+        scratch.file(".env", "A=1");
+        scratch.file("Cargo.lock", "x");
+        scratch.file(r"src\lib.rs", "fn f() {}");
+        scratch.file("deploy.ps1", "x");
+        scratch.file("yarn.lock", "x");
+        let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
+        assert_eq!(
+            paths(&scan),
+            [".env", "Cargo.lock", "deploy.ps1", r"src\lib.rs"]
+        );
     }
 
     fn folders(scan: &Scan) -> Vec<String> {

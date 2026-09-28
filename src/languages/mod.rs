@@ -27,7 +27,9 @@ use std::path::PathBuf;
 
 pub use json_commands::{JsonIssue, format_json, json_invocation_count, validate_json};
 pub(crate) use registry::LANGUAGES;
-pub use registry::{default_extension, detect_language, display_name};
+pub use registry::{
+    default_extension, detect_language, display_name, is_language_extension, is_language_file_name,
+};
 
 /// One Scintilla lexer style's look: `style` is the lexer-specific `SCE_*` style number.
 #[derive(Clone, Copy, Debug)]

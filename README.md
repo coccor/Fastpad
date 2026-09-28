@@ -161,7 +161,8 @@ file that doesn't parse.
 FastPad picks the language from the file name and colours it in every theme: JSON, Markdown, XML
 (including SVG, `.csproj` and `.xaml`), HTML, CSS, JavaScript, TypeScript, YAML, TOML, INI,
 `.properties`, `.env`, PowerShell, Bash, Batch, Python, C, C++, C#, Rust and SQL. Switch it by hand
-from **View → Language** or the command palette.
+from **View → Language** or the command palette. The notebook lists all of these files too
+(`.env`, `.bashrc` and `Cargo.lock` included), each with its own icon in every icon set.
 
 ### Tabs, done right
 

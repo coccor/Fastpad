@@ -62,12 +62,27 @@ pub(crate) enum MaskIcon {
     Document,
     Log,
     Image,
+    Html,
+    Css,
+    JavaScript,
+    TypeScript,
+    Python,
+    Rust,
+    C,
+    Cpp,
+    CSharp,
+    PowerShell,
+    Bash,
+    Batch,
+    Sql,
+    Env,
+    Properties,
 }
 
 impl MaskIcon {
     /// Every icon, in blob order (`ALL[icon as usize] == icon`).
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 25] = [
         Self::Folder,
         Self::FolderOpen,
         Self::Markdown,
@@ -78,6 +93,21 @@ impl MaskIcon {
         Self::Document,
         Self::Log,
         Self::Image,
+        Self::Html,
+        Self::Css,
+        Self::JavaScript,
+        Self::TypeScript,
+        Self::Python,
+        Self::Rust,
+        Self::C,
+        Self::Cpp,
+        Self::CSharp,
+        Self::PowerShell,
+        Self::Bash,
+        Self::Batch,
+        Self::Sql,
+        Self::Env,
+        Self::Properties,
     ];
 
     /// The SVG in each set's `svg/` folder this icon is made from.
@@ -94,6 +124,21 @@ impl MaskIcon {
             Self::Document => "document.svg",
             Self::Log => "log.svg",
             Self::Image => "image.svg",
+            Self::Html => "html.svg",
+            Self::Css => "css.svg",
+            Self::JavaScript => "javascript.svg",
+            Self::TypeScript => "typescript.svg",
+            Self::Python => "python.svg",
+            Self::Rust => "rust.svg",
+            Self::C => "c.svg",
+            Self::Cpp => "cpp.svg",
+            Self::CSharp => "csharp.svg",
+            Self::PowerShell => "powershell.svg",
+            Self::Bash => "bash.svg",
+            Self::Batch => "batch.svg",
+            Self::Sql => "sql.svg",
+            Self::Env => "env.svg",
+            Self::Properties => "properties.svg",
         }
     }
 }
@@ -115,6 +160,21 @@ pub(crate) fn mask_icon(item: TreeItem) -> (MaskIcon, IconColor) {
             NoteKind::Text => (MaskIcon::Document, IconColor::Overlay2),
             NoteKind::Log => (MaskIcon::Log, IconColor::Overlay2),
             NoteKind::Image => (MaskIcon::Image, IconColor::Green),
+            NoteKind::Html => (MaskIcon::Html, IconColor::Peach),
+            NoteKind::Css => (MaskIcon::Css, IconColor::Pink),
+            NoteKind::JavaScript => (MaskIcon::JavaScript, IconColor::Yellow),
+            NoteKind::TypeScript => (MaskIcon::TypeScript, IconColor::Blue),
+            NoteKind::Python => (MaskIcon::Python, IconColor::Blue),
+            NoteKind::Rust => (MaskIcon::Rust, IconColor::Red),
+            NoteKind::C => (MaskIcon::C, IconColor::Sky),
+            NoteKind::Cpp => (MaskIcon::Cpp, IconColor::Blue),
+            NoteKind::CSharp => (MaskIcon::CSharp, IconColor::Mauve),
+            NoteKind::PowerShell => (MaskIcon::PowerShell, IconColor::Blue),
+            NoteKind::Bash => (MaskIcon::Bash, IconColor::Green),
+            NoteKind::Batch => (MaskIcon::Batch, IconColor::Overlay2),
+            NoteKind::Sql => (MaskIcon::Sql, IconColor::Sky),
+            NoteKind::Env => (MaskIcon::Env, IconColor::Yellow),
+            NoteKind::Properties => (MaskIcon::Properties, IconColor::Peach),
         },
     }
 }
@@ -158,6 +218,38 @@ pub(crate) fn source_hash(set: MaskSet) -> u64 {
 mod tests {
     use super::*;
     use crate::window::file_icons::note_kind;
+    use std::path::Path;
+
+    #[test]
+    fn each_programming_and_script_language_has_its_own_mask_shape() {
+        // Break caught: two languages sharing one Minimal or Solid shape (say C and C++ both
+        // drawn as `code`), so only the tint tells them apart.
+        let languages = [
+            "a.html",
+            "a.css",
+            "a.js",
+            "a.ts",
+            "a.py",
+            "a.rs",
+            "a.c",
+            "a.cpp",
+            "a.cs",
+            "a.ps1",
+            "a.sh",
+            "a.bat",
+            "a.sql",
+            ".env",
+            "a.properties",
+            "a.xml",
+            "a.json",
+            "a.md",
+        ];
+        let mut shapes = std::collections::HashSet::new();
+        for path in languages {
+            let (icon, _) = mask_icon(TreeItem::Note(note_kind(Path::new(path))));
+            assert!(shapes.insert(icon), "{path} shares {icon:?}");
+        }
+    }
 
     #[test]
     fn each_mask_set_bundles_exactly_its_svgs_and_its_blob_matches_them() {
@@ -215,6 +307,21 @@ mod tests {
             MaskIcon::Document,
             MaskIcon::Log,
             MaskIcon::Image,
+            MaskIcon::Html,
+            MaskIcon::Css,
+            MaskIcon::JavaScript,
+            MaskIcon::TypeScript,
+            MaskIcon::Python,
+            MaskIcon::Rust,
+            MaskIcon::C,
+            MaskIcon::Cpp,
+            MaskIcon::CSharp,
+            MaskIcon::PowerShell,
+            MaskIcon::Bash,
+            MaskIcon::Batch,
+            MaskIcon::Sql,
+            MaskIcon::Env,
+            MaskIcon::Properties,
         ] {
             let ink = |set| -> u32 {
                 coverage(set, icon, 24)
@@ -231,31 +338,43 @@ mod tests {
     fn every_note_type_and_folder_state_has_its_mask_icon_and_colour_role() {
         // Break caught: a config file drawn as a document, the closed folder shown open, or a
         // type's colour role changed from the Minimal glyphs' (spec §3.1).
-        let note = |extension: &str| mask_icon(TreeItem::Note(note_kind(Some(extension))));
-        for (extension, expected) in [
-            ("md", (MaskIcon::Markdown, IconColor::Blue)),
-            ("markdown", (MaskIcon::Markdown, IconColor::Blue)),
-            ("json", (MaskIcon::Braces, IconColor::Yellow)),
-            ("yaml", (MaskIcon::Settings, IconColor::Peach)),
-            ("yml", (MaskIcon::Settings, IconColor::Peach)),
-            ("toml", (MaskIcon::Settings, IconColor::Peach)),
-            ("ini", (MaskIcon::Settings, IconColor::Peach)),
-            ("cfg", (MaskIcon::Settings, IconColor::Peach)),
-            ("conf", (MaskIcon::Settings, IconColor::Peach)),
-            ("csv", (MaskIcon::Table, IconColor::Green)),
-            ("xml", (MaskIcon::Code, IconColor::Maroon)),
-            ("txt", (MaskIcon::Document, IconColor::Overlay2)),
-            ("py", (MaskIcon::Document, IconColor::Overlay2)),
-            ("log", (MaskIcon::Log, IconColor::Overlay2)),
-            ("png", (MaskIcon::Image, IconColor::Green)),
-            ("svg", (MaskIcon::Image, IconColor::Green)),
+        let note = |path: &str| mask_icon(TreeItem::Note(note_kind(Path::new(path))));
+        for (path, expected) in [
+            ("a.md", (MaskIcon::Markdown, IconColor::Blue)),
+            ("a.markdown", (MaskIcon::Markdown, IconColor::Blue)),
+            ("a.json", (MaskIcon::Braces, IconColor::Yellow)),
+            ("a.yaml", (MaskIcon::Settings, IconColor::Peach)),
+            ("a.yml", (MaskIcon::Settings, IconColor::Peach)),
+            ("a.toml", (MaskIcon::Settings, IconColor::Peach)),
+            ("a.ini", (MaskIcon::Settings, IconColor::Peach)),
+            ("a.cfg", (MaskIcon::Settings, IconColor::Peach)),
+            ("a.conf", (MaskIcon::Settings, IconColor::Peach)),
+            ("a.csv", (MaskIcon::Table, IconColor::Green)),
+            ("a.xml", (MaskIcon::Code, IconColor::Maroon)),
+            ("a.txt", (MaskIcon::Document, IconColor::Overlay2)),
+            ("a.exe", (MaskIcon::Document, IconColor::Overlay2)),
+            ("README", (MaskIcon::Document, IconColor::Overlay2)),
+            ("a.log", (MaskIcon::Log, IconColor::Overlay2)),
+            ("a.png", (MaskIcon::Image, IconColor::Green)),
+            ("a.svg", (MaskIcon::Image, IconColor::Green)),
+            ("a.html", (MaskIcon::Html, IconColor::Peach)),
+            ("a.css", (MaskIcon::Css, IconColor::Pink)),
+            ("a.js", (MaskIcon::JavaScript, IconColor::Yellow)),
+            ("a.ts", (MaskIcon::TypeScript, IconColor::Blue)),
+            ("a.py", (MaskIcon::Python, IconColor::Blue)),
+            ("a.rs", (MaskIcon::Rust, IconColor::Red)),
+            ("a.h", (MaskIcon::C, IconColor::Sky)),
+            ("a.cpp", (MaskIcon::Cpp, IconColor::Blue)),
+            ("a.cs", (MaskIcon::CSharp, IconColor::Mauve)),
+            ("a.ps1", (MaskIcon::PowerShell, IconColor::Blue)),
+            ("a.sh", (MaskIcon::Bash, IconColor::Green)),
+            ("a.cmd", (MaskIcon::Batch, IconColor::Overlay2)),
+            ("a.sql", (MaskIcon::Sql, IconColor::Sky)),
+            (".env", (MaskIcon::Env, IconColor::Yellow)),
+            ("a.properties", (MaskIcon::Properties, IconColor::Peach)),
         ] {
-            assert_eq!(note(extension), expected, "{extension}");
+            assert_eq!(note(path), expected, "{path}");
         }
-        assert_eq!(
-            mask_icon(TreeItem::Note(note_kind(None))),
-            (MaskIcon::Document, IconColor::Overlay2)
-        );
         assert_eq!(
             mask_icon(TreeItem::Folder { expanded: false }),
             (MaskIcon::Folder, IconColor::Yellow)

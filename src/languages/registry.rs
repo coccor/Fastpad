@@ -336,6 +336,31 @@ pub fn detect_language(path: &Path) -> Language {
         .map_or(Language::PlainText, |row| row.language)
 }
 
+/// Whether some language claims `extension` (without the dot), ignoring case.
+pub fn is_language_extension(extension: &str) -> bool {
+    LANGUAGES.iter().any(|row| {
+        row.extensions
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(extension))
+    })
+}
+
+/// Whether some language claims the whole file name `name` (`.env`, `Cargo.lock`), ignoring
+/// case. Allocation-free, since the notebook scan asks it of every unlisted file.
+pub fn is_language_file_name(name: &str) -> bool {
+    let name = name.as_bytes();
+    LANGUAGES.iter().any(|row| {
+        row.file_names
+            .iter()
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => name
+                    .get(..prefix.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes())),
+                None => name.eq_ignore_ascii_case(pattern.as_bytes()),
+            })
+    })
+}
+
 pub fn display_name(language: Language) -> &'static str {
     spec(language).name
 }

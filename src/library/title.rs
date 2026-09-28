@@ -12,10 +12,34 @@ pub const NOTE_EXTENSIONS: [&str; 14] = [
     "csv", "xml",
 ];
 
+/// A note's extension: `NOTE_EXTENSIONS` or any extension a highlighted language claims, except
+/// an image's (SVG is highlighted but listed as an image).
 pub fn is_note_extension(extension: &str) -> bool {
-    NOTE_EXTENSIONS
-        .iter()
-        .any(|known| known.eq_ignore_ascii_case(extension))
+    !is_image_extension(extension)
+        && (NOTE_EXTENSIONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(extension))
+            || crate::languages::is_language_extension(extension))
+}
+
+/// A note: a file with a note extension, or one a language claims by its whole name (`.env`,
+/// `Cargo.lock`), unless it has an image extension.
+pub fn is_note_path(path: &Path) -> bool {
+    match path.extension() {
+        Some(extension) if is_image_extension(&extension.to_string_lossy()) => false,
+        Some(extension) if is_note_extension(&extension.to_string_lossy()) => true,
+        _ => path
+            .file_name()
+            .is_some_and(|name| crate::languages::is_language_file_name(&name.to_string_lossy())),
+    }
+}
+
+/// A file the notebook lists: a note or an image.
+pub fn is_listed_path(path: &Path) -> bool {
+    is_note_path(path)
+        || path
+            .extension()
+            .is_some_and(|extension| is_image_extension(&extension.to_string_lossy()))
 }
 
 /// Image files the notebook lists and FastPad shows (image preview spec §4). SVG is listed but
@@ -129,7 +153,8 @@ pub fn default_extension(language: Language) -> &'static str {
 }
 
 /// Splits what the user typed into a sanitized stem and an extension. A typed extension is kept
-/// only when it is a note extension, so "v1.2 plan" stays one stem.
+/// only when it is a note extension (a highlighted language's included), so "v1.2 plan" stays one
+/// stem and "build.ps1" is a PowerShell file.
 pub fn split_typed_name(input: &str, default_extension: &str) -> (String, String) {
     let input = input.trim();
     if let Some((stem, extension)) = input.rsplit_once('.')
@@ -319,12 +344,62 @@ mod tests {
     }
 
     #[test]
-    fn a_first_save_keeps_a_typed_extension_only_when_it_is_a_note_extension() {
-        // Deliberate (spec §14): "v1.2 plan" and "build.ps1" are both one name on a first save.
+    fn every_highlighted_file_is_listed_by_extension_or_whole_name() {
+        // Break caught: a script, source file or dotfile FastPad highlights missing from the
+        // Notebook tree, or binaries and unknown files appearing in it.
+        for name in [
+            "deploy.ps1",
+            "lib.rs",
+            "Main.CS",
+            "index.html",
+            "site.css",
+            "app.tsx",
+            "tool.py",
+            "run.sh",
+            "make.cmd",
+            "schema.sql",
+            "app.properties",
+            "data.jsonc",
+            "App.xaml",
+            ".env",
+            ".env.local",
+            ".bashrc",
+            ".editorconfig",
+            "Cargo.lock",
+            "notes.txt",
+            "logo.svg",
+            "photo.PNG",
+        ] {
+            assert!(is_listed_path(Path::new(name)), "{name}");
+        }
+        for name in ["setup.exe", "yarn.lock", "README", "archive.zip", ""] {
+            assert!(!is_listed_path(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn notes_are_every_listed_file_except_images() {
+        // Break caught: a text search reading PNG bytes, or skipping `.env` and `deploy.ps1`.
+        for name in [".env", "deploy.ps1", "Cargo.lock", "a.md", "b.log"] {
+            assert!(is_note_path(Path::new(name)), "{name}");
+        }
+        for name in ["a.png", "logo.svg", "setup.exe", "README"] {
+            assert!(!is_note_path(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_typed_language_extension_is_kept_on_new_notes_and_first_saves() {
+        // Break caught: New note turning `deploy.ps1` into `deploy.ps1.md`, or a first save of
+        // `main.rs` dropping its extension; an image extension still never makes a note.
+        assert_eq!(new_note_name("deploy.ps1").as_deref(), Some("deploy.ps1"));
+        assert_eq!(new_note_name("main.RS").as_deref(), Some("main.RS"));
         assert_eq!(
             split_typed_name("build.ps1", "md"),
-            ("build.ps1".into(), "md".into())
+            ("build".into(), "ps1".into())
         );
+        assert_eq!(new_note_name("x.svg").as_deref(), Some("x.svg.md"));
+        assert!(is_note_extension("sql") && !is_note_extension("svg"));
     }
 
     #[test]

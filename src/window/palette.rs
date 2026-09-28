@@ -127,7 +127,7 @@ static PALETTES: [Palette; Theme::COUNT] = [
     catppuccin(&catppuccin::MOCHA, true),
 ];
 
-/// The Notebook view's file-type icon colours (notebook folders spec §5.2): six Catppuccin
+/// The Notebook view's file-type icon colours (notebook folders spec §5.2): ten Catppuccin
 /// roles, from the theme's own flavour, Latte's for Light and Mocha's for Dark. High contrast
 /// uses the muted system colour for all of them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +138,10 @@ pub struct FileIcons {
     pub green: u32,
     pub maroon: u32,
     pub overlay2: u32,
+    pub red: u32,
+    pub pink: u32,
+    pub mauve: u32,
+    pub sky: u32,
 }
 
 const fn file_icons(flavor: &Flavor) -> FileIcons {
@@ -148,6 +152,10 @@ const fn file_icons(flavor: &Flavor) -> FileIcons {
         green: flavor.green,
         maroon: flavor.maroon,
         overlay2: flavor.overlay2,
+        red: flavor.red,
+        pink: flavor.pink,
+        mauve: flavor.mauve,
+        sky: flavor.sky,
     }
 }
 
@@ -177,6 +185,10 @@ impl FileIcons {
                 green: muted,
                 maroon: muted,
                 overlay2: muted,
+                red: muted,
+                pink: muted,
+                mauve: muted,
+                sky: muted,
             }
         } else {
             FILE_ICONS[theme as usize]
@@ -201,6 +213,10 @@ impl FileIcons {
             IconColor::Green => self.green,
             IconColor::Maroon => self.maroon,
             IconColor::Overlay2 => self.overlay2,
+            IconColor::Red => self.red,
+            IconColor::Pink => self.pink,
+            IconColor::Mauve => self.mauve,
+            IconColor::Sky => self.sky,
         }
     }
 }
@@ -273,6 +289,20 @@ impl Palette {
 mod tests {
     use super::Palette;
     use crate::catppuccin;
+    use crate::window::file_icons::IconColor;
+
+    const ALL_ICON_COLORS: [IconColor; 10] = [
+        IconColor::Blue,
+        IconColor::Yellow,
+        IconColor::Peach,
+        IconColor::Green,
+        IconColor::Maroon,
+        IconColor::Overlay2,
+        IconColor::Red,
+        IconColor::Pink,
+        IconColor::Mauve,
+        IconColor::Sky,
+    ];
     use crate::languages::{rgb, syntax_colors};
     use crate::platform::theme::Theme;
     use windows_sys::Win32::Graphics::Gdi::{
@@ -463,19 +493,17 @@ mod tests {
                 ),
                 "{theme:?}"
             );
+            assert_eq!(
+                (icons.red, icons.pink, icons.mauve, icons.sky),
+                (flavor.red, flavor.pink, flavor.mauve, flavor.sky),
+                "{theme:?}"
+            );
             let muted = Palette::for_theme(theme, true).muted_foreground;
             let system = FileIcons::for_theme(theme, true);
             assert!(
-                [
-                    system.blue,
-                    system.yellow,
-                    system.peach,
-                    system.green,
-                    system.maroon,
-                    system.overlay2
-                ]
-                .iter()
-                .all(|&color| color == muted)
+                ALL_ICON_COLORS
+                    .iter()
+                    .all(|&role| system.color(role) == muted)
             );
         }
         assert_eq!(
@@ -493,14 +521,7 @@ mod tests {
         for theme in Theme::ALL {
             let palette = Palette::for_theme(theme, false);
             let icons = FileIcons::for_theme(theme, false);
-            for color in [
-                icons.blue,
-                icons.yellow,
-                icons.peach,
-                icons.green,
-                icons.maroon,
-                icons.overlay2,
-            ] {
+            for color in ALL_ICON_COLORS.map(|role| icons.color(role)) {
                 for background in [
                     palette.selection_background,
                     palette.inactive_selection_background,
