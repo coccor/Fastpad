@@ -11827,13 +11827,13 @@ mod tests {
 
     #[test]
     fn renaming_to_the_prefilled_name_keeps_a_non_note_or_extensionless_file_as_it_is() {
-        // Break caught: "script.py" prefilled and submitted as-is becoming script.py.py, and an
+        // Break caught: "script.lua" prefilled and submitted as-is becoming script.lua.lua, and an
         // extensionless README gaining ".md".
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("rename-kinds");
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
-        for name in ["script.py", "README"] {
+        for name in ["script.lua", "README"] {
             let path = open_note(&window, &scratch, name, "x");
             execute_command(window.hwnd, CommandId::NoteRename);
             assert_eq!(app_mut(window.hwnd).name_box.as_ref().unwrap().text(), name);
@@ -11851,7 +11851,7 @@ mod tests {
             .filter(|name| !name.starts_with('.'))
             .collect();
         names.sort();
-        assert_eq!(names, ["README", "script.py"]);
+        assert_eq!(names, ["README", "script.lua"]);
 
         execute_command(window.hwnd, CommandId::NoteRename);
         type_into_name_box(window.hwnd, "tool");
