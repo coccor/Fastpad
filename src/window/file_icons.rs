@@ -14,7 +14,6 @@ pub(crate) enum IconColor {
     Green,
     Maroon,
     Overlay2,
-    Red,
     Pink,
     Mauve,
     Sky,

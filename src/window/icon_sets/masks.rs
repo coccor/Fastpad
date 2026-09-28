@@ -165,7 +165,7 @@ pub(crate) fn mask_icon(item: TreeItem) -> (MaskIcon, IconColor) {
             NoteKind::JavaScript => (MaskIcon::JavaScript, IconColor::Yellow),
             NoteKind::TypeScript => (MaskIcon::TypeScript, IconColor::Blue),
             NoteKind::Python => (MaskIcon::Python, IconColor::Blue),
-            NoteKind::Rust => (MaskIcon::Rust, IconColor::Red),
+            NoteKind::Rust => (MaskIcon::Rust, IconColor::Peach),
             NoteKind::C => (MaskIcon::C, IconColor::Sky),
             NoteKind::Cpp => (MaskIcon::Cpp, IconColor::Blue),
             NoteKind::CSharp => (MaskIcon::CSharp, IconColor::Mauve),
@@ -310,8 +310,7 @@ mod tests {
     #[test]
     fn minimal_outlines_are_lighter_than_solid_shapes() {
         // Break caught: the two sets' folders swapped, or an outline SVG filled (spec §3). Only
-        // the icons that are the same shape in both sets: Minimal's Markdown adds a frame, and Rust
-        // is the official logo, filled in both.
+        // the icons that are the same shape in both sets: Minimal's Markdown adds a frame.
         for icon in [
             MaskIcon::Folder,
             MaskIcon::FolderOpen,
@@ -324,6 +323,7 @@ mod tests {
             MaskIcon::JavaScript,
             MaskIcon::TypeScript,
             MaskIcon::Python,
+            MaskIcon::Rust,
             MaskIcon::C,
             MaskIcon::Cpp,
             MaskIcon::CSharp,
@@ -373,7 +373,7 @@ mod tests {
             ("a.js", (MaskIcon::JavaScript, IconColor::Yellow)),
             ("a.ts", (MaskIcon::TypeScript, IconColor::Blue)),
             ("a.py", (MaskIcon::Python, IconColor::Blue)),
-            ("a.rs", (MaskIcon::Rust, IconColor::Red)),
+            ("a.rs", (MaskIcon::Rust, IconColor::Peach)),
             ("a.h", (MaskIcon::C, IconColor::Sky)),
             ("a.cpp", (MaskIcon::Cpp, IconColor::Blue)),
             ("a.cs", (MaskIcon::CSharp, IconColor::Mauve)),

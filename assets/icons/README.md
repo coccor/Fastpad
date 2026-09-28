@@ -21,9 +21,6 @@ Every other highlighted language has its own shape: `html`, `css`, `javascript`,
 `python`, `rust`, `c`, `cpp`, `csharp`, `powershell`, `bash`, `batch`, `sql`, `env` and
 `properties`. Keep them distinct; a test fails if two languages share a shape.
 
-`rust.svg` is the official Rust logo (`rust-logo-single-path.svg` from `rust-lang/rust-artwork`,
-CC BY 4.0), scaled into the canvas and filled in both sets; see `licenses/rust-logo.txt`.
-
 Draw only the shape. FastPad applies the colour when it draws: blue for Markdown, yellow for
 folders and JSON, and so on, taken from the theme.
 
