@@ -40,6 +40,12 @@ pub(crate) mod tree_copy;
 pub(crate) mod tree_drag;
 pub(crate) mod tree_move;
 
+#[cfg(test)]
+#[allow(
+    unused_imports,
+    reason = "consumed by the source-linked image_preview integration target"
+)]
+pub(crate) use main_window::build_session;
 pub(crate) use main_window::{
     INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
     clear_input_priority, initialize_editor_with, input_priority_requested,

@@ -8,6 +8,7 @@ use crate::Result;
 use crate::document::{DocumentId, Language};
 use crate::editor::scintilla_constants::SC_MOD_INSERTTEXT;
 use crate::editor::{Editor, ScintillaNotification};
+use crate::image_view::ImageView;
 use crate::platform::wide_null;
 use crate::preview::colors::{PreviewColors, preview_colors};
 use crate::preview::dwrite::Graphics;
@@ -44,8 +45,8 @@ pub(crate) const PREVIEW_TIMER_ID: usize = 0x4650_5056;
 const DIVIDER_WIDTH_AT_96_DPI: i32 = 4;
 const MIN_RATIO: f32 = 0.2;
 const MAX_RATIO: f32 = 0.8;
-const NOT_MARKDOWN_NOTICE: &str = "Markdown preview is available for Markdown documents. Choose \
-                                   View > Markdown to treat this tab as Markdown.";
+const NOT_MARKDOWN_NOTICE: &str = "Markdown preview is available for Markdown and SVG documents. \
+                                   Choose View > Markdown to treat this tab as Markdown.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ScrollOrigin {
@@ -57,6 +58,10 @@ pub(crate) enum ScrollOrigin {
 pub(crate) struct PreviewHost {
     pub(crate) mode: PreviewMode,
     pub(crate) view: Option<PreviewView>,
+    /// The SVG preview (image preview spec §8): an image view in the preview slot of an SVG tab.
+    pub(crate) svg_view: Option<ImageView>,
+    /// The SVG tab `svg_view` shows; `None` forces a reload when next shown.
+    pub(crate) svg_document: Option<DocumentId>,
     /// Declared after `view`: the preview window's own state holds `Rc<Graphics>` references, and
     /// this one must outlive every Direct2D and DirectWrite object they create.
     graphics: Option<Rc<Graphics>>,
@@ -85,6 +90,8 @@ impl std::fmt::Debug for PreviewHost {
             .debug_struct("PreviewHost")
             .field("mode", &self.mode)
             .field("view", &self.view)
+            .field("svg_view", &self.svg_view)
+            .field("svg_document", &self.svg_document)
             .field("graphics_loaded", &self.graphics.is_some())
             .field("ratio", &self.ratio)
             .field("edits", &self.edits)
@@ -107,6 +114,8 @@ impl Default for PreviewHost {
         Self {
             mode: PreviewMode::Off,
             view: None,
+            svg_view: None,
+            svg_document: None,
             graphics: None,
             ratio: 0.5,
             edits: EditLog::default(),
@@ -267,17 +276,89 @@ pub(crate) fn active_document(hwnd: HWND) -> Option<(DocumentId, Language, Optio
 }
 
 pub(crate) fn buttons_visible(hwnd: HWND) -> bool {
-    active_document(hwnd).is_some_and(|(_, language, _)| language == Language::Markdown)
+    active_document(hwnd)
+        .is_some_and(|(_, language, _)| matches!(language, Language::Markdown | Language::Svg))
+}
+
+fn active_is_svg(hwnd: HWND) -> bool {
+    active_document(hwnd).is_some_and(|(_, language, _)| language == Language::Svg)
+}
+
+fn svg_view(hwnd: HWND) -> Option<ImageView> {
+    with_host(hwnd, |host| host.svg_view).flatten()
 }
 
 pub(crate) fn preview_shown(hwnd: HWND) -> bool {
-    mode(hwnd) != PreviewMode::Off && buttons_visible(hwnd) && view(hwnd).is_some()
+    mode(hwnd) != PreviewMode::Off
+        && buttons_visible(hwnd)
+        && if active_is_svg(hwnd) {
+            svg_view(hwnd).is_some()
+        } else {
+            view(hwnd).is_some()
+        }
 }
 
 pub(crate) fn full_view_hwnd(hwnd: HWND) -> Option<HWND> {
-    (mode(hwnd) == PreviewMode::Full && preview_shown(hwnd))
-        .then(|| view(hwnd).map(|view| view.hwnd()))
-        .flatten()
+    if mode(hwnd) != PreviewMode::Full || !preview_shown(hwnd) {
+        return None;
+    }
+    if active_is_svg(hwnd) {
+        svg_view(hwnd).map(|view| view.hwnd())
+    } else {
+        view(hwnd).map(|view| view.hwnd())
+    }
+}
+
+fn ensure_svg_view(hwnd: HWND) -> Result<ImageView> {
+    if let Some(view) = svg_view(hwnd) {
+        return Ok(view);
+    }
+    let graphics = shared_graphics(hwnd)?;
+    let (colors, high_contrast) = image_colors(hwnd);
+    let view = ImageView::create(hwnd, graphics, colors, high_contrast)?;
+    with_host(hwnd, |host| {
+        host.svg_view = Some(view);
+        host.svg_document = None;
+    });
+    Ok(view)
+}
+
+/// Sends the SVG tab's current text to the SVG preview.
+fn load_svg(hwnd: HWND) {
+    let (Some(view), Some(editor), Some((id, ..))) =
+        (svg_view(hwnd), editor(hwnd), active_document(hwnd))
+    else {
+        return;
+    };
+    with_host(hwnd, |host| host.svg_document = Some(id));
+    if editor.length().unwrap_or(0) as u64 > crate::preview::svg::MAX_SVG_BYTES {
+        view.show_error(crate::image_view::decode::ImageError::SvgTooLarge);
+        return;
+    }
+    let name = unsafe { host_window::app_ptr(hwnd) }
+        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.title()))
+        .unwrap_or_default();
+    if let Ok(text) = editor.text() {
+        view.show_svg(std::sync::Arc::from(text), &name);
+    }
+}
+
+/// Zooms the SVG preview while it has the keyboard focus; false otherwise, so the editor zooms.
+pub(crate) fn zoom_svg(hwnd: HWND, command: CommandId) -> bool {
+    let Some(view) = svg_view(hwnd).filter(|view| {
+        active_is_svg(hwnd)
+            && mode(hwnd) != PreviewMode::Off
+            && unsafe { GetFocus() } == view.hwnd()
+    }) else {
+        return false;
+    };
+    match command {
+        CommandId::ZoomIn => view.zoom_in(),
+        CommandId::ZoomOut => view.zoom_out(),
+        CommandId::ZoomReset => view.zoom_reset(),
+        _ => return false,
+    }
+    true
 }
 
 pub(crate) fn run_command(hwnd: HWND, command: CommandId) {
@@ -330,7 +411,7 @@ pub(crate) fn set_mode(hwnd: HWND, next: PreviewMode) {
     }
     sync_visibility(hwnd);
     let focus = match (previous, next) {
-        (_, PreviewMode::Full) => view(hwnd).map(|view| view.hwnd()),
+        (_, PreviewMode::Full) => full_view_hwnd(hwnd),
         (PreviewMode::Full, _) => unsafe { host_window::editor_hwnd(hwnd) },
         _ => None,
     };
@@ -346,16 +427,23 @@ fn close_view(hwnd: HWND) {
         host.full_parse_pending = false;
         host.divider = None;
         host.hover_text = None;
-        host.view.take()
+        host.svg_document = None;
+        (host.view.take(), host.svg_view.take())
     })
-    .flatten();
+    .unwrap_or((None, None));
     unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
-    if let Some(view) = closed {
-        let had_focus = unsafe { GetFocus() } == view.hwnd();
+    let focus = unsafe { GetFocus() };
+    let mut had_focus = false;
+    if let Some(view) = closed.0 {
+        had_focus |= focus == view.hwnd();
         view.destroy();
-        if had_focus && let Some(editor) = unsafe { host_window::editor_hwnd(hwnd) } {
-            unsafe { SetFocus(editor) };
-        }
+    }
+    if let Some(view) = closed.1 {
+        had_focus |= focus == view.hwnd();
+        view.destroy();
+    }
+    if had_focus && let Some(editor) = unsafe { host_window::editor_hwnd(hwnd) } {
+        unsafe { SetFocus(editor) };
     }
     host_window::invalidate_status_bar(hwnd);
 }
@@ -386,6 +474,10 @@ pub(crate) fn refresh_appearance(hwnd: HWND) {
     if let Some(view) = view(hwnd) {
         let (colors, fonts, dark) = appearance(hwnd);
         view.set_appearance(colors, fonts, dark);
+    }
+    if let Some(view) = svg_view(hwnd) {
+        let (colors, high_contrast) = image_colors(hwnd);
+        view.set_appearance(colors, high_contrast);
     }
 }
 
@@ -432,9 +524,12 @@ fn ensure_view(hwnd: HWND) -> Result<PreviewView> {
 /// document when the preview shows something else. Called after mode changes, tab activation or
 /// closing, language changes, and file loads.
 pub(crate) fn sync_visibility(hwnd: HWND) {
-    let markdown = buttons_visible(hwnd);
+    let svg = active_is_svg(hwnd);
+    let markdown = buttons_visible(hwnd) && !svg;
     if let Some(app) = unsafe { host_window::app_ptr(hwnd) } {
-        unsafe { app.as_ref() }.tabs.set_preview_buttons(markdown);
+        unsafe { app.as_ref() }
+            .tabs
+            .set_preview_buttons(markdown || svg);
     }
     let wanted = mode(hwnd);
     let mut view = view(hwnd);
@@ -472,13 +567,42 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
             load_active_document(hwnd, false);
         }
     }
+    let mut shown_svg = None;
+    if wanted != PreviewMode::Off && svg {
+        match ensure_svg_view(hwnd) {
+            Ok(view) => shown_svg = Some(view),
+            Err(error) => {
+                with_host(hwnd, |host| host.mode = PreviewMode::Off);
+                host_window::push_notice(
+                    hwnd,
+                    format!("FastPad could not open the SVG preview: {error}"),
+                );
+            }
+        }
+    }
+    if let Some(view) = svg_view(hwnd) {
+        if shown_svg.is_some() {
+            unsafe { ShowWindow(view.hwnd(), SW_SHOWNA) };
+            let active = active_document(hwnd).map(|(id, ..)| id);
+            if with_host(hwnd, |host| host.svg_document).flatten() != active {
+                load_svg(hwnd);
+            }
+        } else {
+            with_host(hwnd, |host| host.svg_document = None);
+            unsafe { ShowWindow(view.hwnd(), SW_HIDE) };
+            view.release();
+        }
+    }
     let editor_hwnd = unsafe { host_window::editor_hwnd(hwnd) };
-    let hide_editor = shown && wanted == PreviewMode::Full;
-    if let (Some(editor), Some(view)) = (editor_hwnd, view)
+    let hide_editor = (shown || shown_svg.is_some()) && wanted == PreviewMode::Full;
+    let focus_view = shown_svg
+        .map(|view| view.hwnd())
+        .or(view.map(|view| view.hwnd()));
+    if let (Some(editor), Some(target)) = (editor_hwnd, focus_view)
         && hide_editor
         && unsafe { GetFocus() } == editor
     {
-        unsafe { SetFocus(view.hwnd()) };
+        unsafe { SetFocus(target) };
     }
     if let Some(view) = view {
         unsafe { ShowWindow(view.hwnd(), if shown { SW_SHOWNA } else { SW_HIDE }) };
@@ -649,6 +773,10 @@ pub(crate) fn record_edit(hwnd: HWND, notification: &ScintillaNotification) {
         lines_delta: notification.lines_added,
     };
     let recorded = with_host(hwnd, |host| {
+        // The SVG preview renders the whole text again after the pause; it keeps no edit log.
+        if host.svg_document.is_some() {
+            return true;
+        }
         if host.view.is_none() || host.document.is_none() {
             return false;
         }
@@ -717,6 +845,15 @@ pub(crate) fn flush(hwnd: HWND) {
         unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
         return;
     }
+    if active_is_svg(hwnd) {
+        if with_host(hwnd, |host| host.svg_document)
+            .flatten()
+            .is_some()
+        {
+            load_svg(hwnd);
+        }
+        return;
+    }
     let (Some(view), Some(editor), Some((id, ..))) =
         (view(hwnd), editor(hwnd), active_document(hwnd))
     else {
@@ -777,7 +914,10 @@ pub(crate) fn refresh(hwnd: HWND) {
 
 /// A file finished loading into the active tab: its text replaced whatever the preview showed.
 pub(crate) fn document_reloaded(hwnd: HWND) {
-    with_host(hwnd, |host| host.document = None);
+    with_host(hwnd, |host| {
+        host.document = None;
+        host.svg_document = None;
+    });
     sync_visibility(hwnd);
 }
 
@@ -964,10 +1104,15 @@ pub(crate) fn layout(hwnd: HWND, area: RECT, dpi: u32) -> ContentRects {
         host.area = Some(area);
         host.divider = rects.divider;
     });
-    if let (Some(view), Some(rect)) = (view(hwnd), rects.preview) {
+    let slot = if active_is_svg(hwnd) {
+        svg_view(hwnd).map(|view| view.hwnd())
+    } else {
+        view(hwnd).map(|view| view.hwnd())
+    };
+    if let (Some(view), Some(rect)) = (slot, rects.preview) {
         unsafe {
             MoveWindow(
-                view.hwnd(),
+                view,
                 rect.left,
                 rect.top,
                 rect.right - rect.left,

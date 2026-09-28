@@ -132,3 +132,7 @@ path = "tests/windows/markdown_preview.rs"
 [[test]]
 name = "library"
 path = "tests/windows/library.rs"
+
+[[test]]
+name = "image_preview"
+path = "tests/windows/image_preview.rs"

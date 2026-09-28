@@ -2696,7 +2696,8 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::NextTab => cycle_tab(hwnd, true),
         CommandId::PreviousTab => cycle_tab(hwnd, false),
         CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ZoomReset
-            if crate::window::image_host::zoom(hwnd, command) => {}
+            if crate::window::image_host::zoom(hwnd, command)
+                || crate::window::preview_host::zoom_svg(hwnd, command) => {}
         CommandId::ZoomIn => with_editor(hwnd, |editor| {
             let _ = editor.zoom_in();
         }),
