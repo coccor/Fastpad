@@ -1,4 +1,4 @@
-//! Material Icon Theme's 12 tree icons (icon sets spec §3, §5): premultiplied BGRA pixels at each
+//! Material Icon Theme's 13 tree icons (icon sets spec §3, §5): premultiplied BGRA pixels at each
 //! stored size, generated from `assets/icons/material/svg/` by `generate.rs` and embedded. An
 //! icon's place in the blob follows from `MaterialIcon::ALL` and `SIZES`: icons in list order,
 //! sizes smallest first, each `size * size * 4` bytes.
@@ -32,12 +32,13 @@ pub(crate) enum MaterialIcon {
     Log,
     Folder,
     FolderOpen,
+    Image,
 }
 
 impl MaterialIcon {
     /// Every icon, in blob order (`ALL[icon as usize] == icon`).
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::Markdown,
         Self::Json,
         Self::Yaml,
@@ -50,6 +51,7 @@ impl MaterialIcon {
         Self::Log,
         Self::Folder,
         Self::FolderOpen,
+        Self::Image,
     ];
 
     /// The SVG in `assets/icons/material/svg/` this icon is made from.
@@ -68,6 +70,7 @@ impl MaterialIcon {
             Self::Log => "log.svg",
             Self::Folder => "folder.svg",
             Self::FolderOpen => "folder-open.svg",
+            Self::Image => "image.svg",
         }
     }
 }
