@@ -288,3 +288,30 @@ Editing, rotating, saving or converting images; animated GIF/WebP playback; copy
 the clipboard; image thumbnails in the tree; remote images; persisting zoom; slideshow or
 next/previous image in folder; renaming the "Markdown preview" commands; XML syntax
 highlighting for SVG.
+
+## 13. Amendments from planning (2026-09-27)
+
+These are code facts found while writing the plan, and they refine the sections above:
+
+1. **§5 tab model.** Only `handle` moves into `Content`. Only 8 sites read it. The ~120 reads of
+   `language`/`encoding`/`generation` stay on `Document` and are simply unused by image tabs.
+   Save safety does not rely on the type system: every save path refuses an image tab
+   explicitly (`save_command`, `save_as_command`, `save_active_document`,
+   `save_active_document_as`, `save_active_to`), and a test checks the bytes are unchanged.
+2. **§6.5 disk changes.** Text tabs have no disk-change check on activation today, so only
+   image tabs gain one. It runs on tab activation and on `WM_ACTIVATEAPP` (active). Text tabs
+   are unchanged.
+3. **§5 menus.** Today the Edit and Search menus are never grayed. A new
+   `menus::set_text_commands_enabled` grays `CommandId::TEXT_COMMANDS` in every menu while an
+   image tab is active.
+4. **§6.4 D2D load failure.** When `Graphics::load` fails there is no Direct2D view to draw the
+   failed state in. The image tab stays open and blank, and a notice appears once: "FastPad
+   could not display images: {error}".
+5. **§9 rename across kinds.** An open tab keeps its kind when its file is renamed to the other
+   kind. It opens with the right kind the next time it is opened. No automatic reopen.
+6. **§9 inline rename.** Typing an image extension on a renamed image is kept. `pic.png` → `x.jpg`
+   gives `x.jpg`, not `x.jpg.png`, because `title::rename_parts` accepts listed extensions.
+7. **§7 Markdown links.** Covered by the shared `open_path`. There is no dedicated end-to-end
+   test, because `follow_link` needs a posted payload. The open path itself is tested.
+8. **§6.3 grab cursor.** Windows has no grab cursor. `IDC_SIZEALL` shows while the image is
+   larger than the view.
