@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 74] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 65] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -78,15 +78,6 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 74] {
         accelerator(FALT, b'7', CommandId::SelectTab7),
         accelerator(FALT, b'8', CommandId::SelectTab8),
         accelerator(FALT, b'9', CommandId::SelectTab9),
-        virtual_key(FALT, VK_NUMPAD1, CommandId::SelectTab1),
-        virtual_key(FALT, VK_NUMPAD2, CommandId::SelectTab2),
-        virtual_key(FALT, VK_NUMPAD3, CommandId::SelectTab3),
-        virtual_key(FALT, VK_NUMPAD4, CommandId::SelectTab4),
-        virtual_key(FALT, VK_NUMPAD5, CommandId::SelectTab5),
-        virtual_key(FALT, VK_NUMPAD6, CommandId::SelectTab6),
-        virtual_key(FALT, VK_NUMPAD7, CommandId::SelectTab7),
-        virtual_key(FALT, VK_NUMPAD8, CommandId::SelectTab8),
-        virtual_key(FALT, VK_NUMPAD9, CommandId::SelectTab9),
         virtual_key(FCONTROL | FALT, VK_RIGHT, CommandId::MoveTabToNextGroup),
         virtual_key(FCONTROL | FALT, VK_LEFT, CommandId::MoveTabToPreviousGroup),
         // "+" shares a key with "=" on most layouts, so Ctrl+Shift+= is Ctrl++ as typed.
@@ -641,7 +632,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 74);
+        assert_eq!(specs.len(), 65);
     }
 
     #[test]
@@ -699,7 +690,9 @@ mod tests {
             Some(CommandId::PreviousTab)
         );
         // Split editors spec §6: Ctrl+digits focus groups, Alt+digits select tabs.
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_NUMPAD2, VK_RIGHT};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_LEFT, VK_NUMPAD0, VK_NUMPAD2, VK_RIGHT,
+        };
         assert_eq!(
             bound(FCONTROL, u16::from(b'1')),
             Some(CommandId::FocusGroup1)
@@ -710,7 +703,11 @@ mod tests {
         );
         assert_eq!(bound(FCONTROL, VK_NUMPAD2), Some(CommandId::FocusGroup2));
         assert_eq!(bound(FALT, u16::from(b'1')), Some(CommandId::SelectTab1));
-        assert_eq!(bound(FALT, VK_NUMPAD9), Some(CommandId::SelectTab9));
+        // Alt with numpad digits types Alt codes (Alt+0233 is é): an accelerator there would
+        // swallow each digit before TranslateMessage composes the character.
+        for key in VK_NUMPAD0..=VK_NUMPAD9 {
+            assert_eq!(bound(FALT, key), None, "Alt+numpad {key}");
+        }
         assert_eq!(
             bound(FCONTROL | FALT, VK_RIGHT),
             Some(CommandId::MoveTabToNextGroup)

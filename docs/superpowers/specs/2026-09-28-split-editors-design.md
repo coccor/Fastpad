@@ -156,7 +156,7 @@ Each command is in the menu band (a new **View ▸ Editor Layout** submenu), the
 | Split Down | Ctrl+Shift+\\ | The same, below. |
 | Focus Group 1..8 | Ctrl+1..8 | Focuses group N. If group N doesn't exist, the active document is split into a new group to the right of the last group, as in VS Code. |
 | Focus Last Group | Ctrl+9 | |
-| Select Tab 1..8, Last Tab | Alt+1..9 | Within the active group. Moved from Ctrl+1..9, keeping the numpad variants. |
+| Select Tab 1..8, Last Tab | Alt+1..9 | Within the active group. Moved from Ctrl+1..9. Only the top-row digits: Alt with numpad digits types Alt codes. |
 | Move Tab to Next Group | Ctrl+Alt+Right | Moves the active view to the next group in numbering order. If there is none, a group is created on the right. |
 | Move Tab to Previous Group | Ctrl+Alt+Left | Moves the active view to the previous group. Does nothing in group 1. |
 | Close Group | File menu, the strip's right-click menu, palette | Closes each tab with the usual prompts. Cancelling a prompt stops the command and keeps the group. |
