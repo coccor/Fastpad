@@ -46,6 +46,19 @@ pub struct SearchNote {
     pub online_only: bool,
 }
 
+/// The notes a search reads: every listed text note, never an image (image preview spec §9).
+pub fn search_notes<'a>(notes: impl IntoIterator<Item = &'a super::NoteEntry>) -> Vec<SearchNote> {
+    notes
+        .into_iter()
+        .filter(|note| {
+            note.path.extension().is_some_and(|extension| {
+                super::title::is_note_extension(&extension.to_string_lossy())
+            })
+        })
+        .map(SearchNote::from)
+        .collect()
+}
+
 impl From<&super::NoteEntry> for SearchNote {
     fn from(note: &super::NoteEntry) -> Self {
         SearchNote {
@@ -420,6 +433,28 @@ fn read_note(
 mod tests {
     use super::*;
     use crate::search::MatchOptions;
+
+    #[test]
+    fn search_never_reads_images_listed_in_the_notebook() {
+        // Break caught: Search opening every PNG as text and reporting binary noise as matches.
+        let entry = |path: &str| super::super::NoteEntry {
+            path: path.into(),
+            size: 1,
+            mtime: 0,
+            online_only: false,
+        };
+        let notes = [
+            entry("a.md"),
+            entry(r"pics\b.png"),
+            entry("c.svg"),
+            entry("d.txt"),
+        ];
+        let paths = search_notes(&notes)
+            .into_iter()
+            .map(|note| note.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, [PathBuf::from("a.md"), PathBuf::from("d.txt")]);
+    }
 
     struct Scratch(PathBuf);
 

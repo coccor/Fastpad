@@ -147,8 +147,8 @@ pub(crate) fn rename_selection(name: &str, folder: bool) -> (usize, usize) {
     }
 }
 
-/// What the draft row shows an icon for (spec §3.1): a closed folder, or the note type of the
-/// note extension typed so far, Markdown until one is.
+/// What the draft row shows an icon for (spec §3.1): a closed folder, or the type of the listed
+/// extension typed so far, Markdown until one is.
 pub(crate) fn draft_icon(purpose: &Purpose, text: &str) -> TreeItem {
     if purpose.is_folder() {
         return TreeItem::Folder { expanded: false };
@@ -157,7 +157,7 @@ pub(crate) fn draft_icon(purpose: &Purpose, text: &str) -> TreeItem {
         .trim()
         .rsplit_once('.')
         .map(|(_, extension)| extension)
-        .filter(|extension| title::is_note_extension(extension))
+        .filter(|extension| title::is_listed_extension(extension))
         .unwrap_or("md");
     TreeItem::Note(note_kind(Some(extension)))
 }

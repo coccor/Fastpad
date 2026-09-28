@@ -146,10 +146,9 @@ pub fn scan_limited(folder: &Path, limit: usize, folder_limit: usize) -> Result<
                             }
                             pending.push((path, None));
                         }
-                    } else if Path::new(&name)
-                        .extension()
-                        .is_some_and(|ext| super::title::is_note_extension(&ext.to_string_lossy()))
-                    {
+                    } else if Path::new(&name).extension().is_some_and(|ext| {
+                        super::title::is_listed_extension(&ext.to_string_lossy())
+                    }) {
                         if scan.entries.len() >= limit {
                             scan.truncated = true;
                             return Ok(scan);
@@ -215,6 +214,18 @@ mod tests {
             .collect();
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn images_are_listed_next_to_notes_and_other_files_are_not() {
+        // Break caught: images missing from the tree, or executables and archives appearing in it.
+        let scratch = Scratch::new("images");
+        scratch.file("a.md", "a");
+        scratch.file(r"pics\b.PNG", "x");
+        scratch.file("c.svg", "<svg/>");
+        scratch.file("d.exe", "x");
+        let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
+        assert_eq!(paths(&scan), ["a.md", "c.svg", r"pics\b.PNG"]);
     }
 
     fn folders(scan: &Scan) -> Vec<String> {

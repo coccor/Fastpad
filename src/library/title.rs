@@ -166,7 +166,7 @@ fn rename_parts<'a>(input: &'a str, current: Option<&'a str>) -> (&'a str, Optio
         return (stem, Some(extension));
     }
     if let Some((stem, extension)) = input.rsplit_once('.')
-        && is_note_extension(extension)
+        && is_listed_extension(extension)
     {
         return (stem, Some(extension));
     }
@@ -176,7 +176,8 @@ fn rename_parts<'a>(input: &'a str, current: Option<&'a str>) -> (&'a str, Optio
 /// Splits a name typed to rename a file whose extension is `current` (`None`: it has none).
 /// The file keeps its kind unless the user types another one:
 /// - a name ending in `.<current>` (any case) splits there, so `script.py` stays `script.py`;
-/// - otherwise a typed note extension is taken, so `plan.txt` renames `plan.md` to a `.txt`;
+/// - otherwise a typed note or image extension is taken, so `plan.txt` renames `plan.md` to a
+///   `.txt` and `x.jpg` renames `pic.png` to `x.jpg`;
 /// - otherwise the current extension is kept, and an extensionless file stays extensionless.
 pub fn split_rename(input: &str, current: Option<&str>) -> (String, Option<String>) {
     let (stem, extension) = rename_parts(input, current);
@@ -221,6 +222,21 @@ pub fn note_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renaming_an_image_keeps_or_changes_its_image_extension() {
+        // Break caught: "x.jpg" typed on pic.png becoming "x.jpg.png", a bare name losing ".png",
+        // or New note creating an image.
+        assert_eq!(
+            renamed_note_name("x", Some("png")).as_deref(),
+            Some("x.png")
+        );
+        assert_eq!(
+            renamed_note_name("x.jpg", Some("png")).as_deref(),
+            Some("x.jpg")
+        );
+        assert_eq!(new_note_name("x.png").as_deref(), Some("x.png.md"));
+    }
 
     #[test]
     fn images_are_listed_but_only_raster_images_open_as_images() {
