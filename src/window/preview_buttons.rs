@@ -59,7 +59,8 @@ fn button_size(dpi: u32) -> i32 {
     scale(28, dpi)
 }
 
-/// The main window's floating preview buttons, once created.
+/// The active group's floating preview buttons, once created.
+#[cfg(test)]
 pub(crate) fn hwnd(main: HWND) -> Option<HWND> {
     crate::window::main_window::with_group(main, |group| group.preview_buttons.hwnd)
         .filter(|hwnd| !hwnd.is_null())
@@ -109,17 +110,30 @@ pub(crate) fn rect_in_group(group: HWND, button: PreviewButton) -> Option<Rect> 
     ))
 }
 
-/// Shows the pair at the top-right of `area` (the group's content, in its client coordinates),
-/// clear of a vertical scroll bar, while the active tab can preview; hides it otherwise.
+/// Shows `group`'s pair at the top-right of `area` (the group's content, in its client
+/// coordinates), clear of a vertical scroll bar, while that group's active tab can preview; hides
+/// it otherwise.
 pub(crate) fn layout(main: HWND, group: HWND, area: RECT, dpi: u32) {
-    let existing = hwnd(main);
-    if !crate::window::preview_host::buttons_visible(main) {
+    let Some(id) = crate::window::main_window::group_id_of(main, group) else {
+        return;
+    };
+    let existing =
+        crate::window::main_window::with_group_id(main, id, |state| state.preview_buttons.hwnd)
+            .filter(|hwnd| !hwnd.is_null());
+    let previewable =
+        crate::window::preview_host::group_document(main, id).is_some_and(|(_, language, _)| {
+            matches!(
+                language,
+                crate::document::Language::Markdown | crate::document::Language::Svg
+            )
+        });
+    if !previewable {
         if let Some(buttons) = existing {
             unsafe { ShowWindow(buttons, SW_HIDE) };
         }
         return;
     }
-    let Some(buttons) = existing.or_else(|| create(main, group)) else {
+    let Some(buttons) = existing.or_else(|| create(main, id, group)) else {
         return;
     };
     let size = button_size(dpi);
@@ -141,14 +155,16 @@ pub(crate) fn layout(main: HWND, group: HWND, area: RECT, dpi: u32) {
     }
 }
 
-fn create(main: HWND, group: HWND) -> Option<HWND> {
+fn create(main: HWND, id: crate::window::split_tree::GroupId, group: HWND) -> Option<HWND> {
     let buttons = crate::window::panel::create_child(
         group,
         register_class().ok()?,
         WS_CHILD | WS_CLIPSIBLINGS,
     )
     .ok()?;
-    crate::window::main_window::with_group(main, |state| state.preview_buttons.hwnd = buttons);
+    crate::window::main_window::with_group_id(main, id, |state| {
+        state.preview_buttons.hwnd = buttons;
+    });
     Some(buttons)
 }
 

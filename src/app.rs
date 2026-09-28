@@ -8,10 +8,12 @@ use crate::platform::theme::SystemTheme;
 use crate::window::accessibility::AccessibilityState;
 use crate::window::command_palette::CommandPalette;
 use crate::window::commands::CommandId;
+use crate::window::editor_group::GroupWindow;
 use crate::window::find_bar::FindBar;
 use crate::window::menu_band::MenuMode;
 use crate::window::menus::{AcceleratorTable, MenuBar};
 use crate::window::notification::NotificationCenter;
+use crate::window::split_tree::GroupId;
 use crate::window::status::StatusModel;
 use crate::window::tabs::Tabs;
 use crate::window::titlebar::{LogoIcon, PointerState, TitleFonts};
@@ -20,6 +22,7 @@ use std::ffi::c_void;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::IsChild;
 
 #[derive(Clone, Debug)]
 pub(crate) struct WindowIdentity {
@@ -36,16 +39,17 @@ enum WindowIdentityState {
 #[derive(Debug)]
 pub struct App {
     pub hwnd: HWND,
-    pub editor: Option<Editor>,
     pub launch: LaunchOptions,
     pub startup: StartupMetrics,
     pub(crate) tabs: Tabs,
     /// The hidden Scintilla that creates every document and reads and edits background tabs
     /// (split editors spec §3.1).
     pub(crate) document_host: Option<Editor>,
-    /// The editor group window, which holds the editor, find bar, preview and image view; present
-    /// once the editor exists (split editors spec §4.2).
-    pub(crate) group: Option<crate::window::editor_group::GroupWindow>,
+    /// The editor group windows, each with its own editor, find bar, preview and image view, in
+    /// creation order; the first exists once the editor does (split editors spec §4.2).
+    pub(crate) groups: Vec<GroupWindow>,
+    /// The Direct2D factories every group's preview and image view share, created on first use.
+    pub(crate) graphics: Option<Rc<crate::preview::dwrite::Graphics>>,
     pub(crate) accessibility: AccessibilityState,
     pub(crate) accelerators: Option<AcceleratorTable>,
     pub(crate) menu_bar: Option<MenuBar>,
@@ -53,12 +57,8 @@ pub struct App {
     pub(crate) menu_mode: Option<MenuMode>,
     /// Where focus returns when menu mode ends; the frame holds it meanwhile for the key handling.
     pub(crate) menu_return_focus: HWND,
-    pub(crate) find_bar: Option<FindBar>,
     pub(crate) name_box: Option<crate::window::name_box::NameBox>,
     pub(crate) command_palette: Option<CommandPalette>,
-    /// Declared before `preview`, whose Direct2D factories the image view shares.
-    pub(crate) image: crate::window::image_host::ImageHost,
-    pub(crate) preview: crate::window::preview_host::PreviewHost,
     pub(crate) language_manager: Option<LanguageManager>,
     pub(crate) settings: Settings,
     pub(crate) theme: Option<SystemTheme>,
@@ -118,21 +118,18 @@ impl App {
         let process_start = startup.start_tick() as u64;
         Self {
             hwnd: std::ptr::null_mut(),
-            editor: None,
             launch,
             tabs: Tabs::new(),
             document_host: None,
-            group: None,
+            groups: Vec::new(),
+            graphics: None,
             accessibility: AccessibilityState::default(),
             accelerators: AcceleratorTable::create().ok(),
             menu_bar: None,
             menu_mode: None,
             menu_return_focus: std::ptr::null_mut(),
-            find_bar: None,
             name_box: None,
             command_palette: None,
-            image: Default::default(),
-            preview: Default::default(),
             language_manager: None,
             settings: crate::config::default_settings(),
             theme: None,
@@ -252,6 +249,45 @@ impl App {
             self.tabs.view(),
             self.tabs.selection(),
         )
+    }
+
+    pub(crate) fn active_group(&self) -> Option<&GroupWindow> {
+        self.group(self.tabs.active_group())
+    }
+
+    pub(crate) fn active_group_mut(&mut self) -> Option<&mut GroupWindow> {
+        let id = self.tabs.active_group();
+        self.group_mut(id)
+    }
+
+    pub(crate) fn group(&self, id: GroupId) -> Option<&GroupWindow> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    pub(crate) fn group_mut(&mut self, id: GroupId) -> Option<&mut GroupWindow> {
+        self.groups.iter_mut().find(|group| group.id == id)
+    }
+
+    /// The active group's editor.
+    pub(crate) fn editor(&self) -> Option<&Editor> {
+        self.active_group().map(|group| &group.editor)
+    }
+
+    pub(crate) fn find_bar(&self) -> Option<&FindBar> {
+        self.active_group()?.find_bar.as_ref()
+    }
+
+    pub(crate) fn find_bar_mut(&mut self) -> Option<&mut FindBar> {
+        self.active_group_mut()?.find_bar.as_mut()
+    }
+
+    /// The group whose window is `hwnd` or holds it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn group_containing(&self, hwnd: HWND) -> Option<GroupId> {
+        self.groups
+            .iter()
+            .find(|group| group.hwnd == hwnd || unsafe { IsChild(group.hwnd, hwnd) } != 0)
+            .map(|group| group.id)
     }
 
     pub(crate) fn window_identity(&self) -> WindowIdentity {

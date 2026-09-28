@@ -18,11 +18,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
-/// The window of one editor group and its tab strip's pointer state. PR 1 of the split editors
-/// work has exactly one.
+/// The window of one editor group, what it shows, and its tab strip's pointer state. One per
+/// editor group; the main window keeps them in `App.groups`.
 #[derive(Debug)]
 pub(crate) struct GroupWindow {
+    pub(crate) id: super::split_tree::GroupId,
     pub(crate) hwnd: HWND,
+    pub(crate) editor: crate::editor::Editor,
+    /// Created the first time Find or Replace opens in this group.
+    pub(crate) find_bar: Option<super::find_bar::FindBar>,
+    /// Declared before `preview`, whose Direct2D objects the image view's may share.
+    pub(crate) image: super::image_host::ImageHost,
+    pub(crate) preview: super::preview_host::PreviewHost,
     pub(crate) pointer: super::group_strip::StripPointer,
     /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
     pub(crate) thumb_grab: Option<i32>,
@@ -39,9 +46,18 @@ pub(crate) struct GroupWindow {
 }
 
 impl GroupWindow {
-    pub(crate) fn new(hwnd: HWND) -> Self {
+    pub(crate) fn new(
+        id: super::split_tree::GroupId,
+        hwnd: HWND,
+        editor: crate::editor::Editor,
+    ) -> Self {
         Self {
+            id,
             hwnd,
+            editor,
+            find_bar: None,
+            image: Default::default(),
+            preview: Default::default(),
             pointer: Default::default(),
             thumb_grab: None,
             middle_press: None,

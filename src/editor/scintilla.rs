@@ -29,7 +29,8 @@ use crate::editor::scintilla_constants::{
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETXOFFSET, SCI_SETXOFFSET};
 use crate::editor::scintilla_constants::{
-    SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
+    SCI_GETLINECOUNT, SCI_GETZOOM, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT,
+    STYLE_LINENUMBER,
 };
 use crate::{FastPadError, Result};
 use std::cell::Cell;
@@ -1109,6 +1110,18 @@ impl Editor {
 
     pub fn zoom_out(&self) -> Result<()> {
         self.endpoint.send_direct_checked(SCI_ZOOMOUT, 0, 0)?;
+        Ok(())
+    }
+
+    /// The points added to every style's size by zooming.
+    pub fn zoom(&self) -> Result<i32> {
+        Ok(self.endpoint.send_direct_checked(SCI_GETZOOM, 0, 0)? as i32)
+    }
+
+    /// Matches another editor's zoom (split editors plan amendment 11: one zoom for every group).
+    pub fn set_zoom(&self, zoom: i32) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETZOOM, zoom as usize, 0)?;
         Ok(())
     }
 

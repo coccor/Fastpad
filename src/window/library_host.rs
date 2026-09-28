@@ -1078,8 +1078,8 @@ pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
 /// a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`. The sidebar panel's own
 /// drop target is registered here too. Runs in `BUILD_CHROME`.
 pub(crate) fn accept_editor_file_drops(hwnd: HWND) {
-    let editor = unsafe { app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.editor.as_ref().map(|e| e.hwnd()));
+    let editor =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().map(|e| e.hwnd()));
     if let Some(editor) = editor {
         wrap_editor_drop_target(hwnd, editor);
     }
@@ -1188,7 +1188,7 @@ pub(crate) fn refresh_label(hwnd: HWND) {
     let shown = notes_mode(hwnd);
     let changed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let editor = app.editor.as_ref()?;
+        let editor = app.editor()?;
         let active = app.tabs.active()?;
         if active.path.is_some() {
             return None;
@@ -1257,7 +1257,7 @@ pub(crate) fn show_labels(hwnd: HWND) {
 pub(crate) fn text_changed(hwnd: HWND, position: usize) {
     let relevant = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         let app = unsafe { app.as_ref() };
-        let (Some(editor), Some(active)) = (app.editor.as_ref(), app.tabs.active()) else {
+        let (Some(editor), Some(active)) = (app.editor(), app.tabs.active()) else {
             return false;
         };
         active.path.is_none()
@@ -2446,7 +2446,7 @@ pub(crate) fn reload_from_disk(hwnd: HWND) {
         return;
     };
     let Some(editor) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };

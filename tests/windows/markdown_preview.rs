@@ -96,11 +96,11 @@ impl TestMain {
     }
 
     fn mode(&self) -> PreviewMode {
-        self.with_app(|app| app.preview.mode)
+        self.with_app(|app| app.active_group().unwrap().preview.mode)
     }
 
     fn view(&self) -> Option<preview::view::PreviewView> {
-        self.with_app(|app| app.preview.view)
+        self.with_app(|app| app.active_group().unwrap().preview.view)
     }
 
     fn notices(&self) -> Vec<String> {
@@ -543,7 +543,7 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
     pump_until("render", Duration::from_secs(3), || {
         view.stats().block_count == 400
     });
-    let before = main.with_app(|app| app.preview.sync_count);
+    let before = main.with_app(|app| app.active_group().unwrap().preview.sync_count);
     unsafe {
         SendMessageW(
             view.hwnd(),
@@ -565,7 +565,7 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
         }) > 0
     });
     pump_for(Duration::from_millis(250));
-    let syncs = main.with_app(|app| app.preview.sync_count) - before;
+    let syncs = main.with_app(|app| app.active_group().unwrap().preview.sync_count) - before;
     assert!(
         syncs <= 1,
         "scroll sync echoed: {syncs} syncs for one preview scroll"
@@ -585,7 +585,7 @@ fn closing_the_find_bar_in_full_mode_focuses_the_preview() {
     main.command(CommandId::MarkdownPreviewFull);
     let view = main.view().unwrap();
     main.command(CommandId::Find);
-    let query = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
+    let query = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
     assert_eq!(unsafe { GetFocus() }, query);
     unsafe { SendMessageW(query, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
     assert_eq!(unsafe { GetFocus() }, view.hwnd());

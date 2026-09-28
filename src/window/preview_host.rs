@@ -25,6 +25,7 @@ use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
 use crate::window::panel::scale;
 use crate::window::preview_buttons::PreviewButton;
+use crate::window::split_tree::GroupId;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -62,9 +63,6 @@ pub(crate) struct PreviewHost {
     pub(crate) svg_view: Option<ImageView>,
     /// The SVG tab `svg_view` shows; `None` forces a reload when next shown.
     pub(crate) svg_document: Option<DocumentId>,
-    /// Declared after `view`: the preview window's own state holds `Rc<Graphics>` references, and
-    /// this one must outlive every Direct2D and DirectWrite object they create.
-    graphics: Option<Rc<Graphics>>,
     ratio: f32,
     pub(crate) edits: EditLog,
     /// The document the preview currently shows; `None` forces a reload when next shown.
@@ -92,7 +90,6 @@ impl std::fmt::Debug for PreviewHost {
             .field("view", &self.view)
             .field("svg_view", &self.svg_view)
             .field("svg_document", &self.svg_document)
-            .field("graphics_loaded", &self.graphics.is_some())
             .field("ratio", &self.ratio)
             .field("edits", &self.edits)
             .field("document", &self.document)
@@ -116,7 +113,6 @@ impl Default for PreviewHost {
             view: None,
             svg_view: None,
             svg_document: None,
-            graphics: None,
             ratio: 0.5,
             edits: EditLog::default(),
             document: None,
@@ -248,8 +244,22 @@ impl SourceText for ScintillaSource<'_> {
 pub(crate) fn with_host<R>(hwnd: HWND, action: impl FnOnce(&mut PreviewHost) -> R) -> Option<R> {
     // SAFETY: the App pointer is used only for the immediate field access inside `action`, which
     // never calls back into Win32.
+    unsafe { host_window::app_ptr(hwnd) }.and_then(|mut app| {
+        Some(action(
+            &mut unsafe { app.as_mut() }.active_group_mut()?.preview,
+        ))
+    })
+}
+
+/// `with_host` for the group `id`, which need not be the active one.
+pub(crate) fn with_group_host<R>(
+    hwnd: HWND,
+    id: GroupId,
+    action: impl FnOnce(&mut PreviewHost) -> R,
+) -> Option<R> {
+    // SAFETY: as in `with_host`.
     unsafe { host_window::app_ptr(hwnd) }
-        .map(|mut app| action(&mut unsafe { app.as_mut() }.preview))
+        .and_then(|mut app| Some(action(&mut unsafe { app.as_mut() }.group_mut(id)?.preview)))
 }
 
 pub(crate) fn mode(hwnd: HWND) -> PreviewMode {
@@ -261,13 +271,28 @@ pub(crate) fn view(hwnd: HWND) -> Option<PreviewView> {
 }
 
 pub(crate) fn editor(hwnd: HWND) -> Option<Editor> {
-    unsafe { host_window::app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+    unsafe { host_window::app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
 }
 
 /// The active tab's id, language, and folder.
 pub(crate) fn active_document(hwnd: HWND) -> Option<(DocumentId, Language, Option<PathBuf>)> {
     let app = unsafe { host_window::app_ptr(hwnd) }?;
     let document = unsafe { app.as_ref() }.tabs.active()?;
+    let folder = document
+        .path
+        .as_ref()
+        .and_then(|path| path.parent().map(PathBuf::from));
+    Some((document.id, document.language, folder))
+}
+
+/// Group `id`'s active tab's id, language, and folder.
+pub(crate) fn group_document(
+    hwnd: HWND,
+    id: GroupId,
+) -> Option<(DocumentId, Language, Option<PathBuf>)> {
+    let app = unsafe { host_window::app_ptr(hwnd) }?;
+    let tabs = &unsafe { app.as_ref() }.tabs;
+    let document = tabs.document(tabs.group(id)?.active_document()?)?;
     let folder = document
         .path
         .as_ref()
@@ -495,11 +520,15 @@ pub(crate) fn refresh_appearance(hwnd: HWND) {
 /// Loads Direct2D and DirectWrite once per window; the Markdown preview, the SVG preview and image
 /// tabs share them.
 pub(crate) fn shared_graphics(hwnd: HWND) -> Result<Rc<Graphics>> {
-    if let Some(graphics) = with_host(hwnd, |host| host.graphics.clone()).flatten() {
+    // SAFETY: the App pointer is used only for these field accesses.
+    let app = unsafe { host_window::app_ptr(hwnd) };
+    if let Some(graphics) = app.and_then(|app| unsafe { app.as_ref() }.graphics.clone()) {
         return Ok(graphics);
     }
     let graphics = Rc::new(Graphics::load()?);
-    with_host(hwnd, |host| host.graphics = Some(Rc::clone(&graphics)));
+    if let Some(mut app) = app {
+        unsafe { app.as_mut() }.graphics = Some(Rc::clone(&graphics));
+    }
     Ok(graphics)
 }
 
@@ -1112,19 +1141,26 @@ pub(crate) fn diagnostic(hwnd: HWND, selector: usize) -> isize {
 }
 
 /// Positions the preview for `area` and returns where the editor goes.
-pub(crate) fn layout(hwnd: HWND, area: RECT, dpi: u32) -> ContentRects {
-    let (mode, ratio) =
-        with_host(hwnd, |host| (host.mode, host.ratio)).unwrap_or((PreviewMode::Off, 0.5));
-    let rects = content_rects(area, mode, preview_shown(hwnd), ratio, dpi);
-    with_host(hwnd, |host| {
+/// Lays out group `id`'s content area: its editor and its preview beside or over it.
+pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT, dpi: u32) -> ContentRects {
+    let language = group_document(hwnd, id).map(|(_, language, _)| language);
+    let previewable = matches!(language, Some(Language::Markdown | Language::Svg));
+    let svg = language == Some(Language::Svg);
+    let (mode, ratio, slot) = with_group_host(hwnd, id, |host| {
+        let slot = if svg {
+            host.svg_view.map(|view| view.hwnd())
+        } else {
+            host.view.map(|view| view.hwnd())
+        };
+        (host.mode, host.ratio, slot)
+    })
+    .unwrap_or((PreviewMode::Off, 0.5, None));
+    let shown = mode != PreviewMode::Off && previewable && slot.is_some();
+    let rects = content_rects(area, mode, shown, ratio, dpi);
+    with_group_host(hwnd, id, |host| {
         host.area = Some(area);
         host.divider = rects.divider;
     });
-    let slot = if active_is_svg(hwnd) {
-        svg_view(hwnd).map(|view| view.hwnd())
-    } else {
-        view(hwnd).map(|view| view.hwnd())
-    };
     if let (Some(view), Some(rect)) = (slot, rects.preview) {
         unsafe {
             MoveWindow(
@@ -1138,6 +1174,13 @@ pub(crate) fn layout(hwnd: HWND, area: RECT, dpi: u32) -> ContentRects {
         };
     }
     rects
+}
+
+impl PreviewHost {
+    /// The divider between the editor and a side preview, while one shows.
+    pub(crate) fn divider_rect(&self) -> Option<RECT> {
+        self.divider
+    }
 }
 
 pub(crate) fn divider_rect(hwnd: HWND) -> Option<RECT> {

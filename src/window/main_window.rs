@@ -15,6 +15,7 @@ use crate::window::messages::{
 };
 use crate::window::modal::prompt_close_decision;
 use crate::window::palette::Palette;
+use crate::window::split_tree::GroupId;
 use crate::window::tabs::CloseReviewKey;
 use crate::window::titlebar::{
     HitTarget, LogoIcon, PointerState, TitleBarLayout, TitleFontHandles,
@@ -469,8 +470,7 @@ unsafe extern "system" fn main_window_proc(
         WM_CTLCOLOREDIT if find_bar_owns(hwnd, lparam as HWND) => unsafe { app_ptr(hwnd) }
             .and_then(|app| {
                 unsafe { app.as_ref() }
-                    .find_bar
-                    .as_ref()
+                    .find_bar()
                     .map(|bar| bar.control_color(wparam as HDC) as LRESULT)
             })
             .unwrap_or(0),
@@ -567,7 +567,7 @@ unsafe extern "system" fn main_window_proc(
             }
             let dpi = (wparam & 0xffff) as u32;
             if let Some(editor) =
-                unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+                unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
             {
                 let _ = editor.set_text_padding(dpi);
             }
@@ -908,9 +908,6 @@ where
     // The editor, find bar, preview and image view live in the editor group (split editors spec
     // §4.2), which the main window lays out.
     let group = crate::window::editor_group::create(hwnd)?;
-    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_mut() }.group = Some(crate::window::editor_group::GroupWindow::new(group));
-    }
     let editor = create_editor(group)?.with_document_host(&host);
     let editor_hwnd = editor.hwnd();
     if !identity.is_live_for(hwnd) {
@@ -937,7 +934,7 @@ where
     }
 
     unsafe {
-        install_editor(hwnd, editor, document)?;
+        install_editor(hwnd, group, editor, document)?;
         record_milestone(hwnd, Milestone::EditorCreated)?;
     }
     // The sidebar comes with the window, before first paint, from the settings bootstrap read.
@@ -1003,14 +1000,14 @@ pub(crate) unsafe fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     // SAFETY: The App pointer is used only to copy out the child HWND; no reference crosses into
     // any subsequent Win32 call.
     let app = unsafe { app_ptr(hwnd) }?;
-    unsafe { app.as_ref() }.editor.as_ref().map(Editor::hwnd)
+    unsafe { app.as_ref() }.editor().map(Editor::hwnd)
 }
 
 fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
     let Some(app) = (unsafe { app_ptr(hwnd) }) else {
         return;
     };
-    let Some(editor) = unsafe { app.as_ref() }.editor.as_ref() else {
+    let Some(editor) = unsafe { app.as_ref() }.editor() else {
         return;
     };
     action(editor);
@@ -1053,13 +1050,175 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     layout_group(hwnd, group);
 }
 
-/// The editor group's window, once the editor exists.
+/// The active editor group's window, once the editor exists.
 pub(crate) fn group_hwnd(hwnd: HWND) -> Option<HWND> {
     let app = unsafe { app_ptr(hwnd) }?;
     unsafe { app.as_ref() }
-        .group
-        .as_ref()
+        .active_group()
         .map(|group| group.hwnd)
+}
+
+/// The group whose window is `group`.
+pub(crate) fn group_id_of(hwnd: HWND, group: HWND) -> Option<GroupId> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .groups
+        .iter()
+        .find(|state| state.hwnd == group)
+        .map(|state| state.id)
+}
+
+/// Runs `f` on group `id`'s window state.
+pub(crate) fn with_group_id<R>(
+    hwnd: HWND,
+    id: GroupId,
+    f: impl FnOnce(&mut crate::window::editor_group::GroupWindow) -> R,
+) -> Option<R> {
+    let mut app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_mut() }.group_mut(id).map(f)
+}
+
+pub(crate) fn group_editor(hwnd: HWND, id: GroupId) -> Option<Editor> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .group(id)
+        .map(|group| group.editor.clone())
+}
+
+// Used once splits exist (the Split commands and the session restore).
+#[cfg_attr(not(test), allow(dead_code))]
+/// Creates an empty group window with its own editor, set up like the others. The caller puts it
+/// in the layout (split editors spec §4.2).
+pub(crate) fn create_group(hwnd: HWND) -> Result<GroupId> {
+    #[cfg(test)]
+    if FAIL_NEXT_GROUP.with(|fail| fail.replace(false)) {
+        return Err(crate::FastPadError::Invariant(
+            "test: group creation failed",
+        ));
+    }
+    let host = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.document_host.clone())
+        .ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+    let window = crate::window::editor_group::create(hwnd)?;
+    let editor = match Editor::create_with_host(window, &host) {
+        Ok(editor) => editor,
+        Err(error) => {
+            unsafe { DestroyWindow(window) };
+            return Err(error);
+        }
+    };
+    configure_editor(hwnd, &editor);
+    // A new group shows nothing until a view is added.
+    unsafe { ShowWindow(editor.hwnd(), SW_HIDE) };
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        unsafe { DestroyWindow(window) };
+        return Err(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ));
+    };
+    let app = unsafe { app.as_mut() };
+    let id = app.tabs.add_group();
+    app.groups
+        .push(crate::window::editor_group::GroupWindow::new(
+            id, window, editor,
+        ));
+    Ok(id)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_GROUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn fail_next_group_creation() {
+    FAIL_NEXT_GROUP.with(|fail| fail.set(true));
+}
+
+// Used once splits exist (the Split commands and the session restore).
+#[cfg_attr(not(test), allow(dead_code))]
+/// Destroys group `id`'s window, its editor and what it showed. The caller has already emptied it
+/// and taken it out of the layout.
+pub(crate) fn destroy_group(hwnd: HWND, id: GroupId) {
+    let removed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let index = app.groups.iter().position(|group| group.id == id)?;
+        app.tabs.remove_group(id).then(|| app.groups.remove(index))
+    });
+    if let Some(group) = removed {
+        let window = group.hwnd;
+        drop(group);
+        unsafe { DestroyWindow(window) };
+    }
+}
+
+// Used once splits exist (the Split commands and the session restore).
+#[cfg_attr(not(test), allow(dead_code))]
+/// Applies the editor settings, the theme's colours and the shared zoom to `editor`, as every
+/// group's editor has them.
+fn configure_editor(hwnd: HWND, editor: &Editor) {
+    let Some((settings, palette, zoom)) = (unsafe { app_ptr(hwnd) }).map(|app| {
+        let app = unsafe { app.as_ref() };
+        let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
+        let zoom = app.editor().and_then(|editor| editor.zoom().ok());
+        (app.settings.clone(), palette, zoom)
+    }) else {
+        return;
+    };
+    apply_settings_to(editor, &settings, palette);
+    apply_colors_to(editor, palette);
+    if let Some(zoom) = zoom {
+        let _ = editor.set_zoom(zoom);
+    }
+}
+
+fn apply_settings_to(editor: &Editor, settings: &crate::config::Settings, palette: Palette) {
+    let _ = editor.set_line_numbers(settings.line_numbers);
+    let _ = editor.apply_view_settings(
+        &settings.font_face,
+        settings.font_size,
+        settings.tab_width,
+        settings.word_wrap,
+    );
+    let _ =
+        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+}
+
+fn apply_colors_to(editor: &Editor, palette: Palette) {
+    let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
+    let _ =
+        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    let _ = editor.set_chrome_colors(
+        palette.selection_background,
+        palette.inactive_selection_background,
+        palette.caret_line_background,
+    );
+    let _ = editor.set_selection_text_colors(palette.selection_foreground);
+}
+
+/// Every group's editor, the active group's first.
+fn all_editors(hwnd: HWND) -> Vec<Editor> {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let app = unsafe { app.as_ref() };
+            let active = app.tabs.active_group();
+            let mut editors = app
+                .active_group()
+                .map(|group| group.editor.clone())
+                .into_iter()
+                .collect::<Vec<_>>();
+            editors.extend(
+                app.groups
+                    .iter()
+                    .filter(|group| group.id != active)
+                    .map(|group| group.editor.clone()),
+            );
+            editors
+        })
+        .unwrap_or_default()
 }
 
 /// The window the content area's children go into: the editor group, or the main window before
@@ -1071,7 +1230,10 @@ pub(crate) fn content_parent(hwnd: HWND) -> HWND {
 /// Lays out the tab strip, the find bar, then the preview and the editor below them, in `group`'s
 /// client area.
 pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
-    let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
+    let Some(id) = group_id_of(hwnd, group) else {
+        return;
+    };
+    let Some(editor_hwnd) = group_editor(hwnd, id).map(|editor| editor.hwnd()) else {
         return;
     };
     let mut client = RECT::default();
@@ -1087,7 +1249,7 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let find_top = strip_height + band;
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
-            let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
+            let bar = unsafe { app.as_ref() }.group(id)?.find_bar.as_ref()?;
             bar.layout(0, width, find_top, dpi, font);
             bar.is_visible().then(|| find_bar::find_bar_height(dpi))
         })
@@ -1100,8 +1262,8 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
         bottom: client.bottom.max(top),
     };
     set_group_region(hwnd, group, &client, strip_height, band);
-    let rects = crate::window::preview_host::layout(hwnd, area, dpi);
-    crate::window::image_host::layout(hwnd, area);
+    let rects = crate::window::preview_host::layout(hwnd, id, area, dpi);
+    crate::window::image_host::layout(hwnd, id, area);
     crate::window::preview_buttons::layout(hwnd, group, area, dpi);
     if let Some(editor_rect) = rects.editor {
         unsafe {
@@ -1164,7 +1326,7 @@ pub(crate) fn group_hit_test(hwnd: HWND, group: HWND, lparam: LPARAM) -> LRESULT
         y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
     };
     unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point) };
-    let Some(layout) = strip_layout(hwnd) else {
+    let Some(layout) = group_id_of(hwnd, group).and_then(|id| strip_layout_of(hwnd, id)) else {
         return HTCLIENT as LRESULT;
     };
     let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
@@ -1208,18 +1370,22 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
     if dc.is_null() {
         return;
     }
+    let Some(id) = group_id_of(hwnd, group) else {
+        unsafe { windows_sys::Win32::Graphics::Gdi::EndPaint(group, &paint) };
+        return;
+    };
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
     let (palette, fonts, _) = title_chrome(hwnd);
     let mut client = RECT::default();
     unsafe {
         GetClientRect(group, &mut client);
     }
-    if let Some(layout) = strip_layout(hwnd)
+    if let Some(layout) = strip_layout_of(hwnd, id)
         && paint.rcPaint.top < layout.height
     {
-        let (titles, active, _, _, preview_tab) = tab_snapshot(hwnd);
+        let (titles, active, _, _, preview_tab) = tab_snapshot(hwnd, id);
         let titles = titles.iter().map(String::as_str).collect::<Vec<_>>();
-        let pointer = with_group(hwnd, |group| group.pointer).unwrap_or_default();
+        let pointer = with_group_id(hwnd, id, |group| group.pointer).unwrap_or_default();
         unsafe {
             crate::window::group_strip::paint(
                 dc,
@@ -1237,7 +1403,7 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
         }
         client.top = layout.height + menu_band_height(hwnd) + name_box_band_height(hwnd, dpi);
     }
-    if tab_count(hwnd) == 0 {
+    if group_tab_count(hwnd, id) == 0 {
         unsafe {
             crate::window::titlebar::paint_empty_hint(
                 dc,
@@ -1249,7 +1415,9 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
             );
         }
     }
-    if let Some(divider) = crate::window::preview_host::divider_rect(hwnd) {
+    if let Some(divider) =
+        crate::window::preview_host::with_group_host(hwnd, id, |host| host.divider_rect()).flatten()
+    {
         unsafe { crate::window::titlebar::paint_divider(dc, divider, palette) };
     }
     unsafe {
@@ -1282,7 +1450,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     // no way to display it), so it's left alone rather than truncated or rejected. With regex
     // on, it is escaped (as Search escapes it) so it matches only itself.
     let regex = unsafe { app_ptr(hwnd) }
-        .and_then(|app| Some(unsafe { app.as_ref() }.find_bar.as_ref()?.options().regex))
+        .and_then(|app| Some(unsafe { app.as_ref() }.find_bar()?.options().regex))
         .unwrap_or(false);
     let prefill = single_line_selection(hwnd).map(|text| {
         if regex {
@@ -1293,7 +1461,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     });
     let colors = title_chrome(hwnd).0;
     let pending = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
-        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
         Some(bar.show(mode, prefill.as_deref(), colors))
     });
     let Some(pending) = pending else {
@@ -1308,7 +1476,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     }
     layout_editor_and_find_bar(hwnd);
     if let Some(app) = unsafe { app_ptr(hwnd) }
-        && let Some(bar) = unsafe { app.as_ref() }.find_bar.as_ref()
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
     {
         bar.focus_query();
     }
@@ -1319,7 +1487,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
 /// made.
 fn ensure_find_bar(hwnd: HWND) -> bool {
     let Some(exists) =
-        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.find_bar.is_some())
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.find_bar().is_some())
     else {
         return false;
     };
@@ -1330,7 +1498,10 @@ fn ensure_find_bar(hwnd: HWND) -> bool {
         return false;
     };
     unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
-        unsafe { app.as_mut() }.find_bar = Some(bar);
+        let Some(group) = unsafe { app.as_mut() }.active_group_mut() else {
+            return false;
+        };
+        group.find_bar = Some(bar);
         true
     })
 }
@@ -1338,7 +1509,8 @@ fn ensure_find_bar(hwnd: HWND) -> bool {
 /// The active editor's selection as a query, when it is non-empty and on one line. A multi-line
 /// selection can't be shown in a one-line box, so it is left alone rather than cut.
 pub(crate) fn single_line_selection(hwnd: HWND) -> Option<String> {
-    let editor = unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())?;
+    let editor =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())?;
     let text = editor.selected_text().ok()?;
     (!text.is_empty() && !text.contains(['\n', '\r'])).then_some(text)
 }
@@ -1369,7 +1541,7 @@ pub(crate) fn close_find_bar(hwnd: HWND) {
         return;
     };
     let closed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
-        let Some(bar) = unsafe { app.as_mut() }.find_bar.as_mut() else {
+        let Some(bar) = unsafe { app.as_mut() }.find_bar_mut() else {
             return false;
         };
         bar.hide();
@@ -1512,8 +1684,7 @@ fn bar_band_height(hwnd: HWND) -> i32 {
     unsafe { app_ptr(hwnd) }.map_or(0, |app| {
         let app = unsafe { app.as_ref() };
         let find = app
-            .find_bar
-            .as_ref()
+            .find_bar()
             .filter(|bar| bar.is_visible())
             .map_or(0, |_| find_bar::find_bar_height(dpi));
         let name = app
@@ -1858,7 +2029,7 @@ pub(crate) fn go_to_line(hwnd: HWND, line: u32) {
         return;
     }
     let Some(editor) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -1976,7 +2147,12 @@ pub(crate) fn paint_panel(hwnd: HWND, panel: HWND) {
         if let Some(palette) = app.command_palette.as_ref().filter(|p| p.owns(panel)) {
             palette.paint_panel(panel);
             true
-        } else if let Some(bar) = app.find_bar.as_ref().filter(|bar| bar.owns(panel)) {
+        } else if let Some(bar) = app
+            .groups
+            .iter()
+            .filter_map(|group| group.find_bar.as_ref())
+            .find(|bar| bar.owns(panel))
+        {
             bar.paint_panel(panel, glyph_font, text_font);
             true
         } else if let Some(name_box) = app.name_box.as_ref().filter(|n| n.owns(panel)) {
@@ -2050,8 +2226,7 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
     }
     let click = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .filter(|bar| bar.owns(panel))
             .and_then(|bar| bar.pointer(message, lparam))
     });
@@ -2067,8 +2242,7 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
 fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
     let wanted = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| bar.owns(panel) && bar.wants_tooltip())
     });
     if !wanted {
@@ -2077,7 +2251,7 @@ fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lp
     // Made with nothing of the App borrowed: creating the control sends messages.
     let created = crate::window::tooltip::Tooltip::create(panel);
     let tools = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
+        let bar = unsafe { app.as_ref() }.find_bar()?;
         bar.set_tooltip(created);
         Some(bar.toggle_tools())
     });
@@ -2098,7 +2272,7 @@ fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lp
 /// screen readers the check button's state changed, once the borrow is over.
 pub(crate) fn toggle_find_option(hwnd: HWND, option: crate::search::SearchOption) {
     let panel = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
-        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
         bar.toggle_option(option);
         Some(bar.panel_hwnd())
     });
@@ -2116,13 +2290,10 @@ pub(crate) fn toggle_find_option(hwnd: HWND, option: crate::search::SearchOption
 fn find_field_changed(hwnd: HWND, control: HWND) {
     let text = find_bar::control_text(control);
     let query = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
-        unsafe { app.as_mut() }
-            .find_bar
-            .as_mut()
-            .is_some_and(|bar| {
-                bar.field_changed(control, text);
-                bar.is_query(control)
-            })
+        unsafe { app.as_mut() }.find_bar_mut().is_some_and(|bar| {
+            bar.field_changed(control, text);
+            bar.is_query(control)
+        })
     });
     if query {
         set_find_no_match(hwnd, false);
@@ -2133,8 +2304,7 @@ fn find_field_changed(hwnd: HWND, control: HWND) {
 pub(crate) fn paint_find_placeholder(hwnd: HWND, edit: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| bar.paint_placeholder(edit))
     })
 }
@@ -2155,8 +2325,7 @@ fn name_box_owns(hwnd: HWND, control: HWND) -> bool {
 pub(crate) fn find_bar_owns(hwnd: HWND, control: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| bar.owns(control))
     })
 }
@@ -2174,8 +2343,7 @@ pub(crate) fn find_previous(hwnd: HWND) {
 fn find_again(hwnd: HWND, backward: bool) {
     let has_query = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| !bar.query_text().is_empty())
     });
     if has_query {
@@ -2191,8 +2359,8 @@ fn navigate_to_match(hwnd: HWND, backward: bool) {
     };
     let Some((editor, query, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
-        let bar = app.find_bar.as_ref()?;
+        let editor = app.editor().cloned()?;
+        let bar = app.find_bar()?;
         Some((editor, bar.query_text(), bar.options()))
     }) else {
         return;
@@ -2236,7 +2404,7 @@ fn select_match(
 
 fn set_find_no_match(hwnd: HWND, no_match: bool) {
     if let Some(app) = unsafe { app_ptr(hwnd) }
-        && let Some(bar) = unsafe { app.as_ref() }.find_bar.as_ref()
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
     {
         bar.set_no_match(no_match);
     }
@@ -2248,8 +2416,8 @@ pub(crate) fn replace_current(hwnd: HWND) {
     };
     let Some((editor, query, replacement, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
-        let bar = app.find_bar.as_ref()?;
+        let editor = app.editor().cloned()?;
+        let bar = app.find_bar()?;
         Some((editor, bar.query_text(), bar.replace_text(), bar.options()))
     }) else {
         return;
@@ -2279,8 +2447,8 @@ pub(crate) fn replace_all_matches(hwnd: HWND) {
     };
     let Some((editor, query, replacement, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
-        let bar = app.find_bar.as_ref()?;
+        let editor = app.editor().cloned()?;
+        let bar = app.find_bar()?;
         Some((editor, bar.query_text(), bar.replace_text(), bar.options()))
     }) else {
         return;
@@ -2346,31 +2514,37 @@ fn sync_window_title(hwnd: HWND) {
     }
 }
 
-fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool, Option<usize>) {
+/// Group `id`'s tab titles, selected tab, strip scroll, whether it is empty, and its preview tab.
+fn tab_snapshot(hwnd: HWND, id: GroupId) -> (Vec<String>, usize, i32, bool, Option<usize>) {
     unsafe { app_ptr(hwnd) }
-        .map(|app| {
+        .and_then(|app| {
             let app = unsafe { app.as_ref() };
-            (
-                app.tabs.titles().collect(),
-                app.tabs.active_index(),
-                app.tabs.scroll_offset(),
-                app.editor.is_some() && app.tabs.is_empty(),
-                app.tabs
-                    .group_documents(app.tabs.active_group())
-                    .into_iter()
-                    .position(|document| document.preview),
-            )
+            let group = app.tabs.group(id)?;
+            let documents = app.tabs.group_documents(id);
+            Some((
+                documents.iter().map(|document| document.title()).collect(),
+                group.active_index(),
+                group.scroll_offset(),
+                app.group(id).is_some() && group.is_empty(),
+                documents.iter().position(|document| document.preview),
+            ))
         })
         .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false, None))
 }
 
-/// Runs `f` on the editor group's window state.
+fn group_tab_count(hwnd: HWND, id: GroupId) -> usize {
+    unsafe { app_ptr(hwnd) }
+        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.group(id)?.len()))
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the active editor group's window state.
 pub(crate) fn with_group<R>(
     hwnd: HWND,
     f: impl FnOnce(&mut crate::window::editor_group::GroupWindow) -> R,
 ) -> Option<R> {
     let mut app = unsafe { app_ptr(hwnd) }?;
-    unsafe { app.as_mut() }.group.as_mut().map(f)
+    unsafe { app.as_mut() }.active_group_mut().map(f)
 }
 
 /// The title-row strip in the main window's client coordinates, which the frame leaves to the
@@ -2385,21 +2559,27 @@ fn group_strip_bounds(hwnd: HWND) -> Option<crate::window::titlebar::Rect> {
     })
 }
 
-/// The group's tab strip as laid out now, the same one it paints and hit-tests with.
+/// The active group's tab strip as laid out now, the same one it paints and hit-tests with.
 pub(crate) fn strip_layout(hwnd: HWND) -> Option<crate::window::group_strip::StripLayout> {
-    let group = group_hwnd(hwnd)?;
-    let mut client = RECT::default();
-    unsafe {
-        GetClientRect(group, &mut client);
-    }
+    let id = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())?;
+    strip_layout_of(hwnd, id)
+}
+
+/// Group `id`'s tab strip as laid out now.
+pub(crate) fn strip_layout_of(
+    hwnd: HWND,
+    id: GroupId,
+) -> Option<crate::window::group_strip::StripLayout> {
+    let (group, count, scroll) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let tabs = app.tabs.group(id)?;
+        Some((app.group(id)?.hwnd, tabs.len(), tabs.scroll_offset()))
+    })?;
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
-    let scroll = unsafe { app_ptr(hwnd) }
-        .map(|app| unsafe { app.as_ref() }.tabs.scroll_offset())
-        .unwrap_or(0);
     Some(crate::window::group_strip::StripLayout::calculate(
         crate::window::group_strip::strip_width(group),
         dpi,
-        tab_count(hwnd),
+        count,
         scroll,
     ))
 }
@@ -2683,8 +2863,10 @@ pub(crate) fn group_strip_message(
 pub(crate) fn group_accessible_object(hwnd: HWND, group: HWND, wparam: WPARAM) -> LRESULT {
     let provider = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let (view, selection) = (app.tabs.view(), app.tabs.selection());
-        let state = app.group.as_mut()?;
+        let id = app.groups.iter().find(|state| state.hwnd == group)?.id;
+        let tabs = app.tabs.group(id)?;
+        let (view, selection) = (tabs.view(), tabs.selection());
+        let state = app.group_mut(id)?;
         Some(state.accessibility.ensure(
             group,
             crate::window::accessibility::ProviderKind::GroupStrip,
@@ -2706,7 +2888,7 @@ fn refresh_tabs(hwnd: HWND) {
         (
             app.tabs.len(),
             app.tabs.active_index(),
-            app.editor.as_ref().map(Editor::hwnd),
+            app.editor().map(Editor::hwnd),
         )
     }) else {
         return;
@@ -3018,15 +3200,22 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             if crate::window::image_host::zoom(hwnd, command)
                 || crate::window::image_host::active_is_image(hwnd)
                 || crate::window::preview_host::zoom_svg(hwnd, command) => {}
-        CommandId::ZoomIn => with_editor(hwnd, |editor| {
-            let _ = editor.zoom_in();
-        }),
-        CommandId::ZoomOut => with_editor(hwnd, |editor| {
-            let _ = editor.zoom_out();
-        }),
-        CommandId::ZoomReset => with_editor(hwnd, |editor| {
-            let _ = editor.reset_zoom();
-        }),
+        // One zoom for every group (split editors plan amendment 11).
+        CommandId::ZoomIn => {
+            for editor in all_editors(hwnd) {
+                let _ = editor.zoom_in();
+            }
+        }
+        CommandId::ZoomOut => {
+            for editor in all_editors(hwnd) {
+                let _ = editor.zoom_out();
+            }
+        }
+        CommandId::ZoomReset => {
+            for editor in all_editors(hwnd) {
+                let _ = editor.reset_zoom();
+            }
+        }
         CommandId::MarkdownPreviewCycle
         | CommandId::MarkdownPreviewSide
         | CommandId::MarkdownPreviewFull
@@ -3215,7 +3404,7 @@ fn apply_detected_language(hwnd: HWND) {
 /// itself is also left unchanged by `LanguageManager::apply` on failure) and surfaces the error.
 fn apply_language(hwnd: HWND, language: crate::document::Language) {
     let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -3324,22 +3513,16 @@ fn editor_settings_applied() -> usize {
 fn apply_editor_settings(hwnd: HWND) {
     #[cfg(test)]
     EDITOR_SETTINGS_APPLIED.with(|count| count.set(count.get() + 1));
-    let Some((editor, settings, palette)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((settings, palette)) = (unsafe { app_ptr(hwnd) }).map(|app| {
         let app = unsafe { app.as_ref() };
         let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
-        Some((app.editor.clone()?, app.settings.clone(), palette))
+        (app.settings.clone(), palette)
     }) else {
         return;
     };
-    let _ = editor.set_line_numbers(settings.line_numbers);
-    let _ = editor.apply_view_settings(
-        &settings.font_face,
-        settings.font_size,
-        settings.tab_width,
-        settings.word_wrap,
-    );
-    let _ =
-        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    for editor in all_editors(hwnd) {
+        apply_settings_to(&editor, &settings, palette);
+    }
     crate::window::preview_host::refresh_appearance(hwnd);
     crate::window::image_host::refresh_appearance(hwnd);
 }
@@ -3472,12 +3655,14 @@ fn apply_theme(hwnd: HWND) {
     let Some((editor, language, palette, frame_change)) =
         (unsafe { app_ptr(hwnd) }).and_then(|mut app| {
             let app = unsafe { app.as_mut() };
-            let editor = app.editor.clone()?;
+            let editor = app.editor().cloned()?;
             let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
             let frame_change = app.dark_frame_applied != palette.dark_frame;
             app.dark_frame_applied = palette.dark_frame;
-            if let Some(bar) = app.find_bar.as_mut() {
-                bar.set_colors(palette);
+            for group in &mut app.groups {
+                if let Some(bar) = group.find_bar.as_mut() {
+                    bar.set_colors(palette);
+                }
             }
             if let Some(name_box) = app.name_box.as_mut() {
                 name_box.set_colors(palette);
@@ -3496,18 +3681,16 @@ fn apply_theme(hwnd: HWND) {
     else {
         return;
     };
-    let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
-    let _ =
-        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
-    let _ = editor.set_chrome_colors(
-        palette.selection_background,
-        palette.inactive_selection_background,
-        palette.caret_line_background,
-    );
-    let _ = editor.set_selection_text_colors(palette.selection_foreground);
+    for editor in all_editors(hwnd) {
+        apply_colors_to(&editor, palette);
+    }
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_ref() };
-        if let Some(bar) = app.find_bar.as_ref() {
+        for bar in app
+            .groups
+            .iter()
+            .filter_map(|group| group.find_bar.as_ref())
+        {
             bar.invalidate();
         }
         if let Some(name_box) = app.name_box.as_ref() {
@@ -3619,14 +3802,16 @@ fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::StatusBarText
     app.status.as_ref()?;
     let active = app.tabs.active().and_then(|document| {
         Some(crate::window::status::ActiveDocumentStatus {
-            caret: app.editor.as_ref()?.caret_status().ok()?,
+            caret: app.editor()?.caret_status().ok()?,
             language: document.language,
             encoding: document.encoding,
         })
     });
     let mut bar = crate::window::status::status_bar_text(&app.notifications, active);
     if app.notifications.pending().is_empty()
-        && let Some(hint) = app.preview.status_hint()
+        && let Some(hint) = app
+            .active_group()
+            .and_then(|group| group.preview.status_hint())
     {
         bar.left = hint;
     }
@@ -3685,7 +3870,7 @@ fn dismiss_notifications(hwnd: HWND) {
 /// touches the editor's text, selection, or undo stack either way.
 fn validate_active_json(hwnd: HWND) {
     let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -3711,7 +3896,7 @@ fn validate_active_json(hwnd: HWND) {
 /// editor mutation is attempted.
 fn format_active_json(hwnd: HWND) {
     let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -3888,8 +4073,8 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
         ))?;
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         // A preview goes where the preview tab is. Without one it is placed like any new tab,
         // reusing an empty start tab.
@@ -4013,8 +4198,8 @@ fn open_image_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Resul
         ))?;
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         let replace_preview = preview && app.tabs.preview_id().is_some();
         let candidate_ids = app
@@ -4179,7 +4364,7 @@ fn seed_find_bar(
     }
     let colors = title_chrome(hwnd).0;
     let pending = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
-        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
         Some(bar.show_with(find_bar::FindBarMode::Find, query, options, colors))
     });
     let Some(pending) = pending else {
@@ -4192,7 +4377,7 @@ fn seed_find_bar(
     }
     layout_editor_and_find_bar(hwnd);
     let Some(editor) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -4254,8 +4439,8 @@ pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
         };
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         let (id, recovery_id) = app.allocate_document_identity();
         (editor, id, recovery_id)
@@ -4341,7 +4526,7 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
     }
     let target = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         app.tabs.activate(id).ok()?;
         Some((
             editor,
@@ -4378,7 +4563,7 @@ fn remember_active_view(hwnd: HWND) {
     let shown = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         let active = app.tabs.active().filter(|document| !document.is_image())?;
-        Some((active.id, app.editor.clone()?))
+        Some((active.id, app.editor().cloned()?))
     });
     if let Some((id, editor)) = shown
         && let Ok(state) = editor.view_state()
@@ -4413,7 +4598,12 @@ fn close_active_document(hwnd: HWND) {
         let app = unsafe { app.as_ref() };
         let review = app.tabs.active_close_review()?;
         let document = app.tabs.document(review.id)?;
-        Some((review, document.dirty, document.title(), app.editor.clone()))
+        Some((
+            review,
+            document.dirty,
+            document.title(),
+            app.editor().cloned(),
+        ))
     });
     let Some((review, dirty, title, Some(editor))) = snapshot else {
         return;
@@ -4523,7 +4713,7 @@ pub(super) fn close_document_without_prompt(hwnd: HWND, id: DocumentId) {
     }
     let reviewed = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        Some((app.tabs.active_close_review()?, app.editor.clone()?))
+        Some((app.tabs.active_close_review()?, app.editor().cloned()?))
     });
     let Some((review, editor)) = reviewed else {
         return;
@@ -4841,7 +5031,7 @@ fn save_active_to(
     }
     let Some((editor, path, encoding)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let document = app.tabs.active()?;
         Some((editor, document.path.clone()?, document.encoding))
     }) else {
@@ -5018,7 +5208,7 @@ fn snapshot_next_document(hwnd: HWND) {
     };
     let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let active = app.tabs.active()?;
         let document = crate::recovery::next_snapshot_document(
             app.tabs.documents(),
@@ -5128,7 +5318,7 @@ pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
         if app.populating_file {
             return None;
         }
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
         if target.id == active.id {
@@ -5162,7 +5352,7 @@ pub(crate) fn replace_in_document(
         if app.populating_file {
             return None;
         }
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
         if target.id == active.id {
@@ -5234,7 +5424,7 @@ pub(crate) fn reload_clean_document(
         if app.populating_file {
             return None;
         }
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
         let unchanged = TabMark {
@@ -5395,7 +5585,7 @@ fn empty_startup_tab(hwnd: HWND) -> Option<DocumentId> {
     let active = app.tabs.active().filter(|document| {
         !document.dirty && document.path.is_none() && document.recovery_origin.is_none()
     })?;
-    let editor = app.editor.as_ref()?;
+    let editor = app.editor()?;
     let empty = unsafe { SendMessageW(editor.hwnd(), SCI_GETLENGTH, 0, 0) } == 0;
     empty.then_some(active.id)
 }
@@ -5435,7 +5625,7 @@ fn restore_session_entry(hwnd: HWND, entry: &crate::session::SessionEntry) -> Op
 fn adopt_restored_snapshot(hwnd: HWND, identity: &WindowIdentity, root: &std::path::Path) {
     let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let document = app.tabs.active()?;
         let origin = document.recovery_origin.as_ref()?;
         Some((
@@ -5536,7 +5726,7 @@ fn still_empty_untitled(hwnd: HWND, id: DocumentId) -> bool {
 
 fn apply_view_state(hwnd: HWND, entry: &crate::session::SessionEntry) {
     let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -5828,8 +6018,8 @@ fn open_snapshot_tab(
         ))?;
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         let (id, recovery_id) = app.allocate_document_identity();
         (editor, id, recovery_id)
@@ -6059,8 +6249,7 @@ pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate:
         // An image tab has no caret: the editor holds a placeholder then.
         if !document.is_image() {
             let state = if is_active {
-                app.editor
-                    .as_ref()
+                app.editor()
                     .and_then(|editor| editor.view_state().ok())
                     .unwrap_or_default()
             } else {
@@ -6141,7 +6330,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
             let app = unsafe { app.as_mut() };
             promoted = app.tabs.note_active_text_change();
             if modification.lines_added != 0
-                && let Some(editor) = app.editor.as_ref()
+                && let Some(editor) = app.editor()
             {
                 let _ = editor.refresh_line_numbers();
             }
@@ -6489,7 +6678,12 @@ fn menu_activation_message(
     false
 }
 
-unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Result<()> {
+unsafe fn install_editor(
+    hwnd: HWND,
+    group: HWND,
+    editor: Editor,
+    document: Document,
+) -> Result<()> {
     // SAFETY: The App pointer is re-fetched after editor creation so initialization never mutates
     // an App reference borrowed across a reentrant Win32 call.
     let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
@@ -6501,7 +6695,11 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Resu
     app.tabs
         .push(document)
         .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))?;
-    app.editor = Some(editor);
+    let id = app.tabs.active_group();
+    app.groups
+        .push(crate::window::editor_group::GroupWindow::new(
+            id, group, editor,
+        ));
     Ok(())
 }
 
@@ -6965,6 +7163,56 @@ mod tests {
     }
 
     #[test]
+    fn a_second_group_gets_its_own_editor_find_bar_and_preview() {
+        // Break caught: a second group sharing the first one's editor or find bar, so a find in
+        // one group moves the caret in the other, or its preview state leaking across.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetParent;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let second = super::create_group(window.hwnd).expect("second group");
+        assert_ne!(first, second);
+        let (first_editor, second_editor) = (
+            super::group_editor(window.hwnd, first).unwrap(),
+            super::group_editor(window.hwnd, second).unwrap(),
+        );
+        assert_ne!(first_editor.hwnd(), second_editor.hwnd());
+        let second_window = app_mut(window.hwnd).group(second).unwrap().hwnd;
+        assert_eq!(unsafe { GetParent(second_editor.hwnd()) }, second_window);
+        assert!(second_editor.shares_documents_with(&first_editor));
+
+        // Find needs a tab, so group 2 shows the document too.
+        let document = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(
+            app_mut(window.hwnd)
+                .tabs
+                .add_view(second, document, Default::default())
+        );
+        app_mut(window.hwnd).tabs.set_active_group(second);
+        execute_command(window.hwnd, CommandId::Find);
+        let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
+        assert_eq!(unsafe { GetParent(panel) }, second_window);
+        assert!(
+            app_mut(window.hwnd)
+                .group(first)
+                .unwrap()
+                .find_bar
+                .is_none()
+        );
+        assert_eq!(
+            app_mut(window.hwnd).group_containing(first_editor.hwnd()),
+            Some(first)
+        );
+
+        app_mut(window.hwnd).tabs.set_active_group(first);
+        assert!(app_mut(window.hwnd).tabs.move_view(second, document, first));
+        super::destroy_group(window.hwnd, second);
+        assert!(app_mut(window.hwnd).group(second).is_none());
+        assert_eq!(app_mut(window.hwnd).tabs.group_ids(), vec![first]);
+    }
+
+    #[test]
     fn the_editor_and_find_bar_live_in_the_group_window() {
         // Break caught: a child left parented to the main window, painting over or under the
         // group and missing its layout.
@@ -6976,7 +7224,7 @@ mod tests {
         assert_eq!(unsafe { GetParent(group) }, window.hwnd);
         assert_eq!(unsafe { GetParent(editor.hwnd()) }, group);
         execute_command(window.hwnd, CommandId::Find);
-        let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
+        let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
         assert_eq!(unsafe { GetParent(panel) }, group);
         let (width, height) = client_size(window.hwnd);
         let (group_width, group_height) = client_size(group);
@@ -6997,7 +7245,7 @@ mod tests {
         editor.set_text("xyz abc abc").unwrap();
         editor.set_selection(0..0).unwrap();
         execute_command(window.hwnd, CommandId::Find);
-        let query = app_mut(window.hwnd).find_bar.as_ref().unwrap().query_hwnd();
+        let query = app_mut(window.hwnd).find_bar().unwrap().query_hwnd();
         let text = crate::platform::wide_null("abc");
         unsafe { SetWindowTextW(query, text.as_ptr()) };
         editor.set_selection(0..0).unwrap();
@@ -7006,7 +7254,7 @@ mod tests {
         assert_eq!(editor.selected_text().unwrap(), "abc");
 
         unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
-        assert!(!app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+        assert!(!app_mut(window.hwnd).find_bar().unwrap().is_visible());
     }
 
     #[test]
@@ -7336,7 +7584,7 @@ mod tests {
             rect
         };
         let app = app_mut(window.hwnd);
-        let find = rect(app.find_bar.as_ref().unwrap().panel_hwnd());
+        let find = rect(app.find_bar().unwrap().panel_hwnd());
         let palette = rect(app.command_palette.as_ref().unwrap().panel_hwnd());
         assert!(
             palette.top >= find.bottom,
@@ -8133,7 +8381,7 @@ mod tests {
             super::VK_DOWN as usize,
         ));
         assert_eq!(app_mut(window.hwnd).menu_mode, None);
-        assert!(app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+        assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
         assert_eq!(
             editor_top(),
             title_height + super::find_bar::find_bar_height(dpi)
@@ -8166,18 +8414,18 @@ mod tests {
         let title_height = super::title_layout(window.hwnd).height;
 
         execute_command(window.hwnd, CommandId::Find);
-        let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
+        let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
         assert!(visible(panel));
         let band = super::find_bar::find_bar_height(dpi);
         assert_eq!(top_of(panel), (title_height, band));
         assert_eq!(top_of(editor.hwnd()).0, title_height + band);
 
         let brush_before = {
-            let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+            let bar = app_mut(window.hwnd).find_bar().unwrap();
             bar.control_color(std::ptr::null_mut())
         };
         execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.is_visible());
         assert_ne!(bar.control_color(std::ptr::null_mut()), brush_before);
 
@@ -8729,8 +8977,7 @@ mod tests {
         }
         .unwrap();
         let editor_hwnd = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
-            .editor
-            .as_ref()
+            .editor()
             .unwrap()
             .hwnd();
 
@@ -9286,8 +9533,8 @@ mod tests {
         // What the first WM_SIZE does once `bootstrap::run` shows the window.
         super::layout_editor_and_find_bar(window.hwnd);
         unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .unwrap()
     }
 
@@ -9515,7 +9762,7 @@ mod tests {
         assert_eq!(tooltip.tool_count(), 4);
 
         execute_command(window.hwnd, CommandId::Find);
-        let find = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
+        let find = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
         assert_eq!(left_of(find, window.hwnd), left);
         assert_eq!(client_size(find).0, width - left);
         super::close_find_bar(window.hwnd);
@@ -11692,7 +11939,7 @@ mod tests {
         let (_scratch, window, _editor) = open_first_save_box("find-closes");
         execute_command(window.hwnd, CommandId::Find);
         assert!(!name_box_visible(window.hwnd));
-        assert!(app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+        assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
     }
 
     #[test]
@@ -11709,8 +11956,7 @@ mod tests {
 
         super::create_new_document(window.hwnd).unwrap();
         app_mut(window.hwnd)
-            .editor
-            .as_ref()
+            .editor()
             .unwrap()
             .set_text("Device")
             .unwrap();
@@ -16231,7 +16477,7 @@ mod tests {
 
         assert_eq!(editor.text().unwrap(), "see a-b#c here");
         assert_eq!(editor.selection().unwrap(), 4..9);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.options().regex);
         assert!(!bar.no_match());
     }
@@ -17703,7 +17949,7 @@ mod tests {
         let _editor = install_test_editor(&window);
         execute_command(window.hwnd, CommandId::Find);
         let (panel, query, replace) = {
-            let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+            let bar = app_mut(window.hwnd).find_bar().unwrap();
             (bar.panel_hwnd(), bar.query_hwnd(), bar.replace_hwnd())
         };
         let items = || {
@@ -17737,14 +17983,7 @@ mod tests {
 
         // The default action clicks the toggle, as the mouse does.
         (FIND_BAR_ACCESSIBLE.activate)(panel, 1);
-        assert!(
-            app_mut(window.hwnd)
-                .find_bar
-                .as_ref()
-                .unwrap()
-                .options()
-                .case
-        );
+        assert!(app_mut(window.hwnd).find_bar().unwrap().options().case);
 
         execute_command(window.hwnd, CommandId::Replace);
         assert_eq!((FIND_BAR_ACCESSIBLE.count)(panel), 6);
@@ -17934,7 +18173,7 @@ mod tests {
     }
 
     fn set_find_query(hwnd: HWND, text: &str) {
-        let edit = app_mut(hwnd).find_bar.as_ref().unwrap().query_hwnd();
+        let edit = app_mut(hwnd).find_bar().unwrap().query_hwnd();
         let wide = crate::platform::wide_null(text);
         // Sends EN_CHANGE, handled with nothing of the App borrowed here.
         unsafe {
@@ -17955,7 +18194,7 @@ mod tests {
             .populate_clean("Foo foo foobar foo_bar foo. a1 b22")
             .unwrap();
         execute_command(window.hwnd, CommandId::Find);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         set_find_query(window.hwnd, "foo");
         super::toggle_find_option(window.hwnd, SearchOption::Case);
@@ -18002,7 +18241,7 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         execute_command(window.hwnd, CommandId::Find);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
         let (query, panel) = (bar().query_hwnd(), bar().panel_hwnd());
         let alt = 1 << 29;
 
@@ -18041,11 +18280,7 @@ mod tests {
         editor.populate_clean("CAT cat").unwrap();
         execute_command(window.hwnd, CommandId::Replace);
         set_find_query(window.hwnd, "cat");
-        let replace = app_mut(window.hwnd)
-            .find_bar
-            .as_ref()
-            .unwrap()
-            .replace_hwnd();
+        let replace = app_mut(window.hwnd).find_bar().unwrap().replace_hwnd();
         let dog = crate::platform::wide_null("dog");
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(replace, dog.as_ptr());
@@ -18080,7 +18315,7 @@ mod tests {
 
         assert_eq!(editor.text().unwrap(), "beta Beta beta Beta");
         assert_eq!(editor.selection().unwrap(), 5..9);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.is_visible());
         assert_eq!(bar.query_text(), "Beta");
         assert_eq!(
@@ -18119,7 +18354,7 @@ mod tests {
 
         assert_eq!(editor.text().unwrap(), "alpha gamma");
         assert_eq!(editor.selection().unwrap(), 0..0);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.is_visible());
         assert_eq!(bar.query_text(), "beta");
         assert!(bar.no_match());
@@ -18127,7 +18362,7 @@ mod tests {
     }
 
     fn set_replace_text(hwnd: HWND, text: &str) {
-        let edit = app_mut(hwnd).find_bar.as_ref().unwrap().replace_hwnd();
+        let edit = app_mut(hwnd).find_bar().unwrap().replace_hwnd();
         let wide = crate::platform::wide_null(text);
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
@@ -18147,7 +18382,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::Find);
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
         set_find_query(window.hwnd, r"\d*");
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         editor.set_selection(1..1).unwrap();
         super::find_next(window.hwnd);
@@ -18248,7 +18483,7 @@ mod tests {
             .unwrap();
         execute_command(window.hwnd, CommandId::Find);
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         set_find_query(window.hwnd, "élan");
         editor.set_selection(0..0).unwrap();
@@ -18282,7 +18517,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::Replace);
         set_find_query(window.hwnd, "zeta");
         super::find_next(window.hwnd);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar().no_match());
 
         set_replace_text(window.hwnd, "beta");
@@ -18303,7 +18538,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::Find);
         super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
         set_find_query(window.hwnd, "mașină");
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
         let find = |text: &str, backward: bool| {
             editor.populate_clean(text).unwrap();
             let end = editor.length().unwrap();
@@ -18349,7 +18584,7 @@ mod tests {
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
         super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
         set_find_query(window.hwnd, "fo+");
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         editor.set_selection(0..0).unwrap();
         super::find_next(window.hwnd);

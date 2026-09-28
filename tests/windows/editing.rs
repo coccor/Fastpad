@@ -72,14 +72,14 @@ fn ctrl_f_opens_find_bar_prefills_from_selection_and_escape_returns_focus_to_edi
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::Find as usize, 0);
     }
 
-    let query_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
-    assert!(main.with_app(|app| app.find_bar.as_ref().unwrap().is_visible()));
+    let query_hwnd = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
+    assert!(main.with_app(|app| app.find_bar().unwrap().is_visible()));
     wait_text(query_hwnd, "needle");
     wait_focus(query_hwnd);
 
     send_key(query_hwnd, VK_ESCAPE, false);
 
-    assert!(!main.with_app(|app| app.find_bar.as_ref().unwrap().is_visible()));
+    assert!(!main.with_app(|app| app.find_bar().unwrap().is_visible()));
     wait_focus(editor);
 }
 
@@ -99,7 +99,7 @@ fn enter_in_find_field_cycles_forward_through_every_match() {
     unsafe {
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::Find as usize, 0);
     }
-    let query_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
+    let query_hwnd = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
     type_text(query_hwnd, "one");
 
     send_key(query_hwnd, VK_RETURN, false);
@@ -124,7 +124,7 @@ fn enter_in_find_field_with_no_match_leaves_the_selection_unchanged() {
     unsafe {
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::Find as usize, 0);
     }
-    let query_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
+    let query_hwnd = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
     type_text(query_hwnd, "missing");
 
     send_key(query_hwnd, VK_RETURN, false);
@@ -143,7 +143,7 @@ fn shift_enter_in_find_field_navigates_backward() {
     unsafe {
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::Find as usize, 0);
     }
-    let query_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
+    let query_hwnd = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
     type_text(query_hwnd, "one");
 
     send_key(query_hwnd, VK_RETURN, true);
@@ -165,8 +165,8 @@ fn replace_all_replaces_every_match_and_is_undone_in_one_step() {
     unsafe {
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::Replace as usize, 0);
     }
-    let query_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
-    let replace_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().replace_hwnd());
+    let query_hwnd = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
+    let replace_hwnd = main.with_app(|app| app.find_bar().unwrap().replace_hwnd());
     type_text(query_hwnd, "cat");
     type_text(replace_hwnd, "dog");
 
@@ -190,8 +190,8 @@ fn enter_in_replace_field_replaces_the_current_match_and_advances() {
     unsafe {
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::Replace as usize, 0);
     }
-    let query_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
-    let replace_hwnd = main.with_app(|app| app.find_bar.as_ref().unwrap().replace_hwnd());
+    let query_hwnd = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
+    let replace_hwnd = main.with_app(|app| app.find_bar().unwrap().replace_hwnd());
     type_text(query_hwnd, "cat");
     type_text(replace_hwnd, "dog");
 

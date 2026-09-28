@@ -177,7 +177,8 @@ impl TestMain {
     }
 
     fn image_view(&self) -> image_view::ImageView {
-        self.with_app(|app| app.image.view).expect("image view")
+        self.with_app(|app| app.active_group().unwrap().image.view)
+            .expect("image view")
     }
 
     fn wait_ready(&self) -> image_view::ImageStats {
@@ -259,7 +260,7 @@ fn saving_an_image_tab_never_writes_the_file() {
     assert!(platform::dialogs::take_dialog_events().is_empty());
     assert_eq!(std::fs::read(&path).unwrap(), preview::images::PNG_2X2);
     assert!(!main.with_app(|app| app.tabs.active().unwrap().dirty));
-    assert!(main.with_app(|app| app.find_bar.is_none()));
+    assert!(main.with_app(|app| app.find_bar().is_none()));
     main.command(CommandId::CloseTab);
     assert_eq!(main.with_app(|app| app.tabs.len()), 0);
     assert_eq!(std::fs::read(&path).unwrap(), preview::images::PNG_2X2);
@@ -418,7 +419,9 @@ fn an_svg_opens_as_text_and_the_preview_renders_and_follows_edits() {
     assert!(!main.with_app(|app| app.tabs.active().unwrap().is_image()));
     assert!(window::preview_host::buttons_visible(main.hwnd));
     main.command(CommandId::MarkdownPreviewCycle);
-    let view = main.with_app(|app| app.preview.svg_view).expect("svg view");
+    let view = main
+        .with_app(|app| app.active_group().unwrap().preview.svg_view)
+        .expect("svg view");
     pump_until("svg rendered", Duration::from_secs(5), || {
         view.stats().phase == image_view::Phase::Ready
     });

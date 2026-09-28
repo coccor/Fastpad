@@ -4,6 +4,7 @@
 use crate::image_view::ImageView;
 use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
+use crate::window::split_tree::GroupId;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -26,8 +27,23 @@ pub(crate) struct ImageStatus {
     pub zoom_percent: Option<u32>,
 }
 
+/// Runs `action` on the active group's image host.
 fn with_host<R>(hwnd: HWND, action: impl FnOnce(&mut ImageHost) -> R) -> Option<R> {
-    unsafe { host_window::app_ptr(hwnd) }.map(|mut app| action(&mut unsafe { app.as_mut() }.image))
+    unsafe { host_window::app_ptr(hwnd) }.and_then(|mut app| {
+        Some(action(
+            &mut unsafe { app.as_mut() }.active_group_mut()?.image,
+        ))
+    })
+}
+
+/// `with_host` for the group `id`, which need not be the active one.
+pub(crate) fn with_group_host<R>(
+    hwnd: HWND,
+    id: GroupId,
+    action: impl FnOnce(&mut ImageHost) -> R,
+) -> Option<R> {
+    unsafe { host_window::app_ptr(hwnd) }
+        .and_then(|mut app| Some(action(&mut unsafe { app.as_mut() }.group_mut(id)?.image)))
 }
 
 fn view(hwnd: HWND) -> Option<ImageView> {
@@ -122,8 +138,19 @@ pub(crate) fn sync(hwnd: HWND) {
     }
 }
 
-pub(crate) fn layout(hwnd: HWND, area: RECT) {
-    if let Some(view) = view(hwnd).filter(|_| active_is_image(hwnd)) {
+/// Lays out group `id`'s image view, shown when that group's active tab is an image.
+pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT) {
+    let image = unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.group(id)
+            .and_then(|group| group.active_document())
+            .and_then(|document| tabs.document(document))
+            .is_some_and(|document| document.is_image())
+    });
+    if let Some(view) = with_group_host(hwnd, id, |host| host.view)
+        .flatten()
+        .filter(|_| image)
+    {
         unsafe {
             MoveWindow(
                 view.hwnd(),

@@ -1002,16 +1002,17 @@ pub(crate) fn toggle_child(option: SearchOption) -> usize {
         .unwrap_or(0)
 }
 
-/// Runs `f` on the find bar whose panel is `panel`. Called on the window's own thread
+/// Runs `f` on the find bar, in whichever group, whose panel is `panel`. Called on the window's own thread
 /// (`sidebar_accessibility` sends every query there), under a shared App borrow: `f` reads kept
 /// state and sends no messages.
 fn with_bar<R>(panel: HWND, f: impl FnOnce(&FindBar) -> R) -> Option<R> {
     let main = crate::platform::win32::root_window(panel);
     let app = unsafe { super::main_window::app_ptr(main) }?;
     let bar = unsafe { app.as_ref() }
-        .find_bar
-        .as_ref()
-        .filter(|bar| bar.panel == panel)?;
+        .groups
+        .iter()
+        .filter_map(|group| group.find_bar.as_ref())
+        .find(|bar| bar.panel == panel)?;
     Some(f(bar))
 }
 
