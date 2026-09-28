@@ -48,7 +48,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_CHAR,
+    CreateWindowExW, DestroyWindow, GetClientRect, HWND_MESSAGE, SendMessageW, WM_CHAR,
     WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -98,12 +98,16 @@ pub struct ScintillaNotification {
 #[derive(Debug)]
 pub struct Editor {
     endpoint: Rc<EditorEndpoint>,
+    /// The Scintilla that creates this editor's documents: the shared document host (split
+    /// editors spec §3.1), or the editor itself for one made by `create`.
+    documents: Rc<EditorEndpoint>,
 }
 
 impl Clone for Editor {
     fn clone(&self) -> Self {
         Self {
             endpoint: Rc::clone(&self.endpoint),
+            documents: Rc::clone(&self.documents),
         }
     }
 }
@@ -143,7 +147,49 @@ fn line_number_digits(line_count: isize) -> usize {
 impl Editor {
     #[cfg(windows)]
     pub fn create(parent: HWND) -> Result<Self> {
-        let hwnd = create_scintilla_child(parent)?;
+        let endpoint = Self::open_endpoint(create_scintilla_child(parent)?)?;
+        Self::finish(Rc::clone(&endpoint), endpoint)
+    }
+
+    /// A message-only Scintilla that creates every document and never shows one (split editors
+    /// spec §3.1). Its notifications go nowhere, so edits made through it notify nobody.
+    #[cfg(windows)]
+    pub fn create_document_host() -> Result<Self> {
+        let endpoint = Self::open_endpoint(create_scintilla_host()?)?;
+        Ok(Self {
+            documents: Rc::clone(&endpoint),
+            endpoint,
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub fn create_document_host() -> Result<Self> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// A visible editor under `parent` that shows documents `host` created.
+    #[cfg(windows)]
+    pub fn create_with_host(parent: HWND, host: &Editor) -> Result<Self> {
+        let endpoint = Self::open_endpoint(create_scintilla_child(parent)?)?;
+        Self::finish(endpoint, Rc::clone(&host.documents))
+    }
+
+    #[cfg(not(windows))]
+    pub fn create_with_host(_parent: HWND, _host: &Editor) -> Result<Self> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Whether `other` shows documents from the same host, so either can show the other's.
+    pub fn shares_documents_with(&self, other: &Editor) -> bool {
+        Rc::ptr_eq(&self.documents, &other.documents)
+    }
+
+    #[cfg(windows)]
+    fn open_endpoint(hwnd: HWND) -> Result<Rc<EditorEndpoint>> {
         require_hwnd(hwnd)?;
 
         let direct_fn_raw = unsafe { SendMessageW(hwnd, SCI_GETDIRECTFUNCTION, 0, 0) };
@@ -167,8 +213,16 @@ impl Editor {
             true,
         ));
         endpoint.install_lifecycle_guard()?;
+        Ok(endpoint)
+    }
 
-        let editor = Self { endpoint };
+    #[cfg(windows)]
+    fn finish(endpoint: Rc<EditorEndpoint>, documents: Rc<EditorEndpoint>) -> Result<Self> {
+        let hwnd = endpoint.hwnd;
+        let editor = Self {
+            endpoint,
+            documents,
+        };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
         editor.initialize_view(|editor| editor.apply_chrome_defaults(dpi))?;
         Ok(editor)
@@ -240,7 +294,7 @@ impl Editor {
     #[cfg(windows)]
     pub fn create_document(&self) -> Result<EditorDocument> {
         let raw = self
-            .endpoint
+            .documents
             .send_direct_checked(SCI_CREATEDOCUMENT, 0, 0)?;
         if raw == 0 {
             return Err(FastPadError::Invariant(
@@ -249,7 +303,7 @@ impl Editor {
         }
         Ok(EditorDocument {
             raw,
-            endpoint: Rc::clone(&self.endpoint),
+            endpoint: Rc::clone(&self.documents),
         })
     }
 
@@ -268,10 +322,10 @@ impl Editor {
                 "Scintilla did not return the current document",
             ));
         }
-        self.endpoint.retain_document(raw);
+        self.documents.retain_document(raw);
         Ok(EditorDocument {
             raw,
-            endpoint: Rc::clone(&self.endpoint),
+            endpoint: Rc::clone(&self.documents),
         })
     }
 
@@ -284,7 +338,7 @@ impl Editor {
 
     #[cfg(windows)]
     pub fn use_document(&self, document: &EditorDocument) -> Result<()> {
-        if !Rc::ptr_eq(&self.endpoint, &document.endpoint) {
+        if !Rc::ptr_eq(&self.documents, &document.endpoint) {
             return Err(FastPadError::Invariant(
                 "Scintilla document belongs to a different editor",
             ));
@@ -1174,13 +1228,15 @@ impl Editor {
 
     #[cfg(test)]
     pub(crate) fn test_fixture(direct_fn: SciFnDirect, direct_ptr: isize) -> Self {
+        let endpoint = Rc::new(EditorEndpoint::new(
+            std::ptr::null_mut(),
+            direct_fn,
+            direct_ptr,
+            false,
+        ));
         Self {
-            endpoint: Rc::new(EditorEndpoint::new(
-                std::ptr::null_mut(),
-                direct_fn,
-                direct_ptr,
-                false,
-            )),
+            documents: Rc::clone(&endpoint),
+            endpoint,
         }
     }
 }
@@ -1451,6 +1507,30 @@ fn create_scintilla_child(parent: HWND) -> Result<HWND> {
     Ok(hwnd)
 }
 
+/// The document host's window: message-only, so it has no parent to outlive and is never shown.
+#[cfg(windows)]
+fn create_scintilla_host() -> Result<HWND> {
+    let class_name = wide_null("Scintilla");
+    let hwnd = unsafe {
+        // SAFETY: HWND_MESSAGE is the documented parent for a message-only window.
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            1,
+            1,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    Ok(hwnd)
+}
+
 #[cfg(windows)]
 fn parent_client_rect(parent: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
@@ -1609,6 +1689,37 @@ mod tests {
             _host: HostWindow(parent),
             _module: module,
         }
+    }
+
+    #[test]
+    fn a_host_document_shows_in_two_editors_and_outlives_both() {
+        // Break caught: a document tied to the editor that created it, so a second group's editor
+        // refuses it, or closing a group frees text another group still shows.
+        let first = test_editor();
+        let host = Editor::create_document_host().expect("document host");
+        let left = Editor::create_with_host(first._host.0, &host).expect("left editor");
+        let right = Editor::create_with_host(first._host.0, &host).expect("right editor");
+        let document = left.create_document().unwrap();
+        left.use_document(&document).unwrap();
+        right.use_document(&document).unwrap();
+        left.set_text("shared").unwrap();
+        assert_eq!(right.text().unwrap(), "shared");
+        drop(left);
+        drop(right);
+        host.use_document(&document).unwrap();
+        assert_eq!(host.text().unwrap(), "shared");
+    }
+
+    #[test]
+    fn an_editor_refuses_documents_from_another_host() {
+        // Break caught: SCI_SETDOCPOINTER with a document whose owner can be destroyed under it.
+        let fixture = test_editor();
+        let host = Editor::create_document_host().expect("document host");
+        let hosted = Editor::create_with_host(fixture._host.0, &host).expect("hosted editor");
+        let foreign = fixture.create_document().unwrap();
+        assert!(hosted.use_document(&foreign).is_err());
+        assert!(hosted.shares_documents_with(&host));
+        assert!(!hosted.shares_documents_with(&fixture));
     }
 
     #[test]

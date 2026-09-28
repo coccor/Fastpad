@@ -49,7 +49,7 @@ These are the conditions most likely to hurt a user that no part's feature test 
 
 ---
 
-## Part 1: The document host
+## Task 1: The document host
 
 Afterwards, an `Editor` can show any document that a shared host created. Documents outlive the editors that showed them.
 
@@ -238,7 +238,7 @@ git commit -m "feat(split-editors): a document host that any editor can show doc
 
 ---
 
-## Part 2: The document store, views, and per-tab view state
+## Task 2: The document store, views, and per-tab view state
 
 Afterwards, `Tabs` keeps its public API but stores documents in a `DocumentStore` and tabs as views. Switching tabs saves the caret, selection and scroll of the tab being left and restores those of the tab shown.
 
@@ -612,7 +612,7 @@ git commit -m "refactor(split-editors): documents in a store, tabs as views with
 
 ---
 
-## Part 3: The host editor creates every document and reads and writes background tabs
+## Task 3: The host editor creates every document and reads and writes background tabs
 
 Afterwards, every document comes from the host, and background tabs are read and changed through the host, never swapped into the visible editor.
 
@@ -703,7 +703,7 @@ git commit -m "refactor(split-editors): create documents on the host and edit ba
 
 ---
 
-## Part 4: Session version 2
+## Task 4: Session version 2
 
 Afterwards, `session.ini` is written as version 2, with a layout, groups and every view's state. Version 1 reads as one group. In PR 1 there is only one group; a multi-group file is flattened into one group in order.
 
@@ -886,7 +886,7 @@ Also run the session e2e target if one exists (`grep -ln "session" tests/*.rs`),
 
 ---
 
-## Part 5: The group window hosts the editor, find bar, preview and image view
+## Task 5: The group window hosts the editor, find bar, preview and image view
 
 Afterwards, a `FastPadEditorGroup` child window sits in the content area and is the parent of the Scintilla editor, the find bar panel, the preview and SVG views and the image view. The tab strip is still in the title bar; Part 6 moves it.
 
@@ -1019,7 +1019,7 @@ git commit -m "refactor(split-editors): an editor group window hosts the editor,
 
 ---
 
-## Part 6: The tab strip moves into the group
+## Task 6: The tab strip moves into the group
 
 Afterwards, the group paints its own strip at the top, with tabs on the left and Preview Side, Preview Full and "…" on the right, and handles all the strip's input. The title bar keeps only the logo space, the app menu "…", the window title text and the caption buttons.
 
@@ -1202,7 +1202,7 @@ git commit -m "feat(split-editors): the tab strip moves from the title bar into 
 
 ---
 
-## Part 7: Accessibility for the moved strip
+## Task 7: Accessibility for the moved strip
 
 Afterwards, the group window answers `WM_GETOBJECT` with the tab-list provider: tabs, the preview buttons and "…". The main window's provider exposes only the title bar: app menu, minimize, maximize and close.
 
@@ -1259,7 +1259,7 @@ git commit -m "feat(split-editors): accessible tab list on the group strip, titl
 
 ---
 
-## Part 8: Documentation and the startup check
+## Task 8: Documentation and the startup check
 
 **Files:**
 - Modify: `README.md`, if it describes the tab strip's position, Ctrl+1..9, or double-clicking the title bar. Search it with `rg -n "title bar|Ctrl\+1|double-click" README.md`.
@@ -1291,7 +1291,7 @@ git commit -m "docs(split-editors): tabs below the title bar; plan-time amendmen
 
 ---
 
-## Part 9: Full suite and review
+## Task 9: Full suite and review
 
 - [ ] **Step 1: Run the full suite once.**
 
