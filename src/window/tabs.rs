@@ -461,6 +461,9 @@ impl Tabs {
         let Some(document) = self.documents.get_mut(active) else {
             return false;
         };
+        if document.is_image() {
+            return false;
+        }
         // Undo can reach Scintilla's empty save point; a recovered tab stays dirty until saved.
         if document.dirty == dirty || (!dirty && document.recovery_origin.is_some()) {
             return false;
@@ -510,6 +513,9 @@ impl Tabs {
         let Some(document) = self.documents.get_mut(active) else {
             return false;
         };
+        if document.is_image() {
+            return false;
+        }
         document.generation = document.generation.saturating_add(1);
         if !document.preview {
             return false;
@@ -594,7 +600,7 @@ impl Tabs {
     }
 
     pub(crate) fn active_handle(&self) -> Option<&crate::editor::EditorDocument> {
-        self.active().map(|document| &document.handle)
+        self.active().and_then(Document::text_handle)
     }
 
     /// Rejects `path` if it canonicalizes to the same file another open tab (any document other

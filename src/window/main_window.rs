@@ -3567,8 +3567,9 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
         ));
     }
     unsafe { app_ptr(hwnd).unwrap().as_mut() }.populating_file = true;
-    let result = editor
-        .use_document(&document.handle)
+    let result = document
+        .expect_text()
+        .and_then(|handle| editor.use_document(handle))
         .and_then(|_| editor.populate_clean(&loaded.text));
     if result.is_err() && identity.is_live_for(hwnd) {
         let _ = editor.use_document(&previous);
@@ -3803,7 +3804,9 @@ pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
     };
 
     let document = Document::untitled(id, recovery_id, editor.create_document()?);
-    editor.use_document(&document.handle)?;
+    document
+        .expect_text()
+        .and_then(|handle| editor.use_document(handle))?;
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed while creating a document",
@@ -3878,10 +3881,18 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
         let app = unsafe { app.as_mut() };
         let editor = app.editor.clone()?;
         app.tabs.activate(id).ok()?;
-        Some((editor, app.tabs.active_handle()?.clone()))
+        Some((editor, app.tabs.active_handle().cloned()))
     });
     let Some((editor, handle)) = target else {
         return false;
+    };
+    // An image tab has no text: the hidden editor holds an empty placeholder, as with no tab open.
+    let handle = match handle {
+        Some(handle) => handle,
+        None => match editor.create_document() {
+            Ok(blank) => blank,
+            Err(_) => return false,
+        },
     };
     if editor.use_document(&handle).is_err() || !identity.is_live_for(hwnd) {
         return false;
@@ -4497,6 +4508,11 @@ fn snapshot_next_document(hwnd: HWND) {
             app.last_snapshot_attempt,
         )?;
         let origin = document.recovery_origin.as_ref();
+        let inactive = if document.id == active.id {
+            None
+        } else {
+            Some(inactive_pair(&editor, document, active)?)
+        };
         Some(SnapshotJob {
             editor,
             id: document.id,
@@ -4508,8 +4524,7 @@ fn snapshot_next_document(hwnd: HWND) {
                 .or_else(|| origin.and_then(|origin| origin.original_path.clone())),
             encoding: document.encoding,
             source_snapshot: origin.map(|origin| origin.snapshot_path.clone()),
-            inactive: (document.id != active.id)
-                .then(|| (document.handle.clone(), active.handle.clone())),
+            inactive,
         })
     });
     let Some(job) = job else {
@@ -4548,6 +4563,22 @@ fn snapshot_next_document(hwnd: HWND) {
     {
         crate::recovery::remove_snapshot_files(&[source]);
     }
+}
+
+/// The handles `with_inactive_document` swaps: `target`'s text, and the document the editor shows
+/// now. `None` when `target` is an image tab, which has no text to read or change. While an image
+/// tab is active the editor shows a placeholder that no tab owns, so it is read from the editor.
+fn inactive_pair(
+    editor: &Editor,
+    target: &Document,
+    active: &Document,
+) -> Option<(crate::editor::EditorDocument, crate::editor::EditorDocument)> {
+    let target = target.text_handle()?.clone();
+    let shown = match active.text_handle() {
+        Some(handle) => handle.clone(),
+        None => editor.current_document().ok()?,
+    };
+    Some((target, shown))
 }
 
 struct SnapshotJob {
@@ -4633,7 +4664,8 @@ pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
         if target.id == active.id {
             return Some((editor, None));
         }
-        Some((editor, Some((target.handle.clone(), active.handle.clone()))))
+        let pair = inactive_pair(&editor, target, active)?;
+        Some((editor, Some(pair)))
     })?;
     match inactive {
         None => editor.text().ok(),
@@ -4669,7 +4701,8 @@ pub(crate) fn replace_in_document(
         if target.id == active.id {
             return Some((editor, None));
         }
-        Some((editor, Some((target.handle.clone(), active.handle.clone()))))
+        let pair = inactive_pair(&editor, target, active)?;
+        Some((editor, Some(pair)))
     })?;
     // Set once Scintilla is asked to change the text: from then on it may have changed, even if
     // a replacement then fails partway.
@@ -4748,7 +4781,8 @@ pub(crate) fn reload_clean_document(
         if target.id == active.id {
             return Some((editor, None));
         }
-        Some((editor, Some((target.handle.clone(), active.handle.clone()))))
+        let pair = inactive_pair(&editor, target, active)?;
+        Some((editor, Some(pair)))
     }) else {
         return false;
     };
@@ -5345,8 +5379,9 @@ fn open_snapshot_tab(
     }
     set_file_population(hwnd, true);
     // Undo collection stays on so the loaded text leaves the save point: the tab starts dirty.
-    let result = editor
-        .use_document(&document.handle)
+    let result = document
+        .expect_text()
+        .and_then(|handle| editor.use_document(handle))
         .and_then(|_| editor.set_text(&snapshot.text));
     drop(snapshot.text);
     if result.is_err() && identity.is_live_for(hwnd) {
