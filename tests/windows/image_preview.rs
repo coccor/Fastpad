@@ -395,7 +395,7 @@ fn an_image_tab_restores_from_the_session_as_its_file() {
     main.open(&path).unwrap();
     let session = window::build_session(main.hwnd, &dir).unwrap();
     assert!(matches!(
-        &session.entries[0].source,
+        &session.groups[0].entries[0].source,
         session::SessionSource::File(file) if file.ends_with("a.png")
     ));
 }

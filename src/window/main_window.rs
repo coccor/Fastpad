@@ -5060,7 +5060,7 @@ fn begin_session_restore(hwnd: HWND) -> bool {
         return false;
     };
     crate::session::remove(&path);
-    if session.entries.is_empty() {
+    if session.is_empty() {
         return false;
     }
     let placeholder = empty_startup_tab(hwnd);
@@ -5071,7 +5071,7 @@ fn begin_session_restore(hwnd: HWND) -> bool {
         return false;
     };
     unsafe { app.as_mut() }.session_restore =
-        Some(crate::session::SessionRestore::new(session, placeholder));
+        Some(crate::session::SessionRestore::new(&session, placeholder));
     bind_ipc_for_restore(hwnd);
     true
 }
@@ -5115,7 +5115,16 @@ fn restore_session_entry(hwnd: HWND, entry: &crate::session::SessionEntry) -> Op
         }
     }
     apply_detected_language(hwnd);
-    unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+    let (id, text) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let active = unsafe { app.as_ref() }.tabs.active()?;
+        Some((active.id, !active.is_image()))
+    })?;
+    // Every tab lands where it was, not only the active one: the next entry's open records this
+    // position for the tab as it takes the editor over (split editors spec §8).
+    if text {
+        apply_view_state(hwnd, entry);
+    }
+    Some(id)
 }
 
 /// The snapshot a session tab was just restored from belongs to the previous, exited process, so
@@ -5192,7 +5201,7 @@ fn finish_session_restore(hwnd: HWND) {
         && identity.is_live_for(hwnd)
         && restore.saved_active_restored() == Some(active)
     {
-        apply_view_state(hwnd, &restore.session.entries[restore.session.active]);
+        apply_view_state(hwnd, &restore.entries[restore.active]);
     }
     if !identity.is_live_for(hwnd) {
         return;
@@ -5253,8 +5262,9 @@ fn saved_session_snapshots(hwnd: HWND, root: &std::path::Path) -> Vec<std::path:
         return Vec::new();
     };
     session
-        .entries
+        .groups
         .iter()
+        .flat_map(|group| &group.entries)
         .filter_map(|entry| match entry.source {
             crate::session::SessionSource::Snapshot(id) => {
                 Some(crate::recovery::snapshot::snapshot_path(root, id))
@@ -5692,7 +5702,7 @@ fn save_session_for_close(hwnd: HWND) -> bool {
     let Some(session) = build_session(hwnd, &root) else {
         return false;
     };
-    let written = if session.entries.is_empty() {
+    let written = if session.is_empty() {
         crate::session::remove(&path);
         Ok(())
     } else {
@@ -5715,16 +5725,15 @@ fn save_session_for_close(hwnd: HWND) -> bool {
 }
 
 /// The manifest for the open tabs, or `None` when a dirty tab's text is in no snapshot file.
-/// Clean untitled tabs are empty and skipped. Only the shown tab has a caret and scroll
-/// position worth keeping, because switching tabs resets the view.
+/// Clean untitled tabs are empty and skipped. Every text tab keeps its caret and scroll position:
+/// the shown one from the editor, the others from where they were left (split editors spec §8).
 pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate::session::Session> {
-    use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETCURRENTPOS};
     use crate::session::{Session, SessionEntry, SessionSource};
     let app = unsafe { app_ptr(hwnd) }?;
     let app = unsafe { app.as_ref() };
     let active_id = app.tabs.active().map(|document| document.id);
-    let mut session = Session::default();
-    let mut active_entry = None;
+    let mut active = 0;
+    let mut entries = Vec::new();
     for document in app.tabs.documents() {
         let is_active = Some(document.id) == active_id;
         let source = if document.dirty {
@@ -5738,27 +5747,31 @@ pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate:
             SessionSource::File(path.clone())
         } else {
             if is_active {
-                session.active = session.entries.len().saturating_sub(1);
+                active = entries.len().saturating_sub(1);
             }
             continue;
         };
         if is_active {
-            session.active = session.entries.len();
-            // An image tab has no caret: the editor holds a placeholder then.
-            if !document.is_image() {
-                active_entry = Some(session.entries.len());
-            }
+            active = entries.len();
         }
-        session.entries.push(SessionEntry::new(source));
+        let mut entry = SessionEntry::new(source);
+        // An image tab has no caret: the editor holds a placeholder then.
+        if !document.is_image() {
+            let state = if is_active {
+                app.editor
+                    .as_ref()
+                    .and_then(|editor| editor.view_state().ok())
+                    .unwrap_or_default()
+            } else {
+                app.tabs.view_state(document.id)
+            };
+            entry.caret = state.caret;
+            entry.anchor = state.anchor;
+            entry.first_line = state.first_line;
+        }
+        entries.push(entry);
     }
-    if let (Some(index), Some(editor)) = (active_entry, app.editor.as_ref()) {
-        let read = |message| unsafe { SendMessageW(editor.hwnd(), message, 0, 0) }.max(0) as usize;
-        let entry = &mut session.entries[index];
-        entry.caret = read(SCI_GETCURRENTPOS);
-        entry.anchor = read(SCI_GETANCHOR);
-        entry.first_line = editor.first_visible_line().unwrap_or(0);
-    }
-    Some(session)
+    Some(Session::single(active, entries))
 }
 
 /// Services the pipe and handles everything already queued, before a close review begins. This
@@ -9554,7 +9567,7 @@ mod tests {
     fn write_session(scratch: &RecoveryScratch, entries: Vec<SessionEntry>, active: usize) {
         crate::session::write(
             &scratch.path().join("session.ini"),
-            &Session { active, entries },
+            &Session::single(active, entries),
         )
         .unwrap();
     }
@@ -9588,16 +9601,16 @@ mod tests {
         assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
         let session = crate::session::read(&scratch.path().join("session.ini")).unwrap();
         assert_eq!(
-            session.entries.len(),
+            session.groups[0].entries.len(),
             2,
             "the empty untitled tab is skipped"
         );
-        assert_eq!(session.entries[0].source, SessionSource::File(file));
-        let SessionSource::Snapshot(id) = session.entries[1].source else {
+        assert_eq!(session.groups[0].entries[0].source, SessionSource::File(file));
+        let SessionSource::Snapshot(id) = session.groups[0].entries[1].source else {
             panic!("the unsaved tab must be recorded as a snapshot");
         };
         assert_eq!(
-            session.active, 1,
+            session.groups[0].active, 1,
             "the skipped active tab falls back to the one before"
         );
         let snapshot =
@@ -10218,6 +10231,44 @@ mod tests {
     }
 
     #[test]
+    fn the_session_keeps_every_tabs_position_and_restores_it() {
+        // Break caught: only the shown tab's caret saved, so every other tab reopens at the top;
+        // or a restored background tab's position overwritten when the next entry opens.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("session-positions");
+        let a = scratch.note("a.md", &"line\n".repeat(2000));
+        let b = scratch.note("b.md", "b");
+        let recovery = RecoveryScratch::new("session-positions");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_note(window.hwnd, &a, super::OpenMode::Permanent, false).unwrap();
+        let away = crate::editor::ViewState {
+            caret: 1210 * 5,
+            anchor: 1210 * 5,
+            first_line: 1200,
+            x_offset: 0,
+        };
+        editor.apply_view_state(away).unwrap();
+        super::open_note(window.hwnd, &b, super::OpenMode::Permanent, false).unwrap();
+
+        let session = super::build_session(window.hwnd, recovery.path()).unwrap();
+        let entries = &session.groups[0].entries;
+        assert_eq!((entries[0].caret, entries[0].first_line), (1210 * 5, 1200));
+        assert_eq!(session.groups[0].active, 1);
+
+        for id in [b.clone(), a.clone()].map(|path| app_mut(window.hwnd).tabs.find_path(&path)) {
+            super::close_document_without_prompt(window.hwnd, id.unwrap());
+        }
+        for entry in entries {
+            super::restore_session_entry(window.hwnd, entry).unwrap();
+        }
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        let restored = editor.view_state().unwrap();
+        assert_eq!((restored.caret, restored.first_line), (1210 * 5, 1200));
+    }
+
+    #[test]
     fn a_preview_tab_is_kept_by_the_session_and_comes_back_as_a_normal_tab() {
         // Break caught: the session skipping the preview tab, so it vanishes at restart, or the
         // restored tab still being a preview that the next click silently replaces.
@@ -10231,12 +10282,12 @@ mod tests {
         super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
 
         let session = super::build_session(window.hwnd, recovery.path()).unwrap();
-        assert_eq!(session.entries.len(), 1);
-        assert!(matches!(&session.entries[0].source, SessionSource::File(path) if *path == a));
+        assert_eq!(session.groups[0].entries.len(), 1);
+        assert!(matches!(&session.groups[0].entries[0].source, SessionSource::File(path) if *path == a));
 
         let id = app_mut(window.hwnd).tabs.active().unwrap().id;
         super::close_document_without_prompt(window.hwnd, id);
-        super::restore_session_entry(window.hwnd, &session.entries[0]).unwrap();
+        super::restore_session_entry(window.hwnd, &session.groups[0].entries[0]).unwrap();
         assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
     }
 
@@ -10641,7 +10692,7 @@ mod tests {
         let editor = install_test_editor(&window);
         enable_session(window.hwnd, &scratch);
         app_mut(window.hwnd).session_restore = Some(crate::session::SessionRestore::new(
-            Session::default(),
+            &Session::single(0, Vec::new()),
             None,
         ));
         editor.set_text("unsaved words").unwrap();
