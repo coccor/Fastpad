@@ -990,7 +990,7 @@ git commit -m "feat(split-editors): a drop overlay and a tab drag label"
 
 ## Task 4: Tab drags: start, cancel, and reorder in the strip
 
-Afterwards a left press on a tab followed by movement past the drag distance starts a drag. The group window has the capture, the label follows the pointer, and the overlay marks the insertion point in the strip under the pointer. A release in the strip reorders. Esc, a right press or a lost capture cancels. A press and release without that movement is a click, as today. Drops outside the strip resolve and show feedback but do nothing yet; Task 5 applies them.
+Afterwards a left press on a tab followed by movement past the drag distance starts a drag. The group window has the capture, the label follows the pointer, and the overlay marks the insertion point in the strip under the pointer. A release in the strip reorders. Esc, a right press or a lost capture cancels. A press and release without that movement is a click, as today. Over a group's content the overlay tints the drop zone: the whole content for a middle drop, the half the new group would take near an edge (outer third), and nothing where the drop would do nothing. Drops outside the strip resolve and show that feedback but do nothing yet; Task 5 applies them.
 
 **Files:**
 - Create: `src/window/tab_drag.rs`
@@ -1223,13 +1223,69 @@ Then the tests:
         assert_eq!(rect.bottom - rect.top, layout.height);
         crate::window::tab_drag::cancel(window.hwnd);
     }
+
+    #[test]
+    fn near_a_content_edge_the_half_the_new_group_takes_is_tinted() {
+        // Break caught: no zone highlight near the edges, a tint over the whole group for an edge
+        // (the user cannot tell a split from a move), the wrong half, or a tint where the drop
+        // does nothing.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let area = super::with_group_id(window.hwnd, group, |state| state.content).unwrap();
+        let screen = |source: HWND, rect: RECT| {
+            let mut corners = [
+                windows_sys::Win32::Foundation::POINT { x: rect.left, y: rect.top },
+                windows_sys::Win32::Foundation::POINT { x: rect.right, y: rect.bottom },
+            ];
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::MapWindowPoints(
+                    source,
+                    std::ptr::null_mut(),
+                    corners.as_mut_ptr(),
+                    2,
+                )
+            };
+            (corners[0].x, corners[0].y, corners[1].x, corners[1].y)
+        };
+        let tint = || {
+            app_mut(window.hwnd).drop_overlay.map(|overlay| {
+                let rect = overlay.rect();
+                (rect.left, rect.top, rect.right, rect.bottom)
+            })
+        };
+        let (width, height) = (area.right - area.left, area.bottom - area.top);
+        let source = start_strip_drag(window.hwnd, group, 0);
+
+        // The right edge: the right half.
+        let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert_eq!(tint(), Some(screen(source, RECT { left: area.right - width / 2, ..area })));
+        // The bottom edge: the bottom half; the zone follows the pointer.
+        let point = client_lparam((area.left + area.right) / 2, area.bottom - 5);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert_eq!(tint(), Some(screen(source, RECT { top: area.bottom - height / 2, ..area })));
+        crate::window::tab_drag::cancel(window.hwnd);
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+
+        // A lone tab over its own edge would do nothing: no tint.
+        execute_command(window.hwnd, CommandId::CloseTab);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert!(tint().is_none());
+        crate::window::tab_drag::cancel(window.hwnd);
+    }
 ```
 
 If `menus::take_last_popup` doesn't exist, assert what the existing right-click tests assert. Look for the helper they use to record a shown menu (`grep -n "show_tab_strip_menu" src/window/menus.rs`) and use the same one.
 
 - [ ] **Step 2: Run them to confirm they fail.**
 
-Run: `cargo test --lib -- tab_drag a_tab_dragged_along a_wobble a_press_on_a_tabs_close esc_cancels_a_tab a_lost_capture_cancels a_right_press_cancels_a_tab the_insertion_bar --test-threads=1`
+Run: `cargo test --lib -- tab_drag a_tab_dragged_along a_wobble a_press_on_a_tabs_close esc_cancels_a_tab a_lost_capture_cancels a_right_press_cancels_a_tab the_insertion_bar near_a_content_edge --test-threads=1`
 Expected: FAIL to compile (`tab_drag`, `App.tab_drag` and `App.drop_overlay` don't exist yet).
 
 - [ ] **Step 3: Implement.**
