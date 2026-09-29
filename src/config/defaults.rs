@@ -59,6 +59,7 @@ pub fn default_settings() -> Settings {
         insert_spaces: DEFAULT_INSERT_SPACES,
         show_whitespace: DEFAULT_SHOW_WHITESPACE,
         highlight_current_line: DEFAULT_HIGHLIGHT_CURRENT_LINE,
+        key_overrides: std::collections::BTreeMap::new(),
     }
 }
 

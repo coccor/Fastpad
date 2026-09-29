@@ -112,6 +112,9 @@ pub struct Settings {
     pub show_whitespace: bool,
     /// Whether the caret's line gets the theme's caret-line background.
     pub highlight_current_line: bool,
+    /// `key.<command-id>=` lines, id to value, as written: the keymap validates them when
+    /// settings load (keyboard shortcuts spec §4).
+    pub key_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl Settings {
@@ -167,6 +170,9 @@ impl Settings {
         if let Some(highlight_current_line) = delta.highlight_current_line {
             self.highlight_current_line = highlight_current_line;
         }
+        for (id, value) in &delta.key_overrides {
+            self.key_overrides.insert(id.clone(), value.clone());
+        }
     }
 }
 
@@ -201,6 +207,7 @@ pub struct SettingsDelta {
     pub insert_spaces: Option<bool>,
     pub show_whitespace: Option<bool>,
     pub highlight_current_line: Option<bool>,
+    pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
 }
 
@@ -212,7 +219,7 @@ pub struct SettingsDelta {
 /// `show_whitespace` and `highlight_current_line` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `file_icons` is
-/// `material` or `minimal` (any case). Every line is handled independently: a line with an
+/// `material` or `minimal` (any case). `key.<command-id>` lines are collected as text into `key_overrides` for the keymap to validate. Every line is handled independently: a line with an
 /// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
 /// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
@@ -238,6 +245,14 @@ pub fn parse(source: &str) -> SettingsDelta {
 }
 
 fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &str) {
+    if let Some(id) = key.strip_prefix("key.") {
+        if id.is_empty() {
+            warn(delta, line_number, key, value);
+        } else {
+            delta.key_overrides.insert(id.to_owned(), value.to_owned());
+        }
+        return;
+    }
     match key {
         "font_face" => {
             if value.is_empty() {
@@ -472,6 +487,46 @@ pub fn save_setting_to(path: &Path, key: &str, value: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     crate::file::saver::save_atomic(path, set_setting(&source, key, value).as_bytes())
+}
+
+/// Returns `source` without any line naming `key`; everything else is kept byte for byte. A BOM
+/// on a removed first line stays at the start of the file.
+pub fn remove_setting_text(source: &str, key: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    for raw_line in source.split_inclusive('\n') {
+        let content = raw_line.trim_end_matches(['\r', '\n']);
+        let bom = content.starts_with('\u{feff}');
+        let names_key = trim_ascii(content.trim_start_matches('\u{feff}'))
+            .split_once('=')
+            .is_some_and(|(line_key, _)| trim_ascii(line_key) == key);
+        if names_key {
+            if bom {
+                output.push('\u{feff}');
+            }
+        } else {
+            output.push_str(raw_line);
+        }
+    }
+    output
+}
+
+/// Removes one setting from the settings file. A missing file has nothing to remove.
+pub fn remove_setting(key: &str) -> Result<()> {
+    remove_setting_to(&settings_file_path()?, key)
+}
+
+pub fn remove_setting_to(path: &Path, key: &str) -> Result<()> {
+    let source = match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map_err(|_| crate::FastPadError::Invariant("the settings file is not valid UTF-8"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let updated = remove_setting_text(&source, key);
+    if updated == source {
+        return Ok(());
+    }
+    crate::file::saver::save_atomic(path, updated.as_bytes())
 }
 
 #[cfg(test)]
@@ -901,5 +956,68 @@ mod tests {
             assert_eq!(delta.font_size, Some(12), "{key} keeps the other lines");
         }
         assert_eq!(parse("insert_spaces=maybe").insert_spaces, None);
+    }
+
+    #[test]
+    fn key_lines_are_collected_as_text_for_the_keymap() {
+        // Break caught: `key.` lines reported as unknown settings, or their values trimmed of
+        // the `=` key's name.
+        let delta = parse(
+            "key.file.save = Ctrl+Alt+S\nkey.view.zoomIn=Ctrl+=, Ctrl+NumpadAdd\nkey.file.new=\nkey.=F9\n",
+        );
+        assert_eq!(
+            delta.key_overrides.get("file.save").map(String::as_str),
+            Some("Ctrl+Alt+S")
+        );
+        assert_eq!(
+            delta.key_overrides.get("view.zoomIn").map(String::as_str),
+            Some("Ctrl+=, Ctrl+NumpadAdd")
+        );
+        assert_eq!(
+            delta.key_overrides.get("file.new").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(delta.warnings.len(), 1, "{:?}", delta.warnings);
+        assert_eq!(delta.warnings[0].line, 4);
+        let mut settings = crate::config::default_settings();
+        settings.apply_delta(&delta);
+        assert_eq!(settings.key_overrides.len(), 3);
+    }
+
+    #[test]
+    fn removing_a_key_drops_only_its_lines() {
+        // Break caught: Reset leaving `key.file.save=` behind (which unbinds Save), or
+        // rewriting the rest of the user's file.
+        let source = "\u{feff}key.file.save=F9\r\n# mine\r\ntheme=dark\r\nkey.file.save = F8\r\n";
+        assert_eq!(
+            remove_setting_text(source, "key.file.save"),
+            "\u{feff}# mine\r\ntheme=dark\r\n"
+        );
+        assert_eq!(
+            remove_setting_text("theme=dark", "key.file.save"),
+            "theme=dark"
+        );
+        assert_eq!(
+            remove_setting_text("# key.file.save=F9\n", "key.file.save"),
+            "# key.file.save=F9\n"
+        );
+    }
+
+    #[test]
+    fn removing_from_a_missing_file_is_nothing_to_do() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastpad-remove-setting-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("fastpad.ini");
+        remove_setting_to(&path, "key.file.save").unwrap();
+        assert!(!path.exists());
+        save_setting_to(&path, "key.file.save", "F9").unwrap();
+        save_setting_to(&path, "theme", "dark").unwrap();
+        remove_setting_to(&path, "key.file.save").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theme=dark\n");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
