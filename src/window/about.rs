@@ -2,38 +2,47 @@
 //! licenses. `MessageBoxW` would stay light-themed in a dark window, so this is an owned popup
 //! painted in the theme's colors that runs its own modal loop, as `MessageBoxW` does, with the
 //! main window disabled underneath.
+//!
+//! It shares the Settings dialog's look: a hidden native frame for the DWM shadow, a header band
+//! that drags it with a × in its corner, and soft controls drawn through `soft_paint`.
 
 use super::modal::ModalScope;
 use super::palette::Palette;
-use super::panel::{fill, inset, scale, text_height};
+use super::panel::{inset, scale, text_height};
+use super::side_panel::paint_buffered;
+use super::soft_paint::{
+    Canvas, FOCUS_GAP_AT_96_DPI, FOCUS_WIDTH_AT_96_DPI, Frame, GLYPH_FONT, RADIUS_AT_96_DPI, Shape,
+    TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones, title_close,
+};
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
+    DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, EndPaint, FW_NORMAL, FW_SEMIBOLD, GetDC,
-    HDC, HFONT, InvalidateRect, PAINTSTRUCT, ReleaseDC, ScreenToClient, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DeleteObject, DrawTextW,
+    FW_NORMAL, FW_SEMIBOLD, GetDC, HDC, HFONT, InvalidateRect, ReleaseDC, ScreenToClient,
+    SelectObject,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
     TrackMouseEvent, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    DrawIconEx, GW_OWNER, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, HCURSOR, HICON, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND,
-    IMAGE_ICON, IsWindow, LoadCursorW, LoadImageW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_CLIPCHILDREN,
+    CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
+    DrawIconEx, GW_OWNER, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, HCURSOR, HICON, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND, IMAGE_ICON, IsWindow,
+    LoadCursorW, LoadImageW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOZORDER, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_CAPTION, WS_CLIPCHILDREN,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -75,6 +84,8 @@ impl Link {
 pub(crate) enum Target {
     Link(Link),
     Ok,
+    /// The header's ×: the pointer only, like Settings'; it is not in the Tab order.
+    TitleClose,
 }
 
 /// Tab order: the links top to bottom, then OK.
@@ -109,14 +120,21 @@ const ICON_AT_96_DPI: i32 = 48;
 const ICON_GAP_AT_96_DPI: i32 = 16;
 const SECTION_GAP_AT_96_DPI: i32 = 16;
 const LINE_GAP_AT_96_DPI: i32 = 4;
+/// The footer and its button, as in Settings.
+const FOOTER_HEIGHT_AT_96_DPI: i32 = 56;
 const BUTTON_WIDTH_AT_96_DPI: i32 = 88;
 const BUTTON_HEIGHT_AT_96_DPI: i32 = 30;
 
-/// Where everything sits in the box's client area.
+/// Where everything sits in the box's client area, which is the whole window.
 #[derive(Clone, Copy)]
 pub(crate) struct Layout {
     pub width: i32,
     pub height: i32,
+    /// The strip-coloured band across the top holding the icon, title and version; it drags the
+    /// box, like Settings' title row.
+    pub header: RECT,
+    /// The ×, filling the header's top-right corner like a caption button.
+    pub title_close: RECT,
     pub icon: RECT,
     pub title: RECT,
     pub version: RECT,
@@ -124,7 +142,10 @@ pub(crate) struct Layout {
     pub copyright: RECT,
     /// In `Link::ALL` order, each as wide as its label.
     pub links: [RECT; 2],
+    /// The band along the bottom that holds OK.
+    pub footer: RECT,
     pub ok: RECT,
+    dpi: u32,
 }
 
 impl Layout {
@@ -149,27 +170,39 @@ impl Layout {
             bottom: top + height,
         };
 
+        let title_close_left = width - scale(TITLE_CLOSE_WIDTH_AT_96_DPI, dpi);
+        let title_close = RECT {
+            left: title_close_left,
+            top: 0,
+            right: width,
+            bottom: scale(TITLE_HEIGHT_AT_96_DPI, dpi),
+        };
         let icon = RECT {
             left: padding,
             top: padding,
             right: padding + icon_size,
             bottom: padding + icon_size,
         };
+        // The title and version sit as a block centred on the icon, clear of the ×.
         let text_left = icon.right + scale(ICON_GAP_AT_96_DPI, dpi);
-        // The title and version sit as a block centered on the icon.
+        let heading_line = |top: i32, height: i32| RECT {
+            right: title_close_left,
+            ..line(text_left, top, height)
+        };
         let heading_height = title_height + line_gap + body_height;
-        let title = line(
-            text_left,
+        let title = heading_line(
             padding + (icon_size - heading_height).max(0) / 2,
             title_height,
         );
-        let version = line(text_left, title.bottom + line_gap, body_height);
+        let version = heading_line(title.bottom + line_gap, body_height);
+        let header = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: icon.bottom.max(version.bottom) + padding,
+        };
 
-        let description = line(
-            padding,
-            icon.bottom.max(version.bottom) + section_gap,
-            body_height,
-        );
+        let description = line(padding, header.bottom + section_gap, body_height);
         let copyright = line(padding, description.bottom + line_gap, body_height);
 
         let mut top = copyright.bottom + section_gap;
@@ -184,23 +217,35 @@ impl Layout {
             rect
         });
 
-        let button_top = links[1].bottom + section_gap;
+        let footer_top = links[1].bottom + section_gap;
+        let footer = RECT {
+            left: 0,
+            top: footer_top,
+            right: width,
+            bottom: footer_top + scale(FOOTER_HEIGHT_AT_96_DPI, dpi),
+        };
+        let button_height = scale(BUTTON_HEIGHT_AT_96_DPI, dpi);
+        let button_top = footer.top + (footer.bottom - footer.top - button_height) / 2;
         let ok = RECT {
             left: right - scale(BUTTON_WIDTH_AT_96_DPI, dpi),
             top: button_top,
             right,
-            bottom: button_top + scale(BUTTON_HEIGHT_AT_96_DPI, dpi),
+            bottom: button_top + button_height,
         };
         Self {
             width,
-            height: ok.bottom + padding,
+            height: footer.bottom,
+            header,
+            title_close,
             icon,
             title,
             version,
             description,
             copyright,
             links,
+            footer,
             ok,
+            dpi,
         }
     }
 
@@ -208,6 +253,9 @@ impl Layout {
     pub(crate) fn target_at(&self, x: i32, y: i32) -> Option<Target> {
         let inside =
             |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+        if inside(&self.title_close) {
+            return Some(Target::TitleClose);
+        }
         if inside(&self.ok) {
             return Some(Target::Ok);
         }
@@ -218,11 +266,22 @@ impl Layout {
             .map(|(link, _)| Target::Link(link))
     }
 
+    /// Whether a press at client point `x`, `y` drags the box: anywhere on the header but the ×.
+    pub(crate) fn drags_at(&self, x: i32, y: i32) -> bool {
+        y >= self.header.top && y < self.header.bottom && self.target_at(x, y).is_none()
+    }
+
+    /// The corner radius of the button and the focus ring, as in Settings.
+    fn radius(&self) -> i32 {
+        scale(RADIUS_AT_96_DPI, self.dpi)
+    }
+
     fn rect_of(&self, target: Target) -> RECT {
         match target {
             Target::Link(Link::Repository) => self.links[0],
             Target::Link(Link::Licenses) => self.links[1],
             Target::Ok => self.ok,
+            Target::TitleClose => self.title_close,
         }
     }
 }
@@ -235,20 +294,28 @@ struct About {
     title_font: HFONT,
     body_font: HFONT,
     link_font: HFONT,
+    glyph_font: HFONT,
     /// Null when the module has no icon resource, as in test binaries.
     icon: HICON,
     focus: Target,
     hot: Option<Target>,
     pressed: Option<Target>,
     tracking_leave: bool,
+    /// Direct2D for the rounded shapes, loaded as the box opens.
+    canvas: Canvas,
 }
 
 impl Drop for About {
     fn drop(&mut self) {
         unsafe {
-            DeleteObject(self.title_font as _);
-            DeleteObject(self.body_font as _);
-            DeleteObject(self.link_font as _);
+            for font in [
+                self.title_font,
+                self.body_font,
+                self.link_font,
+                self.glyph_font,
+            ] {
+                DeleteObject(font as _);
+            }
             if !self.icon.is_null() {
                 DestroyIcon(self.icon);
             }
@@ -302,7 +369,9 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
             WS_EX_TOOLWINDOW,
             class.as_ptr(),
             title.as_ptr(),
-            WS_POPUP | WS_CLIPCHILDREN,
+            // WS_CAPTION gives it a native frame, hidden by WM_NCCALCSIZE, so DWM draws the
+            // window shadow; no system menu and no sizing border.
+            WS_POPUP | WS_CAPTION | WS_CLIPCHILDREN,
             0,
             0,
             0,
@@ -317,9 +386,11 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
         return None;
     }
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
-    let title_font = create_ui_font(scale(20, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
+    // The title matches Settings' title.
+    let title_font = create_ui_font(scale(18, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
     let body_font = create_ui_font(scale(13, dpi), "Segoe UI", FW_NORMAL as i32, false);
     let link_font = create_underlined_font(scale(13, dpi));
+    let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
     let link_widths = Link::ALL.map(|link| measure(dialog, link_font, link.label()));
     let layout = Layout::calculate(
         dpi,
@@ -345,15 +416,19 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
         title_font,
         body_font,
         link_font,
+        glyph_font,
         icon,
         focus: Target::Ok,
         hot: None,
         pressed: None,
         tracking_leave: false,
+        canvas: Canvas::load(),
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
 
-    // Centered over the owner, with rounded corners where Windows 11 draws them.
+    // Centered over the owner, with rounded corners where Windows 11 draws them and the DWM
+    // shadow of the hidden frame (a 1-px frame margin keeps DWM drawing it though the client
+    // covers the whole window).
     let mut frame = RECT::default();
     unsafe { GetWindowRect(owner, &mut frame) };
     let left = frame.left + (frame.right - frame.left - layout.width) / 2;
@@ -375,6 +450,13 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
             (&raw const corners).cast(),
             std::mem::size_of_val(&corners) as u32,
         );
+        let margins = MARGINS {
+            cxLeftWidth: 1,
+            cxRightWidth: 1,
+            cyTopHeight: 1,
+            cyBottomHeight: 1,
+        };
+        DwmExtendFrameIntoClientArea(dialog, &margins);
     }
     Some(dialog)
 }
@@ -396,8 +478,8 @@ fn register_class() -> Option<&'static [u16]> {
     static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let name = CLASS_NAME.get_or_init(|| wide_null("FastPadAbout"));
     let registered = *REGISTERED.get_or_init(|| {
+        // No CS_DROPSHADOW: the hidden native frame's DWM shadow replaces it.
         let class = WNDCLASSW {
-            style: CS_DROPSHADOW,
             lpfnWndProc: Some(about_proc),
             hInstance: unsafe { GetModuleHandleW(std::ptr::null()) },
             hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
@@ -465,8 +547,9 @@ fn owner(dialog: HWND) -> HWND {
 
 fn state<'a>(hwnd: HWND) -> Option<&'a mut About> {
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut About;
-    // SAFETY: set once in `create` from `Box::into_raw` and cleared in WM_NCDESTROY; the window
-    // procedure runs on this thread only and never holds two of these at once.
+    // SAFETY: set once in `create` from `Box::into_raw` and cleared in WM_NCDESTROY. This thread
+    // only; callers end one borrow before anything that can re-enter the window procedure
+    // (closing, opening a link, capturing the mouse).
     unsafe { pointer.as_mut() }
 }
 
@@ -477,7 +560,7 @@ fn invalidate(hwnd: HWND) {
 /// Follows a link or closes the box.
 fn activate(hwnd: HWND, target: Target) {
     match target {
-        Target::Ok => close(hwnd),
+        Target::Ok | Target::TitleClose => close(hwnd),
         Target::Link(link) => open_url(hwnd, link.url()),
     }
 }
@@ -507,15 +590,19 @@ unsafe extern "system" fn about_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let Some(about) = state(hwnd) else {
+    // Checked without forming a reference: `paint` holds a `&About` across `BeginPaint`, which
+    // sends WM_ERASEBKGND back here, so neither the check nor that arm may borrow.
+    if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == 0 {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-    };
+    }
     match message {
+        WM_ERASEBKGND => 1,
         WM_PAINT => {
-            paint(hwnd, about);
+            if let Some(about) = state(hwnd) {
+                paint(hwnd, about);
+            }
             0
         }
-        WM_ERASEBKGND => 1,
         WM_CLOSE => {
             close(hwnd);
             0
@@ -523,27 +610,34 @@ unsafe extern "system" fn about_proc(
         WM_KEYDOWN => {
             match wparam as u16 {
                 VK_ESCAPE => close(hwnd),
-                VK_RETURN | VK_SPACE => activate(hwnd, about.focus),
+                VK_RETURN | VK_SPACE => {
+                    if let Some(focus) = state(hwnd).map(|about| about.focus) {
+                        activate(hwnd, focus);
+                    }
+                }
                 VK_TAB => {
                     let back = unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0;
-                    about.focus = next_target(about.focus, !back);
+                    if let Some(about) = state(hwnd) {
+                        about.focus = next_target(about.focus, !back);
+                    }
                     invalidate(hwnd);
                 }
                 _ => {}
             }
             0
         }
-        // Everything but the links and the button drags the box, like a caption.
+        // The native frame stays hidden: the client is the whole window. Both forms leave the
+        // proposed rect as it is.
+        WM_NCCALCSIZE => 0,
+        // Only the header drags the box, as Settings' title row does.
         WM_NCHITTEST => {
-            let mut point = POINT {
-                x: lparam_point(lparam).0,
-                y: lparam_point(lparam).1,
-            };
+            let (x, y) = lparam_point(lparam);
+            let mut point = POINT { x, y };
             unsafe { ScreenToClient(hwnd, &mut point) };
-            if about.layout.target_at(point.x, point.y).is_some() {
-                HTCLIENT as LRESULT
-            } else {
+            if state(hwnd).is_some_and(|about| about.layout.drags_at(point.x, point.y)) {
                 HTCAPTION as LRESULT
+            } else {
+                HTCLIENT as LRESULT
             }
         }
         WM_SETCURSOR => {
@@ -552,43 +646,57 @@ unsafe extern "system" fn about_proc(
                 GetCursorPos(&mut point);
                 ScreenToClient(hwnd, &mut point);
             }
-            let cursor = match about.layout.target_at(point.x, point.y) {
-                Some(Target::Link(_)) => IDC_HAND,
-                _ => IDC_ARROW,
-            };
+            let on_link = state(hwnd).is_some_and(|about| {
+                matches!(
+                    about.layout.target_at(point.x, point.y),
+                    Some(Target::Link(_))
+                )
+            });
+            let cursor = if on_link { IDC_HAND } else { IDC_ARROW };
             unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor) as HCURSOR) };
             1
         }
         WM_MOUSEMOVE => {
             let (x, y) = lparam_point(lparam);
-            let hot = about.layout.target_at(x, y);
-            if !about.tracking_leave {
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                about.tracking_leave = unsafe { TrackMouseEvent(&mut track) } != 0;
-            }
-            if hot != about.hot {
-                about.hot = hot;
-                invalidate(hwnd);
+            if let Some(about) = state(hwnd) {
+                let hot = about.layout.target_at(x, y);
+                if !about.tracking_leave {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    about.tracking_leave = unsafe { TrackMouseEvent(&mut track) } != 0;
+                }
+                if hot != about.hot {
+                    about.hot = hot;
+                    invalidate(hwnd);
+                }
             }
             0
         }
         windows_sys::Win32::UI::Controls::WM_MOUSELEAVE => {
-            about.tracking_leave = false;
-            if about.hot.take().is_some() {
-                invalidate(hwnd);
+            if let Some(about) = state(hwnd) {
+                about.tracking_leave = false;
+                if about.hot.take().is_some() {
+                    invalidate(hwnd);
+                }
             }
             0
         }
         WM_LBUTTONDOWN => {
             let (x, y) = lparam_point(lparam);
-            about.pressed = about.layout.target_at(x, y);
-            if let Some(target) = about.pressed {
-                about.focus = target;
+            let pressed = state(hwnd).and_then(|about| {
+                about.pressed = about.layout.target_at(x, y);
+                // The × focuses OK, as Settings' × focuses Close.
+                about.focus = match about.pressed? {
+                    Target::TitleClose => Target::Ok,
+                    target => target,
+                };
+                about.pressed
+            });
+            if pressed.is_some() {
                 unsafe { SetCapture(hwnd) };
                 invalidate(hwnd);
             }
@@ -596,12 +704,13 @@ unsafe extern "system" fn about_proc(
         }
         WM_LBUTTONUP => {
             let (x, y) = lparam_point(lparam);
-            let pressed = about.pressed.take();
+            let clicked = state(hwnd).and_then(|about| {
+                let pressed = about.pressed.take()?;
+                (about.layout.target_at(x, y) == Some(pressed)).then_some(pressed)
+            });
             unsafe { ReleaseCapture() };
             invalidate(hwnd);
-            if let Some(target) = pressed
-                && about.layout.target_at(x, y) == Some(target)
-            {
+            if let Some(target) = clicked {
                 activate(hwnd, target);
             }
             0
@@ -616,117 +725,131 @@ unsafe extern "system" fn about_proc(
     }
 }
 
+/// Paints through an off-screen bitmap so a hover repaint never shows the erase.
 fn paint(hwnd: HWND, about: &About) {
-    let mut paint = PAINTSTRUCT::default();
-    let dc = unsafe { BeginPaint(hwnd, &mut paint) };
-    if dc.is_null() {
-        return;
-    }
-    let colors = about.colors;
-    let layout = &about.layout;
-    let mut client = RECT::default();
-    unsafe {
-        GetClientRect(hwnd, &mut client);
-        fill(dc, client, colors.muted_foreground);
-        fill(dc, inset(client, 1), colors.panel_background());
-        SetBkMode(dc, TRANSPARENT as i32);
-        if !about.icon.is_null() {
+    paint_buffered(hwnd, |dc, client| paint_into(dc, client, about));
+}
+
+fn paint_into(dc: HDC, client: RECT, about: &About) {
+    let mut frame = Frame::default();
+    compose(&mut frame, client, about);
+    frame.paint(dc, client, &about.canvas);
+    // The icon goes on last, with GDI, once Direct2D has let go of the DC.
+    let icon = about.layout.icon;
+    if !about.icon.is_null() {
+        unsafe {
             DrawIconEx(
                 dc,
-                layout.icon.left,
-                layout.icon.top,
+                icon.left,
+                icon.top,
                 about.icon,
-                layout.icon.right - layout.icon.left,
-                layout.icon.bottom - layout.icon.top,
+                icon.right - icon.left,
+                icon.bottom - icon.top,
                 0,
                 std::ptr::null_mut(),
-                windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL,
+                DI_NORMAL,
             );
         }
-        draw_text(
-            dc,
-            about.title_font,
-            colors.editor_foreground,
-            TITLE,
-            layout.title,
-            DT_LEFT,
-        );
-        draw_text(
-            dc,
-            about.body_font,
-            colors.muted_foreground,
-            &version_text(),
-            layout.version,
-            DT_LEFT,
-        );
-        for (text, rect) in [
-            (DESCRIPTION, layout.description),
-            (COPYRIGHT, layout.copyright),
-        ] {
-            draw_text(
-                dc,
-                about.body_font,
-                colors.editor_foreground,
-                text,
-                rect,
-                DT_LEFT,
-            );
-        }
-        for (link, rect) in Link::ALL.into_iter().zip(layout.links) {
-            draw_text(
-                dc,
-                about.link_font,
-                about.link_color,
-                link.label(),
-                rect,
-                DT_LEFT,
-            );
-        }
-
-        let button = if about.pressed == Some(Target::Ok) {
-            colors.pressed_background
-        } else if about.hot == Some(Target::Ok) {
-            colors.hover_background
-        } else {
-            colors.strip_background
-        };
-        fill(dc, layout.ok, colors.muted_foreground);
-        fill(dc, inset(layout.ok, 1), button);
-        draw_text(
-            dc,
-            about.body_font,
-            colors.editor_foreground,
-            OK_LABEL,
-            layout.ok,
-            DT_CENTER,
-        );
-
-        let focus = layout.rect_of(about.focus);
-        let ring = match about.focus {
-            Target::Ok => inset(focus, scale(3, GetDpiForWindow(hwnd).max(96))),
-            Target::Link(_) => inset(focus, -2),
-        };
-        SetTextColor(dc, colors.editor_foreground);
-        DrawFocusRect(dc, &ring);
-        EndPaint(hwnd, &paint);
     }
 }
 
-unsafe fn draw_text(dc: HDC, font: HFONT, color: u32, text: &str, rect: RECT, align: u32) {
-    let mut text = wide_null(text);
-    let mut rect = rect;
-    unsafe {
-        let previous = SelectObject(dc, font as _);
-        SetTextColor(dc, color);
-        DrawTextW(
-            dc,
-            text.as_mut_ptr(),
-            -1,
-            &mut rect,
-            align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-        );
-        SelectObject(dc, previous);
+fn compose<'a>(frame: &mut Frame<'a>, client: RECT, about: &'a About) {
+    let colors = &about.colors;
+    let tones = Tones::new(colors);
+    let layout = &about.layout;
+    let radius = layout.radius();
+
+    // No border line: the native shadow is the edge (square on Windows 10, rounded on 11).
+    frame.shape(Shape::Fill {
+        rect: client,
+        color: colors.panel_background(),
+    });
+
+    // The header: a strip-coloured band like Settings' title row, with the name in Settings'
+    // title font, the version under it, and the ×.
+    frame.shape(Shape::Fill {
+        rect: layout.header,
+        color: colors.strip_background,
+    });
+    frame.text(
+        about.title_font,
+        colors.editor_foreground,
+        TITLE,
+        layout.title,
+        DT_LEFT,
+    );
+    frame.text(
+        about.body_font,
+        colors.muted_foreground,
+        version_text(),
+        layout.version,
+        DT_LEFT,
+    );
+    title_close(
+        frame,
+        colors,
+        about.glyph_font,
+        layout.title_close,
+        about.hot == Some(Target::TitleClose),
+    );
+    // Subtle rules under the header and over the footer.
+    for top in [layout.header.bottom - 1, layout.footer.top] {
+        frame.shape(Shape::Fill {
+            rect: RECT {
+                top,
+                bottom: top + 1,
+                ..client
+            },
+            color: tones.card,
+        });
     }
+
+    for (text, rect) in [
+        (DESCRIPTION, layout.description),
+        (COPYRIGHT, layout.copyright),
+    ] {
+        frame.text(
+            about.body_font,
+            colors.editor_foreground,
+            text,
+            rect,
+            DT_LEFT,
+        );
+    }
+    for (link, rect) in Link::ALL.into_iter().zip(layout.links) {
+        frame.text(
+            about.link_font,
+            about.link_color,
+            link.label(),
+            rect,
+            DT_LEFT,
+        );
+    }
+
+    // OK: a filled accent button, like Settings' Close.
+    let button = match (about.pressed, about.hot) {
+        (Some(Target::Ok), _) => tones.accent_down,
+        (_, Some(Target::Ok)) => tones.accent_hot,
+        _ => tones.accent,
+    };
+    tones.soft(frame, layout.ok, radius, button);
+    frame.text(
+        about.body_font,
+        tones.on_accent,
+        OK_LABEL,
+        layout.ok,
+        DT_CENTER,
+    );
+
+    // The focus ring: a rounded accent stroke just outside the focused link or button.
+    let width = scale(FOCUS_WIDTH_AT_96_DPI, layout.dpi);
+    let outside = width + scale(FOCUS_GAP_AT_96_DPI, layout.dpi);
+    frame.shape(Shape::Ring {
+        rect: inset(layout.rect_of(about.focus), -outside),
+        radius: radius + outside,
+        width,
+        color: tones.accent,
+    });
 }
 
 #[cfg(test)]
@@ -825,5 +948,156 @@ mod tests {
         let double = Layout::calculate(192, 54, 34, [240, 220]);
         assert_eq!(double.width, normal.width * 2);
         assert_eq!(double.height, normal.height * 2);
+        assert_eq!(double.header.bottom, normal.header.bottom * 2);
+        assert_eq!(
+            double.title_close.right - double.title_close.left,
+            (normal.title_close.right - normal.title_close.left) * 2
+        );
+    }
+
+    #[test]
+    fn the_header_band_holds_the_icon_and_title_with_a_caption_close_in_its_corner() {
+        // Break caught: a header that doesn't reach the box's edges, a × inset from the corner
+        // or unlike Settings' (46 by 44 at 96 DPI), a title running under the ×, or a footer
+        // whose OK button isn't centred in it.
+        let layout = Layout::calculate(96, 24, 17, [120, 110]);
+        let header = layout.header;
+        assert_eq!((header.left, header.top, header.right), (0, 0, 380));
+        assert_eq!(header.bottom, 20 + 48 + 20);
+        assert!(layout.icon.bottom <= header.bottom && layout.version.bottom <= header.bottom);
+        assert!(header.bottom <= layout.description.top);
+        let close = layout.title_close;
+        assert_eq!(
+            (close.left, close.top, close.right, close.bottom),
+            (380 - 46, 0, 380, 44)
+        );
+        assert!(layout.title.right <= close.left && layout.version.right <= close.left);
+
+        let footer = layout.footer;
+        assert_eq!(
+            (footer.left, footer.right, footer.bottom),
+            (0, 380, layout.height)
+        );
+        assert_eq!(footer.bottom - footer.top, 56);
+        assert!(layout.links[1].bottom < footer.top);
+        assert_eq!(
+            layout.ok.top - footer.top,
+            footer.bottom - layout.ok.bottom,
+            "OK centred in the footer"
+        );
+        assert_eq!(layout.ok.right, 380 - 20);
+
+        let middle = |rect: RECT| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        let (x, y) = middle(close);
+        assert_eq!(layout.target_at(x, y), Some(Target::TitleClose));
+        assert!(!layout.drags_at(x, y), "the × is a button, not the caption");
+        let (x, y) = middle(layout.title);
+        assert!(layout.drags_at(x, y), "the header drags the box");
+        let (x, y) = middle(layout.icon);
+        assert!(layout.drags_at(x, y));
+        let (x, y) = middle(layout.description);
+        assert!(
+            !layout.drags_at(x, y),
+            "only the header drags, as in Settings"
+        );
+    }
+
+    fn painted_about(canvas: Canvas, theme: crate::platform::theme::Theme) -> About {
+        About {
+            colors: Palette::for_theme(theme, false),
+            link_color: crate::languages::rgb(0, 102, 204),
+            layout: Layout::calculate(96, 24, 17, [120, 110]),
+            title_font: std::ptr::null_mut(),
+            body_font: std::ptr::null_mut(),
+            link_font: std::ptr::null_mut(),
+            glyph_font: std::ptr::null_mut(),
+            icon: std::ptr::null_mut(),
+            focus: Target::Ok,
+            hot: Some(Target::TitleClose),
+            pressed: None,
+            tracking_leave: false,
+            canvas,
+        }
+    }
+
+    #[test]
+    fn the_box_paints_its_soft_look_whether_direct2d_or_the_gdi_fallback_paints() {
+        // Break caught: a hard 1-px border line on Windows 10, a flat OK button instead of the
+        // accent one, the old dotted focus rectangle, a missing header band, or any of these
+        // lost when Direct2D can't load and GDI paints.
+        use crate::platform::theme::Theme;
+        use crate::window::soft_paint::{TestSurface, Tones};
+        for theme in [Theme::Light, Theme::Dark] {
+            for direct2d in [false, true] {
+                let canvas = if direct2d {
+                    Canvas::load()
+                } else {
+                    Canvas::gdi()
+                };
+                assert_eq!(canvas.uses_direct2d(), direct2d);
+                let about = painted_about(canvas, theme);
+                let layout = about.layout;
+                let colors = about.colors;
+                let tones = Tones::new(&colors);
+                let surface = TestSurface::new(layout.width, layout.height);
+                let client = RECT {
+                    left: 0,
+                    top: 0,
+                    right: layout.width,
+                    bottom: layout.height,
+                };
+                paint_into(surface.dc, client, &about);
+                let case = format!("{theme:?}, Direct2D {direct2d}");
+                let middle_y = |rect: RECT| (rect.top + rect.bottom) / 2;
+
+                // No border: the edges are the header band and the panel.
+                assert_eq!(surface.pixel(0, 60), colors.strip_background, "{case}");
+                assert_eq!(
+                    surface.pixel(0, middle_y(layout.description)),
+                    colors.panel_background(),
+                    "{case}: no border line"
+                );
+                assert_eq!(
+                    surface.pixel(layout.width - 1, layout.height - 1),
+                    colors.panel_background(),
+                    "{case}"
+                );
+                // A subtle rule under the header and over the footer.
+                assert_eq!(
+                    surface.pixel(10, layout.header.bottom - 1),
+                    tones.card,
+                    "{case}"
+                );
+                assert_eq!(surface.pixel(10, layout.footer.top), tones.card, "{case}");
+                // The hot × fills its corner like the caption close button.
+                assert_eq!(
+                    surface.pixel(layout.title_close.left + 2, layout.title_close.top + 2),
+                    colors.close_hover_background,
+                    "{case}"
+                );
+                // OK is a filled accent button with the accent focus ring just outside it.
+                let ok = layout.ok;
+                assert_eq!(
+                    surface.pixel(ok.left + 4, middle_y(ok)),
+                    tones.accent,
+                    "{case}"
+                );
+                let middle_x = (ok.left + ok.right) / 2;
+                assert_eq!(surface.pixel(middle_x, ok.top - 3), tones.accent, "{case}");
+                assert_eq!(surface.pixel(middle_x, ok.top - 2), tones.accent, "{case}");
+                assert_eq!(
+                    surface.pixel(middle_x, ok.top - 1),
+                    colors.panel_background(),
+                    "{case}: the gap between ring and button"
+                );
+                // Rounded under Direct2D, square under GDI.
+                let corner = surface.pixel(ok.left, ok.top);
+                if direct2d {
+                    assert_ne!(corner, tones.accent, "{case}: rounded corner");
+                } else {
+                    assert_eq!(corner, tones.accent, "{case}: square corner");
+                }
+            }
+        }
     }
 }

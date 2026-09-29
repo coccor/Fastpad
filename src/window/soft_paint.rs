@@ -1,4 +1,6 @@
-//! Soft, antialiased shapes for the owner-drawn Settings dialog and its dropdown list. A paint
+//! Soft, antialiased shapes for the owner-drawn Settings dialog, its dropdown list and the About
+//! box, and the look they share: the tones, the corner radius, the focus ring and the title
+//! row's ×. A paint
 //! builds a `Frame`: shapes first, then text. The shapes go through Direct2D, bound to the
 //! off-screen memory DC that `side_panel::paint_buffered` hands over; the text is drawn on top
 //! with GDI afterwards, so it keeps ClearType. Direct2D is never held across a GDI call on the
@@ -9,6 +11,7 @@
 //! fails, the shapes fall back to square GDI fills: every control still shows, only the corners
 //! are square.
 
+use super::palette::Palette;
 use super::panel::fill;
 use crate::platform::{OwnedModule, wide_null};
 use crate::preview::dwrite::{create_d2d_factory, load_system_library};
@@ -27,9 +30,118 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::{
-    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, HDC, HFONT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, HDC, HFONT,
     IntersectClipRect, RestoreDC, SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
+
+/// The corner radius of cards, controls and buttons.
+pub(crate) const RADIUS_AT_96_DPI: i32 = 4;
+/// The focus ring's stroke, and its gap outside the control it rings.
+pub(crate) const FOCUS_WIDTH_AT_96_DPI: i32 = 2;
+pub(crate) const FOCUS_GAP_AT_96_DPI: i32 = 1;
+/// A dialog's title row, and its ×, as wide as the main window's caption close button.
+pub(crate) const TITLE_HEIGHT_AT_96_DPI: i32 = 44;
+pub(crate) const TITLE_CLOSE_WIDTH_AT_96_DPI: i32 = 46;
+pub(crate) const GLYPH_FONT: &str = "Segoe MDL2 Assets";
+
+/// The fills of the soft controls, from the theme's palette. Hover and press shift a fill
+/// toward the text colour: darker in light themes, lighter in dark ones. High contrast may
+/// only use system colour pairs, so there it keeps each fill and outlines every card and
+/// control instead.
+pub(crate) struct Tones {
+    /// A setting's card, and the rules under a title row and over a footer: a step off the
+    /// panel (strip_background is too close to it).
+    pub card: u32,
+    pub card_hot: u32,
+    /// Dropdowns, steppers and segment tracks: a step off the card.
+    pub control: u32,
+    pub control_hot: u32,
+    pub control_down: u32,
+    pub accent: u32,
+    pub accent_hot: u32,
+    pub accent_down: u32,
+    /// Text and knobs on the accent.
+    pub on_accent: u32,
+    /// High contrast's outline.
+    pub outline: Option<u32>,
+}
+
+impl Tones {
+    pub(crate) fn new(colors: &Palette) -> Self {
+        let shade = |color: u32, alpha: u32| {
+            if colors.high_contrast {
+                color
+            } else {
+                crate::catppuccin::blend(colors.editor_foreground, color, alpha)
+            }
+        };
+        let (card, control) = if colors.high_contrast {
+            (colors.strip_background, colors.strip_background)
+        } else {
+            (colors.hover_background, colors.pressed_background)
+        };
+        let accent = colors.selection_background;
+        Self {
+            card,
+            card_hot: shade(card, 16),
+            control,
+            control_hot: shade(control, 28),
+            control_down: shade(control, 56),
+            accent,
+            accent_hot: shade(accent, 28),
+            accent_down: shade(accent, 56),
+            on_accent: colors
+                .selection_foreground
+                .unwrap_or(colors.editor_foreground),
+            outline: colors.high_contrast.then_some(colors.muted_foreground),
+        }
+    }
+
+    /// A rounded fill, outlined in high contrast.
+    pub(crate) fn soft(&self, frame: &mut Frame<'_>, rect: RECT, radius: i32, color: u32) {
+        frame.shape(Shape::Round {
+            rect,
+            radius,
+            color,
+        });
+        if let Some(outline) = self.outline {
+            frame.shape(Shape::Ring {
+                rect,
+                radius,
+                width: 1,
+                color: outline,
+            });
+        }
+    }
+}
+
+/// A title row's ×: muted at rest; when `hot`, it fills its full-height corner like the caption
+/// close button.
+pub(crate) fn title_close(
+    frame: &mut Frame<'_>,
+    colors: &Palette,
+    glyph_font: HFONT,
+    rect: RECT,
+    hot: bool,
+) {
+    if hot {
+        frame.shape(Shape::Fill {
+            rect,
+            color: colors.close_hover_background,
+        });
+    }
+    frame.text(
+        glyph_font,
+        if hot {
+            colors.close_hover_foreground
+        } else {
+            colors.muted_foreground
+        },
+        super::titlebar::GLYPH_CLOSE,
+        rect,
+        DT_CENTER,
+    );
+}
 
 /// One shape, in client pixels. Colours are `COLORREF`s.
 #[derive(Clone, Copy)]

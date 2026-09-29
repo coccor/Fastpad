@@ -15,7 +15,10 @@ use super::settings_model::{
     dropdown_step, step_font_size,
 };
 use super::side_panel::paint_buffered;
-use super::soft_paint::{Canvas, Frame, Shape};
+use super::soft_paint::{
+    Canvas, FOCUS_GAP_AT_96_DPI, FOCUS_WIDTH_AT_96_DPI, Frame, GLYPH_FONT, RADIUS_AT_96_DPI, Shape,
+    TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones, title_close,
+};
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
 use std::cell::Cell;
@@ -58,17 +61,12 @@ const TITLE: &str = "Settings";
 const EDIT_INI_LABEL: &str = "Edit fastpad.ini";
 const CLOSE_LABEL: &str = "Close";
 const AUTOSAVE_HINT: &str = "Open a notebook to change this";
-const GLYPH_FONT: &str = "Segoe MDL2 Assets";
 const GLYPH_CHEVRON_DOWN: &str = "\u{E70D}";
 const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_REMOVE: &str = "\u{E738}";
-const GLYPH_CLOSE: &str = "\u{E8BB}";
 
 const WIDTH_AT_96_DPI: i32 = 520;
 const PADDING_AT_96_DPI: i32 = 20;
-const TITLE_HEIGHT_AT_96_DPI: i32 = 44;
-/// The title row's × is as wide as the main window's caption close button.
-const TITLE_CLOSE_WIDTH_AT_96_DPI: i32 = 46;
 const HEADING_HEIGHT_AT_96_DPI: i32 = 30;
 /// A heading's text sits this far below the top of its space, closer to its first card.
 const HEADING_SPACE_ABOVE_AT_96_DPI: i32 = 6;
@@ -78,8 +76,6 @@ const CARD_HEIGHT_AT_96_DPI: i32 = 36;
 const CARD_GAP_AT_96_DPI: i32 = 3;
 /// Between a card's sides and its label or control.
 const CARD_PADDING_AT_96_DPI: i32 = 16;
-/// The corner radius of cards, controls and buttons.
-const RADIUS_AT_96_DPI: i32 = 4;
 const CONTROL_HEIGHT_AT_96_DPI: i32 = 26;
 const DROPDOWN_WIDTH_AT_96_DPI: i32 = 240;
 const SEGMENT_WIDTH_AT_96_DPI: i32 = 80;
@@ -93,9 +89,6 @@ const KNOB_INSET_AT_96_DPI: i32 = 4;
 /// The On/Off text left of a toggle: its width and its gap to the switch.
 const TOGGLE_STATE_WIDTH_AT_96_DPI: i32 = 28;
 const TOGGLE_STATE_GAP_AT_96_DPI: i32 = 10;
-/// The focus ring's stroke, and its gap outside the control it rings.
-const FOCUS_WIDTH_AT_96_DPI: i32 = 2;
-const FOCUS_GAP_AT_96_DPI: i32 = 1;
 const FOOTER_HEIGHT_AT_96_DPI: i32 = 56;
 const BUTTON_WIDTH_AT_96_DPI: i32 = 88;
 const BUTTON_HEIGHT_AT_96_DPI: i32 = 30;
@@ -1261,76 +1254,6 @@ fn paint_into(dc: HDC, client: RECT, dialog: &Dialog) {
     frame.paint(dc, client, &dialog.canvas);
 }
 
-/// The fills of the soft controls, from the theme's palette. Hover and press shift a fill
-/// toward the text colour: darker in light themes, lighter in dark ones. High contrast may
-/// only use system colour pairs, so there it keeps each fill and outlines every card and
-/// control instead.
-struct Tones {
-    /// A setting's card: a step off the panel (strip_background is too close to it).
-    card: u32,
-    card_hot: u32,
-    /// Dropdowns, steppers and segment tracks: a step off the card.
-    control: u32,
-    control_hot: u32,
-    control_down: u32,
-    accent: u32,
-    accent_hot: u32,
-    accent_down: u32,
-    /// Text and knobs on the accent.
-    on_accent: u32,
-    /// High contrast's outline.
-    outline: Option<u32>,
-}
-
-impl Tones {
-    fn new(colors: &Palette) -> Self {
-        let shade = |color: u32, alpha: u32| {
-            if colors.high_contrast {
-                color
-            } else {
-                crate::catppuccin::blend(colors.editor_foreground, color, alpha)
-            }
-        };
-        let (card, control) = if colors.high_contrast {
-            (colors.strip_background, colors.strip_background)
-        } else {
-            (colors.hover_background, colors.pressed_background)
-        };
-        let accent = colors.selection_background;
-        Self {
-            card,
-            card_hot: shade(card, 16),
-            control,
-            control_hot: shade(control, 28),
-            control_down: shade(control, 56),
-            accent,
-            accent_hot: shade(accent, 28),
-            accent_down: shade(accent, 56),
-            on_accent: colors
-                .selection_foreground
-                .unwrap_or(colors.editor_foreground),
-            outline: colors.high_contrast.then_some(colors.muted_foreground),
-        }
-    }
-
-    /// A rounded fill, outlined in high contrast.
-    fn soft(&self, frame: &mut Frame<'_>, rect: RECT, radius: i32, color: u32) {
-        frame.shape(Shape::Round {
-            rect,
-            radius,
-            color,
-        });
-        if let Some(outline) = self.outline {
-            frame.shape(Shape::Ring {
-                rect,
-                radius,
-                width: 1,
-                color: outline,
-            });
-        }
-    }
-}
-
 fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
     let colors = &dialog.colors;
     let tones = Tones::new(colors);
@@ -1360,24 +1283,12 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
         layout.title,
         DT_LEFT,
     );
-    let close_hot = dialog.hot == Some(Hit::TitleClose);
-    if close_hot {
-        // Full height, into the corner, like a caption button.
-        frame.shape(Shape::Fill {
-            rect: layout.title_close,
-            color: colors.close_hover_background,
-        });
-    }
-    frame.text(
+    title_close(
+        frame,
+        colors,
         dialog.glyph_font,
-        if close_hot {
-            colors.close_hover_foreground
-        } else {
-            colors.muted_foreground
-        },
-        GLYPH_CLOSE,
         layout.title_close,
-        DT_CENTER,
+        dialog.hot == Some(Hit::TitleClose),
     );
     // Subtle rules under the title and over the footer.
     for top in [layout.body.top - 1, layout.body.bottom] {

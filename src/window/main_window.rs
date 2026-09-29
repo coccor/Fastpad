@@ -26257,10 +26257,12 @@ three"
     fn about_shows_a_modal_window_over_the_disabled_main_window_until_escape() {
         // Break caught: About doing nothing, leaving the main window usable behind the box (or
         // disabled after it closes), or a modal scope that never ends, which holds back every
-        // deferred message for the rest of the session.
+        // deferred message for the rest of the session; or one with no native frame (no DWM
+        // shadow) or a visible one, as for Settings.
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GW_OWNER, GetWindow, PostMessageW, WM_KEYDOWN,
+            GW_OWNER, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
+            HTCAPTION, HTCLIENT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST, WS_CAPTION,
         };
         let window = ProductionWindow::new(make_app());
         let owner = window.hwnd;
@@ -26270,14 +26272,44 @@ three"
             let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
             let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
             let modal = crate::window::modal::modal_active(owner);
-            seen.set(Some((dialog, owned, owner_disabled, modal)));
+            // A hidden native frame: WS_CAPTION earns the DWM shadow, WM_NCCALCSIZE leaves no
+            // visible frame, so the client is the whole window.
+            let style = unsafe { GetWindowLongW(dialog, GWL_STYLE) } as u32;
+            let (mut client, mut frame) = (RECT::default(), RECT::default());
+            unsafe {
+                GetClientRect(dialog, &mut client);
+                GetWindowRect(dialog, &mut frame);
+            }
+            let framed = style & WS_CAPTION == WS_CAPTION
+                && client.right - client.left == frame.right - frame.left
+                && client.bottom - client.top == frame.bottom - frame.top
+                && client.right > 0;
+            // The header still drags the box; its × and the body below do not.
+            let hit = |x: i32, y: i32| unsafe {
+                SendMessageW(
+                    dialog,
+                    WM_NCHITTEST,
+                    0,
+                    ((u32::from(y as u16) << 16) | u32::from(x as u16)) as LPARAM,
+                )
+            };
+            let framed = framed
+                && hit(frame.left + 30, frame.top + 10) == HTCAPTION as LRESULT
+                && hit(frame.right - 5, frame.top + 10) == HTCLIENT as LRESULT
+                && hit(frame.left + 5, frame.bottom - 5) == HTCLIENT as LRESULT;
+            seen.set(Some((dialog, owned, owner_disabled, modal, framed)));
             unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
         });
 
         execute_command(owner, CommandId::About);
 
-        let (dialog, owned, owner_disabled, modal) = shown.get().expect("the About box was shown");
+        let (dialog, owned, owner_disabled, modal, framed) =
+            shown.get().expect("the About box was shown");
         assert!(owned, "owned by the main window");
+        assert!(
+            framed,
+            "WS_CAPTION, a client rect the size of the window, and the header still a caption"
+        );
         assert!(
             owner_disabled,
             "the main window is disabled while About is up"
