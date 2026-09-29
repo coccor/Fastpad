@@ -321,6 +321,27 @@ pub(crate) fn dropdown_action(row: Row, index: usize, fonts: &[String]) -> Optio
     }
 }
 
+/// What stepping dropdown `row` to its next item (`forward`) or previous one applies, like a
+/// closed combo box: `None` past either end, which it doesn't wrap. A current value missing
+/// from the list (a font that isn't installed) steps to the first item going down and the last
+/// going up.
+pub(crate) fn dropdown_step(
+    row: Row,
+    forward: bool,
+    view: &SettingsView,
+    fonts: &[String],
+) -> Option<SettingsAction> {
+    let (items, selected) = view.dropdown(row, fonts);
+    let last = items.len().checked_sub(1)?;
+    let index = match (selected, forward) {
+        (Some(index), true) => (index < last).then_some(index + 1)?,
+        (Some(index), false) => index.checked_sub(1)?,
+        (None, true) => 0,
+        (None, false) => last,
+    };
+    dropdown_action(row, index, fonts)
+}
+
 /// One step of the stepper from `size`. The result is within 6–72, so a size set outside that
 /// range in `fastpad.ini` comes back into it on the first step (spec §3.2).
 pub(crate) fn step_font_size(size: u16, up: bool) -> u16 {
@@ -391,6 +412,9 @@ pub(crate) enum Effect {
     Repaint,
     Apply(SettingsAction),
     OpenDropdown(Row),
+    /// Up or Down on a closed dropdown: select the next item (`true`) or the previous one. The
+    /// dialog resolves it with `dropdown_step`, since the font names live there.
+    StepDropdown(Row, bool),
     EditIni,
     Close,
 }
@@ -469,6 +493,8 @@ impl DialogModel {
             }
             Control::Dropdown => match key {
                 Key::Enter | Key::AltDown => Effect::OpenDropdown(row),
+                Key::Down => Effect::StepDropdown(row, true),
+                Key::Up => Effect::StepDropdown(row, false),
                 _ => Effect::None,
             },
             Control::Stepper => self.stepper_key(key, view),
@@ -741,6 +767,88 @@ mod tests {
         model.focus = Focus::Close;
         assert_eq!(model.key(Key::Space, &view), Effect::Close);
         assert_eq!(model.key(Key::Escape, &view), Effect::Close);
+    }
+
+    #[test]
+    fn up_and_down_step_a_focused_dropdown() {
+        // Break caught: arrows that do nothing on a closed dropdown, or step the wrong way
+        // (dropdown arrows brief).
+        let view = view();
+        let mut model = DialogModel::new();
+        for row in [Row::Theme, Row::Font] {
+            model.focus = Focus::Row(row);
+            assert_eq!(model.key(Key::Down, &view), Effect::StepDropdown(row, true));
+            assert_eq!(model.key(Key::Up, &view), Effect::StepDropdown(row, false));
+            assert_eq!(model.key(Key::Left, &view), Effect::None);
+        }
+        // No dropdown row is ever greyed; the greyed row ignores the arrows like every key.
+        model.focus = Focus::Row(Row::NotebookAutosave);
+        assert_eq!(model.key(Key::Down, &view), Effect::None);
+        assert_eq!(model.key(Key::Up, &view), Effect::None);
+    }
+
+    #[test]
+    fn a_dropdown_step_picks_the_neighbour_clamps_at_the_ends_and_starts_from_an_end() {
+        // Break caught: Down on the last item wrapping to the first, Up on the first wrapping
+        // to the last, or a font that isn't installed leaving the arrows dead.
+        let mut view = view();
+        let fonts = vec![
+            "Cascadia Mono".to_owned(),
+            "Consolas".to_owned(),
+            "Courier New".to_owned(),
+        ];
+        let font = |name: &str| Some(SettingsAction::SetFontFace(name.to_owned()));
+
+        view.settings.font_face = "consolas".to_owned();
+        assert_eq!(
+            dropdown_step(Row::Font, true, &view, &fonts),
+            font("Courier New")
+        );
+        assert_eq!(
+            dropdown_step(Row::Font, false, &view, &fonts),
+            font("Cascadia Mono")
+        );
+        view.settings.font_face = "Courier New".to_owned();
+        assert_eq!(
+            dropdown_step(Row::Font, true, &view, &fonts),
+            None,
+            "the last"
+        );
+        view.settings.font_face = "Cascadia Mono".to_owned();
+        assert_eq!(
+            dropdown_step(Row::Font, false, &view, &fonts),
+            None,
+            "the first"
+        );
+
+        view.settings.font_face = "Not Installed".to_owned();
+        assert_eq!(
+            dropdown_step(Row::Font, true, &view, &fonts),
+            font("Cascadia Mono"),
+            "Down from a missing value: the first"
+        );
+        assert_eq!(
+            dropdown_step(Row::Font, false, &view, &fonts),
+            font("Courier New"),
+            "Up from a missing value: the last"
+        );
+        assert_eq!(dropdown_step(Row::Font, true, &view, &[]), None, "no fonts");
+
+        view.settings.theme = ThemePreference::System;
+        assert_eq!(
+            dropdown_step(Row::Theme, true, &view, &fonts),
+            Some(SettingsAction::SetTheme(ThemePreference::Light))
+        );
+        assert_eq!(dropdown_step(Row::Theme, false, &view, &fonts), None);
+        view.settings.theme = ThemePreference::CatppuccinMocha;
+        assert_eq!(dropdown_step(Row::Theme, true, &view, &fonts), None);
+        assert_eq!(
+            dropdown_step(Row::Theme, false, &view, &fonts),
+            Some(SettingsAction::SetTheme(
+                ThemePreference::CatppuccinMacchiato
+            ))
+        );
+        assert_eq!(dropdown_step(Row::WordWrap, true, &view, &fonts), None);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use super::palette::Palette;
 use super::panel::{inset, scale};
 use super::settings_model::{
     Control, DialogModel, Effect, Focus, Key, Row, Section, SettingsView, dropdown_action,
-    step_font_size,
+    dropdown_step, step_font_size,
 };
 use super::side_panel::paint_buffered;
 use super::soft_paint::{Canvas, Frame, Shape};
@@ -768,6 +768,14 @@ fn run(hwnd: HWND, effect: Effect) {
             refresh(hwnd);
         }
         Effect::OpenDropdown(row) => open_list(hwnd, row),
+        Effect::StepDropdown(row, forward) => {
+            // The borrow ends before the change applies, as for a pick from the list.
+            let action = state(hwnd)
+                .and_then(|dialog| dropdown_step(row, forward, &dialog.view, &dialog.fonts));
+            if let Some(action) = action {
+                run(hwnd, Effect::Apply(action));
+            }
+        }
         Effect::EditIni => {
             if let Some(dialog) = state(hwnd) {
                 dialog.outcome.set(Outcome::EditIni);

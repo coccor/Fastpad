@@ -26446,6 +26446,38 @@ three"
     }
 
     #[test]
+    fn up_and_down_step_the_focused_theme_dropdown_without_opening_it() {
+        // Break caught: arrows that only work once the list is open, or a step that wraps past
+        // the first item (dropdown arrows brief).
+        use crate::config::ThemePreference;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_UP};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let scratch = RecoveryScratch::new("settings-dialog-theme-arrows");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            // The Theme row has the focus, on System, the first item.
+            key(VK_UP); // clamped: still System
+            key(VK_DOWN); // Light
+            key(VK_DOWN); // Dark
+            key(VK_UP); // Light
+            key(VK_ESCAPE);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).settings.theme, ThemePreference::Light);
+        super::save_settings_to(None);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "theme=light\n",
+            "each step rewrote the one theme line"
+        );
+    }
+
+    #[test]
     fn the_dialog_keeps_the_focus_after_a_change_that_moves_it() {
         // Break caught: switching notes mode off from the dialog tears down the sidebar, the
         // focus lands in the main window, and the dialog stops answering the keyboard (review
