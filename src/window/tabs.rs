@@ -352,26 +352,50 @@ impl Tabs {
     /// Shows the open document `id` in `group` too, selected there. A document with two or more
     /// views is never a preview (plan amendment 3). False for an unknown group or document.
     pub(crate) fn add_view(&mut self, group: GroupId, id: DocumentId, state: ViewState) -> bool {
-        let Some(index) = self.group_index(group) else {
+        self.add_view_at(group, id, state, None)
+    }
+
+    /// `add_view` with a new view going in at strip `index` (clamped; `None`: the end). A group
+    /// that already shows `id` selects that view where it is. A preview arriving where another
+    /// preview already is becomes a normal tab: one preview per group (PR 3 amendment 3).
+    pub(crate) fn add_view_at(
+        &mut self,
+        group: GroupId,
+        id: DocumentId,
+        state: ViewState,
+        index: Option<usize>,
+    ) -> bool {
+        let Some(group_index) = self.group_index(group) else {
             return false;
         };
         if self.store.get(id).is_none() {
             return false;
         }
-        let target = &mut self.groups[index];
+        let target = &mut self.groups[group_index];
         let position = match target.position(id) {
             Some(position) => position,
             None => {
-                target.tabs.push(EditorTab {
-                    document: id,
-                    view_state: state,
-                });
-                target.tabs.len() - 1
+                let at = index.unwrap_or(target.tabs.len()).min(target.tabs.len());
+                target.tabs.insert(
+                    at,
+                    EditorTab {
+                        document: id,
+                        view_state: state,
+                    },
+                );
+                at
             }
         };
         target.select(position);
+        let other_preview = self.groups[group_index].tabs.iter().any(|tab| {
+            tab.document != id
+                && self
+                    .store
+                    .get(tab.document)
+                    .is_some_and(|document| document.preview)
+        });
         self.touch_in(group, id);
-        if self.views_of(id).len() > 1
+        if (self.views_of(id).len() > 1 || other_preview)
             && let Some(document) = self.store.get_mut(id)
         {
             document.preview = false;
@@ -383,6 +407,17 @@ impl Tabs {
     /// Moves the view of `id` from one group to another, keeping its view state. When `to`
     /// already shows `id`, its view is selected and the moved one is dropped.
     pub(crate) fn move_view(&mut self, from: GroupId, id: DocumentId, to: GroupId) -> bool {
+        self.move_view_at(from, id, to, None)
+    }
+
+    /// `move_view` into strip position `index` of `to` (`None`: the end).
+    pub(crate) fn move_view_at(
+        &mut self,
+        from: GroupId,
+        id: DocumentId,
+        to: GroupId,
+        index: Option<usize>,
+    ) -> bool {
         if from == to || self.group_index(to).is_none() {
             return false;
         }
@@ -403,7 +438,27 @@ impl Tabs {
             self.groups[source].select_after_removal(position);
         }
         self.recent.retain(|recent| *recent != (from, id));
-        self.add_view(to, id, tab.view_state)
+        self.add_view_at(to, id, tab.view_state, index)
+    }
+
+    /// Moves `group`'s tab at `from` to `to` in its strip. The document that was active stays
+    /// selected. False for an unknown group or an index past the end.
+    pub(crate) fn reorder(&mut self, group: GroupId, from: usize, to: usize) -> bool {
+        let Some(index) = self.group_index(group) else {
+            return false;
+        };
+        let target = &mut self.groups[index];
+        if from >= target.tabs.len() || to >= target.tabs.len() {
+            return false;
+        }
+        let active = target.active_document();
+        let tab = target.tabs.remove(from);
+        target.tabs.insert(to, tab);
+        if let Some(position) = active.and_then(|active| target.position(active)) {
+            target.select(position);
+        }
+        self.refresh_views();
+        true
     }
 
     /// Selects `id` in `group` and makes it the most recent view; false when `group` has no view
@@ -1645,5 +1700,100 @@ mod tests {
         assert_eq!(tabs.document(DocumentId(1)).unwrap().generation, before + 1);
         assert!(tabs.set_dirty(DocumentId(1), true));
         assert!(!tabs.set_dirty(DocumentId(1), true));
+    }
+
+    #[test]
+    fn a_view_goes_in_at_the_insertion_point() {
+        // Break caught: a tab dropped between two tabs landing at the end of the strip.
+        let mut tabs = Tabs::new();
+        let first = tabs.active_group();
+        tabs.push(document(1)).unwrap();
+        let second = tabs.add_group();
+        tabs.set_active_group(second);
+        tabs.push(document(2)).unwrap();
+        tabs.push(document(3)).unwrap();
+        assert!(tabs.move_view_at(first, DocumentId(1), second, Some(1)));
+        assert_eq!(
+            tabs.group(second).unwrap().document_ids(),
+            [DocumentId(2), DocumentId(1), DocumentId(3)]
+        );
+        assert_eq!(
+            tabs.group(second).unwrap().active_document(),
+            Some(DocumentId(1))
+        );
+        assert!(tabs.group(first).unwrap().is_empty());
+        assert!(tabs.add_view_at(first, DocumentId(3), ViewState::default(), Some(9)));
+        assert_eq!(tabs.group(first).unwrap().document_ids(), [DocumentId(3)]);
+    }
+
+    #[test]
+    fn a_view_already_in_the_target_is_selected_where_it_is() {
+        // Break caught: a second view of one document in one group (spec §6.2).
+        let mut tabs = Tabs::new();
+        let first = tabs.active_group();
+        tabs.push(document(1)).unwrap();
+        let second = tabs.add_group();
+        assert!(tabs.add_view(second, DocumentId(1), ViewState::default()));
+        tabs.set_active_group(second);
+        tabs.push(document(2)).unwrap();
+        assert!(tabs.move_view_at(first, DocumentId(1), second, Some(2)));
+        assert_eq!(
+            tabs.group(second).unwrap().document_ids(),
+            [DocumentId(1), DocumentId(2)]
+        );
+        assert_eq!(
+            tabs.group(second).unwrap().active_document(),
+            Some(DocumentId(1))
+        );
+        assert!(
+            tabs.group(first).unwrap().is_empty(),
+            "a move still removes the source view"
+        );
+    }
+
+    #[test]
+    fn reordering_moves_the_tab_and_keeps_the_active_document_selected() {
+        // Break caught: the selection index left behind, so the strip highlights one tab while
+        // the editor shows another.
+        let mut tabs = Tabs::new();
+        let group = tabs.active_group();
+        for id in 1..=3 {
+            tabs.push(document(id)).unwrap();
+        }
+        tabs.activate(DocumentId(2)).unwrap();
+        assert!(tabs.reorder(group, 0, 2));
+        assert_eq!(
+            tabs.group(group).unwrap().document_ids(),
+            [DocumentId(2), DocumentId(3), DocumentId(1)]
+        );
+        assert_eq!(tabs.active().unwrap().id, DocumentId(2));
+        assert!(!tabs.reorder(group, 0, 3), "out of range");
+    }
+
+    #[test]
+    fn a_preview_arriving_where_a_preview_already_is_becomes_a_normal_tab() {
+        // Break caught (Review Focus 3): two italic tabs in one group, so the next tree click
+        // replaces one of them and the other lingers forever.
+        let mut tabs = Tabs::new();
+        let first = tabs.active_group();
+        tabs.push(preview(1)).unwrap();
+        let second = tabs.add_group();
+        tabs.set_active_group(second);
+        tabs.push(preview(2)).unwrap();
+        assert!(tabs.move_view(first, DocumentId(1), second));
+        assert!(!tabs.document(DocumentId(1)).unwrap().preview);
+        assert!(tabs.document(DocumentId(2)).unwrap().preview);
+        assert_eq!(tabs.preview_id(), Some(DocumentId(2)));
+    }
+
+    #[test]
+    fn a_preview_moved_into_a_group_without_one_stays_a_preview() {
+        // Break caught: every move pinning its tab, so a quick look can never be replaced.
+        let mut tabs = Tabs::new();
+        let first = tabs.active_group();
+        tabs.push(preview(1)).unwrap();
+        let second = tabs.add_group();
+        assert!(tabs.move_view(first, DocumentId(1), second));
+        assert!(tabs.document(DocumentId(1)).unwrap().preview);
     }
 }
