@@ -513,8 +513,9 @@ struct Dialog {
     /// Wheel travel on the shortcuts table not yet a whole row, in 1/120ths of a row (a notch,
     /// 120, is three rows). Dropped when the wheel turns the other way.
     wheel_rest: i32,
-    /// The shortcuts page's native search field, created with the dialog and destroyed with it.
-    search: HWND,
+    /// The shortcuts page's native search field, created with the dialog and destroyed with it;
+    /// `None` if the EDIT could not be created.
+    search: Option<HWND>,
     /// The search field's background (`WM_CTLCOLOREDIT`).
     search_brush: HBRUSH,
 }
@@ -552,7 +553,7 @@ pub(crate) fn show(owner: HWND, colors: Palette, link_color: u32, page: Page) ->
     };
     let search = state(dialog)
         .filter(|state| state.model.page == Page::Shortcuts)
-        .map(|state| state.search);
+        .and_then(|state| state.search);
     unsafe {
         EnableWindow(owner, 0);
         if let Some(search) = search {
@@ -685,7 +686,7 @@ fn create(
         shortcuts,
         last_row_click: None,
         wheel_rest: 0,
-        search: std::ptr::null_mut(),
+        search: None,
         search_brush: unsafe { CreateSolidBrush(Tones::new(&colors).control) },
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
@@ -694,7 +695,7 @@ fn create(
     let field = super::shortcuts_page::field_rect(page_layout.search, text_height, dpi);
     let search = super::shortcuts_page::create_search(dialog, field, body_font);
     if let Some(created) = self::state(dialog) {
-        created.search = search;
+        created.search = Some(search).filter(|search| !search.is_null());
     }
 
     // Centered over the owner, kept inside the work area, with rounded corners where Windows
@@ -873,7 +874,7 @@ fn run(hwnd: HWND, effect: Effect) {
             }
         }
         Effect::ShowPage(page) => {
-            let search = state(hwnd).map(|dialog| {
+            let search = state(hwnd).and_then(|dialog| {
                 dialog.model.show_page(page);
                 dialog.search
             });
@@ -903,6 +904,10 @@ fn sync_focus(hwnd: HWND) {
     let Some((wants_search, search)) =
         state(hwnd).map(|dialog| (dialog.model.focus == Focus::Search, dialog.search))
     else {
+        return;
+    };
+    // Without a field the focus stays on the dialog.
+    let Some(search) = search else {
         return;
     };
     let focus = unsafe { GetFocus() };
@@ -977,7 +982,7 @@ fn refresh(hwnd: HWND) {
                 DeleteObject(dialog.search_brush as _);
                 dialog.search_brush = CreateSolidBrush(Tones::new(&colors).control);
             }
-            repaint_search = Some(dialog.search);
+            repaint_search = dialog.search;
         }
         dialog.view = view;
         dialog.colors = colors;
@@ -1122,8 +1127,12 @@ pub(crate) fn run_shortcuts(hwnd: HWND, effect: super::shortcuts_model::Shortcut
             after_keymap_change(hwnd);
         }
         ShortcutsEffect::CopyId(id) => {
-            // Task 10 puts `id` on the clipboard.
-            let _ = id;
+            if let Err(error) = crate::platform::clipboard::set_text(hwnd, id) {
+                super::main_window::push_notice(
+                    owner(hwnd),
+                    format!("FastPad could not copy to the clipboard: {error}"),
+                );
+            }
         }
         ShortcutsEffect::FocusSearch | ShortcutsEffect::FocusTable => {
             let focus = if effect == ShortcutsEffect::FocusSearch {
@@ -1137,7 +1146,7 @@ pub(crate) fn run_shortcuts(hwnd: HWND, effect: super::shortcuts_model::Shortcut
             }
         }
         ShortcutsEffect::SetSearchText(text) => {
-            let search = state(hwnd).map(|dialog| dialog.search);
+            let search = state(hwnd).and_then(|dialog| dialog.search);
             if let Some(search) = search {
                 unsafe {
                     SetWindowTextW(search, wide_null(&text).as_ptr());
@@ -1148,6 +1157,51 @@ pub(crate) fn run_shortcuts(hwnd: HWND, effect: super::shortcuts_model::Shortcut
             invalidate(hwnd);
         }
         ShortcutsEffect::Close => close(hwnd),
+    }
+}
+
+const CHANGE: usize = 1;
+const ADD: usize = 2;
+const REMOVE: usize = 3;
+const RESET: usize = 4;
+const COPY_ID: usize = 5;
+
+/// The selected row's menu (keyboard shortcuts spec §6.4), at client point `at`.
+fn context_menu(hwnd: HWND, at: POINT) {
+    let Some((user, has_key)) = state(hwnd).and_then(|dialog| {
+        dialog
+            .shortcuts
+            .selected_row()
+            .map(|row| (row.user, row.stroke.is_some()))
+    }) else {
+        return;
+    };
+    let mut items = vec![
+        ("Change Keybinding\tEnter".to_owned(), CHANGE),
+        ("Add Keybinding\tCtrl+Enter".to_owned(), ADD),
+    ];
+    if has_key {
+        items.push(("Remove Keybinding\tDelete".to_owned(), REMOVE));
+    }
+    if user {
+        items.push(("Reset Keybinding".to_owned(), RESET));
+    }
+    items.push((String::new(), 0));
+    items.push(("Copy Command ID\tCtrl+C".to_owned(), COPY_ID));
+    let choice = super::menus::track_choice(owner(hwnd), hwnd, &items, at);
+    let effect = state(hwnd).map(|dialog| {
+        let model = &mut dialog.shortcuts;
+        match choice {
+            Some(CHANGE) => model.start_change(),
+            Some(ADD) => model.start_add(),
+            Some(REMOVE) => model.remove(),
+            Some(RESET) => model.reset(),
+            Some(COPY_ID) => model.copy_id(),
+            _ => super::shortcuts_model::ShortcutsEffect::None,
+        }
+    });
+    if let Some(effect) = effect {
+        run_shortcuts(hwnd, effect);
     }
 }
 
@@ -1348,9 +1402,12 @@ pub(crate) fn search_swallows_char(dialog: HWND, c: u32, sys: bool) -> bool {
     sys || matches!(c, 0x09 | 0x0d | 0x1b) || state(dialog).is_some_and(|d| d.shortcuts.record_keys)
 }
 
-/// The field took the focus (a click on it): the model follows.
+/// The field took the focus (a click on it): the model follows. The field is outside the
+/// recording box, so taking the focus while the box is open (it never asks for it) cancels
+/// the box, as any click outside it does.
 pub(crate) fn search_focused(dialog: HWND) {
     if let Some(d) = state(dialog) {
+        d.shortcuts.cancel_recording();
         d.model.focus = Focus::Search;
     }
     invalidate(dialog);
@@ -1567,7 +1624,7 @@ unsafe extern "system" fn dialog_proc(
                 && ((wparam >> 16) & 0xffff) as u32
                     == windows_sys::Win32::UI::WindowsAndMessaging::EN_CHANGE =>
         {
-            let search = state(hwnd).map(|dialog| dialog.search);
+            let search = state(hwnd).and_then(|dialog| dialog.search);
             let text = search.map(window_text).unwrap_or_default();
             // In record-keys mode the dialog writes the field itself.
             let effect = state(hwnd).and_then(|dialog| {
@@ -1754,6 +1811,26 @@ unsafe extern "system" fn dialog_proc(
                     }
                 }
                 None => {}
+            }
+            0
+        }
+        // A right-click on a row selects it and opens its menu; while the recording box is open
+        // no row is hit.
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP => {
+            use super::shortcuts_page::PageHit;
+            let (x, y) = lparam_point(lparam);
+            let row = state(hwnd).and_then(|dialog| match hit_at(dialog, x, y) {
+                Some(Hit::Page(PageHit::Row(index) | PageHit::Pencil(index))) => {
+                    dialog.shortcuts.select(index);
+                    dialog.model.focus = Focus::Table;
+                    Some(index)
+                }
+                _ => None,
+            });
+            if row.is_some() {
+                sync_focus(hwnd);
+                invalidate(hwnd);
+                context_menu(hwnd, POINT { x, y });
             }
             0
         }
@@ -2263,7 +2340,9 @@ pub(crate) fn answer_in_loop(dialog: HWND, answer: impl FnOnce(HWND) + 'static) 
 /// The shortcuts page's search field.
 #[cfg(test)]
 pub(crate) fn search_hwnd(dialog: HWND) -> HWND {
-    state(dialog).map_or(std::ptr::null_mut(), |dialog| dialog.search)
+    state(dialog)
+        .and_then(|dialog| dialog.search)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// What has the keyboard focus, as the dialog's model sees it.
@@ -2546,7 +2625,7 @@ mod tests {
             ),
             last_row_click: None,
             wheel_rest: 0,
-            search: std::ptr::null_mut(),
+            search: None,
             search_brush: std::ptr::null_mut(),
         }
     }

@@ -421,6 +421,48 @@ pub(crate) fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> O
         .and_then(|value| CommandId::try_from(value).ok())
 }
 
+/// A popup of `items` (label and nonzero id; an empty label is a separator) at `window`'s
+/// client point `client`, for a window whose owner `owner` is disabled (a modal dialog's).
+/// Returns the id picked.
+pub(crate) fn track_choice(
+    owner: HWND,
+    window: HWND,
+    items: &[(String, usize)],
+    client: POINT,
+) -> Option<usize> {
+    let _modal = ModalScope::enter(owner);
+    #[cfg(test)]
+    if let Some(answer) = CHOICE_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return answer(items);
+    }
+    let menu = unsafe { CreatePopupMenu() };
+    if menu.is_null() {
+        return None;
+    }
+    for (label, id) in items {
+        if label.is_empty() {
+            unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null()) };
+        } else {
+            let label = wide_null(label);
+            unsafe { AppendMenuW(menu, MF_STRING, *id, label.as_ptr()) };
+        }
+    }
+    let mut point = client;
+    unsafe { ClientToScreen(window, &mut point) };
+    let selected = unsafe {
+        TrackPopupMenuEx(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            window,
+            std::ptr::null(),
+        )
+    };
+    unsafe { DestroyMenu(menu) };
+    usize::try_from(selected).ok().filter(|id| *id != 0)
+}
+
 /// How a menu-band dropdown closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DropdownExit {
@@ -643,6 +685,23 @@ type DropdownAnswer = Box<dyn FnOnce(HWND, usize) -> DropdownExit>;
 thread_local! {
     static DROPDOWN_ANSWERS: std::cell::RefCell<std::collections::VecDeque<DropdownAnswer>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+type ChoiceAnswer = Box<dyn FnOnce(&[(String, usize)]) -> Option<usize>>;
+
+#[cfg(test)]
+thread_local! {
+    static CHOICE_ANSWERS: RefCell<std::collections::VecDeque<ChoiceAnswer>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Answers the next `track_choice` from inside its modal scope instead of showing a popup.
+#[cfg(test)]
+pub(crate) fn answer_next_choice(
+    answer: impl FnOnce(&[(String, usize)]) -> Option<usize> + 'static,
+) {
+    CHOICE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }
 
 /// Answers the next menu-band dropdown (given its heading) instead of tracking a real popup.

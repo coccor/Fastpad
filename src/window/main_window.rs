@@ -20550,6 +20550,126 @@ three"
     }
 
     #[test]
+    fn delete_unbinds_and_the_context_menus_reset_restores_the_defaults() {
+        // Break caught: Reset offered for default rows, or leaving `key.file.saveAs=` behind.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_DOWN, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CHAR, WM_KEYDOWN, WM_RBUTTONUP,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-reset");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = offered.clone();
+        crate::window::menus::answer_next_choice(move |items| {
+            *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+            items
+                .iter()
+                .find(|(label, _)| label.starts_with("Reset"))
+                .map(|(_, id)| *id)
+        });
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_DELETE), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, |dialog| {
+                let (x, y) = crate::window::settings_dialog::page_row_point(dialog, 0);
+                PostMessageW(
+                    dialog,
+                    WM_RBUTTONUP,
+                    0,
+                    ((y as isize) << 16 | (x as isize & 0xffff)) as LPARAM,
+                );
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert!(
+            offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Reset"))
+        );
+        assert!(
+            !offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Remove")),
+            "the row has no key to remove"
+        );
+        assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::SaveAs));
+        super::save_settings_to(None);
+        assert_eq!(std::fs::read_to_string(&ini).unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn recording_sees_f10_and_refuses_it() {
+        // Break caught: F10 (a WM_SYSKEYDOWN) opening the dialog's system menu or beeping
+        // instead of reaching the recording box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DOWN, VK_ESCAPE, VK_F10, VK_RETURN,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_SYSKEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let refusal = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = refusal.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+            PostMessageW(dialog, WM_SYSKEYDOWN, usize::from(VK_F10), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                *record.borrow_mut() = crate::window::settings_dialog::shortcuts_model(dialog)
+                    .and_then(|model| model.recording)
+                    .and_then(|recording| recording.refusal);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*refusal.borrow(), Some("F10 and Shift+F10 open the menus."));
+    }
+
+    #[test]
+    fn a_click_on_the_search_field_cancels_the_recording_box() {
+        // Break caught: a click on the search field focusing it behind the open recording box,
+        // so typing filters the table and Escape closes the dialog instead of the box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let open = crate::window::settings_dialog::shortcuts_model(dialog)
+                    .is_some_and(|model| model.recording.is_some());
+                PostMessageW(search, WM_LBUTTONDOWN, 1, 0x0005_0005);
+                PostMessageW(search, WM_LBUTTONUP, 0, 0x0005_0005);
+                crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                    let still_open = crate::window::settings_dialog::shortcuts_model(dialog)
+                        .is_some_and(|model| model.recording.is_some());
+                    *record.borrow_mut() = Some((open, still_open));
+                    // With the box still open (the break), this Escape closes the dialog anyway.
+                    PostMessageW(search, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+                });
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*seen.borrow(), Some((true, false)));
+    }
+
+    #[test]
     fn f6_order_skips_a_closed_panel_and_a_missing_sidebar() {
         // Break caught: F6 landing in a hidden panel, or getting stuck when notes mode is off.
         use super::{FocusPart, next_focus_part};

@@ -133,10 +133,6 @@ pub(crate) enum ShortcutsEffect {
     Repaint,
     /// Give the command exactly these keys; the dialog applies and saves them.
     SetKeys(CommandId, Vec<KeyStroke>),
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 10: the row context menu's Reset Keybinding")
-    )]
     Reset(CommandId),
     CopyId(&'static str),
     FocusSearch,
@@ -382,10 +378,6 @@ impl ShortcutsModel {
         ShortcutsEffect::SetKeys(row.command, keys)
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 10: the row context menu's Reset Keybinding")
-    )]
     pub(crate) fn reset(&mut self) -> ShortcutsEffect {
         match self.selected_row() {
             Some(row) if row.user => ShortcutsEffect::Reset(row.command),
