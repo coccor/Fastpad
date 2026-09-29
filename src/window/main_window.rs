@@ -25653,4 +25653,57 @@ three"
         assert!(app_mut(window.hwnd).tabs.document(dragged).unwrap().dirty);
         assert!(strip_ids(window.hwnd, second).contains(&dragged));
     }
+
+    #[test]
+    fn a_strip_tab_dropped_on_a_notebook_folder_copies_its_file() {
+        // Break caught: strip drags ignoring the tree the Open Editors rows already copy into
+        // (split editors spec §6.1).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drag-folder");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let index = strip_ids(window.hwnd, group)
+            .iter()
+            .position(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            })
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, group, index);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        let (x, y) = (
+            (work & 0xffff) as i16 as i32,
+            ((work >> 16) & 0xffff) as i16 as i32,
+        );
+        drop_strip_drag(source, panel, x, y, 0);
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+            "draft"
+        );
+        assert!(
+            strip_ids(window.hwnd, group).iter().any(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            }),
+            "the tab stays"
+        );
+        assert!(notebook_view(window.hwnd).drag.is_none());
+    }
 }

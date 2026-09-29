@@ -337,6 +337,13 @@ fn retarget(hwnd: HWND, point: POINT, copy: bool) {
         return;
     };
     let target = target_at(hwnd, point);
+    let over_tree = target.is_none()
+        && tab_path(hwnd, drag.source.document).is_some_and(|path| {
+            super::notebook_view::strip_tab_over(hwnd, point, drag.source.document, &path)
+        });
+    if target.is_some() || !over_tree {
+        super::notebook_view::strip_tab_leave(hwnd);
+    }
     let source = source_of(hwnd, drag.source.group, drag.source.document);
     let action = source
         .zip(target)
@@ -347,6 +354,12 @@ fn retarget(hwnd: HWND, point: POINT, copy: bool) {
             drag.action = action;
         }
     });
+    if over_tree {
+        // The tree draws its own band over the folder that takes the file.
+        hide_feedback(hwnd);
+        set_cursor(true);
+        return;
+    }
     show_feedback(hwnd, target, action);
 }
 
@@ -362,6 +375,13 @@ pub(crate) fn release(hwnd: HWND, window: HWND, x: i32, y: i32, buttons: WPARAM)
     let mut screen = POINT { x, y };
     unsafe { ClientToScreen(window, &mut screen) };
     let target = target_at(hwnd, screen);
+    if target.is_none()
+        && let Some(path) = tab_path(hwnd, drag.source.document)
+        && super::notebook_view::strip_tab_drop(hwnd, screen, drag.source.document, &path)
+    {
+        end_feedback(hwnd, drag);
+        return true;
+    }
     let action = source_of(hwnd, drag.source.group, drag.source.document)
         .zip(target)
         .and_then(|(source, target)| {
@@ -375,12 +395,19 @@ pub(crate) fn release(hwnd: HWND, window: HWND, x: i32, y: i32, buttons: WPARAM)
     true
 }
 
+/// Document `id`'s file, while it has one.
+fn tab_path(hwnd: HWND, id: DocumentId) -> Option<std::path::PathBuf> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }.tabs.document(id)?.path.clone()
+}
+
 /// Takes the label, the overlay and the capture down after `drag` was taken out of the App.
 fn end_feedback(hwnd: HWND, drag: TabDrag) {
     if let Some(label) = drag.label {
         label.destroy();
     }
     hide_feedback(hwnd);
+    super::notebook_view::strip_tab_leave(hwnd);
     set_cursor(true);
     if unsafe { GetCapture() } == drag.window {
         unsafe { ReleaseCapture() };

@@ -38,6 +38,9 @@ pub(crate) enum DragSource {
     Tab { id: DocumentId, path: PathBuf },
     /// Files dragged in from outside: a drop copies them.
     Files(Vec<PathBuf>),
+    /// A tab dragged from an editor group's strip over the tree: a drop copies its file (split
+    /// editors spec §6.1). The strip drag owns the capture and the label.
+    GroupTab { id: DocumentId, path: PathBuf },
 }
 
 /// A drag armed by a press on a tree or Open Editors row, and under way once `started`: a drop
@@ -151,7 +154,7 @@ pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
 pub(crate) fn source_accepts(source: &DragSource, root: &Path, folder: &Path) -> bool {
     match source {
         DragSource::Row(kind) => accepts(kind, folder),
-        DragSource::Tab { path, .. } => {
+        DragSource::Tab { path, .. } | DragSource::GroupTab { path, .. } => {
             tree_copy::any_accepted(std::slice::from_ref(path), root, folder)
         }
         DragSource::Files(paths) => tree_copy::any_accepted(paths, root, folder),

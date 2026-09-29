@@ -1359,7 +1359,7 @@ impl NotebookView {
                 TreeItem::Note(note_kind(path)),
                 super::tree_copy::item_name(path),
             ),
-            DragSource::Files(_) => return None,
+            DragSource::Files(_) | DragSource::GroupTab { .. } => return None,
         };
         let text = self
             .text_width(&name, paint.fonts.text)
@@ -2641,7 +2641,7 @@ fn retarget_drag(hwnd: HWND, now: Instant) {
 
 /// Whether a drag of `source` came from outside FastPad, through OLE.
 fn is_external(source: &DragSource) -> bool {
-    matches!(source, DragSource::Files(_))
+    matches!(source, DragSource::Files(_) | DragSource::GroupTab { .. })
 }
 
 /// Ends a drag's timer, with nothing of the App borrowed. Leaves the capture alone: most cancels
@@ -2788,7 +2788,7 @@ fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
             DragSource::Tab { id, path } => {
                 super::copy_host::copy_tab_into(hwnd, *id, path, &folder);
             }
-            DragSource::Files(_) => {}
+            DragSource::Files(_) | DragSource::GroupTab { .. } => {}
         }
     }
     true
@@ -2972,6 +2972,103 @@ pub(crate) fn external_drop(hwnd: HWND, x: i32, y: i32, paths: Vec<PathBuf>) -> 
         return false;
     }
     super::copy_host::post_panel_drop(hwnd, paths, folder)
+}
+
+/// Screen point `point` in the panel's client coordinates, when it is over the panel.
+fn panel_point_of(hwnd: HWND, point: POINT) -> Option<(i32, i32)> {
+    let panel = with_view(hwnd, |view| view.panel)?;
+    // Its own style: the main window of a test is never shown.
+    let style = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        )
+    } as u32;
+    if style & windows_sys::Win32::UI::WindowsAndMessaging::WS_VISIBLE == 0 {
+        return None;
+    }
+    let mut local = point;
+    unsafe { ScreenToClient(panel, &mut local) };
+    let mut client = RECT::default();
+    unsafe { GetClientRect(panel, &mut client) };
+    contains(client, local.x, local.y).then_some((local.x, local.y))
+}
+
+/// A strip tab dragged to screen point `point` (split editors spec §6.1): over a folder that
+/// takes `path`'s file the band shows and true is returned; over Open Editors, or anywhere a
+/// copy would do nothing, nothing shows. Kept as a started `DragSource::GroupTab` drag with no
+/// capture and no label, as an Explorer drag is.
+pub(crate) fn strip_tab_over(hwnd: HWND, point: POINT, id: DocumentId, path: &Path) -> bool {
+    let Some((x, y)) = panel_point_of(hwnd, point) else {
+        strip_tab_leave(hwnd);
+        return false;
+    };
+    if with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(true) {
+        strip_tab_leave(hwnd);
+        return false;
+    }
+    let started = with_view(hwnd, |view| {
+        if !view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| matches!(drag.source, DragSource::GroupTab { .. }))
+        {
+            let source = DragSource::GroupTab {
+                id,
+                path: path.to_path_buf(),
+            };
+            view.drag = Drag::armed(source, x, y).map(|mut drag| {
+                drag.started = true;
+                drag
+            });
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false);
+    if started && let Some(panel) = with_view(hwnd, |view| view.panel) {
+        unsafe { SetTimer(panel, DRAG_TIMER, tree_drag::TICK.as_millis() as u32, None) };
+    }
+    with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false)
+}
+
+/// The strip tab left the panel, or its drag ended: the band and the timer go.
+pub(crate) fn strip_tab_leave(hwnd: HWND) {
+    let panel = with_view(hwnd, |view| {
+        let ours = view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| matches!(drag.source, DragSource::GroupTab { .. }));
+        if ours {
+            view.drag = None;
+            view.invalidate();
+        }
+        ours.then_some(view.panel)
+    })
+    .flatten();
+    if let Some(panel) = panel {
+        end_drag_timer(panel);
+    }
+}
+
+/// A strip tab dropped at screen point `point`: copies its file into the folder under it, when
+/// that folder takes it. True when a copy started.
+pub(crate) fn strip_tab_drop(hwnd: HWND, point: POINT, id: DocumentId, path: &Path) -> bool {
+    let accepted = strip_tab_over(hwnd, point, id, path);
+    let folder = accepted
+        .then(|| {
+            with_view(hwnd, |view| {
+                view.drag.as_ref().and_then(|drag| drag.target.clone())
+            })
+        })
+        .flatten()
+        .flatten();
+    strip_tab_leave(hwnd);
+    let Some(folder) = folder else {
+        return false;
+    };
+    super::copy_host::copy_tab_into(hwnd, id, path, &folder);
+    true
 }
 
 /// Gives the tooltip `tools`, making the tooltip first if the view has none yet. Runs with
