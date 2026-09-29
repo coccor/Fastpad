@@ -45,8 +45,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
     WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WNDCLASSW,
-    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR,
+    WM_SYSKEYDOWN, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const TITLE: &str = "Settings";
@@ -893,17 +893,19 @@ unsafe extern "system" fn dialog_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if state(hwnd).is_none() {
+    // Checked without forming a reference: `paint` holds a `&Dialog` across `BeginPaint`,
+    // which sends WM_ERASEBKGND back here, so neither the check nor that arm may borrow.
+    if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == 0 {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     match message {
+        WM_ERASEBKGND => 1,
         WM_PAINT => {
             if let Some(dialog) = state(hwnd) {
                 paint(hwnd, dialog);
             }
             0
         }
-        WM_ERASEBKGND => 1,
         WM_CLOSE => {
             close(hwnd);
             0
@@ -957,6 +959,12 @@ unsafe extern "system" fn dialog_proc(
                 }
             }
             0
+        }
+        // A press on the title row is a non-client click that starts the move loop without a
+        // WM_LBUTTONDOWN or a deactivation: close the list here, as any click elsewhere does.
+        WM_NCLBUTTONDOWN => {
+            close_list(hwnd);
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         // Only the title row drags the dialog.
         WM_NCHITTEST => {

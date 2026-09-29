@@ -306,28 +306,38 @@ unsafe extern "system" fn list_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let Some(list) = state(hwnd) else {
+    // Checked without forming a reference, and each arm borrows only for itself: `paint` holds
+    // a `&ListState` across `BeginPaint`, which sends WM_ERASEBKGND back here.
+    if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == 0 {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-    };
+    }
     match message {
+        WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_PAINT => {
-            paint(hwnd, list);
+            if let Some(list) = state(hwnd) {
+                paint(hwnd, list);
+            }
             0
         }
-        WM_ERASEBKGND => 1,
         WM_MOUSEMOVE => {
-            let hot = item_at(list, ((lparam >> 16) & 0xffff) as i16 as i32);
-            if hot != list.hot {
-                list.hot = hot;
-                invalidate(hwnd);
+            if let Some(list) = state(hwnd) {
+                let hot = item_at(list, ((lparam >> 16) & 0xffff) as i16 as i32);
+                if hot != list.hot {
+                    list.hot = hot;
+                    invalidate(hwnd);
+                }
             }
             0
         }
         WM_LBUTTONUP => {
-            if let Some(index) = item_at(list, ((lparam >> 16) & 0xffff) as i16 as i32) {
+            let picked = state(hwnd).and_then(|list| {
+                item_at(list, ((lparam >> 16) & 0xffff) as i16 as i32)
+                    .map(|index| (list.owner, index))
+            });
+            if let Some((owner, index)) = picked {
                 // Posted: the dialog destroys this window when it handles the pick.
-                unsafe { PostMessageW(list.owner, WM_LIST_PICKED, index, 0) };
+                unsafe { PostMessageW(owner, WM_LIST_PICKED, index, 0) };
             }
             0
         }
