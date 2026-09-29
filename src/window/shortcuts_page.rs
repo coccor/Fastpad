@@ -508,7 +508,18 @@ pub(crate) fn compose<'a>(
         }
         let keys = layout.cell(rect, 1);
         match row.stroke {
-            Some(stroke) => keycaps(frame, style, measure, stroke, keys, Some(keys.left), dpi),
+            Some(stroke) => {
+                // A long stroke (Ctrl+Shift+NumpadMultiply) is cut at its column, not drawn
+                // over the Source column.
+                frame.clip(Some(RECT {
+                    left: keys.left.max(layout.table.left),
+                    top: keys.top.max(layout.table.top),
+                    right: keys.right.min(layout.table.right),
+                    bottom: keys.bottom.min(layout.table.bottom),
+                }));
+                keycaps(frame, style, measure, stroke, keys, Some(keys.left), dpi);
+                frame.clip(Some(layout.table));
+            }
             None => frame.text(
                 style.body_font,
                 colors.muted_foreground,
@@ -635,6 +646,57 @@ mod tests {
         assert_eq!(layout.hit(x, y, &model), Some(PageHit::RecordBox));
         model.record_key(KeyStroke::parse("Ctrl+S").unwrap());
         assert_eq!(layout.hit(x, y, &model), Some(PageHit::ConflictLink));
+    }
+
+    #[test]
+    fn a_long_stroke_stays_in_the_keybinding_column() {
+        // Break caught: Ctrl+Shift+NumpadMultiply's keycaps drawn on over the Source column.
+        use crate::window::commands::CommandId;
+        let layout = PageLayout::calculate(body(), 96);
+        let long = KeyStroke::parse("Ctrl+Shift+NumpadMultiply").unwrap();
+        let mut model = ShortcutsModel::new(
+            Keymap::defaults().with_keys(CommandId::About, vec![long]),
+            layout.visible_rows(),
+        );
+        model.set_text("about");
+        let colors = Palette::for_theme(crate::platform::theme::Theme::Dark, false);
+        let tones = Tones::new(&colors);
+        let style = PageStyle {
+            colors: &colors,
+            tones: &tones,
+            link_color: 0,
+            body_font: std::ptr::null_mut(),
+            heading_font: std::ptr::null_mut(),
+            link_font: std::ptr::null_mut(),
+            glyph_font: std::ptr::null_mut(),
+            radius: 4,
+            hot: None,
+            table_focused: true,
+        };
+        let mut frame = Frame::default();
+        // Wide text, so the caps need more than the column.
+        compose(
+            &mut frame,
+            &|text| 40 * text.len() as i32,
+            &layout,
+            &model,
+            &style,
+        );
+        let column = layout.cell(layout.row_rect(0), 1);
+        let caps = frame
+            .test_texts()
+            .into_iter()
+            .filter(|(text, _, _)| {
+                ["Ctrl", "Shift", "NumpadMultiply", "+"].contains(&text.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert!(caps.iter().any(|(_, rect, _)| rect.right > column.right));
+        for (text, _, clip) in caps {
+            assert!(
+                clip.is_some_and(|clip| clip.right <= column.right),
+                "{text} is not clipped to its column"
+            );
+        }
     }
 
     #[test]

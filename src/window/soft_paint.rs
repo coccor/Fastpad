@@ -207,6 +207,15 @@ impl<'a> Frame<'a> {
         self.texts.push((text, self.clip));
     }
 
+    /// Every text added so far: its string, its rect and the clip it was added under.
+    #[cfg(test)]
+    pub(crate) fn test_texts(&self) -> Vec<(String, RECT, Option<RECT>)> {
+        self.texts
+            .iter()
+            .map(|(text, clip)| (text.text.to_string(), text.rect, *clip))
+            .collect()
+    }
+
     /// Draws the shapes through `canvas`, then the text with GDI.
     pub(crate) fn paint(&self, dc: HDC, client: RECT, canvas: &Canvas) {
         canvas.draw(dc, client, &self.shapes);
