@@ -21,6 +21,9 @@ pub fn installed_font_families() -> Vec<FontFamily> {
         lfCharSet: DEFAULT_CHARSET,
         ..Default::default()
     };
+    // SAFETY: the enumeration is synchronous, so the `&raw mut families` pointer it hands
+    // `collect_family` outlives every callback, and nothing else touches `families` meanwhile.
+    // The screen DC is released on the only path out after `GetDC` succeeds.
     unsafe {
         let dc = GetDC(std::ptr::null_mut());
         if dc.is_null() {
