@@ -17,6 +17,7 @@ pub mod group_strip;
 pub(crate) mod icon_sets;
 pub(crate) mod image_host;
 pub(crate) mod inline_name;
+pub(crate) mod keymap;
 pub(crate) mod library_host;
 mod main_window;
 pub(crate) mod menu_band;
