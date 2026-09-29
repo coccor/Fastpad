@@ -631,6 +631,8 @@ unsafe extern "system" fn main_window_proc(
             // The worker's boxed result: handled at once, since a held message would lose it.
             if message == crate::window::WM_FASTPAD_LIBRARY_READY {
                 crate::window::library_host::library_ready(hwnd, lparam);
+                // The notebook's autosave switch may be known now.
+                crate::window::settings_dialog::refresh_open(hwnd);
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_FILES_DROPPED {
@@ -26322,7 +26324,8 @@ three"
         crate::window::settings_dialog::answer_next(move |dialog| {
             let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
             let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
-            let modal = crate::window::modal::modal_active(owner);
+            let modal = crate::window::modal::modal_active(owner)
+                && crate::window::settings_dialog::open_dialog(owner) == Some(dialog);
             seen.set(Some((dialog, owned, owner_disabled, modal)));
             unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
         });
@@ -26332,6 +26335,7 @@ three"
         let (dialog, owned, owner_disabled, modal) = shown.get().expect("Settings was shown");
         assert!(owned && owner_disabled && modal);
         assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
+        assert_eq!(crate::window::settings_dialog::open_dialog(owner), None);
         assert_ne!(unsafe { IsWindowEnabled(owner) }, 0);
         assert!(!crate::window::modal::modal_active(owner));
     }
@@ -26467,6 +26471,99 @@ three"
         assert!(
             app_mut(window.hwnd).tabs.find_path(&ini).is_some(),
             "opened in a tab"
+        );
+        super::save_settings_to(None);
+    }
+
+    /// Point `(x, y)` packed as a mouse message's `lparam`.
+    fn settings_click_at(x: i32, y: i32) -> LPARAM {
+        (x as u16 as usize | ((y as u16 as usize) << 16)) as LPARAM
+    }
+
+    /// The center of `row` in the open Settings dialog's client area, before any scrolling.
+    fn settings_row_center(dialog: HWND, row: crate::window::settings_model::Row) -> (i32, i32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow};
+        let owner = unsafe { GetWindow(dialog, GW_OWNER) };
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(owner) }.max(96);
+        let layout = crate::window::settings_dialog::Layout::calculate(dpi, i32::MAX, 100);
+        let rect = layout.row_rect(row, 0);
+        ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+    }
+
+    #[test]
+    fn the_second_click_of_a_double_click_on_a_dropdown_item_changes_nothing_else() {
+        // Break caught: double-clicking a theme in the list picks it on the first click, the
+        // list goes, and the second click lands on the Word wrap row underneath and toggles it
+        // (final review 3). A later click still toggles it: only one press is swallowed.
+        use crate::config::ThemePreference;
+        use crate::window::settings_model::Row;
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-double-click");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        assert!(!app_mut(window.hwnd).settings.word_wrap);
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let (x, y) = settings_row_center(dialog, Row::WordWrap);
+            let mut screen = POINT { x, y };
+            ClientToScreen(dialog, &mut screen);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0); // the Theme list
+            // The list's first click picks Light at a point over the Word wrap row.
+            PostMessageW(
+                dialog,
+                crate::window::dropdown_list::WM_LIST_PICKED,
+                1,
+                settings_click_at(screen.x, screen.y),
+            );
+            for _ in 0..2 {
+                PostMessageW(dialog, WM_LBUTTONDOWN, 1, settings_click_at(x, y));
+                PostMessageW(dialog, WM_LBUTTONUP, 0, settings_click_at(x, y));
+            }
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+
+        super::show_settings(window.hwnd);
+
+        let settings = app_mut(window.hwnd).settings.clone();
+        assert_eq!(settings.theme, ThemePreference::Light, "the pick applied");
+        assert!(settings.word_wrap, "toggled once: by the later click only");
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn clicking_the_greyed_autosave_row_leaves_the_focus_where_it_was() {
+        // Break caught: a click on the Notebook autosave row, greyed with no notebook open,
+        // moving the focus onto a row the keyboard can't use (final review 6). Tab and Right
+        // after the click then change File icons, the row after Theme.
+        use crate::config::FileIconSet;
+        use crate::window::settings_model::Row;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RIGHT, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let scratch = RecoveryScratch::new("settings-dialog-greyed-row");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let (x, y) = settings_row_center(dialog, Row::NotebookAutosave);
+            PostMessageW(dialog, WM_LBUTTONDOWN, 1, settings_click_at(x, y));
+            PostMessageW(dialog, WM_LBUTTONUP, 0, settings_click_at(x, y));
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RIGHT), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert_eq!(
+            app_mut(window.hwnd).settings.file_icons,
+            FileIconSet::Minimal
         );
         super::save_settings_to(None);
     }

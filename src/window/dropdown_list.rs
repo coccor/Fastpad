@@ -6,28 +6,29 @@ use super::palette::Palette;
 use super::panel::{fill, inset};
 use crate::platform::wide_null;
 use windows_sys::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW,
-    EndPaint, GetMonitorInfoW, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, ClientToScreen, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DrawTextW, EndPaint, GetMonitorInfoW, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
     GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MA_NOACTIVATE, PostMessageW, RegisterClassW,
     SW_SHOWNA, SetWindowLongPtrW, ShowWindow, WM_APP, WM_ERASEBKGND, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 pub(crate) const VISIBLE_ROWS: usize = 10;
 /// Letters typed within this long of each other build up one type-ahead prefix.
 const TYPE_AHEAD_PAUSE_MS: u32 = 1000;
 
-/// Posted to the owner (the Settings dialog) when a row is clicked; `wparam` is the item index.
-/// `WM_APP + 1` is the dialog's own message space, not the main window's.
+/// Posted to the owner (the Settings dialog) when a row is clicked; `wparam` is the item index
+/// and `lparam` the click's screen point, packed like a mouse message's. `WM_APP + 1` is the
+/// dialog's own message space, not the main window's.
 pub(crate) const WM_LIST_PICKED: u32 = WM_APP + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +60,9 @@ pub(crate) struct ListModel {
     pub top: usize,
     typed: String,
     last_typed_at: u32,
+    /// Wheel travel not yet worth a whole row, in 1/120ths of a row (precision touchpads send
+    /// deltas far smaller than a notch).
+    wheel_remainder: i32,
 }
 
 impl ListModel {
@@ -71,6 +75,7 @@ impl ListModel {
             top: 0,
             typed: String::new(),
             last_typed_at: 0,
+            wheel_remainder: 0,
         };
         model.scroll_into_view();
         model
@@ -93,6 +98,15 @@ impl ListModel {
         let moved = top != self.top;
         self.top = top;
         moved
+    }
+
+    /// A wheel turn of `delta` (120 per notch): three rows per notch, keeping what a small
+    /// delta adds up to until it makes a whole row. True when the view moved.
+    pub(crate) fn wheel(&mut self, delta: i16) -> bool {
+        let travel = self.wheel_remainder + i32::from(delta) * 3;
+        let rows = travel / 120;
+        self.wheel_remainder = travel - rows * 120;
+        rows != 0 && self.scroll(-rows as isize)
     }
 
     pub(crate) fn key(&mut self, key: ListKey, now_ms: u32) -> ListOutcome {
@@ -249,13 +263,9 @@ impl DropdownList {
         outcome
     }
 
-    /// A mouse wheel turn the dialog forwarded: three rows per notch.
+    /// A mouse wheel turn the dialog forwarded.
     pub(crate) fn wheel(&self, delta: i16) {
-        if let Some(state) = state(self.hwnd)
-            && state.model.scroll(-(isize::from(delta) / 120) * 3)
-        {
-            invalidate(self.hwnd);
-        }
+        wheel(self.hwnd, delta);
     }
 }
 
@@ -294,6 +304,13 @@ fn invalidate(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
+/// Scrolls the list for a wheel turn of `delta`, whichever window the wheel reached.
+fn wheel(hwnd: HWND, delta: i16) {
+    if state(hwnd).is_some_and(|list| list.model.wheel(delta)) {
+        invalidate(hwnd);
+    }
+}
+
 /// The item under client `y`, one pixel of border above the first row.
 fn item_at(state: &ListState, y: i32) -> Option<usize> {
     let row = (y - 1).max(0) / state.row_height.max(1);
@@ -330,14 +347,24 @@ unsafe extern "system" fn list_proc(
             }
             0
         }
+        // With "scroll inactive windows when I hover over them" the wheel comes here rather
+        // than to the dialog, and DefWindowProc would not pass it on.
+        WM_MOUSEWHEEL => {
+            wheel(hwnd, ((wparam >> 16) & 0xffff) as i16);
+            0
+        }
         WM_LBUTTONUP => {
-            let picked = state(hwnd).and_then(|list| {
-                item_at(list, ((lparam >> 16) & 0xffff) as i16 as i32)
-                    .map(|index| (list.owner, index))
-            });
+            let mut point = POINT {
+                x: (lparam & 0xffff) as i16 as i32,
+                y: ((lparam >> 16) & 0xffff) as i16 as i32,
+            };
+            let picked = state(hwnd)
+                .and_then(|list| item_at(list, point.y).map(|index| (list.owner, index)));
             if let Some((owner, index)) = picked {
+                unsafe { ClientToScreen(hwnd, &mut point) };
+                let at = (point.x as u16 as usize | ((point.y as u16 as usize) << 16)) as LPARAM;
                 // Posted: the dialog destroys this window when it handles the pick.
-                unsafe { PostMessageW(owner, WM_LIST_PICKED, index, 0) };
+                unsafe { PostMessageW(owner, WM_LIST_PICKED, index, at) };
             }
             0
         }
@@ -465,6 +492,23 @@ mod tests {
         assert!(!model.scroll(-1), "already at the top");
         assert_eq!(model.item_at_row(2), Some(2));
         assert_eq!(model.item_at_row(VISIBLE_ROWS), None);
+    }
+
+    #[test]
+    fn small_wheel_deltas_add_up_to_whole_rows() {
+        // Break caught: a precision touchpad's deltas of a few units each truncating to zero
+        // rows, so the list never scrolls under two-finger scrolling (final review 4a).
+        let mut model = ListModel::new((0..30).map(|i| format!("Font {i}")).collect(), Some(0));
+        assert!(!model.wheel(-30), "a quarter notch is less than a row");
+        assert_eq!(model.top, 0);
+        assert!(model.wheel(-30), "half a notch: 1.5 rows, one whole row");
+        assert_eq!(model.top, 1);
+        assert!(model.wheel(-60), "the kept half row plus 1.5 rows");
+        assert_eq!(model.top, 3);
+        assert!(model.wheel(-120), "a notch is three rows");
+        assert_eq!(model.top, 6);
+        assert!(model.wheel(120));
+        assert_eq!(model.top, 3);
     }
 
     #[test]

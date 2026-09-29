@@ -23,9 +23,9 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, EndPaint, FW_NORMAL,
-    FW_SEMIBOLD, GetDC, GetMonitorInfoW, HDC, HFONT, IntersectClipRect, InvalidateRect,
+    BeginPaint, ClientToScreen, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, EndPaint,
+    FW_NORMAL, FW_SEMIBOLD, GetDC, GetMonitorInfoW, HDC, HFONT, IntersectClipRect, InvalidateRect,
     MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow, PAINTSTRUCT,
     ReleaseDC, RestoreDC, SaveDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
     TRANSPARENT,
@@ -34,15 +34,16 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
+    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_OWNER,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, HCURSOR, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND, IsWindow, LoadCursorW, MSG,
-    PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
+    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW,
+    GW_OWNER, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageTime, GetMessageW,
+    GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, HCURSOR, HTCAPTION, HTCLIENT,
+    IDC_ARROW, IDC_HAND, IsWindow, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
     WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR,
@@ -393,6 +394,12 @@ struct Dialog {
     tracking_leave: bool,
     /// The open dropdown and its row. Dropped before the fonts it borrows.
     list: Option<(Row, DropdownList)>,
+    /// When and where (screen) the last mouse pick in a dropdown was: the second click of a
+    /// double-click on an item lands here once the list is gone and must not change a setting.
+    picked_at: Option<(u32, POINT)>,
+    /// A press swallowed as the second click of such a double-click: its release is swallowed
+    /// too.
+    swallowing: bool,
     outcome: Rc<Cell<Outcome>>,
 }
 
@@ -527,6 +534,8 @@ fn create(
         pressed: None,
         tracking_leave: false,
         list: None,
+        picked_at: None,
+        swallowing: false,
         outcome,
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
@@ -697,6 +706,56 @@ fn run(hwnd: HWND, effect: Effect) {
         }
         Effect::Close => close(hwnd),
     }
+}
+
+/// Posted to an open dialog when something it shows changed outside it (the notebook finished
+/// loading, so its autosave switch is known): it calls `refresh`.
+const WM_SETTINGS_REFRESH: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 2;
+
+/// The Settings dialog `owner` has open, if any.
+pub(crate) fn open_dialog(owner: HWND) -> Option<HWND> {
+    let class = register_class()?;
+    let mut after: HWND = std::ptr::null_mut();
+    loop {
+        after = unsafe {
+            FindWindowExW(
+                std::ptr::null_mut(),
+                after,
+                class.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if after.is_null() {
+            return None;
+        }
+        if unsafe { GetWindow(after, GW_OWNER) } == owner {
+            return Some(after);
+        }
+    }
+}
+
+/// Has `owner`'s open dialog, if any, re-read what it shows. Posted, so the dialog does it from
+/// its own loop with nothing borrowed.
+pub(crate) fn refresh_open(owner: HWND) {
+    if let Some(dialog) = open_dialog(owner) {
+        unsafe { PostMessageW(dialog, WM_SETTINGS_REFRESH, 0, 0) };
+    }
+}
+
+/// Whether a press at `at` (screen) at `now` is the second click of a double-click whose first
+/// click picked a dropdown item at `picked`: within the double-click time and rectangle
+/// (`limits`: milliseconds, width, height, as Windows reports them).
+pub(crate) fn completes_double_click(
+    picked: (u32, POINT),
+    now: u32,
+    at: POINT,
+    limits: (u32, i32, i32),
+) -> bool {
+    let (time, point) = picked;
+    let (max_ms, width, height) = limits;
+    now.wrapping_sub(time) <= max_ms
+        && (at.x - point.x).abs() <= width / 2
+        && (at.y - point.y).abs() <= height / 2
 }
 
 /// Re-reads what the dialog shows after a change: the settings, the notebook's switch, and the
@@ -934,7 +993,16 @@ unsafe extern "system" fn dialog_proc(
             0
         }
         WM_LIST_PICKED => {
+            let (x, y) = lparam_point(lparam);
+            let time = unsafe { GetMessageTime() } as u32;
+            if let Some(dialog) = state(hwnd) {
+                dialog.picked_at = Some((time, POINT { x, y }));
+            }
             pick(hwnd, wparam);
+            0
+        }
+        WM_SETTINGS_REFRESH => {
+            refresh(hwnd);
             0
         }
         WM_ACTIVATE => {
@@ -1027,6 +1095,27 @@ unsafe extern "system" fn dialog_proc(
         }
         WM_LBUTTONDOWN => {
             let (x, y) = lparam_point(lparam);
+            let mut at = POINT { x, y };
+            unsafe { ClientToScreen(hwnd, &mut at) };
+            let now = unsafe { GetMessageTime() } as u32;
+            let limits = unsafe {
+                (
+                    GetDoubleClickTime(),
+                    GetSystemMetrics(SM_CXDOUBLECLK),
+                    GetSystemMetrics(SM_CYDOUBLECLK),
+                )
+            };
+            let swallow = state(hwnd).is_some_and(|dialog| {
+                let swallow = dialog
+                    .picked_at
+                    .take()
+                    .is_some_and(|picked| completes_double_click(picked, now, at, limits));
+                dialog.swallowing = swallow;
+                swallow
+            });
+            if swallow {
+                return 0;
+            }
             let open_row = state(hwnd).and_then(|dialog| dialog.list.as_ref().map(|(row, _)| *row));
             close_list(hwnd);
             let effect = state(hwnd).and_then(|dialog| {
@@ -1035,7 +1124,11 @@ unsafe extern "system" fn dialog_proc(
                 // A click on the dropdown whose list was open only closes that list.
                 dialog.pressed =
                     (open_row.map(|row| Hit::Row(row, Part::Whole)) != Some(hit)).then_some(hit);
-                Some(dialog.model.set_focus(focus_of(hit), &dialog.view))
+                // A greyed row takes no focus: it stays where it was.
+                Some(match hit {
+                    Hit::Row(row, _) if !dialog.view.enabled(row) => Effect::None,
+                    _ => dialog.model.set_focus(focus_of(hit), &dialog.view),
+                })
             });
             if let Some(effect) = effect {
                 unsafe { SetCapture(hwnd) };
@@ -1044,6 +1137,9 @@ unsafe extern "system" fn dialog_proc(
             0
         }
         WM_LBUTTONUP => {
+            if state(hwnd).is_some_and(|dialog| std::mem::take(&mut dialog.swallowing)) {
+                return 0;
+            }
             let (x, y) = lparam_point(lparam);
             unsafe { ReleaseCapture() };
             let effect = state(hwnd).and_then(|dialog| {
@@ -1509,6 +1605,29 @@ mod tests {
         assert_eq!(hit(layout.edit_ini), Some(Hit::EditIni));
         assert_eq!(hit(layout.title_close), Some(Hit::TitleClose));
         assert_eq!(hit(layout.title), None);
+    }
+
+    #[test]
+    fn only_a_quick_nearby_press_after_a_pick_completes_a_double_click() {
+        // Break caught: the second click of a double-click on a dropdown item toggling the
+        // checkbox row under it, or every later click after a pick being swallowed (final
+        // review 3).
+        let picked = (1_000, POINT { x: 100, y: 200 });
+        let limits = (500, 4, 4);
+        let near = POINT { x: 102, y: 198 };
+        assert!(completes_double_click(picked, 1_300, near, limits));
+        assert!(
+            !completes_double_click(picked, 1_600, near, limits),
+            "too late"
+        );
+        assert!(
+            !completes_double_click(picked, 1_300, POINT { x: 103, y: 200 }, limits),
+            "too far"
+        );
+        assert!(
+            completes_double_click((u32::MAX - 10, picked.1), 100, near, limits),
+            "the tick count wrapping between the clicks"
+        );
     }
 
     #[test]
