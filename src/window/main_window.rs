@@ -2106,6 +2106,8 @@ pub(crate) fn show_settings(hwnd: HWND) {
     }
 }
 
+const EDIT_INI_NOTICE: &str = "Changes saved in fastpad.ini apply the next time FastPad starts.";
+
 /// Preferences: Edit fastpad.ini. Creates the file (empty) when it doesn't exist yet, then opens
 /// it in a tab through the normal open path (settings dialog spec §3.6).
 pub(crate) fn edit_settings_file(hwnd: HWND) {
@@ -2119,8 +2121,11 @@ pub(crate) fn edit_settings_file(hwnd: HWND) {
             .open(&path)?;
         open_path(hwnd, &path)
     });
-    if let Err(error) = result {
-        push_notice(hwnd, format!("FastPad could not open fastpad.ini: {error}"));
+    match result {
+        // Settings are read once, at startup: say so rather than leave a saved edit looking
+        // ignored.
+        Ok(()) => push_notice(hwnd, EDIT_INI_NOTICE.to_owned()),
+        Err(error) => push_notice(hwnd, format!("FastPad could not open fastpad.ini: {error}")),
     }
 }
 
@@ -26471,6 +26476,16 @@ three"
         assert!(
             app_mut(window.hwnd).tabs.find_path(&ini).is_some(),
             "opened in a tab"
+        );
+        // Break caught: a hand edit saved there looking ignored because FastPad reads the file
+        // only at startup, with nothing saying so (final review 5).
+        assert!(
+            app_mut(window.hwnd)
+                .notifications
+                .pending()
+                .iter()
+                .any(|notice| notice.message == super::EDIT_INI_NOTICE),
+            "the notice says when hand edits apply"
         );
         super::save_settings_to(None);
     }
