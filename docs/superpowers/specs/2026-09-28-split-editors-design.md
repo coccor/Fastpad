@@ -308,7 +308,7 @@ Three PRs, stacked on `feat/split-editors`:
      5. "Not enough room to split" is a notice, not a status-bar hint (§4.3, §9).
      6. Focus arriving in a group activates it: the editor reports `SCN_FOCUSIN`; the preview view, the image view and the find fields post `WM_FASTPAD_CONTENT_FOCUSED` with their window, resolved with `IsChild`.
      7. The active-tab accent is a 2 px top bar, only with two or more groups (§4.2).
-     8. The new command ids are 197–210; the palette completeness test covers `100..300`.
+     8. The new command ids are 217–230 (197–216 went to the language commands on `main`); the palette completeness test covers `100..300`.
      9. Focus Group 1–8 and Focus Last Group are not palette entries, like Select Tab 1–9.
      10. Close all tabs acts on the active group (§5.1).
      11. Zoom applies to every group's editor (§5.1).

@@ -4384,6 +4384,15 @@ fn json_issue_message(issue: &crate::languages::JsonIssue) -> String {
     }
 }
 
+/// A launch with no file leaves no tab: the empty untitled tab the window started with closes
+/// once the session restore has had its turn, unless it is not alone or has text by now.
+fn close_unused_startup_tab(hwnd: HWND) {
+    let alone = unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.tabs.len() == 1);
+    if alone && empty_startup_tab(hwnd).is_some() {
+        close_active_document(hwnd);
+    }
+}
+
 fn handle_open_request(hwnd: HWND) -> LRESULT {
     let request = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
@@ -4426,9 +4435,12 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
                 }
             }
         }
-        crate::launch::LaunchRequest::New => unsafe {
-            let _ = record_milestone(hwnd, Milestone::FileLoaded);
-        },
+        crate::launch::LaunchRequest::New => {
+            close_unused_startup_tab(hwnd);
+            unsafe {
+                let _ = record_milestone(hwnd, Milestone::FileLoaded);
+            }
+        }
     }
     if unsafe { window_identity(hwnd) }.is_some_and(|identity| identity.is_live_for(hwnd)) {
         unsafe {
@@ -7756,6 +7768,9 @@ pub(crate) unsafe fn translate_accelerator(
     if palette_keeps_key(hwnd, message) || inline_name_keeps_key(hwnd, message) {
         return false;
     }
+    if start_tab_for_typing(hwnd, message) {
+        return true;
+    }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .accelerators
@@ -7763,6 +7778,52 @@ pub(crate) unsafe fn translate_accelerator(
             .map(|table| table.raw())
     });
     accelerator.is_some_and(|accelerator| menus::translate_accelerator(accelerator, hwnd, message))
+}
+
+/// A character typed with no tab to take it (the focus on the hidden editor of a group with no
+/// tabs, or on the main window once the last tab closed) first opens an untitled tab there, so
+/// the character lands in it: a window with no tabs is still instant-to-type. True when the
+/// character was delivered here; the message loop then drops it.
+fn start_tab_for_typing(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    let printable = message.wParam >= 0x20 && message.wParam != 0x7F;
+    if message.message != WM_CHAR || !(printable || message.wParam == 0x0D) {
+        return false;
+    }
+    let on_main = message.hwnd == hwnd;
+    let id = if on_main {
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    } else {
+        group_of_child(hwnd, message.hwnd).filter(|&id| {
+            group_editor(hwnd, id).is_some_and(|editor| editor.hwnd() == message.hwnd)
+        })
+    };
+    let Some(id) = id else {
+        return false;
+    };
+    let empty = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .group(id)
+            .is_some_and(|group| group.is_empty())
+    });
+    if !empty {
+        return false;
+    }
+    activate_group(hwnd, id);
+    execute_command(hwnd, CommandId::New);
+    if !on_main {
+        return false;
+    }
+    let Some(editor) = group_editor(hwnd, id) else {
+        return false;
+    };
+    focus_content(hwnd);
+    unsafe { SendMessageW(editor.hwnd(), WM_CHAR, message.wParam, message.lParam) };
+    true
 }
 
 /// Ctrl+W (without Alt) aimed at one of the command palette's controls.
@@ -9617,6 +9678,87 @@ three"
         assert!(x + width >= group_width - crate::window::titlebar::scale(48, dpi));
         // Above the editor in z-order: no sibling before it.
         assert!(unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_null());
+    }
+
+    #[test]
+    fn a_plain_launch_leaves_no_empty_untitled_tab() {
+        // Break caught: double-clicking FastPad.exe opens on an untitled document nobody asked
+        // for.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+
+        super::handle_open_request(window.hwnd);
+
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+    }
+
+    #[test]
+    fn typing_into_a_window_with_no_tabs_starts_an_untitled_tab() {
+        // Break caught: a plain launch with no tab swallowing the first keystrokes, so FastPad is
+        // no longer instant-to-type.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        super::handle_open_request(window.hwnd);
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+        let message = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_CHAR,
+            wParam: usize::from(b'a'),
+            ..Default::default()
+        };
+
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+        unsafe { SendMessageW(editor.hwnd(), WM_CHAR, message.wParam, 0) };
+
+        assert!(!translated, "the character still reaches the editor");
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+        assert_eq!(editor.text().unwrap(), "a");
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn typing_with_the_focus_on_the_main_window_and_no_tabs_types_into_a_new_tab() {
+        // Break caught: closing the last tab hides the editor and leaves the focus on the main
+        // window, whose characters go nowhere.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        super::handle_open_request(window.hwnd);
+        let message = MSG {
+            hwnd: window.hwnd,
+            message: WM_CHAR,
+            wParam: usize::from(b'a'),
+            ..Default::default()
+        };
+
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+
+        assert!(
+            translated,
+            "the character went to the new tab's editor instead"
+        );
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+        assert_eq!(editor.text().unwrap(), "a");
+    }
+
+    #[test]
+    fn a_plain_launch_keeps_the_untitled_tab_once_it_has_text() {
+        // Break caught: text typed before the startup chain finished thrown away with its tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("typed early").unwrap();
+
+        super::handle_open_request(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
     }
 
     #[test]
