@@ -25345,4 +25345,313 @@ three"
         assert!(tint().is_none());
         crate::window::tab_drag::cancel(window.hwnd);
     }
+
+    /// Two groups side by side, the second showing the first's document; the second active.
+    fn two_groups(hwnd: HWND) -> (GroupId, GroupId) {
+        let first = app_mut(hwnd).tabs.active_group();
+        execute_command(hwnd, CommandId::SplitRight);
+        (first, app_mut(hwnd).tabs.active_group())
+    }
+
+    fn group_window(hwnd: HWND, id: GroupId) -> HWND {
+        super::with_group_id(hwnd, id, |state| state.hwnd).unwrap()
+    }
+
+    fn content(hwnd: HWND, id: GroupId) -> RECT {
+        let area = super::with_group_id(hwnd, id, |state| state.content).unwrap();
+        RECT {
+            left: area.left,
+            top: area.top,
+            right: area.right,
+            bottom: area.bottom,
+        }
+    }
+
+    #[test]
+    fn a_tab_dropped_on_another_groups_strip_moves_there_at_that_point() {
+        // Break caught: a cross-group drop appending, keeping the source view, or leaving the
+        // focus in the source group.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        execute_command(window.hwnd, CommandId::New);
+        let moving = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let layout = super::strip_layout_of(window.hwnd, second).unwrap();
+        drop_strip_drag(source, target, layout.insertion_x(1) + 1, 10, 0);
+        assert_eq!(strip_ids(window.hwnd, second)[1], dragged);
+        assert!(strip_ids(window.hwnd, second).contains(&moving));
+        assert!(!strip_ids(window.hwnd, first).contains(&dragged));
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            super::group_editor(window.hwnd, second).unwrap().hwnd()
+        );
+    }
+
+    #[test]
+    fn a_ctrl_drop_on_another_group_adds_a_view_and_keeps_the_source() {
+        // Break caught: Ctrl ignored, so a copy drag takes the tab away from where it was.
+        const MK_CONTROL: usize = 0x0008;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            MK_CONTROL,
+        );
+        assert!(strip_ids(window.hwnd, first).contains(&dragged));
+        assert_eq!(strip_ids(window.hwnd, second).last(), Some(&dragged));
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(dragged).len(), 2);
+    }
+
+    #[test]
+    fn a_drop_where_the_document_is_already_open_activates_that_view_and_still_moves() {
+        // Break caught (spec §6.2): a second view of one document in one group, or the source
+        // view left behind by a move.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        let shared = strip_ids(window.hwnd, second)[0];
+        execute_command(window.hwnd, CommandId::New);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let source = start_strip_drag(window.hwnd, first, 0);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert_eq!(
+            strip_ids(window.hwnd, second)
+                .iter()
+                .filter(|id| **id == shared)
+                .count(),
+            1
+        );
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .active_document(),
+            Some(shared)
+        );
+        assert!(!strip_ids(window.hwnd, first).contains(&shared));
+    }
+
+    #[test]
+    fn dragging_a_groups_last_tab_to_another_group_closes_the_source_group() {
+        // Break caught (Review Focus 4): an empty group left behind after its last tab moved.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, second)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let other = strip_ids(window.hwnd, second)[1 - index];
+        // Leave `dragged` alone in the second group.
+        super::focus_view(window.hwnd, second, other);
+        super::close_document_tab(window.hwnd, other);
+        let source = start_strip_drag(window.hwnd, second, 0);
+        let target = group_window(window.hwnd, first);
+        let middle = content(window.hwnd, first);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert_eq!(super::group_order(window.hwnd), [first]);
+        assert!(strip_ids(window.hwnd, first).contains(&dragged));
+    }
+
+    #[test]
+    fn a_lone_tab_dropped_on_its_own_edge_or_middle_does_nothing() {
+        // Break caught (Review Focus 4): a one-tab group splitting itself and closing, which
+        // shuffles the layout for nothing.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        let area = content(window.hwnd, group);
+        let own = group_window(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        drop_strip_drag(source, own, area.right - 5, (area.top + area.bottom) / 2, 0);
+        assert_eq!(super::group_order(window.hwnd), [group]);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        drop_strip_drag(
+            source,
+            own,
+            (area.left + area.right) / 2,
+            (area.top + area.bottom) / 2,
+            0,
+        );
+        assert_eq!(strip_ids(window.hwnd, group), ids);
+    }
+
+    #[test]
+    fn a_tab_dropped_on_an_edge_splits_that_way_and_moves_into_the_new_group() {
+        // Break caught: the split going the wrong way, or the view copied instead of moved.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let dragged = strip_ids(window.hwnd, group)[0];
+        let area = content(window.hwnd, group);
+        let own = group_window(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        drop_strip_drag(
+            source,
+            own,
+            (area.left + area.right) / 2,
+            area.bottom - 5,
+            0,
+        );
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 2);
+        let new = order[1];
+        assert_eq!(strip_ids(window.hwnd, new), [dragged]);
+        assert!(!strip_ids(window.hwnd, group).contains(&dragged));
+        let layout = super::tree_layout(window.hwnd).unwrap();
+        assert!(
+            layout.rect_of(new).unwrap().top > layout.rect_of(group).unwrap().top,
+            "below"
+        );
+    }
+
+    #[test]
+    fn an_edge_drop_without_room_says_so_and_leaves_the_tab_where_it_was() {
+        // Break caught (Review Focus 5): the view removed from its group before the split was
+        // refused, losing the tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        let area = content(window.hwnd, group);
+        let own = group_window(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        // Shrink the window below two minimum-width groups mid-drag.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                window.hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                300,
+                400,
+                windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            );
+        }
+        super::layout_editor_and_find_bar(window.hwnd);
+        let area = content(window.hwnd, group);
+        drop_strip_drag(source, own, area.right - 3, (area.top + area.bottom) / 2, 0);
+        assert_eq!(super::group_order(window.hwnd), [group]);
+        assert_eq!(strip_ids(window.hwnd, group), ids);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.contains(super::NO_ROOM_TO_SPLIT))
+        );
+    }
+
+    #[test]
+    fn a_tab_closed_mid_drag_drops_nothing() {
+        // Break caught (Review Focus 2): a stale id moving some other tab, or a panic.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        super::close_document_without_prompt(window.hwnd, dragged);
+        let before = strip_ids(window.hwnd, second);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert_eq!(strip_ids(window.hwnd, second), before);
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn a_dirty_document_moves_between_groups_without_a_prompt_and_stays_dirty() {
+        // Break caught: a move implemented as close plus open, asking to save.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        editor.set_text("unsaved").unwrap();
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        app_mut(window.hwnd).tabs.set_dirty(dragged, true);
+        assert!(app_mut(window.hwnd).tabs.document(dragged).unwrap().dirty);
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert!(crate::window::modal::take_last_confirm().is_none());
+        assert!(app_mut(window.hwnd).tabs.document(dragged).unwrap().dirty);
+        assert!(strip_ids(window.hwnd, second).contains(&dragged));
+    }
 }
