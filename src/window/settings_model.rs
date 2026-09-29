@@ -18,7 +18,7 @@ impl Section {
         match self {
             Self::Appearance => "Appearance",
             Self::Editor => "Editor",
-            Self::NotesAndSession => "Notes and session",
+            Self::NotesAndSession => "Notes and Session",
         }
     }
 }

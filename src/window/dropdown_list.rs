@@ -3,16 +3,18 @@
 //! spec §3.5). `ListModel` is the pure part: selection, scrolling and type-ahead.
 
 use super::palette::Palette;
-use super::panel::{fill, inset};
 use super::side_panel::paint_buffered;
+use super::soft_paint::{Canvas, Frame, Shape};
 use crate::platform::wide_null;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW,
-    GetMonitorInfoW, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    ClientToScreen, DT_LEFT, GetMonitorInfoW, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromRect,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -186,16 +188,22 @@ struct ListState {
     /// Borrowed from the dialog, which outlives the list.
     font: HFONT,
     row_height: i32,
+    /// The corner radius of the item highlight.
+    radius: i32,
     hot: Option<usize>,
+    /// Direct2D for the rounded highlight, loaded as the list opens.
+    canvas: Canvas,
 }
 
 impl DropdownList {
     /// Shows `model` directly under `anchor` (screen coordinates), as wide as it, or above it when
     /// the monitor's work area has no room below. It never takes the activation from `owner`.
+    /// Its item highlight is rounded by `radius`.
     pub(crate) fn show(
         owner: HWND,
         anchor: RECT,
         row_height: i32,
+        radius: i32,
         font: HFONT,
         colors: Palette,
         model: ListModel,
@@ -243,10 +251,20 @@ impl DropdownList {
             colors,
             font,
             row_height,
+            radius,
             hot: None,
+            canvas: Canvas::load(),
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+            // Small rounded corners where Windows 11 draws them; Windows 10 ignores this.
+            let corners = DWMWCP_ROUNDSMALL;
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                (&raw const corners).cast(),
+                std::mem::size_of_val(&corners) as u32,
+            );
             ShowWindow(hwnd, SW_SHOWNA);
         }
         Some(Self { hwnd })
@@ -385,69 +403,96 @@ fn paint(hwnd: HWND, list: &ListState) {
 }
 
 fn paint_into(dc: HDC, client: RECT, list: &ListState) {
-    let colors = list.colors;
-    unsafe {
-        fill(dc, client, colors.muted_foreground);
-        fill(dc, inset(client, 1), colors.panel_background());
-        SetBkMode(dc, TRANSPARENT as i32);
-        let previous = SelectObject(dc, list.font as _);
-        let text_inset = list.row_height / 3;
-        for row in 0..list.model.visible_rows() {
-            let Some(index) = list.model.item_at_row(row) else {
-                break;
-            };
-            let top = 1 + row as i32 * list.row_height;
-            let rect = RECT {
-                left: 1,
-                top,
-                right: client.right - 1,
-                bottom: top + list.row_height,
-            };
-            let foreground = if index == list.model.selected {
-                fill(dc, rect, colors.selection_background);
+    let mut frame = Frame::default();
+    compose(&mut frame, client, list);
+    frame.paint(dc, client, &list.canvas);
+}
+
+fn compose<'a>(frame: &mut Frame<'a>, client: RECT, list: &'a ListState) {
+    let colors = &list.colors;
+    frame.shape(Shape::Fill {
+        rect: client,
+        color: colors.panel_background(),
+    });
+    // A subtle 1-px edge; high contrast keeps a strong one.
+    frame.shape(Shape::Ring {
+        rect: client,
+        radius: 0,
+        width: 1,
+        color: if colors.high_contrast {
+            colors.muted_foreground
+        } else {
+            colors.hover_background
+        },
+    });
+    let text_inset = list.row_height / 3;
+    // The highlight is a rounded pill inside its row, clear of the edge.
+    let highlight_inset = list.radius.max(1);
+    for row in 0..list.model.visible_rows() {
+        let Some(index) = list.model.item_at_row(row) else {
+            break;
+        };
+        let top = 1 + row as i32 * list.row_height;
+        let rect = RECT {
+            left: 1,
+            top,
+            right: client.right - 1,
+            bottom: top + list.row_height,
+        };
+        let highlight = RECT {
+            left: rect.left + highlight_inset,
+            top: rect.top + 1,
+            right: rect.right - highlight_inset,
+            bottom: rect.bottom - 1,
+        };
+        let (fill, foreground) = if index == list.model.selected {
+            (
+                Some(colors.selection_background),
                 colors
                     .selection_foreground
-                    .unwrap_or(colors.editor_foreground)
-            } else {
-                if list.hot == Some(index) {
-                    fill(dc, rect, colors.hover_background);
-                }
-                colors.editor_foreground
-            };
-            SetTextColor(dc, foreground);
-            let mut text = wide_null(&list.model.items[index]);
-            let mut text_rect = RECT {
+                    .unwrap_or(colors.editor_foreground),
+            )
+        } else if list.hot == Some(index) {
+            (Some(colors.hover_background), colors.editor_foreground)
+        } else {
+            (None, colors.editor_foreground)
+        };
+        if let Some(color) = fill {
+            frame.shape(Shape::Round {
+                rect: highlight,
+                radius: list.radius,
+                color,
+            });
+        }
+        frame.text(
+            list.font,
+            foreground,
+            list.model.items[index].as_str(),
+            RECT {
                 left: rect.left + text_inset,
                 right: rect.right - text_inset,
                 ..rect
-            };
-            DrawTextW(
-                dc,
-                text.as_mut_ptr(),
-                -1,
-                &mut text_rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-            );
-        }
-        // A thin thumb shows where the view is in a list longer than it.
-        let count = list.model.items.len();
-        if count > VISIBLE_ROWS {
-            let track = client.bottom - 2;
-            let thumb = (track * VISIBLE_ROWS as i32 / count as i32).max(8);
-            let top =
-                1 + (track - thumb) * list.model.top as i32 / (count - VISIBLE_ROWS).max(1) as i32;
-            fill(
-                dc,
-                RECT {
-                    left: client.right - 5,
-                    top,
-                    right: client.right - 2,
-                    bottom: top + thumb,
-                },
-                colors.muted_foreground,
-            );
-        }
-        SelectObject(dc, previous);
+            },
+            DT_LEFT,
+        );
+    }
+    // A thin rounded thumb shows where the view is in a list longer than it.
+    let count = list.model.items.len();
+    if count > VISIBLE_ROWS {
+        let track = client.bottom - 2;
+        let thumb = (track * VISIBLE_ROWS as i32 / count as i32).max(8);
+        let top =
+            1 + (track - thumb) * list.model.top as i32 / (count - VISIBLE_ROWS).max(1) as i32;
+        frame.shape(Shape::Round {
+            rect: RECT {
+                left: client.right - 5,
+                top,
+                right: client.right - 2,
+                bottom: top + thumb,
+            },
+            radius: 2,
+            color: colors.muted_foreground,
+        });
     }
 }
 

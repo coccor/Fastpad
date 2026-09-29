@@ -7,12 +7,13 @@
 use super::dropdown_list::{DropdownList, ListKey, ListModel, ListOutcome, WM_LIST_PICKED};
 use super::modal::ModalScope;
 use super::palette::Palette;
-use super::panel::{fill, inset, scale};
+use super::panel::{inset, scale};
 use super::settings_model::{
     Control, DialogModel, Effect, Focus, Key, Row, Section, SettingsView, dropdown_action,
     step_font_size,
 };
 use super::side_panel::paint_buffered;
+use super::soft_paint::{Canvas, Frame, Shape};
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
 use std::cell::Cell;
@@ -25,11 +26,10 @@ use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, FW_NORMAL, FW_SEMIBOLD,
-    GetDC, GetMonitorInfoW, HDC, HFONT, IntersectClipRect, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow, ReleaseDC,
-    RestoreDC, SaveDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    ClientToScreen, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
+    DeleteObject, DrawTextW, FW_NORMAL, FW_SEMIBOLD, GetDC, GetMonitorInfoW, HDC, HFONT,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow,
+    ReleaseDC, ScreenToClient, SelectObject,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
@@ -57,7 +57,6 @@ const EDIT_INI_LABEL: &str = "Edit fastpad.ini";
 const CLOSE_LABEL: &str = "Close";
 const AUTOSAVE_HINT: &str = "Open a notebook to change this";
 const GLYPH_FONT: &str = "Segoe MDL2 Assets";
-const GLYPH_CHECK: &str = "\u{E73E}";
 const GLYPH_CHEVRON_DOWN: &str = "\u{E70D}";
 const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_REMOVE: &str = "\u{E738}";
@@ -69,19 +68,36 @@ const TITLE_HEIGHT_AT_96_DPI: i32 = 44;
 /// The title row's × is as wide as the main window's caption close button.
 const TITLE_CLOSE_WIDTH_AT_96_DPI: i32 = 46;
 const HEADING_HEIGHT_AT_96_DPI: i32 = 30;
-const ROW_HEIGHT_AT_96_DPI: i32 = 32;
+/// A heading's text sits this far below the top of its space, closer to its first card.
+const HEADING_SPACE_ABOVE_AT_96_DPI: i32 = 6;
+/// Each setting sits on its own card, this tall with this gap under it: 13 cards and 3 headings
+/// keep the dialog under 700 px at 96 DPI.
+const CARD_HEIGHT_AT_96_DPI: i32 = 36;
+const CARD_GAP_AT_96_DPI: i32 = 3;
+/// Between a card's sides and its label or control.
+const CARD_PADDING_AT_96_DPI: i32 = 16;
+/// The corner radius of cards, controls and buttons.
+const RADIUS_AT_96_DPI: i32 = 4;
 const CONTROL_HEIGHT_AT_96_DPI: i32 = 26;
 const DROPDOWN_WIDTH_AT_96_DPI: i32 = 240;
 const SEGMENT_WIDTH_AT_96_DPI: i32 = 80;
 const TAB_SEGMENT_WIDTH_AT_96_DPI: i32 = 44;
 const STEP_BUTTON_AT_96_DPI: i32 = 28;
 const STEP_VALUE_AT_96_DPI: i32 = 48;
-const CHECK_AT_96_DPI: i32 = 18;
-const CONTENT_BOTTOM_GAP_AT_96_DPI: i32 = 8;
+const TOGGLE_WIDTH_AT_96_DPI: i32 = 40;
+const TOGGLE_HEIGHT_AT_96_DPI: i32 = 20;
+/// Between a toggle's track and its round knob.
+const KNOB_INSET_AT_96_DPI: i32 = 4;
+/// The On/Off text left of a toggle: its width and its gap to the switch.
+const TOGGLE_STATE_WIDTH_AT_96_DPI: i32 = 28;
+const TOGGLE_STATE_GAP_AT_96_DPI: i32 = 10;
+/// The focus ring's stroke, and its gap outside the control it rings.
+const FOCUS_WIDTH_AT_96_DPI: i32 = 2;
+const FOCUS_GAP_AT_96_DPI: i32 = 1;
 const FOOTER_HEIGHT_AT_96_DPI: i32 = 56;
 const BUTTON_WIDTH_AT_96_DPI: i32 = 88;
 const BUTTON_HEIGHT_AT_96_DPI: i32 = 30;
-/// However short the screen, at least this many rows stay visible.
+/// However short the screen, at least this many cards stay visible.
 const MIN_VISIBLE_ROWS: i32 = 3;
 
 /// How the dialog was closed.
@@ -112,7 +128,8 @@ pub(crate) enum Hit {
 }
 
 /// Where everything sits. Headings and rows are in content coordinates, placed in the
-/// scrolling `body` by `row_rect`/`heading_rect`.
+/// scrolling `body` by `row_rect`/`heading_rect`. A row's rect is its card, without the gap
+/// under it.
 #[derive(Clone, Copy)]
 pub(crate) struct Layout {
     pub width: i32,
@@ -136,7 +153,8 @@ impl Layout {
         let padding = scale(PADDING_AT_96_DPI, dpi);
         let title_height = scale(TITLE_HEIGHT_AT_96_DPI, dpi);
         let heading_height = scale(HEADING_HEIGHT_AT_96_DPI, dpi);
-        let row_height = scale(ROW_HEIGHT_AT_96_DPI, dpi);
+        let card_height = scale(CARD_HEIGHT_AT_96_DPI, dpi);
+        let row_pitch = card_height + scale(CARD_GAP_AT_96_DPI, dpi);
         let footer_height = scale(FOOTER_HEIGHT_AT_96_DPI, dpi);
 
         // The × fills the title row's top-right corner, full height, like a caption button.
@@ -167,13 +185,14 @@ impl Layout {
             headings[section as usize] = line(top, heading_height);
             top += heading_height;
             for row in Row::ALL.into_iter().filter(|row| row.section() == section) {
-                rows[row as usize] = line(top, row_height);
-                top += row_height;
+                rows[row as usize] = line(top, card_height);
+                top += row_pitch;
             }
         }
-        let content_height = top + scale(CONTENT_BOTTOM_GAP_AT_96_DPI, dpi);
+        // The last card's gap separates it from the footer.
+        let content_height = top;
 
-        let smallest = title_height + row_height * MIN_VISIBLE_ROWS + footer_height;
+        let smallest = title_height + row_pitch * MIN_VISIBLE_ROWS + footer_height;
         let height = (title_height + content_height + footer_height).min(max_height.max(smallest));
         let body = RECT {
             left: 0,
@@ -218,6 +237,16 @@ impl Layout {
         scale(CONTROL_HEIGHT_AT_96_DPI, self.dpi)
     }
 
+    /// The corner radius of cards and controls.
+    pub(crate) fn radius(&self) -> i32 {
+        scale(RADIUS_AT_96_DPI, self.dpi)
+    }
+
+    /// A card and the gap under it, as `calculate` stacks them; a wheel notch scrolls three.
+    fn row_pitch(&self) -> i32 {
+        scale(CARD_HEIGHT_AT_96_DPI, self.dpi) + scale(CARD_GAP_AT_96_DPI, self.dpi)
+    }
+
     fn place(&self, rect: RECT, scroll: i32) -> RECT {
         let offset = self.body.top - scroll;
         RECT {
@@ -236,8 +265,8 @@ impl Layout {
         self.place(self.headings[section as usize], scroll)
     }
 
-    /// The control of `row`, right-aligned in `row_rect`. `segments` is how many a segmented
-    /// row shows.
+    /// The control of `row`, right-aligned inside the padding of its card `row_rect`.
+    /// `segments` is how many a segmented row shows.
     pub(crate) fn control_rect(&self, row: Row, row_rect: RECT, segments: usize) -> RECT {
         let dpi = self.dpi;
         let (width, height) = match row.control() {
@@ -260,13 +289,17 @@ impl Layout {
                 scale(STEP_BUTTON_AT_96_DPI, dpi) * 2 + scale(STEP_VALUE_AT_96_DPI, dpi),
                 scale(CONTROL_HEIGHT_AT_96_DPI, dpi),
             ),
-            Control::Check => (scale(CHECK_AT_96_DPI, dpi), scale(CHECK_AT_96_DPI, dpi)),
+            Control::Check => (
+                scale(TOGGLE_WIDTH_AT_96_DPI, dpi),
+                scale(TOGGLE_HEIGHT_AT_96_DPI, dpi),
+            ),
         };
         let top = row_rect.top + (row_rect.bottom - row_rect.top - height) / 2;
+        let right = row_rect.right - scale(CARD_PADDING_AT_96_DPI, dpi);
         RECT {
-            left: row_rect.right - width,
+            left: right - width,
             top,
-            right: row_rect.right,
+            right,
             bottom: top + height,
         }
     }
@@ -308,8 +341,8 @@ impl Layout {
         ]
     }
 
-    /// What client point `x`, `y` is on at `scroll`. A checkbox row is hit anywhere, label
-    /// included. Other rows are hit only on their control.
+    /// What client point `x`, `y` is on at `scroll`. A toggle row is hit anywhere on its card,
+    /// label included. Other rows are hit only on their control.
     pub(crate) fn hit(&self, x: i32, y: i32, scroll: i32, view: &SettingsView) -> Option<Hit> {
         let inside =
             |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
@@ -381,6 +414,24 @@ impl Layout {
     }
 }
 
+/// The round knob of a toggle switch whose track is `track`: inset on every side, at the right
+/// when `on`, at the left when off.
+pub(crate) fn toggle_knob(track: RECT, on: bool, dpi: u32) -> RECT {
+    let inset = scale(KNOB_INSET_AT_96_DPI, dpi);
+    let size = (track.bottom - track.top - 2 * inset).max(0);
+    let left = if on {
+        track.right - inset - size
+    } else {
+        track.left + inset
+    };
+    RECT {
+        left,
+        top: track.top + inset,
+        right: left + size,
+        bottom: track.top + inset + size,
+    }
+}
+
 /// The open dialog's state, owned by its window through `GWLP_USERDATA`.
 struct Dialog {
     colors: Palette,
@@ -407,6 +458,8 @@ struct Dialog {
     /// too.
     swallowing: bool,
     outcome: Rc<Cell<Outcome>>,
+    /// Direct2D for the rounded shapes, loaded as the dialog opens.
+    canvas: Canvas,
 }
 
 impl Drop for Dialog {
@@ -496,7 +549,7 @@ fn create(
     }
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
     let title_font = create_ui_font(scale(18, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
-    let heading_font = create_ui_font(scale(12, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
+    let heading_font = create_ui_font(scale(14, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
     let body_font = create_ui_font(scale(13, dpi), "Segoe UI", FW_NORMAL as i32, false);
     let link_font = create_underlined_font(scale(13, dpi));
     let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
@@ -545,6 +598,7 @@ fn create(
         picked_at: None,
         swallowing: false,
         outcome,
+        canvas: Canvas::load(),
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
 
@@ -814,6 +868,7 @@ fn open_list(hwnd: HWND, row: Row) {
         hwnd,
         anchor,
         dialog.layout.list_row_height(),
+        dialog.layout.radius(),
         dialog.body_font,
         dialog.colors,
         ListModel::new(items, selected),
@@ -1033,8 +1088,8 @@ unsafe extern "system" fn dialog_proc(
                 if let Some((_, list)) = &dialog.list {
                     list.wheel(delta);
                 } else {
-                    let row_height = scale(ROW_HEIGHT_AT_96_DPI, dialog.layout.dpi);
-                    let scroll = (dialog.scroll - i32::from(delta) * row_height / 40)
+                    let pitch = dialog.layout.row_pitch();
+                    let scroll = (dialog.scroll - i32::from(delta) * pitch / 40)
                         .clamp(0, dialog.layout.max_scroll());
                     if scroll != dialog.scroll {
                         dialog.scroll = scroll;
@@ -1188,150 +1243,221 @@ fn paint(hwnd: HWND, dialog: &Dialog) {
 }
 
 fn paint_into(dc: HDC, client: RECT, dialog: &Dialog) {
-    let colors = dialog.colors;
-    let layout = &dialog.layout;
-    let view = &dialog.view;
-    unsafe {
-        let inside = inset(client, 1);
-        fill(dc, client, colors.muted_foreground);
-        fill(dc, inside, colors.panel_background());
-        SetBkMode(dc, TRANSPARENT as i32);
+    let mut frame = Frame::default();
+    compose(&mut frame, client, dialog);
+    frame.paint(dc, client, &dialog.canvas);
+}
 
-        // Title row: a strip-colored band inside the border with the name and the × button.
-        fill(
-            dc,
-            RECT {
-                bottom: layout.title.bottom,
-                ..inside
-            },
-            colors.strip_background,
-        );
-        draw_text(
-            dc,
-            dialog.title_font,
-            colors.editor_foreground,
-            TITLE,
-            layout.title,
-            DT_LEFT,
-        );
-        let close_hot = dialog.hot == Some(Hit::TitleClose);
-        if close_hot {
-            // Full height to the separator, flush against the border.
-            fill(
-                dc,
-                RECT {
-                    top: inside.top,
-                    right: inside.right,
-                    ..layout.title_close
-                },
-                colors.close_hover_background,
-            );
-        }
-        draw_text(
-            dc,
-            dialog.glyph_font,
-            if close_hot {
-                colors.close_hover_foreground
+/// The fills of the soft controls, from the theme's palette. Hover and press shift a fill
+/// toward the text colour: darker in light themes, lighter in dark ones. High contrast may
+/// only use system colour pairs, so there it keeps each fill and outlines every card and
+/// control instead.
+struct Tones {
+    /// A setting's card: a step off the panel (strip_background is too close to it).
+    card: u32,
+    card_hot: u32,
+    /// Dropdowns, steppers and segment tracks: a step off the card.
+    control: u32,
+    control_hot: u32,
+    control_down: u32,
+    accent: u32,
+    accent_hot: u32,
+    accent_down: u32,
+    /// Text and knobs on the accent.
+    on_accent: u32,
+    /// High contrast's outline.
+    outline: Option<u32>,
+}
+
+impl Tones {
+    fn new(colors: &Palette) -> Self {
+        let shade = |color: u32, alpha: u32| {
+            if colors.high_contrast {
+                color
             } else {
-                colors.muted_foreground
-            },
-            GLYPH_CLOSE,
-            layout.title_close,
-            DT_CENTER,
-        );
-        let rule = |top: i32| RECT {
-            left: 1,
-            top,
-            right: client.right - 1,
-            bottom: top + 1,
-        };
-        // pressed_background, not strip_background: the rule must show against the strip-colored
-        // title row as well as the panel.
-        fill(dc, rule(layout.body.top - 1), colors.pressed_background);
-        fill(dc, rule(layout.body.bottom), colors.pressed_background);
-
-        // The scrolling body, clipped to its area.
-        let saved = SaveDC(dc);
-        IntersectClipRect(
-            dc,
-            layout.body.left,
-            layout.body.top,
-            layout.body.right,
-            layout.body.bottom,
-        );
-        for section in Section::ALL {
-            draw_text(
-                dc,
-                dialog.heading_font,
-                colors.muted_foreground,
-                &section.title().to_uppercase(),
-                layout.heading_rect(section, dialog.scroll),
-                DT_LEFT,
-            );
-        }
-        for row in Row::ALL {
-            paint_row(dc, dialog, row);
-        }
-        RestoreDC(dc, saved);
-
-        // Footer: the link and Close.
-        draw_text(
-            dc,
-            dialog.link_font,
-            dialog.link_color,
-            EDIT_INI_LABEL,
-            layout.edit_ini,
-            DT_LEFT,
-        );
-        let button = match (dialog.pressed, dialog.hot) {
-            (Some(Hit::Close), _) => colors.pressed_background,
-            (_, Some(Hit::Close)) => colors.hover_background,
-            _ => colors.strip_background,
-        };
-        fill(dc, layout.close, colors.muted_foreground);
-        fill(dc, inset(layout.close, 1), button);
-        draw_text(
-            dc,
-            dialog.body_font,
-            colors.editor_foreground,
-            CLOSE_LABEL,
-            layout.close,
-            DT_CENTER,
-        );
-
-        // The focus ring.
-        let ring = match dialog.model.focus {
-            Focus::EditIni => Some(inset(layout.edit_ini, -2)),
-            Focus::Close => Some(inset(layout.close, scale(3, layout.dpi))),
-            Focus::Row(row) => {
-                let row_rect = layout.row_rect(row, dialog.scroll);
-                let visible =
-                    row_rect.top >= layout.body.top && row_rect.bottom <= layout.body.bottom;
-                visible.then(|| {
-                    if row.control() == Control::Check {
-                        inset(row_rect, 1)
-                    } else {
-                        inset(
-                            layout.control_rect(row, row_rect, view.segments(row).len()),
-                            -2,
-                        )
-                    }
-                })
+                crate::catppuccin::blend(colors.editor_foreground, color, alpha)
             }
         };
-        if let Some(ring) = ring {
-            SetTextColor(dc, colors.editor_foreground);
-            DrawFocusRect(dc, &ring);
+        let (card, control) = if colors.high_contrast {
+            (colors.strip_background, colors.strip_background)
+        } else {
+            (colors.hover_background, colors.pressed_background)
+        };
+        let accent = colors.selection_background;
+        Self {
+            card,
+            card_hot: shade(card, 16),
+            control,
+            control_hot: shade(control, 28),
+            control_down: shade(control, 56),
+            accent,
+            accent_hot: shade(accent, 28),
+            accent_down: shade(accent, 56),
+            on_accent: colors
+                .selection_foreground
+                .unwrap_or(colors.editor_foreground),
+            outline: colors.high_contrast.then_some(colors.muted_foreground),
+        }
+    }
+
+    /// A rounded fill, outlined in high contrast.
+    fn soft(&self, frame: &mut Frame<'_>, rect: RECT, radius: i32, color: u32) {
+        frame.shape(Shape::Round {
+            rect,
+            radius,
+            color,
+        });
+        if let Some(outline) = self.outline {
+            frame.shape(Shape::Ring {
+                rect,
+                radius,
+                width: 1,
+                color: outline,
+            });
         }
     }
 }
 
-unsafe fn paint_row(dc: HDC, dialog: &Dialog, row: Row) {
-    let colors = dialog.colors;
+fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
+    let colors = &dialog.colors;
+    let tones = Tones::new(colors);
     let layout = &dialog.layout;
     let view = &dialog.view;
-    let row_rect = layout.row_rect(row, dialog.scroll);
-    if row_rect.bottom < layout.body.top || row_rect.top > layout.body.bottom {
+    let dpi = layout.dpi;
+    let radius = layout.radius();
+
+    // No border line: the native shadow is the edge (square on Windows 10, rounded on 11).
+    frame.shape(Shape::Fill {
+        rect: client,
+        color: colors.panel_background(),
+    });
+
+    // Title row: a strip-coloured band with the name and the × button.
+    frame.shape(Shape::Fill {
+        rect: RECT {
+            bottom: layout.title.bottom,
+            ..client
+        },
+        color: colors.strip_background,
+    });
+    frame.text(
+        dialog.title_font,
+        colors.editor_foreground,
+        TITLE,
+        layout.title,
+        DT_LEFT,
+    );
+    let close_hot = dialog.hot == Some(Hit::TitleClose);
+    if close_hot {
+        // Full height, into the corner, like a caption button.
+        frame.shape(Shape::Fill {
+            rect: layout.title_close,
+            color: colors.close_hover_background,
+        });
+    }
+    frame.text(
+        dialog.glyph_font,
+        if close_hot {
+            colors.close_hover_foreground
+        } else {
+            colors.muted_foreground
+        },
+        GLYPH_CLOSE,
+        layout.title_close,
+        DT_CENTER,
+    );
+    // Subtle rules under the title and over the footer.
+    for top in [layout.body.top - 1, layout.body.bottom] {
+        frame.shape(Shape::Fill {
+            rect: RECT {
+                top,
+                bottom: top + 1,
+                ..client
+            },
+            color: tones.card,
+        });
+    }
+
+    // The scrolling body, clipped to its area.
+    frame.clip(Some(layout.body));
+    for section in Section::ALL {
+        let heading = layout.heading_rect(section, dialog.scroll);
+        frame.text(
+            dialog.heading_font,
+            colors.editor_foreground,
+            section.title(),
+            RECT {
+                top: heading.top + scale(HEADING_SPACE_ABOVE_AT_96_DPI, dpi),
+                ..heading
+            },
+            DT_LEFT,
+        );
+    }
+    for row in Row::ALL {
+        compose_row(frame, &tones, dialog, row);
+    }
+    frame.clip(None);
+
+    // Footer: the link and a filled accent Close.
+    frame.text(
+        dialog.link_font,
+        dialog.link_color,
+        EDIT_INI_LABEL,
+        layout.edit_ini,
+        DT_LEFT,
+    );
+    let button = match (dialog.pressed, dialog.hot) {
+        (Some(Hit::Close), _) => tones.accent_down,
+        (_, Some(Hit::Close)) => tones.accent_hot,
+        _ => tones.accent,
+    };
+    tones.soft(frame, layout.close, radius, button);
+    frame.text(
+        dialog.body_font,
+        tones.on_accent,
+        CLOSE_LABEL,
+        layout.close,
+        DT_CENTER,
+    );
+
+    // The focus ring: a rounded accent stroke just outside the focused control, or on the
+    // edge of a toggle's card, all of which is its hit area.
+    let width = scale(FOCUS_WIDTH_AT_96_DPI, dpi);
+    let outside = width + scale(FOCUS_GAP_AT_96_DPI, dpi);
+    let ring = match dialog.model.focus {
+        Focus::EditIni => Some((inset(layout.edit_ini, -outside), radius + outside)),
+        Focus::Close => Some((inset(layout.close, -outside), radius + outside)),
+        Focus::Row(row) => {
+            let card = layout.row_rect(row, dialog.scroll);
+            let visible = card.top >= layout.body.top && card.bottom <= layout.body.bottom;
+            visible.then(|| {
+                if row.control() == Control::Check {
+                    (card, radius)
+                } else {
+                    let control = layout.control_rect(row, card, view.segments(row).len());
+                    (inset(control, -outside), radius + outside)
+                }
+            })
+        }
+    };
+    if let Some((rect, radius)) = ring {
+        frame.shape(Shape::Ring {
+            rect,
+            radius,
+            width,
+            color: tones.accent,
+        });
+    }
+}
+
+fn compose_row<'a>(frame: &mut Frame<'a>, tones: &Tones, dialog: &'a Dialog, row: Row) {
+    let colors = &dialog.colors;
+    let layout = &dialog.layout;
+    let view = &dialog.view;
+    let dpi = layout.dpi;
+    let radius = layout.radius();
+    let card = layout.row_rect(row, dialog.scroll);
+    if card.bottom < layout.body.top || card.top > layout.body.bottom {
         return;
     }
     let enabled = view.enabled(row);
@@ -1341,195 +1467,201 @@ unsafe fn paint_row(dc: HDC, dialog: &Dialog, row: Row) {
         colors.muted_foreground
     };
     let segments = view.segments(row);
-    let control = layout.control_rect(row, row_rect, segments.len());
-    unsafe {
-        draw_text(dc, dialog.body_font, text, row.label(), row_rect, DT_LEFT);
-        let hot = matches!(dialog.hot, Some(Hit::Row(hot_row, _)) if hot_row == row) && enabled;
-        match row.control() {
-            Control::Check => {
-                let checked = row.toggle().is_some_and(|toggle| view.checked(toggle));
-                if !enabled {
-                    let hint = RECT {
-                        right: control.left - scale(12, layout.dpi),
-                        ..row_rect
-                    };
-                    draw_text(
-                        dc,
-                        dialog.body_font,
-                        colors.muted_foreground,
-                        AUTOSAVE_HINT,
-                        hint,
-                        DT_RIGHT,
-                    );
-                }
-                fill(
-                    dc,
-                    control,
-                    if enabled {
+    let control = layout.control_rect(row, card, segments.len());
+    let hot = matches!(dialog.hot, Some(Hit::Row(hot_row, _)) if hot_row == row) && enabled;
+    // A toggle's whole card is its hit area, so the card shows the hover.
+    let card_fill = if hot && row.control() == Control::Check {
+        tones.card_hot
+    } else {
+        tones.card
+    };
+    tones.soft(frame, card, radius, card_fill);
+    let padding = scale(CARD_PADDING_AT_96_DPI, dpi);
+    let label = RECT {
+        left: card.left + padding,
+        right: card.right - padding,
+        ..card
+    };
+    frame.text(dialog.body_font, text, row.label(), label, DT_LEFT);
+    // Pills inside a control's track.
+    let pill_inset = scale(2, dpi);
+    let pill_radius = (radius - pill_inset).max(scale(2, dpi));
+    match row.control() {
+        Control::Check => {
+            let on = row.toggle().is_some_and(|toggle| view.checked(toggle));
+            let state = RECT {
+                left: control.left
+                    - scale(
+                        TOGGLE_STATE_GAP_AT_96_DPI + TOGGLE_STATE_WIDTH_AT_96_DPI,
+                        dpi,
+                    ),
+                right: control.left - scale(TOGGLE_STATE_GAP_AT_96_DPI, dpi),
+                ..card
+            };
+            frame.text(
+                dialog.body_font,
+                text,
+                if on { "On" } else { "Off" },
+                state,
+                DT_RIGHT,
+            );
+            if !enabled {
+                let hint = RECT {
+                    left: label.left,
+                    right: state.left - scale(12, dpi),
+                    ..card
+                };
+                frame.text(
+                    dialog.body_font,
+                    colors.muted_foreground,
+                    AUTOSAVE_HINT,
+                    hint,
+                    DT_RIGHT,
+                );
+            }
+            let track_radius = (control.bottom - control.top) / 2;
+            let knob = toggle_knob(control, on, dpi);
+            let (track, knob_color) = match (enabled, on) {
+                (true, true) => (
+                    Some(if hot { tones.accent_hot } else { tones.accent }),
+                    tones.on_accent,
+                ),
+                (true, false) => (None, colors.muted_foreground),
+                // Greyed: a pale track and knob.
+                (false, true) => (Some(colors.pressed_background), tones.card),
+                (false, false) => (None, colors.pressed_background),
+            };
+            match track {
+                Some(color) => frame.shape(Shape::Round {
+                    rect: control,
+                    radius: track_radius,
+                    color,
+                }),
+                // Off: a pill outlined on the card, not filled.
+                None => frame.shape(Shape::Ring {
+                    rect: control,
+                    radius: track_radius,
+                    width: scale(1, dpi),
+                    color: if enabled {
                         colors.muted_foreground
                     } else {
-                        colors.strip_background
+                        colors.pressed_background
                     },
-                );
-                let inner = inset(control, 1);
-                if checked {
-                    fill(dc, inner, colors.selection_background);
-                    draw_text(
-                        dc,
-                        dialog.glyph_font,
-                        colors
-                            .selection_foreground
-                            .unwrap_or(colors.editor_foreground),
-                        GLYPH_CHECK,
-                        control,
-                        DT_CENTER,
-                    );
+                }),
+            }
+            frame.shape(Shape::Round {
+                rect: knob,
+                radius: (knob.bottom - knob.top) / 2,
+                color: knob_color,
+            });
+        }
+        Control::Segmented => {
+            tones.soft(frame, control, radius, tones.control);
+            for (index, (segment, rect)) in segments
+                .iter()
+                .zip(layout.segment_rects(control, segments.len()))
+                .enumerate()
+            {
+                let pill = inset(rect, pill_inset);
+                let hot_segment = dialog.hot == Some(Hit::Row(row, Part::Segment(index)));
+                let (fill, foreground) = if segment.selected {
+                    (Some(tones.accent), tones.on_accent)
+                } else if hot_segment {
+                    (Some(tones.control_hot), colors.editor_foreground)
                 } else {
-                    fill(
-                        dc,
-                        inner,
-                        if hot {
-                            colors.hover_background
-                        } else {
-                            colors.panel_background()
-                        },
-                    );
-                }
-            }
-            Control::Segmented => {
-                fill(dc, control, colors.muted_foreground);
-                for (index, (segment, rect)) in segments
-                    .iter()
-                    .zip(layout.segment_rects(control, segments.len()))
-                    .enumerate()
-                {
-                    let inner = RECT {
-                        left: rect.left + i32::from(index == 0),
-                        ..inset(rect, 1)
-                    };
-                    let hot_segment = dialog.hot == Some(Hit::Row(row, Part::Segment(index)));
-                    let (background, foreground) = if segment.selected {
-                        (
-                            colors.selection_background,
-                            colors
-                                .selection_foreground
-                                .unwrap_or(colors.editor_foreground),
-                        )
-                    } else if hot_segment {
-                        (colors.hover_background, colors.editor_foreground)
-                    } else {
-                        (colors.strip_background, colors.editor_foreground)
-                    };
-                    fill(dc, inner, background);
-                    draw_text(
-                        dc,
-                        dialog.body_font,
-                        foreground,
-                        &segment.label,
-                        rect,
-                        DT_CENTER,
-                    );
-                }
-            }
-            Control::Dropdown => {
-                let open = matches!(&dialog.list, Some((open_row, _)) if *open_row == row);
-                fill(dc, control, colors.muted_foreground);
-                fill(
-                    dc,
-                    inset(control, 1),
-                    if hot || open {
-                        colors.hover_background
-                    } else {
-                        colors.strip_background
-                    },
-                );
-                let pad = scale(8, layout.dpi);
-                let chevron = RECT {
-                    left: control.right - scale(26, layout.dpi),
-                    ..control
+                    (None, colors.editor_foreground)
                 };
-                let value = RECT {
-                    left: control.left + pad,
-                    right: chevron.left,
-                    ..control
-                };
-                draw_text(
-                    dc,
-                    dialog.body_font,
-                    colors.editor_foreground,
-                    &view.dropdown_text(row),
-                    value,
-                    DT_LEFT,
-                );
-                draw_text(
-                    dc,
-                    dialog.glyph_font,
-                    colors.muted_foreground,
-                    GLYPH_CHEVRON_DOWN,
-                    chevron,
-                    DT_CENTER,
-                );
-            }
-            Control::Stepper => {
-                let [minus, value, plus] = layout.stepper_rects(control);
-                fill(dc, control, colors.muted_foreground);
-                for (rect, glyph, part) in [
-                    (minus, GLYPH_REMOVE, Part::Minus),
-                    (plus, GLYPH_ADD, Part::Plus),
-                ] {
-                    let background = match (dialog.pressed, dialog.hot) {
-                        (Some(pressed), _) if pressed == Hit::Row(row, part) => {
-                            colors.pressed_background
-                        }
-                        (_, Some(hot)) if hot == Hit::Row(row, part) => colors.hover_background,
-                        _ => colors.strip_background,
-                    };
-                    fill(dc, inset(rect, 1), background);
-                    draw_text(
-                        dc,
-                        dialog.glyph_font,
-                        colors.editor_foreground,
-                        glyph,
-                        rect,
-                        DT_CENTER,
-                    );
+                if let Some(color) = fill {
+                    frame.shape(Shape::Round {
+                        rect: pill,
+                        radius: pill_radius,
+                        color,
+                    });
                 }
-                fill(
-                    dc,
-                    RECT {
-                        top: value.top + 1,
-                        bottom: value.bottom - 1,
-                        ..value
-                    },
-                    colors.editor_background,
-                );
-                draw_text(
-                    dc,
+                frame.text(
                     dialog.body_font,
-                    colors.editor_foreground,
-                    &dialog.model.font_size_text(view),
-                    value,
+                    foreground,
+                    segment.label.clone(),
+                    rect,
                     DT_CENTER,
                 );
             }
         }
-    }
-}
-
-unsafe fn draw_text(dc: HDC, font: HFONT, color: u32, text: &str, rect: RECT, align: u32) {
-    let mut text = wide_null(text);
-    let mut rect = rect;
-    unsafe {
-        let previous = SelectObject(dc, font as _);
-        SetTextColor(dc, color);
-        DrawTextW(
-            dc,
-            text.as_mut_ptr(),
-            -1,
-            &mut rect,
-            align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-        );
-        SelectObject(dc, previous);
+        Control::Dropdown => {
+            let open = matches!(&dialog.list, Some((open_row, _)) if *open_row == row);
+            let fill = if hot || open {
+                tones.control_hot
+            } else {
+                tones.control
+            };
+            tones.soft(frame, control, radius, fill);
+            let chevron = RECT {
+                left: control.right - scale(26, dpi),
+                ..control
+            };
+            let value = RECT {
+                left: control.left + scale(8, dpi),
+                right: chevron.left,
+                ..control
+            };
+            frame.text(
+                dialog.body_font,
+                colors.editor_foreground,
+                view.dropdown_text(row),
+                value,
+                DT_LEFT,
+            );
+            frame.text(
+                dialog.glyph_font,
+                colors.muted_foreground,
+                GLYPH_CHEVRON_DOWN,
+                chevron,
+                DT_CENTER,
+            );
+        }
+        Control::Stepper => {
+            let [minus, value, plus] = layout.stepper_rects(control);
+            tones.soft(frame, control, radius, tones.control);
+            for (rect, glyph, part) in [
+                (minus, GLYPH_REMOVE, Part::Minus),
+                (plus, GLYPH_ADD, Part::Plus),
+            ] {
+                let fill = match (dialog.pressed, dialog.hot) {
+                    (Some(pressed), _) if pressed == Hit::Row(row, part) => {
+                        Some(tones.control_down)
+                    }
+                    (_, Some(hot)) if hot == Hit::Row(row, part) => Some(tones.control_hot),
+                    _ => None,
+                };
+                if let Some(color) = fill {
+                    frame.shape(Shape::Round {
+                        rect: inset(rect, pill_inset),
+                        radius: pill_radius,
+                        color,
+                    });
+                }
+                frame.text(
+                    dialog.glyph_font,
+                    colors.editor_foreground,
+                    glyph,
+                    rect,
+                    DT_CENTER,
+                );
+            }
+            // The typed value's field.
+            frame.shape(Shape::Round {
+                rect: inset(value, pill_inset),
+                radius: pill_radius,
+                color: colors.editor_background,
+            });
+            frame.text(
+                dialog.body_font,
+                colors.editor_foreground,
+                dialog.model.font_size_text(view),
+                value,
+                DT_CENTER,
+            );
+        }
     }
 }
 
@@ -1574,9 +1706,10 @@ mod tests {
     }
 
     #[test]
-    fn rows_stack_under_their_headings_and_everything_fits_at_96_dpi() {
-        // Break caught: rows overlapping, a heading painted under its first row, or a dialog
-        // that scrolls on an ordinary screen.
+    fn cards_stack_under_their_headings_with_gaps_and_everything_fits_at_96_dpi() {
+        // Break caught: cards touching or overlapping, a heading painted under its first card,
+        // cards flush with the dialog's edges, or a dialog over about 700 px tall at 96 DPI
+        // (soft-look addendum).
         let layout = Layout::calculate(96, 2000, 100);
         assert_eq!(layout.width, 520);
         assert_eq!(layout.max_scroll(), 0);
@@ -1585,11 +1718,16 @@ mod tests {
             assert_eq!(layout.headings[section as usize].top, expected_top);
             expected_top = layout.headings[section as usize].bottom;
             for row in Row::ALL.into_iter().filter(|row| row.section() == section) {
-                assert_eq!(layout.rows[row as usize].top, expected_top, "{row:?}");
-                expected_top = layout.rows[row as usize].bottom;
+                let card = layout.rows[row as usize];
+                assert_eq!(card.top, expected_top, "{row:?}");
+                assert_eq!(card.bottom - card.top, 36, "{row:?}");
+                assert_eq!((card.left, card.right), (20, 500), "{row:?}");
+                expected_top = card.bottom + 3;
             }
         }
+        assert_eq!(layout.content_height, expected_top);
         assert_eq!(layout.height, 44 + layout.content_height + 56);
+        assert!(layout.height <= 700, "{}", layout.height);
         assert!(layout.edit_ini.right <= layout.close.left);
     }
 
@@ -1632,6 +1770,13 @@ mod tests {
         assert_eq!(hit(minus), Some(Hit::Row(Row::FontSize, Part::Minus)));
         assert_eq!(hit(value), Some(Hit::Row(Row::FontSize, Part::Value)));
         assert_eq!(hit(plus), Some(Hit::Row(Row::FontSize, Part::Plus)));
+
+        let gap = RECT {
+            top: row(Row::WordWrap).bottom,
+            bottom: row(Row::LineNumbers).top,
+            ..row(Row::WordWrap)
+        };
+        assert_eq!(hit(gap), None, "the gap between two cards");
 
         assert_eq!(hit(layout.close), Some(Hit::Close));
         assert_eq!(hit(layout.edit_ini), Some(Hit::EditIni));
@@ -1688,6 +1833,158 @@ mod tests {
         assert_eq!(layout.title.bottom, close.bottom);
         assert_eq!(layout.title.right, close.left);
         assert_eq!(layout.body.top, close.bottom);
+    }
+
+    #[test]
+    fn a_toggle_row_shows_a_40_by_20_switch_at_its_right_end() {
+        // Break caught: the switch drawn in the 18-px square the checkbox had, squashed into a
+        // square, off-centre in its row, or not DPI-scaled.
+        for dpi in [96, 144, 192] {
+            let layout = Layout::calculate(dpi, 4000, 100);
+            for row in Row::ALL
+                .into_iter()
+                .filter(|row| row.control() == Control::Check)
+            {
+                let row_rect = layout.row_rect(row, 0);
+                let control = layout.control_rect(row, row_rect, 0);
+                assert_eq!(control.right - control.left, scale(40, dpi), "{row:?}");
+                assert_eq!(control.bottom - control.top, scale(20, dpi), "{row:?}");
+                assert_eq!(
+                    control.right,
+                    row_rect.right - scale(16, dpi),
+                    "right-aligned inside the card's padding"
+                );
+                assert!(
+                    (control.top - row_rect.top - (row_rect.bottom - control.bottom)).abs() <= 1,
+                    "centred in the row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_knob_is_a_circle_inside_the_track_on_the_right_when_on() {
+        // Break caught: a knob that pokes out of its track, is not round, or sits on the same
+        // side whether the switch is on or off.
+        let track = RECT {
+            left: 100,
+            top: 10,
+            right: 140,
+            bottom: 30,
+        };
+        let off = toggle_knob(track, false, 96);
+        let on = toggle_knob(track, true, 96);
+        assert_eq!(
+            (off.left, off.top, off.right, off.bottom),
+            (104, 14, 116, 26)
+        );
+        assert_eq!((on.left, on.top, on.right, on.bottom), (124, 14, 136, 26));
+
+        let layout = Layout::calculate(192, 4000, 100);
+        let track = layout.control_rect(Row::WordWrap, layout.row_rect(Row::WordWrap, 0), 0);
+        for on in [false, true] {
+            let knob = toggle_knob(track, on, 192);
+            assert_eq!(knob.right - knob.left, knob.bottom - knob.top, "round");
+            assert!(knob.left > track.left && knob.right < track.right);
+            assert!(knob.top > track.top && knob.bottom < track.bottom);
+            let middle = (track.left + track.right) / 2;
+            if on {
+                assert!(knob.left > middle, "on: right");
+            } else {
+                assert!(knob.right < middle, "off: left");
+            }
+        }
+    }
+
+    fn painted_dialog(canvas: Canvas, theme: crate::platform::theme::Theme) -> Dialog {
+        Dialog {
+            colors: Palette::for_theme(theme, false),
+            link_color: 0,
+            layout: Layout::calculate(96, 2000, 100),
+            view: view(),
+            model: DialogModel::new(),
+            fonts: Vec::new(),
+            scroll: 0,
+            title_font: std::ptr::null_mut(),
+            heading_font: std::ptr::null_mut(),
+            body_font: std::ptr::null_mut(),
+            link_font: std::ptr::null_mut(),
+            glyph_font: std::ptr::null_mut(),
+            hot: None,
+            pressed: None,
+            tracking_leave: false,
+            list: None,
+            picked_at: None,
+            swallowing: false,
+            outcome: Rc::new(Cell::new(Outcome::Closed)),
+            canvas,
+        }
+    }
+
+    #[test]
+    fn toggles_show_their_state_whether_direct2d_or_the_gdi_fallback_paints() {
+        // Break caught: a switch whose knob or track is missing, on the wrong side, or the same
+        // on and off, in either theme, and above all when Direct2D can't load and GDI paints.
+        use crate::platform::theme::Theme;
+        use crate::window::soft_paint::TestSurface;
+        for theme in [Theme::Light, Theme::Dark] {
+            for direct2d in [false, true] {
+                let canvas = if direct2d {
+                    Canvas::load()
+                } else {
+                    Canvas::gdi()
+                };
+                assert_eq!(canvas.uses_direct2d(), direct2d);
+                let dialog = painted_dialog(canvas, theme);
+                let layout = dialog.layout;
+                let colors = dialog.colors;
+                let tones = Tones::new(&colors);
+                let surface = TestSurface::new(layout.width, layout.height);
+                let client = RECT {
+                    left: 0,
+                    top: 0,
+                    right: layout.width,
+                    bottom: layout.height,
+                };
+                paint_into(surface.dc, client, &dialog);
+                let at = |rect: RECT| surface.pixel(center(rect).0, center(rect).1);
+                let control = |row| layout.control_rect(row, layout.row_rect(row, 0), 0);
+                let case = format!("{theme:?}, Direct2D {direct2d}");
+
+                // Line numbers are on by default: an accent track, the knob on the right.
+                let track = control(Row::LineNumbers);
+                assert_eq!(at(toggle_knob(track, true, 96)), tones.on_accent, "{case}");
+                assert_eq!(at(toggle_knob(track, false, 96)), tones.accent, "{case}");
+                // Word wrap is off: the card shows through the outline, the knob on the left.
+                let track = control(Row::WordWrap);
+                assert_eq!(
+                    at(toggle_knob(track, false, 96)),
+                    colors.muted_foreground,
+                    "{case}"
+                );
+                assert_eq!(at(toggle_knob(track, true, 96)), tones.card, "{case}");
+                assert_eq!(
+                    surface.pixel(center(track).0, track.top),
+                    colors.muted_foreground,
+                    "{case}: the off outline"
+                );
+                // Notebook autosave with no notebook: greyed.
+                let track = control(Row::NotebookAutosave);
+                assert_eq!(
+                    at(toggle_knob(track, false, 96)),
+                    colors.pressed_background,
+                    "{case}"
+                );
+                // The card, and Close as a filled accent button.
+                let card = layout.row_rect(Row::Theme, 0);
+                assert_eq!(surface.pixel(card.left + 8, center(card).1), tones.card);
+                assert_eq!(
+                    surface.pixel(layout.close.left + 4, center(layout.close).1),
+                    tones.accent,
+                    "{case}"
+                );
+            }
+        }
     }
 
     #[test]
