@@ -3930,7 +3930,10 @@ pub(crate) fn set_command_keys(
     let Some(saved) = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let keymap = app.keymap.with_keys(command, keys);
-        if keymap == app.keymap {
+        // A line the keymap ignored (`key.file.save=Bogus`) is still in the settings and the
+        // file; it is stale, and resetting the command removes it.
+        let stale = !keymap.is_user(command) && app.settings.key_overrides.contains_key(&id);
+        if keymap == app.keymap && !stale {
             return None;
         }
         let value = keymap
@@ -26574,6 +26577,38 @@ three"
             vec![KeyStroke::parse("Ctrl+S").unwrap()],
         );
         assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn resetting_a_command_removes_an_ignored_key_line() {
+        // Break caught: `key.file.save=Bogus` is ignored at load, so Reset saw an unchanged
+        // keymap, returned early and left the line (and its warning) forever.
+        let scratch = RecoveryScratch::new("keymap-stale");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(
+            &ini,
+            "# kept
+key.file.save=Bogus
+",
+        )
+        .unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let mut settings = crate::config::default_settings();
+        settings
+            .key_overrides
+            .insert("file.save".into(), "Bogus".into());
+        super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+        assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::Save));
+
+        super::reset_command_keys(window.hwnd, CommandId::Save);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept
+"
+        );
+        assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
         super::save_settings_to(None);
     }
 
