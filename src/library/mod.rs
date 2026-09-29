@@ -363,9 +363,7 @@ fn merge_notes(folder: &Path, fresh: Vec<NoteEntry>, touched: &[PathBuf]) -> Vec
             .find(|note| same_path(&note.path, path))
             .is_some_and(|note| note.online_only);
         merged.retain(|note| !same_path(&note.path, path));
-        let is_note = path
-            .extension()
-            .is_some_and(|ext| title::is_listed_extension(&ext.to_string_lossy()));
+        let is_note = title::is_listed_path(path);
         if is_note && let Some(stamp) = store::stamp(&folder.join(path)) {
             merged.push(NoteEntry {
                 path: path.clone(),
@@ -527,10 +525,7 @@ impl LibraryState {
         let Some(relative) = strip_folder(&self.folder, path) else {
             return false;
         };
-        let is_note = relative
-            .extension()
-            .is_some_and(|ext| title::is_listed_extension(&ext.to_string_lossy()));
-        if !is_note {
+        if !title::is_listed_path(&relative) {
             return false;
         }
         self.touched.push(relative.clone());

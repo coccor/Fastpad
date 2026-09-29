@@ -89,24 +89,44 @@ pub enum CommandId {
     FileIconsMaterial = 194,
     FileIconsMinimal = 195,
     FileIconsSolid = 196,
-    SplitRight = 197,
-    SplitDown = 198,
-    CloseGroup = 199,
-    FocusGroup1 = 200,
-    FocusGroup2 = 201,
-    FocusGroup3 = 202,
-    FocusGroup4 = 203,
-    FocusGroup5 = 204,
-    FocusGroup6 = 205,
-    FocusGroup7 = 206,
-    FocusGroup8 = 207,
-    FocusLastGroup = 208,
-    MoveTabToNextGroup = 209,
-    MoveTabToPreviousGroup = 210,
+    LanguageBash = 197,
+    LanguageBatch = 198,
+    LanguageC = 199,
+    LanguageCSharp = 200,
+    LanguageCpp = 201,
+    LanguageCss = 202,
+    LanguageEnv = 203,
+    LanguageHtml = 204,
+    LanguageIni = 205,
+    LanguageJavaScript = 206,
+    LanguagePowerShell = 207,
+    LanguageProperties = 208,
+    LanguagePython = 209,
+    LanguageRust = 210,
+    LanguageSql = 211,
+    LanguageSvg = 212,
+    LanguageToml = 213,
+    LanguageTypeScript = 214,
+    LanguageXml = 215,
+    LanguageYaml = 216,
+    SplitRight = 217,
+    SplitDown = 218,
+    CloseGroup = 219,
+    FocusGroup1 = 220,
+    FocusGroup2 = 221,
+    FocusGroup3 = 222,
+    FocusGroup4 = 223,
+    FocusGroup5 = 224,
+    FocusGroup6 = 225,
+    FocusGroup7 = 226,
+    FocusGroup8 = 227,
+    FocusLastGroup = 228,
+    MoveTabToNextGroup = 229,
+    MoveTabToPreviousGroup = 230,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 18] = [
+pub const TEXT_COMMANDS: [CommandId; 38] = [
     CommandId::Save,
     CommandId::SaveAs,
     CommandId::Undo,
@@ -123,6 +143,26 @@ pub const TEXT_COMMANDS: [CommandId; 18] = [
     CommandId::LanguagePlainText,
     CommandId::LanguageJson,
     CommandId::LanguageMarkdown,
+    CommandId::LanguageBash,
+    CommandId::LanguageBatch,
+    CommandId::LanguageC,
+    CommandId::LanguageCSharp,
+    CommandId::LanguageCpp,
+    CommandId::LanguageCss,
+    CommandId::LanguageEnv,
+    CommandId::LanguageHtml,
+    CommandId::LanguageIni,
+    CommandId::LanguageJavaScript,
+    CommandId::LanguagePowerShell,
+    CommandId::LanguageProperties,
+    CommandId::LanguagePython,
+    CommandId::LanguageRust,
+    CommandId::LanguageSql,
+    CommandId::LanguageSvg,
+    CommandId::LanguageToml,
+    CommandId::LanguageTypeScript,
+    CommandId::LanguageXml,
+    CommandId::LanguageYaml,
     CommandId::NoteReloadFromDisk,
     CommandId::NoteKeepMine,
 ];
@@ -231,6 +271,67 @@ impl CommandId {
         }
     }
 
+    /// The language a `Language*` command switches the active tab to.
+    pub const fn language(self) -> Option<crate::document::Language> {
+        use crate::document::Language as L;
+        Some(match self {
+            Self::LanguagePlainText => L::PlainText,
+            Self::LanguageJson => L::Json,
+            Self::LanguageMarkdown => L::Markdown,
+            Self::LanguageBash => L::Bash,
+            Self::LanguageBatch => L::Batch,
+            Self::LanguageC => L::C,
+            Self::LanguageCSharp => L::CSharp,
+            Self::LanguageCpp => L::Cpp,
+            Self::LanguageCss => L::Css,
+            Self::LanguageEnv => L::Env,
+            Self::LanguageHtml => L::Html,
+            Self::LanguageIni => L::Ini,
+            Self::LanguageJavaScript => L::JavaScript,
+            Self::LanguagePowerShell => L::PowerShell,
+            Self::LanguageProperties => L::Properties,
+            Self::LanguagePython => L::Python,
+            Self::LanguageRust => L::Rust,
+            Self::LanguageSql => L::Sql,
+            Self::LanguageSvg => L::Svg,
+            Self::LanguageToml => L::Toml,
+            Self::LanguageTypeScript => L::TypeScript,
+            Self::LanguageXml => L::Xml,
+            Self::LanguageYaml => L::Yaml,
+            _ => return None,
+        })
+    }
+
+    /// The command that switches the active tab to `language`.
+    pub const fn for_language(language: crate::document::Language) -> Self {
+        use crate::document::Language as L;
+        match language {
+            L::PlainText => Self::LanguagePlainText,
+            L::Json => Self::LanguageJson,
+            L::Markdown => Self::LanguageMarkdown,
+            L::Bash => Self::LanguageBash,
+            L::Batch => Self::LanguageBatch,
+            L::C => Self::LanguageC,
+            L::CSharp => Self::LanguageCSharp,
+            L::Cpp => Self::LanguageCpp,
+            L::Css => Self::LanguageCss,
+            L::Env => Self::LanguageEnv,
+            L::Html => Self::LanguageHtml,
+            L::Ini => Self::LanguageIni,
+            L::JavaScript => Self::LanguageJavaScript,
+            L::PowerShell => Self::LanguagePowerShell,
+            L::Properties => Self::LanguageProperties,
+            L::Python => Self::LanguagePython,
+            L::Rust => Self::LanguageRust,
+            L::Sql => Self::LanguageSql,
+            L::Svg => Self::LanguageSvg,
+            L::Toml => Self::LanguageToml,
+            L::TypeScript => Self::LanguageTypeScript,
+            L::Xml => Self::LanguageXml,
+            L::Yaml => Self::LanguageYaml,
+        }
+    }
+
     /// The zero-based tab a `SelectTabN` command activates.
     pub const fn tab_index(self) -> Option<usize> {
         let first = Self::SelectTab1 as u16;
@@ -263,7 +364,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 100] = [
+        const COMMANDS: [CommandId; 120] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -350,6 +451,26 @@ impl TryFrom<u16> for CommandId {
             CommandId::FileIconsMaterial,
             CommandId::FileIconsMinimal,
             CommandId::FileIconsSolid,
+            CommandId::LanguageBash,
+            CommandId::LanguageBatch,
+            CommandId::LanguageC,
+            CommandId::LanguageCSharp,
+            CommandId::LanguageCpp,
+            CommandId::LanguageCss,
+            CommandId::LanguageEnv,
+            CommandId::LanguageHtml,
+            CommandId::LanguageIni,
+            CommandId::LanguageJavaScript,
+            CommandId::LanguagePowerShell,
+            CommandId::LanguageProperties,
+            CommandId::LanguagePython,
+            CommandId::LanguageRust,
+            CommandId::LanguageSql,
+            CommandId::LanguageSvg,
+            CommandId::LanguageToml,
+            CommandId::LanguageTypeScript,
+            CommandId::LanguageXml,
+            CommandId::LanguageYaml,
             CommandId::SplitRight,
             CommandId::SplitDown,
             CommandId::CloseGroup,
@@ -400,9 +521,9 @@ mod tests {
     fn native_command_values_are_stable_and_round_trip() {
         assert_eq!(CommandId::New as u16, 100);
         assert_eq!(CommandId::Exit as u16, 117);
-        assert_eq!(CommandId::SplitRight as u16, 197);
-        assert_eq!(CommandId::MoveTabToPreviousGroup as u16, 210);
-        assert_eq!(CommandId::try_from(200), Ok(CommandId::FocusGroup1));
+        assert_eq!(CommandId::SplitRight as u16, 217);
+        assert_eq!(CommandId::MoveTabToPreviousGroup as u16, 230);
+        assert_eq!(CommandId::try_from(220), Ok(CommandId::FocusGroup1));
         assert_eq!(CommandId::FocusGroup8.group_index(), Some(7));
         assert_eq!(CommandId::FocusLastGroup.group_index(), Some(usize::MAX));
         assert!(!CommandId::SplitRight.needs_document());
@@ -581,6 +702,39 @@ mod tests {
         assert_eq!(CommandId::try_from(193), Ok(CommandId::NoteNew));
         assert!(!CommandId::NoteNew.needs_document());
         assert!(!CommandId::NoteNew.is_sidebar());
+    }
+
+    #[test]
+    fn language_commands_round_trip_and_keep_their_numbers() {
+        // Break caught: a renumbered language command, or one that maps to the wrong language.
+        use crate::document::Language;
+        assert_eq!(CommandId::LanguagePlainText as u16, 114);
+        assert_eq!(CommandId::LanguageJson as u16, 115);
+        assert_eq!(CommandId::LanguageMarkdown as u16, 116);
+        assert_eq!(CommandId::LanguageBash as u16, 197);
+        assert_eq!(CommandId::LanguageYaml as u16, 216);
+        for row in crate::languages::LANGUAGES.iter() {
+            let command = CommandId::for_language(row.language);
+            assert_eq!(command.language(), Some(row.language));
+            assert_eq!(CommandId::try_from(command as u16), Ok(command));
+        }
+        assert_eq!(CommandId::Save.language(), None);
+        assert_eq!(
+            CommandId::for_language(Language::Xml),
+            CommandId::LanguageXml
+        );
+    }
+
+    #[test]
+    fn every_language_command_needs_text() {
+        // Break caught: a language command left enabled on an image tab.
+        for row in crate::languages::LANGUAGES.iter() {
+            assert!(
+                CommandId::for_language(row.language).needs_text(),
+                "{}",
+                row.name
+            );
+        }
     }
 
     #[test]

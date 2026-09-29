@@ -4,7 +4,7 @@
 //! editors spec §7). Built from the tab list in memory: no disk.
 
 use crate::document::{Document, DocumentId};
-use crate::window::file_icons::note_kind;
+use crate::window::file_icons::{NoteKind, note_kind};
 use crate::window::icon_sets::TreeItem;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::main_window::app_ptr;
@@ -162,12 +162,7 @@ pub(crate) fn close_rect(row: RECT, dpi: u32) -> RECT {
 
 /// The icon a row (and its drag label) shows.
 pub(crate) fn tree_item(row: &EditorRow) -> TreeItem {
-    let extension = row
-        .path
-        .as_ref()
-        .and_then(|path| path.extension())
-        .map(|extension| extension.to_string_lossy());
-    TreeItem::Note(note_kind(extension.as_deref()))
+    TreeItem::Note(row.path.as_deref().map_or(NoteKind::Text, note_kind))
 }
 
 /// The section's rows and its own list state (scroll, hover, the active row as selected).

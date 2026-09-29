@@ -1803,7 +1803,7 @@ fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
         .and_then(|app| Some(unsafe { app.as_ref() }.tabs.document(id)?.language))
         .unwrap_or(crate::document::Language::Markdown);
     let (stem, extension) = title::split_typed_name(text, title::default_extension(language));
-    let name = format!("{stem}.{extension}");
+    let name = title::file_name(&stem, &extension);
     let target = folder.join(&name);
     if target.exists() {
         name_box_error(hwnd, name_taken_error(&folder, &stem, &extension));

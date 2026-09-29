@@ -16,8 +16,7 @@ text is in `LICENSE`.
 
 | Artwork | Version | License | Text |
 |---|---|---|---|
-| Material Icon Theme icons (12 file and folder icons, embedded in `FastPad.exe`) | 5.38.1 | MIT License, Copyright (c) 2025 Material Extensions | `licenses/material-icon-theme.txt` |
-
+| Material Icon Theme icons (26 file and folder icons, embedded in `FastPad.exe`) | 5.38.1 | MIT License, Copyright (c) 2025 Material Extensions | `licenses/material-icon-theme.txt` |
 ## Rust crates
 
 FastPad depends directly on windows-sys 0.61.2, serde_json 1.0.151, pulldown-cmark 0.13.4, regex

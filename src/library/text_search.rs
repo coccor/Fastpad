@@ -50,11 +50,7 @@ pub struct SearchNote {
 pub fn search_notes<'a>(notes: impl IntoIterator<Item = &'a super::NoteEntry>) -> Vec<SearchNote> {
     notes
         .into_iter()
-        .filter(|note| {
-            note.path.extension().is_some_and(|extension| {
-                super::title::is_note_extension(&extension.to_string_lossy())
-            })
-        })
+        .filter(|note| super::title::is_note_path(&note.path))
         .map(SearchNote::from)
         .collect()
 }

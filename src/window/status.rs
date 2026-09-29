@@ -114,12 +114,7 @@ pub fn caret_text(caret: CaretStatus) -> String {
 }
 
 pub fn language_name(language: Language) -> &'static str {
-    match language {
-        Language::PlainText => "Plain Text",
-        Language::Json => "JSON",
-        Language::Markdown => "Markdown",
-        Language::Svg => "SVG",
-    }
+    crate::languages::display_name(language)
 }
 
 pub fn encoding_name(encoding: Encoding) -> &'static str {
