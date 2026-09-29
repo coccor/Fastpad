@@ -25910,4 +25910,143 @@ three"
                 .any(|document| document.path.as_deref() == Some(note.as_path()))
         );
     }
+
+    #[test]
+    fn a_left_release_after_a_right_press_cancel_drops_nothing_and_opens_no_menu() {
+        // Break caught: the right press hides the drag, but releasing the left button still
+        // drops the tab, and the right release then falls through to a context menu.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let menu = std::rc::Rc::new(std::cell::Cell::new(false));
+        let shown = menu.clone();
+        crate::window::menus::answer_next_popup_menu(move |_| {
+            shown.set(true);
+            None
+        });
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        let point = lparam_in(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+        );
+        unsafe {
+            SendMessageW(source, WM_MOUSEMOVE, 1, point);
+            SendMessageW(source, WM_RBUTTONDOWN, 3, point);
+            SendMessageW(source, WM_LBUTTONUP, 2, point);
+            SendMessageW(source, WM_RBUTTONUP, 0, point);
+        }
+        assert!(strip_ids(window.hwnd, first).contains(&dragged));
+        assert!(!strip_ids(window.hwnd, second).contains(&dragged));
+        assert!(!menu.get(), "the right release opened a menu");
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+    }
+
+    #[test]
+    fn a_right_press_cancel_over_a_notebook_folder_ends_the_trees_drag() {
+        // Break caught: the folder's band and the tree's drag timer left running after the tab
+        // drag was cancelled.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drag-right-cancel");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let index = strip_ids(window.hwnd, group)
+            .iter()
+            .position(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            })
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, group, index);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        let (x, y) = (
+            (work & 0xffff) as i16 as i32,
+            ((work >> 16) & 0xffff) as i16 as i32,
+        );
+        let point = lparam_in(source, panel, x, y);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert!(notebook_view(window.hwnd).drag.is_some(), "over the folder");
+        unsafe { SendMessageW(source, WM_RBUTTONDOWN, 3, point) };
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        unsafe { SendMessageW(source, WM_RBUTTONUP, 0, point) };
+    }
+
+    #[test]
+    fn a_strip_tab_dropped_on_a_folder_asks_to_replace_with_the_drag_already_gone() {
+        // Break caught: the "Replace?" question opening under a frozen drag label with the group
+        // window still holding the mouse.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drag-replace");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\draft.txt", "old");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let index = strip_ids(window.hwnd, group)
+            .iter()
+            .position(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            })
+            .unwrap();
+        let asked = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = asked.clone();
+        crate::window::modal::answer_next_confirm(move |_| {
+            let capture = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() };
+            seen.set(Some(capture.is_null()));
+            false
+        });
+        let source = start_strip_drag(window.hwnd, group, index);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        let (x, y) = (
+            (work & 0xffff) as i16 as i32,
+            ((work >> 16) & 0xffff) as i16 as i32,
+        );
+        drop_strip_drag(source, panel, x, y, 0);
+        assert_eq!(
+            asked.get(),
+            Some(true),
+            "asked, with the capture already released"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+            "old"
+        );
+    }
 }

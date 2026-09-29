@@ -3108,9 +3108,15 @@ pub(crate) fn strip_tab_leave(hwnd: HWND) {
     }
 }
 
-/// A strip tab dropped at screen point `point`: copies its file into the folder under it, when
-/// that folder takes it. True when a copy started.
-pub(crate) fn strip_tab_drop(hwnd: HWND, point: POINT, id: DocumentId, path: &Path) -> bool {
+/// A strip tab dropped at screen point `point`: the folder under it that takes its file, if any.
+/// The tree's band goes either way; the caller ends its drag before it copies, so a "Replace?"
+/// question never opens under the drag.
+pub(crate) fn strip_tab_drop_folder(
+    hwnd: HWND,
+    point: POINT,
+    id: DocumentId,
+    path: &Path,
+) -> Option<PathBuf> {
     let accepted = strip_tab_over(hwnd, point, id, path);
     let folder = accepted
         .then(|| {
@@ -3121,11 +3127,7 @@ pub(crate) fn strip_tab_drop(hwnd: HWND, point: POINT, id: DocumentId, path: &Pa
         .flatten()
         .flatten();
     strip_tab_leave(hwnd);
-    let Some(folder) = folder else {
-        return false;
-    };
-    super::copy_host::copy_tab_into(hwnd, id, path, &folder);
-    true
+    folder
 }
 
 /// Gives the tooltip `tools`, making the tooltip first if the view has none yet. Runs with

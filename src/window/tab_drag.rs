@@ -366,8 +366,11 @@ fn retarget(hwnd: HWND, point: POINT, copy: bool) {
 /// `WM_LBUTTONUP` on `window`: a started drag drops where the button went up. An armed one was
 /// a click and is dropped here, leaving the release to the strip. True when a drag was under way.
 pub(crate) fn release(hwnd: HWND, window: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
-    let Some(drag) = with_drag(hwnd, Option::take).flatten() else {
-        return false;
+    let Some(drag) = with_drag(hwnd, |slot| slot.take_if(|drag| !drag.eat_right_up)).flatten()
+    else {
+        // A right press cancelled the drag and waits for its own release (plan amendment 8):
+        // this release drops nothing, and the capture stays for `right_release`.
+        return with_drag(hwnd, |slot| slot.is_some()).unwrap_or(false);
     };
     if !drag.started || drag.window != window {
         return false;
@@ -377,9 +380,12 @@ pub(crate) fn release(hwnd: HWND, window: HWND, x: i32, y: i32, buttons: WPARAM)
     let target = target_at(hwnd, screen);
     if target.is_none()
         && let Some(path) = tab_path(hwnd, drag.source.document)
-        && super::notebook_view::strip_tab_drop(hwnd, screen, drag.source.document, &path)
+        && let Some(folder) =
+            super::notebook_view::strip_tab_drop_folder(hwnd, screen, drag.source.document, &path)
     {
+        // The drag is gone before the copy can ask to replace a file.
         end_feedback(hwnd, drag);
+        super::copy_host::copy_tab_into(hwnd, drag.source.document, &path, &folder);
         return true;
     }
     let action = source_of(hwnd, drag.source.group, drag.source.document)
@@ -444,6 +450,7 @@ pub(crate) fn cancel_for_right_press(hwnd: HWND) -> bool {
         label.destroy();
     }
     hide_feedback(hwnd);
+    super::notebook_view::strip_tab_leave(hwnd);
     set_cursor(true);
     true
 }
