@@ -509,6 +509,9 @@ struct Dialog {
     shortcuts: super::shortcuts_model::ShortcutsModel,
     /// When and on which row the last click in the table was, for double-clicks.
     last_row_click: Option<(u32, usize)>,
+    /// Wheel travel on the shortcuts table not yet a whole row, in 1/120ths of a row (a notch,
+    /// 120, is three rows). Dropped when the wheel turns the other way.
+    wheel_rest: i32,
 }
 
 impl Drop for Dialog {
@@ -669,6 +672,7 @@ fn create(
         page_layout,
         shortcuts,
         last_row_click: None,
+        wheel_rest: 0,
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
 
@@ -1353,11 +1357,17 @@ unsafe extern "system" fn dialog_proc(
                 if let Some((_, list)) = &dialog.list {
                     list.wheel(delta);
                 } else if dialog.model.page == Page::Shortcuts {
-                    // Three rows a notch; General's scroll stays where it was.
+                    // Three rows a notch, small touchpad deltas adding up; General's scroll
+                    // stays where it was.
+                    let delta = i32::from(delta);
+                    if dialog.wheel_rest.signum() == -delta.signum() {
+                        dialog.wheel_rest = 0;
+                    }
+                    dialog.wheel_rest += delta * 3;
+                    let rows = dialog.wheel_rest / 120;
+                    dialog.wheel_rest -= rows * 120;
                     let top = dialog.shortcuts.top;
-                    dialog
-                        .shortcuts
-                        .scroll(-(i32::from(delta) * 3 / 120) as isize);
+                    dialog.shortcuts.scroll(-rows as isize);
                     if dialog.shortcuts.top != top {
                         invalidate(hwnd);
                     }
@@ -2264,6 +2274,7 @@ mod tests {
                 1,
             ),
             last_row_click: None,
+            wheel_rest: 0,
         }
     }
 

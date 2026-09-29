@@ -20409,6 +20409,37 @@ three"
     }
 
     #[test]
+    fn small_wheel_deltas_add_up_to_whole_rows_on_the_shortcuts_page() {
+        // Break caught: a touchpad's small deltas each rounding to zero rows, so slow scrolling
+        // never moves the table; or a leftover from one direction eating the first reverse step.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, SendMessageW, WM_KEYDOWN, WM_MOUSEWHEEL,
+        };
+        let window = ProductionWindow::new(make_app());
+        let tops = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = tops.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let top = || crate::window::settings_dialog::shortcuts_model(dialog).map(|m| m.top);
+            let wheel = |delta: i16| {
+                SendMessageW(dialog, WM_MOUSEWHEEL, usize::from(delta as u16) << 16, 0);
+            };
+            // Four quarter notches down: one notch, three rows.
+            for _ in 0..4 {
+                wheel(-30);
+            }
+            seen.borrow_mut().push(top());
+            // A leftover third of a row down, then one notch up: exactly three rows back.
+            wheel(-30);
+            wheel(120);
+            seen.borrow_mut().push(top());
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*tops.borrow(), [Some(3), Some(0)]);
+    }
+
+    #[test]
     fn a_double_click_on_a_row_opens_the_recording_box_and_f9_rebinds_it() {
         // Break caught: rows that select but never open the box, or a confirmed key that the
         // window never applies.
