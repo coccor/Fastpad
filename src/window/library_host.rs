@@ -1074,20 +1074,28 @@ pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
     );
 }
 
-/// Scintilla's own OLE drop target refuses files and wins over `WM_DROPFILES`, so the editor gets
-/// a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`. The sidebar panel's own
-/// drop target is registered here too. Runs in `BUILD_CHROME`.
+/// Scintilla's own OLE drop target refuses files and wins over `WM_DROPFILES`, so every group's
+/// editor gets a wrapper that posts dropped files here as `WM_FASTPAD_FILES_DROPPED`, with its
+/// group window (split editors spec §6.2). The sidebar panel's own drop target is registered
+/// here too. Runs in `BUILD_CHROME`; `create_group` wraps groups made later.
 pub(crate) fn accept_editor_file_drops(hwnd: HWND) {
-    let editor = unsafe { app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.editor.as_ref().map(|e| e.hwnd()));
-    if let Some(editor) = editor {
-        wrap_editor_drop_target(hwnd, editor);
+    let editors = unsafe { app_ptr(hwnd) }.map(|mut app| {
+        let app = unsafe { app.as_mut() };
+        app.file_drops_accepted = true;
+        app.groups
+            .iter()
+            .map(|group| (group.hwnd, group.editor.hwnd()))
+            .collect::<Vec<_>>()
+    });
+    for (group, editor) in editors.unwrap_or_default() {
+        wrap_group_drop_target(hwnd, group, editor);
     }
     super::side_panel::accept_file_drops(hwnd);
 }
 
-fn wrap_editor_drop_target(hwnd: HWND, editor: HWND) {
-    let target = hwnd as isize;
+/// Wraps `editor`'s drop target so its files open in group window `group`.
+pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
+    let (target, group) = (hwnd as isize, group as usize);
     // Text drag-and-drop still works without the wrapper; only file drops on the editor are lost.
     let _ = crate::editor::file_drop::accept_file_drops(editor, move |paths| {
         let payload = Box::into_raw(Box::new(paths));
@@ -1095,7 +1103,7 @@ fn wrap_editor_drop_target(hwnd: HWND, editor: HWND) {
             PostMessageW(
                 target as HWND,
                 crate::window::WM_FASTPAD_FILES_DROPPED,
-                0,
+                group,
                 payload as isize,
             )
         } == 0
@@ -1105,16 +1113,25 @@ fn wrap_editor_drop_target(hwnd: HWND, editor: HWND) {
     });
 }
 
-/// `WM_FASTPAD_FILES_DROPPED`: frees the posted paths and opens them. A drop that lands while a
-/// modal dialog runs is ignored, as `WM_DROPFILES` is for a disabled window.
-pub(crate) fn editor_files_dropped(hwnd: HWND, lparam: LPARAM) {
+/// `WM_FASTPAD_FILES_DROPPED`: frees the posted paths and opens them in the group of window
+/// `wparam`, else the active one. A drop that lands while a modal dialog runs is ignored, as
+/// `WM_DROPFILES` is for a disabled window.
+pub(crate) fn editor_files_dropped(
+    hwnd: HWND,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+) {
     if lparam == 0 {
         return;
     }
     let paths = *unsafe { Box::from_raw(lparam as *mut Vec<PathBuf>) };
-    if !super::modal::modal_active(hwnd) {
-        files_dropped(hwnd, paths);
+    if super::modal::modal_active(hwnd) {
+        return;
     }
+    if let Some(group) = super::main_window::group_id_of(hwnd, wparam as HWND) {
+        super::main_window::activate_group(hwnd, group);
+    }
+    files_dropped(hwnd, paths);
 }
 
 /// Dropped folders open as the library (the last one wins); dropped files open as tabs.
@@ -1188,7 +1205,7 @@ pub(crate) fn refresh_label(hwnd: HWND) {
     let shown = notes_mode(hwnd);
     let changed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let editor = app.editor.as_ref()?;
+        let editor = app.editor()?;
         let active = app.tabs.active()?;
         if active.path.is_some() {
             return None;
@@ -1254,10 +1271,19 @@ pub(crate) fn show_labels(hwnd: HWND) {
 }
 
 /// `SCN_MODIFIED`: only edits at or above the label's line can change it.
-pub(crate) fn text_changed(hwnd: HWND, position: usize) {
+/// A text change at `position` in `group`'s editor; its active tab's label may follow.
+pub(crate) fn text_changed(hwnd: HWND, group: crate::window::split_tree::GroupId, position: usize) {
     let relevant = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         let app = unsafe { app.as_ref() };
-        let (Some(editor), Some(active)) = (app.editor.as_ref(), app.tabs.active()) else {
+        let Some(editor) = app.group(group).map(|state| &state.editor) else {
+            return false;
+        };
+        let Some(active) = app
+            .tabs
+            .group(group)
+            .and_then(|tabs| tabs.active_document())
+            .and_then(|id| app.tabs.document(id))
+        else {
             return false;
         };
         active.path.is_none()
@@ -2446,7 +2472,7 @@ pub(crate) fn reload_from_disk(hwnd: HWND) {
         return;
     };
     let Some(editor) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -2709,6 +2735,21 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
         }
         (PickerKind::QuickOpen, PickerChoice::Note { path, line }) => {
             super::main_window::open_quick_open_choice(hwnd, &path, line);
+        }
+        (PickerKind::QuickOpen, PickerChoice::View { path, group }) => {
+            // The tab listed, in the group listed: never a new view (split editors spec §7).
+            let id = folder(hwnd).and_then(|folder| {
+                let app = unsafe { app_ptr(hwnd) }?;
+                unsafe { app.as_ref() }
+                    .tabs
+                    .find_stored_path(&folder.join(&path))
+            });
+            match id {
+                Some(id) if super::main_window::focus_view(hwnd, group, id) => {
+                    super::main_window::focus_content(hwnd);
+                }
+                _ => super::main_window::open_quick_open_choice(hwnd, &path, None),
+            }
         }
         (PickerKind::QuickOpen, PickerChoice::GoToLine(line)) => {
             super::main_window::go_to_line(hwnd, line);

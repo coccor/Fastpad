@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, 
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{
     AccessibleObjectFromWindow, ObjectFromLresult, ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST,
-    ROLE_SYSTEM_PUSHBUTTON, SELFLAG_TAKESELECTION,
+    ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TITLEBAR, SELFLAG_TAKESELECTION,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
@@ -49,7 +49,7 @@ fn get_object_returns_a_marshaled_title_provider() -> TestResult<()> {
     let result = unsafe { SendMessageW(hwnd, WM_GETOBJECT, 0, OBJID_CLIENT as isize) };
     assert_ne!(result, 0, "WM_GETOBJECT did not return the title provider");
     let accessible = Accessible::from_lresult(result, 0)?;
-    assert_eq!(accessible.child_count()?, 5);
+    assert_eq!(accessible.child_count()?, 3);
 
     process.close()
 }
@@ -74,15 +74,7 @@ fn alt_and_f10_from_the_focused_editor_toggle_the_themed_menu_band() -> TestResu
     let _dpi = DpiContext::per_monitor_v2()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
-    let scintilla = wide_null("Scintilla");
-    let editor = unsafe {
-        FindWindowExW(
-            hwnd,
-            std::ptr::null_mut(),
-            scintilla.as_ptr(),
-            std::ptr::null(),
-        )
-    };
+    let editor = support::win32::find_child_by_class(hwnd, "Scintilla")?;
     assert!(!editor.is_null());
     let resting_top = editor_top(hwnd, editor);
 
@@ -116,15 +108,7 @@ fn alt_space_does_not_attach_the_transient_menu() -> TestResult<()> {
     let _dpi = DpiContext::per_monitor_v2()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
-    let scintilla = wide_null("Scintilla");
-    let editor = unsafe {
-        FindWindowExW(
-            hwnd,
-            std::ptr::null_mut(),
-            scintilla.as_ptr(),
-            std::ptr::null(),
-        )
-    };
+    let editor = support::win32::find_child_by_class(hwnd, "Scintilla")?;
     assert!(!editor.is_null());
     let resting_top = editor_top(hwnd, editor);
 
@@ -208,7 +192,6 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     let layout = TitleBarLayout::calculate(
         Size::new(client.right - client.left, client.bottom - client.top),
         dpi,
-        1,
     );
     let point = layout.maximize.center();
     let mut screen_point = windows_sys::Win32::Foundation::POINT {
@@ -284,21 +267,38 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         )
     );
 
-    let accessible = Accessible::from_window(hwnd)?;
+    // The title bar's own object lists the caption buttons.
+    let title = Accessible::from_window(hwnd)?;
     assert_eq!(std::mem::size_of::<VARIANT>(), 24);
-    assert_eq!(accessible.child_count()?, 5);
+    assert_eq!(title.child_count()?, 3);
+    assert_eq!(title.role(0)?, ROLE_SYSTEM_TITLEBAR as i32);
+    for child in 1..=3 {
+        assert_eq!(title.role(child)?, ROLE_SYSTEM_PUSHBUTTON as i32);
+    }
+    let names = (1..=3)
+        .map(|child| title.name(child))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(names, vec!["Minimize", "Maximize", "Close"]);
+    assert_eq!(title.selection()?, None);
+    assert_eq!(title.select(SELFLAG_TAKESELECTION as i32, 1), E_INVALIDARG);
+
+    // The tabs are the editor group's: its strip lists them.
+    let group = support::win32::find_child_by_class(hwnd, "FastPadEditorGroup")?;
+    let accessible = Accessible::from_window(group)?;
+    // A plain launch ends with no tab; New opens the one the strip lists.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while accessible.child_count()? != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the startup tab stayed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
+    assert_eq!(accessible.child_count()?, 1);
     assert_eq!(accessible.role(0)?, ROLE_SYSTEM_PAGETABLIST as i32);
     assert_eq!(accessible.role(1)?, ROLE_SYSTEM_PAGETAB as i32);
-    for child in 2..=5 {
-        assert_eq!(accessible.role(child)?, ROLE_SYSTEM_PUSHBUTTON as i32);
-    }
-    let names = (1..=5)
-        .map(|child| accessible.name(child))
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(
-        names,
-        vec!["Untitled", "Overflow", "Minimize", "Maximize", "Close"]
-    );
+    assert_eq!(accessible.name(1)?, "Untitled");
     assert_ne!(accessible.state(1)? as u32 & STATE_SYSTEM_SELECTED, 0);
     assert_eq!(accessible.focus()?, None);
     assert_eq!(accessible.selection()?, Some(1));
@@ -310,14 +310,14 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     );
     assert_eq!(accessible.do_default_action(1), S_OK);
     assert_eq!(accessible.do_default_action(0), E_INVALIDARG);
-    assert_eq!(accessible.do_default_action(6), E_INVALIDARG);
+    assert_eq!(accessible.do_default_action(3), E_INVALIDARG);
     std::thread::sleep(Duration::from_millis(50));
     assert_ne!(
         unsafe { IsWindow(hwnd) },
         0,
         "closing the last tab must leave the window open"
     );
-    assert_eq!(accessible.child_count()?, 4, "the last tab closes");
+    assert_eq!(accessible.child_count()?, 0, "the last tab closes");
     assert_eq!(accessible.selection()?, None);
 
     process.close()
@@ -348,7 +348,7 @@ fn title_strip_owns_the_top_edge_and_its_caption_buttons_still_work() -> TestRes
         hit_test(
             hwnd,
             origin,
-            Point::new(layout.tab(0).center().x, old_band_y)
+            Point::new(layout.drag_region.center().x, old_band_y)
         ),
         HTTOP as isize
     );
@@ -515,7 +515,6 @@ fn frame_geometry(
     let layout = TitleBarLayout::calculate(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(hwnd) },
-        1,
     );
     Ok((window, origin, layout))
 }

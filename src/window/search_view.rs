@@ -2340,13 +2340,9 @@ pub(crate) fn handle(
                 }
                 return Some(0);
             }
+            // Enter opens a normal tab: the preview tab is the mouse's (spec §6.4).
             if key == VK_RETURN {
-                if ctrl {
-                    open_selected(hwnd, OpenMode::Permanent, true);
-                } else {
-                    // Enter keeps the focus in the list, so arrows and Enter browse (spec §6.4).
-                    open_selected(hwnd, OpenMode::Preview, false);
-                }
+                open_selected(hwnd, OpenMode::Permanent, true);
                 return Some(0);
             }
             let at_top = with_view(hwnd, |view| {
@@ -2499,12 +2495,8 @@ unsafe extern "system" fn search_edit_proc(
             }
             // Enter in the replace field replaces nothing: Replace all is Ctrl+Alt+Enter.
             VK_RETURN if replace => return 0,
-            VK_RETURN if ctrl => {
-                open_selected(main, OpenMode::Permanent, true);
-                return 0;
-            }
             VK_RETURN => {
-                open_selected(main, OpenMode::Preview, false);
+                open_selected(main, OpenMode::Permanent, true);
                 return 0;
             }
             VK_ESCAPE => {

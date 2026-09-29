@@ -1,3 +1,4 @@
+use crate::editor::ViewState;
 use crate::editor::scintilla_constants::{
     SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY,
     SCI_CREATEDOCUMENT, SCI_CUT, SCI_EMPTYUNDOBUFFER, SCI_ENDUNDOACTION, SCI_GETDIRECTFUNCTION,
@@ -25,9 +26,11 @@ use crate::editor::scintilla_constants::{
     SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER,
     SCI_LINEFROMPOSITION, SCI_LINELENGTH, SCI_SETFIRSTVISIBLELINE, SCI_VISIBLEFROMDOCLINE,
 };
+#[cfg(windows)]
+use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETXOFFSET, SCI_SETXOFFSET};
 use crate::editor::scintilla_constants::{
-    SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
-    STYLE_MAX,
+    SCI_GETLINECOUNT, SCI_GETZOOM, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT,
+    STYLE_LINENUMBER, STYLE_MAX,
 };
 use crate::{FastPadError, Result};
 use std::cell::Cell;
@@ -49,7 +52,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_CHAR,
+    CreateWindowExW, DestroyWindow, GetClientRect, HWND_MESSAGE, SendMessageW, WM_CHAR,
     WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -99,12 +102,16 @@ pub struct ScintillaNotification {
 #[derive(Debug)]
 pub struct Editor {
     endpoint: Rc<EditorEndpoint>,
+    /// The Scintilla that creates this editor's documents: the shared document host (split
+    /// editors spec §3.1), or the editor itself for one made by `create`.
+    documents: Rc<EditorEndpoint>,
 }
 
 impl Clone for Editor {
     fn clone(&self) -> Self {
         Self {
             endpoint: Rc::clone(&self.endpoint),
+            documents: Rc::clone(&self.documents),
         }
     }
 }
@@ -144,7 +151,58 @@ fn line_number_digits(line_count: isize) -> usize {
 impl Editor {
     #[cfg(windows)]
     pub fn create(parent: HWND) -> Result<Self> {
-        let hwnd = create_scintilla_child(parent)?;
+        let endpoint = Self::open_endpoint(create_scintilla_child(parent)?)?;
+        Self::finish(Rc::clone(&endpoint), endpoint)
+    }
+
+    /// A message-only Scintilla that creates every document and never shows one (split editors
+    /// spec §3.1). Its notifications go nowhere, so edits made through it notify nobody.
+    #[cfg(windows)]
+    pub fn create_document_host() -> Result<Self> {
+        let endpoint = Self::open_endpoint(create_scintilla_host()?)?;
+        Ok(Self {
+            documents: Rc::clone(&endpoint),
+            endpoint,
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub fn create_document_host() -> Result<Self> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// A visible editor under `parent` that shows documents `host` created.
+    #[cfg(windows)]
+    pub fn create_with_host(parent: HWND, host: &Editor) -> Result<Self> {
+        let endpoint = Self::open_endpoint(create_scintilla_child(parent)?)?;
+        Self::finish(endpoint, Rc::clone(&host.documents))
+    }
+
+    #[cfg(not(windows))]
+    pub fn create_with_host(_parent: HWND, _host: &Editor) -> Result<Self> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// This editor, now creating and showing documents from `host`'s store instead of its own.
+    /// For editors made by `create` before the host existed; documents the editor already
+    /// created stay valid for it only through `host`'s reference counting, so call this before
+    /// creating any.
+    pub fn with_document_host(mut self, host: &Editor) -> Self {
+        self.documents = Rc::clone(&host.documents);
+        self
+    }
+
+    /// Whether `other` shows documents from the same host, so either can show the other's.
+    pub fn shares_documents_with(&self, other: &Editor) -> bool {
+        Rc::ptr_eq(&self.documents, &other.documents)
+    }
+
+    #[cfg(windows)]
+    fn open_endpoint(hwnd: HWND) -> Result<Rc<EditorEndpoint>> {
         require_hwnd(hwnd)?;
 
         let direct_fn_raw = unsafe { SendMessageW(hwnd, SCI_GETDIRECTFUNCTION, 0, 0) };
@@ -168,8 +226,16 @@ impl Editor {
             true,
         ));
         endpoint.install_lifecycle_guard()?;
+        Ok(endpoint)
+    }
 
-        let editor = Self { endpoint };
+    #[cfg(windows)]
+    fn finish(endpoint: Rc<EditorEndpoint>, documents: Rc<EditorEndpoint>) -> Result<Self> {
+        let hwnd = endpoint.hwnd;
+        let editor = Self {
+            endpoint,
+            documents,
+        };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
         editor.initialize_view(|editor| editor.apply_chrome_defaults(dpi))?;
         Ok(editor)
@@ -241,7 +307,7 @@ impl Editor {
     #[cfg(windows)]
     pub fn create_document(&self) -> Result<EditorDocument> {
         let raw = self
-            .endpoint
+            .documents
             .send_direct_checked(SCI_CREATEDOCUMENT, 0, 0)?;
         if raw == 0 {
             return Err(FastPadError::Invariant(
@@ -250,7 +316,7 @@ impl Editor {
         }
         Ok(EditorDocument {
             raw,
-            endpoint: Rc::clone(&self.endpoint),
+            endpoint: Rc::clone(&self.documents),
         })
     }
 
@@ -269,10 +335,10 @@ impl Editor {
                 "Scintilla did not return the current document",
             ));
         }
-        self.endpoint.retain_document(raw);
+        self.documents.retain_document(raw);
         Ok(EditorDocument {
             raw,
-            endpoint: Rc::clone(&self.endpoint),
+            endpoint: Rc::clone(&self.documents),
         })
     }
 
@@ -285,7 +351,7 @@ impl Editor {
 
     #[cfg(windows)]
     pub fn use_document(&self, document: &EditorDocument) -> Result<()> {
-        if !Rc::ptr_eq(&self.endpoint, &document.endpoint) {
+        if !Rc::ptr_eq(&self.documents, &document.endpoint) {
             return Err(FastPadError::Invariant(
                 "Scintilla document belongs to a different editor",
             ));
@@ -455,6 +521,48 @@ impl Editor {
 
     #[cfg(not(windows))]
     pub fn set_first_visible_line(&self, _display_line: usize) -> Result<()> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// This view's selection, first visible line and horizontal scroll, to restore when the tab
+    /// is shown again.
+    #[cfg(windows)]
+    pub fn view_state(&self) -> Result<ViewState> {
+        Ok(ViewState {
+            caret: self
+                .endpoint
+                .send_direct_checked(SCI_GETCURRENTPOS, 0, 0)?
+                .max(0) as usize,
+            anchor: self
+                .endpoint
+                .send_direct_checked(SCI_GETANCHOR, 0, 0)?
+                .max(0) as usize,
+            first_line: self.first_visible_line()?,
+            x_offset: self.endpoint.send_direct_checked(SCI_GETXOFFSET, 0, 0)? as i32,
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub fn view_state(&self) -> Result<ViewState> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    /// Restores `state`, clamping the selection to the document, which may have shrunk since.
+    #[cfg(windows)]
+    pub fn apply_view_state(&self, state: ViewState) -> Result<()> {
+        let length = self
+            .endpoint
+            .send_direct_checked(SCI_GETLENGTH, 0, 0)?
+            .max(0) as usize;
+        self.set_selection(state.anchor.min(length)..state.caret.min(length))?;
+        self.set_first_visible_line(state.first_line)?;
+        self.endpoint
+            .send_direct_checked(SCI_SETXOFFSET, state.x_offset.max(0) as usize, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn apply_view_state(&self, _state: ViewState) -> Result<()> {
         Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
@@ -1005,6 +1113,18 @@ impl Editor {
         Ok(())
     }
 
+    /// The points added to every style's size by zooming.
+    pub fn zoom(&self) -> Result<i32> {
+        Ok(self.endpoint.send_direct_checked(SCI_GETZOOM, 0, 0)? as i32)
+    }
+
+    /// Matches another editor's zoom (split editors plan amendment 11: one zoom for every group).
+    pub fn set_zoom(&self, zoom: i32) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETZOOM, zoom as usize, 0)?;
+        Ok(())
+    }
+
     /// Returns to the configured font size.
     pub fn reset_zoom(&self) -> Result<()> {
         self.endpoint.send_direct_checked(SCI_SETZOOM, 0, 0)?;
@@ -1223,13 +1343,15 @@ impl Editor {
 
     #[cfg(test)]
     pub(crate) fn test_fixture(direct_fn: SciFnDirect, direct_ptr: isize) -> Self {
+        let endpoint = Rc::new(EditorEndpoint::new(
+            std::ptr::null_mut(),
+            direct_fn,
+            direct_ptr,
+            false,
+        ));
         Self {
-            endpoint: Rc::new(EditorEndpoint::new(
-                std::ptr::null_mut(),
-                direct_fn,
-                direct_ptr,
-                false,
-            )),
+            documents: Rc::clone(&endpoint),
+            endpoint,
         }
     }
 }
@@ -1500,6 +1622,30 @@ fn create_scintilla_child(parent: HWND) -> Result<HWND> {
     Ok(hwnd)
 }
 
+/// The document host's window: message-only, so it has no parent to outlive and is never shown.
+#[cfg(windows)]
+fn create_scintilla_host() -> Result<HWND> {
+    let class_name = wide_null("Scintilla");
+    let hwnd = unsafe {
+        // SAFETY: HWND_MESSAGE is the documented parent for a message-only window.
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            1,
+            1,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    Ok(hwnd)
+}
+
 #[cfg(windows)]
 fn parent_client_rect(parent: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
@@ -1658,6 +1804,57 @@ mod tests {
             _host: HostWindow(parent),
             _module: module,
         }
+    }
+
+    #[test]
+    fn a_host_document_shows_in_two_editors_and_outlives_both() {
+        // Break caught: a document tied to the editor that created it, so a second group's editor
+        // refuses it, or closing a group frees text another group still shows.
+        let first = test_editor();
+        let host = Editor::create_document_host().expect("document host");
+        let left = Editor::create_with_host(first._host.0, &host).expect("left editor");
+        let right = Editor::create_with_host(first._host.0, &host).expect("right editor");
+        let document = left.create_document().unwrap();
+        left.use_document(&document).unwrap();
+        right.use_document(&document).unwrap();
+        left.set_text("shared").unwrap();
+        assert_eq!(right.text().unwrap(), "shared");
+        drop(left);
+        drop(right);
+        host.use_document(&document).unwrap();
+        assert_eq!(host.text().unwrap(), "shared");
+    }
+
+    #[test]
+    fn an_editor_refuses_documents_from_another_host() {
+        // Break caught: SCI_SETDOCPOINTER with a document whose owner can be destroyed under it.
+        let fixture = test_editor();
+        let host = Editor::create_document_host().expect("document host");
+        let hosted = Editor::create_with_host(fixture._host.0, &host).expect("hosted editor");
+        let foreign = fixture.create_document().unwrap();
+        assert!(hosted.use_document(&foreign).is_err());
+        assert!(hosted.shares_documents_with(&host));
+        assert!(!hosted.shares_documents_with(&fixture));
+    }
+
+    #[test]
+    fn view_state_round_trips_and_clamps_to_a_shorter_document() {
+        // Break caught: switching back to a tab lands at the top, or a saved caret past the end of
+        // a file that shrank on disk panics or selects garbage.
+        let editor = test_editor();
+        editor.set_text(&"line\n".repeat(200)).unwrap();
+        let saved = crate::editor::ViewState {
+            caret: 500,
+            anchor: 495,
+            first_line: 90,
+            x_offset: 0,
+        };
+        editor.apply_view_state(saved).unwrap();
+        assert_eq!(editor.view_state().unwrap(), saved);
+        editor.set_text("short").unwrap();
+        editor.apply_view_state(saved).unwrap();
+        let clamped = editor.view_state().unwrap();
+        assert_eq!((clamped.caret, clamped.anchor), (5, 5));
     }
 
     #[test]

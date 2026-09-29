@@ -41,6 +41,17 @@ pub(crate) fn handle_is_valid(raw: HANDLE) -> bool {
     !raw.is_null() && raw != INVALID_HANDLE_VALUE
 }
 
+/// The top-level window `hwnd` belongs to: FastPad's main window for any of its children, however
+/// deeply nested. Children now sit inside editor groups, so their direct parent is no longer the
+/// main window (split editors spec §4.2).
+#[cfg(windows)]
+pub(crate) fn root_window(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+) -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+    unsafe { GetAncestor(hwnd, GA_ROOT) }
+}
+
 #[cfg(windows)]
 pub(crate) fn free_library(module: HMODULE) {
     unsafe {
@@ -103,6 +114,15 @@ pub(crate) fn dropped_paths(drop: windows_sys::Win32::UI::Shell::HDROP) -> Vec<s
 /// caller frees it (`GlobalFree`, `DragFinish` or `ReleaseStgMedium`).
 #[cfg(all(test, windows))]
 pub(crate) fn test_hdrop(paths: &[&std::path::Path]) -> windows_sys::Win32::Foundation::HGLOBAL {
+    test_hdrop_at(paths, windows_sys::Win32::Foundation::POINT { x: 0, y: 0 })
+}
+
+/// `test_hdrop` dropped at client point `point` of the window it is sent to.
+#[cfg(all(test, windows))]
+pub(crate) fn test_hdrop_at(
+    paths: &[&std::path::Path],
+    point: windows_sys::Win32::Foundation::POINT,
+) -> windows_sys::Win32::Foundation::HGLOBAL {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Memory::{
         GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock,
@@ -121,6 +141,7 @@ pub(crate) fn test_hdrop(paths: &[&std::path::Path]) -> windows_sys::Win32::Foun
         let base = GlobalLock(global).cast::<u8>();
         let files = DROPFILES {
             pFiles: header as u32,
+            pt: point,
             fWide: 1,
             ..Default::default()
         };

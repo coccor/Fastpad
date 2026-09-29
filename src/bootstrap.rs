@@ -377,10 +377,7 @@ mod tests {
         pump_thread_messages();
 
         with_app(main.hwnd, |app| {
-            assert_eq!(
-                app.editor.as_ref().unwrap().text().unwrap(),
-                "{\"ok\":true}"
-            );
+            assert_eq!(app.editor().unwrap().text().unwrap(), "{\"ok\":true}");
             assert_eq!(
                 app.tabs.active().unwrap().path.as_deref(),
                 Some(fixture.path.as_path())
@@ -449,7 +446,7 @@ mod tests {
             }
 
             with_app(main.hwnd, |app| {
-                assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), "");
+                assert_eq!(app.editor().unwrap().text().unwrap(), "");
                 assert!(
                     app.startup
                         .micros(crate::perf::Milestone::FileLoaded)
@@ -513,9 +510,7 @@ mod tests {
         unsafe {
             SendMessageW(editor, WM_CHAR, b'!' as usize, 0);
         }
-        let before = with_app(main.hwnd, |app| {
-            app.editor.as_ref().unwrap().text().unwrap()
-        });
+        let before = with_app(main.hwnd, |app| app.editor().unwrap().text().unwrap());
         App::open_path(
             main.hwnd,
             &fixture.path.parent().unwrap().join(".").join("config.json"),
@@ -523,7 +518,7 @@ mod tests {
         .unwrap();
         with_app(main.hwnd, |app| {
             assert_eq!(app.tabs.len(), 1);
-            assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), before);
+            assert_eq!(app.editor().unwrap().text().unwrap(), before);
             assert!(app.tabs.active().unwrap().dirty);
         });
     }
@@ -593,7 +588,7 @@ mod tests {
                 ),
                 before
             );
-            assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), "x");
+            assert_eq!(app.editor().unwrap().text().unwrap(), "x");
             assert!(app.tabs.active().unwrap().path.is_none());
         });
     }
@@ -773,7 +768,8 @@ mod tests {
         let error = unsafe {
             initialize_editor_with(window.hwnd, &window.identity, |parent| {
                 let editor = Editor::create(parent)?;
-                DestroyWindow(parent);
+                // The editor's parent is the editor group; the main window is its root.
+                DestroyWindow(crate::platform::win32::root_window(parent));
                 Ok(editor)
             })
         }

@@ -109,6 +109,20 @@ pub enum CommandId {
     LanguageTypeScript = 214,
     LanguageXml = 215,
     LanguageYaml = 216,
+    SplitRight = 217,
+    SplitDown = 218,
+    CloseGroup = 219,
+    FocusGroup1 = 220,
+    FocusGroup2 = 221,
+    FocusGroup3 = 222,
+    FocusGroup4 = 223,
+    FocusGroup5 = 224,
+    FocusGroup6 = 225,
+    FocusGroup7 = 226,
+    FocusGroup8 = 227,
+    FocusLastGroup = 228,
+    MoveTabToNextGroup = 229,
+    MoveTabToPreviousGroup = 230,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -207,6 +221,18 @@ impl CommandId {
                 | Self::QuickOpen
                 | Self::NoteNewFolder
                 | Self::NoteNew
+                | Self::SplitRight
+                | Self::SplitDown
+                | Self::CloseGroup
+                | Self::FocusGroup1
+                | Self::FocusGroup2
+                | Self::FocusGroup3
+                | Self::FocusGroup4
+                | Self::FocusGroup5
+                | Self::FocusGroup6
+                | Self::FocusGroup7
+                | Self::FocusGroup8
+                | Self::FocusLastGroup
         )
     }
 
@@ -318,11 +344,27 @@ impl CommandId {
     }
 }
 
+impl CommandId {
+    /// The zero-based group a `FocusGroupN` command focuses, in layout order; `usize::MAX` for
+    /// Focus Last Group.
+    pub const fn group_index(self) -> Option<usize> {
+        let first = Self::FocusGroup1 as u16;
+        let value = self as u16;
+        if value >= first && value <= Self::FocusGroup8 as u16 {
+            Some((value - first) as usize)
+        } else if value == Self::FocusLastGroup as u16 {
+            Some(usize::MAX)
+        } else {
+            None
+        }
+    }
+}
+
 impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 106] = [
+        const COMMANDS: [CommandId; 120] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -429,6 +471,20 @@ impl TryFrom<u16> for CommandId {
             CommandId::LanguageTypeScript,
             CommandId::LanguageXml,
             CommandId::LanguageYaml,
+            CommandId::SplitRight,
+            CommandId::SplitDown,
+            CommandId::CloseGroup,
+            CommandId::FocusGroup1,
+            CommandId::FocusGroup2,
+            CommandId::FocusGroup3,
+            CommandId::FocusGroup4,
+            CommandId::FocusGroup5,
+            CommandId::FocusGroup6,
+            CommandId::FocusGroup7,
+            CommandId::FocusGroup8,
+            CommandId::FocusLastGroup,
+            CommandId::MoveTabToNextGroup,
+            CommandId::MoveTabToPreviousGroup,
         ];
         COMMANDS
             .into_iter()
@@ -465,6 +521,13 @@ mod tests {
     fn native_command_values_are_stable_and_round_trip() {
         assert_eq!(CommandId::New as u16, 100);
         assert_eq!(CommandId::Exit as u16, 117);
+        assert_eq!(CommandId::SplitRight as u16, 217);
+        assert_eq!(CommandId::MoveTabToPreviousGroup as u16, 230);
+        assert_eq!(CommandId::try_from(220), Ok(CommandId::FocusGroup1));
+        assert_eq!(CommandId::FocusGroup8.group_index(), Some(7));
+        assert_eq!(CommandId::FocusLastGroup.group_index(), Some(usize::MAX));
+        assert!(!CommandId::SplitRight.needs_document());
+        assert!(CommandId::MoveTabToNextGroup.needs_document());
         assert_eq!(CommandId::try_from(103), Ok(CommandId::SaveAs));
         assert!(CommandId::try_from(99).is_err());
         assert_eq!(CommandId::try_from(118), Ok(CommandId::CloseAllTabs));

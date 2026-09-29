@@ -278,6 +278,32 @@ const DEFAULT_FONT_FACE: &str = "Consolas";
 #[cfg(test)]
 pub(crate) static NATIVE_LEXILLA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// `language`'s style table in `theme`: empty for the languages with no lexer.
+pub(crate) fn style_table(language: Language, theme: Theme) -> &'static [LexerStyle] {
+    if registry::spec(language).lexer.is_none() {
+        return &[];
+    }
+    (registry::spec(language).styles)(theme)
+}
+
+/// Gives `editor`'s view `language`'s style table without touching the document's lexer. Styles
+/// belong to each Scintilla view while the lexer belongs to the document, so a second editor
+/// showing a document needs its own table (split editors spec §3.2).
+pub(crate) fn apply_styles(editor: &Editor, language: Language, theme: Theme) -> Result<()> {
+    editor.clear_all_styles()?;
+    for style in style_table(language, theme) {
+        editor.set_style(
+            style.style,
+            style.foreground,
+            style.background,
+            style.bold,
+            style.italic,
+            DEFAULT_FONT_FACE,
+        )?;
+    }
+    Ok(())
+}
+
 /// Owns the deferred `Lexilla.dll` and applies a document's language (lexer + style table) to the
 /// live editor. `Lexilla.dll` is only ever loaded the first time `apply` is called with a lexed
 /// language; a plain-text-only session never touches it.
@@ -313,18 +339,7 @@ impl LanguageManager {
         for (set, words) in spec.keywords.iter().enumerate() {
             editor.set_keywords(set, words)?;
         }
-        editor.clear_all_styles()?;
-        for style in (spec.styles)(theme) {
-            editor.set_style(
-                style.style,
-                style.foreground,
-                style.background,
-                style.bold,
-                style.italic,
-                DEFAULT_FONT_FACE,
-            )?;
-        }
-        Ok(())
+        apply_styles(editor, language, theme)
     }
 
     fn ensure_lexilla(&mut self) -> Result<&LexillaLibrary> {

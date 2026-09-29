@@ -5,25 +5,22 @@ mod support;
 use fastpad::editor::scintilla_constants::SCI_SETSAVEPOINT;
 use fastpad::platform::wide_null;
 use fastpad::window::commands::CommandId;
-use fastpad::window::titlebar::{Size, TitleBarLayout};
+use fastpad::window::group_strip::StripLayout;
 use std::error::Error;
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use support::process::FastPadProcess;
 use support::win32::{find_child_by_class, scintilla_text, send_text};
-use windows_sys::Win32::Foundation::{
-    E_INVALIDARG, HWND, LPARAM, POINT, SysFreeString, SysStringLen,
-};
-use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::Foundation::{E_INVALIDARG, HWND, LPARAM, SysFreeString, SysStringLen};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{AccessibleObjectFromWindow, SELFLAG_TAKESELECTION};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, HTCAPTION,
-    IDCANCEL, IDNO, IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_LBUTTONUP, WM_NCLBUTTONDBLCLK,
+    BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, IDCANCEL, IDNO,
+    IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 use windows_sys::core::{BOOL, BSTR, GUID, HRESULT};
 
@@ -68,7 +65,7 @@ fn accessibility_selection_switches_the_native_editor_document() -> TestResult<(
     send_text(editor, "second")?;
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
 
-    let accessible = Accessible::from_window(hwnd)?;
+    let accessible = Accessible::from_window(find_child_by_class(hwnd, "FastPadEditorGroup")?)?;
     assert_eq!(accessible.select(1), windows_sys::Win32::Foundation::S_OK);
     wait_for_editor_text(editor, "first", Duration::from_secs(2))?;
 
@@ -84,19 +81,19 @@ fn retained_accessibility_provider_tracks_current_tabs_and_rejects_removed_tab()
     let editor = find_child_by_class(hwnd, "Scintilla")?;
     send_text(editor, "first")?;
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
-    let accessible = Accessible::from_window(hwnd)?;
-    assert_eq!(accessible.child_count()?, 5);
+    let accessible = Accessible::from_window(find_child_by_class(hwnd, "FastPadEditorGroup")?)?;
+    assert_eq!(accessible.child_count()?, 1);
 
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
     send_text(editor, "second")?;
-    assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.child_count()?, 2);
     // Notes mode is on by default: the new tab is labelled by its first line.
     assert_eq!(accessible.name(2)?, "second *");
 
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0) };
     wait_for_editor_text(editor, "first", Duration::from_secs(2))?;
-    assert_eq!(accessible.child_count()?, 5);
+    assert_eq!(accessible.child_count()?, 1);
     assert_eq!(accessible.select(2), E_INVALIDARG);
     assert_eq!(scintilla_text(editor)?, "first");
 
@@ -157,13 +154,13 @@ fn modal_close_does_not_close_a_reentrantly_created_active_tab() -> TestResult<(
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
     let editor = find_child_by_class(hwnd, "Scintilla")?;
     send_text(editor, "original")?;
-    let accessible = Accessible::from_window(hwnd)?;
+    let accessible = Accessible::from_window(find_child_by_class(hwnd, "FastPadEditorGroup")?)?;
     unsafe { PostMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0) };
     let dialog = wait_for_dialog(process.id(), true, Duration::from_secs(2))?;
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
     answer_dialog(dialog, IDNO)?;
     wait_for_dialog(process.id(), false, Duration::from_secs(2))?;
-    assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.child_count()?, 2);
     assert_eq!(accessible.select(1), windows_sys::Win32::Foundation::S_OK);
     assert_eq!(scintilla_text(editor)?, "original");
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
@@ -233,45 +230,51 @@ fn window_close_reviews_dirty_tabs_in_order_and_cancel_aborts_shutdown() -> Test
 }
 
 fn click_tab(hwnd: HWND, index: usize, tab_count: usize) -> TestResult<()> {
-    let layout = title_layout(hwnd, tab_count)?;
-    let point = layout.tab(index).center();
+    let (group, layout) = strip_layout(hwnd, tab_count)?;
+    let point = layout.tab(index).ok_or("no such tab")?.center();
     let packed = (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize;
-    unsafe { SendMessageW(hwnd, WM_LBUTTONUP, 0, packed) };
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDOWN, 1, packed);
+        SendMessageW(group, WM_LBUTTONUP, 0, packed);
+    }
     Ok(())
 }
 
+/// A double-click on the strip right of the last tab, which opens a new tab (the strip's own
+/// window class takes double-clicks).
 fn double_click_empty_strip(hwnd: HWND, tab_count: usize) -> TestResult<()> {
-    let layout = title_layout(hwnd, tab_count)?;
-    let center = layout.drag_region.center();
-    let mut point = POINT {
-        x: center.x,
-        y: center.y,
-    };
-    unsafe { ClientToScreen(hwnd, &mut point) };
-    let packed = (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize;
-    unsafe { SendMessageW(hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, packed) };
+    let (group, layout) = strip_layout(hwnd, tab_count)?;
+    let x = tab_count
+        .checked_sub(1)
+        .and_then(|last| layout.tab(last))
+        .map_or(10, |tab| tab.right + 10);
+    let packed = (x as u16 as u32 | (((layout.height / 2) as u16 as u32) << 16)) as isize;
+    unsafe { SendMessageW(group, WM_LBUTTONDBLCLK, 1, packed) };
     Ok(())
 }
 
-fn title_layout(hwnd: HWND, tab_count: usize) -> TestResult<TitleBarLayout> {
+/// The editor group window and its tab strip, as the group lays it out.
+fn strip_layout(hwnd: HWND, tab_count: usize) -> TestResult<(HWND, StripLayout)> {
+    let group = find_child_by_class(hwnd, "FastPadEditorGroup")?;
     let mut client = windows_sys::Win32::Foundation::RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
+    let mut frame = windows_sys::Win32::Foundation::RECT::default();
+    if unsafe { GetClientRect(group, &mut client) } == 0
+        || unsafe { GetClientRect(hwnd, &mut frame) } == 0
+    {
         return Err(Box::new(fastpad::platform::last_error()));
     }
-    // The tabs start right of the notes-mode sidebar, where the editor starts.
-    let editor = find_child_by_class(hwnd, "Scintilla")?;
-    let mut editor_rect = windows_sys::Win32::Foundation::RECT::default();
-    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(editor, &mut editor_rect) };
-    let mut origin = POINT { x: 0, y: 0 };
-    unsafe { ClientToScreen(hwnd, &mut origin) };
-    Ok(TitleBarLayout::calculate_with_offset(
-        Size::new(client.right - client.left, client.bottom - client.top),
-        unsafe { GetDpiForWindow(hwnd) },
-        tab_count,
-        0,
-        false,
-        editor_rect.left - origin.x,
-    ))
+    // The strip is the title row, up to the app menu.
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    let dpi = unsafe { GetDpiForWindow(group) };
+    let caption = fastpad::window::titlebar::TitleBarLayout::calculate(
+        fastpad::window::titlebar::Size::new(frame.right, frame.bottom),
+        dpi,
+    )
+    .minimize
+    .left;
+    let width = client.right.min(caption - origin.x);
+    Ok((group, StripLayout::calculate(width, dpi, tab_count, 0)))
 }
 
 fn wait_for_editor_text(hwnd: HWND, expected: &str, timeout: Duration) -> TestResult<()> {

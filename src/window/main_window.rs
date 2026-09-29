@@ -15,6 +15,7 @@ use crate::window::messages::{
 };
 use crate::window::modal::prompt_close_decision;
 use crate::window::palette::Palette;
+use crate::window::split_tree::GroupId;
 use crate::window::tabs::CloseReviewKey;
 use crate::window::titlebar::{
     HitTarget, LogoIcon, PointerState, TitleBarLayout, TitleFontHandles,
@@ -34,18 +35,18 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE,
-    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HICON, HTCAPTION, IMAGE_ICON,
-    IsWindow, IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadIconW, LoadImageW,
-    MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE,
-    SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_ACTIVATEAPP,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT,
+    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HICON, IMAGE_ICON, IsWindow,
+    IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MoveWindow,
+    OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE,
+    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED,
+    WM_DRAWITEM, WM_DROPFILES, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
@@ -161,6 +162,10 @@ pub(crate) unsafe fn maybe_post_deferred_start(hwnd: HWND, identity: &WindowIden
     }
     let should_post = unsafe { take_deferred_start_pending(hwnd) };
     if should_post {
+        // Posted startup steps outrank WM_PAINT, so the tab strip paints now or only after them.
+        if let Some(group) = group_hwnd(hwnd) {
+            unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(group) };
+        }
         unsafe {
             PostMessageW(hwnd, deferred_start_message(), 0, 0);
         }
@@ -289,7 +294,17 @@ unsafe extern "system" fn main_window_proc(
         WM_DROPFILES => {
             let drop = wparam as windows_sys::Win32::UI::Shell::HDROP;
             let paths = crate::platform::win32::dropped_paths(drop);
+            let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            let at = unsafe { windows_sys::Win32::UI::Shell::DragQueryPoint(drop, &mut point) };
             unsafe { windows_sys::Win32::UI::Shell::DragFinish(drop) };
+            // The group under the drop opens it: a strip, a preview or an image view (plan
+            // amendment 6).
+            if at != 0 {
+                unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point) };
+                if let Some((group, _)) = group_at(hwnd, point) {
+                    activate_group(hwnd, group);
+                }
+            }
             crate::window::library_host::files_dropped(hwnd, paths);
             0
         }
@@ -303,8 +318,10 @@ unsafe extern "system" fn main_window_proc(
         WM_PAINT => {
             sync_window_title(hwnd);
             let paint_title_strip = |hwnd, _, _, _| {
-                let (titles, active, scroll, empty, preview_tab) = tab_snapshot(hwnd);
-                let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
+                let covered = group_strip_bounds(hwnd);
+                let sashes = tree_layout(hwnd)
+                    .map(|layout| layout.sashes.iter().map(|sash| sash.rect).collect())
+                    .unwrap_or_default();
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
                 let headings = menu_headings(hwnd);
@@ -312,19 +329,13 @@ unsafe extern "system" fn main_window_proc(
                     crate::window::titlebar::paint(
                         hwnd,
                         &crate::window::titlebar::TitlePaint {
-                            titles: &title_refs,
-                            active,
-                            preview_tab,
-                            scroll,
-                            empty_hint: empty.then_some(EMPTY_TABS_HINT),
+                            covered,
+                            sashes,
                             status: status.as_ref(),
                             palette,
                             fonts,
                             pointer,
                             menu: menu_mode(hwnd).map(|mode| (mode, headings.as_slice())),
-                            preview: preview_buttons_visible(hwnd)
-                                .then(|| crate::window::preview_host::mode(hwnd)),
-                            divider: crate::window::preview_host::divider_rect(hwnd),
                         },
                     )
                 };
@@ -345,41 +356,22 @@ unsafe extern "system" fn main_window_proc(
             }
         }
         WM_NCHITTEST => unsafe {
-            crate::window::titlebar::nonclient_hit_test(
-                hwnd,
-                wparam,
-                lparam,
-                tab_count(hwnd),
-                tab_scroll(hwnd),
-                preview_buttons_visible(hwnd),
-            )
+            crate::window::titlebar::nonclient_hit_test(hwnd, wparam, lparam)
         },
         WM_NCCALCSIZE => unsafe { crate::window::titlebar::reclaim_caption(hwnd, wparam, lparam) },
         WM_GETMINMAXINFO => unsafe {
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
+        WM_MOUSEMOVE if drag_sash(hwnd, lparam) => 0,
         WM_MOUSEMOVE => {
-            if crate::window::preview_host::drag_divider(
-                hwnd,
-                (lparam as u32 & 0xffff) as u16 as i16 as i32,
-            ) {
-                return 0;
-            }
             hover_menu_heading(hwnd, lparam);
-            drag_tab_thumb(hwnd, lparam);
             crate::window::titlebar::track_pointer_leave(hwnd, false);
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target));
-            crate::window::preview_host::button_hover(hwnd, target);
             0
         }
         WM_MOUSELEAVE => {
             update_title_pointer(hwnd, |pointer| pointer.leave(false));
-            crate::window::preview_host::button_hover(hwnd, None);
-            // A middle press whose release never reaches the strip must not close a tab later.
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                unsafe { app.as_mut() }.middle_press = None;
-            }
             0
         }
         WM_NCMOUSEMOVE => {
@@ -392,15 +384,15 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_NCMOUSELEAVE => {
             update_title_pointer(hwnd, |pointer| pointer.leave(true));
-            crate::window::preview_host::button_hover(hwnd, None);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR if set_sash_cursor(hwnd) => 1,
         WM_LBUTTONDOWN => {
             let (x, y) = (
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
-            if crate::window::preview_host::begin_divider_drag(hwnd, x, y) {
+            if press_sash(hwnd, x, y) {
                 return 0;
             }
             if menu_mode(hwnd).is_some() {
@@ -414,52 +406,32 @@ unsafe extern "system" fn main_window_proc(
             }
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target).press(target));
-            if target == Some(HitTarget::ScrollBar) {
-                begin_tab_thumb_drag(hwnd, (lparam as u32 & 0xffff) as u16 as i16 as i32);
-            }
             0
         }
-        WM_CAPTURECHANGED => {
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                unsafe { app.as_mut() }.tab_thumb_grab = None;
+        // Over a title-row strip's empty space the caption double-click opens a tab and the
+        // right-click opens the strip menu, as the strip does (spec §4.1).
+        WM_NCLBUTTONDBLCLK
+            if wparam == windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize
+                && caption_strip_point(hwnd, lparam).is_some() =>
+        {
+            exit_menu_mode(hwnd);
+            if let Some((group, ..)) = caption_strip_point(hwnd, lparam) {
+                activate_group_window(hwnd, group);
             }
-            crate::window::preview_host::cancel_divider_drag(hwnd);
-            0
-        }
-        // The empty tab-strip space is the only caption: double-clicking it opens a tab, VSCode
-        // style, instead of maximizing. Over the sidebar's top strip it maximizes as usual.
-        WM_NCLBUTTONDBLCLK if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => {
             execute_command(hwnd, CommandId::New);
             0
         }
-        // Its context menu replaces the system menu; Alt+Space still opens that.
-        WM_NCRBUTTONDOWN if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => 0,
-        WM_NCRBUTTONUP if wparam == HTCAPTION as usize && !over_sidebar(hwnd, lparam) => {
-            let mut point = windows_sys::Win32::Foundation::POINT {
-                x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
-                y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
-            };
-            unsafe {
-                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
-            }
-            let has_tabs = tab_count(hwnd) > 0;
-            if let Some(command) = menus::show_tab_strip_menu(hwnd, point.x, point.y, has_tabs) {
-                execute_command(hwnd, command);
-            }
-            0
-        }
-        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-            let delta = i32::from((wparam >> 16) as u16 as i16);
-            // Wheel up scrolls toward the first tab; a tilt to the right toward the last.
-            let delta = if message == WM_MOUSEWHEEL {
-                -delta
-            } else {
-                delta
-            };
-            if scroll_tabs(hwnd, lparam, delta) {
-                0
-            } else {
-                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_NCRBUTTONUP
+            if wparam == windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize =>
+        {
+            match caption_strip_point(hwnd, lparam) {
+                Some((group, x, y)) => {
+                    exit_menu_mode(hwnd);
+                    activate_group_window(hwnd, group);
+                    show_group_strip_menu(hwnd, group, x, y);
+                    0
+                }
+                None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
             }
         }
         // DefWindowProc would run its own classic caption-button tracking loop over our strip.
@@ -483,76 +455,22 @@ unsafe extern "system" fn main_window_proc(
             }
             0
         }
+        WM_LBUTTONUP if end_sash_drag(hwnd) => {
+            unsafe { ReleaseCapture() };
+            0
+        }
+        WM_CAPTURECHANGED => {
+            end_sash_drag(hwnd);
+            0
+        }
         WM_LBUTTONUP => {
-            if crate::window::preview_host::end_divider_drag(hwnd) {
-                return 0;
-            }
             update_title_pointer(hwnd, |pointer| pointer.release(None).0);
-            if end_tab_thumb_drag(hwnd) {
-                return 0;
-            }
             let point = crate::window::titlebar::Point::new(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
             if notice_contains(hwnd, point.y) {
                 dismiss_notifications(hwnd);
-                return 0;
-            }
-            let layout = title_layout(hwnd);
-            match layout.hit_test(point) {
-                crate::window::titlebar::HitTarget::Overflow => {
-                    if let Some(command) = menus::show_overflow(hwnd, point.x, layout.height) {
-                        execute_command(hwnd, command);
-                    }
-                }
-                crate::window::titlebar::HitTarget::CloseTab(index) => {
-                    activate_tab(hwnd, index);
-                    execute_command(hwnd, CommandId::CloseTab);
-                }
-                crate::window::titlebar::HitTarget::Tab(index) => {
-                    activate_tab(hwnd, index);
-                    if tab_double_click(hwnd, index)
-                        && let Some(id) = unsafe { app_ptr(hwnd) }
-                            .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
-                    {
-                        promote_tab(hwnd, id);
-                    }
-                }
-                target @ (crate::window::titlebar::HitTarget::PreviewSide
-                | crate::window::titlebar::HitTarget::PreviewFull) => {
-                    crate::window::preview_host::click_button(hwnd, target)
-                }
-                _ => {}
-            }
-            0
-        }
-        // A middle-click closes the tab under the pointer (quick-open spec §5). Tabs answer
-        // HTCLIENT, so the button arrives here; the caption and the logo square are nonclient
-        // and keep the system's behavior.
-        WM_MBUTTONDOWN => {
-            let press = match client_title_target(hwnd, lparam) {
-                Some(HitTarget::Tab(index) | HitTarget::CloseTab(index)) => {
-                    tab_id_at(hwnd, index).map(|id| (index, id))
-                }
-                _ => None,
-            };
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                unsafe { app.as_mut() }.middle_press = press;
-            }
-            0
-        }
-        WM_MBUTTONUP => {
-            let press = unsafe { app_ptr(hwnd) }
-                .and_then(|mut app| unsafe { app.as_mut() }.middle_press.take());
-            // Only over the pressed tab, and only while it still shows the same document.
-            if let Some((index, id)) = press
-                && let Some(HitTarget::Tab(released) | HitTarget::CloseTab(released)) =
-                    client_title_target(hwnd, lparam)
-                && released == index
-                && tab_id_at(hwnd, index) == Some(id)
-            {
-                close_tab_at(hwnd, index);
             }
             0
         }
@@ -560,7 +478,7 @@ unsafe extern "system" fn main_window_proc(
             handle_editor_notification(hwnd, lparam);
             0
         }
-        WM_FASTPAD_ACCESSIBLE_SELECT => handle_accessible_select(hwnd, lparam),
+        WM_FASTPAD_ACCESSIBLE_SELECT => handle_accessible_select(hwnd, wparam, lparam),
         WM_COMMAND
             if lparam != 0
                 && ((wparam >> 16) & 0xffff) as u32 == EN_CHANGE
@@ -583,8 +501,7 @@ unsafe extern "system" fn main_window_proc(
         WM_CTLCOLOREDIT if find_bar_owns(hwnd, lparam as HWND) => unsafe { app_ptr(hwnd) }
             .and_then(|app| {
                 unsafe { app.as_ref() }
-                    .find_bar
-                    .as_ref()
+                    .find_bar()
                     .map(|bar| bar.control_color(wparam as HDC) as LRESULT)
             })
             .unwrap_or(0),
@@ -681,7 +598,7 @@ unsafe extern "system" fn main_window_proc(
             }
             let dpi = (wparam & 0xffff) as u32;
             if let Some(editor) =
-                unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+                unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
             {
                 let _ = editor.set_text_padding(dpi);
             }
@@ -700,19 +617,6 @@ unsafe extern "system" fn main_window_proc(
             }
             0
         }
-        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR
-            if crate::window::preview_host::cursor_over_divider(hwnd) =>
-        {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(
-                    windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
-                        std::ptr::null_mut(),
-                        windows_sys::Win32::UI::WindowsAndMessaging::IDC_SIZEWE,
-                    ),
-                )
-            };
-            1
-        }
         WM_NCDESTROY => {
             let app = unsafe { take_app(hwnd) };
             if let Some(app) = app.as_ref() {
@@ -729,7 +633,7 @@ unsafe extern "system" fn main_window_proc(
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_FILES_DROPPED {
-                crate::window::library_host::editor_files_dropped(hwnd, lparam);
+                crate::window::library_host::editor_files_dropped(hwnd, wparam, lparam);
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_NOTEBOOK_CHECKED {
@@ -782,8 +686,16 @@ unsafe extern "system" fn main_window_proc(
                 return handle_ipc_requests(hwnd);
             }
             match message {
+                crate::window::WM_FASTPAD_CONTENT_FOCUSED => {
+                    if let Some(id) = group_of_child(hwnd, wparam as HWND) {
+                        activate_group(hwnd, id);
+                    }
+                    return 0;
+                }
                 crate::window::WM_FASTPAD_PREVIEW_ESCAPE => {
-                    crate::window::preview_host::escape(hwnd);
+                    if let Some(id) = group_of_child(hwnd, wparam as HWND) {
+                        crate::window::preview_host::escape(hwnd, id);
+                    }
                     return 0;
                 }
                 crate::window::WM_FASTPAD_PREVIEW_PARSED => {
@@ -795,19 +707,35 @@ unsafe extern "system" fn main_window_proc(
                     return 0;
                 }
                 crate::window::WM_FASTPAD_PREVIEW_LINK => {
-                    crate::window::preview_host::follow_link(hwnd, lparam);
+                    match group_of_child(hwnd, wparam as HWND) {
+                        Some(id) => crate::window::preview_host::follow_link(hwnd, id, lparam),
+                        None if lparam != 0 => {
+                            drop(unsafe { Box::from_raw(lparam as *mut String) });
+                        }
+                        None => {}
+                    }
                     return 0;
                 }
                 crate::window::WM_FASTPAD_PREVIEW_HOVER => {
-                    crate::window::preview_host::hover_link(hwnd, lparam);
+                    match group_of_child(hwnd, wparam as HWND) {
+                        Some(id) => crate::window::preview_host::hover_link(hwnd, id, lparam),
+                        None if lparam != 0 => {
+                            drop(unsafe { Box::from_raw(lparam as *mut Option<String>) });
+                        }
+                        None => {}
+                    }
                     return 0;
                 }
                 crate::window::WM_FASTPAD_PREVIEW_REFRESH => {
-                    crate::window::preview_host::refresh(hwnd);
+                    if let Some(id) = group_of_child(hwnd, wparam as HWND) {
+                        crate::window::preview_host::refresh(hwnd, id);
+                    }
                     return 0;
                 }
                 crate::window::WM_FASTPAD_PREVIEW_SCROLLED => {
-                    crate::window::preview_host::preview_scrolled(hwnd, wparam);
+                    if let Some(id) = group_of_child(hwnd, lparam as HWND) {
+                        crate::window::preview_host::preview_scrolled(hwnd, id, wparam);
+                    }
                     return 0;
                 }
                 _ => {}
@@ -1029,7 +957,13 @@ where
         record_milestone(hwnd, Milestone::WindowCreated)?;
     }
 
-    let editor = create_editor(hwnd)?;
+    // Every document comes from the host, so any editor can show any of them (split editors
+    // spec §3.1).
+    let host = Editor::create_document_host()?;
+    // The editor, find bar, preview and image view live in the editor group (split editors spec
+    // §4.2), which the main window lays out.
+    let group = crate::window::editor_group::create(hwnd)?;
+    let editor = create_editor(group)?.with_document_host(&host);
     let editor_hwnd = editor.hwnd();
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
@@ -1042,7 +976,12 @@ where
         .ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
         ))?;
-    let document = Document::untitled(DocumentId(1), recovery_id, editor.current_document()?);
+    let initial = editor.create_document()?;
+    editor.use_document(&initial)?;
+    let document = Document::untitled(DocumentId(1), recovery_id, initial);
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.document_host = Some(host);
+    }
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed while adopting the initial document",
@@ -1050,7 +989,7 @@ where
     }
 
     unsafe {
-        install_editor(hwnd, editor, document)?;
+        install_editor(hwnd, group, editor, document)?;
         record_milestone(hwnd, Milestone::EditorCreated)?;
     }
     // The sidebar comes with the window, before first paint, from the settings bootstrap read.
@@ -1116,21 +1055,22 @@ pub(crate) unsafe fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     // SAFETY: The App pointer is used only to copy out the child HWND; no reference crosses into
     // any subsequent Win32 call.
     let app = unsafe { app_ptr(hwnd) }?;
-    unsafe { app.as_ref() }.editor.as_ref().map(Editor::hwnd)
+    unsafe { app.as_ref() }.editor().map(Editor::hwnd)
 }
 
 fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
     let Some(app) = (unsafe { app_ptr(hwnd) }) else {
         return;
     };
-    let Some(editor) = unsafe { app.as_ref() }.editor.as_ref() else {
+    let Some(editor) = unsafe { app.as_ref() }.editor() else {
         return;
     };
     action(editor);
 }
 
-/// Lays out the sidebar, then the find bar, the name box, the preview and the editor right of it,
-/// below the title strip. The sole layout choke point for all of them.
+/// Lays out the sidebar, then the name box and the editor group right of it, below the title
+/// strip. The sole layout choke point for all of them; the group lays out its own children
+/// (`layout_group`).
 pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     let mut rect = RECT::default();
     unsafe {
@@ -1139,44 +1079,448 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     crate::window::side_panel::layout(hwnd, rect, dpi);
     let left = crate::window::side_panel::left_edge(hwnd);
-    // The accessibility provider locates the tabs from this, never from the App.
-    if let Some(app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_ref() }.tabs.set_strip_left(left);
-    }
     layout_command_palette(hwnd);
-    let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
+    if group_hwnd(hwnd).is_none() {
         return;
-    };
+    }
     let title_height = title_layout(hwnd).height + menu_band_height(hwnd);
     let width = (rect.right - rect.left - left).max(0);
     let font = title_chrome(hwnd).1.text();
+    // The name box spans the editor area under the title row, over the top groups.
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(name_box) = unsafe { app.as_ref() }.name_box.as_ref()
+    {
+        name_box.layout(left, width, title_height, dpi, font);
+    }
+    let (Some(area), Some(layout)) = (tree_area(hwnd), tree_layout(hwnd)) else {
+        return;
+    };
+    for (id, rect) in &layout.groups {
+        let Some(group) = with_group_id(hwnd, *id, |state| state.hwnd) else {
+            continue;
+        };
+        // A top group reaches up into the title row and draws its strip there (spec §4.1); a
+        // lower group draws its strip at its own top.
+        let top = if rect.top == area.top { 0 } else { rect.top };
+        unsafe {
+            MoveWindow(
+                group,
+                rect.left,
+                top,
+                rect.right - rect.left,
+                rect.bottom - top,
+                1,
+            );
+        }
+        // A move that keeps the group's size sends no WM_SIZE, but what is inside may have
+        // changed.
+        layout_group(hwnd, group);
+    }
+    unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+}
+
+/// The sash under the cursor sets the resize cursor; false elsewhere.
+fn set_sash_cursor(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, IDC_SIZENS, IDC_SIZEWE, LoadCursorW, SetCursor,
+    };
+    let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe {
+        GetCursorPos(&mut point);
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+    }
+    let Some(axis) =
+        tree_layout(hwnd).and_then(|layout| layout.sash_at(point.x, point.y).map(|sash| sash.axis))
+    else {
+        return false;
+    };
+    let cursor = match axis {
+        crate::window::split_tree::Axis::Row => IDC_SIZEWE,
+        crate::window::split_tree::Axis::Column => IDC_SIZENS,
+    };
+    unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };
+    true
+}
+
+/// A press on a sash starts dragging it; a second press there within the double-click time
+/// shares its branch out evenly instead (spec §4.3). The main window has no `CS_DBLCLKS`, so the
+/// double-click is timed here, as the tab strip does. False when no sash is under the point.
+fn press_sash(hwnd: HWND, x: i32, y: i32) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
+    let Some(sash) = tree_layout(hwnd).and_then(|layout| layout.sash_at(x, y).cloned()) else {
+        return false;
+    };
+    let now = unsafe { GetMessageTime() } as u32;
+    let double_click_time = unsafe { GetDoubleClickTime() };
+    let equalized = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let double = app.last_sash_click.as_ref().is_some_and(|(id, time)| {
+            *id == sash.id && now.wrapping_sub(*time) <= double_click_time
+        });
+        if double {
+            app.last_sash_click = None;
+            app.layout.equalize(&sash.id);
+        } else {
+            app.last_sash_click = Some((sash.id.clone(), now));
+            app.sash_drag = Some(sash);
+        }
+        double
+    });
+    if equalized {
+        layout_editor_and_find_bar(hwnd);
+    } else {
+        unsafe { SetCapture(hwnd) };
+    }
+    true
+}
+
+/// Moves the dragged sash to the pointer; false when no sash is being dragged.
+fn drag_sash(hwnd: HWND, lparam: LPARAM) -> bool {
+    let (x, y) = (
+        (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    );
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let moved = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let sash = app.sash_drag.clone()?;
+        let at = match sash.axis {
+            crate::window::split_tree::Axis::Row => x,
+            crate::window::split_tree::Axis::Column => y,
+        };
+        Some(app.layout.set_sash(&sash, at, dpi))
+    });
+    match moved {
+        Some(changed) => {
+            if changed {
+                layout_editor_and_find_bar(hwnd);
+                unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(hwnd) };
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Ends a sash drag; returns whether one was under way.
+fn end_sash_drag(hwnd: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }
+        .is_some_and(|mut app| unsafe { app.as_mut() }.sash_drag.take().is_some())
+}
+
+/// The editor area the groups share, in the main window's client coordinates: below the title
+/// row, above the status bar, right of the sidebar.
+pub(crate) fn tree_area(hwnd: HWND) -> Option<crate::window::titlebar::Rect> {
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut client);
+    }
+    let left = crate::window::side_panel::left_edge(hwnd);
+    let top = title_layout(hwnd).height;
+    let bottom = (client.bottom - status_bar_height(hwnd)).max(top + 1);
+    (client.right > left)
+        .then(|| crate::window::titlebar::Rect::new(left, top, client.right, bottom))
+}
+
+/// Where each group and sash goes now.
+pub(crate) fn tree_layout(hwnd: HWND) -> Option<crate::window::split_tree::TreeLayout> {
+    let area = tree_area(hwnd)?;
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let app = unsafe { app_ptr(hwnd) }?;
+    Some(unsafe { app.as_ref() }.layout.layout(area, dpi))
+}
+
+/// The groups in layout order: left to right, top to bottom (spec §4.3).
+pub(crate) fn group_order(hwnd: HWND) -> Vec<GroupId> {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| unsafe { app.as_ref() }.layout.leaves())
+        .unwrap_or_default()
+}
+
+/// Whether `group`'s window starts at the top of the main window's client area, so its strip is
+/// in the title row.
+fn is_top_group(hwnd: HWND, group: HWND) -> bool {
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    origin.y == 0
+}
+
+/// The active editor group's window, once the editor exists.
+pub(crate) fn group_hwnd(hwnd: HWND) -> Option<HWND> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .active_group()
+        .map(|group| group.hwnd)
+}
+
+/// The group whose window is `group`.
+/// The group whose window contains screen point `point`, with that window.
+pub(crate) fn group_at(
+    hwnd: HWND,
+    point: windows_sys::Win32::Foundation::POINT,
+) -> Option<(GroupId, HWND)> {
+    let windows = unsafe { app_ptr(hwnd) }.map(|app| {
+        unsafe { app.as_ref() }
+            .groups
+            .iter()
+            .map(|group| (group.id, group.hwnd))
+            .collect::<Vec<_>>()
+    })?;
+    windows.into_iter().find(|(_, window)| {
+        let mut rect = RECT::default();
+        let shown = unsafe {
+            // Its own style: the main window of a test is never shown.
+            GetWindowLongPtrW(*window, GWL_STYLE) as u32 & WS_VISIBLE != 0
+                && windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(*window, &mut rect)
+                    != 0
+        };
+        shown
+            && point.x >= rect.left
+            && point.x < rect.right
+            && point.y >= rect.top
+            && point.y < rect.bottom
+    })
+}
+
+pub(crate) fn group_id_of(hwnd: HWND, group: HWND) -> Option<GroupId> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .groups
+        .iter()
+        .find(|state| state.hwnd == group)
+        .map(|state| state.id)
+}
+
+/// Runs `f` on group `id`'s window state.
+pub(crate) fn with_group_id<R>(
+    hwnd: HWND,
+    id: GroupId,
+    f: impl FnOnce(&mut crate::window::editor_group::GroupWindow) -> R,
+) -> Option<R> {
+    let mut app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_mut() }.group_mut(id).map(f)
+}
+
+pub(crate) fn group_editor(hwnd: HWND, id: GroupId) -> Option<Editor> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .group(id)
+        .map(|group| group.editor.clone())
+}
+
+/// Creates an empty group window with its own editor, set up like the others. The caller puts it
+/// in the layout (split editors spec §4.2).
+pub(crate) fn create_group(hwnd: HWND) -> Result<GroupId> {
+    #[cfg(test)]
+    if FAIL_GROUP_AFTER.with(|after| match after.get() {
+        Some(0) => {
+            after.set(None);
+            true
+        }
+        Some(count) => {
+            after.set(Some(count - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err(crate::FastPadError::Invariant(
+            "test: group creation failed",
+        ));
+    }
+    let host = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.document_host.clone())
+        .ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+    let window = crate::window::editor_group::create(hwnd)?;
+    let editor = match Editor::create_with_host(window, &host) {
+        Ok(editor) => editor,
+        Err(error) => {
+            unsafe { DestroyWindow(window) };
+            return Err(error);
+        }
+    };
+    configure_editor(hwnd, &editor);
+    // A new group shows nothing until a view is added.
+    unsafe { ShowWindow(editor.hwnd(), SW_HIDE) };
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        unsafe { DestroyWindow(window) };
+        return Err(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ));
+    };
+    let editor_hwnd = editor.hwnd();
+    let app = unsafe { app.as_mut() };
+    let id = app.tabs.add_group();
+    app.groups
+        .push(crate::window::editor_group::GroupWindow::new(
+            id, window, editor,
+        ));
+    // A group made after `BUILD_CHROME` takes Explorer drops too (split editors spec §6.2).
+    let wrap = app.file_drops_accepted;
+    if wrap {
+        crate::window::library_host::wrap_group_drop_target(hwnd, window, editor_hwnd);
+    }
+    Ok(id)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many more group windows are made before one fails, for the failure tests.
+    static FAIL_GROUP_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_group_creation() {
+    fail_group_creation_after(0);
+}
+
+/// The group window made after `count` more succeed fails.
+#[cfg(test)]
+pub(crate) fn fail_group_creation_after(count: usize) {
+    FAIL_GROUP_AFTER.with(|after| after.set(Some(count)));
+}
+
+/// Destroys group `id`'s window, its editor and what it showed. The caller has already emptied it
+/// and taken it out of the layout.
+pub(crate) fn destroy_group(hwnd: HWND, id: GroupId) {
+    if unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tab_drag
+            .as_ref()
+            .is_some_and(|drag| drag.source.group == id)
+    }) {
+        crate::window::tab_drag::cancel(hwnd);
+    }
+    let removed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let index = app.groups.iter().position(|group| group.id == id)?;
+        app.tabs.remove_group(id).then(|| app.groups.remove(index))
+    });
+    if let Some(group) = removed {
+        let window = group.hwnd;
+        drop(group);
+        unsafe { DestroyWindow(window) };
+    }
+}
+
+/// Applies the editor settings, the theme's colours and the shared zoom to `editor`, as every
+/// group's editor has them.
+fn configure_editor(hwnd: HWND, editor: &Editor) {
+    let Some((settings, palette, zoom)) = (unsafe { app_ptr(hwnd) }).map(|app| {
+        let app = unsafe { app.as_ref() };
+        let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
+        let zoom = app.editor().and_then(|editor| editor.zoom().ok());
+        (app.settings.clone(), palette, zoom)
+    }) else {
+        return;
+    };
+    apply_settings_to(editor, &settings, palette);
+    apply_colors_to(editor, palette);
+    if let Some(zoom) = zoom {
+        let _ = editor.set_zoom(zoom);
+    }
+}
+
+fn apply_settings_to(editor: &Editor, settings: &crate::config::Settings, palette: Palette) {
+    let _ = editor.set_line_numbers(settings.line_numbers);
+    let _ = editor.apply_view_settings(
+        &settings.font_face,
+        settings.font_size,
+        settings.tab_width,
+        settings.word_wrap,
+    );
+    let _ =
+        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+}
+
+fn apply_colors_to(editor: &Editor, palette: Palette) {
+    let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
+    let _ =
+        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    let _ = editor.set_chrome_colors(
+        palette.selection_background,
+        palette.inactive_selection_background,
+        palette.caret_line_background,
+    );
+    let _ = editor.set_selection_text_colors(palette.selection_foreground);
+}
+
+/// Every group's editor, the active group's first.
+fn all_editors(hwnd: HWND) -> Vec<Editor> {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let app = unsafe { app.as_ref() };
+            let active = app.tabs.active_group();
+            let mut editors = app
+                .active_group()
+                .map(|group| group.editor.clone())
+                .into_iter()
+                .collect::<Vec<_>>();
+            editors.extend(
+                app.groups
+                    .iter()
+                    .filter(|group| group.id != active)
+                    .map(|group| group.editor.clone()),
+            );
+            editors
+        })
+        .unwrap_or_default()
+}
+
+/// The window the content area's children go into: the editor group, or the main window before
+/// the group exists.
+pub(crate) fn content_parent(hwnd: HWND) -> HWND {
+    group_hwnd(hwnd).unwrap_or(hwnd)
+}
+
+/// Lays out the tab strip, the find bar, then the preview and the editor below them, in `group`'s
+/// client area.
+pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
+    let Some(id) = group_id_of(hwnd, group) else {
+        return;
+    };
+    let Some(editor_hwnd) = group_editor(hwnd, id).map(|editor| editor.hwnd()) else {
+        return;
+    };
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(group, &mut client);
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
+    let font = title_chrome(hwnd).1.text();
+    let width = client.right;
+    let strip_height = crate::window::group_strip::strip_height(dpi);
+    // The menu band and the name box sit under the title row, over the top groups' content.
+    let band = if is_top_group(hwnd, group) {
+        menu_band_height(hwnd) + name_box_band_height(hwnd, dpi)
+    } else {
+        0
+    };
+    let find_top = strip_height + band;
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
-            let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
-            bar.layout(left, width, title_height, dpi, font);
+            let bar = unsafe { app.as_ref() }.group(id)?.find_bar.as_ref()?;
+            bar.layout(0, width, find_top, dpi, font);
             bar.is_visible().then(|| find_bar::find_bar_height(dpi))
         })
         .unwrap_or(0);
-    // Opening either bar closes the other, so at most one of the two bands is ever reserved.
-    let name_box_height = unsafe { app_ptr(hwnd) }
-        .and_then(|app| {
-            let name_box = unsafe { app.as_ref() }.name_box.as_ref()?;
-            name_box.layout(left, width, title_height + find_bar_height, dpi, font);
-            name_box
-                .is_visible()
-                .then(|| crate::window::name_box::name_box_height(dpi))
-        })
-        .unwrap_or(0);
-    let content_top = title_height + find_bar_height + name_box_height;
-    let status_height = status_bar_height(hwnd);
+    let top = find_top + find_bar_height;
     let area = RECT {
-        left,
-        top: content_top,
-        right: left + width,
-        bottom: (rect.bottom - rect.top - status_height).max(content_top),
+        left: 0,
+        top,
+        right: width,
+        bottom: client.bottom.max(top),
     };
-    let rects = crate::window::preview_host::layout(hwnd, area, dpi);
-    crate::window::image_host::layout(hwnd, area);
+    with_group_id(hwnd, id, |state| {
+        state.content =
+            crate::window::titlebar::Rect::new(area.left, area.top, area.right, area.bottom)
+    });
+    set_group_region(hwnd, group, &client, strip_height, band);
+    let rects = crate::window::preview_host::layout(hwnd, id, area, dpi);
+    crate::window::image_host::layout(hwnd, id, area);
+    crate::window::preview_buttons::layout(hwnd, group, area, dpi);
     if let Some(editor_rect) = rects.editor {
         unsafe {
             MoveWindow(
@@ -1188,6 +1532,195 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
                 1,
             );
         }
+    }
+    unsafe {
+        InvalidateRect(group, std::ptr::null(), 0);
+    }
+}
+
+/// The visible name box's height, or 0.
+fn name_box_band_height(hwnd: HWND, dpi: u32) -> i32 {
+    unsafe { app_ptr(hwnd) }
+        .filter(|app| {
+            unsafe { app.as_ref() }
+                .name_box
+                .as_ref()
+                .is_some_and(|name_box| name_box.is_visible())
+        })
+        .map_or(0, |_| crate::window::name_box::name_box_height(dpi))
+}
+
+/// Leaves out of the group window what the main window keeps in its area: the caption buttons at
+/// the right end of the title row, and the band under it while the menu band or the name box
+/// shows. The main window paints them and gets their input.
+fn set_group_region(hwnd: HWND, group: HWND, client: &RECT, strip_height: i32, band: i32) {
+    use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, RGN_DIFF, SetWindowRgn};
+    // Only the group under the caption buttons gives up the part of its strip they cover.
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    let caption_left = title_layout(hwnd).minimize.left - origin.x;
+    let caption_left = if origin.y == 0 && caption_left < client.right {
+        caption_left.max(0)
+    } else {
+        client.right
+    };
+    unsafe {
+        let region = CreateRectRgn(0, 0, client.right, client.bottom);
+        let cut = |left: i32, top: i32, right: i32, bottom: i32| {
+            let part = CreateRectRgn(left, top, right, bottom);
+            CombineRgn(region, region, part, RGN_DIFF);
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(part);
+        };
+        cut(caption_left, 0, client.right, strip_height);
+        if band > 0 {
+            cut(0, strip_height, client.right, strip_height + band);
+        }
+        // The system owns the region from here on.
+        SetWindowRgn(group, region, 1);
+    }
+}
+
+/// The group's answer to `WM_NCHITTEST`: its empty strip space, and a restored window's top
+/// resize band, are the main window's caption (spec §4.1), so the window drags and resizes there.
+pub(crate) fn group_hit_test(hwnd: HWND, group: HWND, lparam: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLIENT, HTTRANSPARENT, IsZoomed};
+    let mut point = windows_sys::Win32::Foundation::POINT {
+        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point) };
+    let Some(layout) = group_id_of(hwnd, group).and_then(|id| strip_layout_of(hwnd, id)) else {
+        return HTCLIENT as LRESULT;
+    };
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1) };
+    let in_title_row = origin.y == 0 && point.y >= 0 && point.y < layout.height;
+    if !in_title_row {
+        return HTCLIENT as LRESULT;
+    }
+    let resizes = unsafe { IsZoomed(hwnd) } == 0 && point.y < title_layout(hwnd).resize_border;
+    let empty = layout.hit_test(crate::window::titlebar::Point::new(point.x, point.y))
+        == crate::window::group_strip::StripTarget::Empty;
+    if resizes || empty {
+        HTTRANSPARENT as LRESULT
+    } else {
+        HTCLIENT as LRESULT
+    }
+}
+
+/// A caption point (screen coordinates in `lparam`) over a title-row strip's empty space, as the
+/// group window and its client coordinates.
+fn caption_strip_point(hwnd: HWND, lparam: LPARAM) -> Option<(HWND, i32, i32)> {
+    let groups = unsafe { app_ptr(hwnd) }.map(|app| {
+        unsafe { app.as_ref() }
+            .groups
+            .iter()
+            .map(|group| (group.id, group.hwnd))
+            .collect::<Vec<_>>()
+    })?;
+    groups.into_iter().find_map(|(id, group)| {
+        if !is_top_group(hwnd, group) {
+            return None;
+        }
+        let mut point = windows_sys::Win32::Foundation::POINT {
+            x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+            y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+        };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point) };
+        let layout = strip_layout_of(hwnd, id)?;
+        (point.x >= 0
+            && point.x < layout.bounds().right
+            && point.y >= 0
+            && point.y < layout.height
+            && layout.hit_test(crate::window::titlebar::Point::new(point.x, point.y))
+                == crate::window::group_strip::StripTarget::Empty)
+            .then_some((group, point.x, point.y))
+    })
+}
+
+/// Paints what the group's children leave uncovered: the tab strip, the preview divider, and the
+/// empty hint while no tab is open.
+pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
+    let mut paint = windows_sys::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+    let dc = unsafe { windows_sys::Win32::Graphics::Gdi::BeginPaint(group, &mut paint) };
+    if dc.is_null() {
+        return;
+    }
+    let Some(id) = group_id_of(hwnd, group) else {
+        unsafe { windows_sys::Win32::Graphics::Gdi::EndPaint(group, &paint) };
+        return;
+    };
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
+    let (palette, fonts, _) = title_chrome(hwnd);
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(group, &mut client);
+    }
+    if let Some(layout) = strip_layout_of(hwnd, id)
+        && paint.rcPaint.top < layout.height
+    {
+        let (titles, active, _, _, preview_tab) = tab_snapshot(hwnd, id);
+        let titles = titles.iter().map(String::as_str).collect::<Vec<_>>();
+        let pointer = with_group_id(hwnd, id, |group| group.pointer).unwrap_or_default();
+        let (is_active_group, group_count) = unsafe { app_ptr(hwnd) }
+            .map(|app| {
+                let app = unsafe { app.as_ref() };
+                (app.tabs.active_group() == id, app.groups.len())
+            })
+            .unwrap_or((true, 1));
+        unsafe {
+            crate::window::group_strip::paint(
+                dc,
+                &layout,
+                dpi,
+                &crate::window::group_strip::StripPaint {
+                    titles: &titles,
+                    active,
+                    preview_tab,
+                    palette,
+                    fonts,
+                    pointer,
+                    accent: crate::window::group_strip::tab_accent(
+                        is_active_group,
+                        group_count,
+                        &palette,
+                    ),
+                },
+            );
+        }
+        client.top = layout.height + menu_band_height(hwnd) + name_box_band_height(hwnd, dpi);
+    }
+    if group_tab_count(hwnd, id) == 0 {
+        unsafe {
+            crate::window::titlebar::paint_empty_hint(
+                dc,
+                client,
+                EMPTY_TABS_HINT,
+                palette,
+                fonts.text(),
+                dpi,
+            );
+        }
+    }
+    if let Some(divider) =
+        crate::window::preview_host::with_group_host(hwnd, id, |host| host.divider_rect()).flatten()
+    {
+        unsafe { crate::window::titlebar::paint_divider(dc, divider, palette) };
+    }
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::EndPaint(group, &paint);
+    }
+}
+
+/// Focus given to the group window goes on to its content, as focus given to the frame does. With
+/// no tab open the frame keeps it, to take the menu keys.
+pub(crate) fn focus_group_content(hwnd: HWND) {
+    let target = (tab_count(hwnd) > 0)
+        .then(|| content_focus_target(hwnd))
+        .flatten()
+        .unwrap_or(hwnd);
+    unsafe {
+        SetFocus(target);
     }
 }
 
@@ -1204,7 +1737,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     // no way to display it), so it's left alone rather than truncated or rejected. With regex
     // on, it is escaped (as Search escapes it) so it matches only itself.
     let regex = unsafe { app_ptr(hwnd) }
-        .and_then(|app| Some(unsafe { app.as_ref() }.find_bar.as_ref()?.options().regex))
+        .and_then(|app| Some(unsafe { app.as_ref() }.find_bar()?.options().regex))
         .unwrap_or(false);
     let prefill = single_line_selection(hwnd).map(|text| {
         if regex {
@@ -1215,7 +1748,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     });
     let colors = title_chrome(hwnd).0;
     let pending = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
-        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
         Some(bar.show(mode, prefill.as_deref(), colors))
     });
     let Some(pending) = pending else {
@@ -1230,7 +1763,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     }
     layout_editor_and_find_bar(hwnd);
     if let Some(app) = unsafe { app_ptr(hwnd) }
-        && let Some(bar) = unsafe { app.as_ref() }.find_bar.as_ref()
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
     {
         bar.focus_query();
     }
@@ -1241,18 +1774,21 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
 /// made.
 fn ensure_find_bar(hwnd: HWND) -> bool {
     let Some(exists) =
-        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.find_bar.is_some())
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.find_bar().is_some())
     else {
         return false;
     };
     if exists {
         return true;
     }
-    let Ok(bar) = find_bar::FindBar::create(hwnd) else {
+    let Ok(bar) = find_bar::FindBar::create(content_parent(hwnd)) else {
         return false;
     };
     unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
-        unsafe { app.as_mut() }.find_bar = Some(bar);
+        let Some(group) = unsafe { app.as_mut() }.active_group_mut() else {
+            return false;
+        };
+        group.find_bar = Some(bar);
         true
     })
 }
@@ -1260,7 +1796,8 @@ fn ensure_find_bar(hwnd: HWND) -> bool {
 /// The active editor's selection as a query, when it is non-empty and on one line. A multi-line
 /// selection can't be shown in a one-line box, so it is left alone rather than cut.
 pub(crate) fn single_line_selection(hwnd: HWND) -> Option<String> {
-    let editor = unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())?;
+    let editor =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())?;
     let text = editor.selected_text().ok()?;
     (!text.is_empty() && !text.contains(['\n', '\r'])).then_some(text)
 }
@@ -1291,7 +1828,7 @@ pub(crate) fn close_find_bar(hwnd: HWND) {
         return;
     };
     let closed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
-        let Some(bar) = unsafe { app.as_mut() }.find_bar.as_mut() else {
+        let Some(bar) = unsafe { app.as_mut() }.find_bar_mut() else {
             return false;
         };
         bar.hide();
@@ -1313,12 +1850,13 @@ pub(crate) fn focus_content(hwnd: HWND) {
     }
 }
 
-/// The three parts F6 moves between, in tab order (spec §10).
+/// The parts F6 moves between, in tab order (spec §10): the sidebar's two, then every editor
+/// group by its place in the layout (split editors spec §6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusPart {
     ActivityBar,
     Panel,
-    Editor,
+    Group(usize),
 }
 
 /// The part after `current`, skipping a closed panel and, with notes mode off, the sidebar.
@@ -1327,12 +1865,16 @@ pub(crate) fn next_focus_part(
     backwards: bool,
     sidebar: bool,
     panel_open: bool,
+    groups: usize,
 ) -> FocusPart {
-    let parts: &[FocusPart] = match (sidebar, panel_open) {
-        (false, _) => &[FocusPart::Editor],
-        (true, false) => &[FocusPart::ActivityBar, FocusPart::Editor],
-        (true, true) => &[FocusPart::ActivityBar, FocusPart::Panel, FocusPart::Editor],
-    };
+    let mut parts = Vec::new();
+    if sidebar {
+        parts.push(FocusPart::ActivityBar);
+        if panel_open {
+            parts.push(FocusPart::Panel);
+        }
+    }
+    parts.extend((0..groups.max(1)).map(FocusPart::Group));
     let index = parts
         .iter()
         .position(|part| *part == current)
@@ -1363,6 +1905,12 @@ pub(crate) fn cycle_focus(hwnd: HWND, backwards: bool) {
     let windows = side_panel::windows(hwnd);
     let panel_open = windows.is_some() && side_panel::current_view(hwnd) != SidebarView::Hidden;
     let focus = unsafe { GetFocus() };
+    let order = group_order(hwnd);
+    let active = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+    let group_index = |id: Option<GroupId>| {
+        id.and_then(|id| order.iter().position(|group| *group == id))
+            .unwrap_or(0)
+    };
     let current = match windows {
         Some((bar, _)) if focus == bar => FocusPart::ActivityBar,
         Some((_, panel))
@@ -1373,9 +1921,19 @@ pub(crate) fn cycle_focus(hwnd: HWND, backwards: bool) {
         {
             FocusPart::Panel
         }
-        _ => FocusPart::Editor,
+        _ => {
+            let inside = unsafe { app_ptr(hwnd) }
+                .and_then(|app| unsafe { app.as_ref() }.group_containing(focus));
+            FocusPart::Group(group_index(inside.or(active)))
+        }
     };
-    match next_focus_part(current, backwards, windows.is_some(), panel_open) {
+    match next_focus_part(
+        current,
+        backwards,
+        windows.is_some(),
+        panel_open,
+        order.len(),
+    ) {
         FocusPart::ActivityBar => {
             if let Some((bar, _)) = windows {
                 unsafe {
@@ -1384,7 +1942,12 @@ pub(crate) fn cycle_focus(hwnd: HWND, backwards: bool) {
             }
         }
         FocusPart::Panel => side_panel::show_view(hwnd, side_panel::current_view(hwnd), true),
-        FocusPart::Editor => return_focus_to_editor(hwnd),
+        FocusPart::Group(index) => {
+            if let Some(group) = order.get(index) {
+                activate_group(hwnd, *group);
+            }
+            return_focus_to_editor(hwnd);
+        }
     }
 }
 
@@ -1434,8 +1997,7 @@ fn bar_band_height(hwnd: HWND) -> i32 {
     unsafe { app_ptr(hwnd) }.map_or(0, |app| {
         let app = unsafe { app.as_ref() };
         let find = app
-            .find_bar
-            .as_ref()
+            .find_bar()
             .filter(|bar| bar.is_visible())
             .map_or(0, |_| find_bar::find_bar_height(dpi));
         let name = app
@@ -1456,7 +2018,7 @@ fn content_focus_target(hwnd: HWND) -> Option<HWND> {
 }
 
 /// Overlays the palette at the top of the editor area, even with no tab open (New and Open stay
-/// available then), below a visible find bar or name box so both stay usable.
+/// available then), below the tab strip and a visible find bar or name box so all stay usable.
 fn layout_command_palette(hwnd: HWND) {
     if !with_command_palette(hwnd, CommandPalette::is_visible).unwrap_or(false) {
         return;
@@ -1671,19 +2233,38 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
         let selected = (!rows.is_empty()).then_some(0);
         return (rows, selected);
     }
-    // Nothing typed: the notes open in tabs, the most recently used first (spec §3.2). Tabs
-    // outside the notebook are left out here, untitled ones by having no path.
+    // Nothing typed: the notes open in tabs, the most recently used first (spec §3.2), across
+    // groups (split editors spec §7). Tabs outside the notebook are left out here, untitled ones
+    // by having no path.
+    let order = group_order(hwnd);
+    let number = |group: GroupId| {
+        (order.len() > 1)
+            .then(|| {
+                order
+                    .iter()
+                    .position(|id| *id == group)
+                    .map(|index| index + 1)
+            })
+            .flatten()
+    };
     let open = unsafe { app_ptr(hwnd) }
         .map(|app| {
             let tabs = &unsafe { app.as_ref() }.tabs;
-            let active = tabs.active().map(|document| document.id);
+            let active = tabs
+                .active()
+                .map(|document| (tabs.active_group(), document.id));
             tabs.activation_order()
                 .iter()
-                .filter_map(|&id| {
+                .filter_map(|&(group, id)| {
                     let path = tabs.document(id)?.path.as_deref()?;
                     let relative = crate::library::record_path(&folder, path);
-                    (!relative.is_absolute())
-                        .then(|| (crate::library::path_key(&relative), Some(id) == active))
+                    (!relative.is_absolute()).then(|| {
+                        (
+                            crate::library::path_key(&relative),
+                            Some((group, id)) == active,
+                            group,
+                        )
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -1695,7 +2276,7 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
     let (rows, first_active) = crate::window::library_host::with_state(hwnd, |state| {
         let wanted = open
             .iter()
-            .map(|(key, _)| key.as_str())
+            .map(|(key, ..)| key.as_str())
             .collect::<std::collections::HashSet<_>>();
         let mut listed = std::collections::HashMap::new();
         for note in &state.notes {
@@ -1706,7 +2287,7 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
         }
         let mut rows = Vec::new();
         let mut first_active = false;
-        for (key, active) in &open {
+        for (key, active, group) in &open {
             let Some(path) = listed.get(key) else {
                 continue;
             };
@@ -1716,7 +2297,11 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
             if rows.is_empty() {
                 first_active = *active;
             }
-            rows.push(PickerRow::Note { found, line: None });
+            rows.push(PickerRow::View {
+                found,
+                group: *group,
+                number: number(*group),
+            });
         }
         (rows, first_active)
     })
@@ -1730,6 +2315,26 @@ fn quick_open_rows(hwnd: HWND, query: &str) -> (Vec<command_palette::PickerRow>,
         _ => Some(0),
     };
     (rows, selected)
+}
+
+/// Shows `id`'s view in `group`, making that group active; never adds a view. False when `group`
+/// has no view of `id`. The focus stays where it is.
+pub(crate) fn focus_view(hwnd: HWND, group: GroupId, id: DocumentId) -> bool {
+    let revision = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let tabs = unsafe { app.as_ref() }.tabs.group(group)?;
+        tabs.contains(id).then(|| tabs.view().snapshot().revision)
+    });
+    let Some(revision) = revision else {
+        return false;
+    };
+    activate_group(hwnd, group);
+    let shown = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .group(group)
+            .is_some_and(|tabs| tabs.active_document() == Some(id))
+    });
+    shown || activate_document_in(hwnd, group, id, revision)
 }
 
 /// Opens a quick-open pick (spec §3.5). `relative` is resolved again against the notebook's
@@ -1780,7 +2385,7 @@ pub(crate) fn go_to_line(hwnd: HWND, line: u32) {
         return;
     }
     let Some(editor) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -1870,6 +2475,7 @@ fn refilter_command_palette(hwnd: HWND) {
         // New note and New folder need a notebook, open or loading, to put the item in (inline
         // naming spec §3.1).
         let notebook = crate::window::library_host::folder(hwnd).is_some();
+        let groups = unsafe { app_ptr(hwnd) }.map_or(1, |app| unsafe { app.as_ref() }.groups.len());
         let subset = with_command_palette(hwnd, CommandPalette::subset).flatten();
         let entries = command_palette::filter_entries(&query, |command| {
             subset.is_none_or(|subset| subset.contains(&command))
@@ -1878,6 +2484,8 @@ fn refilter_command_palette(hwnd: HWND) {
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
                 && (notebook || !matches!(command, CommandId::NoteNew | CommandId::NoteNewFolder))
+                // Close Group with one empty group would do nothing.
+                && (has_tabs || groups > 1 || command != CommandId::CloseGroup)
         });
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
@@ -1898,7 +2506,12 @@ pub(crate) fn paint_panel(hwnd: HWND, panel: HWND) {
         if let Some(palette) = app.command_palette.as_ref().filter(|p| p.owns(panel)) {
             palette.paint_panel(panel);
             true
-        } else if let Some(bar) = app.find_bar.as_ref().filter(|bar| bar.owns(panel)) {
+        } else if let Some(bar) = app
+            .groups
+            .iter()
+            .filter_map(|group| group.find_bar.as_ref())
+            .find(|bar| bar.owns(panel))
+        {
             bar.paint_panel(panel, glyph_font, text_font);
             true
         } else if let Some(name_box) = app.name_box.as_ref().filter(|n| n.owns(panel)) {
@@ -1972,8 +2585,7 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
     }
     let click = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .filter(|bar| bar.owns(panel))
             .and_then(|bar| bar.pointer(message, lparam))
     });
@@ -1989,8 +2601,7 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
 fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
     let wanted = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| bar.owns(panel) && bar.wants_tooltip())
     });
     if !wanted {
@@ -1999,7 +2610,7 @@ fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lp
     // Made with nothing of the App borrowed: creating the control sends messages.
     let created = crate::window::tooltip::Tooltip::create(panel);
     let tools = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
+        let bar = unsafe { app.as_ref() }.find_bar()?;
         bar.set_tooltip(created);
         Some(bar.toggle_tools())
     });
@@ -2020,7 +2631,7 @@ fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lp
 /// screen readers the check button's state changed, once the borrow is over.
 pub(crate) fn toggle_find_option(hwnd: HWND, option: crate::search::SearchOption) {
     let panel = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
-        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
         bar.toggle_option(option);
         Some(bar.panel_hwnd())
     });
@@ -2038,13 +2649,10 @@ pub(crate) fn toggle_find_option(hwnd: HWND, option: crate::search::SearchOption
 fn find_field_changed(hwnd: HWND, control: HWND) {
     let text = find_bar::control_text(control);
     let query = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
-        unsafe { app.as_mut() }
-            .find_bar
-            .as_mut()
-            .is_some_and(|bar| {
-                bar.field_changed(control, text);
-                bar.is_query(control)
-            })
+        unsafe { app.as_mut() }.find_bar_mut().is_some_and(|bar| {
+            bar.field_changed(control, text);
+            bar.is_query(control)
+        })
     });
     if query {
         set_find_no_match(hwnd, false);
@@ -2055,8 +2663,7 @@ fn find_field_changed(hwnd: HWND, control: HWND) {
 pub(crate) fn paint_find_placeholder(hwnd: HWND, edit: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| bar.paint_placeholder(edit))
     })
 }
@@ -2077,8 +2684,7 @@ fn name_box_owns(hwnd: HWND, control: HWND) -> bool {
 pub(crate) fn find_bar_owns(hwnd: HWND, control: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| bar.owns(control))
     })
 }
@@ -2096,8 +2702,7 @@ pub(crate) fn find_previous(hwnd: HWND) {
 fn find_again(hwnd: HWND, backward: bool) {
     let has_query = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
-            .find_bar
-            .as_ref()
+            .find_bar()
             .is_some_and(|bar| !bar.query_text().is_empty())
     });
     if has_query {
@@ -2113,8 +2718,8 @@ fn navigate_to_match(hwnd: HWND, backward: bool) {
     };
     let Some((editor, query, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
-        let bar = app.find_bar.as_ref()?;
+        let editor = app.editor().cloned()?;
+        let bar = app.find_bar()?;
         Some((editor, bar.query_text(), bar.options()))
     }) else {
         return;
@@ -2158,7 +2763,7 @@ fn select_match(
 
 fn set_find_no_match(hwnd: HWND, no_match: bool) {
     if let Some(app) = unsafe { app_ptr(hwnd) }
-        && let Some(bar) = unsafe { app.as_ref() }.find_bar.as_ref()
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
     {
         bar.set_no_match(no_match);
     }
@@ -2170,8 +2775,8 @@ pub(crate) fn replace_current(hwnd: HWND) {
     };
     let Some((editor, query, replacement, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
-        let bar = app.find_bar.as_ref()?;
+        let editor = app.editor().cloned()?;
+        let bar = app.find_bar()?;
         Some((editor, bar.query_text(), bar.replace_text(), bar.options()))
     }) else {
         return;
@@ -2201,8 +2806,8 @@ pub(crate) fn replace_all_matches(hwnd: HWND) {
     };
     let Some((editor, query, replacement, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
-        let bar = app.find_bar.as_ref()?;
+        let editor = app.editor().cloned()?;
+        let bar = app.find_bar()?;
         Some((editor, bar.query_text(), bar.replace_text(), bar.options()))
     }) else {
         return;
@@ -2226,24 +2831,8 @@ pub(crate) fn tab_count(hwnd: HWND) -> usize {
         .unwrap_or(1)
 }
 
-fn tab_scroll(hwnd: HWND) -> i32 {
-    unsafe { app_ptr(hwnd) }
-        .map(|app| unsafe { app.as_ref() }.tabs.scroll_offset())
-        .unwrap_or(0)
-}
-
 pub(crate) fn title_layout(hwnd: HWND) -> TitleBarLayout {
-    crate::window::titlebar::layout_for_window(
-        hwnd,
-        tab_count(hwnd),
-        tab_scroll(hwnd),
-        preview_buttons_visible(hwnd),
-    )
-}
-
-/// Whether the title strip shows the Markdown preview buttons (the active tab is Markdown).
-fn preview_buttons_visible(hwnd: HWND) -> bool {
-    crate::window::preview_host::buttons_visible(hwnd)
+    crate::window::titlebar::layout_for_window(hwnd)
 }
 
 /// Titles, active index, scroll offset, and whether the editor is hidden because no tab is open.
@@ -2256,21 +2845,23 @@ fn window_title(active_tab: Option<&str>) -> String {
     )
 }
 
+/// The window title for the active tab, as the title bar and the taskbar show it.
+fn active_window_title(hwnd: HWND) -> String {
+    window_title(
+        unsafe { app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.active().map(Document::title))
+            .as_deref(),
+    )
+}
+
 /// Brings the window text in line with the active tab. Runs on every frame paint, since every tab
 /// change (switch, open, close, save, dirty state) repaints the title strip.
 fn sync_window_title(hwnd: HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, SetWindowTextW};
-    let Some(title) = (unsafe { app_ptr(hwnd) }).map(|app| {
-        window_title(
-            unsafe { app.as_ref() }
-                .tabs
-                .active()
-                .map(Document::title)
-                .as_deref(),
-        )
-    }) else {
+    if unsafe { app_ptr(hwnd) }.is_none() {
         return;
-    };
+    }
+    let title = active_window_title(hwnd);
     let wanted = title.encode_utf16().collect::<Vec<_>>();
     // One spare unit so a longer current title never reads as equal after truncation.
     let mut current = vec![0u16; wanted.len() + 2];
@@ -2282,53 +2873,187 @@ fn sync_window_title(hwnd: HWND) {
     }
 }
 
-fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool, Option<usize>) {
+/// Group `id`'s tab titles, selected tab, strip scroll, whether it is empty, and its preview tab.
+fn tab_snapshot(hwnd: HWND, id: GroupId) -> (Vec<String>, usize, i32, bool, Option<usize>) {
     unsafe { app_ptr(hwnd) }
-        .map(|app| {
+        .and_then(|app| {
             let app = unsafe { app.as_ref() };
-            (
-                app.tabs.titles().collect(),
-                app.tabs.active_index(),
-                app.tabs.scroll_offset(),
-                app.editor.is_some() && app.tabs.is_empty(),
-                app.tabs.documents().position(|document| document.preview),
-            )
+            let group = app.tabs.group(id)?;
+            let documents = app.tabs.group_documents(id);
+            Some((
+                documents.iter().map(|document| document.title()).collect(),
+                group.active_index(),
+                group.scroll_offset(),
+                app.group(id).is_some() && group.is_empty(),
+                documents.iter().position(|document| document.preview),
+            ))
         })
         .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false, None))
 }
 
-/// Scrolls the tabs when the wheel turns over the tab strip; reports whether it was over it.
-fn scroll_tabs(hwnd: HWND, lparam: LPARAM, delta: i32) -> bool {
+fn group_tab_count(hwnd: HWND, id: GroupId) -> usize {
+    unsafe { app_ptr(hwnd) }
+        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.group(id)?.len()))
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the active editor group's window state.
+pub(crate) fn with_group<R>(
+    hwnd: HWND,
+    f: impl FnOnce(&mut crate::window::editor_group::GroupWindow) -> R,
+) -> Option<R> {
+    let mut app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_mut() }.active_group_mut().map(f)
+}
+
+/// The title-row strip in the main window's client coordinates, which the frame leaves to the
+/// group when it paints the title row.
+fn group_strip_bounds(hwnd: HWND) -> Vec<crate::window::titlebar::Rect> {
+    let groups = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .groups
+                .iter()
+                .map(|group| (group.id, group.hwnd))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    groups
+        .into_iter()
+        .filter_map(|(id, group)| {
+            let bounds = strip_layout_of(hwnd, id)?.bounds();
+            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut origin, 1)
+            };
+            (origin.y == 0).then(|| {
+                crate::window::titlebar::Rect::new(
+                    origin.x,
+                    0,
+                    origin.x + bounds.right,
+                    bounds.bottom,
+                )
+            })
+        })
+        .collect()
+}
+
+/// The active group's tab strip as laid out now, the same one it paints and hit-tests with.
+pub(crate) fn strip_layout(hwnd: HWND) -> Option<crate::window::group_strip::StripLayout> {
+    let id = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())?;
+    strip_layout_of(hwnd, id)
+}
+
+/// Group `id`'s tab strip as laid out now.
+pub(crate) fn strip_layout_of(
+    hwnd: HWND,
+    id: GroupId,
+) -> Option<crate::window::group_strip::StripLayout> {
+    let (group, count, scroll) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let tabs = app.tabs.group(id)?;
+        Some((app.group(id)?.hwnd, tabs.len(), tabs.scroll_offset()))
+    })?;
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(group) }.max(96);
+    Some(crate::window::group_strip::StripLayout::calculate(
+        crate::window::group_strip::strip_width(group),
+        dpi,
+        count,
+        scroll,
+    ))
+}
+
+pub(crate) fn invalidate_group_strip(hwnd: HWND, id: GroupId) {
+    let (Some(group), Some(layout)) = (
+        with_group_id(hwnd, id, |state| state.hwnd),
+        strip_layout_of(hwnd, id),
+    ) else {
+        return;
+    };
+    let bounds = layout.bounds();
+    let rect = RECT {
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+    };
+    unsafe {
+        InvalidateRect(group, &rect, 0);
+    }
+}
+
+pub(crate) fn update_strip_pointer(
+    hwnd: HWND,
+    id: GroupId,
+    update: impl FnOnce(
+        crate::window::group_strip::StripPointer,
+    ) -> crate::window::group_strip::StripPointer,
+) {
+    let changed = with_group_id(hwnd, id, |group| {
+        let next = update(group.pointer);
+        let changed = next != group.pointer;
+        group.pointer = next;
+        changed
+    })
+    .unwrap_or(false);
+    if changed {
+        invalidate_group_strip(hwnd, id);
+    }
+}
+
+/// What the group-client point is over in group `id`'s strip; `None` below it.
+pub(crate) fn strip_target(
+    hwnd: HWND,
+    id: GroupId,
+    x: i32,
+    y: i32,
+) -> Option<crate::window::group_strip::StripTarget> {
+    let layout = strip_layout_of(hwnd, id)?;
+    (y >= 0 && y < layout.height)
+        .then(|| layout.hit_test(crate::window::titlebar::Point::new(x, y)))
+}
+
+/// Scrolls the tabs when the wheel turns over the strip; reports whether it was over it. The
+/// point is in screen coordinates, as wheel messages carry it.
+fn scroll_tabs(hwnd: HWND, id: GroupId, group: HWND, lparam: LPARAM, delta: i32) -> bool {
     let mut point = windows_sys::Win32::Foundation::POINT {
         x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
         y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
     };
     unsafe {
-        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(group, &mut point);
     }
-    let layout = title_layout(hwnd);
-    if point.y < 0
-        || point.y >= layout.height
-        || point.x < layout.tabs.left
-        || point.x >= layout.overflow.left
-    {
+    let Some(layout) = strip_layout_of(hwnd, id) else {
+        return false;
+    };
+    if point.y < 0 || point.y >= layout.height || point.x < 0 || point.x >= layout.tabs.right {
         return false;
     }
     let scroll = layout.scroll_by_wheel(delta, WHEEL_DELTA as i32);
-    let changed = unsafe { app_ptr(hwnd) }
-        .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll));
-    if changed {
+    if set_strip_scroll(hwnd, id, scroll) {
         // The hovered tab moved out from under the pointer; the next mouse move finds the new one.
-        update_title_pointer(hwnd, |pointer| pointer.hover(None));
-        crate::window::titlebar::invalidate_strip(hwnd);
+        update_strip_pointer(hwnd, id, |pointer| pointer.hover(None));
+        invalidate_group_strip(hwnd, id);
     }
     true
 }
 
+/// Scrolls group `id`'s tabs to `offset`; returns whether it moved.
+fn set_strip_scroll(hwnd: HWND, id: GroupId, offset: i32) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .group(id)
+            .is_some_and(|tabs| tabs.selection().set_scroll_offset(offset))
+    })
+}
+
 /// Starts dragging the tab scroll thumb. Pressing the track beside the thumb first jumps the
 /// thumb there, centred under the pointer, so the same press can keep dragging it.
-fn begin_tab_thumb_drag(hwnd: HWND, x: i32) {
-    let layout = title_layout(hwnd);
+fn begin_tab_thumb_drag(hwnd: HWND, id: GroupId, group: HWND, x: i32) {
+    let Some(layout) = strip_layout_of(hwnd, id) else {
+        return;
+    };
     let Some(thumb) = layout.scroll_thumb() else {
         return;
     };
@@ -2336,41 +3061,34 @@ fn begin_tab_thumb_drag(hwnd: HWND, x: i32) {
         x - thumb.left
     } else {
         let grab = (thumb.right - thumb.left) / 2;
-        if let Some(app) = unsafe { app_ptr(hwnd) } {
-            unsafe { app.as_ref() }
-                .tabs
-                .set_scroll_offset(layout.scroll_for_thumb(x - grab));
-        }
+        set_strip_scroll(hwnd, id, layout.scroll_for_thumb(x - grab));
         grab
     };
-    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_mut() }.tab_thumb_grab = Some(grab);
-    }
+    with_group_id(hwnd, id, |state| state.thumb_grab = Some(grab));
     unsafe {
-        SetCapture(hwnd);
+        SetCapture(group);
     }
-    crate::window::titlebar::invalidate_strip(hwnd);
+    invalidate_group_strip(hwnd, id);
 }
 
-fn drag_tab_thumb(hwnd: HWND, lparam: LPARAM) {
-    let Some(grab) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tab_thumb_grab)
-    else {
-        return;
+/// Follows the pointer while the thumb is dragged; reports whether a drag is in progress.
+fn drag_tab_thumb(hwnd: HWND, id: GroupId, x: i32) -> bool {
+    let Some(grab) = with_group_id(hwnd, id, |group| group.thumb_grab).flatten() else {
+        return false;
     };
-    let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-    let scroll = title_layout(hwnd).scroll_for_thumb(x - grab);
-    if unsafe { app_ptr(hwnd) }
-        .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll))
-    {
-        crate::window::titlebar::invalidate_strip(hwnd);
+    let Some(layout) = strip_layout_of(hwnd, id) else {
+        return true;
+    };
+    if set_strip_scroll(hwnd, id, layout.scroll_for_thumb(x - grab)) {
+        invalidate_group_strip(hwnd, id);
     }
+    true
 }
 
 /// Ends a thumb drag; reports whether one was in progress, so the release activates nothing.
-fn end_tab_thumb_drag(hwnd: HWND) -> bool {
-    let dragging = unsafe { app_ptr(hwnd) }
-        .and_then(|mut app| unsafe { app.as_mut() }.tab_thumb_grab.take())
+fn end_tab_thumb_drag(hwnd: HWND, id: GroupId) -> bool {
+    let dragging = with_group_id(hwnd, id, |group| group.thumb_grab.take())
+        .flatten()
         .is_some();
     if dragging {
         unsafe {
@@ -2380,15 +3098,218 @@ fn end_tab_thumb_drag(hwnd: HWND) -> bool {
     dragging
 }
 
+/// Opens the tab-strip menu at group-client `x`, `y`. The menu belongs to the main window, whose
+/// modal accounting holds deferred work while it is open.
+fn show_group_strip_menu(hwnd: HWND, group: HWND, x: i32, y: i32) {
+    let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut point, 1);
+    }
+    let has_tabs = tab_count(hwnd) > 0;
+    if let Some(command) = menus::show_tab_strip_menu(hwnd, point.x, point.y, has_tabs) {
+        execute_command(hwnd, command);
+    }
+}
+
+/// The tab strip's share of the group window's pointer messages (split editors spec §4.2): what
+/// the title bar used to do for the tabs. `None` leaves the message to the window's default.
+pub(crate) fn group_strip_message(
+    hwnd: HWND,
+    group: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    use crate::window::group_strip::StripTarget;
+    // Everything below acts on this strip's own group; a press has already made it active.
+    let id = group_id_of(hwnd, group)?;
+    let (x, y) = (
+        (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    );
+    // Clicking the strip leaves menu mode, as a click anywhere else off the menu band does.
+    if matches!(
+        message,
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MBUTTONDOWN | WM_RBUTTONUP
+    ) {
+        exit_menu_mode(hwnd);
+    }
+    match message {
+        WM_RBUTTONDOWN if crate::window::tab_drag::cancel_for_right_press(hwnd) => Some(0),
+        WM_MOUSEMOVE => {
+            if drag_tab_thumb(hwnd, id, x) {
+                return Some(0);
+            }
+            if crate::window::tab_drag::mouse_move(hwnd, group, x, y, wparam) {
+                return Some(0);
+            }
+            let mut track = windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT,
+                >() as u32,
+                dwFlags: windows_sys::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE,
+                hwndTrack: group,
+                dwHoverTime: 0,
+            };
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut track) };
+            let target = strip_target(hwnd, id, x, y);
+            update_strip_pointer(hwnd, id, |pointer| pointer.hover(target));
+            Some(0)
+        }
+        WM_MOUSELEAVE => {
+            update_strip_pointer(hwnd, id, |pointer| pointer.hover(None));
+            // A middle press whose release never reaches the strip must not close a tab later.
+            with_group_id(hwnd, id, |state| state.middle_press = None);
+            Some(0)
+        }
+        // The class has CS_DBLCLKS, so a second click comes as a double-click: on empty strip it
+        // opens a tab (VS Code style); anywhere else it is one more press.
+        WM_LBUTTONDBLCLK if strip_target(hwnd, id, x, y) == Some(StripTarget::Empty) => {
+            execute_command(hwnd, CommandId::New);
+            Some(0)
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let target = strip_target(hwnd, id, x, y)?;
+            update_strip_pointer(hwnd, id, |pointer| {
+                pointer.hover(Some(target)).press(Some(target))
+            });
+            if target == StripTarget::ScrollBar {
+                begin_tab_thumb_drag(hwnd, id, group, x);
+            }
+            if let StripTarget::Tab(index) = target {
+                crate::window::tab_drag::arm(hwnd, id, group, index, x, y);
+            }
+            Some(0)
+        }
+        // A release acts only over the target its press went down on, so the release that ends
+        // a double-click on empty strip never hits the tab that double-click just opened.
+        WM_LBUTTONUP => {
+            if crate::window::tab_drag::release(hwnd, group, x, y, wparam) {
+                update_strip_pointer(hwnd, id, |pointer| pointer.press(None));
+                return Some(0);
+            }
+            let mut activated = None;
+            update_strip_pointer(hwnd, id, |pointer| {
+                let (next, released) = pointer.release(strip_target(hwnd, id, x, y));
+                activated = released;
+                next
+            });
+            if end_tab_thumb_drag(hwnd, id) {
+                return Some(0);
+            }
+            match activated? {
+                StripTarget::CloseTab(index) => {
+                    activate_tab(hwnd, index);
+                    execute_command(hwnd, CommandId::CloseTab);
+                }
+                StripTarget::Tab(index) => {
+                    activate_tab(hwnd, index);
+                    if tab_double_click(hwnd, index)
+                        && let Some(id) = unsafe { app_ptr(hwnd) }
+                            .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+                    {
+                        promote_tab(hwnd, id);
+                    }
+                }
+                StripTarget::ScrollBar | StripTarget::Empty => {}
+            }
+            Some(0)
+        }
+        WM_RBUTTONUP if crate::window::tab_drag::right_release(hwnd) => Some(0),
+        WM_RBUTTONUP if strip_target(hwnd, id, x, y) == Some(StripTarget::Empty) => {
+            show_group_strip_menu(hwnd, group, x, y);
+            Some(0)
+        }
+        // A tab's menu acts on that tab, so it is activated first.
+        WM_RBUTTONUP => match strip_target(hwnd, id, x, y) {
+            Some(StripTarget::Tab(index) | StripTarget::CloseTab(index)) => {
+                activate_tab(hwnd, index);
+                let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+                unsafe {
+                    windows_sys::Win32::Graphics::Gdi::MapWindowPoints(group, hwnd, &mut point, 1)
+                };
+                if let Some(command) = menus::show_tab_menu(hwnd, point.x, point.y) {
+                    execute_command(hwnd, command);
+                }
+                Some(0)
+            }
+            _ => None,
+        },
+        // A middle-click closes the tab under the pointer (quick-open spec §5).
+        WM_MBUTTONDOWN => {
+            let press = match strip_target(hwnd, id, x, y) {
+                Some(StripTarget::Tab(index) | StripTarget::CloseTab(index)) => {
+                    tab_id_at(hwnd, index).map(|id| (index, id))
+                }
+                _ => None,
+            };
+            with_group_id(hwnd, id, |state| state.middle_press = press);
+            Some(0)
+        }
+        WM_MBUTTONUP => {
+            let press = with_group_id(hwnd, id, |state| state.middle_press.take()).flatten();
+            // Only over the pressed tab, and only while it still shows the same document.
+            if let Some((index, document)) = press
+                && let Some(StripTarget::Tab(released) | StripTarget::CloseTab(released)) =
+                    strip_target(hwnd, id, x, y)
+                && released == index
+                && tab_id_at(hwnd, index) == Some(document)
+            {
+                close_tab_at(hwnd, index);
+            }
+            Some(0)
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let delta = i32::from((wparam >> 16) as u16 as i16);
+            // Wheel up scrolls toward the first tab; a tilt to the right toward the last.
+            let delta = if message == WM_MOUSEWHEEL {
+                -delta
+            } else {
+                delta
+            };
+            scroll_tabs(hwnd, id, group, lparam, delta).then_some(0)
+        }
+        WM_CAPTURECHANGED => {
+            with_group_id(hwnd, id, |state| state.thumb_grab = None);
+            if lparam as HWND != group {
+                crate::window::tab_drag::cancel(hwnd);
+            }
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// The tab strip's accessible object, for the group window's `WM_GETOBJECT`.
+pub(crate) fn group_accessible_object(hwnd: HWND, group: HWND, wparam: WPARAM) -> LRESULT {
+    let provider = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let id = app.groups.iter().find(|state| state.hwnd == group)?.id;
+        let tabs = app.tabs.group(id)?;
+        let (view, selection) = (tabs.view(), tabs.selection());
+        let state = app.group_mut(id)?;
+        Some(state.accessibility.ensure(
+            group,
+            crate::window::accessibility::ProviderKind::GroupStrip,
+            view,
+            selection,
+        ))
+    });
+    match provider {
+        Some(provider) => unsafe { crate::window::accessibility::object_result(provider, wparam) },
+        None => 0,
+    }
+}
+
 /// Follows every change to the set of tabs or the active one: scrolls the active tab into view,
 /// shows the editor only while a tab is open, and repaints.
-fn refresh_tabs(hwnd: HWND) {
+pub(crate) fn refresh_tabs(hwnd: HWND) {
     let Some((count, active, editor_hwnd)) = (unsafe { app_ptr(hwnd) }).map(|app| {
         let app = unsafe { app.as_ref() };
         (
             app.tabs.len(),
             app.tabs.active_index(),
-            app.editor.as_ref().map(Editor::hwnd),
+            app.editor().map(Editor::hwnd),
         )
     }) else {
         return;
@@ -2396,7 +3317,7 @@ fn refresh_tabs(hwnd: HWND) {
     let scroll = if count == 0 {
         0
     } else {
-        title_layout(hwnd).scroll_to_reveal(active)
+        strip_layout(hwnd).map_or(0, |layout| layout.scroll_to_reveal(active))
     };
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll);
@@ -2457,6 +3378,13 @@ fn execute_command(hwnd: HWND, command: CommandId) {
     execute_command_with_note(hwnd, command, None);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The last command `execute_command_with_note` received, for the tests that check what a
+    /// key chord runs.
+    static LAST_COMMAND: std::cell::Cell<Option<CommandId>> = const { std::cell::Cell::new(None) };
+}
+
 /// Counts `is_sidebar` commands that ran past the notes-mode guard below. The sidebar's own state
 /// (`app.sidebar`, the Search view's options) already reads as empty/default with no sidebar to
 /// hold it, so a test disabling notes mode has nothing else to observe; this hook makes the guard
@@ -2473,6 +3401,8 @@ fn sidebar_command_runs() -> u32 {
 /// row that `capture_palette_focus` recorded when the palette opened, taken by
 /// `run_command_palette_selection` before closing it moved focus off the panel (spec §6.3).
 fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathBuf>) {
+    #[cfg(test)]
+    LAST_COMMAND.with(|last| last.set(Some(command)));
     exit_menu_mode(hwnd);
     if file_population_active(hwnd) {
         return;
@@ -2513,6 +3443,10 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         if index < tab_count(hwnd) {
             activate_tab(hwnd, index);
         }
+        return;
+    }
+    if let Some(index) = command.group_index() {
+        focus_group_number(hwnd, index);
         return;
     }
     match command {
@@ -2668,6 +3602,21 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             }
         }
         CommandId::CloseNotebook => crate::window::library_host::close_notebook(hwnd),
+        CommandId::SplitRight => {
+            split_active_group(hwnd, crate::window::split_tree::Direction::Right);
+        }
+        CommandId::MoveTabToNextGroup => move_active_view(hwnd, true),
+        CommandId::MoveTabToPreviousGroup => move_active_view(hwnd, false),
+        CommandId::SplitDown => {
+            split_active_group(hwnd, crate::window::split_tree::Direction::Down);
+        }
+        CommandId::CloseGroup => {
+            if let Some(group) =
+                unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+            {
+                close_group(hwnd, group);
+            }
+        }
         CommandId::ToggleNotebookFavorite => {
             crate::window::library_host::toggle_notebook_favorite(hwnd);
         }
@@ -2724,15 +3673,22 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             if crate::window::image_host::zoom(hwnd, command)
                 || crate::window::image_host::active_is_image(hwnd)
                 || crate::window::preview_host::zoom_svg(hwnd, command) => {}
-        CommandId::ZoomIn => with_editor(hwnd, |editor| {
-            let _ = editor.zoom_in();
-        }),
-        CommandId::ZoomOut => with_editor(hwnd, |editor| {
-            let _ = editor.zoom_out();
-        }),
-        CommandId::ZoomReset => with_editor(hwnd, |editor| {
-            let _ = editor.reset_zoom();
-        }),
+        // One zoom for every group (split editors plan amendment 11).
+        CommandId::ZoomIn => {
+            for editor in all_editors(hwnd) {
+                let _ = editor.zoom_in();
+            }
+        }
+        CommandId::ZoomOut => {
+            for editor in all_editors(hwnd) {
+                let _ = editor.zoom_out();
+            }
+        }
+        CommandId::ZoomReset => {
+            for editor in all_editors(hwnd) {
+                let _ = editor.reset_zoom();
+            }
+        }
         CommandId::MarkdownPreviewCycle
         | CommandId::MarkdownPreviewSide
         | CommandId::MarkdownPreviewFull
@@ -2921,7 +3877,7 @@ fn apply_detected_language(hwnd: HWND) {
 /// itself is also left unchanged by `LanguageManager::apply` on failure) and surfaces the error.
 fn apply_language(hwnd: HWND, language: crate::document::Language) {
     let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -3052,22 +4008,16 @@ fn editor_settings_applied() -> usize {
 fn apply_editor_settings(hwnd: HWND) {
     #[cfg(test)]
     EDITOR_SETTINGS_APPLIED.with(|count| count.set(count.get() + 1));
-    let Some((editor, settings, palette)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((settings, palette)) = (unsafe { app_ptr(hwnd) }).map(|app| {
         let app = unsafe { app.as_ref() };
         let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
-        Some((app.editor.clone()?, app.settings.clone(), palette))
+        (app.settings.clone(), palette)
     }) else {
         return;
     };
-    let _ = editor.set_line_numbers(settings.line_numbers);
-    let _ = editor.apply_view_settings(
-        &settings.font_face,
-        settings.font_size,
-        settings.tab_width,
-        settings.word_wrap,
-    );
-    let _ =
-        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    for editor in all_editors(hwnd) {
+        apply_settings_to(&editor, &settings, palette);
+    }
     crate::window::preview_host::refresh_appearance(hwnd);
     crate::window::image_host::refresh_appearance(hwnd);
 }
@@ -3200,12 +4150,14 @@ fn apply_theme(hwnd: HWND) {
     let Some((editor, language, palette, frame_change)) =
         (unsafe { app_ptr(hwnd) }).and_then(|mut app| {
             let app = unsafe { app.as_mut() };
-            let editor = app.editor.clone()?;
+            let editor = app.editor().cloned()?;
             let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
             let frame_change = app.dark_frame_applied != palette.dark_frame;
             app.dark_frame_applied = palette.dark_frame;
-            if let Some(bar) = app.find_bar.as_mut() {
-                bar.set_colors(palette);
+            for group in &mut app.groups {
+                if let Some(bar) = group.find_bar.as_mut() {
+                    bar.set_colors(palette);
+                }
             }
             if let Some(name_box) = app.name_box.as_mut() {
                 name_box.set_colors(palette);
@@ -3224,18 +4176,16 @@ fn apply_theme(hwnd: HWND) {
     else {
         return;
     };
-    let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
-    let _ =
-        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
-    let _ = editor.set_chrome_colors(
-        palette.selection_background,
-        palette.inactive_selection_background,
-        palette.caret_line_background,
-    );
-    let _ = editor.set_selection_text_colors(palette.selection_foreground);
+    for editor in all_editors(hwnd) {
+        apply_colors_to(&editor, palette);
+    }
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_ref() };
-        if let Some(bar) = app.find_bar.as_ref() {
+        for bar in app
+            .groups
+            .iter()
+            .filter_map(|group| group.find_bar.as_ref())
+        {
             bar.invalidate();
         }
         if let Some(name_box) = app.name_box.as_ref() {
@@ -3251,6 +4201,20 @@ fn apply_theme(hwnd: HWND) {
     if language != crate::document::Language::PlainText {
         apply_language(hwnd, language);
     }
+    let others: Vec<GroupId> = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let app = unsafe { app.as_ref() };
+            let active = app.tabs.active_group();
+            app.groups
+                .iter()
+                .map(|group| group.id)
+                .filter(|id| *id != active)
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in others {
+        style_group_view(hwnd, id);
+    }
     crate::window::preview_host::refresh_appearance(hwnd);
     crate::window::image_host::refresh_appearance(hwnd);
     crate::window::side_panel::refresh(hwnd);
@@ -3258,7 +4222,7 @@ fn apply_theme(hwnd: HWND) {
 
 /// Copies what a title-strip paint needs out of App, creating the per-DPI fonts on first use.
 /// Before chrome is built the palette is the neutral compiled one (no theme queries).
-fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
+pub(crate) fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     unsafe { app_ptr(hwnd) }
         .map(|mut app| {
@@ -3286,18 +4250,6 @@ fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
                 PointerState::default(),
             )
         })
-}
-
-/// Whether the screen point in a non-client mouse message's `lparam` is over the sidebar.
-fn over_sidebar(hwnd: HWND, lparam: LPARAM) -> bool {
-    let mut point = windows_sys::Win32::Foundation::POINT {
-        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
-        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
-    };
-    unsafe {
-        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
-    }
-    point.x < crate::window::side_panel::left_edge(hwnd)
 }
 
 fn client_title_target(hwnd: HWND, lparam: LPARAM) -> Option<HitTarget> {
@@ -3359,14 +4311,16 @@ fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::StatusBarText
     app.status.as_ref()?;
     let active = app.tabs.active().and_then(|document| {
         Some(crate::window::status::ActiveDocumentStatus {
-            caret: app.editor.as_ref()?.caret_status().ok()?,
+            caret: app.editor()?.caret_status().ok()?,
             language: document.language,
             encoding: document.encoding,
         })
     });
     let mut bar = crate::window::status::status_bar_text(&app.notifications, active);
     if app.notifications.pending().is_empty()
-        && let Some(hint) = app.preview.status_hint()
+        && let Some(hint) = app
+            .active_group()
+            .and_then(|group| group.preview.status_hint())
     {
         bar.left = hint;
     }
@@ -3425,7 +4379,7 @@ fn dismiss_notifications(hwnd: HWND) {
 /// touches the editor's text, selection, or undo stack either way.
 fn validate_active_json(hwnd: HWND) {
     let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -3451,7 +4405,7 @@ fn validate_active_json(hwnd: HWND) {
 /// editor mutation is attempted.
 fn format_active_json(hwnd: HWND) {
     let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -3501,6 +4455,15 @@ fn json_issue_message(issue: &crate::languages::JsonIssue) -> String {
     }
 }
 
+/// A launch with no file leaves no tab: the empty untitled tab the window started with closes
+/// once the session restore has had its turn, unless it is not alone or has text by now.
+fn close_unused_startup_tab(hwnd: HWND) {
+    let alone = unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.tabs.len() == 1);
+    if alone && empty_startup_tab(hwnd).is_some() {
+        close_active_document(hwnd);
+    }
+}
+
 fn handle_open_request(hwnd: HWND) -> LRESULT {
     let request = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
@@ -3543,9 +4506,12 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
                 }
             }
         }
-        crate::launch::LaunchRequest::New => unsafe {
-            let _ = record_milestone(hwnd, Milestone::FileLoaded);
-        },
+        crate::launch::LaunchRequest::New => {
+            close_unused_startup_tab(hwnd);
+            unsafe {
+                let _ = record_milestone(hwnd, Milestone::FileLoaded);
+            }
+        }
     }
     if unsafe { window_identity(hwnd) }.is_some_and(|identity| identity.is_live_for(hwnd)) {
         unsafe {
@@ -3572,14 +4538,10 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
             "file population is already active",
         ));
     }
-    let existing = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let app = unsafe { app.as_ref() };
-        app.tabs
-            .find_path(path)
-            .map(|id| (id, app.tabs.view().snapshot().revision))
-    });
-    if let Some((id, revision)) = existing {
-        return if activate_document(hwnd, id, revision) {
+    let existing =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.find_path(path));
+    if let Some(id) = existing {
+        return if open_in_active_group(hwnd, id) {
             unsafe {
                 PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
             }
@@ -3628,19 +4590,22 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
         ))?;
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         // A preview goes where the preview tab is. Without one it is placed like any new tab,
         // reusing an empty start tab.
         let replace_preview = preview && app.tabs.preview_id().is_some();
+        // An untitled tab another group also shows stays: that view keeps it.
         let candidate_ids = app
             .tabs
             .active()
             .filter(|active| !replace_preview && !active.dirty && active.path.is_none())
+            .filter(|active| app.tabs.views_of(active.id).len() == 1)
             .map(|active| (active.id, active.recovery_id));
         (editor, candidate_ids, replace_preview)
     };
+    remember_active_view(hwnd);
     // With no tab open this is the hidden placeholder document.
     let previous = editor.current_document()?;
     let reused_ids = match candidate_ids {
@@ -3752,8 +4717,8 @@ fn open_image_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Resul
         ))?;
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         let replace_preview = preview && app.tabs.preview_id().is_some();
         let candidate_ids = app
@@ -3765,6 +4730,7 @@ fn open_image_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Resul
             .map(|active| (active.id, active.recovery_id));
         (editor, candidate_ids, replace_preview)
     };
+    remember_active_view(hwnd);
     let reused_ids = match candidate_ids {
         Some(ids) if editor.text()?.is_empty() => Some(ids),
         _ => None,
@@ -3843,7 +4809,7 @@ pub(crate) fn open_note(
         .and_then(|app| unsafe { app.as_ref() }.tabs.find_stored_path(path));
     match open {
         Some(id) => {
-            if !activate_document_by_id(hwnd, id) {
+            if !open_in_active_group(hwnd, id) {
                 return Err(crate::FastPadError::Invariant(
                     "the note's tab could not be activated",
                 ));
@@ -3917,7 +4883,7 @@ fn seed_find_bar(
     }
     let colors = title_chrome(hwnd).0;
     let pending = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
-        let bar = unsafe { app.as_mut() }.find_bar.as_mut()?;
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
         Some(bar.show_with(find_bar::FindBarMode::Find, query, options, colors))
     });
     let Some(pending) = pending else {
@@ -3930,7 +4896,7 @@ fn seed_find_bar(
     }
     layout_editor_and_find_bar(hwnd);
     let Some(editor) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
     else {
         return;
     };
@@ -3961,18 +4927,17 @@ fn tab_double_click(hwnd: HWND, index: usize) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
     let now = unsafe { GetMessageTime() } as u32;
     let limit = unsafe { GetDoubleClickTime() };
-    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+    let Some(id) = tab_id_at(hwnd, index) else {
         return false;
     };
-    let app = unsafe { app.as_mut() };
-    let Some(id) = app.tabs.view().snapshot().tabs.get(index).map(|tab| tab.id) else {
-        return false;
-    };
-    let double = app
-        .last_tab_click
-        .is_some_and(|(last, at)| last == id && now.wrapping_sub(at) <= limit);
-    app.last_tab_click = if double { None } else { Some((id, now)) };
-    double
+    with_group(hwnd, |group| {
+        let double = group
+            .last_tab_click
+            .is_some_and(|(last, at)| last == id && now.wrapping_sub(at) <= limit);
+        group.last_tab_click = if double { None } else { Some((id, now)) };
+        double
+    })
+    .unwrap_or(false)
 }
 
 pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
@@ -3993,13 +4958,14 @@ pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
         };
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         let (id, recovery_id) = app.allocate_document_identity();
         (editor, id, recovery_id)
     };
 
+    remember_active_view(hwnd);
     let document = Document::untitled(id, recovery_id, editor.create_document()?);
     document
         .expect_text()
@@ -4052,6 +5018,21 @@ fn cycle_tab(hwnd: HWND, forward: bool) {
 }
 
 fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
+    let Some(group) =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    else {
+        return false;
+    };
+    activate_document_in(hwnd, group, id, revision)
+}
+
+/// Shows `id`'s view in `group`, provided `group`'s strip is still at `revision`.
+pub(crate) fn activate_document_in(
+    hwnd: HWND,
+    group: GroupId,
+    id: DocumentId,
+    revision: u64,
+) -> bool {
     if file_population_active(hwnd) {
         return false;
     }
@@ -4060,52 +5041,64 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
     };
     let leaving = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        (app.tabs.view().snapshot().revision == revision)
-            .then(|| app.tabs.active().is_some_and(|active| active.id != id))
+        let tabs = app.tabs.group(group)?;
+        (tabs.view().snapshot().revision == revision).then(|| {
+            (
+                tabs.active_document() != Some(id),
+                app.tabs.active_group() == group,
+            )
+        })
     });
-    let Some(leaving) = leaving else {
+    let Some((leaving, active)) = leaving else {
         return false;
     };
     // Saving the tab being left bumps the view revision itself, so the caller's revision is
-    // checked before it; afterwards `activate` still refuses an `id` that has gone.
-    if leaving {
+    // checked before it; afterwards `activate_in` still refuses an `id` that has gone.
+    if leaving && active {
         crate::window::library_host::autosave_active(hwnd);
         if !identity.is_live_for(hwnd) {
             return false;
         }
     }
-    let target = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
-        let app = unsafe { app.as_mut() };
-        let editor = app.editor.clone()?;
-        app.tabs.activate(id).ok()?;
-        Some((editor, app.tabs.active_handle().cloned()))
-    });
-    let Some((editor, handle)) = target else {
-        return false;
-    };
-    // An image tab has no text: the hidden editor holds an empty placeholder, as with no tab open.
-    let handle = match handle {
-        Some(handle) => handle,
-        None => match editor.create_document() {
-            Ok(blank) => blank,
-            Err(_) => return false,
-        },
-    };
-    if editor.use_document(&handle).is_err() || !identity.is_live_for(hwnd) {
+    if leaving {
+        remember_view(hwnd, group);
+    }
+    let activated = unsafe { app_ptr(hwnd) }
+        .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.activate_in(group, id));
+    if !activated || !show_group_view(hwnd, group) || !identity.is_live_for(hwnd) {
         return false;
     }
-    refresh_tabs(hwnd);
-    crate::window::image_host::check_disk(hwnd);
+    if active {
+        refresh_tabs(hwnd);
+        crate::window::image_host::check_disk(hwnd);
+    } else if let Some(window) = with_group_id(hwnd, group, |state| state.hwnd) {
+        unsafe { InvalidateRect(window, std::ptr::null(), 0) };
+        crate::window::notebook_view::editors_changed(hwnd);
+    }
     true
 }
 
-fn handle_accessible_select(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+/// `remember_view` for the active group.
+fn remember_active_view(hwnd: HWND) {
+    if let Some(group) =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    {
+        remember_view(hwnd, group);
+    }
+}
+
+/// Selects a tab for the strip provider of the group window `wparam`.
+fn handle_accessible_select(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if lparam == 0 {
         return 0;
     }
     let request = unsafe { *(lparam as *const AccessibleSelectRequest) };
-    isize::from(activate_document(
+    let Some(group) = group_id_of(hwnd, wparam as HWND) else {
+        return 0;
+    };
+    isize::from(activate_document_in(
         hwnd,
+        group,
         request.document_id,
         request.revision,
     ))
@@ -4115,6 +5108,17 @@ fn close_active_document(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    // Another group still shows the document: only this view closes, without asking (split
+    // editors spec §5.4). Its text and dirty state stay with the other view.
+    let shared = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let review = app.tabs.active_close_review()?;
+        (app.tabs.views_of(review.id).len() > 1).then(|| (review, app.editor().cloned()))
+    });
+    if let Some((review, Some(editor))) = shared {
+        close_reviewed_document(hwnd, &identity, &editor, review, CloseDecision::Discard);
+        return;
+    }
     // A saved note is clean now and closes without a prompt; paused or failed ones still ask.
     crate::window::library_host::autosave_active(hwnd);
     if !identity.is_live_for(hwnd) {
@@ -4124,7 +5128,12 @@ fn close_active_document(hwnd: HWND) {
         let app = unsafe { app.as_ref() };
         let review = app.tabs.active_close_review()?;
         let document = app.tabs.document(review.id)?;
-        Some((review, document.dirty, document.title(), app.editor.clone()))
+        Some((
+            review,
+            document.dirty,
+            document.title(),
+            app.editor().cloned(),
+        ))
     });
     let Some((review, dirty, title, Some(editor))) = snapshot else {
         return;
@@ -4157,9 +5166,9 @@ fn close_active_document(hwnd: HWND) {
 /// Closes tab `id` as a middle-click on it does (open editors spec §3.2), if it is still open.
 pub(crate) fn close_document_tab(hwnd: HWND, id: DocumentId) {
     let index = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        unsafe { app.as_ref() }
-            .tabs
-            .documents()
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.group_documents(tabs.active_group())
+            .into_iter()
             .position(|document| document.id == id)
     });
     if let Some(index) = index {
@@ -4176,7 +5185,7 @@ fn close_tab_at(hwnd: HWND, index: usize) {
     };
     let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let tabs = &unsafe { app.as_ref() }.tabs;
-        let document = tabs.documents().nth(index)?;
+        let document = *tabs.group_documents(tabs.active_group()).get(index)?;
         let background = tabs.active().is_some_and(|active| active.id != document.id);
         Some((
             crate::window::tabs::CloseReview {
@@ -4217,31 +5226,52 @@ fn refresh_quick_open_after_close(hwnd: HWND) {
 /// The document shown by tab `index` of the strip.
 fn tab_id_at(hwnd: HWND, index: usize) -> Option<DocumentId> {
     unsafe { app_ptr(hwnd) }.and_then(|app| {
-        unsafe { app.as_ref() }
-            .tabs
-            .documents()
-            .nth(index)
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.group_documents(tabs.active_group())
+            .get(index)
             .map(|document| document.id)
     })
 }
 
 /// Closes `id` without asking, discarding any unsaved edits, e.g. once its file is deleted.
+/// Every group's view of `id` closes, each without asking (split editors spec §5.6).
 pub(super) fn close_document_without_prompt(hwnd: HWND, id: DocumentId) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    if !activate_document_by_id(hwnd, id) || !identity.is_live_for(hwnd) {
-        return;
+    let previous = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+    close_every_view(hwnd, &identity, id);
+    // Closing a view elsewhere activated its group; the one the user was in stays active.
+    if let Some(previous) = previous
+        && identity.is_live_for(hwnd)
+        && with_group_id(hwnd, previous, |_| ()).is_some()
+    {
+        activate_group(hwnd, previous);
     }
-    let reviewed = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let app = unsafe { app.as_ref() };
-        Some((app.tabs.active_close_review()?, app.editor.clone()?))
-    });
-    let Some((review, editor)) = reviewed else {
-        return;
+}
+
+fn close_every_view(hwnd: HWND, identity: &WindowIdentity, id: DocumentId) {
+    let views = || {
+        unsafe { app_ptr(hwnd) }.map_or(0, |app| unsafe { app.as_ref() }.tabs.views_of(id).len())
     };
-    if review.id == id {
-        close_reviewed_document(hwnd, &identity, &editor, review, CloseDecision::Discard);
+    while let before @ 1.. = views() {
+        if !activate_document_by_id(hwnd, id) || !identity.is_live_for(hwnd) {
+            return;
+        }
+        let reviewed = unsafe { app_ptr(hwnd) }.and_then(|app| {
+            let app = unsafe { app.as_ref() };
+            Some((app.tabs.active_close_review()?, app.editor().cloned()?))
+        });
+        let Some((review, editor)) = reviewed else {
+            return;
+        };
+        if review.id != id {
+            return;
+        }
+        close_reviewed_document(hwnd, identity, &editor, review, CloseDecision::Discard);
+        if !identity.is_live_for(hwnd) || views() >= before {
+            return;
+        }
     }
 }
 
@@ -4254,35 +5284,60 @@ fn close_reviewed_document(
     review: crate::window::tabs::CloseReview,
     decision: CloseDecision,
 ) {
+    let group = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
     let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
+        // `None` when the document is still shown in another group: it stays open.
         let closed = app.tabs.close_reviewed(review, decision).ok()?;
         let snapshots = app
             .recovery_root
             .as_deref()
-            .map(|root| {
+            .zip(closed.as_ref())
+            .map(|(root, closed)| {
                 crate::recovery::snapshots_removed_on_close(
                     root,
-                    &closed,
+                    closed,
                     decision == CloseDecision::Discard,
                 )
             })
             .unwrap_or_default();
-        Some((closed, app.tabs.active_handle().cloned(), snapshots))
+        let view_state = app
+            .tabs
+            .active()
+            .map(|document| app.tabs.view_state(document.id))
+            .unwrap_or_default();
+        Some((
+            closed,
+            app.tabs.active_handle().cloned(),
+            view_state,
+            snapshots,
+        ))
     });
-    let Some((closed, active, snapshots)) = switched else {
+    let Some((closed, active, view_state, snapshots)) = switched else {
         return;
     };
     // The view keeps its own reference to whatever it shows, so the last closed document is
     // swapped for an empty placeholder rather than lingering in the hidden editor.
-    let active = active.or_else(|| editor.create_document().ok());
-    if let Some(active) = active {
-        let _ = editor.use_document(&active);
+    match active {
+        Some(active) => {
+            if editor.use_document(&active).is_ok() {
+                let _ = editor.apply_view_state(view_state);
+            }
+        }
+        None => {
+            if let Ok(blank) = editor.create_document() {
+                let _ = editor.use_document(&blank);
+            }
+        }
     }
     drop(closed);
     crate::recovery::remove_snapshot_files(&snapshots);
     if identity.is_live_for(hwnd) {
         refresh_tabs(hwnd);
+        // A group closes with its last tab, unless it is the only one (spec §5.4).
+        if let Some(group) = group {
+            remove_empty_group(hwnd, group);
+        }
     }
 }
 
@@ -4299,7 +5354,8 @@ fn close_background_document(
         let snapshots = app
             .recovery_root
             .as_deref()
-            .map(|root| crate::recovery::snapshots_removed_on_close(root, &closed, true))
+            .zip(closed.as_ref())
+            .map(|(root, closed)| crate::recovery::snapshots_removed_on_close(root, closed, true))
             .unwrap_or_default();
         Some((closed, snapshots))
     });
@@ -4314,20 +5370,257 @@ fn close_background_document(
 }
 
 /// Closes tabs one at a time, reviewing each dirty one, until none remain or a close is refused.
+/// Close all tabs closes the active group's tabs (split editors plan amendment 10). The group goes
+/// with its last tab, which ends the loop, unless it is the only one.
 fn close_all_documents(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
+    let active_group =
+        || unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+    let Some(group) = active_group() else {
+        return;
+    };
     loop {
         let before = tab_count(hwnd);
-        if before == 0 {
+        if before == 0 || active_group() != Some(group) {
             return;
         }
         close_active_document(hwnd);
-        if !identity.is_live_for(hwnd) || tab_count(hwnd) >= before {
+        if !identity.is_live_for(hwnd)
+            || (active_group() == Some(group) && tab_count(hwnd) >= before)
+        {
             return;
         }
     }
+}
+
+pub(crate) const NO_ROOM_TO_SPLIT: &str = "Not enough room to split";
+
+/// Ctrl+1..8 focus group N in layout order, and Ctrl+9 (`usize::MAX`) the last group. A group
+/// that doesn't exist yet is made to the right of the last one, showing the active document, as
+/// VS Code does (split editors spec §6).
+pub(crate) fn focus_group_number(hwnd: HWND, index: usize) {
+    let order = group_order(hwnd);
+    let Some(last) = order.last().copied() else {
+        return;
+    };
+    let index = if index == usize::MAX {
+        order.len() - 1
+    } else {
+        index
+    };
+    if let Some(group) = order.get(index) {
+        activate_group(hwnd, *group);
+        focus_content(hwnd);
+        return;
+    }
+    let Some(source) =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    else {
+        return;
+    };
+    remember_view(hwnd, source);
+    let Some(new) = split_group(hwnd, last, crate::window::split_tree::Direction::Right) else {
+        return;
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        if let Some(id) = app.tabs.active().map(|document| document.id) {
+            let state = app.tabs.view_state_in(source, id);
+            app.tabs.add_view(new, id, state);
+        }
+    }
+    activate_group(hwnd, new);
+    show_group_view(hwnd, new);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+}
+
+/// Ctrl+Alt+Right and Ctrl+Alt+Left: moves the active tab to the next or previous group in layout
+/// order. Past the last group a new one opens to the right; before the first there is nowhere
+/// to go. A group left without tabs closes (spec §5.2).
+/// Puts document `id`'s view from group `from` into group `to` at strip `index` (`None`: the
+/// end): moved, or with `copy` a second view at the same position. A group that already shows
+/// `id` activates that view, and a move still removes the source view (spec §6.2). The source
+/// group closes when that was its last tab; the focus goes to `to`.
+pub(crate) fn place_view(
+    hwnd: HWND,
+    from: GroupId,
+    id: DocumentId,
+    to: GroupId,
+    index: Option<usize>,
+    copy: bool,
+) -> bool {
+    remember_view(hwnd, from);
+    let placed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let tabs = &mut unsafe { app.as_mut() }.tabs;
+        if copy {
+            let state = tabs.view_state_in(from, id);
+            tabs.add_view_at(to, id, state, index)
+        } else {
+            tabs.move_view_at(from, id, to, index)
+        }
+    });
+    if !placed {
+        return false;
+    }
+    activate_group(hwnd, to);
+    show_group_view(hwnd, from);
+    show_group_view(hwnd, to);
+    remove_empty_group(hwnd, from);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+    true
+}
+
+pub(crate) fn move_active_view(hwnd: HWND, forward: bool) {
+    let Some((id, source)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        Some((app.tabs.active()?.id, app.tabs.active_group()))
+    }) else {
+        return;
+    };
+    let order = group_order(hwnd);
+    let Some(position) = order.iter().position(|group| *group == source) else {
+        return;
+    };
+    let neighbour = if forward {
+        order.get(position + 1).copied()
+    } else {
+        position
+            .checked_sub(1)
+            .and_then(|previous| order.get(previous).copied())
+    };
+    let target = match neighbour {
+        Some(target) => target,
+        None if forward => {
+            match split_group(hwnd, source, crate::window::split_tree::Direction::Right) {
+                Some(new) => new,
+                None => return,
+            }
+        }
+        None => return,
+    };
+    place_view(hwnd, source, id, target, None, false);
+}
+
+/// Makes an empty group beside `target`, or says why not (split editors spec §4.3, §9).
+pub(crate) fn split_group(
+    hwnd: HWND,
+    target: GroupId,
+    direction: crate::window::split_tree::Direction,
+) -> Option<GroupId> {
+    let area = tree_area(hwnd)?;
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    // A trial id: the real one is only handed out once the window exists.
+    let trial = GroupId(u32::MAX);
+    let fits = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .layout
+            .fits_split(target, direction, trial, area, dpi)
+    });
+    if !fits {
+        push_notice(hwnd, NO_ROOM_TO_SPLIT.to_owned());
+        return None;
+    }
+    let new = match create_group(hwnd) {
+        Ok(new) => new,
+        Err(error) => {
+            push_notice(
+                hwnd,
+                format!("FastPad could not open a new editor group: {error}"),
+            );
+            return None;
+        }
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.layout.split(target, direction, new);
+    }
+    Some(new)
+}
+
+/// Ctrl+\ and Ctrl+Shift+\: a new group beside the active one, showing a new view of the active
+/// document at the same position (spec §5.1).
+pub(crate) fn split_active_group(hwnd: HWND, direction: crate::window::split_tree::Direction) {
+    let Some(source) =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    else {
+        return;
+    };
+    remember_view(hwnd, source);
+    let Some(new) = split_group(hwnd, source, direction) else {
+        return;
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        if let Some(id) = app.tabs.active().map(|document| document.id) {
+            let state = app.tabs.view_state_in(source, id);
+            app.tabs.add_view(new, id, state);
+        }
+    }
+    activate_group(hwnd, new);
+    show_group_view(hwnd, new);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+}
+
+/// Closes every tab of group `id`, asking about each unsaved one only where no other group shows
+/// it, then the group itself unless it is the only one. A cancelled prompt stops there.
+pub(crate) fn close_group(hwnd: HWND, id: GroupId) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    activate_group(hwnd, id);
+    let count = || {
+        unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.group(id)?.len()))
+    };
+    while let Some(before) = count().filter(|count| *count > 0) {
+        close_active_document(hwnd);
+        if !identity.is_live_for(hwnd) || count().is_some_and(|after| after >= before) {
+            return;
+        }
+    }
+    remove_empty_group(hwnd, id);
+}
+
+/// Removes group `id` once it has no tabs, unless it is the only group, and activates its
+/// neighbour: the next group in layout order, else the previous one.
+pub(crate) fn remove_empty_group(hwnd: HWND, id: GroupId) -> bool {
+    let removable = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        let app = unsafe { app.as_ref() };
+        app.groups.len() > 1 && app.tabs.group(id).is_some_and(|group| group.is_empty())
+    });
+    if !removable {
+        return false;
+    }
+    let order = group_order(hwnd);
+    let Some(index) = order.iter().position(|group| *group == id) else {
+        return false;
+    };
+    let Some(neighbour) = order
+        .get(index + 1)
+        .or_else(|| {
+            index
+                .checked_sub(1)
+                .and_then(|previous| order.get(previous))
+        })
+        .copied()
+    else {
+        return false;
+    };
+    activate_group(hwnd, neighbour);
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.layout.remove(id);
+    }
+    destroy_group(hwnd, id);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+    true
 }
 
 /// Activates `id` (the prompt's modal loop can have activated another tab) and saves it. Reports
@@ -4347,7 +5640,65 @@ fn save_reviewed_document(hwnd: HWND, id: DocumentId) -> bool {
 }
 
 /// Makes `id` the active document, or reports false when it no longer exists.
+/// Shows open document `id` in the active group: its view there, or a new view when only another
+/// group has one (split editors spec §5.3). A second view makes a preview tab normal.
+fn open_in_active_group(hwnd: HWND, id: DocumentId) -> bool {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return false;
+    };
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        tabs.document(id)?;
+        let group = tabs.active_group();
+        let state = tabs.group(group)?;
+        Some((group, state.contains(id), state.view().snapshot().revision))
+    });
+    let Some((group, here, revision)) = target else {
+        return false;
+    };
+    if here {
+        return activate_document(hwnd, id, revision);
+    }
+    // The tab being left saves first, as switching tabs does.
+    crate::window::library_host::autosave_active(hwnd);
+    if !identity.is_live_for(hwnd) {
+        return false;
+    }
+    remember_view(hwnd, group);
+    let added = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        unsafe { app.as_mut() }
+            .tabs
+            .add_view(group, id, crate::editor::ViewState::default())
+    });
+    if !added || !show_group_view(hwnd, group) {
+        return false;
+    }
+    refresh_tabs(hwnd);
+    crate::window::image_host::check_disk(hwnd);
+    true
+}
+
+/// Makes `id` the active document, or reports false when it no longer exists: its view in the
+/// active group, else its view in the first group in layout order that has one, which becomes
+/// the active group.
 pub(super) fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
+    let group = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let active = app.tabs.active_group();
+        let views = app.tabs.views_of(id);
+        if views.contains(&active) {
+            return Some(active);
+        }
+        app.layout
+            .leaves()
+            .into_iter()
+            .chain(views.iter().copied())
+            .find(|group| views.contains(group))
+    });
+    let Some(group) = group else {
+        return false;
+    };
+    activate_group(hwnd, group);
     let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         if app.tabs.active().is_some_and(|active| active.id == id) {
@@ -4532,7 +5883,7 @@ fn save_active_to(
     }
     let Some((editor, path, encoding)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let document = app.tabs.active()?;
         Some((editor, document.path.clone()?, document.encoding))
     }) else {
@@ -4709,7 +6060,7 @@ fn snapshot_next_document(hwnd: HWND) {
     };
     let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let active = app.tabs.active()?;
         let document = crate::recovery::next_snapshot_document(
             app.tabs.documents(),
@@ -4719,7 +6070,7 @@ fn snapshot_next_document(hwnd: HWND) {
         let inactive = if document.id == active.id {
             None
         } else {
-            Some(inactive_pair(&editor, document, active)?)
+            Some(document.text_handle()?.clone())
         };
         Some(SnapshotJob {
             editor,
@@ -4745,7 +6096,7 @@ fn snapshot_next_document(hwnd: HWND) {
     let started = std::time::Instant::now();
     let text = match &job.inactive {
         None => job.editor.text(),
-        Some((target, active)) => read_inactive_text(hwnd, &identity, &job.editor, target, active),
+        Some(target) => with_background_document(hwnd, target, Editor::text),
     };
     let Ok(text) = text else {
         return;
@@ -4773,22 +6124,6 @@ fn snapshot_next_document(hwnd: HWND) {
     }
 }
 
-/// The handles `with_inactive_document` swaps: `target`'s text, and the document the editor shows
-/// now. `None` when `target` is an image tab, which has no text to read or change. While an image
-/// tab is active the editor shows a placeholder that no tab owns, so it is read from the editor.
-fn inactive_pair(
-    editor: &Editor,
-    target: &Document,
-    active: &Document,
-) -> Option<(crate::editor::EditorDocument, crate::editor::EditorDocument)> {
-    let target = target.text_handle()?.clone();
-    let shown = match active.text_handle() {
-        Some(handle) => handle.clone(),
-        None => editor.current_document().ok()?,
-    };
-    Some((target, shown))
-}
-
 struct SnapshotJob {
     editor: Editor,
     id: DocumentId,
@@ -4797,97 +6132,75 @@ struct SnapshotJob {
     original_path: Option<std::path::PathBuf>,
     encoding: crate::file::encoding::Encoding,
     source_snapshot: Option<std::path::PathBuf>,
-    inactive: Option<(crate::editor::EditorDocument, crate::editor::EditorDocument)>,
+    /// A background tab's document, read through the document host.
+    inactive: Option<crate::editor::EditorDocument>,
 }
 
-/// Scintilla can only read or change the document shown in the view, so an inactive tab is
-/// swapped in, `f` runs on it, and it is swapped out again, with notifications suppressed
-/// (`populating_file`), restoring the visible selection and scroll position.
-fn with_inactive_document<R>(
+/// Runs `f` on the document host showing `target`, a document no visible editor shows (split
+/// editors spec §3.1). The host is never painted and its notifications reach no window, so the
+/// visible editor's view and the notification handler see none of this; callers record edits
+/// themselves (`Tabs::note_background_edit`).
+/// The editor of a group whose active view shows `id`: the active group's if it does, else the
+/// first in layout order.
+fn editor_showing(app: &App, id: DocumentId) -> Option<Editor> {
+    let active = app.tabs.active_group();
+    let showing = groups_showing(app, id);
+    let group = showing
+        .iter()
+        .find(|group| **group == active)
+        .or_else(|| showing.first())?;
+    app.group(*group).map(|state| state.editor.clone())
+}
+
+fn with_background_document<R>(
     hwnd: HWND,
-    identity: &WindowIdentity,
-    editor: &Editor,
     target: &crate::editor::EditorDocument,
-    active: &crate::editor::EditorDocument,
     f: impl FnOnce(&Editor) -> Result<R>,
 ) -> Result<R> {
-    use crate::editor::scintilla_constants::{SCI_GETFIRSTVISIBLELINE, SCI_SETFIRSTVISIBLELINE};
-    let selection = editor.selection();
-    let first_line = unsafe { SendMessageW(editor.hwnd(), SCI_GETFIRSTVISIBLELINE, 0, 0) };
-    set_file_population(hwnd, true);
-    let value = editor.use_document(target).and_then(|_| f(editor));
-    let restored = if identity.is_live_for(hwnd) {
-        editor.use_document(active)
-    } else {
-        Err(crate::FastPadError::Invariant(
-            "main window was destroyed while a background tab was swapped in",
-        ))
-    };
-    if restored.is_ok() {
-        if let Ok(selection) = selection {
-            let _ = editor.set_selection(selection);
-        }
-        unsafe {
-            SendMessageW(
-                editor.hwnd(),
-                SCI_SETFIRSTVISIBLELINE,
-                first_line as usize,
-                0,
-            );
-        }
+    let host = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.document_host.clone())
+        .ok_or(crate::FastPadError::Invariant(
+            "the document host is missing",
+        ))?;
+    host.use_document(target)?;
+    let result = f(&host);
+    // Leave the host on a document of its own, so it never keeps a closed tab's text alive.
+    if let Ok(blank) = host.create_document() {
+        let _ = host.use_document(&blank);
     }
-    if identity.is_live_for(hwnd) {
-        set_file_population(hwnd, false);
-    }
-    restored?;
-    value
-}
-
-/// An inactive tab's text (`with_inactive_document`).
-fn read_inactive_text(
-    hwnd: HWND,
-    identity: &WindowIdentity,
-    editor: &Editor,
-    target: &crate::editor::EditorDocument,
-    active: &crate::editor::EditorDocument,
-) -> Result<String> {
-    with_inactive_document(hwnd, identity, editor, target, active, Editor::text)
+    result
 }
 
 /// The text of tab `id` as the editor has it, for the Search view's overlays. A background tab is
-/// swapped into the editor and back (`read_inactive_text`). `None` without an editor or that tab,
-/// for a background tab while a file is being populated (the swap would end the population), or
-/// when Scintilla can't be read. Call it with nothing of the App borrowed.
+/// read through the document host (`with_background_document`). `None` without an editor or that
+/// tab, while a file is being populated, or when Scintilla can't be read. Call it with nothing of
+/// the App borrowed.
 pub(crate) fn document_text(hwnd: HWND, id: DocumentId) -> Option<String> {
-    let identity = unsafe { window_identity(hwnd) }?;
     let (editor, inactive) = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         // While a file is populated the editor may show a document that is not the active tab's.
         if app.populating_file {
             return None;
         }
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
         if target.id == active.id {
             return Some((editor, None));
         }
-        let pair = inactive_pair(&editor, target, active)?;
-        Some((editor, Some(pair)))
+        Some((editor, Some(target.text_handle()?.clone())))
     })?;
     match inactive {
         None => editor.text().ok(),
-        Some((target, active)) => {
-            read_inactive_text(hwnd, &identity, &editor, &target, &active).ok()
-        }
+        Some(target) => with_background_document(hwnd, &target, Editor::text).ok(),
     }
 }
 
 /// Replaces every match of `matcher` in tab `id`'s live text with `template` (expanded in regex
 /// mode), in the editor, as one undo action (note-search spec §12). The tab is not saved. The
 /// active tab's edit raises Scintilla's notifications as typing does. A background tab is
-/// swapped in (`with_inactive_document`, notifications suppressed) and then marked edited by
-/// hand (`Tabs::note_background_edit`). Returns how many matches were replaced, or `None`
+/// edited through the document host (`with_background_document`), whose notifications reach no
+/// window, and then marked edited by hand (`Tabs::note_background_edit`). Returns how many matches were replaced, or `None`
 /// without an editor or that tab, while a file is being populated, or when Scintilla fails. Call
 /// it with nothing of the App borrowed.
 pub(crate) fn replace_in_document(
@@ -4903,14 +6216,13 @@ pub(crate) fn replace_in_document(
         if app.populating_file {
             return None;
         }
-        let editor = app.editor.clone()?;
-        let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
-        if target.id == active.id {
+        // A group showing the document edits it, so its notifications record the change once.
+        if let Some(editor) = editor_showing(app, id) {
             return Some((editor, None));
         }
-        let pair = inactive_pair(&editor, target, active)?;
-        Some((editor, Some(pair)))
+        let editor = app.editor().cloned()?;
+        Some((editor, Some(target.text_handle()?.clone())))
     })?;
     // Set once Scintilla is asked to change the text: from then on it may have changed, even if
     // a replacement then fails partway.
@@ -4925,10 +6237,10 @@ pub(crate) fn replace_in_document(
     };
     match inactive {
         None => replace(&editor).ok(),
-        Some((target, active)) => {
-            // What the edit replaced, even if restoring the active tab then fails.
+        Some(target) => {
+            // What the edit replaced, even if a later step fails.
             let done = std::cell::Cell::new(None);
-            let result = with_inactive_document(hwnd, &identity, &editor, &target, &active, |e| {
+            let result = with_background_document(hwnd, &target, |e| {
                 let replaced = replace(e)?;
                 done.set(Some(replaced));
                 Ok(replaced)
@@ -4976,8 +6288,6 @@ pub(crate) fn reload_clean_document(
         if app.populating_file {
             return None;
         }
-        let editor = app.editor.clone()?;
-        let active = app.tabs.active()?;
         let target = app.tabs.document(id)?;
         let unchanged = TabMark {
             generation: target.generation,
@@ -4986,19 +6296,17 @@ pub(crate) fn reload_clean_document(
         if target.dirty || target.path.as_deref() != Some(path) || !unchanged {
             return None;
         }
-        if target.id == active.id {
+        if let Some(editor) = editor_showing(app, id) {
             return Some((editor, None));
         }
-        let pair = inactive_pair(&editor, target, active)?;
-        Some((editor, Some(pair)))
+        let editor = app.editor().cloned()?;
+        Some((editor, Some(target.text_handle()?.clone())))
     }) else {
         return false;
     };
     let populate = |editor: &Editor| editor.populate_clean(&loaded.text);
     let populated = match &inactive {
-        Some((target, active)) => {
-            with_inactive_document(hwnd, &identity, &editor, target, active, populate)
-        }
+        Some(target) => with_background_document(hwnd, target, populate),
         None => {
             use crate::editor::scintilla_constants::{
                 SCI_GETFIRSTVISIBLELINE, SCI_SETFIRSTVISIBLELINE,
@@ -5067,18 +6375,19 @@ fn restore_session_step(hwnd: HWND) -> RestoreStep {
     if !started && !begin_session_restore(hwnd) {
         return RestoreStep::Done;
     }
-    let entry = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        unsafe { app.as_ref() }
-            .session_restore
-            .as_ref()?
-            .next_entry()
-            .cloned()
+    let next = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let restore = unsafe { app.as_ref() }.session_restore.as_ref()?;
+        let (index, entry) = restore.next_entry()?;
+        // A group whose window could not be made reopens its entries in the first group.
+        let group = restore.groups[index].id.or(restore.groups.first()?.id)?;
+        Some((group, entry.clone()))
     });
-    let Some(entry) = entry else {
+    let Some((group, entry)) = next else {
         finish_session_restore(hwnd);
         return RestoreStep::Done;
     };
-    let restored = restore_session_entry(hwnd, &entry);
+    activate_group(hwnd, group);
+    let restored = restore_session_entry(hwnd, group, &entry);
     if !identity.is_live_for(hwnd) {
         return RestoreStep::Done;
     }
@@ -5106,7 +6415,7 @@ fn begin_session_restore(hwnd: HWND) -> bool {
         return false;
     };
     crate::session::remove(&path);
-    if session.entries.is_empty() {
+    if session.is_empty() {
         return false;
     }
     let placeholder = empty_startup_tab(hwnd);
@@ -5117,9 +6426,71 @@ fn begin_session_restore(hwnd: HWND) -> bool {
         return false;
     };
     unsafe { app.as_mut() }.session_restore =
-        Some(crate::session::SessionRestore::new(session, placeholder));
+        Some(crate::session::SessionRestore::new(&session, placeholder));
+    set_up_restored_groups(hwnd);
     bind_ipc_for_restore(hwnd);
     true
+}
+
+/// Makes a group window for every saved group after the first, which is the group already open,
+/// and arranges them as the manifest's layout (split editors spec §8). A group whose window can't
+/// be made has its entries reopened in the first group (spec §9).
+fn set_up_restored_groups(hwnd: HWND) {
+    let Some((first, saved)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let restore = app.session_restore.as_ref()?;
+        let numbers = restore
+            .groups
+            .iter()
+            .map(|group| group.number)
+            .collect::<Vec<_>>();
+        Some((app.tabs.active_group(), (numbers, restore.layout.clone())))
+    }) else {
+        return;
+    };
+    let (numbers, layout) = saved;
+    let mut ids = vec![Some(first)];
+    for _ in 1..numbers.len() {
+        ids.push(create_group(hwnd).ok());
+    }
+    // A failed group leaves the layout; its share goes to its neighbours.
+    let layout = numbers
+        .iter()
+        .zip(&ids)
+        .filter(|(_, id)| id.is_none())
+        .try_fold(layout, |layout, (number, _)| layout.without(*number));
+    let group_of = |number: usize| {
+        numbers
+            .iter()
+            .position(|saved| *saved == number)
+            .and_then(|index| ids[index])
+    };
+    let made = ids.iter().flatten().copied().collect::<Vec<_>>();
+    let tree = layout
+        .and_then(|layout| crate::window::split_tree::SplitTree::from_session(&layout, &group_of))
+        .filter(|tree| tree.leaves().len() == made.len())
+        .unwrap_or_else(|| {
+            // A layout that doesn't name exactly the groups made: a row of them in order.
+            let mut tree = crate::window::split_tree::SplitTree::new(first);
+            for pair in made.windows(2) {
+                tree.split(
+                    pair[0],
+                    crate::window::split_tree::Direction::Right,
+                    pair[1],
+                );
+            }
+            tree
+        });
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        app.layout = tree;
+        if let Some(restore) = app.session_restore.as_mut() {
+            for (group, id) in restore.groups.iter_mut().zip(&ids) {
+                group.id = *id;
+            }
+        }
+    }
+    layout_editor_and_find_bar(hwnd);
 }
 
 /// A launch made while a long session is reopening must reach this window, not time out and
@@ -5140,28 +6511,73 @@ fn empty_startup_tab(hwnd: HWND) -> Option<DocumentId> {
     let active = app.tabs.active().filter(|document| {
         !document.dirty && document.path.is_none() && document.recovery_origin.is_none()
     })?;
-    let editor = app.editor.as_ref()?;
+    let editor = app.editor()?;
     let empty = unsafe { SendMessageW(editor.hwnd(), SCI_GETLENGTH, 0, 0) } == 0;
     empty.then_some(active.id)
 }
 
-/// Reopens one manifest entry and applies its language while it is the active tab. Returns
-/// its tab, or `None` when the entry could not be reopened.
-fn restore_session_entry(hwnd: HWND, entry: &crate::session::SessionEntry) -> Option<DocumentId> {
+/// Reopens one manifest entry in `group`, the active group, and applies its language while it is
+/// the active tab. Returns its document, or `None` when the entry could not be reopened. A file
+/// or snapshot already reopened for another group becomes a second view of the same document.
+fn restore_session_entry(
+    hwnd: HWND,
+    group: GroupId,
+    entry: &crate::session::SessionEntry,
+) -> Option<DocumentId> {
     match &entry.source {
+        // An open file gets a view in the active group (split editors spec §5.3).
         crate::session::SessionSource::File(path) => open_path(hwnd, path).ok()?,
         crate::session::SessionSource::Snapshot(id) => {
-            let identity = unsafe { window_identity(hwnd) }?;
-            let root = recovery_root(hwnd)?;
-            let path = crate::recovery::snapshot::snapshot_path(&root, *id);
-            let snapshot = crate::recovery::Snapshot::decode(&std::fs::read(&path).ok()?).ok()?;
-            let candidate = crate::recovery::SnapshotCandidate { path, snapshot };
-            open_snapshot_tab(hwnd, &identity, candidate, SnapshotTab::Session).ok()?;
-            adopt_restored_snapshot(hwnd, &identity, &root);
+            let reopened = unsafe { app_ptr(hwnd) }.and_then(|app| {
+                let app = unsafe { app.as_ref() };
+                let (_, document) = app
+                    .session_restore
+                    .as_ref()?
+                    .snapshots
+                    .iter()
+                    .find(|(snapshot, _)| snapshot == id)?;
+                app.tabs.document(*document).map(|_| *document)
+            });
+            match reopened {
+                Some(document) => {
+                    if !open_in_active_group(hwnd, document) {
+                        return None;
+                    }
+                }
+                None => {
+                    let identity = unsafe { window_identity(hwnd) }?;
+                    let root = recovery_root(hwnd)?;
+                    let path = crate::recovery::snapshot::snapshot_path(&root, *id);
+                    let snapshot =
+                        crate::recovery::Snapshot::decode(&std::fs::read(&path).ok()?).ok()?;
+                    let candidate = crate::recovery::SnapshotCandidate { path, snapshot };
+                    open_snapshot_tab(hwnd, &identity, candidate, SnapshotTab::Session).ok()?;
+                    // Recorded before the adoption below removes the file the id names.
+                    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                        let app = unsafe { app.as_mut() };
+                        let document = app.tabs.active().map(|document| document.id);
+                        if let (Some(document), Some(restore)) =
+                            (document, app.session_restore.as_mut())
+                        {
+                            restore.snapshots.push((*id, document));
+                        }
+                    }
+                    adopt_restored_snapshot(hwnd, &identity, &root);
+                }
+            }
         }
     }
     apply_detected_language(hwnd);
-    unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+    let (id, text) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let active = unsafe { app.as_ref() }.tabs.active()?;
+        Some((active.id, !active.is_image()))
+    })?;
+    // Every tab lands where it was, not only the active one: the next entry's open records this
+    // position for the tab as it takes the editor over (split editors spec §8).
+    if text {
+        apply_view_state(hwnd, group, entry);
+    }
+    Some(id)
 }
 
 /// The snapshot a session tab was just restored from belongs to the previous, exited process, so
@@ -5171,7 +6587,7 @@ fn restore_session_entry(hwnd: HWND, entry: &crate::session::SessionEntry) -> Op
 fn adopt_restored_snapshot(hwnd: HWND, identity: &WindowIdentity, root: &std::path::Path) {
     let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let editor = app.editor.clone()?;
+        let editor = app.editor().cloned()?;
         let document = app.tabs.active()?;
         let origin = document.recovery_origin.as_ref()?;
         Some((
@@ -5221,7 +6637,7 @@ fn finish_session_restore(hwnd: HWND) {
     else {
         return;
     };
-    let restored_any = restore.restored.iter().any(Option::is_some);
+    let restored_any = restore.restored_any();
     if let Some(placeholder) = restore.placeholder
         && restored_any
         && still_empty_untitled(hwnd, placeholder)
@@ -5233,13 +6649,37 @@ fn finish_session_restore(hwnd: HWND) {
     if !identity.is_live_for(hwnd) {
         return;
     }
-    if let Some(active) = restore.active_tab()
-        && activate_document_by_id(hwnd, active)
-        && identity.is_live_for(hwnd)
-        && restore.saved_active_restored() == Some(active)
-    {
-        apply_view_state(hwnd, &restore.session.entries[restore.session.active]);
+    // Each group shows its saved active view where it was left.
+    for (index, group) in restore.groups.iter().enumerate() {
+        let Some(id) = group.id else {
+            continue;
+        };
+        if let Some(active) = restore.active_view(index)
+            && focus_view(hwnd, id, active)
+            && identity.is_live_for(hwnd)
+            && restore.saved_active_restored(index) == Some(active)
+        {
+            apply_view_state(hwnd, id, &group.entries[group.active]);
+        }
+        if !identity.is_live_for(hwnd) {
+            return;
+        }
     }
+    // A group none of whose entries came back closes, unless it is the only one.
+    for id in group_order(hwnd) {
+        remove_empty_group(hwnd, id);
+    }
+    let active = restore
+        .groups
+        .get(restore.active_group)
+        .and_then(|group| group.id)
+        .filter(|id| group_order(hwnd).contains(id))
+        .or_else(|| group_order(hwnd).first().copied());
+    if let Some(active) = active {
+        activate_group(hwnd, active);
+    }
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
     if !identity.is_live_for(hwnd) {
         return;
     }
@@ -5270,17 +6710,18 @@ fn still_empty_untitled(hwnd: HWND, id: DocumentId) -> bool {
     })
 }
 
-fn apply_view_state(hwnd: HWND, entry: &crate::session::SessionEntry) {
-    use crate::editor::scintilla_constants::SCI_GETLENGTH;
-    let Some(editor) =
-        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
-    else {
+/// Puts group `group`'s editor where `entry` was saved.
+fn apply_view_state(hwnd: HWND, group: GroupId, entry: &crate::session::SessionEntry) {
+    let Some(editor) = group_editor(hwnd, group) else {
         return;
     };
-    // The file may have shrunk since the session was saved.
-    let length = unsafe { SendMessageW(editor.hwnd(), SCI_GETLENGTH, 0, 0) }.max(0) as usize;
-    let _ = editor.set_selection(entry.anchor.min(length)..entry.caret.min(length));
-    let _ = editor.set_first_visible_line(entry.first_line);
+    // `apply_view_state` clamps: the file may have shrunk since the session was saved.
+    let _ = editor.apply_view_state(crate::editor::ViewState {
+        caret: entry.caret,
+        anchor: entry.anchor,
+        first_line: entry.first_line,
+        x_offset: 0,
+    });
 }
 
 /// Snapshot files a saved `session.ini` still names. They are waiting for the primary window's
@@ -5297,8 +6738,9 @@ fn saved_session_snapshots(hwnd: HWND, root: &std::path::Path) -> Vec<std::path:
         return Vec::new();
     };
     session
-        .entries
+        .groups
         .iter()
+        .flat_map(|group| &group.entries)
         .filter_map(|entry| match entry.source {
             crate::session::SessionSource::Snapshot(id) => {
                 Some(crate::recovery::snapshot::snapshot_path(root, id))
@@ -5561,12 +7003,13 @@ fn open_snapshot_tab(
         ))?;
         let app = unsafe { app.as_mut() };
         let editor = app
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         let (id, recovery_id) = app.allocate_document_identity();
         (editor, id, recovery_id)
     };
+    remember_active_view(hwnd);
     let previous = editor.current_document()?;
     let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
     document.path = bound_path;
@@ -5735,7 +7178,7 @@ fn save_session_for_close(hwnd: HWND) -> bool {
     let Some(session) = build_session(hwnd, &root) else {
         return false;
     };
-    let written = if session.entries.is_empty() {
+    let written = if session.is_empty() {
         crate::session::remove(&path);
         Ok(())
     } else {
@@ -5758,50 +7201,100 @@ fn save_session_for_close(hwnd: HWND) -> bool {
 }
 
 /// The manifest for the open tabs, or `None` when a dirty tab's text is in no snapshot file.
-/// Clean untitled tabs are empty and skipped. Only the shown tab has a caret and scroll
-/// position worth keeping, because switching tabs resets the view.
+/// Clean untitled tabs are empty and skipped. Every text tab keeps its caret and scroll position:
+/// the shown one from the editor, the others from where they were left (split editors spec §8).
+///
+/// Every group is written in layout order, numbered from 1, with its views in strip order and
+/// the layout (split editors spec §8). A document in two groups is written under both with the
+/// same source. A group left with no entries is dropped, and the layout with it.
 pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate::session::Session> {
-    use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETCURRENTPOS};
-    use crate::session::{Session, SessionEntry, SessionSource};
+    use crate::session::{Session, SessionEntry, SessionGroup, SessionLayout, SessionSource};
     let app = unsafe { app_ptr(hwnd) }?;
     let app = unsafe { app.as_ref() };
-    let active_id = app.tabs.active().map(|document| document.id);
-    let mut session = Session::default();
-    let mut active_entry = None;
-    for document in app.tabs.documents() {
-        let is_active = Some(document.id) == active_id;
-        let source = if document.dirty {
+    let order = app.layout.leaves();
+    // `None` for a document with nothing to write (a clean untitled tab); an error (`?`) for a
+    // dirty one whose text is in no snapshot.
+    let source_of = |document: &Document| -> Option<Option<SessionSource>> {
+        if document.dirty {
             let file = crate::recovery::current_snapshot_file(root, document)?;
-            SessionSource::Snapshot(crate::recovery::snapshot::snapshot_file_id(&file)?)
-        } else if let Some(path) = document
-            .path
-            .as_ref()
-            .filter(|path| path.to_str().is_some())
-        {
-            SessionSource::File(path.clone())
-        } else {
+            let id = crate::recovery::snapshot::snapshot_file_id(&file)?;
+            return Some(Some(SessionSource::Snapshot(id)));
+        }
+        Some(
+            document
+                .path
+                .as_ref()
+                .filter(|path| path.to_str().is_some())
+                .map(|path| SessionSource::File(path.clone())),
+        )
+    };
+    let mut groups = Vec::new();
+    let mut dropped = Vec::new();
+    for (position, group) in order.iter().enumerate() {
+        let number = position + 1;
+        let active_id = app.tabs.group(*group)?.active_document();
+        let editor = app.group(*group).map(|state| &state.editor);
+        let mut active = 0;
+        let mut entries = Vec::new();
+        for document in app.tabs.group_documents(*group) {
+            let is_active = Some(document.id) == active_id;
+            let Some(source) = source_of(document)? else {
+                if is_active {
+                    active = entries.len().saturating_sub(1);
+                }
+                continue;
+            };
             if is_active {
-                session.active = session.entries.len().saturating_sub(1);
+                active = entries.len();
             }
-            continue;
-        };
-        if is_active {
-            session.active = session.entries.len();
+            let mut entry = SessionEntry::new(source);
             // An image tab has no caret: the editor holds a placeholder then.
             if !document.is_image() {
-                active_entry = Some(session.entries.len());
+                let state = if is_active {
+                    editor
+                        .and_then(|editor| editor.view_state().ok())
+                        .unwrap_or_default()
+                } else {
+                    app.tabs.view_state_in(*group, document.id)
+                };
+                entry.caret = state.caret;
+                entry.anchor = state.anchor;
+                entry.first_line = state.first_line;
             }
+            entries.push(entry);
         }
-        session.entries.push(SessionEntry::new(source));
+        if entries.is_empty() {
+            dropped.push(number);
+            continue;
+        }
+        groups.push(SessionGroup {
+            number,
+            active,
+            entries,
+        });
     }
-    if let (Some(index), Some(editor)) = (active_entry, app.editor.as_ref()) {
-        let read = |message| unsafe { SendMessageW(editor.hwnd(), message, 0, 0) }.max(0) as usize;
-        let entry = &mut session.entries[index];
-        entry.caret = read(SCI_GETCURRENTPOS);
-        entry.anchor = read(SCI_GETANCHOR);
-        entry.first_line = editor.first_visible_line().unwrap_or(0);
-    }
-    Some(session)
+    let number_of = |id: GroupId| {
+        order
+            .iter()
+            .position(|group| *group == id)
+            .map_or(1, |index| index + 1)
+    };
+    let layout = dropped
+        .iter()
+        .try_fold(app.layout.to_session(&number_of), |layout, number| {
+            layout.without(*number)
+        })
+        .unwrap_or(SessionLayout::Leaf(1));
+    let active_number = number_of(app.tabs.active_group());
+    let active_group = groups
+        .iter()
+        .position(|group| group.number == active_number)
+        .unwrap_or(0);
+    Some(Session {
+        layout,
+        active_group,
+        groups,
+    })
 }
 
 /// Services the pipe and handles everything already queued, before a close review begins. This
@@ -5843,45 +7336,82 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         return;
     }
     let notification = unsafe { &*(lparam as *const NMHDR) };
-    if unsafe { editor_hwnd(hwnd) } != Some(notification.hwndFrom) {
+    // Every group's editor reports here; each one showing a document reports its changes.
+    let Some((group, active, document, editor)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let state = app
+            .groups
+            .iter()
+            .find(|group| group.editor.hwnd() == notification.hwndFrom)?;
+        Some((
+            state.id,
+            app.tabs.active_group() == state.id,
+            app.tabs.group(state.id)?.active_document(),
+            state.editor.clone(),
+        ))
+    }) else {
+        return;
+    };
+    if notification.code == crate::editor::scintilla_constants::SCN_FOCUSIN {
+        activate_group(hwnd, group);
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_UPDATEUI {
-        invalidate_status_bar(hwnd);
+        if active {
+            invalidate_status_bar(hwnd);
+        }
         let update = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
         if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_V_SCROLL != 0 {
-            crate::window::preview_host::editor_scrolled(hwnd);
+            crate::window::preview_host::editor_scrolled(hwnd, group);
         }
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {
-        with_editor(hwnd, |editor| {
-            let _ = editor.remeasure_line_numbers();
-        });
+        let _ = editor.remeasure_line_numbers();
         return;
     }
+    // A document shown in several groups notifies once per editor: its own changes are recorded
+    // by one of them (split editors spec §3.3).
+    let Some(document) =
+        document.filter(|document| reporting_group(hwnd, *document) == Some(group))
+    else {
+        if notification.code == crate::editor::scintilla_constants::SCN_MODIFIED {
+            let modification = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
+            if modification.lines_added != 0 {
+                let _ = editor.refresh_line_numbers();
+            }
+        }
+        return;
+    };
     if notification.code == crate::editor::scintilla_constants::SCN_MODIFIED {
         let modification = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
         let text_changes = crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
             | crate::editor::scintilla_constants::SC_MOD_DELETETEXT;
         let text_change = modification.modification_type & text_changes as i32 != 0;
-        let mut promoted = false;
-        if text_change && let Some(mut app) = unsafe { app_ptr(hwnd) } {
-            let app = unsafe { app.as_mut() };
-            promoted = app.tabs.note_active_text_change();
-            if modification.lines_added != 0
-                && let Some(editor) = app.editor.as_ref()
-            {
-                let _ = editor.refresh_line_numbers();
-            }
+        if !text_change {
+            return;
         }
+        if modification.lines_added != 0 {
+            let _ = editor.refresh_line_numbers();
+        }
+        let (promoted, showing) = unsafe { app_ptr(hwnd) }
+            .map(|mut app| {
+                let app = unsafe { app.as_mut() };
+                let promoted = app.tabs.note_text_change(document);
+                (promoted, groups_showing(app, document))
+            })
+            .unwrap_or_default();
         if promoted {
             invalidate_title_strip(hwnd);
         }
-        if text_change {
-            crate::window::library_host::text_changed(hwnd, modification.position.max(0) as usize);
-            crate::window::library_host::schedule_autosave(hwnd);
-            crate::window::preview_host::record_edit(hwnd, modification);
+        crate::window::library_host::text_changed(
+            hwnd,
+            group,
+            modification.position.max(0) as usize,
+        );
+        crate::window::library_host::schedule_autosave(hwnd);
+        for shown in showing {
+            crate::window::preview_host::record_edit(hwnd, shown, modification);
         }
         return;
     }
@@ -5891,10 +7421,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         _ => return,
     };
     let changed = unsafe { app_ptr(hwnd) }
-        .map(|mut app| {
-            let app = unsafe { app.as_mut() };
-            app.tabs.set_active_dirty(dirty)
-        })
+        .map(|mut app| unsafe { app.as_mut() }.tabs.set_dirty(document, dirty))
         .unwrap_or(false);
     if changed {
         invalidate_title_strip(hwnd);
@@ -5902,9 +7429,199 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     crate::window::notebook_view::editors_changed(hwnd);
 }
 
+/// The group that records `document`'s changes: the first, in layout order, whose active view
+/// shows it.
+fn reporting_group(hwnd: HWND, document: DocumentId) -> Option<GroupId> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    groups_showing(unsafe { app.as_ref() }, document)
+        .into_iter()
+        .next()
+}
+
+/// The groups whose active view shows `document`, in layout order.
+fn groups_showing(app: &App, document: DocumentId) -> Vec<GroupId> {
+    let mut order = app.layout.leaves();
+    // A group not in the layout yet (between its creation and its split) comes last.
+    let unplaced = app
+        .tabs
+        .group_ids()
+        .into_iter()
+        .filter(|id| !order.contains(id))
+        .collect::<Vec<_>>();
+    order.extend(unplaced);
+    order
+        .into_iter()
+        .filter(|id| {
+            app.tabs
+                .group(*id)
+                .is_some_and(|group| group.active_document() == Some(document))
+        })
+        .collect()
+}
+
+/// Tells the main window that `child`, a content window inside an editor group (a preview, an
+/// image view, a find field), got the focus, so its group becomes the active one.
+pub(crate) fn post_content_focus(child: HWND) {
+    unsafe {
+        PostMessageW(
+            crate::platform::win32::root_window(child),
+            crate::window::WM_FASTPAD_CONTENT_FOCUSED,
+            child as usize,
+            0,
+        )
+    };
+}
+
+/// The group holding the content child `child`.
+fn group_of_child(hwnd: HWND, child: HWND) -> Option<GroupId> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }.group_containing(child)
+}
+
+/// Makes `id` the active group, which commands act on; returns whether it changed. The focus
+/// stays where it is: this follows a click or focus arriving in the group.
+pub(crate) fn activate_group(hwnd: HWND, id: GroupId) -> bool {
+    let previous = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let previous = app.tabs.active_group();
+        app.tabs.set_active_group(id).then_some(previous)
+    });
+    let Some(previous) = previous else {
+        return false;
+    };
+    for group in [previous, id] {
+        if let Some(window) = with_group_id(hwnd, group, |state| state.hwnd) {
+            // Only the active group floats the preview buttons.
+            layout_group(hwnd, window);
+            unsafe { InvalidateRect(window, std::ptr::null(), 0) };
+        }
+    }
+    invalidate_status_bar(hwnd);
+    invalidate_title_strip(hwnd);
+    crate::window::side_panel::active_tab_changed(hwnd);
+    true
+}
+
+/// A press on the group window `group` makes its group active, and takes the focus along when
+/// another group had it: typing then goes where the commands go.
+pub(crate) fn press_group_window(hwnd: HWND, group: HWND) {
+    let Some(id) = group_id_of(hwnd, group) else {
+        return;
+    };
+    let focused = group_of_child(hwnd, unsafe { GetFocus() });
+    activate_group(hwnd, id);
+    if focused.is_some_and(|focused| focused != id) {
+        focus_content(hwnd);
+    }
+}
+
+/// The focus arriving in the group window `group` makes its group active.
+pub(crate) fn activate_group_window(hwnd: HWND, group: HWND) {
+    if let Some(id) = group_id_of(hwnd, group) {
+        activate_group(hwnd, id);
+    }
+}
+
+/// Group `id`'s editor shows its active view's document where that view was left. An image tab
+/// or an empty group shows no text: the editor holds an empty placeholder then, and a group that
+/// isn't active hides it (`refresh_tabs` does that for the active group).
+pub(crate) fn show_group_view(hwnd: HWND, id: GroupId) -> bool {
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.group(id)?.editor.clone();
+        let document = app.tabs.group(id)?.active_document();
+        let handle = document
+            .and_then(|document| app.tabs.document(document))
+            .and_then(Document::text_handle)
+            .cloned();
+        let state = document
+            .map(|document| app.tabs.view_state_in(id, document))
+            .unwrap_or_default();
+        Some((editor, handle, state, app.tabs.active_group() == id))
+    });
+    let Some((editor, handle, state, active)) = target else {
+        return false;
+    };
+    let text = handle.is_some();
+    let handle = match handle {
+        Some(handle) => handle,
+        None => match editor.create_document() {
+            Ok(blank) => blank,
+            Err(_) => return false,
+        },
+    };
+    if editor.use_document(&handle).is_err() {
+        return false;
+    }
+    if text {
+        let _ = editor.apply_view_state(state);
+        style_group_view(hwnd, id);
+    }
+    if !active {
+        unsafe { ShowWindow(editor.hwnd(), if text { SW_SHOWNA } else { SW_HIDE }) };
+        crate::window::preview_host::in_group(id, || {
+            crate::window::preview_host::sync_visibility(hwnd);
+        });
+    }
+    true
+}
+
+/// Gives group `id`'s editor the style table of the language its active view's document has, and
+/// the configured font back. The lexer belongs to the document but the styles to each editor, so
+/// an editor that starts showing a document, or outlives a theme change, needs this.
+fn style_group_view(hwnd: HWND, id: GroupId) {
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.group(id)?.editor.clone();
+        let document = app.tabs.document(app.tabs.group(id)?.active_document()?)?;
+        let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
+        Some((editor, document.language, app.settings.clone(), palette))
+    });
+    let Some((editor, language, settings, palette)) = target else {
+        return;
+    };
+    if crate::languages::apply_styles(&editor, language, effective_theme(hwnd)).is_ok() {
+        apply_settings_to(&editor, &settings, palette);
+    }
+}
+
+/// Records where group `id`'s editor is in its active text tab, so showing that view again lands
+/// there (split editors spec §3.2). Called before anything else takes over that editor.
+pub(crate) fn remember_view(hwnd: HWND, id: GroupId) {
+    let shown = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let document = app.tabs.group(id)?.active_document()?;
+        let editor = app.group(id)?.editor.clone();
+        (!app.tabs.document(document)?.is_image()).then_some((document, editor))
+    });
+    if let Some((document, editor)) = shown
+        && let Ok(state) = editor.view_state()
+        && let Some(mut app) = unsafe { app_ptr(hwnd) }
+    {
+        unsafe { app.as_mut() }
+            .tabs
+            .set_view_state_in(id, document, state);
+    }
+}
+
 pub(crate) fn invalidate_title_strip(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+    // A document's title shows in every group with a view of it.
+    let groups = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .groups
+                .iter()
+                .map(|group| group.hwnd)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for group in groups {
+        unsafe {
+            InvalidateRect(group, std::ptr::null(), 0);
+        }
     }
     // The Open Editors rows show what the strip does.
     crate::window::notebook_view::editors_changed(hwnd);
@@ -6134,6 +7851,9 @@ pub(crate) unsafe fn translate_accelerator(
     if !identity.is_live_for(hwnd) {
         return false;
     }
+    if crate::window::tab_drag::keeps_key(hwnd, message) {
+        return true;
+    }
     if menu_activation_message(hwnd, message)
         && unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0) } != 0
     {
@@ -6145,6 +7865,9 @@ pub(crate) unsafe fn translate_accelerator(
     if palette_keeps_key(hwnd, message) || inline_name_keeps_key(hwnd, message) {
         return false;
     }
+    if start_tab_for_typing(hwnd, message) {
+        return true;
+    }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .accelerators
@@ -6152,6 +7875,52 @@ pub(crate) unsafe fn translate_accelerator(
             .map(|table| table.raw())
     });
     accelerator.is_some_and(|accelerator| menus::translate_accelerator(accelerator, hwnd, message))
+}
+
+/// A character typed with no tab to take it (the focus on the hidden editor of a group with no
+/// tabs, or on the main window once the last tab closed) first opens an untitled tab there, so
+/// the character lands in it: a window with no tabs is still instant-to-type. True when the
+/// character was delivered here; the message loop then drops it.
+fn start_tab_for_typing(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    let printable = message.wParam >= 0x20 && message.wParam != 0x7F;
+    if message.message != WM_CHAR || !(printable || message.wParam == 0x0D) {
+        return false;
+    }
+    let on_main = message.hwnd == hwnd;
+    let id = if on_main {
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+    } else {
+        group_of_child(hwnd, message.hwnd).filter(|&id| {
+            group_editor(hwnd, id).is_some_and(|editor| editor.hwnd() == message.hwnd)
+        })
+    };
+    let Some(id) = id else {
+        return false;
+    };
+    let empty = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .group(id)
+            .is_some_and(|group| group.is_empty())
+    });
+    if !empty {
+        return false;
+    }
+    activate_group(hwnd, id);
+    execute_command(hwnd, CommandId::New);
+    if !on_main {
+        return false;
+    }
+    let Some(editor) = group_editor(hwnd, id) else {
+        return false;
+    };
+    focus_content(hwnd);
+    unsafe { SendMessageW(editor.hwnd(), WM_CHAR, message.wParam, message.lParam) };
+    true
 }
 
 /// Ctrl+W (without Alt) aimed at one of the command palette's controls.
@@ -6214,7 +7983,12 @@ fn menu_activation_message(
     false
 }
 
-unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Result<()> {
+unsafe fn install_editor(
+    hwnd: HWND,
+    group: HWND,
+    editor: Editor,
+    document: Document,
+) -> Result<()> {
     // SAFETY: The App pointer is re-fetched after editor creation so initialization never mutates
     // an App reference borrowed across a reentrant Win32 call.
     let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
@@ -6226,7 +8000,11 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Resu
     app.tabs
         .push(document)
         .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))?;
-    app.editor = Some(editor);
+    let id = app.tabs.active_group();
+    app.groups
+        .push(crate::window::editor_group::GroupWindow::new(
+            id, group, editor,
+        ));
     Ok(())
 }
 
@@ -6293,6 +8071,7 @@ mod tests {
     use crate::window::commands::CommandId;
     use crate::window::menus::answer_next_popup_menu;
     use crate::window::modal::{answer_next_close_prompt, answer_next_save_dialog};
+    use crate::window::split_tree::GroupId;
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::{
@@ -6497,7 +8276,7 @@ mod tests {
 
     #[test]
     fn queued_ipc_requests_wait_for_the_overflow_menu_to_close() {
-        // Break caught: the overflow menu's own modal loop dispatches a forwarded request, so a
+        // Break caught: a popup menu's own modal loop dispatches a forwarded request, so a
         // new tab becomes active underneath it and the command the user picks acts on that tab
         // instead of the one they opened the menu on.
         let _scintilla = load_native_scintilla();
@@ -6515,12 +8294,12 @@ mod tests {
             }
             None
         });
-        assert!(crate::window::menus::show_overflow(window.hwnd, 0, 0).is_none());
+        assert!(crate::window::menus::show_tab_strip_menu(window.hwnd, 0, 0, true).is_none());
 
         assert_eq!(
             app_mut(window.hwnd).tabs.len(),
             before,
-            "a forwarded request was handled inside the overflow menu's modal loop"
+            "a forwarded request was handled inside the popup menu's modal loop"
         );
 
         pump_posted_messages(window.hwnd);
@@ -6538,7 +8317,7 @@ mod tests {
         // hidden editor still taking edits, or the empty strip's double-click and context menu
         // not reaching New and Close all tabs.
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GWL_STYLE, GetWindowLongPtrW, HTCAPTION, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP, WS_VISIBLE,
+            GWL_STYLE, GetWindowLongPtrW, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WS_VISIBLE,
         };
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
@@ -6555,21 +8334,21 @@ mod tests {
         execute_command(window.hwnd, CommandId::CloseTab);
         assert_eq!(editor.text().unwrap(), "");
 
-        // The empty strip right of the sidebar; over the sidebar the caption maximizes instead.
-        let drag = super::title_layout(window.hwnd).drag_region.center();
-        let strip = screen_lparam(window.hwnd, drag.x, drag.y);
+        // A double-click on the group's empty strip opens a tab; the caption maximizes instead.
+        // The far end of the tab viewport stays empty while two tabs fit.
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let layout = super::strip_layout(window.hwnd).unwrap();
+        let strip = client_lparam(layout.tabs.right - 10, layout.height / 2);
         unsafe {
-            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, strip);
-            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, strip);
+            SendMessageW(group, WM_LBUTTONDBLCLK, 1, strip);
+            SendMessageW(group, WM_LBUTTONDBLCLK, 1, strip);
         }
         assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
         assert!(editor_visible());
 
         answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
-        let drag = super::title_layout(window.hwnd).drag_region.center();
-        let strip = screen_lparam(window.hwnd, drag.x, drag.y);
         unsafe {
-            SendMessageW(window.hwnd, WM_NCRBUTTONUP, HTCAPTION as usize, strip);
+            SendMessageW(group, WM_RBUTTONUP, 0, strip);
         }
         assert!(app_mut(window.hwnd).tabs.is_empty());
         assert!(!editor_visible());
@@ -6629,6 +8408,1596 @@ mod tests {
         assert_eq!(active(), 2);
         execute_command(window.hwnd, CommandId::SelectTab9);
         assert_eq!(active(), 2);
+    }
+
+    #[test]
+    fn switching_tabs_restores_each_tabs_caret_and_scroll() {
+        // Break caught: switching tabs resetting the caret and scroll to the start of the document.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text(&"line\n".repeat(2000)).unwrap();
+        let saved = crate::editor::ViewState {
+            caret: 1210 * 5 + 2,
+            anchor: 1210 * 5,
+            first_line: 1200,
+            x_offset: 0,
+        };
+        editor.apply_view_state(saved).unwrap();
+        execute_command(window.hwnd, CommandId::New);
+        editor.set_text("second").unwrap();
+        assert_eq!(editor.view_state().unwrap().first_line, 0);
+
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        assert_eq!(editor.view_state().unwrap(), saved);
+    }
+
+    #[test]
+    fn replacing_in_a_background_tab_leaves_the_active_view_alone() {
+        // Break caught: a background replace swapping the document through the visible editor,
+        // so the active tab's caret, selection direction or scroll jumps.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text(&"line\n".repeat(2000)).unwrap();
+        let first = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::New);
+        editor.set_text("foo foo").unwrap();
+        let second = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        let shown = crate::editor::ViewState {
+            caret: 1210 * 5,
+            anchor: 1210 * 5 + 3,
+            first_line: 1200,
+            x_offset: 0,
+        };
+        editor.apply_view_state(shown).unwrap();
+
+        let matcher = crate::search::Matcher::new("foo", Default::default()).unwrap();
+        assert_eq!(
+            super::replace_in_document(window.hwnd, second, &matcher, "bar"),
+            Some(2)
+        );
+
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, first);
+        assert_eq!(editor.view_state().unwrap(), shown);
+        assert_eq!(
+            super::document_text(window.hwnd, second).unwrap(),
+            "bar bar"
+        );
+        assert!(app_mut(window.hwnd).tabs.document(second).unwrap().dirty);
+    }
+
+    #[test]
+    fn a_second_group_gets_its_own_editor_find_bar_and_preview() {
+        // Break caught: a second group sharing the first one's editor or find bar, so a find in
+        // one group moves the caret in the other, or its preview state leaking across.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetParent;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let second = super::create_group(window.hwnd).expect("second group");
+        assert_ne!(first, second);
+        let (first_editor, second_editor) = (
+            super::group_editor(window.hwnd, first).unwrap(),
+            super::group_editor(window.hwnd, second).unwrap(),
+        );
+        assert_ne!(first_editor.hwnd(), second_editor.hwnd());
+        let second_window = app_mut(window.hwnd).group(second).unwrap().hwnd;
+        assert_eq!(unsafe { GetParent(second_editor.hwnd()) }, second_window);
+        assert!(second_editor.shares_documents_with(&first_editor));
+
+        // Find needs a tab, so group 2 shows the document too.
+        let document = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(
+            app_mut(window.hwnd)
+                .tabs
+                .add_view(second, document, Default::default())
+        );
+        app_mut(window.hwnd).tabs.set_active_group(second);
+        execute_command(window.hwnd, CommandId::Find);
+        let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
+        assert_eq!(unsafe { GetParent(panel) }, second_window);
+        assert!(
+            app_mut(window.hwnd)
+                .group(first)
+                .unwrap()
+                .find_bar
+                .is_none()
+        );
+        assert_eq!(
+            app_mut(window.hwnd).group_containing(first_editor.hwnd()),
+            Some(first)
+        );
+
+        app_mut(window.hwnd).tabs.set_active_group(first);
+        assert!(app_mut(window.hwnd).tabs.move_view(second, document, first));
+        super::destroy_group(window.hwnd, second);
+        assert!(app_mut(window.hwnd).group(second).is_none());
+        assert_eq!(app_mut(window.hwnd).tabs.group_ids(), vec![first]);
+    }
+
+    fn second_group_showing_the_active_document(hwnd: HWND) -> (GroupId, GroupId) {
+        let first = app_mut(hwnd).tabs.active_group();
+        let second = super::create_group(hwnd).expect("second group");
+        let id = app_mut(hwnd).tabs.active().unwrap().id;
+        assert!(
+            app_mut(hwnd)
+                .tabs
+                .add_view(second, id, crate::editor::ViewState::default())
+        );
+        super::show_group_view(hwnd, second);
+        (first, second)
+    }
+
+    /// A point on group `id`'s strip past its last tab, in the group's client coordinates.
+    fn empty_strip_point(hwnd: HWND, id: GroupId) -> LPARAM {
+        let layout = super::strip_layout_of(hwnd, id).unwrap();
+        let count = app_mut(hwnd).tabs.group(id).unwrap().len();
+        let last = layout.tab(count - 1).unwrap();
+        client_lparam(last.right + 10, layout.height / 2)
+    }
+
+    #[test]
+    fn an_edit_in_one_group_shows_in_the_other_and_counts_once() {
+        // Break caught: document-level effects run by every editor showing the document, so one
+        // keystroke bumps the generation twice, or the other group's caret jumps to the edit.
+        use crate::editor::ViewState;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor
+            .set_text(
+                "one
+two
+three",
+            )
+            .unwrap();
+        let (_, second) = second_group_showing_the_active_document(window.hwnd);
+        let other = super::group_editor(window.hwnd, second).unwrap();
+        let at = |caret| ViewState {
+            caret,
+            anchor: caret,
+            first_line: 0,
+            x_offset: 0,
+        };
+        editor.apply_view_state(at(0)).unwrap();
+        other.apply_view_state(at(8)).unwrap();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let before = app_mut(window.hwnd).tabs.document(id).unwrap().generation;
+
+        editor.replace_target(0..0, "x").unwrap();
+
+        assert_eq!(
+            other.text().unwrap(),
+            "xone
+two
+three"
+        );
+        let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+        assert_eq!(document.generation, before + 1);
+        assert!(document.dirty);
+        assert_eq!(
+            other.view_state().unwrap().caret,
+            9,
+            "the other caret moves with its text only"
+        );
+    }
+
+    #[test]
+    fn focus_in_a_groups_editor_or_find_bar_makes_that_group_active() {
+        // Break caught: a click into group 2 leaving group 1 active, so Ctrl+F, the status bar
+        // and the title act on the group the user left.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = second_group_showing_the_active_document(window.hwnd);
+        let other = super::group_editor(window.hwnd, second).unwrap();
+
+        unsafe { SetFocus(other.hwnd()) };
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        execute_command(window.hwnd, CommandId::Find);
+        let query = app_mut(window.hwnd).find_bar().unwrap().query_hwnd();
+
+        let first_editor = super::group_editor(window.hwnd, first).unwrap();
+        unsafe { SetFocus(first_editor.hwnd()) };
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        unsafe { SetFocus(query) };
+        super::pump_posted_messages(window.hwnd);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    }
+
+    #[test]
+    fn a_strip_menu_command_acts_on_the_group_that_was_right_clicked() {
+        // Break caught: the strip's menu running New in the active group instead of the group
+        // under the pointer.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = second_group_showing_the_active_document(window.hwnd);
+        super::layout_editor_and_find_bar(window.hwnd);
+        let group = app_mut(window.hwnd).group(second).unwrap().hwnd;
+        // Until groups are laid out side by side, the second one gets its size here.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MoveWindow(group, 0, 0, 600, 400, 0)
+        };
+        let empty = empty_strip_point(window.hwnd, second);
+        answer_next_popup_menu(|_| Some(CommandId::New));
+        unsafe {
+            SendMessageW(group, WM_RBUTTONDOWN, 0, empty);
+            SendMessageW(group, WM_RBUTTONUP, 0, empty);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(app_mut(window.hwnd).tabs.group(second).unwrap().len(), 2);
+        assert_eq!(app_mut(window.hwnd).tabs.group(first).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_preview_opened_in_one_group_leaves_the_other_group_alone() {
+        // Break caught: one preview mode shared by every group, so Full preview in group 2 hides
+        // group 1's editor or opens a preview there too.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongPtrW, WS_VISIBLE,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("# title").unwrap();
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Markdown);
+        let (first, second) = second_group_showing_the_active_document(window.hwnd);
+        super::activate_group(window.hwnd, second);
+        execute_command(window.hwnd, CommandId::MarkdownPreviewFull);
+        let mode =
+            |id| crate::window::preview_host::with_group_host(window.hwnd, id, |host| host.mode());
+        assert_eq!(mode(second), Some(crate::preview::PreviewMode::Full));
+        assert_eq!(mode(first), Some(crate::preview::PreviewMode::Off));
+        // The test window is never shown, so the style says whether the editor would show.
+        let style = unsafe { GetWindowLongPtrW(editor.hwnd(), GWL_STYLE) } as u32;
+        assert!(style & WS_VISIBLE != 0, "group 1's editor still shows");
+        let other = super::group_editor(window.hwnd, second).unwrap();
+        let style = unsafe { GetWindowLongPtrW(other.hwnd(), GWL_STYLE) } as u32;
+        assert!(
+            style & WS_VISIBLE == 0,
+            "group 2's Full preview hides its editor"
+        );
+    }
+
+    fn split_for_test(hwnd: HWND, direction: crate::window::split_tree::Direction) -> GroupId {
+        let active = app_mut(hwnd).tabs.active_group();
+        let new = super::create_group(hwnd).expect("group");
+        assert!(app_mut(hwnd).layout.split(active, direction, new));
+        let id = app_mut(hwnd).tabs.active().unwrap().id;
+        app_mut(hwnd)
+            .tabs
+            .add_view(new, id, crate::editor::ViewState::default());
+        super::show_group_view(hwnd, new);
+        super::layout_editor_and_find_bar(hwnd);
+        new
+    }
+
+    fn window_rect_in_main(hwnd: HWND, child: HWND) -> RECT {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(child, &mut rect);
+            MapWindowPoints(
+                std::ptr::null_mut(),
+                hwnd,
+                &mut rect as *mut RECT as *mut POINT,
+                2,
+            );
+        }
+        rect
+    }
+
+    #[test]
+    fn groups_side_by_side_both_reach_into_the_title_row_with_a_sash_between() {
+        // Break caught: a second column pushed below the title row (wasting a row), overlapping
+        // the first, or leaving no gap for the sash.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let (a, b) = (
+            window_rect_in_main(window.hwnd, app_mut(window.hwnd).group(first).unwrap().hwnd),
+            window_rect_in_main(
+                window.hwnd,
+                app_mut(window.hwnd).group(second).unwrap().hwnd,
+            ),
+        );
+        assert_eq!((a.top, b.top), (0, 0));
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) };
+        assert_eq!(
+            b.left - a.right,
+            crate::window::titlebar::scale(crate::window::split_tree::SASH_96, dpi)
+        );
+        assert_eq!(super::tree_layout(window.hwnd).unwrap().sashes.len(), 1);
+        assert_eq!(super::group_strip_bounds(window.hwnd).len(), 2);
+    }
+
+    #[test]
+    fn a_group_below_another_draws_its_strip_at_its_own_top() {
+        // Break caught: a lower group's strip hit-tested as caption, so clicking its tabs drags
+        // the window.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_NCHITTEST};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Down);
+        let group = app_mut(window.hwnd).group(second).unwrap().hwnd;
+        let rect = window_rect_in_main(window.hwnd, group);
+        assert!(rect.top > 0);
+        let mut screen = windows_sys::Win32::Foundation::POINT {
+            x: rect.right - 20,
+            y: rect.top + 5,
+        };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut screen) };
+        let packed = ((screen.y as u32 & 0xffff) << 16 | (screen.x as u32 & 0xffff)) as LPARAM;
+        assert_eq!(
+            unsafe { SendMessageW(group, WM_NCHITTEST, 0, packed) },
+            HTCLIENT as LRESULT
+        );
+        assert_eq!(super::group_strip_bounds(window.hwnd).len(), 1);
+    }
+
+    #[test]
+    fn dragging_a_sash_resizes_both_groups_and_stops_at_the_minimum() {
+        // Break caught: a sash that doesn't follow the pointer, or one dragged over the edge
+        // collapsing a group to nothing.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+        let (x, y) = (sash.rect.left + 1, (sash.rect.top + sash.rect.bottom) / 2);
+        let area = super::tree_area(window.hwnd).unwrap();
+        unsafe {
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+            SendMessageW(window.hwnd, WM_MOUSEMOVE, 1, client_lparam(area.left, y));
+            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, client_lparam(area.left, y));
+        }
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) };
+        let a = super::tree_layout(window.hwnd)
+            .unwrap()
+            .rect_of(first)
+            .unwrap();
+        assert_eq!(
+            a.right - a.left,
+            crate::window::titlebar::scale(crate::window::split_tree::MIN_WIDTH_96, dpi)
+        );
+        let group = app_mut(window.hwnd).group(first).unwrap().hwnd;
+        let rect = window_rect_in_main(window.hwnd, group);
+        assert_eq!(rect.right - rect.left, a.right - a.left);
+    }
+
+    #[test]
+    fn a_double_click_on_a_sash_equalizes() {
+        // Break caught: a sash double-click read as two presses and ignored.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+        app_mut(window.hwnd)
+            .layout
+            .set_sash(&sash, sash.rect.left - 100, 96);
+        super::layout_editor_and_find_bar(window.hwnd);
+        let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+        let (x, y) = (sash.rect.left + 1, (sash.rect.top + sash.rect.bottom) / 2);
+        for _ in 0..2 {
+            unsafe {
+                SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+                SendMessageW(window.hwnd, WM_LBUTTONUP, 0, client_lparam(x, y));
+            }
+        }
+        let layout = super::tree_layout(window.hwnd).unwrap();
+        let area = super::tree_area(window.hwnd).unwrap();
+        let a = layout.rect_of(first).unwrap();
+        assert!(((a.right - area.left) - (area.right - area.left) / 2).abs() <= 3);
+    }
+
+    #[test]
+    fn only_the_group_under_the_caption_buttons_gives_them_up() {
+        // Break caught: every top group cutting the caption area out of its region, leaving a
+        // hole in the left group's strip.
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+        let region_has = |group: HWND, x: i32, y: i32| unsafe {
+            let region = CreateRectRgn(0, 0, 0, 0);
+            let kind = GetWindowRgn(group, region);
+            let inside =
+                kind == 0 /* ERROR: no region, the whole window */ || PtInRegion(region, x, y) != 0;
+            DeleteObject(region);
+            inside
+        };
+        let a = app_mut(window.hwnd).group(first).unwrap().hwnd;
+        let b = app_mut(window.hwnd).group(second).unwrap().hwnd;
+        let a_rect = window_rect_in_main(window.hwnd, a);
+        let b_rect = window_rect_in_main(window.hwnd, b);
+        assert!(region_has(a, a_rect.right - a_rect.left - 2, 2));
+        assert!(!region_has(b, b_rect.right - b_rect.left - 2, 2));
+    }
+
+    #[test]
+    fn split_right_opens_the_active_document_in_a_new_group_to_the_right() {
+        // Break caught: Split Right opening an empty group, a copy of the document instead of a
+        // second view, or the new group landing on the left.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("shared").unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0], first);
+        let second = order[1];
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![first, second]);
+        assert_eq!(
+            super::group_editor(window.hwnd, second)
+                .unwrap()
+                .text()
+                .unwrap(),
+            "shared"
+        );
+    }
+
+    /// The foreground group `id`'s editor draws JSON strings in.
+    fn json_string_colour(hwnd: HWND, id: GroupId) -> isize {
+        const SCI_STYLEGETFORE: u32 = 2481;
+        let editor = super::group_editor(hwnd, id).unwrap();
+        unsafe {
+            SendMessageW(
+                editor.hwnd(),
+                SCI_STYLEGETFORE,
+                crate::editor::scintilla_constants::SCE_JSON_STRING as usize,
+                0,
+            )
+        }
+    }
+
+    fn theme_json_string_colour(hwnd: HWND) -> isize {
+        crate::languages::style_table(
+            crate::document::Language::Json,
+            super::effective_theme(hwnd),
+        )
+        .iter()
+        .find(|style| style.style == crate::editor::scintilla_constants::SCE_JSON_STRING)
+        .unwrap()
+        .foreground as isize
+    }
+
+    #[test]
+    fn a_split_shows_the_documents_syntax_colours_in_the_new_group() {
+        // Break caught: a new group's editor keeps only the base colour in every style, so a JSON
+        // or Markdown document shows monochrome there (styles belong to each Scintilla view).
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("{\"a\": \"b\"}").unwrap();
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Json);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert_eq!(
+            json_string_colour(window.hwnd, second),
+            theme_json_string_colour(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn a_theme_change_recolours_the_syntax_in_every_group() {
+        // Break caught: a theme change re-applies the language to the active editor only, and the
+        // other groups keep the base colour in every style.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("{\"a\": \"b\"}").unwrap();
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Json);
+        let (first, second) = second_group_showing_the_active_document(window.hwnd);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
+        assert_eq!(
+            json_string_colour(window.hwnd, second),
+            theme_json_string_colour(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn hovering_a_strip_that_is_not_active_highlights_its_own_tab() {
+        // Break caught: pointer messages on a group's strip hit-test and highlight the active
+        // group's strip instead of their own.
+        use crate::window::group_strip::StripTarget;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        let tab = super::strip_layout_of(window.hwnd, second)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        unsafe { SendMessageW(group, super::WM_MOUSEMOVE, 0, client_lparam(tab.x, tab.y)) };
+        let hovered =
+            |id| super::with_group_id(window.hwnd, id, |state| state.pointer.hovered).unwrap();
+        assert_eq!(hovered(second), Some(StripTarget::Tab(0)));
+        assert_eq!(hovered(first), None);
+    }
+
+    #[test]
+    fn the_wheel_over_a_strip_that_is_not_active_leaves_the_active_strip_alone() {
+        // Break caught: the wheel over one group's strip scrolls the active group's tabs.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        for _ in 0..40 {
+            execute_command(window.hwnd, CommandId::New);
+        }
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        let _ = app_mut(window.hwnd).tabs.set_scroll_offset(0);
+        let tab = super::strip_layout_of(window.hwnd, second)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let mut point = windows_sys::Win32::Foundation::POINT { x: tab.x, y: tab.y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(group, &mut point) };
+        let wheel_down = ((-120_i16 as u16 as usize) << 16) as super::WPARAM;
+        unsafe {
+            SendMessageW(
+                group,
+                super::WM_MOUSEWHEEL,
+                wheel_down,
+                client_lparam(point.x, point.y),
+            )
+        };
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(first)
+                .unwrap()
+                .scroll_offset(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_tab_click_in_another_group_moves_the_focus_there() {
+        // Break caught: the click makes the other group active but the caret stays in the first
+        // group's editor, so typing edits one document while Ctrl+S saves another.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        unsafe { SetFocus(editor.hwnd()) };
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        let tab = super::strip_layout_of(window.hwnd, second)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let point = client_lparam(tab.x, tab.y);
+        unsafe {
+            SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, super::WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(
+            unsafe { GetFocus() },
+            super::group_editor(window.hwnd, second).unwrap().hwnd()
+        );
+    }
+
+    #[test]
+    fn closing_a_document_shown_only_elsewhere_leaves_the_focused_group_active() {
+        // Break caught: a file deleted on disk closes its view in another group by activating
+        // that group, and leaves it active while the caret stays in the first group.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        execute_command(window.hwnd, CommandId::New);
+        let elsewhere = app_mut(window.hwnd).tabs.active().unwrap().id;
+        unsafe { SetFocus(editor.hwnd()) };
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+
+        super::close_document_without_prompt(window.hwnd, elsewhere);
+
+        assert!(app_mut(window.hwnd).tabs.document(elsewhere).is_none());
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        assert_eq!(unsafe { GetFocus() }, editor.hwnd());
+    }
+
+    #[test]
+    fn an_accessible_tab_selection_in_another_group_selects_that_tab() {
+        // Break caught: the strip's MSAA selection is resolved against the active group, so a
+        // screen-reader user selecting a tab in another group's list gets no response.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let shared = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::New);
+        assert!(super::activate_group(window.hwnd, first));
+        let request = super::AccessibleSelectRequest {
+            document_id: shared,
+            revision: app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .view()
+                .snapshot()
+                .revision,
+        };
+        let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let selected = unsafe {
+            SendMessageW(
+                group,
+                super::WM_FASTPAD_ACCESSIBLE_SELECT,
+                0,
+                &request as *const super::AccessibleSelectRequest as LPARAM,
+            )
+        };
+        assert_eq!(selected, 1);
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .active_document(),
+            Some(shared)
+        );
+    }
+
+    #[test]
+    fn a_split_without_room_is_refused_with_a_notice() {
+        // Break caught: a split into a sliver narrower than the minimum group.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOZORDER, SetWindowPos};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        unsafe {
+            SetWindowPos(
+                window.hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                360,
+                400,
+                SWP_NOMOVE | SWP_NOZORDER,
+            )
+        };
+        super::layout_editor_and_find_bar(window.hwnd);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        assert_eq!(super::group_order(window.hwnd).len(), 1);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice == super::NO_ROOM_TO_SPLIT)
+        );
+    }
+
+    #[test]
+    fn a_failed_group_window_leaves_the_layout_and_tabs_unchanged() {
+        // Break caught: a half-made group left in the tree when its Scintilla can't be created.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        super::fail_next_group_creation();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        assert_eq!(super::group_order(window.hwnd).len(), 1);
+        assert_eq!(app_mut(window.hwnd).tabs.group_ids().len(), 1);
+        assert!(!notices(window.hwnd).is_empty());
+    }
+
+    #[test]
+    fn closing_a_group_with_a_dirty_document_shown_elsewhere_does_not_prompt() {
+        // Break caught: Close Group asking to save (or discarding) a document another group
+        // still shows, or leaving it clean.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("unsaved").unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(app_mut(window.hwnd).tabs.document(id).unwrap().dirty);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&prompted);
+        answer_next_close_prompt(move |_| {
+            seen.set(true);
+            CloseDecision::Cancel
+        });
+        execute_command(window.hwnd, CommandId::CloseGroup);
+        assert!(!prompted.get(), "another group still shows the document");
+        assert_eq!(super::group_order(window.hwnd), vec![first]);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+        assert!(document.dirty);
+        assert_eq!(
+            super::group_editor(window.hwnd, first)
+                .unwrap()
+                .text()
+                .unwrap(),
+            "unsaved"
+        );
+    }
+
+    #[test]
+    fn closing_a_groups_last_tab_removes_the_group_but_never_the_only_one() {
+        // Break caught: an empty second group left on screen, or the only group destroyed.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitDown);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert_eq!(super::group_order(window.hwnd), vec![first]);
+        execute_command(window.hwnd, CommandId::CloseAllTabs);
+        assert_eq!(super::group_order(window.hwnd), vec![first]);
+        assert!(app_mut(window.hwnd).groups.len() == 1);
+    }
+
+    #[test]
+    fn ctrl_2_focuses_group_two_and_ctrl_3_without_one_splits_right_of_the_last() {
+        // Break caught: Ctrl+N still selecting tabs, or a missing group N doing nothing instead
+        // of VS Code's split to the right of the last group.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitDown);
+        let second = super::group_order(window.hwnd)[1];
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        execute_command(window.hwnd, CommandId::FocusGroup2);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        execute_command(window.hwnd, CommandId::FocusGroup3);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 3);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+        let area = super::tree_area(window.hwnd).unwrap();
+        let layout = super::tree_layout(window.hwnd).unwrap();
+        assert_eq!(layout.rect_of(order[2]).unwrap().right, area.right);
+        assert_eq!(
+            layout.rect_of(order[2]).unwrap().top,
+            layout.rect_of(second).unwrap().top,
+            "beside the last group, as in VS Code"
+        );
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        execute_command(window.hwnd, CommandId::FocusLastGroup);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+    }
+
+    #[test]
+    fn moving_a_tab_to_the_next_group_creates_one_and_the_empty_source_closes() {
+        // Break caught: Ctrl+Alt+Right doing nothing with one group, copying instead of moving,
+        // or leaving the emptied group behind.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("moved").unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::MoveTabToNextGroup);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 1, "the emptied first group closed");
+        assert_ne!(order[0], first);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![order[0]]);
+        assert_eq!(
+            super::group_editor(window.hwnd, order[0])
+                .unwrap()
+                .text()
+                .unwrap(),
+            "moved"
+        );
+        execute_command(window.hwnd, CommandId::MoveTabToPreviousGroup);
+        assert_eq!(
+            super::group_order(window.hwnd),
+            order,
+            "nothing before group 1"
+        );
+    }
+
+    #[test]
+    fn alt_digits_select_tabs_and_ctrl_digits_focus_groups_through_the_table() {
+        // Break caught: Alt+2 eaten by the menu band's mnemonic handling, or Ctrl+2 still bound
+        // to Select Tab 2.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        assert_eq!(
+            translate_key_with(window.hwnd, editor.hwnd(), b'2', true, false, false),
+            Some(CommandId::FocusGroup2)
+        );
+        assert_eq!(
+            translate_key_with(window.hwnd, editor.hwnd(), b'2', false, false, true),
+            Some(CommandId::SelectTab2)
+        );
+    }
+
+    #[test]
+    fn right_clicking_a_tab_activates_it_and_runs_the_chosen_item() {
+        // Break caught: the tab menu acting on the previously active tab.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let first_tab = app_mut(window.hwnd).tabs.ids().collect::<Vec<_>>()[0];
+        let group = app_mut(window.hwnd).active_group().unwrap().hwnd;
+        let center = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let point = client_lparam(center.x, center.y);
+        answer_next_popup_menu(|_| Some(CommandId::SplitRight));
+        unsafe {
+            SendMessageW(group, WM_RBUTTONDOWN, 0, point);
+            SendMessageW(group, WM_RBUTTONUP, 0, point);
+        }
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 2);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(first_tab), order);
+    }
+
+    #[test]
+    fn opening_a_file_open_in_another_group_adds_a_view_in_the_active_group() {
+        // Break caught: the open jumping back to group 1 (leaving group 2 where the user is
+        // working) or opening a second copy of the file.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-open");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        super::open_path(window.hwnd, &b).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        super::open_path(window.hwnd, &a).unwrap();
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![first, second]);
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, id);
+        super::open_path(window.hwnd, &a).unwrap();
+        assert_eq!(
+            app_mut(window.hwnd).tabs.group(second).unwrap().len(),
+            2,
+            "no second view in one group"
+        );
+    }
+
+    #[test]
+    fn a_tree_click_replaces_only_the_active_groups_preview() {
+        // Break caught: a click in the tree replacing group 1's italic tab while the user works
+        // in group 2.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-preview");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let c = scratch.note("c.md", "c");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        // An empty group 2, so group 1's preview is the only view of `a`.
+        let second = super::split_group(
+            window.hwnd,
+            first,
+            crate::window::split_tree::Direction::Right,
+        )
+        .unwrap();
+        super::activate_group(window.hwnd, second);
+        super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+        super::open_note(window.hwnd, &c, super::OpenMode::Preview, false).unwrap();
+        let a_id = app_mut(window.hwnd).tabs.find_path(&a);
+        assert!(a_id.is_some(), "group 1's preview kept");
+        assert!(
+            app_mut(window.hwnd).tabs.find_path(&b).is_none(),
+            "group 2's preview replaced"
+        );
+        assert_eq!(
+            app_mut(window.hwnd).tabs.views_of(a_id.unwrap()),
+            vec![first]
+        );
+        assert_eq!(app_mut(window.hwnd).tabs.group(second).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_note_open_in_two_groups_closes_both_views() {
+        // Break caught: a view left open on a deleted file in the group that wasn't active.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-delete");
+        let a = scratch.note("a.md", "a");
+        scratch.note("keep.md", "k");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &scratch.folder().join("keep.md")).unwrap();
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        crate::window::answer_next_confirm(|_| true);
+        execute_command(window.hwnd, CommandId::NoteDelete);
+        assert!(!a.exists());
+        assert!(app_mut(window.hwnd).tabs.document(id).is_none());
+        assert!(app_mut(window.hwnd).tabs.views_of(id).is_empty());
+    }
+
+    #[test]
+    fn a_background_replace_in_a_document_shown_in_the_other_group_counts_once() {
+        // Break caught: a replace through the document host double-counting a document another
+        // group's editor shows (host edit plus that editor's notifications), or moving the
+        // active group's caret.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("groups-replace");
+        let a = scratch.note("a.md", "alpha beta");
+        let b = scratch.note("b.md", "other");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        super::open_path(window.hwnd, &b).unwrap();
+        let first = super::group_order(window.hwnd)[0];
+        let second = super::group_order(window.hwnd)[1];
+        execute_command(window.hwnd, CommandId::FocusGroup2);
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        let before = app_mut(window.hwnd).tabs.document(id).unwrap().generation;
+        let caret = super::group_editor(window.hwnd, second)
+            .unwrap()
+            .view_state()
+            .unwrap();
+        let matcher = crate::search::Matcher::new("alpha", Default::default()).unwrap();
+        assert_eq!(
+            super::replace_in_document(window.hwnd, id, &matcher, "ALPHA"),
+            Some(1)
+        );
+        let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+        assert!(document.dirty);
+        assert!(document.generation > before);
+        assert_eq!(
+            super::group_editor(window.hwnd, first)
+                .unwrap()
+                .text()
+                .unwrap(),
+            "ALPHA beta"
+        );
+        assert_eq!(
+            super::group_editor(window.hwnd, second)
+                .unwrap()
+                .view_state()
+                .unwrap(),
+            caret
+        );
+    }
+
+    #[test]
+    fn clicking_an_open_editors_row_focuses_that_group_and_a_header_does_nothing() {
+        // Break caught: a click on group 2's row opening a copy in the active group, or a header
+        // row acting like a tab.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-groups");
+        let a = scratch.note("a.md", "a");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        execute_command(window.hwnd, CommandId::New);
+        let first = super::group_order(window.hwnd)[0];
+        let panel = sidebar_windows(window.hwnd).1;
+        let header = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+        mouse(panel, WM_LBUTTONUP, 0, centre(header));
+        assert_ne!(app_mut(window.hwnd).tabs.active_group(), first);
+        let row = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(row));
+        mouse(panel, WM_LBUTTONUP, 0, centre(row));
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+        let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+        assert_eq!(
+            app_mut(window.hwnd).tabs.views_of(id).len(),
+            2,
+            "no copy made"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_lists_views_in_every_group_and_picking_one_focuses_it() {
+        // Break caught: the MRU rows only covering the active group, or a pick adding a view to
+        // the active group instead of going to the one listed.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("quick-groups");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &a).unwrap();
+        execute_command(window.hwnd, CommandId::FocusGroup2);
+        super::open_path(window.hwnd, &b).unwrap();
+        execute_command(window.hwnd, CommandId::FocusGroup1);
+        let (rows, _) = super::quick_open_rows(window.hwnd, "");
+        let groups: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                crate::window::command_palette::PickerRow::View { number, found, .. } => {
+                    Some((found.name.clone(), *number))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(groups.contains(&("b.md".to_owned(), Some(2))), "{groups:?}");
+        let b_id = app_mut(window.hwnd).tabs.find_path(&b).unwrap();
+        let second = super::group_order(window.hwnd)[1];
+        assert!(super::focus_view(window.hwnd, second, b_id));
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(b_id), vec![second]);
+    }
+
+    #[test]
+    fn the_editor_and_find_bar_live_in_the_group_window() {
+        // Break caught: a child left parented to the main window, painting over or under the
+        // group and missing its layout.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetParent;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).expect("the editor group window");
+        assert_eq!(unsafe { GetParent(group) }, window.hwnd);
+        assert_eq!(unsafe { GetParent(editor.hwnd()) }, group);
+        execute_command(window.hwnd, CommandId::Find);
+        let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
+        assert_eq!(unsafe { GetParent(panel) }, group);
+        let (width, height) = client_size(window.hwnd);
+        let (group_width, group_height) = client_size(group);
+        assert_eq!(left_of(group, window.hwnd) + group_width, width);
+        // The group reaches up into the title row, down to the status bar.
+        assert!(group_height > 0 && group_height <= height);
+    }
+
+    #[test]
+    fn find_bar_keys_still_reach_the_main_window() {
+        // Break caught: the find field hook sending to its parent, now the group, so Enter and
+        // Escape in the query field do nothing.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("xyz abc abc").unwrap();
+        editor.set_selection(0..0).unwrap();
+        execute_command(window.hwnd, CommandId::Find);
+        let query = app_mut(window.hwnd).find_bar().unwrap().query_hwnd();
+        let text = crate::platform::wide_null("abc");
+        unsafe { SetWindowTextW(query, text.as_ptr()) };
+        editor.set_selection(0..0).unwrap();
+
+        unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(VK_RETURN), 0) };
+        assert_eq!(editor.selected_text().unwrap(), "abc");
+
+        unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        assert!(!app_mut(window.hwnd).find_bar().unwrap().is_visible());
+    }
+
+    #[test]
+    fn typing_in_the_grouped_editor_still_marks_the_tab_dirty() {
+        // Break caught: WM_NOTIFY now going to the group, which drops it, so typing never dirties
+        // the tab and never autosaves.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+        unsafe { SendMessageW(editor.hwnd(), WM_CHAR, usize::from(b'x'), 0) };
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn clicking_a_tab_in_the_group_strip_activates_it() {
+        // Break caught: strip input still handled by the main window, so clicks on the strip that
+        // moved into the group do nothing.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
+        let point = client_lparam(tab.left + 10, tab.bottom / 2);
+        unsafe {
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+    }
+
+    #[test]
+    fn double_clicking_the_empty_strip_where_the_new_tab_closes_keeps_it_open() {
+        // Break caught: the release after the double-click acting on whatever the new tab put
+        // under the pointer, so a double-click on its close box's spot opens a tab and closes it.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let close = super::strip_layout(window.hwnd)
+            .unwrap()
+            .close_tab(1)
+            .unwrap()
+            .center();
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert_eq!(super::tab_count(window.hwnd), 1);
+        assert_eq!(
+            super::strip_target(
+                window.hwnd,
+                app_mut(window.hwnd).tabs.active_group(),
+                close.x,
+                close.y
+            ),
+            Some(crate::window::group_strip::StripTarget::Empty)
+        );
+
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let point = client_lparam(close.x, close.y);
+        unsafe {
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+            SendMessageW(group, WM_LBUTTONDBLCLK, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    /// `child`'s top-left corner in `parent`'s client coordinates.
+    fn origin_in(child: HWND, parent: HWND) -> (i32, i32) {
+        let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(child, parent, &mut point, 1) };
+        (point.x, point.y)
+    }
+
+    #[test]
+    fn the_group_strip_is_the_title_row() {
+        // Break caught: the strip drawn in a row of its own under the title bar (the file name
+        // shown twice and a row of height lost), or running under the app menu and the caption
+        // buttons.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let title = super::title_layout(window.hwnd);
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        assert_eq!(origin_in(group, window.hwnd), (left, 0));
+        assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        assert_eq!(strip.height, title.height);
+        assert_eq!(strip.bounds().right, title.minimize.left - left);
+    }
+
+    #[test]
+    fn empty_title_row_strip_space_is_caption_and_tabs_are_client() {
+        // Break caught: a strip that swallows the caption, so the window can no longer be dragged
+        // or top-resized by the empty space beside the tabs.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HTCAPTION, HTCLIENT, HTTRANSPARENT, WM_NCHITTEST,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let title = super::title_layout(window.hwnd);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        let hit = |target: HWND, x: i32, y: i32| unsafe {
+            SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
+        };
+        let y = strip.height - 2;
+        assert!(y >= title.resize_border);
+        let tab = strip.tab(0).unwrap().center();
+        let empty = strip.tabs.right - 10;
+        assert_eq!(hit(group, tab.x, y), HTCLIENT as LRESULT);
+        assert_eq!(hit(group, empty, y), HTTRANSPARENT as LRESULT);
+        assert_eq!(hit(window.hwnd, empty + left, y), HTCAPTION as LRESULT);
+        // A restored window's top band resizes, over the tabs too.
+        assert_eq!(hit(group, tab.x, 0), HTTRANSPARENT as LRESULT);
+    }
+
+    #[test]
+    fn a_caption_double_click_over_the_strip_opens_a_tab_and_over_the_sidebar_does_not() {
+        // Break caught: the caption's double-click maximizing over the strip's empty space, where
+        // 0.2.0 opened a new tab, or opening tabs from the caption over the sidebar.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, WM_NCLBUTTONDBLCLK};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let title = super::title_layout(window.hwnd);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        let double_click = |x: i32, y: i32| unsafe {
+            SendMessageW(
+                window.hwnd,
+                WM_NCLBUTTONDBLCLK,
+                HTCAPTION as usize,
+                screen_lparam(window.hwnd, x, y),
+            )
+        };
+        double_click(strip.tabs.right - 10 + left, strip.height / 2);
+        assert_eq!(super::tab_count(window.hwnd), 2);
+        assert!(
+            title.sidebar.right > title.sidebar.left,
+            "no sidebar to test"
+        );
+        let sidebar = title.sidebar.center();
+        double_click(sidebar.x, sidebar.y);
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    #[test]
+    fn a_caption_right_click_over_the_strip_opens_the_strip_menu() {
+        // Break caught: the strip's menu lost once its empty space answers as caption.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, WM_NCRBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
+        unsafe {
+            SendMessageW(
+                window.hwnd,
+                WM_NCRBUTTONUP,
+                HTCAPTION as usize,
+                screen_lparam(window.hwnd, strip.tabs.right - 10 + left, strip.height / 2),
+            )
+        };
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+    }
+
+    #[test]
+    fn the_group_region_leaves_the_caption_buttons_and_the_menu_band_to_the_main_window() {
+        // Break caught: the group window covering the app menu and caption buttons, or the menu
+        // band shown under it, so the main window can neither paint them nor get their clicks.
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let left = crate::window::side_panel::left_edge(window.hwnd);
+        let covers = |x: i32, y: i32| unsafe {
+            let region = CreateRectRgn(0, 0, 0, 0);
+            GetWindowRgn(group, region);
+            let inside = PtInRegion(region, x - left, y) != 0;
+            DeleteObject(region);
+            inside
+        };
+        let title = super::title_layout(window.hwnd);
+        let tab = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        assert!(covers(tab.x + left, tab.y));
+        for button in [title.minimize, title.maximize, title.close] {
+            let center = button.center();
+            assert!(!covers(center.x, center.y));
+        }
+
+        super::enter_menu_mode(window.hwnd, 0);
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let band = super::menu_band::band_height(dpi);
+        let heading = super::menu_headings(window.hwnd)[0];
+        assert!(!covers(
+            (heading.left + heading.right) / 2,
+            (heading.top + heading.bottom) / 2
+        ));
+        assert!(covers(tab.x + left, tab.y));
+        assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height + band);
+    }
+
+    #[test]
+    fn markdown_tabs_show_floating_preview_buttons_at_the_content_top_right() {
+        // Break caught: preview buttons left in the strip, shown for tabs that cannot preview,
+        // or drawn under the editor.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, GetParent, GetWindow};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let buttons = || crate::window::preview_buttons::hwnd(window.hwnd);
+        let visible = |hwnd: HWND| {
+            (unsafe { GetWindowLongPtrW(hwnd, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
+        };
+        assert!(buttons().is_none_or(|hwnd| !visible(hwnd)));
+
+        // What a successful language switch does, without loading Lexilla.
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Markdown);
+        crate::window::preview_host::sync_visibility(window.hwnd);
+        let hwnd = buttons().expect("floating preview buttons");
+        assert!(visible(hwnd));
+        assert_eq!(unsafe { GetParent(hwnd) }, group);
+        let strip = super::strip_layout(window.hwnd).unwrap();
+        assert_eq!(
+            strip.tabs.right,
+            strip.bounds().right,
+            "the strip holds only tabs"
+        );
+        let dpi = unsafe { GetDpiForWindow(group) }.max(96);
+        let (group_width, _) = client_size(group);
+        let (x, y) = origin_in(hwnd, group);
+        let (width, _) = client_size(hwnd);
+        assert_eq!(y, strip.height + crate::window::titlebar::scale(8, dpi));
+        assert!(x + width < group_width, "clear of the vertical scroll bar");
+        assert!(x + width >= group_width - crate::window::titlebar::scale(48, dpi));
+        // Above the editor in z-order: no sibling before it.
+        assert!(unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_null());
+    }
+
+    #[test]
+    fn a_plain_launch_leaves_no_empty_untitled_tab() {
+        // Break caught: double-clicking FastPad.exe opens on an untitled document nobody asked
+        // for.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+
+        super::handle_open_request(window.hwnd);
+
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+    }
+
+    #[test]
+    fn typing_into_a_window_with_no_tabs_starts_an_untitled_tab() {
+        // Break caught: a plain launch with no tab swallowing the first keystrokes, so FastPad is
+        // no longer instant-to-type.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        super::handle_open_request(window.hwnd);
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+        let message = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_CHAR,
+            wParam: usize::from(b'a'),
+            ..Default::default()
+        };
+
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+        unsafe { SendMessageW(editor.hwnd(), WM_CHAR, message.wParam, 0) };
+
+        assert!(!translated, "the character still reaches the editor");
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+        assert_eq!(editor.text().unwrap(), "a");
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    }
+
+    #[test]
+    fn typing_with_the_focus_on_the_main_window_and_no_tabs_types_into_a_new_tab() {
+        // Break caught: closing the last tab hides the editor and leaves the focus on the main
+        // window, whose characters go nowhere.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        super::handle_open_request(window.hwnd);
+        let message = MSG {
+            hwnd: window.hwnd,
+            message: WM_CHAR,
+            wParam: usize::from(b'a'),
+            ..Default::default()
+        };
+
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+
+        assert!(
+            translated,
+            "the character went to the new tab's editor instead"
+        );
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+        assert_eq!(editor.text().unwrap(), "a");
+    }
+
+    #[test]
+    fn a_plain_launch_keeps_the_untitled_tab_once_it_has_text() {
+        // Break caught: text typed before the startup chain finished thrown away with its tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("typed early").unwrap();
+
+        super::handle_open_request(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+    }
+
+    #[test]
+    fn only_the_active_group_shows_the_floating_preview_buttons() {
+        // Break caught: a Markdown document shown in two groups floats a pair of preview buttons
+        // over both, though only the selected one's act on the active tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Markdown);
+        crate::window::preview_host::sync_visibility(window.hwnd);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        let shown = |id| {
+            super::with_group_id(window.hwnd, id, |state| state.preview_buttons.hwnd)
+                .filter(|hwnd| !hwnd.is_null())
+                .is_some_and(|hwnd| {
+                    (unsafe { GetWindowLongPtrW(hwnd, super::GWL_STYLE) }) as u32
+                        & super::WS_VISIBLE
+                        != 0
+                })
+        };
+        assert!(shown(second));
+        assert!(!shown(first));
+
+        assert!(super::activate_group(window.hwnd, first));
+
+        assert!(shown(first));
+        assert!(!shown(second));
+    }
+
+    #[test]
+    fn the_floating_side_button_opens_and_closes_the_side_preview() {
+        // Break caught: floating buttons that paint but do not act.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        // What a successful language switch does, without loading Lexilla.
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Markdown);
+        crate::window::preview_host::sync_visibility(window.hwnd);
+        let hwnd = crate::window::preview_buttons::hwnd(window.hwnd).unwrap();
+        let side = crate::window::preview_buttons::button_rect(
+            hwnd,
+            crate::window::preview_buttons::PreviewButton::Side,
+        )
+        .center();
+        let click = || unsafe {
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(side.x, side.y));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(side.x, side.y));
+        };
+        click();
+        assert_eq!(
+            crate::window::preview_host::mode(window.hwnd),
+            crate::preview::PreviewMode::Split
+        );
+        click();
+        assert_eq!(
+            crate::window::preview_host::mode(window.hwnd),
+            crate::preview::PreviewMode::Off
+        );
+    }
+
+    #[test]
+    fn clicking_a_tab_in_menu_mode_leaves_menu_mode() {
+        // Break caught: the group taking strip clicks without the main window's menu-mode exit, so
+        // after Alt a tab click switches tabs while keystrokes still go to menu mnemonics.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        super::enter_menu_mode(window.hwnd, 0);
+        assert!(app_mut(window.hwnd).menu_mode.is_some());
+
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
+        let point = client_lparam(tab.left + 10, tab.bottom / 2);
+        unsafe {
+            SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+            SendMessageW(group, WM_LBUTTONUP, 0, point);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+        assert_eq!(app_mut(window.hwnd).menu_mode, None);
+    }
+
+    #[test]
+    fn the_command_palette_opens_below_the_tab_strip_and_the_find_bar() {
+        // Break caught: the palette's top still summing only the title and bar heights, so once
+        // the strip and find bar moved into the group it covers the strip and the find bar.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::Find);
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let rect = |hwnd| {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(hwnd, &mut rect) };
+            rect
+        };
+        let app = app_mut(window.hwnd);
+        let find = rect(app.find_bar().unwrap().panel_hwnd());
+        let palette = rect(app.command_palette.as_ref().unwrap().panel_hwnd());
+        assert!(
+            palette.top >= find.bottom,
+            "palette top {} overlaps the find bar ending at {}",
+            palette.top,
+            find.bottom
+        );
+    }
+
+    #[test]
+    fn the_tab_strip_paints_before_deferred_startup_begins() {
+        // Break caught: the group's first paint queued behind the deferred startup chain, whose
+        // posted steps outrank WM_PAINT, so the first frame shows no tabs until restore finishes.
+        use windows_sys::Win32::Graphics::Gdi::{GetUpdateRect, InvalidateRect};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let identity = app_mut(window.hwnd).window_identity();
+        app_mut(window.hwnd).mark_first_paint_complete();
+        // Only a visible window has an update region to wait on.
+        unsafe {
+            ShowWindow(window.hwnd, SW_SHOWNA);
+            InvalidateRect(group, std::ptr::null(), 0);
+        }
+        assert_ne!(unsafe { GetUpdateRect(group, std::ptr::null_mut(), 0) }, 0);
+
+        unsafe { super::maybe_post_deferred_start(window.hwnd, &identity) };
+        assert_eq!(
+            unsafe { GetUpdateRect(group, std::ptr::null_mut(), 0) },
+            0,
+            "the strip still waits for a WM_PAINT"
+        );
     }
 
     #[test]
@@ -6841,9 +10210,7 @@ mod tests {
         // Break caught (review focus 3): a middle-click switching to the tab it closes, closing
         // the active tab instead, a press on one tab and a release on another closing either, a
         // release with no press closing anything, or a press kept after the pointer left.
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            HTCLIENT, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_NCHITTEST,
-        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDOWN, WM_MBUTTONUP};
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
@@ -6859,24 +10226,18 @@ mod tests {
         let &[first, second, third] = &ids()[..] else {
             panic!("three tabs")
         };
-        let center = |index: usize| super::title_layout(window.hwnd).tab(index).center();
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let center = |index: usize| {
+            super::strip_layout(window.hwnd)
+                .unwrap()
+                .tab(index)
+                .unwrap()
+                .center()
+        };
         let send = |message: u32, index: usize| {
             let point = center(index);
-            unsafe { SendMessageW(window.hwnd, message, 0, client_lparam(point.x, point.y)) };
+            unsafe { SendMessageW(group, message, 0, client_lparam(point.x, point.y)) };
         };
-        // Tabs answer HTCLIENT, so the middle button arrives as client WM_MBUTTON* (spec §5).
-        let tab = center(0);
-        assert_eq!(
-            unsafe {
-                SendMessageW(
-                    window.hwnd,
-                    WM_NCHITTEST,
-                    0,
-                    screen_lparam(window.hwnd, tab.x, tab.y),
-                )
-            },
-            HTCLIENT as isize
-        );
 
         send(WM_MBUTTONDOWN, 0);
         send(WM_MBUTTONUP, 1);
@@ -6884,14 +10245,7 @@ mod tests {
         send(WM_MBUTTONUP, 0);
         assert_eq!(ids(), [first, second, third], "a release with no press");
         send(WM_MBUTTONDOWN, 0);
-        unsafe {
-            SendMessageW(
-                window.hwnd,
-                windows_sys::Win32::UI::Controls::WM_MOUSELEAVE,
-                0,
-                0,
-            )
-        };
+        unsafe { SendMessageW(group, windows_sys::Win32::UI::Controls::WM_MOUSELEAVE, 0, 0) };
         send(WM_MBUTTONUP, 0);
         assert_eq!(ids(), [first, second, third], "the pointer left in between");
 
@@ -6925,21 +10279,16 @@ mod tests {
             seen.set(true);
             CloseDecision::Cancel
         });
-        let center = super::title_layout(window.hwnd).tab(0).center();
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let center = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
 
         unsafe {
-            SendMessageW(
-                window.hwnd,
-                WM_MBUTTONDOWN,
-                0,
-                client_lparam(center.x, center.y),
-            );
-            SendMessageW(
-                window.hwnd,
-                WM_MBUTTONUP,
-                0,
-                client_lparam(center.x, center.y),
-            );
+            SendMessageW(group, WM_MBUTTONDOWN, 0, client_lparam(center.x, center.y));
+            SendMessageW(group, WM_MBUTTONUP, 0, client_lparam(center.x, center.y));
         }
 
         assert!(asked.get(), "no prompt");
@@ -6961,7 +10310,8 @@ mod tests {
                 .shown_picker_rows()
                 .iter()
                 .map(|row| match row {
-                    crate::window::command_palette::PickerRow::Note { found, .. } => {
+                    crate::window::command_palette::PickerRow::Note { found, .. }
+                    | crate::window::command_palette::PickerRow::View { found, .. } => {
                         found.name.clone()
                     }
                     other => format!("{other:?}"),
@@ -7355,6 +10705,7 @@ mod tests {
             )
         };
         let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        // The editor group's tab strip is the title row, so the editor starts right below it.
         let title_height = super::title_layout(window.hwnd).height;
         let band = super::menu_band::band_height(dpi);
 
@@ -7410,7 +10761,7 @@ mod tests {
             super::VK_DOWN as usize,
         ));
         assert_eq!(app_mut(window.hwnd).menu_mode, None);
-        assert!(app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+        assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
         assert_eq!(
             editor_top(),
             title_height + super::find_bar::find_bar_height(dpi)
@@ -7439,21 +10790,22 @@ mod tests {
             (unsafe { GetWindowLongPtrW(child, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
         };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+        // The editor group's tab strip is the title row, so the editor starts right below it.
         let title_height = super::title_layout(window.hwnd).height;
 
         execute_command(window.hwnd, CommandId::Find);
-        let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
+        let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
         assert!(visible(panel));
         let band = super::find_bar::find_bar_height(dpi);
         assert_eq!(top_of(panel), (title_height, band));
         assert_eq!(top_of(editor.hwnd()).0, title_height + band);
 
         let brush_before = {
-            let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+            let bar = app_mut(window.hwnd).find_bar().unwrap();
             bar.control_color(std::ptr::null_mut())
         };
         execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.is_visible());
         assert_ne!(bar.control_color(std::ptr::null_mut()), brush_before);
 
@@ -7785,7 +11137,9 @@ mod tests {
             execute_command(window.hwnd, CommandId::New);
         }
         super::activate_tab(window.hwnd, 0);
-        let layout = super::title_layout(window.hwnd);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let scroll = || app_mut(window.hwnd).tabs.scroll_offset();
+        let layout = super::strip_layout(window.hwnd).unwrap();
         assert_eq!(layout.scroll, 0);
         let thumb = layout.scroll_thumb().expect("40 tabs overflow the strip");
         let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
@@ -7793,28 +11147,31 @@ mod tests {
         let far_right = layout.tabs.right + 500;
 
         unsafe {
-            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, pack(thumb.center().x, y));
-            SendMessageW(window.hwnd, WM_MOUSEMOVE, 1, pack(far_right, y));
+            SendMessageW(group, WM_LBUTTONDOWN, 1, pack(thumb.center().x, y));
+            SendMessageW(group, WM_MOUSEMOVE, 1, pack(far_right, y));
         }
-        assert_eq!(super::tab_scroll(window.hwnd), layout.max_scroll);
+        assert_eq!(scroll(), layout.max_scroll);
         unsafe {
-            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, pack(far_right, y));
-            SendMessageW(window.hwnd, WM_MOUSEMOVE, 0, pack(layout.tabs.left, y));
+            SendMessageW(group, WM_LBUTTONUP, 0, pack(far_right, y));
+            SendMessageW(group, WM_MOUSEMOVE, 0, pack(layout.tabs.left, y));
         }
         assert_eq!(
-            super::tab_scroll(window.hwnd),
+            scroll(),
             layout.max_scroll,
             "moving after the release must not keep dragging"
         );
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
 
         // Pressing the track away from the thumb jumps there.
-        let track = super::title_layout(window.hwnd).scroll_bar.unwrap();
+        let track = super::strip_layout(window.hwnd)
+            .unwrap()
+            .scroll_bar
+            .unwrap();
         unsafe {
-            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, pack(track.left, y));
-            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, pack(track.left, y));
+            SendMessageW(group, WM_LBUTTONDOWN, 1, pack(track.left, y));
+            SendMessageW(group, WM_LBUTTONUP, 0, pack(track.left, y));
         }
-        assert_eq!(super::tab_scroll(window.hwnd), 0);
+        assert_eq!(scroll(), 0);
     }
 
     #[test]
@@ -8036,8 +11393,7 @@ mod tests {
         }
         .unwrap();
         let editor_hwnd = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
-            .editor
-            .as_ref()
+            .editor()
             .unwrap()
             .hwnd();
 
@@ -8085,6 +11441,7 @@ mod tests {
             GetClientRect(editor_hwnd, &mut shown);
         }
         let dpi = unsafe { GetDpiForWindow(window.hwnd) };
+        // The editor group's tab strip is the title row, so the editor starts right below it.
         let title_height = super::title_layout(window.hwnd).height;
         assert_eq!(
             (client.bottom - client.top) - (shown.bottom - shown.top),
@@ -8592,8 +11949,8 @@ mod tests {
         // What the first WM_SIZE does once `bootstrap::run` shows the window.
         super::layout_editor_and_find_bar(window.hwnd);
         unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
-            .editor
-            .clone()
+            .editor()
+            .cloned()
             .unwrap()
     }
 
@@ -8717,7 +12074,10 @@ mod tests {
         let editor = install_test_editor(&window);
         assert!(app_mut(window.hwnd).sidebar.is_none());
         assert_eq!(crate::window::side_panel::left_edge(window.hwnd), 0);
-        assert_eq!(super::title_layout(window.hwnd).tab(0).left, 0);
+        assert_eq!(
+            left_of(super::group_hwnd(window.hwnd).unwrap(), window.hwnd),
+            0
+        );
         assert_eq!(left_of(editor.hwnd(), window.hwnd), 0);
         assert_eq!(
             crate::window::side_panel::current_view(window.hwnd),
@@ -8779,7 +12139,10 @@ mod tests {
         assert_eq!(left_of(panel, window.hwnd), activity);
         let left = activity + panel_width;
         assert_eq!(crate::window::side_panel::left_edge(window.hwnd), left);
-        assert_eq!(super::title_layout(window.hwnd).tab(0).left, left);
+        assert_eq!(
+            left_of(super::group_hwnd(window.hwnd).unwrap(), window.hwnd),
+            left
+        );
         assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
         assert_eq!(client_size(editor.hwnd()).0, width - left);
         // Nothing before the pointer needs the tooltip, so the first frame goes without it.
@@ -8815,7 +12178,7 @@ mod tests {
         assert_eq!(tooltip.tool_count(), 4);
 
         execute_command(window.hwnd, CommandId::Find);
-        let find = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
+        let find = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
         assert_eq!(left_of(find, window.hwnd), left);
         assert_eq!(client_size(find).0, width - left);
         super::close_find_bar(window.hwnd);
@@ -9282,6 +12645,12 @@ mod tests {
         }
         .unwrap();
         super::create_new_document(window.hwnd).unwrap();
+        // Documents belong to the document host, so their releases go through its endpoint.
+        let host = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .document_host
+            .as_ref()
+            .unwrap()
+            .hwnd();
         let (_, releases) = crate::editor::scintilla::release_observation::during(|| unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
                 window.hwnd,
@@ -9295,9 +12664,10 @@ mod tests {
         assert!(
             releases
                 .iter()
-                .all(|release| release.hwnd == editor && release.window_was_live)
+                .all(|release| release.hwnd == host && release.window_was_live)
         );
         assert_eq!(unsafe { IsWindow(editor) }, 0);
+        assert_eq!(unsafe { IsWindow(host) }, 0);
         assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
     }
 
@@ -9572,7 +12942,7 @@ mod tests {
     fn write_session(scratch: &RecoveryScratch, entries: Vec<SessionEntry>, active: usize) {
         crate::session::write(
             &scratch.path().join("session.ini"),
-            &Session { active, entries },
+            &Session::single(active, entries),
         )
         .unwrap();
     }
@@ -9606,16 +12976,19 @@ mod tests {
         assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
         let session = crate::session::read(&scratch.path().join("session.ini")).unwrap();
         assert_eq!(
-            session.entries.len(),
+            session.groups[0].entries.len(),
             2,
             "the empty untitled tab is skipped"
         );
-        assert_eq!(session.entries[0].source, SessionSource::File(file));
-        let SessionSource::Snapshot(id) = session.entries[1].source else {
+        assert_eq!(
+            session.groups[0].entries[0].source,
+            SessionSource::File(file)
+        );
+        let SessionSource::Snapshot(id) = session.groups[0].entries[1].source else {
             panic!("the unsaved tab must be recorded as a snapshot");
         };
         assert_eq!(
-            session.active, 1,
+            session.groups[0].active, 1,
             "the skipped active tab falls back to the one before"
         );
         let snapshot =
@@ -9664,6 +13037,104 @@ mod tests {
         while unsafe { PeekMessageW(&mut message, hwnd, restore, restore, PM_REMOVE) } != 0 {
             unsafe { DispatchMessageW(&message) };
         }
+    }
+
+    #[test]
+    fn a_three_group_session_comes_back_with_its_layout_views_and_positions() {
+        // Break caught: the layout flattened into one group, a view's caret lost, or a document
+        // shown in two groups restored twice (or failing on its second snapshot entry).
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-groups");
+        let file = scratch.path().join("plan.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour").unwrap();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        super::open_path(window.hwnd, &file).unwrap();
+        editor
+            .apply_view_state(crate::editor::ViewState {
+                caret: 5,
+                anchor: 5,
+                first_line: 1,
+                x_offset: 0,
+            })
+            .unwrap();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        execute_command(window.hwnd, CommandId::New);
+        super::group_editor(window.hwnd, super::group_order(window.hwnd)[1])
+            .unwrap()
+            .set_text("unsaved and shared")
+            .unwrap();
+        execute_command(window.hwnd, CommandId::SplitDown);
+        assert_eq!(super::group_order(window.hwnd).len(), 3);
+        assert!(super::save_session_for_close(window.hwnd));
+        let saved = std::fs::read_to_string(scratch.path().join("session.ini")).unwrap();
+        assert!(
+            saved.contains("layout=row(1:0.5,column(2:0.5,3:0.5):0.5)"),
+            "{saved}"
+        );
+        drop(window);
+
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        run_session_restore(window.hwnd);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 3);
+        let tabs = &app_mut(window.hwnd).tabs;
+        let shared = tabs
+            .documents()
+            .find(|document| document.path.is_none())
+            .map(|document| document.id)
+            .unwrap();
+        assert_eq!(tabs.views_of(shared), vec![order[1], order[2]]);
+        assert_eq!(tabs.documents().count(), 2);
+        let first_editor = super::group_editor(window.hwnd, order[0]).unwrap();
+        assert_eq!(first_editor.view_state().unwrap().caret, 5);
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+        assert!(
+            notices(window.hwnd).is_empty(),
+            "{:?}",
+            notices(window.hwnd)
+        );
+    }
+
+    #[test]
+    fn a_group_whose_files_are_gone_or_whose_window_fails_folds_into_the_others() {
+        // Break caught: an empty group left in the layout after its files vanished, or a group
+        // whose window can't be made losing its tabs.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-groups-gone");
+        let kept = scratch.path().join("kept.txt");
+        std::fs::write(&kept, "kept").unwrap();
+        let other = scratch.path().join("other.txt");
+        std::fs::write(&other, "other").unwrap();
+        let gone = scratch.path().join("gone.txt");
+        let group = |number, path: &std::path::Path| crate::session::SessionGroup {
+            number,
+            active: 0,
+            entries: vec![SessionEntry::new(SessionSource::File(path.to_path_buf()))],
+        };
+        let session = crate::session::Session {
+            layout: crate::session::SessionLayout::parse("row(1:0.3,2:0.3,3:0.4)").unwrap(),
+            active_group: 0,
+            groups: vec![group(1, &kept), group(2, &gone), group(3, &other)],
+        };
+        crate::session::write(&scratch.path().join("session.ini"), &session).unwrap();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        // Group 2's window is made; group 3's fails.
+        super::fail_group_creation_after(1);
+        run_session_restore(window.hwnd);
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 1, "group 2 emptied, group 3's window failed");
+        let tabs = &app_mut(window.hwnd).tabs;
+        assert!(tabs.find_path(&kept).is_some());
+        assert!(
+            tabs.find_path(&other).is_some(),
+            "group 3's views went to the first group"
+        );
     }
 
     #[test]
@@ -9804,7 +13275,7 @@ mod tests {
             .tabs
             .activation_order()
             .iter()
-            .map(|&id| app.tabs.document(id).unwrap().path.clone().unwrap())
+            .map(|&(_, id)| app.tabs.document(id).unwrap().path.clone().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(
             paths,
@@ -10214,13 +13685,24 @@ mod tests {
 
         super::open_note(window.hwnd, &c, super::OpenMode::Preview, false).unwrap();
         let index = app_mut(window.hwnd).tabs.active_index();
-        let center = super::title_layout(window.hwnd).tab(index).center();
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let center = super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(index)
+            .unwrap()
+            .center();
         let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
         // Both clicks carry the same message time, well inside the double-click time.
         for _ in 0..2 {
             unsafe {
                 SendMessageW(
-                    window.hwnd,
+                    group,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN,
+                    1,
+                    pack(center.x, center.y),
+                );
+                SendMessageW(
+                    group,
                     windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
                     0,
                     pack(center.x, center.y),
@@ -10233,6 +13715,45 @@ mod tests {
             "a double-click promotes"
         );
         assert_eq!(super::tab_count(window.hwnd), 3);
+    }
+
+    #[test]
+    fn the_session_keeps_every_tabs_position_and_restores_it() {
+        // Break caught: only the shown tab's caret saved, so every other tab reopens at the top;
+        // or a restored background tab's position overwritten when the next entry opens.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("session-positions");
+        let a = scratch.note("a.md", &"line\n".repeat(2000));
+        let b = scratch.note("b.md", "b");
+        let recovery = RecoveryScratch::new("session-positions");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        scratch.install(window.hwnd);
+        super::open_note(window.hwnd, &a, super::OpenMode::Permanent, false).unwrap();
+        let away = crate::editor::ViewState {
+            caret: 1210 * 5,
+            anchor: 1210 * 5,
+            first_line: 1200,
+            x_offset: 0,
+        };
+        editor.apply_view_state(away).unwrap();
+        super::open_note(window.hwnd, &b, super::OpenMode::Permanent, false).unwrap();
+
+        let session = super::build_session(window.hwnd, recovery.path()).unwrap();
+        let entries = &session.groups[0].entries;
+        assert_eq!((entries[0].caret, entries[0].first_line), (1210 * 5, 1200));
+        assert_eq!(session.groups[0].active, 1);
+
+        for id in [b.clone(), a.clone()].map(|path| app_mut(window.hwnd).tabs.find_path(&path)) {
+            super::close_document_without_prompt(window.hwnd, id.unwrap());
+        }
+        for entry in entries {
+            let group = app_mut(window.hwnd).tabs.active_group();
+            super::restore_session_entry(window.hwnd, group, entry).unwrap();
+        }
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        let restored = editor.view_state().unwrap();
+        assert_eq!((restored.caret, restored.first_line), (1210 * 5, 1200));
     }
 
     #[test]
@@ -10249,12 +13770,15 @@ mod tests {
         super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
 
         let session = super::build_session(window.hwnd, recovery.path()).unwrap();
-        assert_eq!(session.entries.len(), 1);
-        assert!(matches!(&session.entries[0].source, SessionSource::File(path) if *path == a));
+        assert_eq!(session.groups[0].entries.len(), 1);
+        assert!(
+            matches!(&session.groups[0].entries[0].source, SessionSource::File(path) if *path == a)
+        );
 
         let id = app_mut(window.hwnd).tabs.active().unwrap().id;
         super::close_document_without_prompt(window.hwnd, id);
-        super::restore_session_entry(window.hwnd, &session.entries[0]).unwrap();
+        let group = app_mut(window.hwnd).tabs.active_group();
+        super::restore_session_entry(window.hwnd, group, &session.groups[0].entries[0]).unwrap();
         assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
     }
 
@@ -10659,7 +14183,7 @@ mod tests {
         let editor = install_test_editor(&window);
         enable_session(window.hwnd, &scratch);
         app_mut(window.hwnd).session_restore = Some(crate::session::SessionRestore::new(
-            Session::default(),
+            &Session::single(0, Vec::new()),
             None,
         ));
         editor.set_text("unsaved words").unwrap();
@@ -10931,7 +14455,7 @@ mod tests {
         let (_scratch, window, _editor) = open_first_save_box("find-closes");
         execute_command(window.hwnd, CommandId::Find);
         assert!(!name_box_visible(window.hwnd));
-        assert!(app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+        assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
     }
 
     #[test]
@@ -10948,8 +14472,7 @@ mod tests {
 
         super::create_new_document(window.hwnd).unwrap();
         app_mut(window.hwnd)
-            .editor
-            .as_ref()
+            .editor()
             .unwrap()
             .set_text("Device")
             .unwrap();
@@ -12360,6 +15883,43 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_note_row_opens_a_normal_tab_and_promotes_the_preview() {
+        // Break caught: Enter opening the italic preview tab, so a keyboard user has no way to
+        // keep a note open short of Ctrl+Enter, and a second Enter on the preview does nothing.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("view-enter");
+        let a = scratch.note("a.md", "a");
+        let b = scratch.note("b.md", "b");
+        let (window, editor) = notebook_window(&scratch);
+        let (_, panel) = sidebar_windows(window.hwnd);
+
+        select_row(window.hwnd, &RowKind::Note("a.md".into()));
+        unsafe { SetFocus(panel) };
+        crate::window::notebook_view::key_down(window.hwnd, VK_RETURN);
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(a.as_path()));
+        assert!(!active.preview, "Enter opens a normal tab");
+        assert_eq!(
+            unsafe { GetFocus() },
+            editor.hwnd(),
+            "and moves to the editor"
+        );
+
+        // A note already in the preview tab becomes a normal tab on Enter.
+        let row = row_of(window.hwnd, &RowKind::Note("b.md".into()));
+        crate::window::notebook_view::activate(window.hwnd, row, Activation::Click);
+        assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+        select_row(window.hwnd, &RowKind::Note("b.md".into()));
+        unsafe { SetFocus(panel) };
+        crate::window::notebook_view::key_down(window.hwnd, VK_RETURN);
+        let active = app_mut(window.hwnd).tabs.active().unwrap();
+        assert_eq!(active.path.as_deref(), Some(b.as_path()));
+        assert!(!active.preview);
+        assert_eq!(super::tab_count(window.hwnd), 2);
+    }
+
+    #[test]
     fn clicking_a_note_row_opens_the_preview_and_a_double_click_keeps_it() {
         // Break caught: a click opening a normal tab every time (tabs pile up), or a double-click
         // opening a second tab instead of keeping the preview, or a click moving the keyboard to
@@ -13613,9 +17173,9 @@ mod tests {
     }
 
     #[test]
-    fn the_search_view_finds_note_text_shows_folders_and_opens_the_preview_tab() {
+    fn the_search_view_finds_note_text_shows_folders_and_enter_opens_a_normal_tab() {
         // Break caught: a search over names instead of text, results without their folder, or
-        // Enter opening a normal tab instead of the preview tab.
+        // Enter opening the preview tab, which a keyboard user cannot then keep.
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("search-view");
         scratch.note("Alpha.md", "the alpha plan");
@@ -13650,14 +17210,22 @@ mod tests {
             crate::window::search_view::summary(window.hwnd),
             Some(("3 notes".to_owned(), false))
         );
-        crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+        let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+        unsafe {
+            SendMessageW(
+                edit,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN),
+                0,
+            )
+        };
         let active = app_mut(window.hwnd).tabs.active().unwrap();
         assert_eq!(
             active.path.as_deref(),
             Some(scratch.folder().join("Alpha.md").as_path())
         );
-        let active_id = active.id;
-        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), Some(active_id));
+        assert!(!active.preview, "Enter opens a normal tab");
+        assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
 
         search_for(window.hwnd, "zzz");
         assert_eq!(
@@ -14553,27 +18121,45 @@ mod tests {
     /// Runs `key` with Ctrl (and Shift) held through the accelerator table, as the message loop
     /// does for a key sent to `target`, and returns whether the table translated it.
     fn translate_key(hwnd: HWND, target: HWND, key: u8, shift: bool) -> bool {
+        translate_key_with(hwnd, target, key, true, shift, false).is_some()
+    }
+
+    /// Runs `key` with the given modifiers through the accelerator table, as the message loop
+    /// does, and reports the command it ran.
+    fn translate_key_with(
+        hwnd: HWND,
+        target: HWND,
+        key: u8,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> Option<CommandId> {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
         };
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN, WM_SYSKEYDOWN};
         let identity = unsafe { super::window_identity(hwnd).unwrap() };
         let mut keys = [0u8; 256];
         unsafe { GetKeyboardState(keys.as_mut_ptr()) };
         let original = keys;
-        keys[VK_CONTROL as usize] = 0x80;
-        keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
-        keys[VK_MENU as usize] = 0;
+        let down = |on: bool| if on { 0x80 } else { 0 };
+        keys[VK_CONTROL as usize] = down(ctrl);
+        keys[VK_SHIFT as usize] = down(shift);
+        keys[VK_MENU as usize] = down(alt);
         unsafe { SetKeyboardState(keys.as_ptr()) };
         let message = MSG {
             hwnd: target,
-            message: WM_KEYDOWN,
+            message: if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN },
             wParam: usize::from(key),
+            // Bit 29: the Alt key was down, as the system reports it.
+            lParam: if alt { 1 << 29 } else { 0 },
             ..Default::default()
         };
+        super::LAST_COMMAND.with(|last| last.set(None));
         let translated = unsafe { super::translate_accelerator(hwnd, &identity, &message) };
         unsafe { SetKeyboardState(original.as_ptr()) };
-        translated
+        let command = super::LAST_COMMAND.with(std::cell::Cell::get);
+        translated.then_some(command).flatten()
     }
 
     #[test]
@@ -15425,7 +19011,7 @@ mod tests {
 
         assert_eq!(editor.text().unwrap(), "see a-b#c here");
         assert_eq!(editor.selection().unwrap(), 4..9);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.options().regex);
         assert!(!bar.no_match());
     }
@@ -16481,28 +20067,50 @@ mod tests {
         // Break caught: F6 landing in a hidden panel, or getting stuck when notes mode is off.
         use super::{FocusPart, next_focus_part};
         assert_eq!(
-            next_focus_part(FocusPart::Editor, false, true, true),
+            next_focus_part(FocusPart::Group(0), false, true, true, 1),
             FocusPart::ActivityBar
         );
         assert_eq!(
-            next_focus_part(FocusPart::ActivityBar, false, true, true),
+            next_focus_part(FocusPart::ActivityBar, false, true, true, 1),
             FocusPart::Panel
         );
         assert_eq!(
-            next_focus_part(FocusPart::Panel, false, true, true),
-            FocusPart::Editor
+            next_focus_part(FocusPart::Panel, false, true, true, 1),
+            FocusPart::Group(0)
         );
         assert_eq!(
-            next_focus_part(FocusPart::ActivityBar, true, true, true),
-            FocusPart::Editor
+            next_focus_part(FocusPart::ActivityBar, true, true, true, 1),
+            FocusPart::Group(0)
         );
         assert_eq!(
-            next_focus_part(FocusPart::ActivityBar, false, true, false),
-            FocusPart::Editor
+            next_focus_part(FocusPart::ActivityBar, false, true, false, 1),
+            FocusPart::Group(0)
         );
         assert_eq!(
-            next_focus_part(FocusPart::Editor, false, false, false),
-            FocusPart::Editor
+            next_focus_part(FocusPart::Group(0), false, false, false, 1),
+            FocusPart::Group(0)
+        );
+    }
+
+    #[test]
+    fn f6_visits_every_group_in_order() {
+        // Break caught: F6 skipping every group after the first.
+        use super::FocusPart::*;
+        assert_eq!(
+            super::next_focus_part(Group(0), false, true, true, 3),
+            Group(1)
+        );
+        assert_eq!(
+            super::next_focus_part(Group(2), false, true, true, 3),
+            ActivityBar
+        );
+        assert_eq!(
+            super::next_focus_part(ActivityBar, true, true, true, 3),
+            Group(2)
+        );
+        assert_eq!(
+            super::next_focus_part(Group(0), false, false, false, 1),
+            Group(0)
         );
     }
 
@@ -16897,7 +20505,7 @@ mod tests {
         let _editor = install_test_editor(&window);
         execute_command(window.hwnd, CommandId::Find);
         let (panel, query, replace) = {
-            let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+            let bar = app_mut(window.hwnd).find_bar().unwrap();
             (bar.panel_hwnd(), bar.query_hwnd(), bar.replace_hwnd())
         };
         let items = || {
@@ -16931,14 +20539,7 @@ mod tests {
 
         // The default action clicks the toggle, as the mouse does.
         (FIND_BAR_ACCESSIBLE.activate)(panel, 1);
-        assert!(
-            app_mut(window.hwnd)
-                .find_bar
-                .as_ref()
-                .unwrap()
-                .options()
-                .case
-        );
+        assert!(app_mut(window.hwnd).find_bar().unwrap().options().case);
 
         execute_command(window.hwnd, CommandId::Replace);
         assert_eq!((FIND_BAR_ACCESSIBLE.count)(panel), 6);
@@ -17128,7 +20729,7 @@ mod tests {
     }
 
     fn set_find_query(hwnd: HWND, text: &str) {
-        let edit = app_mut(hwnd).find_bar.as_ref().unwrap().query_hwnd();
+        let edit = app_mut(hwnd).find_bar().unwrap().query_hwnd();
         let wide = crate::platform::wide_null(text);
         // Sends EN_CHANGE, handled with nothing of the App borrowed here.
         unsafe {
@@ -17149,7 +20750,7 @@ mod tests {
             .populate_clean("Foo foo foobar foo_bar foo. a1 b22")
             .unwrap();
         execute_command(window.hwnd, CommandId::Find);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         set_find_query(window.hwnd, "foo");
         super::toggle_find_option(window.hwnd, SearchOption::Case);
@@ -17196,7 +20797,7 @@ mod tests {
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         execute_command(window.hwnd, CommandId::Find);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
         let (query, panel) = (bar().query_hwnd(), bar().panel_hwnd());
         let alt = 1 << 29;
 
@@ -17235,11 +20836,7 @@ mod tests {
         editor.populate_clean("CAT cat").unwrap();
         execute_command(window.hwnd, CommandId::Replace);
         set_find_query(window.hwnd, "cat");
-        let replace = app_mut(window.hwnd)
-            .find_bar
-            .as_ref()
-            .unwrap()
-            .replace_hwnd();
+        let replace = app_mut(window.hwnd).find_bar().unwrap().replace_hwnd();
         let dog = crate::platform::wide_null("dog");
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(replace, dog.as_ptr());
@@ -17274,7 +20871,7 @@ mod tests {
 
         assert_eq!(editor.text().unwrap(), "beta Beta beta Beta");
         assert_eq!(editor.selection().unwrap(), 5..9);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.is_visible());
         assert_eq!(bar.query_text(), "Beta");
         assert_eq!(
@@ -17313,7 +20910,7 @@ mod tests {
 
         assert_eq!(editor.text().unwrap(), "alpha gamma");
         assert_eq!(editor.selection().unwrap(), 0..0);
-        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar.is_visible());
         assert_eq!(bar.query_text(), "beta");
         assert!(bar.no_match());
@@ -17321,7 +20918,7 @@ mod tests {
     }
 
     fn set_replace_text(hwnd: HWND, text: &str) {
-        let edit = app_mut(hwnd).find_bar.as_ref().unwrap().replace_hwnd();
+        let edit = app_mut(hwnd).find_bar().unwrap().replace_hwnd();
         let wide = crate::platform::wide_null(text);
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
@@ -17341,7 +20938,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::Find);
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
         set_find_query(window.hwnd, r"\d*");
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         editor.set_selection(1..1).unwrap();
         super::find_next(window.hwnd);
@@ -17442,7 +21039,7 @@ mod tests {
             .unwrap();
         execute_command(window.hwnd, CommandId::Find);
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         set_find_query(window.hwnd, "élan");
         editor.set_selection(0..0).unwrap();
@@ -17476,7 +21073,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::Replace);
         set_find_query(window.hwnd, "zeta");
         super::find_next(window.hwnd);
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
         assert!(bar().no_match());
 
         set_replace_text(window.hwnd, "beta");
@@ -17497,7 +21094,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::Find);
         super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
         set_find_query(window.hwnd, "mașină");
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
         let find = |text: &str, backward: bool| {
             editor.populate_clean(text).unwrap();
             let end = editor.length().unwrap();
@@ -17543,7 +21140,7 @@ mod tests {
         super::toggle_find_option(window.hwnd, SearchOption::Regex);
         super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
         set_find_query(window.hwnd, "fo+");
-        let bar = || app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        let bar = || app_mut(window.hwnd).find_bar().unwrap();
 
         editor.set_selection(0..0).unwrap();
         super::find_next(window.hwnd);
@@ -18879,13 +22476,118 @@ mod tests {
     }
 
     #[test]
-    fn open_editors_an_untitled_row_does_not_start_a_drag() {
+    fn open_editors_an_untitled_row_drags_but_no_folder_takes_it() {
+        // Break caught: an untitled row that cannot reach another group, or one the tree tries
+        // to copy with no file behind it (plan amendment 5).
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("editors-drag-untitled");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
         let (window, _editor) = notebook_window(&scratch);
         let panel = sidebar_windows(window.hwnd).1;
         start_tab_drag(window.hwnd, panel, 0);
-        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert!(
+            notebook_view(window.hwnd)
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.started)
+        );
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            None
+        );
+        drop_at(panel, work);
+    }
+
+    /// The Open Editors entry index (headers counted, as `editor_rect_at` counts them) of
+    /// document `id`'s first view.
+    fn open_editors_row_of(hwnd: HWND, id: crate::document::DocumentId) -> usize {
+        (0..64)
+            .find(|&index| {
+                notebook_view(hwnd)
+                    .editors
+                    .row(index)
+                    .is_some_and(|row| row.id == id)
+            })
+            .expect("an Open Editors row")
+    }
+
+    #[test]
+    fn open_editors_a_row_dropped_on_another_groups_content_moves_there() {
+        // Break caught: row drags stopping at the sidebar's edge (split editors spec §6.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-group");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::New);
+        // Close the split's view of `dragged`, so a move is visible.
+        super::focus_view(window.hwnd, second, dragged);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert!(super::activate_group(window.hwnd, first));
+        let panel = sidebar_windows(window.hwnd).1;
+        let row = open_editors_row_of(window.hwnd, dragged);
+        start_tab_drag(window.hwnd, panel, row);
+        let target = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let middle = super::with_group_id(window.hwnd, second, |state| state.content).unwrap();
+        let point = lparam_in(
+            panel,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+        );
+        drag_over(panel, point);
+        assert!(app_mut(window.hwnd).drop_overlay.is_some());
+        drop_at(panel, point);
+        assert!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .contains(dragged)
+        );
+        assert!(
+            !app_mut(window.hwnd)
+                .tabs
+                .group(first)
+                .is_some_and(|group| group.contains(dragged))
+        );
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn open_editors_a_row_drag_cancelled_over_a_group_leaves_no_overlay() {
+        // Break caught: Esc mid-drag leaving the tint over the editor.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-cancel");
+        let (window, _editor) = notebook_window(&scratch);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        let panel = sidebar_windows(window.hwnd).1;
+        // With two groups entry 0 is a header: press the first tab row.
+        let row = (0..64)
+            .find(|&index| notebook_view(window.hwnd).editors.row(index).is_some())
+            .unwrap();
+        start_tab_drag(window.hwnd, panel, row);
+        let target = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let middle = super::with_group_id(window.hwnd, second, |state| state.content).unwrap();
+        drag_over(
+            panel,
+            lparam_in(
+                panel,
+                target,
+                middle.left + 40,
+                (middle.top + middle.bottom) / 2,
+            ),
+        );
+        assert!(crate::window::notebook_view::cancel_drag(window.hwnd));
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
     }
 
     #[test]
@@ -19722,6 +23424,7 @@ mod tests {
                 .editors
                 .rows
                 .iter()
+                .filter_map(crate::window::open_editors::EditorEntry::row)
                 .map(|row| (row.name.clone(), row.dirty, row.active))
                 .collect::<Vec<_>>()
         };
@@ -19805,7 +23508,7 @@ mod tests {
         };
         toggle();
         assert!(!super::open_editors_expanded(window.hwnd));
-        let fifth = notebook_view(window.hwnd).editors.rows[4].id;
+        let fifth = notebook_view(window.hwnd).editors.row(4).unwrap().id;
         super::activate_document_by_id(window.hwnd, fifth);
         assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(4));
         toggle();
@@ -21138,7 +24841,11 @@ mod tests {
                 .editors
                 .rows
                 .iter()
-                .position(|row| row.path.as_deref() == Some(outside.as_path()))
+                .position(|entry| {
+                    entry
+                        .row()
+                        .is_some_and(|row| row.path.as_deref() == Some(outside.as_path()))
+                })
                 .unwrap();
             start_tab_drag(window.hwnd, panel, tab);
             let root = notebook_view(window.hwnd).root_rect();
@@ -21385,5 +25092,961 @@ mod tests {
         pump_posted_messages(window.hwnd);
         assert!(!scratch.folder().join("x.md").exists());
         assert!(!tab_paths(window.hwnd).contains(&Some(outside.clone())));
+    }
+
+    #[test]
+    fn the_drop_overlay_covers_its_rectangle_and_lets_the_pointer_through() {
+        // Break caught: an overlay that steals the drag's clicks, or lands off by the frame.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowRect, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let rect = RECT {
+            left: 100,
+            top: 120,
+            right: 300,
+            bottom: 220,
+        };
+        let overlay = crate::window::drop_overlay::DropOverlay::show(
+            window.hwnd,
+            rect,
+            0x00ff_0000,
+            crate::window::drop_overlay::TINT_ALPHA,
+        )
+        .expect("overlay");
+        let mut shown = RECT::default();
+        unsafe { GetWindowRect(overlay.hwnd(), &mut shown) };
+        assert_eq!(
+            (shown.left, shown.top, shown.right, shown.bottom),
+            (100, 120, 300, 220)
+        );
+        let style = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
+        assert_ne!(style & WS_EX_LAYERED, 0);
+        assert_ne!(style & WS_EX_TRANSPARENT, 0);
+        let moved = RECT {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        };
+        overlay.place(moved, 0x0000_ff00, crate::window::drop_overlay::BAR_ALPHA);
+        assert_eq!(overlay.rect().right, 30);
+        let hwnd = overlay.hwnd();
+        overlay.destroy();
+        assert_eq!(unsafe { super::IsWindow(hwnd) }, 0);
+    }
+
+    #[test]
+    fn a_tab_label_is_painted_without_the_sidebar() {
+        // Break caught: the tab drag reaching into the notebook view, which is gone when the
+        // sidebar is hidden.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let image = crate::window::notebook_view::tab_label_image(
+            window.hwnd,
+            group,
+            crate::window::icon_sets::TreeItem::Note(crate::window::file_icons::NoteKind::Text),
+            "notes.txt",
+        )
+        .expect("label image");
+        assert!(image.size.cx > image.size.cy);
+    }
+
+    /// Group `from`'s window, and a press on its tab `index` followed by a move past the drag
+    /// distance.
+    fn start_strip_drag(hwnd: HWND, from: GroupId, index: usize) -> HWND {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let window = super::with_group_id(hwnd, from, |state| state.hwnd).unwrap();
+        let tab = super::strip_layout_of(hwnd, from)
+            .unwrap()
+            .tab(index)
+            .unwrap()
+            .center();
+        unsafe {
+            SendMessageW(window, WM_LBUTTONDOWN, 1, client_lparam(tab.x, tab.y));
+            SendMessageW(window, WM_MOUSEMOVE, 1, client_lparam(tab.x + 30, tab.y));
+        }
+        window
+    }
+
+    /// Window `to`'s client point (`x`, `y`) in window `from`'s client coordinates, as an
+    /// `lParam`: where the source group, which has the capture, sees the pointer.
+    fn lparam_in(from: HWND, to: HWND, x: i32, y: i32) -> super::LPARAM {
+        let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(to, from, &mut point, 1) };
+        client_lparam(point.x, point.y)
+    }
+
+    /// Moves the drag to window `to`'s client point and releases there; `buttons` carries
+    /// `MK_CONTROL` for a copy.
+    fn drop_strip_drag(from: HWND, to: HWND, x: i32, y: i32, buttons: usize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_MOUSEMOVE};
+        let point = lparam_in(from, to, x, y);
+        unsafe {
+            SendMessageW(from, WM_MOUSEMOVE, 1 | buttons, point);
+            SendMessageW(from, WM_LBUTTONUP, buttons, point);
+        }
+    }
+
+    fn strip_ids(hwnd: HWND, group: GroupId) -> Vec<crate::document::DocumentId> {
+        app_mut(hwnd).tabs.group(group).unwrap().document_ids()
+    }
+
+    #[test]
+    fn a_tab_dragged_along_its_strip_moves_there_and_stays_active() {
+        // Break caught: a strip drag that does nothing, or reorders but leaves the editor on
+        // another tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        assert!(
+            app_mut(window.hwnd)
+                .tab_drag
+                .as_ref()
+                .is_some_and(|drag| drag.started)
+        );
+        let layout = super::strip_layout_of(window.hwnd, group).unwrap();
+        let end = layout.tab(2).unwrap();
+        drop_strip_drag(source, source, end.right - 2, end.center().y, 0);
+        assert_eq!(strip_ids(window.hwnd, group), [ids[1], ids[2], ids[0]]);
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, ids[0]);
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn a_wobble_under_the_drag_distance_is_still_a_click() {
+        // Break caught (Review Focus 1): a slightly shaky click starting a drag, so the tab
+        // never activates.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let first = strip_ids(window.hwnd, group)[0];
+        let tab = super::strip_layout_of(window.hwnd, group)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let source = super::with_group_id(window.hwnd, group, |state| state.hwnd).unwrap();
+        unsafe {
+            SendMessageW(source, WM_LBUTTONDOWN, 1, client_lparam(tab.x, tab.y));
+            SendMessageW(source, WM_MOUSEMOVE, 1, client_lparam(tab.x + 1, tab.y));
+            SendMessageW(source, WM_LBUTTONUP, 0, client_lparam(tab.x + 1, tab.y));
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, first);
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+    }
+
+    #[test]
+    fn a_press_on_a_tabs_close_button_never_starts_a_drag() {
+        // Break caught: a jittery click on × dragging the tab instead of closing it.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let close = super::strip_layout_of(window.hwnd, group)
+            .unwrap()
+            .close_tab(0)
+            .unwrap()
+            .center();
+        let source = super::with_group_id(window.hwnd, group, |state| state.hwnd).unwrap();
+        unsafe {
+            SendMessageW(source, WM_LBUTTONDOWN, 1, client_lparam(close.x, close.y));
+            SendMessageW(
+                source,
+                WM_MOUSEMOVE,
+                1,
+                client_lparam(close.x - 40, close.y),
+            );
+        }
+        assert!(
+            app_mut(window.hwnd)
+                .tab_drag
+                .as_ref()
+                .is_none_or(|drag| !drag.started)
+        );
+    }
+
+    #[test]
+    fn esc_cancels_a_tab_drag_and_takes_its_label_and_overlay() {
+        // Break caught: Esc typed into the editor while a tab drag hangs on the pointer.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        start_strip_drag(window.hwnd, group, 0);
+        let escape = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_KEYDOWN,
+            wParam: VK_ESCAPE as usize,
+            ..Default::default()
+        };
+        assert!(crate::window::tab_drag::keeps_key(window.hwnd, &escape));
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+        assert_eq!(strip_ids(window.hwnd, group), ids);
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() },
+            std::ptr::null_mut()
+        );
+    }
+
+    #[test]
+    fn a_lost_capture_cancels_a_tab_drag() {
+        // Break caught (Review Focus 2): Alt+Tab mid-drag leaving the label on screen and the
+        // next click dropping the tab somewhere.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        start_strip_drag(window.hwnd, group, 0);
+        unsafe { ReleaseCapture() };
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn a_right_press_cancels_a_tab_drag_and_its_release_opens_no_menu() {
+        // Break caught: the right release after a cancel falling through to the strip's menu.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let menu = std::rc::Rc::new(std::cell::Cell::new(false));
+        let shown = menu.clone();
+        crate::window::menus::answer_next_popup_menu(move |_| {
+            shown.set(true);
+            None
+        });
+        let source = start_strip_drag(window.hwnd, group, 0);
+        unsafe { SendMessageW(source, WM_RBUTTONDOWN, 2, client_lparam(20, 10)) };
+        assert!(
+            app_mut(window.hwnd)
+                .tab_drag
+                .as_ref()
+                .is_some_and(|drag| drag.eat_right_up)
+        );
+        unsafe { SendMessageW(source, WM_RBUTTONUP, 0, client_lparam(20, 10)) };
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(!menu.get(), "the release opened a menu");
+    }
+
+    #[test]
+    fn the_insertion_bar_shows_over_the_strip_under_the_pointer() {
+        // Break caught: no feedback until the drop, so the user cannot see where the tab lands.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let source = start_strip_drag(window.hwnd, group, 0);
+        let layout = super::strip_layout_of(window.hwnd, group).unwrap();
+        let x = layout.insertion_x(2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, client_lparam(x + 1, 10)) };
+        let overlay = app_mut(window.hwnd).drop_overlay.expect("an insertion bar");
+        let mut origin = windows_sys::Win32::Foundation::POINT { x, y: 0 };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(source, &mut origin) };
+        let rect = overlay.rect();
+        assert!(
+            (rect.left - origin.x).abs() <= 2,
+            "bar at {} vs insertion point {}",
+            rect.left,
+            origin.x
+        );
+        assert_eq!(rect.bottom - rect.top, layout.height);
+        crate::window::tab_drag::cancel(window.hwnd);
+    }
+
+    #[test]
+    fn near_a_content_edge_the_half_the_new_group_takes_is_tinted() {
+        // Break caught: no zone highlight near the edges, a tint over the whole group for an edge
+        // (the user cannot tell a split from a move), the wrong half, or a tint where the drop
+        // does nothing.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let area = super::with_group_id(window.hwnd, group, |state| state.content).unwrap();
+        let area = RECT {
+            left: area.left,
+            top: area.top,
+            right: area.right,
+            bottom: area.bottom,
+        };
+        let screen = |source: HWND, rect: RECT| {
+            let mut corners = [
+                windows_sys::Win32::Foundation::POINT {
+                    x: rect.left,
+                    y: rect.top,
+                },
+                windows_sys::Win32::Foundation::POINT {
+                    x: rect.right,
+                    y: rect.bottom,
+                },
+            ];
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::MapWindowPoints(
+                    source,
+                    std::ptr::null_mut(),
+                    corners.as_mut_ptr(),
+                    2,
+                )
+            };
+            (corners[0].x, corners[0].y, corners[1].x, corners[1].y)
+        };
+        let tint = || {
+            app_mut(window.hwnd).drop_overlay.map(|overlay| {
+                let rect = overlay.rect();
+                (rect.left, rect.top, rect.right, rect.bottom)
+            })
+        };
+        let (width, height) = (area.right - area.left, area.bottom - area.top);
+        let source = start_strip_drag(window.hwnd, group, 0);
+
+        // The right edge: the right half.
+        let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert_eq!(
+            tint(),
+            Some(screen(
+                source,
+                RECT {
+                    left: area.right - width / 2,
+                    ..area
+                }
+            ))
+        );
+        // The bottom edge: the bottom half; the zone follows the pointer.
+        let point = client_lparam((area.left + area.right) / 2, area.bottom - 5);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert_eq!(
+            tint(),
+            Some(screen(
+                source,
+                RECT {
+                    top: area.bottom - height / 2,
+                    ..area
+                }
+            ))
+        );
+        crate::window::tab_drag::cancel(window.hwnd);
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+
+        // A lone tab over its own edge would do nothing: no tint.
+        execute_command(window.hwnd, CommandId::CloseTab);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert!(tint().is_none());
+        crate::window::tab_drag::cancel(window.hwnd);
+    }
+
+    /// Two groups side by side, the second showing the first's document; the second active.
+    fn two_groups(hwnd: HWND) -> (GroupId, GroupId) {
+        let first = app_mut(hwnd).tabs.active_group();
+        execute_command(hwnd, CommandId::SplitRight);
+        (first, app_mut(hwnd).tabs.active_group())
+    }
+
+    fn group_window(hwnd: HWND, id: GroupId) -> HWND {
+        super::with_group_id(hwnd, id, |state| state.hwnd).unwrap()
+    }
+
+    fn content(hwnd: HWND, id: GroupId) -> RECT {
+        let area = super::with_group_id(hwnd, id, |state| state.content).unwrap();
+        RECT {
+            left: area.left,
+            top: area.top,
+            right: area.right,
+            bottom: area.bottom,
+        }
+    }
+
+    #[test]
+    fn a_tab_dropped_on_another_groups_strip_moves_there_at_that_point() {
+        // Break caught: a cross-group drop appending, keeping the source view, or leaving the
+        // focus in the source group.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        execute_command(window.hwnd, CommandId::New);
+        let moving = app_mut(window.hwnd).tabs.active().unwrap().id;
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let layout = super::strip_layout_of(window.hwnd, second).unwrap();
+        drop_strip_drag(source, target, layout.insertion_x(1) + 1, 10, 0);
+        assert_eq!(strip_ids(window.hwnd, second)[1], dragged);
+        assert!(strip_ids(window.hwnd, second).contains(&moving));
+        assert!(!strip_ids(window.hwnd, first).contains(&dragged));
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            super::group_editor(window.hwnd, second).unwrap().hwnd()
+        );
+    }
+
+    #[test]
+    fn a_ctrl_drop_on_another_group_adds_a_view_and_keeps_the_source() {
+        // Break caught: Ctrl ignored, so a copy drag takes the tab away from where it was.
+        const MK_CONTROL: usize = 0x0008;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            MK_CONTROL,
+        );
+        assert!(strip_ids(window.hwnd, first).contains(&dragged));
+        assert_eq!(strip_ids(window.hwnd, second).last(), Some(&dragged));
+        assert_eq!(app_mut(window.hwnd).tabs.views_of(dragged).len(), 2);
+    }
+
+    #[test]
+    fn a_drop_where_the_document_is_already_open_activates_that_view_and_still_moves() {
+        // Break caught (spec §6.2): a second view of one document in one group, or the source
+        // view left behind by a move.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        let shared = strip_ids(window.hwnd, second)[0];
+        execute_command(window.hwnd, CommandId::New);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let source = start_strip_drag(window.hwnd, first, 0);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert_eq!(
+            strip_ids(window.hwnd, second)
+                .iter()
+                .filter(|id| **id == shared)
+                .count(),
+            1
+        );
+        assert_eq!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .active_document(),
+            Some(shared)
+        );
+        assert!(!strip_ids(window.hwnd, first).contains(&shared));
+    }
+
+    #[test]
+    fn dragging_a_groups_last_tab_to_another_group_closes_the_source_group() {
+        // Break caught (Review Focus 4): an empty group left behind after its last tab moved.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, second)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let other = strip_ids(window.hwnd, second)[1 - index];
+        // Leave `dragged` alone in the second group.
+        super::focus_view(window.hwnd, second, other);
+        super::close_document_tab(window.hwnd, other);
+        let source = start_strip_drag(window.hwnd, second, 0);
+        let target = group_window(window.hwnd, first);
+        let middle = content(window.hwnd, first);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert_eq!(super::group_order(window.hwnd), [first]);
+        assert!(strip_ids(window.hwnd, first).contains(&dragged));
+    }
+
+    #[test]
+    fn a_lone_tab_dropped_on_its_own_edge_or_middle_does_nothing() {
+        // Break caught (Review Focus 4): a one-tab group splitting itself and closing, which
+        // shuffles the layout for nothing.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        let area = content(window.hwnd, group);
+        let own = group_window(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        drop_strip_drag(source, own, area.right - 5, (area.top + area.bottom) / 2, 0);
+        assert_eq!(super::group_order(window.hwnd), [group]);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        drop_strip_drag(
+            source,
+            own,
+            (area.left + area.right) / 2,
+            (area.top + area.bottom) / 2,
+            0,
+        );
+        assert_eq!(strip_ids(window.hwnd, group), ids);
+    }
+
+    #[test]
+    fn a_tab_dropped_on_an_edge_splits_that_way_and_moves_into_the_new_group() {
+        // Break caught: the split going the wrong way, or the view copied instead of moved.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let dragged = strip_ids(window.hwnd, group)[0];
+        let area = content(window.hwnd, group);
+        let own = group_window(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        drop_strip_drag(
+            source,
+            own,
+            (area.left + area.right) / 2,
+            area.bottom - 5,
+            0,
+        );
+        let order = super::group_order(window.hwnd);
+        assert_eq!(order.len(), 2);
+        let new = order[1];
+        assert_eq!(strip_ids(window.hwnd, new), [dragged]);
+        assert!(!strip_ids(window.hwnd, group).contains(&dragged));
+        let layout = super::tree_layout(window.hwnd).unwrap();
+        assert!(
+            layout.rect_of(new).unwrap().top > layout.rect_of(group).unwrap().top,
+            "below"
+        );
+    }
+
+    #[test]
+    fn an_edge_drop_without_room_says_so_and_leaves_the_tab_where_it_was() {
+        // Break caught (Review Focus 5): the view removed from its group before the split was
+        // refused, losing the tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        let own = group_window(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        // Shrink the window below two minimum-width groups mid-drag.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                window.hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                300,
+                400,
+                windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            );
+        }
+        super::layout_editor_and_find_bar(window.hwnd);
+        let area = content(window.hwnd, group);
+        drop_strip_drag(source, own, area.right - 3, (area.top + area.bottom) / 2, 0);
+        assert_eq!(super::group_order(window.hwnd), [group]);
+        assert_eq!(strip_ids(window.hwnd, group), ids);
+        assert!(
+            notices(window.hwnd)
+                .iter()
+                .any(|notice| notice.contains(super::NO_ROOM_TO_SPLIT))
+        );
+    }
+
+    #[test]
+    fn a_tab_closed_mid_drag_drops_nothing() {
+        // Break caught (Review Focus 2): a stale id moving some other tab, or a panic.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        super::close_document_without_prompt(window.hwnd, dragged);
+        let before = strip_ids(window.hwnd, second);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert_eq!(strip_ids(window.hwnd, second), before);
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn a_dirty_document_moves_between_groups_without_a_prompt_and_stays_dirty() {
+        // Break caught: a move implemented as close plus open, asking to save.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        editor.set_text("unsaved").unwrap();
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        app_mut(window.hwnd).tabs.set_dirty(dragged, true);
+        assert!(app_mut(window.hwnd).tabs.document(dragged).unwrap().dirty);
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        drop_strip_drag(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+            0,
+        );
+        assert!(crate::window::modal::take_last_confirm().is_none());
+        assert!(app_mut(window.hwnd).tabs.document(dragged).unwrap().dirty);
+        assert!(strip_ids(window.hwnd, second).contains(&dragged));
+    }
+
+    #[test]
+    fn a_strip_tab_dropped_on_a_notebook_folder_copies_its_file() {
+        // Break caught: strip drags ignoring the tree the Open Editors rows already copy into
+        // (split editors spec §6.1).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drag-folder");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let index = strip_ids(window.hwnd, group)
+            .iter()
+            .position(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            })
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, group, index);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        let (x, y) = (
+            (work & 0xffff) as i16 as i32,
+            ((work >> 16) & 0xffff) as i16 as i32,
+        );
+        drop_strip_drag(source, panel, x, y, 0);
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+            "draft"
+        );
+        assert!(
+            strip_ids(window.hwnd, group).iter().any(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            }),
+            "the tab stays"
+        );
+        assert!(notebook_view(window.hwnd).drag.is_none());
+    }
+
+    #[test]
+    fn files_dropped_on_a_second_groups_editor_open_in_that_group() {
+        // Break caught: only group 1's editor taking Explorer drops, so a drop on the right-hand
+        // editor opens on the left (split editors spec §6.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editor-drop-group");
+        let note = scratch.note("dropped.md", "dropped");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        crate::window::library_host::accept_editor_file_drops(window.hwnd);
+        let target = super::group_editor(window.hwnd, second).unwrap();
+        crate::editor::file_drop::test_support::drag_and_drop(target.hwnd(), &[note.as_path()]);
+        pump_until(window.hwnd, || {
+            app_mut(window.hwnd)
+                .tabs
+                .group_documents(second)
+                .iter()
+                .any(|document| document.path.as_deref() == Some(note.as_path()))
+        });
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    }
+
+    #[test]
+    fn a_group_split_off_after_the_chrome_takes_explorer_drops() {
+        // Break caught: the wrapper installed once in BUILD_CHROME, so every later group's
+        // editor refuses files.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editor-drop-late");
+        let note = scratch.note("late.md", "late");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::library_host::accept_editor_file_drops(window.hwnd);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        let target = super::group_editor(window.hwnd, second).unwrap();
+        let effects =
+            crate::editor::file_drop::test_support::drag_and_drop(target.hwnd(), &[note.as_path()]);
+        assert_eq!(
+            effects,
+            [windows_sys::Win32::System::Ole::DROPEFFECT_COPY; 3]
+        );
+        pump_until(window.hwnd, || {
+            app_mut(window.hwnd)
+                .tabs
+                .group_documents(second)
+                .iter()
+                .any(|document| document.path.as_deref() == Some(note.as_path()))
+        });
+    }
+
+    #[test]
+    fn files_dropped_on_a_groups_strip_open_in_that_group() {
+        // Break caught: WM_DROPFILES (a drop on a strip, a preview or an image) always opening
+        // in the active group.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drop");
+        let note = scratch.note("strip.md", "strip");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        let strip = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let mut point = windows_sys::Win32::Foundation::POINT { x: 20, y: 10 };
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::MapWindowPoints(strip, window.hwnd, &mut point, 1)
+        };
+        let drop = crate::platform::win32::test_hdrop_at(&[note.as_path()], point);
+        unsafe { SendMessageW(window.hwnd, super::WM_DROPFILES, drop as usize, 0) };
+        assert!(
+            app_mut(window.hwnd)
+                .tabs
+                .group_documents(second)
+                .iter()
+                .any(|document| document.path.as_deref() == Some(note.as_path()))
+        );
+    }
+
+    #[test]
+    fn a_left_release_after_a_right_press_cancel_drops_nothing_and_opens_no_menu() {
+        // Break caught: the right press hides the drag, but releasing the left button still
+        // drops the tab, and the right release then falls through to a context menu.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let (first, second) = two_groups(window.hwnd);
+        assert!(super::activate_group(window.hwnd, first));
+        execute_command(window.hwnd, CommandId::New);
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        let index = strip_ids(window.hwnd, first)
+            .iter()
+            .position(|id| *id == dragged)
+            .unwrap();
+        let menu = std::rc::Rc::new(std::cell::Cell::new(false));
+        let shown = menu.clone();
+        crate::window::menus::answer_next_popup_menu(move |_| {
+            shown.set(true);
+            None
+        });
+        let source = start_strip_drag(window.hwnd, first, index);
+        let target = group_window(window.hwnd, second);
+        let middle = content(window.hwnd, second);
+        let point = lparam_in(
+            source,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+        );
+        unsafe {
+            SendMessageW(source, WM_MOUSEMOVE, 1, point);
+            SendMessageW(source, WM_RBUTTONDOWN, 3, point);
+            SendMessageW(source, WM_LBUTTONUP, 2, point);
+            SendMessageW(source, WM_RBUTTONUP, 0, point);
+        }
+        assert!(strip_ids(window.hwnd, first).contains(&dragged));
+        assert!(!strip_ids(window.hwnd, second).contains(&dragged));
+        assert!(!menu.get(), "the right release opened a menu");
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+    }
+
+    #[test]
+    fn a_right_press_cancel_over_a_notebook_folder_ends_the_trees_drag() {
+        // Break caught: the folder's band and the tree's drag timer left running after the tab
+        // drag was cancelled.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drag-right-cancel");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\b.md", "b");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let index = strip_ids(window.hwnd, group)
+            .iter()
+            .position(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            })
+            .unwrap();
+        let source = start_strip_drag(window.hwnd, group, index);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        let (x, y) = (
+            (work & 0xffff) as i16 as i32,
+            ((work >> 16) & 0xffff) as i16 as i32,
+        );
+        let point = lparam_in(source, panel, x, y);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert!(notebook_view(window.hwnd).drag.is_some(), "over the folder");
+        unsafe { SendMessageW(source, WM_RBUTTONDOWN, 3, point) };
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        unsafe { SendMessageW(source, WM_RBUTTONUP, 0, point) };
+    }
+
+    #[test]
+    fn a_strip_tab_dropped_on_a_folder_asks_to_replace_with_the_drag_already_gone() {
+        // Break caught: the "Replace?" question opening under a frozen drag label with the group
+        // window still holding the mouse.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drag-replace");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+        scratch.note(r"work\draft.txt", "old");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let index = strip_ids(window.hwnd, group)
+            .iter()
+            .position(|id| {
+                app_mut(window.hwnd)
+                    .tabs
+                    .document(*id)
+                    .unwrap()
+                    .path
+                    .as_deref()
+                    == Some(outside.as_path())
+            })
+            .unwrap();
+        let asked = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = asked.clone();
+        crate::window::modal::answer_next_confirm(move |_| {
+            let capture = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() };
+            seen.set(Some(capture.is_null()));
+            false
+        });
+        let source = start_strip_drag(window.hwnd, group, index);
+        let panel = sidebar_windows(window.hwnd).1;
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        let (x, y) = (
+            (work & 0xffff) as i16 as i32,
+            ((work >> 16) & 0xffff) as i16 as i32,
+        );
+        drop_strip_drag(source, panel, x, y, 0);
+        assert_eq!(
+            asked.get(),
+            Some(true),
+            "asked, with the capture already released"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+            "old"
+        );
     }
 }

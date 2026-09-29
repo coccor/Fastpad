@@ -21,7 +21,7 @@ use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset, scale};
 use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
-use crate::window::sidebar_accessibility::MK_LBUTTON;
+use crate::window::sidebar_accessibility::{MK_CONTROL, MK_LBUTTON};
 use crate::window::tooltip::Tooltip;
 use crate::window::tree_drag::{self, Drag, DragSource, Hover};
 use std::collections::HashSet;
@@ -36,8 +36,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+    GetCapture, GetFocus, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetParent, GetSystemMetrics, IDC_ARROW, IDC_NO, KillTimer,
@@ -117,9 +117,7 @@ pub(crate) enum HeaderButton {
 pub(crate) enum Activation {
     /// A mouse click: the preview tab, focus stays in the tree (F2 and Del act on the row).
     Click,
-    /// Enter: the preview tab, focus stays in the tree for further browsing.
-    Enter,
-    /// Ctrl+Enter or a double-click: a normal tab, focus to the editor.
+    /// Enter, Ctrl+Enter or a double-click: a normal tab, focus to the editor.
     Permanent,
 }
 
@@ -605,6 +603,37 @@ fn drag_item(kind: &RowKind) -> Option<TreeItem> {
 
 /// The drag label's size for a name `text` pixels wide: padding, the icon, a gap, the name,
 /// padding.
+/// A tab's drag label for window `window` (a group window): its icon and name, painted like a
+/// tree drag's (split editors spec §6). `None` if GDI can't make the image. Needs no notebook
+/// view, so it works with the sidebar hidden.
+pub(crate) fn tab_label_image(
+    hwnd: HWND,
+    window: HWND,
+    item: TreeItem,
+    name: &str,
+) -> Option<LabelImage> {
+    let paint = super::side_panel::view_paint(hwnd, window, std::ptr::null_mut(), RECT::default());
+    let wide = name.encode_utf16().collect::<Vec<_>>();
+    let mut extent = SIZE::default();
+    if !wide.is_empty() {
+        unsafe {
+            let dc = GetDC(window);
+            if dc.is_null() {
+                return None;
+            }
+            let previous = SelectObject(dc, paint.fonts.text);
+            GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut extent);
+            SelectObject(dc, previous);
+            ReleaseDC(window, dc);
+        }
+    }
+    let size = drag_label_size(extent.cx.min(scale(LABEL_MAX_TEXT, paint.dpi)), paint.dpi);
+    let image = LabelImage::new(size.cx, size.cy)?;
+    let mut images = crate::window::icon_sets::images::IconImages::new();
+    paint_drag_label(image.dc, size, item, name, &paint, &mut images);
+    Some(image)
+}
+
 fn drag_label_size(text: i32, dpi: u32) -> SIZE {
     SIZE {
         cx: 2 * scale(LABEL_PAD, dpi) + scale(GLYPH_BOX, dpi) + scale(GAP, dpi) + text,
@@ -1169,7 +1198,8 @@ impl NotebookView {
                 return Hit::Empty;
             };
             let row = self.editors_row_rect(layout.editors_list, index);
-            let clean = self.editors.rows.get(index).is_some_and(|row| !row.dirty);
+            // A header row has no close box.
+            let clean = self.editors.row(index).is_some_and(|row| !row.dirty);
             let close = clean
                 && row.is_some_and(|row| contains(super::open_editors::close_rect(row, dpi), x, y));
             return Hit::Editor { index, close };
@@ -1325,11 +1355,14 @@ impl NotebookView {
                 let name = self.rows.iter().find(|row| &row.kind == kind)?.name.clone();
                 (item, name)
             }
-            DragSource::Tab { path, .. } => (
-                TreeItem::Note(note_kind(path)),
-                super::tree_copy::item_name(path),
+            DragSource::Tab { path, name, .. } => (
+                TreeItem::Note(
+                    path.as_deref()
+                        .map_or(crate::window::file_icons::NoteKind::Text, note_kind),
+                ),
+                name.clone(),
             ),
-            DragSource::Files(_) => return None,
+            DragSource::Files(_) | DragSource::GroupTab { .. } => return None,
         };
         let text = self
             .text_width(&name, paint.fonts.text)
@@ -1433,7 +1466,7 @@ impl NotebookView {
         // An Open Editors row shows its path; a tree row its cut-off name.
         let editor_tip = self.editors.list.hover.and_then(|index| {
             let rect = self.editors_row_rect(layout.editors_list, index)?;
-            let row = self.editors.rows.get(index)?;
+            let row = self.editors.row(index)?;
             Some((rect, super::open_editors::tooltip(row)))
         });
         let (row_rect, row_text) = match editor_tip {
@@ -1668,7 +1701,7 @@ impl NotebookView {
             left: chevron.right,
             ..layout.editors_header
         };
-        let count = self.editors.rows.len();
+        let count = self.editors.view_count();
         bold(
             &format!("OPEN EDITORS  {count}"),
             label,
@@ -1684,8 +1717,11 @@ impl NotebookView {
             &editors.list,
             palette,
             paint.focused,
-            &mut |dc, index, rect, look| {
-                if let Some(row) = editors.rows.get(index) {
+            &mut |dc, index, rect, look| match editors.rows.get(index) {
+                Some(super::open_editors::EditorEntry::Header(number)) => {
+                    super::open_editors::draw_header(dc, *number, rect, paint);
+                }
+                Some(super::open_editors::EditorEntry::View(row)) => {
                     super::open_editors::draw_editor_row(
                         dc,
                         row,
@@ -1696,6 +1732,7 @@ impl NotebookView {
                         hover_close && look.hover,
                     );
                 }
+                None => {}
             },
         );
         // The root row: chevron, name, and its buttons (not without a notebook).
@@ -2030,7 +2067,7 @@ pub(crate) fn editors_changed(hwnd: HWND) {
             || rows
                 .iter()
                 .zip(&view.editors.rows)
-                .any(|(new, old)| new.id != old.id);
+                .any(|(new, old)| new.key() != old.key());
         let changed = view.editors.set_rows(rows);
         if reordered {
             // Screen readers hear the reorder (`accessible_generation`).
@@ -2388,7 +2425,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_MBUTTONDOWN => {
             let (x, y) = point_of(lparam);
             let pressed = with_view(hwnd, |view| match view.hit_test(x, y) {
-                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                Hit::Editor { index, .. } => view.editors.row(index).map(|row| row.id),
                 _ => None,
             })
             .flatten();
@@ -2399,18 +2436,20 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             let (x, y) = point_of(lparam);
             let pressed = with_view(hwnd, |view| view.middle_press.take()).flatten();
             let released = with_view(hwnd, |view| match view.hit_test(x, y) {
-                Hit::Editor { index, .. } => view.editors.rows.get(index).map(|row| row.id),
+                Hit::Editor { index, .. } => view.editors.row(index).map(|row| (row.id, row.group)),
                 _ => None,
             })
             .flatten();
-            if let Some(id) = pressed.filter(|id| Some(*id) == released) {
+            if let Some((id, group)) = released.filter(|(id, _)| pressed == Some(*id)) {
+                // The row's own group loses the tab.
+                super::main_window::activate_group(hwnd, group);
                 super::main_window::close_document_tab(hwnd, id);
             }
             Some(0)
         }
         WM_LBUTTONUP => {
             let (x, y) = point_of(lparam);
-            if drag_release(hwnd, x, y) {
+            if drag_release(hwnd, x, y, wparam) {
                 return Some(0);
             }
             // Released after the borrow ends: ReleaseCapture sends WM_CAPTURECHANGED here.
@@ -2605,7 +2644,7 @@ fn retarget_drag(hwnd: HWND, now: Instant) {
 
 /// Whether a drag of `source` came from outside FastPad, through OLE.
 fn is_external(source: &DragSource) -> bool {
-    matches!(source, DragSource::Files(_))
+    matches!(source, DragSource::Files(_) | DragSource::GroupTab { .. })
 }
 
 /// Ends a drag's timer, with nothing of the App borrowed. Leaves the capture alone: most cancels
@@ -2725,13 +2764,51 @@ fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
         move_drag_label(hwnd, panel, x, y);
     }
     let accepted = with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false);
-    set_drag_cursor(accepted);
+    let source = with_view(hwnd, |view| {
+        view.drag.as_ref().map(|drag| drag.source.clone())
+    })
+    .flatten();
+    let over_group = !accepted
+        && source.is_some_and(|source| {
+            group_drop_at(hwnd, panel, &source, x, y, buttons & MK_CONTROL != 0).is_some()
+        });
+    if accepted {
+        super::tab_drag::hide_feedback(hwnd);
+    }
+    // Last: `show_feedback` sets the cursor too.
+    set_drag_cursor(accepted || over_group);
     true
 }
 
 /// `WM_LBUTTONUP`: a drag under way drops where the button went up (tree drag spec §3.4). An
 /// armed drag was a click. True when a drag was under way.
-fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
+/// A started Open Editors drag of `source` at panel point `x`, `y`, off the panel: the group
+/// drop there, if any, and its feedback (split editors spec §6.2). `None` for any other drag or
+/// point, which also hides the overlay.
+fn group_drop_at(
+    hwnd: HWND,
+    panel: HWND,
+    source: &DragSource,
+    x: i32,
+    y: i32,
+    copy: bool,
+) -> Option<(super::group_drop::Source, super::group_drop::Action)> {
+    let DragSource::Tab { id, group, .. } = source else {
+        super::tab_drag::hide_feedback(hwnd);
+        return None;
+    };
+    let screen = screen_point(panel, x, y);
+    let target = super::tab_drag::target_at(hwnd, screen);
+    let found = super::tab_drag::source_of(hwnd, *group, *id)
+        .zip(target)
+        .and_then(|(from, target)| {
+            super::group_drop::decide(from, target, copy).map(|action| (from, action))
+        });
+    super::tab_drag::show_feedback(hwnd, target, found.map(|(_, action)| action));
+    found
+}
+
+fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
     let Some((drag, panel)) = with_view(hwnd, |view| {
         if view.drag.as_ref().is_some_and(|drag| drag.started) {
             view.drag_to(x, y, Instant::now());
@@ -2744,14 +2821,28 @@ fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
     let Some(drag) = drag.filter(|drag| drag.started) else {
         return false;
     };
+    let group_drop = drag
+        .target
+        .is_none()
+        .then(|| group_drop_at(hwnd, panel, &drag.source, x, y, buttons & MK_CONTROL != 0))
+        .flatten();
     end_drag_input(panel);
     end_drag_label(hwnd);
+    super::tab_drag::hide_feedback(hwnd);
+    if let Some((from, action)) = group_drop {
+        super::tab_drag::apply(hwnd, from, action);
+    }
     if let Some(folder) = drag.target {
         match &drag.source {
             DragSource::Row(kind) => super::tree_move::drop_into(hwnd, kind, &folder),
-            DragSource::Tab { id, path } => {
+            DragSource::Tab {
+                id,
+                path: Some(path),
+                ..
+            } => {
                 super::copy_host::copy_tab_into(hwnd, *id, path, &folder);
             }
+            DragSource::Tab { path: None, .. } | DragSource::GroupTab { .. } => {}
             DragSource::Files(_) => {}
         }
     }
@@ -2780,6 +2871,7 @@ pub(crate) fn cancel_drag(hwnd: HWND) -> bool {
     };
     end_drag_input(panel);
     end_drag_label(hwnd);
+    super::tab_drag::hide_feedback(hwnd);
     true
 }
 
@@ -2793,6 +2885,7 @@ fn cancel_drag_for_right_press(hwnd: HWND) -> bool {
     };
     end_drag_timer(panel);
     end_drag_label(hwnd);
+    super::tab_drag::hide_feedback(hwnd);
     set_drag_cursor(true);
     true
 }
@@ -2938,6 +3031,105 @@ pub(crate) fn external_drop(hwnd: HWND, x: i32, y: i32, paths: Vec<PathBuf>) -> 
     super::copy_host::post_panel_drop(hwnd, paths, folder)
 }
 
+/// Screen point `point` in the panel's client coordinates, when it is over the panel.
+fn panel_point_of(hwnd: HWND, point: POINT) -> Option<(i32, i32)> {
+    let panel = with_view(hwnd, |view| view.panel)?;
+    // Its own style: the main window of a test is never shown.
+    let style = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        )
+    } as u32;
+    if style & windows_sys::Win32::UI::WindowsAndMessaging::WS_VISIBLE == 0 {
+        return None;
+    }
+    let mut local = point;
+    unsafe { ScreenToClient(panel, &mut local) };
+    let mut client = RECT::default();
+    unsafe { GetClientRect(panel, &mut client) };
+    contains(client, local.x, local.y).then_some((local.x, local.y))
+}
+
+/// A strip tab dragged to screen point `point` (split editors spec §6.1): over a folder that
+/// takes `path`'s file the band shows and true is returned; over Open Editors, or anywhere a
+/// copy would do nothing, nothing shows. Kept as a started `DragSource::GroupTab` drag with no
+/// capture and no label, as an Explorer drag is.
+pub(crate) fn strip_tab_over(hwnd: HWND, point: POINT, id: DocumentId, path: &Path) -> bool {
+    let Some((x, y)) = panel_point_of(hwnd, point) else {
+        strip_tab_leave(hwnd);
+        return false;
+    };
+    if with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(true) {
+        strip_tab_leave(hwnd);
+        return false;
+    }
+    let started = with_view(hwnd, |view| {
+        if !view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| matches!(drag.source, DragSource::GroupTab { .. }))
+        {
+            let source = DragSource::GroupTab {
+                id,
+                path: path.to_path_buf(),
+            };
+            view.drag = Drag::armed(source, x, y).map(|mut drag| {
+                drag.started = true;
+                drag
+            });
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false);
+    if started && let Some(panel) = with_view(hwnd, |view| view.panel) {
+        unsafe { SetTimer(panel, DRAG_TIMER, tree_drag::TICK.as_millis() as u32, None) };
+    }
+    with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false)
+}
+
+/// The strip tab left the panel, or its drag ended: the band and the timer go.
+pub(crate) fn strip_tab_leave(hwnd: HWND) {
+    let panel = with_view(hwnd, |view| {
+        let ours = view
+            .drag
+            .as_ref()
+            .is_some_and(|drag| matches!(drag.source, DragSource::GroupTab { .. }));
+        if ours {
+            view.drag = None;
+            view.invalidate();
+        }
+        ours.then_some(view.panel)
+    })
+    .flatten();
+    if let Some(panel) = panel {
+        end_drag_timer(panel);
+    }
+}
+
+/// A strip tab dropped at screen point `point`: the folder under it that takes its file, if any.
+/// The tree's band goes either way; the caller ends its drag before it copies, so a "Replace?"
+/// question never opens under the drag.
+pub(crate) fn strip_tab_drop_folder(
+    hwnd: HWND,
+    point: POINT,
+    id: DocumentId,
+    path: &Path,
+) -> Option<PathBuf> {
+    let accepted = strip_tab_over(hwnd, point, id, path);
+    let folder = accepted
+        .then(|| {
+            with_view(hwnd, |view| {
+                view.drag.as_ref().and_then(|drag| drag.target.clone())
+            })
+        })
+        .flatten()
+        .flatten();
+    strip_tab_leave(hwnd);
+    folder
+}
+
 /// Gives the tooltip `tools`, making the tooltip first if the view has none yet. Runs with
 /// nothing of the App borrowed: creating the control and adding tools send messages.
 fn apply_tooltips(hwnd: HWND, tools: &[(usize, RECT, String)]) {
@@ -3055,19 +3247,29 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
             rebuild(hwnd);
         }
         Hit::Editor { index, close } => {
-            let Some(row) = with_view(hwnd, |view| view.editors.rows.get(index).cloned()).flatten()
+            // A header row does nothing.
+            let Some(row) = with_view(hwnd, |view| view.editors.row(index).cloned()).flatten()
             else {
                 return;
             };
             if close {
+                super::main_window::activate_group(hwnd, row.group);
                 super::main_window::close_document_tab(hwnd, row.id);
             } else {
-                super::main_window::activate_document_by_id(hwnd, row.id);
-                // The path is taken now, so the drag outlives its tab closing (open editors spec
-                // §4.3). An untitled tab has no file to copy: no drag.
-                if let Some(path) = row.path {
-                    arm_drag(hwnd, DragSource::Tab { id: row.id, path }, x, y);
-                }
+                super::main_window::focus_view(hwnd, row.group, row.id);
+                // The name and path are taken now, so the drag outlives its tab closing (open
+                // editors spec §4.3). An untitled tab drags onto groups only.
+                arm_drag(
+                    hwnd,
+                    DragSource::Tab {
+                        id: row.id,
+                        group: row.group,
+                        name: row.name.clone(),
+                        path: row.path.clone(),
+                    },
+                    x,
+                    y,
+                );
             }
         }
         Hit::Root => {
@@ -3176,7 +3378,7 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
                 let (mode, focus) = match how {
                     // A click keeps the keyboard in the tree, as VS Code's explorer does, so F2
                     // and Del act on the row just clicked.
-                    Activation::Click | Activation::Enter => (OpenMode::Preview, false),
+                    Activation::Click => (OpenMode::Preview, false),
                     Activation::Permanent => (OpenMode::Permanent, true),
                 };
                 if let Err(error) = super::main_window::open_note(hwnd, &path, mode, focus) {
@@ -3258,7 +3460,21 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
                 view.invalidate();
                 return;
             }
-            match panel_cursor::step(view.cursor, view.list.selected, list_key, shape) {
+            let mut stepped = panel_cursor::step(view.cursor, view.list.selected, list_key, shape);
+            // A group's header row is passed over, as a separator is.
+            for _ in 0..view.editors.rows.len() {
+                match stepped {
+                    Some((Cursor::Editor(index), tree)) if view.editors.is_header(index) => {
+                        let next = panel_cursor::step(Cursor::Editor(index), tree, list_key, shape);
+                        if next == stepped {
+                            break;
+                        }
+                        stepped = next;
+                    }
+                    _ => break,
+                }
+            }
+            match stepped {
                 Some((cursor, tree)) => {
                     view.cursor = cursor;
                     if let Some(index) = tree {
@@ -3304,14 +3520,9 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
     match key {
+        // Enter opens a normal tab: the preview tab is the mouse's (spec §6.4).
         VK_RETURN => {
-            let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
-            let how = if ctrl {
-                Activation::Permanent
-            } else {
-                Activation::Enter
-            };
-            activate(hwnd, selected, how);
+            activate(hwnd, selected, Activation::Permanent);
             true
         }
         VK_RIGHT => {
@@ -3354,12 +3565,13 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
 fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
     match (cursor, key) {
         (Cursor::Editor(index), VK_RETURN) => {
-            let Some(id) =
-                with_view(hwnd, |view| view.editors.rows.get(index).map(|row| row.id)).flatten()
-            else {
+            let Some((group, id)) = with_view(hwnd, |view| {
+                view.editors.row(index).map(|row| (row.group, row.id))
+            })
+            .flatten() else {
                 return true;
             };
-            super::main_window::activate_document_by_id(hwnd, id);
+            super::main_window::focus_view(hwnd, group, id);
             super::main_window::focus_content(hwnd);
         }
         (Cursor::EditorsHeader, VK_RETURN | VK_LEFT | VK_RIGHT) => {
@@ -3496,7 +3708,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         let index = index - buttons.len();
         if index < header {
             return Some(section_item(
-                &format!("Open editors, {}", self.editors.rows.len()),
+                &format!("Open editors, {}", self.editors.view_count()),
                 self.editors_expanded,
                 self.cursor == Cursor::EditorsHeader,
                 focused,
@@ -3505,8 +3717,16 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         }
         let index = index - header;
         if index < editors {
-            let row = self.editors.rows.get(index)?;
             let (rect, visible) = row_rect(layout.editors_list, &self.editors.list, index);
+            let row = match self.editors.rows.get(index)? {
+                super::open_editors::EditorEntry::Header(number) => {
+                    return Some(crate::window::sidebar_accessibility::text_item(
+                        &super::open_editors::header_label(*number),
+                        rect,
+                    ));
+                }
+                super::open_editors::EditorEntry::View(row) => row,
+            };
             return Some(editor_item(
                 &super::open_editors::accessible_name(row),
                 self.cursor == Cursor::Editor(index),
@@ -3664,8 +3884,14 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         }
         let index = index - header;
         if index < editors {
-            let row = self.editors.rows.get(index)?;
-            return Some(identity_of(&("editor", row.id.0)));
+            return Some(match self.editors.rows.get(index)? {
+                super::open_editors::EditorEntry::Header(number) => {
+                    identity_of(&("editor-group", *number))
+                }
+                super::open_editors::EditorEntry::View(row) => {
+                    identity_of(&("editor", row.group.0, row.id.0))
+                }
+            });
         }
         let index = index - editors;
         if index < root {

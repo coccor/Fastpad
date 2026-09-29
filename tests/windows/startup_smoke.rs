@@ -12,20 +12,24 @@ use support::process::{FastPadProcess, wait_for_process_exit};
 use support::win32::{find_child_by_class, focused_window, scintilla_text, send_text};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
 
 #[cfg(windows)]
 #[test]
-fn launch_creates_a_focused_editable_scintilla() {
-    // Break caught: bootstrap returns without creating a main window, so startup never exposes
-    // a focused Scintilla editor that can accept real input.
+fn launch_takes_typing_into_a_focused_editable_scintilla() {
+    // Break caught: bootstrap returns without creating a main window, or a plain launch (which
+    // ends with no tab) swallows the first keystroke instead of typing it into a new tab.
     let mut process = FastPadProcess::spawn(["--new-window", "--diagnostic"]).unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
     let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
+    let focused = focused_window(hwnd).unwrap();
+    assert!(focused == editor || focused == hwnd);
+    unsafe { PostMessageW(focused, WM_CHAR, usize::from(b'x'), 0) };
+    wait_for_text(editor, "x");
     assert_eq!(focused_window(hwnd).unwrap(), editor);
-    send_text(editor, "x").unwrap();
-    assert_eq!(scintilla_text(editor).unwrap(), "x");
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
     process.close().unwrap();
 }
@@ -86,4 +90,16 @@ fn dropping_fastpad_process_reaps_the_running_child() {
     };
 
     wait_for_process_exit(process_id, Duration::from_secs(2)).unwrap();
+}
+
+#[cfg(windows)]
+fn wait_for_text(editor: windows_sys::Win32::Foundation::HWND, text: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while scintilla_text(editor).unwrap() != text {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the editor never showed {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

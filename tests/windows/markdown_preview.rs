@@ -96,11 +96,11 @@ impl TestMain {
     }
 
     fn mode(&self) -> PreviewMode {
-        self.with_app(|app| app.preview.mode)
+        self.with_app(|app| app.active_group().unwrap().preview.mode)
     }
 
     fn view(&self) -> Option<preview::view::PreviewView> {
-        self.with_app(|app| app.preview.view)
+        self.with_app(|app| app.active_group().unwrap().preview.view)
     }
 
     fn notices(&self) -> Vec<String> {
@@ -185,7 +185,7 @@ fn side_full_and_pressed_full_move_through_split_full_and_off() {
     main.make_markdown("# Title\n\nBody\n");
     assert!(window::preview_host::buttons_visible(main.hwnd));
 
-    window::preview_host::click_button(main.hwnd, window::titlebar::HitTarget::PreviewSide);
+    window::preview_host::click_button(main.hwnd, window::preview_buttons::PreviewButton::Side);
     assert_eq!(main.mode(), PreviewMode::Split);
     let view = main.view().expect("preview window");
     assert!(visible(view.hwnd()) && visible(main.editor));
@@ -193,12 +193,12 @@ fn side_full_and_pressed_full_move_through_split_full_and_off() {
         view.stats().block_count == 2
     });
 
-    window::preview_host::click_button(main.hwnd, window::titlebar::HitTarget::PreviewFull);
+    window::preview_host::click_button(main.hwnd, window::preview_buttons::PreviewButton::Full);
     assert_eq!(main.mode(), PreviewMode::Full);
     assert!(!visible(main.editor));
     assert_eq!(unsafe { GetFocus() }, view.hwnd());
 
-    window::preview_host::click_button(main.hwnd, window::titlebar::HitTarget::PreviewFull);
+    window::preview_host::click_button(main.hwnd, window::preview_buttons::PreviewButton::Full);
     assert_eq!(main.mode(), PreviewMode::Off);
     assert!(main.view().is_none());
     assert!(visible(main.editor));
@@ -317,7 +317,7 @@ fn full_mode_reloads_keep_the_preview_position() {
     pump_for(Duration::from_millis(100));
     let before = view.top_line();
     assert!(before > 0);
-    window::preview_host::refresh(main.hwnd);
+    window::preview_host::refresh(main.hwnd, main.with_app(|app| app.tabs.active_group()));
     pump_for(Duration::from_millis(100));
     assert_eq!(view.top_line(), before, "inline reparse");
 
@@ -340,7 +340,7 @@ fn full_mode_reloads_keep_the_preview_position() {
     pump_for(Duration::from_millis(100));
     let before = view.top_line();
     assert!(before > 0);
-    window::preview_host::refresh(main.hwnd);
+    window::preview_host::refresh(main.hwnd, main.with_app(|app| app.tabs.active_group()));
     assert_eq!(
         view.stats().block_count,
         0,
@@ -433,7 +433,7 @@ fn relative_markdown_links_open_in_a_tab() {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
             main.hwnd,
             window::WM_FASTPAD_PREVIEW_LINK,
-            0,
+            main.view().unwrap().hwnd() as usize,
             payload as isize,
         );
     }
@@ -455,7 +455,7 @@ fn unsupported_links_explain_themselves() {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
             main.hwnd,
             window::WM_FASTPAD_PREVIEW_LINK,
-            0,
+            main.view().unwrap().hwnd() as usize,
             payload as isize,
         );
     }
@@ -488,7 +488,7 @@ fn large_documents_parse_on_a_worker_and_huge_ones_pause() {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
             main.hwnd,
             window::WM_FASTPAD_PREVIEW_REFRESH,
-            0,
+            view.hwnd() as usize,
             0,
         );
     }
@@ -543,7 +543,7 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
     pump_until("render", Duration::from_secs(3), || {
         view.stats().block_count == 400
     });
-    let before = main.with_app(|app| app.preview.sync_count);
+    let before = main.with_app(|app| app.active_group().unwrap().preview.sync_count);
     unsafe {
         SendMessageW(
             view.hwnd(),
@@ -565,7 +565,7 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
         }) > 0
     });
     pump_for(Duration::from_millis(250));
-    let syncs = main.with_app(|app| app.preview.sync_count) - before;
+    let syncs = main.with_app(|app| app.active_group().unwrap().preview.sync_count) - before;
     assert!(
         syncs <= 1,
         "scroll sync echoed: {syncs} syncs for one preview scroll"
@@ -585,7 +585,7 @@ fn closing_the_find_bar_in_full_mode_focuses_the_preview() {
     main.command(CommandId::MarkdownPreviewFull);
     let view = main.view().unwrap();
     main.command(CommandId::Find);
-    let query = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
+    let query = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
     assert_eq!(unsafe { GetFocus() }, query);
     unsafe { SendMessageW(query, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
     assert_eq!(unsafe { GetFocus() }, view.hwnd());
@@ -598,8 +598,14 @@ fn losing_capture_ends_a_divider_drag() {
     main.make_markdown("# A\n");
     main.command(CommandId::MarkdownPreviewSide);
     let divider = window::preview_host::divider_rect(main.hwnd).expect("divider");
+    // The preview sits in the editor group, whose client area the divider is laid out in.
+    let group = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetParent(main.view().unwrap().hwnd())
+    };
+    assert_ne!(group, main.hwnd);
     assert!(window::preview_host::begin_divider_drag(
         main.hwnd,
+        group,
         divider.left,
         divider.top
     ));

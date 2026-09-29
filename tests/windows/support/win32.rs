@@ -275,6 +275,38 @@ fn wait_for_text(hwnd: HWND, expected: &str, deadline: &Deadline) -> TestResult<
     }
 }
 
+/// Every descendant of `parent` whose window class is `class_name`, in enumeration order.
+#[allow(dead_code)]
+pub fn find_children_by_class(parent: HWND, class_name: &str) -> Vec<HWND> {
+    let mut search = ChildrenSearch {
+        wanted: class_name,
+        found: Vec::new(),
+    };
+    unsafe {
+        EnumChildWindows(
+            parent,
+            Some(enum_children_by_class),
+            &mut search as *mut ChildrenSearch as isize,
+        );
+    }
+    search.found
+}
+
+struct ChildrenSearch<'a> {
+    wanted: &'a str,
+    found: Vec<HWND>,
+}
+
+unsafe extern "system" fn enum_children_by_class(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam as *mut ChildrenSearch<'_>) };
+    let mut class_name = [0_u16; 128];
+    let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+    if length > 0 && String::from_utf16_lossy(&class_name[..length as usize]) == search.wanted {
+        search.found.push(hwnd);
+    }
+    1
+}
+
 struct ChildSearch<'a> {
     wanted: &'a str,
     found: Option<HWND>,

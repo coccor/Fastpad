@@ -564,13 +564,28 @@ fn wait_for_editor_eagerly(process: &mut FastPadProcess) -> TestResult<(HWND, HW
         };
         unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM) };
         if !search.hwnd.is_null() {
-            let editor = unsafe {
+            // The editor sits in the editor group window, a child of the main window.
+            let group_class = fastpad::platform::wide_null("FastPadEditorGroup");
+            let group = unsafe {
                 FindWindowExW(
                     search.hwnd,
                     std::ptr::null_mut(),
-                    scintilla_class.as_ptr(),
+                    group_class.as_ptr(),
                     std::ptr::null(),
                 )
+            };
+            // Until the group exists, a null parent would search the top-level windows instead.
+            let editor = if group.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe {
+                    FindWindowExW(
+                        group,
+                        std::ptr::null_mut(),
+                        scintilla_class.as_ptr(),
+                        std::ptr::null(),
+                    )
+                }
             };
             if !editor.is_null() {
                 return Ok((search.hwnd, editor));

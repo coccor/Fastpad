@@ -139,13 +139,13 @@ Untitled tabs (Ctrl+N) appear first at the root, in italics, labeled from their 
 
 ### 6.4 Opening notes: the preview tab
 
-- A single click, or Enter, opens a note in the **preview tab**. There is at most one preview tab, and its label is in italics.
+- A single click opens a note in the **preview tab**. There is at most one preview tab, and its label is in italics.
   - If the note is already open in a tab, FastPad switches to that tab instead.
   - Otherwise the preview tab's document is replaced in place, keeping its position in the tab strip. If there is no preview tab yet, one is added where a new tab would go.
-- **The preview tab becomes a normal tab** on a double-click of the row, Ctrl+Enter, "Open in new tab", a double-click on the tab, the first edit, or a save.
+- **The preview tab becomes a normal tab** on a double-click of the row, Enter, "Open in new tab", a double-click on the tab, the first edit, or a save.
 - A preview tab is never dirty, since the first edit promotes it, so replacing it never discards changes.
 - Session restore brings the preview tab back as a normal tab.
-- Focus: a mouse click keeps focus in the tree, as VS Code's explorer does, so F2 and Del act on the clicked row; Enter does too, so arrow keys and Enter can browse. A double-click or Ctrl+Enter opens a normal tab and moves focus to the editor.
+- Focus: a mouse click keeps focus in the tree, as VS Code's explorer does, so F2 and Del act on the clicked row. A double-click or Enter (Ctrl+Enter too) opens a normal tab and moves focus to the editor. The keyboard never opens the preview tab (changed 2026-09-28: Enter used to open it, leaving a keyboard user no plain way to keep a note).
 
 ### 6.5 Header
 
@@ -205,7 +205,7 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 - A search box with the placeholder "Search <notebook>", focused when the view opens.
 - Results update as you type, matching the query anywhere in note names (case-insensitive). Names that start with the query come first, then the rest, each group by name.
 - Each result row is the file icon, the name, and the note's folder relative to the notebook in dim text. This is the only place a path is shown, because results lose the tree's context.
-- Enter or a click opens the note, following the preview-tab rules (§6.4). Down arrow moves from the box into the results.
+- A click opens the note in the preview tab and Enter in a normal tab (§6.4). Down arrow moves from the box into the results.
 - The query stays until the notebook changes. With nothing typed, the view is empty. When nothing matches: "No notes match."
 - Sub-project 3 adds text matches below the name matches.
 
@@ -257,7 +257,7 @@ The panel says "Open a notebook to see its notes.", shows an **Open notebook…*
 - **Tree:**
   - Up and Down move the selection. Home, End, PageUp and PageDown work.
   - Right expands a folder or moves to its first child. Left collapses a folder or moves to its parent.
-  - Enter opens (preview tab), Ctrl+Enter opens in a normal tab.
+  - Enter (or Ctrl+Enter) opens in a normal tab.
   - Typing letters jumps to the next row whose name starts with them (type-ahead, 1 s reset).
   - F2 renames and Del deletes. Shift+F10 or the context-menu key opens the context menu.
 - **Screen readers (MSAA):** each part answers `WM_GETOBJECT` with a provider following `accessibility.rs`.

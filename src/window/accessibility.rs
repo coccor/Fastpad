@@ -1,7 +1,9 @@
 use crate::document::DocumentId;
 use crate::window::commands::CommandId;
+use crate::window::group_strip::StripLayout;
+use crate::window::preview_buttons::PreviewButton;
 use crate::window::tabs::{TabSelection, TabView, TabViewSnapshot};
-use crate::window::titlebar::{Point, Size, TitleBarLayout};
+use crate::window::titlebar::{Point, Rect, Size, TitleBarLayout};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -13,13 +15,14 @@ use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{
     LresultFromObject, NAVDIR_FIRSTCHILD, NAVDIR_LASTCHILD, NAVDIR_NEXT, NAVDIR_PREVIOUS,
-    ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST, ROLE_SYSTEM_PUSHBUTTON, SELFLAG_TAKESELECTION,
+    ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TITLEBAR,
+    SELFLAG_TAKESELECTION,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
-    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, SendMessageW, WM_APP, WM_COMMAND, WM_LBUTTONUP,
-    WM_SYSCOMMAND,
+    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, SendMessageW, WM_APP, WM_COMMAND,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSCOMMAND,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -52,24 +55,45 @@ impl AccessibleChild {
     }
 }
 
-pub fn accessible_children(tab_titles: &[&str], preview_buttons: bool) -> Vec<AccessibleChild> {
-    let mut children = tab_titles
-        .iter()
-        .map(|title| AccessibleChild::Tab((*title).to_owned()))
-        .collect::<Vec<_>>();
-    children.extend([
-        AccessibleChild::Button("Overflow"),
-        AccessibleChild::Button("Minimize"),
-        AccessibleChild::Button("Maximize"),
-        AccessibleChild::Button("Close"),
-    ]);
-    if preview_buttons {
-        children.extend([
-            AccessibleChild::Button("Open Preview to the Side"),
-            AccessibleChild::Button("Open Preview"),
-        ]);
+/// Which strip a provider exposes: the title bar (the app menu and the caption buttons) on the
+/// main window, or an editor group's tab strip (its tabs and actions) on the group window
+/// (split editors spec §3.2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderKind {
+    TitleBar,
+    GroupStrip,
+}
+
+const MINIMIZE: &str = "Minimize";
+const MAXIMIZE: &str = "Maximize";
+const CLOSE: &str = "Close";
+const PREVIEW_SIDE: &str = "Open Preview to the Side";
+const PREVIEW_FULL: &str = "Open Preview";
+
+pub(crate) fn accessible_children(
+    kind: ProviderKind,
+    tab_titles: &[&str],
+    preview_buttons: bool,
+) -> Vec<AccessibleChild> {
+    match kind {
+        ProviderKind::TitleBar => [MINIMIZE, MAXIMIZE, CLOSE]
+            .into_iter()
+            .map(AccessibleChild::Button)
+            .collect(),
+        ProviderKind::GroupStrip => {
+            let mut children = tab_titles
+                .iter()
+                .map(|title| AccessibleChild::Tab((*title).to_owned()))
+                .collect::<Vec<_>>();
+            if preview_buttons {
+                children.extend([
+                    AccessibleChild::Button(PREVIEW_SIDE),
+                    AccessibleChild::Button(PREVIEW_FULL),
+                ]);
+            }
+            children
+        }
     }
-    children
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +105,7 @@ impl AccessibilityState {
     pub(crate) fn ensure(
         &mut self,
         hwnd: HWND,
+        kind: ProviderKind,
         view: TabView,
         selection: TabSelection,
     ) -> *mut c_void {
@@ -89,6 +114,7 @@ impl AccessibilityState {
                 vtable: &ACCESSIBLE_VTABLE,
                 references: AtomicU32::new(1),
                 hwnd,
+                kind,
                 view,
                 selection,
             });
@@ -102,7 +128,12 @@ impl AccessibilityState {
         let tabs = crate::window::tabs::Tabs::with_document(
             crate::document::Document::test_fixture(crate::document::DocumentId(1), false),
         );
-        let _ = self.ensure(std::ptr::null_mut(), tabs.view(), tabs.selection());
+        let _ = self.ensure(
+            std::ptr::null_mut(),
+            ProviderKind::GroupStrip,
+            tabs.view(),
+            tabs.selection(),
+        );
     }
 
     #[cfg(test)]
@@ -130,6 +161,7 @@ struct AccessibleProvider {
     vtable: &'static AccessibleVtable,
     references: AtomicU32,
     hwnd: HWND,
+    kind: ProviderKind,
     view: TabView,
     selection: TabSelection,
 }
@@ -415,8 +447,9 @@ unsafe extern "system" fn accessible_get_name(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    let children = current_children(unsafe { provider(this) });
-    let Some(name) = child_name(&children, &child) else {
+    let item = unsafe { provider(this) };
+    let children = current_children(item);
+    let Some(name) = child_name(item.kind, &children, &child) else {
         return E_INVALIDARG;
     };
     unsafe { allocate_bstr(name, output) }
@@ -439,12 +472,21 @@ unsafe extern "system" fn accessible_get_description(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    let children = current_children(unsafe { provider(this) });
-    let description = match accessible_target(&children, &child) {
-        Some(AccessibleTarget::SelfObject) => "Title bar tab list",
-        Some(AccessibleTarget::Child(AccessibleChild::Tab(_))) => "Selectable and closable tab",
-        Some(AccessibleTarget::Child(AccessibleChild::Button(_))) => "Title bar button",
-        None => return E_INVALIDARG,
+    let item = unsafe { provider(this) };
+    let children = current_children(item);
+    let description = match (accessible_target(&children, &child), item.kind) {
+        (Some(AccessibleTarget::SelfObject), ProviderKind::TitleBar) => "Title bar",
+        (Some(AccessibleTarget::SelfObject), ProviderKind::GroupStrip) => "Editor tab list",
+        (Some(AccessibleTarget::Child(AccessibleChild::Tab(_))), _) => {
+            "Selectable and closable tab"
+        }
+        (Some(AccessibleTarget::Child(AccessibleChild::Button(_))), ProviderKind::TitleBar) => {
+            "Title bar button"
+        }
+        (Some(AccessibleTarget::Child(AccessibleChild::Button(_))), ProviderKind::GroupStrip) => {
+            "Tab strip button"
+        }
+        (None, _) => return E_INVALIDARG,
     };
     unsafe { allocate_bstr(description, output) }
 }
@@ -460,10 +502,14 @@ unsafe extern "system" fn accessible_get_role(
     let Some(id) = child.child_id() else {
         return E_INVALIDARG;
     };
+    let item = unsafe { provider(this) };
     let role = if id == 0 {
-        ROLE_SYSTEM_PAGETABLIST
+        match item.kind {
+            ProviderKind::TitleBar => ROLE_SYSTEM_TITLEBAR,
+            ProviderKind::GroupStrip => ROLE_SYSTEM_PAGETABLIST,
+        }
     } else {
-        let children = current_children(unsafe { provider(this) });
+        let children = current_children(item);
         match accessible_child(&children, &child).map(|(_, child)| child) {
             Some(AccessibleChild::Tab(_)) => ROLE_SYSTEM_PAGETAB,
             Some(AccessibleChild::Button(_)) => ROLE_SYSTEM_PUSHBUTTON,
@@ -601,7 +647,7 @@ unsafe extern "system" fn accessible_select(
     }
     let item = unsafe { provider(this) };
     let view = item.view.snapshot();
-    let children = children_from_view(&view);
+    let children = children_from_view(item.kind, &view);
     let Some((index, AccessibleChild::Tab(_))) = accessible_child(&children, &child) else {
         return E_INVALIDARG;
     };
@@ -632,10 +678,17 @@ unsafe extern "system" fn accessible_select(
     if selected != 0 { S_OK } else { E_INVALIDARG }
 }
 
+/// A floating preview button, whose action is a click at its centre.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClickTarget {
+    PreviewSide,
+    PreviewFull,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccessibleDefaultAction {
     Command(CommandId),
-    Click(crate::window::titlebar::HitTarget),
+    Click(ClickTarget),
     SystemCommand(usize),
 }
 
@@ -649,24 +702,14 @@ fn accessible_default_action(
     let index = child_id as usize - 1;
     match children.get(index)? {
         AccessibleChild::Tab(_) => Some(AccessibleDefaultAction::Command(CommandId::CloseTab)),
-        AccessibleChild::Button(_) => {
-            let button = index.checked_sub(tab_count(children))?;
-            match button {
-                0 => Some(AccessibleDefaultAction::Click(
-                    crate::window::titlebar::HitTarget::Overflow,
-                )),
-                1 => Some(AccessibleDefaultAction::SystemCommand(SC_MINIMIZE as usize)),
-                2 => Some(AccessibleDefaultAction::SystemCommand(SC_MAXIMIZE as usize)),
-                3 => Some(AccessibleDefaultAction::SystemCommand(SC_CLOSE as usize)),
-                4 => Some(AccessibleDefaultAction::Click(
-                    crate::window::titlebar::HitTarget::PreviewSide,
-                )),
-                5 => Some(AccessibleDefaultAction::Click(
-                    crate::window::titlebar::HitTarget::PreviewFull,
-                )),
-                _ => None,
-            }
-        }
+        AccessibleChild::Button(name) => match *name {
+            MINIMIZE => Some(AccessibleDefaultAction::SystemCommand(SC_MINIMIZE as usize)),
+            MAXIMIZE => Some(AccessibleDefaultAction::SystemCommand(SC_MAXIMIZE as usize)),
+            CLOSE => Some(AccessibleDefaultAction::SystemCommand(SC_CLOSE as usize)),
+            PREVIEW_SIDE => Some(AccessibleDefaultAction::Click(ClickTarget::PreviewSide)),
+            PREVIEW_FULL => Some(AccessibleDefaultAction::Click(ClickTarget::PreviewFull)),
+            _ => None,
+        },
     }
 }
 
@@ -776,19 +819,11 @@ unsafe extern "system" fn accessible_hit_test(
         return S_FALSE;
     }
     let children = current_children(item);
-    let tab_count = tab_count(&children);
-    let target = native_layout(item, tab_count).hit_test(Point::new(point.x, point.y));
-    let id = match target {
-        crate::window::titlebar::HitTarget::Tab(index)
-        | crate::window::titlebar::HitTarget::CloseTab(index) => Some(index as i32 + 1),
-        crate::window::titlebar::HitTarget::Overflow => Some(tab_count as i32 + 1),
-        crate::window::titlebar::HitTarget::Minimize => Some(tab_count as i32 + 2),
-        crate::window::titlebar::HitTarget::Maximize => Some(tab_count as i32 + 3),
-        crate::window::titlebar::HitTarget::Close => Some(tab_count as i32 + 4),
-        crate::window::titlebar::HitTarget::PreviewSide => Some(tab_count as i32 + 5),
-        crate::window::titlebar::HitTarget::PreviewFull => Some(tab_count as i32 + 6),
-        _ => None,
-    };
+    let point = Point::new(point.x, point.y);
+    // The child whose rectangle holds the point, in the same layout that locates them.
+    let id = (1..=children.len() as i32).find(|&id| {
+        child_client_rect(item, &children, id).is_some_and(|rect| rect.contains(point))
+    });
     unsafe { *output = id.map_or_else(RawVariant::empty, RawVariant::integer) };
     if id.is_some() { S_OK } else { S_FALSE }
 }
@@ -802,25 +837,25 @@ unsafe extern "system" fn accessible_do_default_action(
         return E_INVALIDARG;
     };
     let children = current_children(item);
-    let tabs = tab_count(&children);
     match accessible_default_action(&children, id) {
         Some(AccessibleDefaultAction::Command(command)) => unsafe {
             PostMessageW(item.hwnd, WM_COMMAND, command as usize, 0)
         },
         Some(AccessibleDefaultAction::Click(target)) => {
-            let layout = native_layout(item, tabs);
-            let rect = match target {
-                crate::window::titlebar::HitTarget::Overflow => Some(layout.overflow),
-                crate::window::titlebar::HitTarget::PreviewSide => layout.preview_side,
-                crate::window::titlebar::HitTarget::PreviewFull => layout.preview_full,
-                _ => None,
+            // The preview buttons are their own window, floating over the group's content.
+            let button = match target {
+                ClickTarget::PreviewSide => PreviewButton::Side,
+                ClickTarget::PreviewFull => PreviewButton::Full,
             };
-            let Some(rect) = rect else {
+            let Some(window) = crate::window::preview_buttons::find(item.hwnd) else {
                 return E_INVALIDARG;
             };
+            let rect = crate::window::preview_buttons::button_rect(window, button);
             let center = rect.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
-            unsafe { PostMessageW(item.hwnd, WM_LBUTTONUP, 0, packed) }
+            // A whole click: the strip acts only on a release over the target it was pressed on.
+            unsafe { PostMessageW(window, WM_LBUTTONDOWN, 1, packed) };
+            unsafe { PostMessageW(window, WM_LBUTTONUP, 0, packed) }
         }
         Some(AccessibleDefaultAction::SystemCommand(command)) => unsafe {
             PostMessageW(item.hwnd, WM_SYSCOMMAND, command, 0)
@@ -846,9 +881,16 @@ unsafe extern "system" fn accessible_put_value(
     E_NOTIMPL
 }
 
-fn child_name<'a>(children: &'a [AccessibleChild], child: &RawVariant) -> Option<&'a str> {
+fn child_name<'a>(
+    kind: ProviderKind,
+    children: &'a [AccessibleChild],
+    child: &RawVariant,
+) -> Option<&'a str> {
     match child.child_id()? {
-        0 => Some("FastPad title tabs"),
+        0 => Some(match kind {
+            ProviderKind::TitleBar => "FastPad title bar",
+            ProviderKind::GroupStrip => "Tabs",
+        }),
         id if id > 0 => match children.get((id - 1) as usize)? {
             AccessibleChild::Tab(name) => Some(name),
             AccessibleChild::Button(name) => Some(name),
@@ -884,21 +926,7 @@ unsafe fn child_screen_rect(
         return Some(window);
     }
     let children = current_children(item);
-    let tab_count = tab_count(&children);
-    let layout = native_layout(item, tab_count);
-    let rect = if id as usize <= tab_count {
-        layout.tab(id as usize - 1)
-    } else {
-        match id as usize - tab_count {
-            1 => layout.overflow,
-            2 => layout.minimize,
-            3 => layout.maximize,
-            4 => layout.close,
-            5 => layout.preview_side?,
-            6 => layout.preview_full?,
-            _ => return None,
-        }
-    };
+    let rect = child_client_rect(item, &children, id)?;
     let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
     unsafe {
         windows_sys::Win32::Graphics::Gdi::ClientToScreen(item.hwnd, &mut origin);
@@ -911,41 +939,77 @@ unsafe fn child_screen_rect(
     })
 }
 
-fn native_layout(item: &AccessibleProvider, tabs: usize) -> TitleBarLayout {
+/// Child `id`'s rectangle in the provider window's client area, from the same layout the window
+/// paints and hit-tests with. Computed from the window alone: the provider may run on another
+/// thread and never reads the App.
+fn child_client_rect(
+    item: &AccessibleProvider,
+    children: &[AccessibleChild],
+    id: i32,
+) -> Option<Rect> {
+    let index = usize::try_from(id).ok()?.checked_sub(1)?;
+    let child = children.get(index)?;
     let mut client = windows_sys::Win32::Foundation::RECT::default();
-    unsafe {
-        GetClientRect(item.hwnd, &mut client);
+    if item.hwnd.is_null() || unsafe { GetClientRect(item.hwnd, &mut client) } == 0 {
+        return None;
     }
-    TitleBarLayout::calculate_with_offset(
-        Size::new(client.right - client.left, client.bottom - client.top),
-        unsafe { GetDpiForWindow(item.hwnd) }.max(96),
-        tabs,
-        item.selection.scroll_offset(),
-        item.view.snapshot().preview_buttons,
-        item.selection.strip_left(),
-    )
+    let dpi = unsafe { GetDpiForWindow(item.hwnd) }.max(96);
+    match item.kind {
+        ProviderKind::TitleBar => {
+            let layout = TitleBarLayout::calculate(
+                Size::new(client.right - client.left, client.bottom - client.top),
+                dpi,
+            );
+            match child {
+                AccessibleChild::Button(MINIMIZE) => Some(layout.minimize),
+                AccessibleChild::Button(MAXIMIZE) => Some(layout.maximize),
+                AccessibleChild::Button(CLOSE) => Some(layout.close),
+                _ => None,
+            }
+        }
+        ProviderKind::GroupStrip => {
+            let tabs = tab_count(children);
+            let layout = StripLayout::calculate(
+                crate::window::group_strip::strip_width(item.hwnd),
+                dpi,
+                tabs,
+                item.selection.scroll_offset(),
+            );
+            // The preview buttons float over the group's content (spec §4.1).
+            match child {
+                AccessibleChild::Tab(_) => layout.tab(index),
+                AccessibleChild::Button(PREVIEW_SIDE) => {
+                    crate::window::preview_buttons::rect_in_group(item.hwnd, PreviewButton::Side)
+                }
+                AccessibleChild::Button(PREVIEW_FULL) => {
+                    crate::window::preview_buttons::rect_in_group(item.hwnd, PreviewButton::Full)
+                }
+                AccessibleChild::Button(_) => None,
+            }
+        }
+    }
 }
 
 fn current_children(item: &AccessibleProvider) -> Vec<AccessibleChild> {
-    children_from_view(&item.view.snapshot())
+    children_from_view(item.kind, &item.view.snapshot())
 }
 
-fn children_from_view(view: &TabViewSnapshot) -> Vec<AccessibleChild> {
+fn children_from_view(kind: ProviderKind, view: &TabViewSnapshot) -> Vec<AccessibleChild> {
     let titles = view
         .tabs
         .iter()
         .map(|tab| tab.title.as_str())
         .collect::<Vec<_>>();
-    accessible_children(&titles, view.preview_buttons)
+    accessible_children(kind, &titles, view.preview_buttons)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessibilityState, AccessibleChild, AccessibleDefaultAction, RawVariant, VariantValue,
-        accessible_children, accessible_default_action, accessible_get_default_action,
-        accessible_get_focus, accessible_get_selection, accessible_get_state, accessible_location,
-        accessible_select,
+        AccessibilityState, AccessibleChild, AccessibleDefaultAction, ClickTarget, ProviderKind,
+        RawVariant, VariantValue, accessible_children, accessible_default_action,
+        accessible_get_default_action, accessible_get_focus, accessible_get_selection,
+        accessible_get_state, accessible_location, accessible_select,
     };
     use crate::document::{Document, DocumentId};
     use crate::window::tabs::Tabs;
@@ -984,14 +1048,32 @@ mod tests {
     }
 
     #[test]
-    fn title_strip_accessibility_contains_tab_and_four_named_buttons() {
-        let children = accessible_children(&["Untitled"], false);
-        assert_eq!(children[0], AccessibleChild::Tab("Untitled".into()));
+    fn the_group_strip_lists_its_tabs_and_strip_buttons_only() {
+        // Break caught: Narrator on the strip announcing caption buttons, or missing the tabs
+        // after they moved out of the title bar.
+        let children = accessible_children(ProviderKind::GroupStrip, &["a", "b"], true);
+        assert_eq!(children[0], AccessibleChild::Tab("a".into()));
+        assert_eq!(children[1], AccessibleChild::Tab("b".into()));
         let names = children
             .iter()
             .filter_map(AccessibleChild::button_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["Overflow", "Minimize", "Maximize", "Close"]);
+        assert_eq!(names, vec!["Open Preview to the Side", "Open Preview"]);
+        let without = accessible_children(ProviderKind::GroupStrip, &["a"], false);
+        assert_eq!(without.len(), 1);
+    }
+
+    #[test]
+    fn the_title_bar_lists_the_caption_buttons() {
+        // Break caught: caption buttons unreachable by Narrator, tabs listed twice, once per
+        // provider, or a removed app menu button still announced.
+        let children = accessible_children(ProviderKind::TitleBar, &["a"], true);
+        let names = children
+            .iter()
+            .filter_map(AccessibleChild::button_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Minimize", "Maximize", "Close"]);
+        assert_eq!(children.len(), 3);
     }
 
     #[test]
@@ -1007,7 +1089,12 @@ mod tests {
         let mut state = AccessibilityState::default();
         let tabs = fixture_tabs(2);
         let model_selection = tabs.selection();
-        let provider = state.ensure(std::ptr::null_mut(), tabs.view(), model_selection.clone());
+        let provider = state.ensure(
+            std::ptr::null_mut(),
+            ProviderKind::GroupStrip,
+            tabs.view(),
+            model_selection.clone(),
+        );
 
         assert_eq!(
             unsafe {
@@ -1049,7 +1136,7 @@ mod tests {
 
         for (flags, child) in [
             (SELFLAG_TAKESELECTION as i32, 0),
-            (SELFLAG_TAKESELECTION as i32, 3),
+            (SELFLAG_TAKESELECTION as i32, 4),
             (SELFLAG_TAKESELECTION as i32, 99),
             (0, 1),
             ((SELFLAG_TAKESELECTION | SELFLAG_TAKEFOCUS) as i32, 1),
@@ -1066,7 +1153,12 @@ mod tests {
     fn focus_is_not_fabricated_when_the_editor_owns_focus() {
         let mut state = AccessibilityState::default();
         let tabs = fixture_tabs(1);
-        let provider = state.ensure(std::ptr::null_mut(), tabs.view(), tabs.selection());
+        let provider = state.ensure(
+            std::ptr::null_mut(),
+            ProviderKind::GroupStrip,
+            tabs.view(),
+            tabs.selection(),
+        );
         let mut focus = RawVariant::integer(99);
 
         assert_eq!(
@@ -1083,7 +1175,12 @@ mod tests {
     fn tabs_expose_close_as_their_default_action() {
         let mut state = AccessibilityState::default();
         let tabs = fixture_tabs(1);
-        let provider = state.ensure(std::ptr::null_mut(), tabs.view(), tabs.selection());
+        let provider = state.ensure(
+            std::ptr::null_mut(),
+            ProviderKind::GroupStrip,
+            tabs.view(),
+            tabs.selection(),
+        );
         let mut action = std::ptr::null();
 
         assert_eq!(
@@ -1098,60 +1195,47 @@ mod tests {
     }
 
     #[test]
-    fn default_actions_route_tabs_and_overflow_to_real_actions() {
-        let children = accessible_children(&["Untitled"], false);
+    fn default_actions_route_each_button_to_its_real_action() {
+        // Break caught: Narrator's default action on a button doing nothing, or pressing the
+        // wrong one, now that the buttons are split over two providers.
+        let strip = accessible_children(ProviderKind::GroupStrip, &["Untitled"], true);
         assert_eq!(
-            accessible_default_action(&children, 1),
-            Some(super::AccessibleDefaultAction::Command(
+            accessible_default_action(&strip, 1),
+            Some(AccessibleDefaultAction::Command(
                 crate::window::commands::CommandId::CloseTab
             ))
         );
         assert_eq!(
-            accessible_default_action(&children, 2),
-            Some(super::AccessibleDefaultAction::Click(
-                crate::window::titlebar::HitTarget::Overflow
-            ))
+            accessible_default_action(&strip, 2),
+            Some(AccessibleDefaultAction::Click(ClickTarget::PreviewSide))
         );
-        assert_eq!(accessible_default_action(&children, 0), None);
-        assert_eq!(accessible_default_action(&children, 6), None);
-    }
+        assert_eq!(
+            accessible_default_action(&strip, 3),
+            Some(AccessibleDefaultAction::Click(ClickTarget::PreviewFull))
+        );
+        assert_eq!(accessible_default_action(&strip, 0), None);
+        assert_eq!(accessible_default_action(&strip, 4), None);
 
-    #[test]
-    fn preview_buttons_are_appended_after_the_caption_buttons() {
-        let children = accessible_children(&["Untitled"], true);
-        let names = children
-            .iter()
-            .filter_map(AccessibleChild::button_name)
-            .collect::<Vec<_>>();
+        let title = accessible_children(ProviderKind::TitleBar, &[], false);
         assert_eq!(
-            names,
-            vec![
-                "Overflow",
-                "Minimize",
-                "Maximize",
-                "Close",
-                "Open Preview to the Side",
-                "Open Preview"
-            ]
-        );
-        assert_eq!(
-            accessible_default_action(&children, 6),
-            Some(AccessibleDefaultAction::Click(
-                crate::window::titlebar::HitTarget::PreviewSide
+            accessible_default_action(&title, 1),
+            Some(AccessibleDefaultAction::SystemCommand(
+                windows_sys::Win32::UI::WindowsAndMessaging::SC_MINIMIZE as usize
             ))
         );
         assert_eq!(
-            accessible_default_action(&children, 7),
-            Some(AccessibleDefaultAction::Click(
-                crate::window::titlebar::HitTarget::PreviewFull
+            accessible_default_action(&title, 3),
+            Some(AccessibleDefaultAction::SystemCommand(
+                windows_sys::Win32::UI::WindowsAndMessaging::SC_CLOSE as usize
             ))
         );
     }
 
     #[test]
-    fn tab_locations_start_at_the_published_sidebar_edge_without_reading_the_app() {
-        // Break caught: accessible tab rectangles still starting at x = 0 under the sidebar, or a
-        // provider that reads the App (it may run on an RPC thread). This window has no App.
+    fn tab_locations_come_from_the_strip_layout_of_the_providers_window() {
+        // Break caught: accessible tab rectangles computed from the title bar after the tabs
+        // moved into the group, so Narrator's highlight lands on the caption. This window has no
+        // App: the provider may run on an RPC thread and must not read it.
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, WS_OVERLAPPEDWINDOW,
         };
@@ -1175,10 +1259,15 @@ mod tests {
         assert!(!window.is_null());
         let mut state = AccessibilityState::default();
         let tabs = fixture_tabs(2);
-        let provider = state.ensure(window, tabs.view(), tabs.selection());
+        let provider = state.ensure(
+            window,
+            ProviderKind::GroupStrip,
+            tabs.view(),
+            tabs.selection(),
+        );
         let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
         unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window, &mut origin) };
-        let first_tab_left = || {
+        let tab_left = |id: i32| {
             let (mut left, mut top, mut width, mut height) = (0, 0, 0, 0);
             let result = unsafe {
                 accessible_location(
@@ -1187,15 +1276,23 @@ mod tests {
                     &mut top,
                     &mut width,
                     &mut height,
-                    RawVariant::integer(1),
+                    RawVariant::integer(id),
                 )
             };
             assert_eq!(result, S_OK);
             left - origin.x
         };
-        assert_eq!(first_tab_left(), 0);
-        tabs.set_strip_left(304);
-        assert_eq!(first_tab_left(), 304);
+        let mut client = windows_sys::Win32::Foundation::RECT::default();
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(window, &mut client) };
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window) }.max(96);
+        let layout = crate::window::group_strip::StripLayout::calculate(
+            crate::window::group_strip::strip_width(window),
+            dpi,
+            2,
+            0,
+        );
+        assert_eq!(tab_left(1), 0);
+        assert_eq!(tab_left(2), layout.tab(1).unwrap().left);
         drop(state);
         unsafe { DestroyWindow(window) };
     }

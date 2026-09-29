@@ -42,13 +42,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DLGC_WANTALLKEYS, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetParent, GetScrollInfo, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_HAND, LoadCursorW,
-    PostMessageW, RegisterClassW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
-    SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_ALL, SIF_TRACKPOS, SetCursor,
-    SetWindowLongPtrW, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_VSCROLL, WNDCLASSW, WS_CHILD,
-    WS_CLIPSIBLINGS, WS_TABSTOP, WS_VSCROLL,
+    GetScrollInfo, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_HAND, LoadCursorW, PostMessageW,
+    RegisterClassW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK,
+    SB_TOP, SB_VERT, SCROLLINFO, SIF_ALL, SIF_TRACKPOS, SetCursor, SetWindowLongPtrW,
+    WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+    WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_TABSTOP, WS_VSCROLL,
 };
 
 const CLASS_NAME: &str = "FastPadPreview";
@@ -807,7 +807,14 @@ fn set_scroll(state: &mut ViewState, y: f32, user: bool) {
             ..
         } = state;
         let line = line_for_offset(&document.blocks, heights, *scroll_y);
-        unsafe { PostMessageW(GetParent(*hwnd), WM_FASTPAD_PREVIEW_SCROLLED, line, 0) };
+        unsafe {
+            PostMessageW(
+                crate::platform::win32::root_window(*hwnd),
+                WM_FASTPAD_PREVIEW_SCROLLED,
+                line,
+                *hwnd as isize,
+            )
+        };
     }
 }
 
@@ -1131,9 +1138,9 @@ fn post_link(hwnd: HWND, dest: String) {
     let payload = Box::into_raw(Box::new(dest));
     if unsafe {
         PostMessageW(
-            GetParent(hwnd),
+            crate::platform::win32::root_window(hwnd),
             WM_FASTPAD_PREVIEW_LINK,
-            0,
+            hwnd as usize,
             payload as isize,
         )
     } == 0
@@ -1146,9 +1153,9 @@ fn post_hover(hwnd: HWND, dest: Option<String>) {
     let payload = Box::into_raw(Box::new(dest));
     if unsafe {
         PostMessageW(
-            GetParent(hwnd),
+            crate::platform::win32::root_window(hwnd),
             WM_FASTPAD_PREVIEW_HOVER,
-            0,
+            hwnd as usize,
             payload as isize,
         )
     } == 0
@@ -1357,6 +1364,9 @@ unsafe extern "system" fn preview_proc(
         }
         WM_GETDLGCODE => DLGC_WANTALLKEYS as LRESULT,
         WM_SETFOCUS | WM_KILLFOCUS | WM_DPICHANGED_AFTERPARENT => {
+            if message == WM_SETFOCUS {
+                crate::window::post_content_focus(hwnd);
+            }
             invalidate(hwnd);
             0
         }
@@ -1423,7 +1433,14 @@ unsafe extern "system" fn preview_proc(
         WM_KEYDOWN => {
             let key = wparam as u16;
             if key == VK_ESCAPE {
-                unsafe { PostMessageW(GetParent(hwnd), WM_FASTPAD_PREVIEW_ESCAPE, 0, 0) };
+                unsafe {
+                    PostMessageW(
+                        crate::platform::win32::root_window(hwnd),
+                        WM_FASTPAD_PREVIEW_ESCAPE,
+                        hwnd as usize,
+                        0,
+                    )
+                };
                 return 0;
             }
             with_state(hwnd, |state| {
@@ -1520,7 +1537,14 @@ unsafe extern "system" fn preview_proc(
             let (x, y) = client_point(lparam);
             with_state(hwnd, |state| {
                 if state.paused && (y as f32) < PAUSED_BAR_HEIGHT * dpi_scale(hwnd) {
-                    unsafe { PostMessageW(GetParent(hwnd), WM_FASTPAD_PREVIEW_REFRESH, 0, 0) };
+                    unsafe {
+                        PostMessageW(
+                            crate::platform::win32::root_window(hwnd),
+                            WM_FASTPAD_PREVIEW_REFRESH,
+                            hwnd as usize,
+                            0,
+                        )
+                    };
                     return;
                 }
                 let released = target_at(state, x, y);

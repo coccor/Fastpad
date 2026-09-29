@@ -460,8 +460,10 @@ impl FindBar {
         let fields = (|| {
             let query_edit = create_edit_child(panel)?;
             let replace_edit = create_edit_child(panel)?;
-            install_field_hook(query_edit, parent, FindField::Query)?;
-            install_field_hook(replace_edit, parent, FindField::Replace)?;
+            // The field hooks call into the main window, whichever window holds the bar.
+            let main = crate::platform::win32::root_window(parent);
+            install_field_hook(query_edit, main, FindField::Query)?;
+            install_field_hook(replace_edit, main, FindField::Replace)?;
             Ok((query_edit, replace_edit))
         })();
         let (query_edit, replace_edit) = match fields {
@@ -1000,16 +1002,17 @@ pub(crate) fn toggle_child(option: SearchOption) -> usize {
         .unwrap_or(0)
 }
 
-/// Runs `f` on the find bar whose panel is `panel`. Called on the window's own thread
+/// Runs `f` on the find bar, in whichever group, whose panel is `panel`. Called on the window's own thread
 /// (`sidebar_accessibility` sends every query there), under a shared App borrow: `f` reads kept
 /// state and sends no messages.
 fn with_bar<R>(panel: HWND, f: impl FnOnce(&FindBar) -> R) -> Option<R> {
-    let main = unsafe { GetParent(panel) };
+    let main = crate::platform::win32::root_window(panel);
     let app = unsafe { super::main_window::app_ptr(main) }?;
     let bar = unsafe { app.as_ref() }
-        .find_bar
-        .as_ref()
-        .filter(|bar| bar.panel == panel)?;
+        .groups
+        .iter()
+        .filter_map(|group| group.find_bar.as_ref())
+        .find(|bar| bar.panel == panel)?;
     Some(f(bar))
 }
 
@@ -1183,9 +1186,12 @@ unsafe extern "system" fn find_field_proc(
             }
         }
         // The focused field carries the accent outline the bar paints.
-        WM_SETFOCUS | WM_KILLFOCUS => unsafe {
-            InvalidateRect(GetParent(hwnd), std::ptr::null(), 0);
-        },
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            if message == WM_SETFOCUS {
+                super::main_window::post_content_focus(hwnd);
+            }
+            unsafe { InvalidateRect(GetParent(hwnd), std::ptr::null(), 0) };
+        }
         _ => {}
     }
     result

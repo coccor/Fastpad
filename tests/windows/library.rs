@@ -368,7 +368,11 @@ impl Drop for Accessible {
 
 /// The main window's tab titles, from its title-strip MSAA object.
 fn tab_titles(hwnd: HWND) -> Vec<String> {
-    let Some(strip) = Accessible::from_window(hwnd) else {
+    // The tabs are the editor group's strip, not the main window's title bar.
+    let Some(strip) = find_child_by_class(hwnd, "FastPadEditorGroup")
+        .ok()
+        .and_then(Accessible::from_window)
+    else {
         return Vec::new();
     };
     (1..=strip.child_count())

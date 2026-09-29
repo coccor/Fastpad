@@ -96,9 +96,14 @@ fn secondary_racing_server_start_is_never_lost_and_never_hangs() -> TestResult<(
     let mut process = FastPadProcess::spawn_with_local_app_data([] as [&str; 0], &scratch.root)?;
     let hwnd = process.wait_for_main_window(WAIT)?;
     let editor = find_child_by_class(hwnd, "Scintilla")?;
-    let tabs = tab_count(hwnd)?;
 
     unsafe { PostMessageW(editor, WM_CHAR, usize::from(b'x'), 0) };
+    // The count is only stable once the character has landed: in the startup tab, which then
+    // stays, or in the tab it opened after a plain launch closed that one.
+    wait_until("the typed character", || {
+        scintilla_text(editor).is_ok_and(|text| text == "x")
+    })?;
+    let tabs = tab_count(hwnd)?;
     let started = Instant::now();
     let mut secondary = FastPadProcess::spawn_with_local_app_data([&file], &scratch.root)?;
     match secondary.wait_for_main_window(WAIT) {
@@ -206,9 +211,9 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) -> TestResult<()>
     Ok(())
 }
 
-/// Client-area accessible children are the fixed chrome items plus one per tab.
+/// The editor group's tab strip lists one accessible child per tab plus its fixed buttons.
 fn tab_count(hwnd: HWND) -> TestResult<i32> {
-    Accessible::from_window(hwnd)?.child_count()
+    Accessible::from_window(find_child_by_class(hwnd, "FastPadEditorGroup")?)?.child_count()
 }
 
 struct Scratch {
