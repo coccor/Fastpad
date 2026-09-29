@@ -4,18 +4,19 @@
 
 use super::palette::Palette;
 use super::panel::{fill, inset};
+use super::side_panel::paint_buffered;
 use crate::platform::wide_null;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DrawTextW, EndPaint, GetMonitorInfoW, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-    MONITORINFO, MonitorFromRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    ClientToScreen, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW,
+    GetMonitorInfoW, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
+    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
     GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MA_NOACTIVATE, PostMessageW, RegisterClassW,
     SW_SHOWNA, SetWindowLongPtrW, ShowWindow, WM_APP, WM_ERASEBKGND, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WNDCLASSW,
@@ -378,16 +379,14 @@ unsafe extern "system" fn list_proc(
     }
 }
 
+/// Paints through an off-screen bitmap so a hover repaint never shows the erase.
 fn paint(hwnd: HWND, list: &ListState) {
-    let mut paint = PAINTSTRUCT::default();
-    let dc = unsafe { BeginPaint(hwnd, &mut paint) };
-    if dc.is_null() {
-        return;
-    }
+    paint_buffered(hwnd, |dc, client| paint_into(dc, client, list));
+}
+
+fn paint_into(dc: HDC, client: RECT, list: &ListState) {
     let colors = list.colors;
-    let mut client = RECT::default();
     unsafe {
-        GetClientRect(hwnd, &mut client);
         fill(dc, client, colors.muted_foreground);
         fill(dc, inset(client, 1), colors.panel_background());
         SetBkMode(dc, TRANSPARENT as i32);
@@ -449,7 +448,6 @@ fn paint(hwnd: HWND, list: &ListState) {
             );
         }
         SelectObject(dc, previous);
-        EndPaint(hwnd, &paint);
     }
 }
 

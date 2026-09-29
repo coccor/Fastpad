@@ -12,6 +12,7 @@ use super::settings_model::{
     Control, DialogModel, Effect, Focus, Key, Row, Section, SettingsView, dropdown_action,
     step_font_size,
 };
+use super::side_panel::paint_buffered;
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
 use std::cell::Cell;
@@ -23,12 +24,11 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, EndPaint,
-    FW_NORMAL, FW_SEMIBOLD, GetDC, GetMonitorInfoW, HDC, HFONT, IntersectClipRect, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow, PAINTSTRUCT,
-    ReleaseDC, RestoreDC, SaveDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    ClientToScreen, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, FW_NORMAL, FW_SEMIBOLD,
+    GetDC, GetMonitorInfoW, HDC, HFONT, IntersectClipRect, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow, ReleaseDC,
+    RestoreDC, SaveDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
@@ -40,14 +40,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW,
-    GW_OWNER, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageTime, GetMessageW,
-    GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, HCURSOR, HTCAPTION, HTCLIENT,
-    IDC_ARROW, IDC_HAND, IsWindow, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
-    WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR,
-    WM_SYSKEYDOWN, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
+    GW_OWNER, GWLP_USERDATA, GetCursorPos, GetMessageTime, GetMessageW, GetSystemMetrics,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, HCURSOR, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND,
+    IsWindow, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXDOUBLECLK,
+    SM_CYDOUBLECLK, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const TITLE: &str = "Settings";
@@ -1163,18 +1163,16 @@ unsafe extern "system" fn dialog_proc(
     }
 }
 
+/// Paints through an off-screen bitmap so a hover repaint never shows the erase.
 fn paint(hwnd: HWND, dialog: &Dialog) {
-    let mut paint = PAINTSTRUCT::default();
-    let dc = unsafe { BeginPaint(hwnd, &mut paint) };
-    if dc.is_null() {
-        return;
-    }
+    paint_buffered(hwnd, |dc, client| paint_into(dc, client, dialog));
+}
+
+fn paint_into(dc: HDC, client: RECT, dialog: &Dialog) {
     let colors = dialog.colors;
     let layout = &dialog.layout;
     let view = &dialog.view;
-    let mut client = RECT::default();
     unsafe {
-        GetClientRect(hwnd, &mut client);
         fill(dc, client, colors.muted_foreground);
         fill(dc, inset(client, 1), colors.panel_background());
         SetBkMode(dc, TRANSPARENT as i32);
@@ -1290,7 +1288,6 @@ fn paint(hwnd: HWND, dialog: &Dialog) {
             SetTextColor(dc, colors.editor_foreground);
             DrawFocusRect(dc, &ring);
         }
-        EndPaint(hwnd, &paint);
     }
 }
 
