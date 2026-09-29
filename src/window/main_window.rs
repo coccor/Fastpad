@@ -26599,7 +26599,8 @@ three"
         use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow};
         let owner = unsafe { GetWindow(dialog, GW_OWNER) };
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(owner) }.max(96);
-        let layout = crate::window::settings_dialog::Layout::calculate(dpi, i32::MAX, 100);
+        let layout =
+            crate::window::settings_dialog::Layout::calculate(dpi, i32::MAX, i32::MAX, 100);
         let rect = layout.row_rect(row, 0);
         ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
     }

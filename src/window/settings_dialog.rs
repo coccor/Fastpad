@@ -65,7 +65,8 @@ const GLYPH_CHEVRON_DOWN: &str = "\u{E70D}";
 const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_REMOVE: &str = "\u{E738}";
 
-const WIDTH_AT_96_DPI: i32 = 520;
+/// The width, unless the work area is narrower.
+const WIDTH_AT_96_DPI: i32 = 640;
 const PADDING_AT_96_DPI: i32 = 20;
 const HEADING_HEIGHT_AT_96_DPI: i32 = 30;
 /// A heading's text sits this far below the top of its space, closer to its first card.
@@ -77,7 +78,10 @@ const CARD_GAP_AT_96_DPI: i32 = 3;
 /// Between a card's sides and its label or control.
 const CARD_PADDING_AT_96_DPI: i32 = 16;
 const CONTROL_HEIGHT_AT_96_DPI: i32 = 26;
-const DROPDOWN_WIDTH_AT_96_DPI: i32 = 240;
+/// A dropdown's width, room for long font names; in a dialog narrowed by its work area it gives
+/// up width before its label's `LABEL_MIN_WIDTH_AT_96_DPI`.
+const DROPDOWN_WIDTH_AT_96_DPI: i32 = 360;
+const LABEL_MIN_WIDTH_AT_96_DPI: i32 = 120;
 const SEGMENT_WIDTH_AT_96_DPI: i32 = 80;
 const TAB_SEGMENT_WIDTH_AT_96_DPI: i32 = 44;
 const STEP_BUTTON_AT_96_DPI: i32 = 28;
@@ -141,10 +145,10 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    /// The layout at `dpi`, at most `max_height` tall (the work area), with the Edit fastpad.ini
-    /// link `link_width` wide.
-    pub(crate) fn calculate(dpi: u32, max_height: i32, link_width: i32) -> Self {
-        let width = scale(WIDTH_AT_96_DPI, dpi);
+    /// The layout at `dpi`, at most `max_width` wide and `max_height` tall (the work area), with
+    /// the Edit fastpad.ini link `link_width` wide.
+    pub(crate) fn calculate(dpi: u32, max_width: i32, max_height: i32, link_width: i32) -> Self {
+        let width = scale(WIDTH_AT_96_DPI, dpi).min(max_width);
         let padding = scale(PADDING_AT_96_DPI, dpi);
         let title_height = scale(TITLE_HEIGHT_AT_96_DPI, dpi);
         let heading_height = scale(HEADING_HEIGHT_AT_96_DPI, dpi);
@@ -265,10 +269,16 @@ impl Layout {
     pub(crate) fn control_rect(&self, row: Row, row_rect: RECT, segments: usize) -> RECT {
         let dpi = self.dpi;
         let (width, height) = match row.control() {
-            Control::Dropdown => (
-                scale(DROPDOWN_WIDTH_AT_96_DPI, dpi),
-                scale(CONTROL_HEIGHT_AT_96_DPI, dpi),
-            ),
+            Control::Dropdown => {
+                let room = row_rect.right
+                    - row_rect.left
+                    - scale(CARD_PADDING_AT_96_DPI, dpi) * 2
+                    - scale(LABEL_MIN_WIDTH_AT_96_DPI, dpi);
+                (
+                    scale(DROPDOWN_WIDTH_AT_96_DPI, dpi).min(room).max(0),
+                    scale(CONTROL_HEIGHT_AT_96_DPI, dpi),
+                )
+            }
             Control::Segmented => {
                 let each = if row == Row::TabWidth {
                     TAB_SEGMENT_WIDTH_AT_96_DPI
@@ -562,12 +572,17 @@ fn create(
         GetWindowRect(owner, &mut frame);
     }
     let work = monitor.rcWork;
-    let max_height = if work.bottom > work.top {
-        work.bottom - work.top
+    let (max_width, max_height) = if work.bottom > work.top && work.right > work.left {
+        (work.right - work.left, work.bottom - work.top)
     } else {
-        i32::MAX
+        (i32::MAX, i32::MAX)
     };
-    let layout = Layout::calculate(dpi, max_height, measure(dialog, link_font, EDIT_INI_LABEL));
+    let layout = Layout::calculate(
+        dpi,
+        max_width,
+        max_height,
+        measure(dialog, link_font, EDIT_INI_LABEL),
+    );
     let view = super::main_window::settings_view(owner);
     let fonts = crate::platform::fonts::dropdown_names(
         crate::platform::fonts::installed_font_families(),
@@ -1634,8 +1649,8 @@ mod tests {
         // Break caught: cards touching or overlapping, a heading painted under its first card,
         // cards flush with the dialog's edges, or a dialog over about 700 px tall at 96 DPI
         // (soft-look addendum).
-        let layout = Layout::calculate(96, 2000, 100);
-        assert_eq!(layout.width, 520);
+        let layout = Layout::calculate(96, 4000, 2000, 100);
+        assert_eq!(layout.width, 640);
         assert_eq!(layout.max_scroll(), 0);
         let mut expected_top = 0;
         for section in Section::ALL {
@@ -1645,7 +1660,7 @@ mod tests {
                 let card = layout.rows[row as usize];
                 assert_eq!(card.top, expected_top, "{row:?}");
                 assert_eq!(card.bottom - card.top, 36, "{row:?}");
-                assert_eq!((card.left, card.right), (20, 500), "{row:?}");
+                assert_eq!((card.left, card.right), (20, 620), "{row:?}");
                 expected_top = card.bottom + 3;
             }
         }
@@ -1657,7 +1672,7 @@ mod tests {
 
     #[test]
     fn hits_find_controls_checkbox_labels_segments_and_stepper_parts() {
-        let layout = Layout::calculate(96, 2000, 100);
+        let layout = Layout::calculate(96, 4000, 2000, 100);
         let view = view();
         let hit = |rect: RECT| {
             let (x, y) = center(rect);
@@ -1733,8 +1748,8 @@ mod tests {
 
     #[test]
     fn the_layout_scales_with_dpi() {
-        let normal = Layout::calculate(96, 4000, 100);
-        let double = Layout::calculate(192, 4000, 200);
+        let normal = Layout::calculate(96, 4000, 4000, 100);
+        let double = Layout::calculate(192, 4000, 4000, 200);
         assert_eq!(double.width, normal.width * 2);
         assert_eq!(double.content_height, normal.content_height * 2);
         assert_eq!(double.rows[5].top, normal.rows[5].top * 2);
@@ -1748,11 +1763,11 @@ mod tests {
     fn the_title_close_button_fills_the_title_row_corner_like_the_caption_close() {
         // Break caught: a × inset from the corner or shorter than the title row, unlike the
         // main window's caption close button, or a title that runs under it.
-        let layout = Layout::calculate(96, 2000, 100);
+        let layout = Layout::calculate(96, 4000, 2000, 100);
         let close = layout.title_close;
         assert_eq!(
             (close.left, close.top, close.right, close.bottom),
-            (520 - 46, 0, 520, 44)
+            (640 - 46, 0, 640, 44)
         );
         assert_eq!(layout.title.bottom, close.bottom);
         assert_eq!(layout.title.right, close.left);
@@ -1764,7 +1779,7 @@ mod tests {
         // Break caught: the switch drawn in the 18-px square the checkbox had, squashed into a
         // square, off-centre in its row, or not DPI-scaled.
         for dpi in [96, 144, 192] {
-            let layout = Layout::calculate(dpi, 4000, 100);
+            let layout = Layout::calculate(dpi, 4000, 4000, 100);
             for row in Row::ALL
                 .into_iter()
                 .filter(|row| row.control() == Control::Check)
@@ -1804,7 +1819,7 @@ mod tests {
         );
         assert_eq!((on.left, on.top, on.right, on.bottom), (124, 14, 136, 26));
 
-        let layout = Layout::calculate(192, 4000, 100);
+        let layout = Layout::calculate(192, 4000, 4000, 100);
         let track = layout.control_rect(Row::WordWrap, layout.row_rect(Row::WordWrap, 0), 0);
         for on in [false, true] {
             let knob = toggle_knob(track, on, 192);
@@ -1824,7 +1839,7 @@ mod tests {
         Dialog {
             colors: Palette::for_theme(theme, false),
             link_color: 0,
-            layout: Layout::calculate(96, 2000, 100),
+            layout: Layout::calculate(96, 4000, 2000, 100),
             view: view(),
             model: DialogModel::new(),
             fonts: Vec::new(),
@@ -1912,10 +1927,68 @@ mod tests {
     }
 
     #[test]
+    fn dropdowns_take_the_extra_width_and_the_other_controls_keep_their_natural_sizes() {
+        // Break caught: long font names cut off in a dropdown that stayed 240 px in a wider
+        // dialog, a dropdown grown over its label, or segments, steppers and toggles stretched
+        // instead of right-aligned at their own sizes.
+        let view = view();
+        for dpi in [96, 144, 192] {
+            let layout = Layout::calculate(dpi, 8000, 8000, 100);
+            for row in Row::ALL {
+                let card = layout.row_rect(row, 0);
+                let control = layout.control_rect(row, card, view.segments(row).len());
+                let width = control.right - control.left;
+                assert_eq!(control.right, card.right - scale(16, dpi), "{row:?}");
+                let natural = match row.control() {
+                    Control::Dropdown => 360,
+                    Control::Segmented if row == Row::TabWidth => 44 * 3,
+                    Control::Segmented => 80 * view.segments(row).len() as i32,
+                    Control::Stepper => 28 * 2 + 48,
+                    Control::Check => 40,
+                };
+                assert_eq!(width, scale(natural, dpi), "{row:?} at {dpi} DPI");
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_work_area_caps_the_width_and_shrinks_the_dropdowns_not_their_labels() {
+        // Break caught: a dialog wider than the screen, its × or Close off the right edge, or a
+        // dropdown squeezed over its label instead of giving up its extra width.
+        let layout = Layout::calculate(96, 450, 2000, 100);
+        assert_eq!(layout.width, 450);
+        assert_eq!(layout.title_close.right, 450);
+        assert_eq!(layout.close.right, 450 - 20);
+        let view = view();
+        for row in [Row::Theme, Row::Font] {
+            let card = layout.row_rect(row, 0);
+            assert_eq!((card.left, card.right), (20, 430));
+            let control = layout.control_rect(row, card, 0);
+            assert_eq!(control.right, card.right - 16);
+            assert!(
+                control.left >= card.left + 16 + 120,
+                "{row:?}: the label keeps 120 px"
+            );
+            assert!(control.right - control.left < 360, "{row:?} gave up width");
+        }
+        let track = layout.control_rect(
+            Row::WordWrap,
+            layout.row_rect(Row::WordWrap, 0),
+            view.segments(Row::WordWrap).len(),
+        );
+        assert_eq!(track.right - track.left, 40, "a toggle keeps its size");
+        assert_eq!(
+            Layout::calculate(144, 4000, 2000, 100).width,
+            scale(640, 144),
+            "a wide work area leaves the scaled width alone"
+        );
+    }
+
+    #[test]
     fn a_short_work_area_caps_the_height_and_scrolls_the_focused_row_into_view() {
         // Break caught: a dialog taller than a 1366×768 screen at 150%, with Close off-screen,
         // or Tab moving the focus to a row the body never scrolls to (review focus 4).
-        let layout = Layout::calculate(144, 700, 150);
+        let layout = Layout::calculate(144, 4000, 700, 150);
         assert_eq!(layout.height, 700);
         assert!(layout.max_scroll() > 0);
         let visible = layout.body.bottom - layout.body.top;
@@ -1933,7 +2006,7 @@ mod tests {
             "the first row brings its heading back"
         );
         assert_eq!(layout.scroll_to_show(Focus::Close, 37), 37);
-        let tiny = Layout::calculate(96, 100, 100);
+        let tiny = Layout::calculate(96, 4000, 100, 100);
         assert!(tiny.height > 100, "at least a few rows always show");
     }
 }
