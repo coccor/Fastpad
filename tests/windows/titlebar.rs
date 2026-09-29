@@ -142,6 +142,58 @@ fn editor_top(
     rect.top - origin.y
 }
 
+#[test]
+fn help_about_shows_an_owned_box_that_escape_closes() -> TestResult<()> {
+    // Break caught: About doing nothing in the real binary, a box that isn't owned by (and so can
+    // hide behind) the main window, or one Escape can't close.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow, IsWindowVisible};
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let class = wide_null("FastPadAbout");
+    let find_about = || unsafe {
+        FindWindowExW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            class.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    assert!(find_about().is_null());
+
+    assert_ne!(
+        unsafe { PostMessageW(hwnd, WM_COMMAND, CommandId::About as usize, 0) },
+        0
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let about = loop {
+        let about = find_about();
+        if !about.is_null() && unsafe { IsWindowVisible(about) } != 0 {
+            break about;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("the About box never showed".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(unsafe { GetWindow(about, GW_OWNER) }, hwnd);
+    assert_eq!(unsafe { IsWindowEnabled(hwnd) }, 0);
+
+    assert_ne!(
+        unsafe { PostMessageW(about, WM_KEYDOWN, VK_ESCAPE as usize, 0) },
+        0
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while unsafe { IsWindow(about) } != 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err("Escape did not close the About box".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_ne!(unsafe { IsWindowEnabled(hwnd) }, 0);
+    process.close()
+}
+
 fn wait_for_editor_top(
     hwnd: windows_sys::Win32::Foundation::HWND,
     editor: windows_sys::Win32::Foundation::HWND,

@@ -2070,6 +2070,19 @@ fn take_palette_note_target(hwnd: HWND) -> Option<std::path::PathBuf> {
     unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.palette_note_target.take())
 }
 
+/// Help → About FastPad, in the current theme's colors and the Markdown preview's link color.
+fn show_about(hwnd: HWND) {
+    let colors = current_palette(hwnd);
+    let theme = effective_theme(hwnd);
+    let high_contrast = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .theme
+            .is_some_and(|system| system.high_contrast)
+    });
+    let link = crate::preview::colors::preview_colors(theme, high_contrast).link;
+    crate::window::about::show(hwnd, colors, link);
+}
+
 pub(crate) fn open_command_palette(hwnd: HWND) {
     show_command_palette(hwnd, None);
 }
@@ -3496,6 +3509,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::FindNext => find_again(hwnd, false),
         CommandId::FindPrevious => find_again(hwnd, true),
         CommandId::CommandPalette => open_command_palette(hwnd),
+        CommandId::About => show_about(hwnd),
         CommandId::QuickOpen => open_quick_open(hwnd),
         CommandId::NoteNewFolder => crate::window::inline_name::new_folder(hwnd, None),
         CommandId::NoteNew => crate::window::inline_name::new_note(hwnd, None),
@@ -10722,7 +10736,7 @@ three"
             "no native menu bar"
         );
         assert_eq!(editor_top(), title_height + band);
-        assert_eq!(super::menu_headings(window.hwnd).len(), 4);
+        assert_eq!(super::menu_headings(window.hwnd).len(), 5);
 
         key_menu(0);
         assert_eq!(app_mut(window.hwnd).menu_mode, None);
@@ -26047,6 +26061,67 @@ three"
         assert_eq!(
             std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
             "old"
+        );
+    }
+
+    #[test]
+    fn about_shows_a_modal_window_over_the_disabled_main_window_until_escape() {
+        // Break caught: About doing nothing, leaving the main window usable behind the box (or
+        // disabled after it closes), or a modal scope that never ends, which holds back every
+        // deferred message for the rest of the session.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GW_OWNER, GetWindow, PostMessageW, WM_KEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let owner = window.hwnd;
+        let shown = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = shown.clone();
+        crate::window::about::answer_next(move |dialog| {
+            let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
+            let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
+            let modal = crate::window::modal::modal_active(owner);
+            seen.set(Some((dialog, owned, owner_disabled, modal)));
+            unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        });
+
+        execute_command(owner, CommandId::About);
+
+        let (dialog, owned, owner_disabled, modal) = shown.get().expect("the About box was shown");
+        assert!(owned, "owned by the main window");
+        assert!(
+            owner_disabled,
+            "the main window is disabled while About is up"
+        );
+        assert!(modal, "About runs inside a modal scope");
+        assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
+        assert_ne!(
+            unsafe { IsWindowEnabled(owner) },
+            0,
+            "the main window is usable again"
+        );
+        assert!(!crate::window::modal::modal_active(owner));
+    }
+
+    #[test]
+    fn about_opens_the_repository_link_from_the_keyboard_and_stays_open() {
+        // Break caught: a link that Tab can't reach or Enter doesn't follow, or following a link
+        // that also closes the box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let window = ProductionWindow::new(make_app());
+        crate::window::about::take_opened_urls();
+        crate::window::about::answer_next(move |dialog| unsafe {
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+
+        execute_command(window.hwnd, CommandId::About);
+
+        assert_eq!(
+            crate::window::about::take_opened_urls(),
+            [crate::window::about::Link::Repository.url()]
         );
     }
 }

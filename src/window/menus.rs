@@ -250,7 +250,9 @@ impl MenuBar {
                     CommandId::CommandPalette,
                 ),
             ])?;
-            append_popup(root, MENU_TITLES[menu_band::VIEW_MENU_INDEX], view)
+            append_popup(root, MENU_TITLES[menu_band::VIEW_MENU_INDEX], view)?;
+            let help = create_popup(&[MenuEntry::command("&About FastPad", CommandId::About)])?;
+            append_popup(root, MENU_TITLES[menu_band::HELP_MENU_INDEX], help)
         })();
         match result {
             Ok(()) => Ok(Self(root)),
@@ -871,6 +873,26 @@ mod tests {
         };
         assert!(has(0, CommandId::CloseAllTabs), "File: Close all tabs");
         assert!(has(1, CommandId::FormatJson), "Edit: Format JSON");
+    }
+
+    #[test]
+    fn the_help_menu_is_last_and_opens_about() {
+        // Break caught: a Help heading whose dropdown is missing, so the band shows a heading
+        // that opens nothing, or About filed under another heading.
+        use super::MenuBar;
+        use crate::window::menu_band::{HELP_MENU_INDEX, MENU_TITLES};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND};
+        assert_eq!(MENU_TITLES[HELP_MENU_INDEX], "&Help");
+        assert_eq!(HELP_MENU_INDEX, MENU_TITLES.len() - 1);
+        let bar = MenuBar::create().unwrap();
+        let state = unsafe {
+            GetMenuState(
+                bar.dropdown(HELP_MENU_INDEX),
+                CommandId::About as u32,
+                MF_BYCOMMAND,
+            )
+        };
+        assert_ne!(state, u32::MAX, "Help: About FastPad");
     }
 
     #[test]

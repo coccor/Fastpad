@@ -123,6 +123,7 @@ pub enum CommandId {
     FocusLastGroup = 228,
     MoveTabToNextGroup = 229,
     MoveTabToPreviousGroup = 230,
+    About = 231,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -233,6 +234,7 @@ impl CommandId {
                 | Self::FocusGroup7
                 | Self::FocusGroup8
                 | Self::FocusLastGroup
+                | Self::About
         )
     }
 
@@ -364,7 +366,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 120] = [
+        const COMMANDS: [CommandId; 121] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -485,6 +487,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::FocusLastGroup,
             CommandId::MoveTabToNextGroup,
             CommandId::MoveTabToPreviousGroup,
+            CommandId::About,
         ];
         COMMANDS
             .into_iter()
@@ -702,6 +705,17 @@ mod tests {
         assert_eq!(CommandId::try_from(193), Ok(CommandId::NoteNew));
         assert!(!CommandId::NoteNew.needs_document());
         assert!(!CommandId::NoteNew.is_sidebar());
+    }
+
+    #[test]
+    fn about_is_231_and_runs_without_a_document() {
+        // Break caught: About renumbered onto another command, or greyed out while no tab is open
+        // or an image tab is active.
+        assert_eq!(CommandId::About as u16, 231);
+        assert_eq!(CommandId::try_from(231), Ok(CommandId::About));
+        assert!(!CommandId::About.needs_document());
+        assert!(!CommandId::About.needs_text());
+        assert!(!CommandId::About.is_sidebar());
     }
 
     #[test]

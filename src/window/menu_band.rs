@@ -1,4 +1,4 @@
-//! The Alt/F10 menu: a painted band of File/Edit/Search/View headings below the title strip. It
+//! The Alt/F10 menu: a painted band of File/Edit/Search/View/Help headings below the title strip. It
 //! replaces a native menu bar, which Windows would draw unthemed over the reclaimed caption. The
 //! band exists only while menu mode is active and pushes the find bar and editor down like any
 //! other band; each heading opens its native dropdown from `menus::MenuBar`.
@@ -13,9 +13,11 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 
 /// Headings in dropdown order; `&` marks each mnemonic, as in a native menu bar.
-pub(crate) const MENU_TITLES: [&str; 4] = ["&File", "&Edit", "&Search", "&View"];
+pub(crate) const MENU_TITLES: [&str; 5] = ["&File", "&Edit", "&Search", "&View", "&Help"];
 /// The index of the View heading, whose dropdown holds the Markdown preview commands.
 pub(crate) const VIEW_MENU_INDEX: usize = 3;
+/// The index of the Help heading, whose dropdown holds About.
+pub(crate) const HELP_MENU_INDEX: usize = 4;
 
 const BAND_HEIGHT_AT_96_DPI: i32 = 28;
 const HEADING_PADDING_AT_96_DPI: i32 = 10;
@@ -203,9 +205,10 @@ mod tests {
         assert_eq!(mnemonic_heading(u32::from(b'e')), Some(1));
         assert_eq!(mnemonic_heading(u32::from(b'S')), Some(2));
         assert_eq!(mnemonic_heading(u32::from(b'V')), Some(3));
+        assert_eq!(mnemonic_heading(u32::from(b'h')), Some(4));
         assert_eq!(mnemonic_heading(u32::from(b'Q')), None);
-        assert_eq!(neighbor(0, false), 3);
-        assert_eq!(neighbor(3, true), 0);
+        assert_eq!(neighbor(0, false), 4);
+        assert_eq!(neighbor(4, true), 0);
         assert_eq!(neighbor(1, true), 2);
     }
 }

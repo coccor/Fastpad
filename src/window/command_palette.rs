@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 98] = [
+pub(crate) const ENTRIES: [PaletteEntry; 99] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -180,6 +180,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 98] = [
     entry("Editor: Tab width 4", CommandId::TabWidth4),
     entry("Editor: Tab width 8", CommandId::TabWidth8),
     entry("File: Exit", CommandId::Exit),
+    entry("Help: About FastPad", CommandId::About),
 ];
 
 /// What the activity bar's Settings button lists: every command that changes a `fastpad.ini`
@@ -1507,7 +1508,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 98);
+        assert_eq!(ENTRIES.len(), 99);
     }
 
     #[test]
@@ -1544,6 +1545,14 @@ mod tests {
             position(CommandId::NoteNew).map(|index| index + 1),
             position(CommandId::NoteNewFolder)
         );
+    }
+
+    #[test]
+    fn about_is_listed_under_help_without_a_shortcut() {
+        // Break caught: the About box reachable only from the menu band, or its row showing a
+        // shortcut it doesn't have.
+        assert_eq!(labels("about")[0], "Help: About FastPad");
+        assert_eq!(shortcut_text(CommandId::About), None);
     }
 
     #[test]

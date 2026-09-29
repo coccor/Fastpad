@@ -1,3 +1,4 @@
+pub(crate) mod about;
 pub(crate) mod accessibility;
 pub(crate) mod activity_bar;
 pub(crate) mod command_palette;

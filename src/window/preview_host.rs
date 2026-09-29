@@ -1131,7 +1131,7 @@ fn shell_execute() -> Option<ShellExecuteFn> {
     address.map(|address| unsafe { std::mem::transmute::<usize, ShellExecuteFn>(address) })
 }
 
-fn shell_open(hwnd: HWND, url: &str) -> bool {
+pub(crate) fn shell_open(hwnd: HWND, url: &str) -> bool {
     let Some(execute) = shell_execute() else {
         return false;
     };
