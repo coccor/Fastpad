@@ -603,6 +603,38 @@ fn drag_item(kind: &RowKind) -> Option<TreeItem> {
 
 /// The drag label's size for a name `text` pixels wide: padding, the icon, a gap, the name,
 /// padding.
+/// A tab's drag label for window `window` (a group window): its icon and name, painted like a
+/// tree drag's (split editors spec §6). `None` if GDI can't make the image. Needs no notebook
+/// view, so it works with the sidebar hidden.
+#[allow(dead_code)] // Used by tab drags from Task 4.
+pub(crate) fn tab_label_image(
+    hwnd: HWND,
+    window: HWND,
+    item: TreeItem,
+    name: &str,
+) -> Option<LabelImage> {
+    let paint = super::side_panel::view_paint(hwnd, window, std::ptr::null_mut(), RECT::default());
+    let wide = name.encode_utf16().collect::<Vec<_>>();
+    let mut extent = SIZE::default();
+    if !wide.is_empty() {
+        unsafe {
+            let dc = GetDC(window);
+            if dc.is_null() {
+                return None;
+            }
+            let previous = SelectObject(dc, paint.fonts.text);
+            GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut extent);
+            SelectObject(dc, previous);
+            ReleaseDC(window, dc);
+        }
+    }
+    let size = drag_label_size(extent.cx.min(scale(LABEL_MAX_TEXT, paint.dpi)), paint.dpi);
+    let image = LabelImage::new(size.cx, size.cy)?;
+    let mut images = crate::window::icon_sets::images::IconImages::new();
+    paint_drag_label(image.dc, size, item, name, &paint, &mut images);
+    Some(image)
+}
+
 fn drag_label_size(text: i32, dpi: u32) -> SIZE {
     SIZE {
         cx: 2 * scale(LABEL_PAD, dpi) + scale(GLYPH_BOX, dpi) + scale(GAP, dpi) + text,

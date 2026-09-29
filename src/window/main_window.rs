@@ -24891,4 +24891,65 @@ three"
         assert!(!scratch.folder().join("x.md").exists());
         assert!(!tab_paths(window.hwnd).contains(&Some(outside.clone())));
     }
+
+    #[test]
+    fn the_drop_overlay_covers_its_rectangle_and_lets_the_pointer_through() {
+        // Break caught: an overlay that steals the drag's clicks, or lands off by the frame.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowRect, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let rect = RECT {
+            left: 100,
+            top: 120,
+            right: 300,
+            bottom: 220,
+        };
+        let overlay = crate::window::drop_overlay::DropOverlay::show(
+            window.hwnd,
+            rect,
+            0x00ff_0000,
+            crate::window::drop_overlay::TINT_ALPHA,
+        )
+        .expect("overlay");
+        let mut shown = RECT::default();
+        unsafe { GetWindowRect(overlay.hwnd(), &mut shown) };
+        assert_eq!(
+            (shown.left, shown.top, shown.right, shown.bottom),
+            (100, 120, 300, 220)
+        );
+        let style = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
+        assert_ne!(style & WS_EX_LAYERED, 0);
+        assert_ne!(style & WS_EX_TRANSPARENT, 0);
+        let moved = RECT {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        };
+        overlay.place(moved, 0x0000_ff00, crate::window::drop_overlay::BAR_ALPHA);
+        assert_eq!(overlay.rect().right, 30);
+        let hwnd = overlay.hwnd();
+        overlay.destroy();
+        assert_eq!(unsafe { super::IsWindow(hwnd) }, 0);
+    }
+
+    #[test]
+    fn a_tab_label_is_painted_without_the_sidebar() {
+        // Break caught: the tab drag reaching into the notebook view, which is gone when the
+        // sidebar is hidden.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = super::group_hwnd(window.hwnd).unwrap();
+        let image = crate::window::notebook_view::tab_label_image(
+            window.hwnd,
+            group,
+            crate::window::icon_sets::TreeItem::Note(crate::window::file_icons::NoteKind::Text),
+            "notes.txt",
+        )
+        .expect("label image");
+        assert!(image.size.cx > image.size.cy);
+    }
 }
