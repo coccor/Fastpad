@@ -106,6 +106,12 @@ pub struct Settings {
     pub file_icons: FileIconSet,
     /// Whether the Notebook view's Open Editors section is expanded.
     pub open_editors_expanded: bool,
+    /// Whether Tab inserts spaces instead of a tab character.
+    pub insert_spaces: bool,
+    /// Whether spaces and tabs are drawn as dots and arrows.
+    pub show_whitespace: bool,
+    /// Whether the caret's line gets the theme's caret-line background.
+    pub highlight_current_line: bool,
 }
 
 impl Settings {
@@ -152,6 +158,15 @@ impl Settings {
         if let Some(expanded) = delta.open_editors_expanded {
             self.open_editors_expanded = expanded;
         }
+        if let Some(insert_spaces) = delta.insert_spaces {
+            self.insert_spaces = insert_spaces;
+        }
+        if let Some(show_whitespace) = delta.show_whitespace {
+            self.show_whitespace = show_whitespace;
+        }
+        if let Some(highlight_current_line) = delta.highlight_current_line {
+            self.highlight_current_line = highlight_current_line;
+        }
     }
 }
 
@@ -183,6 +198,9 @@ pub struct SettingsDelta {
     pub sidebar_width: Option<u16>,
     pub file_icons: Option<FileIconSet>,
     pub open_editors_expanded: Option<bool>,
+    pub insert_spaces: Option<bool>,
+    pub show_whitespace: Option<bool>,
+    pub highlight_current_line: Option<bool>,
     pub warnings: Vec<SettingWarning>,
 }
 
@@ -190,7 +208,8 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
-/// `sidebar_view`, `sidebar_width`, `file_icons` and `open_editors_expanded` are recognized.
+/// `sidebar_view`, `sidebar_width`, `file_icons`, `open_editors_expanded`, `insert_spaces`,
+/// `show_whitespace` and `highlight_current_line` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `file_icons` is
 /// `material` or `minimal` (any case). Every line is handled independently: a line with an
@@ -274,6 +293,18 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "open_editors_expanded" => match parse_bool(value) {
             Some(expanded) => delta.open_editors_expanded = Some(expanded),
+            None => warn(delta, line_number, key, value),
+        },
+        "insert_spaces" => match parse_bool(value) {
+            Some(insert_spaces) => delta.insert_spaces = Some(insert_spaces),
+            None => warn(delta, line_number, key, value),
+        },
+        "show_whitespace" => match parse_bool(value) {
+            Some(show_whitespace) => delta.show_whitespace = Some(show_whitespace),
+            None => warn(delta, line_number, key, value),
+        },
+        "highlight_current_line" => match parse_bool(value) {
+            Some(highlight) => delta.highlight_current_line = Some(highlight),
             None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
@@ -837,5 +868,38 @@ mod tests {
         assert_eq!(warnings.len(), 2);
 
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn the_editor_display_keys_parse_as_bools_with_their_defaults() {
+        // Break caught: a new key reported as unknown, a typo silently flipping it, or a default
+        // that changes how a brand-new profile's editor looks (settings dialog spec §4.4).
+        let defaults = default_settings();
+        assert!(!defaults.insert_spaces);
+        assert!(!defaults.show_whitespace);
+        assert!(defaults.highlight_current_line);
+
+        let delta = parse("insert_spaces=yes\nshow_whitespace=ON\nhighlight_current_line=0\n");
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        assert_eq!(
+            (
+                delta.insert_spaces,
+                delta.show_whitespace,
+                delta.highlight_current_line
+            ),
+            (Some(true), Some(true), Some(false))
+        );
+        let mut settings = default_settings();
+        settings.apply_delta(&delta);
+        assert!(settings.insert_spaces);
+        assert!(settings.show_whitespace);
+        assert!(!settings.highlight_current_line);
+
+        for key in ["insert_spaces", "show_whitespace", "highlight_current_line"] {
+            let delta = parse(&format!("{key}=sometimes\nfont_size=12"));
+            assert_eq!(delta.warnings.len(), 1, "{key}");
+            assert_eq!(delta.font_size, Some(12), "{key} keeps the other lines");
+        }
+        assert_eq!(parse("insert_spaces=maybe").insert_spaces, None);
     }
 }
