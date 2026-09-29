@@ -177,28 +177,16 @@ in a new window.
 
 <img src="docs/images/split-editors.png" alt="Four editor groups in a 2x2 grid showing Rust, Markdown, Python and JSON" width="800">
 
-Put files side by side, or in any grid of rows and columns. **Ctrl+\\** splits the editor to the
-right and **Ctrl+Shift+\\** splits it down, opening the current file in the new group. Each group has
-its own tabs, find bar and preview; drag the sash between groups to resize them.
-
-- Drag a tab to another group's tab strip to move it there, or onto the edge of an editor to split
-  it. An overlay shows where the tab will land.
-- **Ctrl+1** … **Ctrl+8** focus a group and **Ctrl+9** the last one; **Ctrl+Alt+Right** and
-  **Ctrl+Alt+Left** move the current tab to the next or previous group.
-- The same file can be open in two groups: they share its text and undo history, and each keeps
-  its own caret and scroll position.
-- Files dropped from Explorer open in the group under the pointer, and the whole layout comes back
-  with your session.
+Put files side by side in any grid of rows and columns. `Ctrl+\` splits right, `Ctrl+Shift+\`
+splits down, and dragging a tab onto another group or an editor's edge moves or splits it. Each group
+has its own tabs, and the layout comes back with your session.
 
 ### Images next to your notes
 
 <img src="docs/images/image-preview.png" alt="An SVG open as text with its rendered preview beside it, and images in the notebook tree" width="800">
 
-PNG, JPEG, GIF (first frame), BMP, ICO, TIFF, and WebP/HEIC/AVIF when Windows has the codec, open
-in an image tab: it fits the window, Ctrl + wheel or Ctrl +/− zooms, Ctrl+0 fits again,
-double-click toggles 100%, and drag or the arrow keys pan. SVG files open as text; press
-**Ctrl+Shift+V** to see them rendered beside or instead of the source. The notebook lists images
-next to notes; Search reads notes only.
+PNG, JPEG, GIF, WebP and more open in an image tab you can zoom and pan. SVGs open as text, with
+**Ctrl+Shift+V** showing them rendered beside the source. The notebook lists images next to your notes.
 
 ### A command palette for everything
 
