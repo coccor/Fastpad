@@ -127,6 +127,8 @@ pub enum CommandId {
     ToggleInsertSpaces = 232,
     ToggleShowWhitespace = 233,
     ToggleHighlightCurrentLine = 234,
+    OpenSettings = 235,
+    EditSettingsFile = 236,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -241,6 +243,8 @@ impl CommandId {
                 | Self::ToggleInsertSpaces
                 | Self::ToggleShowWhitespace
                 | Self::ToggleHighlightCurrentLine
+                | Self::OpenSettings
+                | Self::EditSettingsFile
         )
     }
 
@@ -372,7 +376,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 124] = [
+        const COMMANDS: [CommandId; 126] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -497,6 +501,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::ToggleInsertSpaces,
             CommandId::ToggleShowWhitespace,
             CommandId::ToggleHighlightCurrentLine,
+            CommandId::OpenSettings,
+            CommandId::EditSettingsFile,
         ];
         COMMANDS
             .into_iter()
@@ -537,6 +543,22 @@ mod tests {
             (232, CommandId::ToggleInsertSpaces),
             (233, CommandId::ToggleShowWhitespace),
             (234, CommandId::ToggleHighlightCurrentLine),
+        ] {
+            assert_eq!(command as u16, value);
+            assert_eq!(CommandId::try_from(value), Ok(command));
+            assert!(!command.needs_document(), "{command:?}");
+            assert!(!command.needs_text(), "{command:?}");
+            assert!(!command.is_sidebar(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn settings_commands_are_235_and_236_and_need_no_document() {
+        // Break caught: Ctrl+, renumbered onto another command, or Settings greyed out while no
+        // tab is open.
+        for (value, command) in [
+            (235, CommandId::OpenSettings),
+            (236, CommandId::EditSettingsFile),
         ] {
             assert_eq!(command as u16, value);
             assert_eq!(CommandId::try_from(value), Ok(command));

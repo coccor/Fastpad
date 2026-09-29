@@ -156,8 +156,9 @@ their rendered preview beside the source. The notebook lists images next to your
 <img src="docs/images/command-palette.png" alt="The command palette filtering theme commands" width="800">
 
 Open it and start typing. Switch theme, toggle word wrap or line numbers, change font size
-or tab width, all without leaving the keyboard. Every change is saved instantly. The
-**Settings** button at the bottom of the sidebar opens the palette with just the settings.
+or tab width, all without leaving the keyboard. Every change is saved instantly. Prefer to
+see everything at once? **Settings** (`Ctrl+,`, **File > Settings...** or the gear at the
+bottom of the sidebar) lists every setting, and changes apply as you make them.
 
 ### Themes that match your desk
 
@@ -210,6 +211,7 @@ before closing again.
 | Replace in the selected result | `Ctrl+Shift+1` | | Go to note | `Ctrl+P` |
 | Close tab | `Ctrl+W` or middle-click | | Split editor right / down | `Ctrl+\` / `Ctrl+Shift+\` |
 | Focus editor group 1–8 / last | `Ctrl+1` … `Ctrl+8` / `Ctrl+9` | | Move tab to next / previous group | `Ctrl+Alt+Right` / `Ctrl+Alt+Left` |
+| Settings | `Ctrl+,` | | | |
 
 ## Make it yours
 

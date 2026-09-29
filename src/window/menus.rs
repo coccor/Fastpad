@@ -10,7 +10,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_F3, VK_F6, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2,
     VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_5,
-    VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
+    VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CallNextHookEx, CheckMenuItem, CreateAcceleratorTableW, CreateMenu,
@@ -29,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 65] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 66] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -90,6 +90,7 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 65] {
         virtual_key(FCONTROL, VK_NUMPAD0, CommandId::ZoomReset),
         accelerator(FCONTROL, b'P', CommandId::QuickOpen),
         accelerator(FCONTROL | FSHIFT, b'P', CommandId::CommandPalette),
+        virtual_key(FCONTROL, VK_OEM_COMMA, CommandId::OpenSettings),
         accelerator(FCONTROL | FSHIFT, b'V', CommandId::MarkdownPreviewCycle),
         accelerator(FCONTROL, b'B', CommandId::ToggleSidebar),
         accelerator(FCONTROL | FSHIFT, b'E', CommandId::ShowNotebookView),
@@ -191,6 +192,7 @@ impl MenuBar {
                 MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
                 MenuEntry::command("Close &group", CommandId::CloseGroup),
                 MenuEntry::Separator,
+                MenuEntry::command("Se&ttings...	Ctrl+,", CommandId::OpenSettings),
                 MenuEntry::command(
                     "&Restore session on startup",
                     CommandId::ToggleRestoreSession,
@@ -721,7 +723,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 65);
+        assert_eq!(specs.len(), 66);
     }
 
     #[test]
@@ -893,6 +895,23 @@ mod tests {
             )
         };
         assert_ne!(state, u32::MAX, "Help: About FastPad");
+    }
+
+    #[test]
+    fn the_file_menu_opens_settings() {
+        // Break caught: Settings missing from the menus, so the only mouse route is the gear,
+        // which is hidden with notes mode off.
+        use super::MenuBar;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND};
+        let bar = MenuBar::create().unwrap();
+        let state = unsafe {
+            GetMenuState(
+                bar.dropdown(0),
+                CommandId::OpenSettings as u32,
+                MF_BYCOMMAND,
+            )
+        };
+        assert_ne!(state, u32::MAX, "File: Settings");
     }
 
     #[test]

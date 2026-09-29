@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 102] = [
+pub(crate) const ENTRIES: [PaletteEntry; 104] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -192,34 +192,9 @@ pub(crate) const ENTRIES: [PaletteEntry; 102] = [
         CommandId::ToggleHighlightCurrentLine,
     ),
     entry("File: Exit", CommandId::Exit),
+    entry("Preferences: Open Settings", CommandId::OpenSettings),
+    entry("Preferences: Edit fastpad.ini", CommandId::EditSettingsFile),
     entry("Help: About FastPad", CommandId::About),
-];
-
-/// What the activity bar's Settings button lists: every command that changes a `fastpad.ini`
-/// setting or the open notebook's autosave switch. The palette shows them in catalog order.
-pub(crate) const SETTINGS_COMMANDS: &[CommandId] = &[
-    CommandId::ToggleRestoreSession,
-    CommandId::ToggleNotesMode,
-    CommandId::ToggleFolderAutosave,
-    CommandId::ToggleWordWrap,
-    CommandId::ToggleLineNumbers,
-    CommandId::FontSizeIncrease,
-    CommandId::FontSizeDecrease,
-    CommandId::FontSizeReset,
-    CommandId::ThemeSystem,
-    CommandId::ThemeLight,
-    CommandId::ThemeDark,
-    CommandId::ThemeCatppuccin,
-    CommandId::ThemeCatppuccinLatte,
-    CommandId::ThemeCatppuccinFrappe,
-    CommandId::ThemeCatppuccinMacchiato,
-    CommandId::ThemeCatppuccinMocha,
-    CommandId::FileIconsMaterial,
-    CommandId::FileIconsMinimal,
-    CommandId::FileIconsSolid,
-    CommandId::TabWidth2,
-    CommandId::TabWidth4,
-    CommandId::TabWidth8,
 ];
 
 /// How well `query` matches `label`, lower is better; `None` when it does not match at all.
@@ -417,7 +392,7 @@ pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
         }
     }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_F1, VK_F24, VK_LEFT, VK_OEM_5, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT,
+        VK_F1, VK_F24, VK_LEFT, VK_OEM_5, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT,
     };
     match spec.key {
         VK_TAB => text.push_str("Tab"),
@@ -426,6 +401,7 @@ pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
         VK_RIGHT => text.push_str("Right"),
         VK_OEM_PLUS => text.push('+'),
         VK_OEM_MINUS => text.push('-'),
+        VK_OEM_COMMA => text.push(','),
         key @ VK_F1..=VK_F24 => text.push_str(&format!("F{}", key - VK_F1 + 1)),
         key => text.push(char::from_u32(u32::from(key))?),
     }
@@ -514,8 +490,6 @@ pub(crate) struct CommandPalette {
     picker_rows: Vec<PickerRow>,
     /// The row `fill_list` selects in picker mode; `None` selects nothing.
     picker_selected: Option<usize>,
-    /// `Some` while command mode lists only these commands (the Settings button).
-    subset: Option<&'static [CommandId]>,
     visible: bool,
     colors: Palette,
     layout: Option<PanelLayout>,
@@ -568,7 +542,6 @@ impl CommandPalette {
             picker: None,
             picker_rows: Vec::new(),
             picker_selected: None,
-            subset: None,
             visible: false,
             colors,
             layout: None,
@@ -637,7 +610,6 @@ impl CommandPalette {
         self.picker = None;
         self.picker_rows = Vec::new();
         self.picker_selected = None;
-        self.subset = None;
         std::mem::take(&mut self.visible)
     }
 
@@ -682,15 +654,6 @@ impl CommandPalette {
 
     pub(crate) fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
-    }
-
-    /// Limits command mode to `subset`, or lifts the limit with `None`.
-    pub(crate) fn set_subset(&mut self, subset: Option<&'static [CommandId]>) {
-        self.subset = subset;
-    }
-
-    pub(crate) fn subset(&self) -> Option<&'static [CommandId]> {
-        self.subset
     }
 
     /// Records the picker rows to list and the one to select; `fill_list` then puts them in the
@@ -1465,8 +1428,8 @@ unsafe extern "system" fn palette_control_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, SETTINGS_COMMANDS, filter_entries,
-        hit_runs, match_rank, picker_row_label, picker_rows, shortcut_text,
+        ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, filter_entries, hit_runs, match_rank,
+        picker_row_label, picker_rows, shortcut_text,
     };
     use crate::window::commands::CommandId;
 
@@ -1510,24 +1473,15 @@ mod tests {
     }
 
     #[test]
-    fn every_settings_command_has_exactly_one_palette_entry() {
-        // Break caught: a Settings button entry with no palette row, which the filtered palette
-        // could never show, or a settings list that lets non-settings commands through.
-        for command in SETTINGS_COMMANDS {
-            let listed = ENTRIES
-                .iter()
-                .filter(|entry| entry.command == *command)
-                .count();
-            assert_eq!(listed, 1, "{command:?}");
-        }
-        let listed = filter_entries("", |command| SETTINGS_COMMANDS.contains(&command));
-        assert_eq!(listed.len(), SETTINGS_COMMANDS.len());
-        assert!(listed.iter().all(|entry| entry.command != CommandId::Save));
-        assert!(
-            listed
-                .iter()
-                .any(|entry| entry.command == CommandId::ThemeCatppuccinMocha)
+    fn settings_is_listed_under_preferences_with_ctrl_comma() {
+        // Break caught: the dialog reachable only by mouse, or its row showing no shortcut.
+        assert_eq!(labels("open settings")[0], "Preferences: Open Settings");
+        assert_eq!(
+            shortcut_text(CommandId::OpenSettings).as_deref(),
+            Some("Ctrl+,")
         );
+        assert_eq!(labels("fastpad.ini")[0], "Preferences: Edit fastpad.ini");
+        assert_eq!(shortcut_text(CommandId::EditSettingsFile), None);
     }
 
     fn labels(query: &str) -> Vec<&'static str> {

@@ -2096,7 +2096,6 @@ fn show_about(hwnd: HWND) {
 
 /// The Settings dialog: File → Settings…, Ctrl+, and the activity bar's gear (settings dialog
 /// spec §4.3).
-#[allow(dead_code)] // Temporary: Task 8 wires the command, menu and gear button.
 pub(crate) fn show_settings(hwnd: HWND) {
     let outcome =
         crate::window::settings_dialog::show(hwnd, current_palette(hwnd), link_color(hwnd));
@@ -2107,7 +2106,6 @@ pub(crate) fn show_settings(hwnd: HWND) {
 
 /// Preferences: Edit fastpad.ini. Creates the file (empty) when it doesn't exist yet, then opens
 /// it in a tab through the normal open path (settings dialog spec §3.6).
-#[allow(dead_code)] // Temporary: Task 8 wires the command, menu and gear button.
 pub(crate) fn edit_settings_file(hwnd: HWND) {
     let result = settings_file_for_editing().and_then(|path| {
         if let Some(parent) = path.parent() {
@@ -2140,15 +2138,6 @@ fn settings_file_for_editing() -> Result<std::path::PathBuf> {
 }
 
 pub(crate) fn open_command_palette(hwnd: HWND) {
-    show_command_palette(hwnd, None);
-}
-
-/// The activity bar's Settings button: the palette listing only `SETTINGS_COMMANDS`.
-pub(crate) fn open_settings_palette(hwnd: HWND) {
-    show_command_palette(hwnd, Some(command_palette::SETTINGS_COMMANDS));
-}
-
-fn show_command_palette(hwnd: HWND, subset: Option<&'static [CommandId]>) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
@@ -2163,14 +2152,12 @@ fn show_command_palette(hwnd: HWND, subset: Option<&'static [CommandId]>) {
         let newly_shown = palette.mark_shown(colors);
         // Reopening the palette normally always shows commands, even right after a picker.
         palette.set_picker(None);
-        palette.set_subset(subset);
         Some(newly_shown)
     });
     let Some(newly_shown) = newly_shown else {
         return;
     };
-    // A query typed for the full list would hide most settings, so Settings always starts empty.
-    if newly_shown || subset.is_some() {
+    if newly_shown {
         // Clearing the field sends EN_CHANGE, which lists every available command.
         with_command_palette(hwnd, CommandPalette::clear_query);
     }
@@ -2253,7 +2240,6 @@ pub(crate) fn open_quick_open(hwnd: HWND) {
     let shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let palette = unsafe { app.as_mut() }.command_palette.as_mut()?;
         palette.mark_shown(colors);
-        palette.set_subset(None);
         palette.set_picker(Some(command_palette::Picker {
             kind: command_palette::PickerKind::QuickOpen,
             items: Vec::new(),
@@ -2545,10 +2531,8 @@ fn refilter_command_palette(hwnd: HWND) {
         // naming spec §3.1).
         let notebook = crate::window::library_host::folder(hwnd).is_some();
         let groups = unsafe { app_ptr(hwnd) }.map_or(1, |app| unsafe { app.as_ref() }.groups.len());
-        let subset = with_command_palette(hwnd, CommandPalette::subset).flatten();
         let entries = command_palette::filter_entries(&query, |command| {
-            subset.is_none_or(|subset| subset.contains(&command))
-                && (has_tabs || !command.needs_document())
+            (has_tabs || !command.needs_document())
                 && (!image || !command.needs_text())
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
@@ -3566,6 +3550,8 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::FindPrevious => find_again(hwnd, true),
         CommandId::CommandPalette => open_command_palette(hwnd),
         CommandId::About => show_about(hwnd),
+        CommandId::OpenSettings => show_settings(hwnd),
+        CommandId::EditSettingsFile => edit_settings_file(hwnd),
         CommandId::QuickOpen => open_quick_open(hwnd),
         CommandId::NoteNewFolder => crate::window::inline_name::new_folder(hwnd, None),
         CommandId::NoteNew => crate::window::inline_name::new_note(hwnd, None),
@@ -11068,14 +11054,6 @@ three"
             std::fs::read_to_string(&ini).unwrap(),
             "# kept\r\nfile_icons=material\r\n"
         );
-        assert!(
-            crate::window::command_palette::SETTINGS_COMMANDS
-                .contains(&CommandId::FileIconsMaterial)
-                && crate::window::command_palette::SETTINGS_COMMANDS
-                    .contains(&CommandId::FileIconsMinimal)
-                && crate::window::command_palette::SETTINGS_COMMANDS
-                    .contains(&CommandId::FileIconsSolid)
-        );
         assert!(!CommandId::FileIconsSolid.needs_document());
         assert!(!CommandId::FileIconsMaterial.needs_document());
     }
@@ -12611,15 +12589,23 @@ three"
         assert_eq!(view(), SidebarView::Search);
         assert_eq!(saved(), "# kept\r\nsidebar_view=search\r\n");
 
-        // Settings opens the command palette listing only the settings commands.
+        // Settings opens the Settings dialog and leaves the panel alone.
+        let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = shown.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| {
+            seen.set(true);
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    dialog,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                    usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE),
+                    0,
+                )
+            };
+        });
         let (x, y) = button_center(window.hwnd, ActivityButton::Settings);
         click(bar, x, y);
-        let palette = app_mut(window.hwnd).command_palette.as_ref().unwrap();
-        assert!(palette.is_visible());
-        assert_eq!(
-            palette.subset(),
-            Some(crate::window::command_palette::SETTINGS_COMMANDS)
-        );
+        assert!(shown.get(), "the gear opened Settings");
         assert_eq!(view(), SidebarView::Search);
         super::save_settings_to(None);
     }
@@ -20247,30 +20233,29 @@ three"
     }
 
     #[test]
-    fn the_settings_button_lists_only_settings_and_the_next_palette_lists_everything() {
-        // Break caught: Settings showing the full command list, or its filter sticking to the
-        // next Ctrl+Shift+P.
+    fn ctrl_comma_and_edit_settings_file_run_from_the_command_table() {
+        // Break caught: OpenSettings or EditSettingsFile falling through to `App::execute`,
+        // which ignores them.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-commands");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
         let window = ProductionWindow::new(make_app());
-        super::open_settings_palette(window.hwnd);
-        let shown = with_command_palette(window.hwnd, |palette| {
-            palette
-                .shown()
-                .iter()
-                .map(|entry| entry.command)
-                .collect::<Vec<_>>()
-        })
-        .unwrap();
-        assert!(shown.contains(&CommandId::ThemeDark));
-        assert!(
-            shown
-                .iter()
-                .all(|command| crate::window::command_palette::SETTINGS_COMMANDS.contains(command))
-        );
-        super::close_command_palette(window.hwnd, false);
+        let _editor = install_test_editor(&window);
+        let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = shown.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| {
+            seen.set(true);
+            unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        });
+        execute_command(window.hwnd, CommandId::OpenSettings);
+        assert!(shown.get());
 
-        execute_command(window.hwnd, CommandId::CommandPalette);
-        let shown = with_command_palette(window.hwnd, |palette| palette.shown().len()).unwrap();
-        assert!(shown > crate::window::command_palette::SETTINGS_COMMANDS.len());
+        execute_command(window.hwnd, CommandId::EditSettingsFile);
+        assert!(app_mut(window.hwnd).tabs.find_path(&ini).is_some());
+        super::save_settings_to(None);
     }
 
     #[test]
