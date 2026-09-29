@@ -215,7 +215,7 @@ before closing again.
 
 ## Make it yours
 
-Everything in the command palette is saved to `%LocalAppData%\FastPad\fastpad.ini`. You can also
+Everything in the command palette or Settings is saved to `%LocalAppData%\FastPad\fastpad.ini`. You can also
 edit it by hand: one `key=value` per line. A typo never blocks startup; FastPad points out the bad
 line in a notification and applies the rest.
 
@@ -226,6 +226,9 @@ line in a notification and applies the rest.
 | `tab_width` | 1–255 | `4` |
 | `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `insert_spaces` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `show_whitespace` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `highlight_current_line` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
@@ -233,7 +236,7 @@ line in a notification and applies the rest.
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
 | `file_icons` | `material`, `minimal` or `solid` | `material` |
 
-Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
+Hand edits keep your comments and other lines; the palette and Settings rewrite only the lines they change.
 
 ## Command line
 

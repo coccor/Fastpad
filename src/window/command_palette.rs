@@ -1500,7 +1500,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 99);
+        assert_eq!(ENTRIES.len(), 104);
     }
 
     #[test]
