@@ -112,6 +112,9 @@ pub struct Settings {
     pub show_whitespace: bool,
     /// Whether the caret's line gets the theme's caret-line background.
     pub highlight_current_line: bool,
+    /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
+    /// `None` opens it at its natural size. Saved when a resize drag ends.
+    pub settings_size: Option<(u16, u16)>,
     /// `key.<command-id>=` lines, id to value, as written: the keymap validates them when
     /// settings load (keyboard shortcuts spec §4).
     pub key_overrides: std::collections::BTreeMap<String, String>,
@@ -154,6 +157,9 @@ impl Settings {
         }
         if let Some(sidebar_width) = delta.sidebar_width {
             self.sidebar_width = sidebar_width;
+        }
+        if let Some(size) = delta.settings_size {
+            self.settings_size = Some(size);
         }
         if let Some(file_icons) = delta.file_icons {
             self.file_icons = file_icons;
@@ -202,6 +208,7 @@ pub struct SettingsDelta {
     pub notes_mode: Option<bool>,
     pub sidebar_view: Option<SidebarView>,
     pub sidebar_width: Option<u16>,
+    pub settings_size: Option<(u16, u16)>,
     pub file_icons: Option<FileIconSet>,
     pub open_editors_expanded: Option<bool>,
     pub insert_spaces: Option<bool>,
@@ -215,10 +222,12 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
-/// `sidebar_view`, `sidebar_width`, `file_icons`, `open_editors_expanded`, `insert_spaces`,
-/// `show_whitespace` and `highlight_current_line` are recognized.
+/// `sidebar_view`, `sidebar_width`, `settings_size`, `file_icons`, `open_editors_expanded`,
+/// `insert_spaces`, `show_whitespace` and `highlight_current_line` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
-/// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `file_icons` is
+/// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
+/// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
+/// `file_icons` is
 /// `material` or `minimal` (any case). `key.<command-id>` lines are collected as text into `key_overrides` for the keymap to validate. Every line is handled independently: a line with an
 /// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
 /// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
@@ -242,6 +251,14 @@ pub fn parse(source: &str) -> SettingsDelta {
         apply_line(&mut delta, line_number, trim_ascii(key), trim_ascii(value));
     }
     delta
+}
+
+/// `<width>x<height>`, both above zero, as `settings_size` writes it.
+fn parse_size(value: &str) -> Option<(u16, u16)> {
+    let (width, height) = value.split_once(['x', 'X'])?;
+    let width = trim_ascii(width).parse::<u16>().ok()?;
+    let height = trim_ascii(height).parse::<u16>().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &str) {
@@ -301,6 +318,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         "sidebar_width" => match value.parse::<u16>() {
             Ok(width) => delta.sidebar_width = Some(clamp_sidebar_width(width)),
             Err(_) => warn(delta, line_number, key, value),
+        },
+        "settings_size" => match parse_size(value) {
+            Some(size) => delta.settings_size = Some(size),
+            None => warn(delta, line_number, key, value),
         },
         "file_icons" => match FileIconSet::parse(value) {
             Some(set) => delta.file_icons = Some(set),
@@ -850,6 +871,37 @@ mod tests {
         assert_eq!(settings.file_icons, FileIconSet::Material);
         settings.apply_delta(&parse("file_icons=minimal"));
         assert_eq!(settings.file_icons, FileIconSet::Minimal);
+    }
+
+    #[test]
+    fn settings_size_reads_width_by_height_and_warns_about_anything_else() {
+        // Break caught: the Settings dialog forgetting the size it was dragged to, or a
+        // hand-edited size of 0x0 or nonsense opening it with no room for anything.
+        assert_eq!(
+            parse("settings_size=900x700").settings_size,
+            Some((900, 700))
+        );
+        assert_eq!(
+            parse("settings_size = 900 X 700").settings_size,
+            Some((900, 700))
+        );
+        for bad in [
+            "0x700",
+            "900x0",
+            "900",
+            "wide",
+            "900x700x3",
+            "-5x700",
+            "70000x700",
+        ] {
+            let delta = parse(&format!("settings_size={bad}"));
+            assert_eq!(delta.settings_size, None, "{bad}");
+            assert_eq!(delta.warnings.len(), 1, "{bad}");
+        }
+        let mut settings = default_settings();
+        assert_eq!(settings.settings_size, None);
+        settings.apply_delta(&parse("settings_size=900x700"));
+        assert_eq!(settings.settings_size, Some((900, 700)));
     }
 
     #[test]

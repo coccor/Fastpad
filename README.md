@@ -234,6 +234,7 @@ line in a notification and applies the rest.
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
+| `settings_size` | `<width>x<height>` (pixels at 100% scaling), saved when you resize Settings | none: its natural size |
 | `file_icons` | `material`, `minimal` or `solid` | `material` |
 
 Hand edits keep your comments and other lines; the palette and Settings rewrite only the lines they change.

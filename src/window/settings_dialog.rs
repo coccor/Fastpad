@@ -674,12 +674,15 @@ fn create(
     } else {
         (i32::MAX, i32::MAX)
     };
-    let layout = Layout::calculate(
-        dpi,
-        max_width,
-        max_height,
-        measure(dialog, link_font, EDIT_INI_LABEL),
-    );
+    let view = super::main_window::settings_view(owner);
+    let link_width = measure(dialog, link_font, EDIT_INI_LABEL);
+    let layout = match view.settings.settings_size {
+        Some(saved) => {
+            let (width, height) = opening_size(saved, dpi, max_width, max_height);
+            Layout::sized(dpi, width, height, link_width)
+        }
+        None => Layout::calculate(dpi, max_width, max_height, link_width),
+    };
     // Built here, as the dialog opens: nothing of the shortcuts page runs before.
     let page_layout = super::shortcuts_page::PageLayout::calculate(layout.body, dpi);
     let mut shortcuts = super::shortcuts_model::ShortcutsModel::new(
@@ -687,7 +690,6 @@ fn create(
         page_layout.visible_rows(),
     );
     shortcuts.lines = super::main_window::key_line_commands(owner);
-    let view = super::main_window::settings_view(owner);
     let fonts = crate::platform::fonts::dropdown_names(
         crate::platform::fonts::installed_font_families(),
         &view.settings.font_face,
@@ -763,6 +765,48 @@ fn create(
         DwmExtendFrameIntoClientArea(dialog, &margins);
     }
     Some(dialog)
+}
+
+/// The size, in pixels at `dpi`, to open at for a `saved` size in 96-DPI pixels: no smaller
+/// than the minimum and no larger than the `max_width` by `max_height` work area.
+pub(crate) fn opening_size(
+    saved: (u16, u16),
+    dpi: u32,
+    max_width: i32,
+    max_height: i32,
+) -> (i32, i32) {
+    let (min_width, min_height) = Layout::min_size(dpi);
+    let fit = |value: u16, min: i32, max: i32| scale(i32::from(value), dpi).max(min).min(max);
+    (
+        fit(saved.0, min_width, max_width),
+        fit(saved.1, min_height, max_height),
+    )
+}
+
+/// `layout`'s size in 96-DPI pixels, as `settings_size` saves it.
+pub(crate) fn saved_size(layout: &Layout) -> (u16, u16) {
+    let unscale = |value: i32| {
+        let dpi = layout.dpi.max(1) as i32;
+        u16::try_from((value * 96 + dpi / 2) / dpi).unwrap_or(u16::MAX)
+    };
+    (unscale(layout.width), unscale(layout.height))
+}
+
+/// Saves the size the user dragged the dialog to, unless it is maximized (that is no size to
+/// reopen at) or the drag only moved it.
+fn save_size(hwnd: HWND) {
+    if unsafe { IsZoomed(hwnd) } != 0 {
+        return;
+    }
+    let Some(size) = state(hwnd).map(|dialog| saved_size(&dialog.layout)) else {
+        return;
+    };
+    super::main_window::change_setting(owner(hwnd), |settings| {
+        (settings.settings_size != Some(size)).then(|| {
+            settings.settings_size = Some(size);
+            ("settings_size", format!("{}x{}", size.0, size.1))
+        })
+    });
 }
 
 /// Where the search EDIT sits in the page's search box.
@@ -1852,6 +1896,10 @@ unsafe extern "system" fn dialog_proc(
                 HTCLIENT as LRESULT
             }
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE => {
+            save_size(hwnd);
+            0
+        }
         WM_SIZE => {
             let (width, height) = lparam_point(lparam);
             if width > 0 && height > 0 {
@@ -1873,6 +1921,10 @@ unsafe extern "system" fn dialog_proc(
             };
             0
         }
+        // Over the sizing edges, the sizing cursors DefWindowProcW picks from the hit test.
+        WM_SETCURSOR if (lparam & 0xffff) as u32 != HTCLIENT => unsafe {
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        },
         WM_SETCURSOR => {
             let mut point = POINT::default();
             unsafe {
@@ -2704,6 +2756,21 @@ mod tests {
         let edges = |rect: RECT| (rect.left, rect.top, rect.right, rect.bottom);
         assert_eq!(edges(again.body), edges(opened.body));
         assert_eq!(edges(again.close), edges(opened.close));
+    }
+
+    #[test]
+    fn a_saved_size_reopens_scaled_and_fitted_to_the_screen() {
+        // Break caught: Settings reopening at its default size after being sized, at the wrong
+        // size on a scaled monitor, or larger than the screen or smaller than usable when
+        // fastpad.ini says so.
+        assert_eq!(opening_size((900, 700), 96, 1920, 1040), (900, 700));
+        assert_eq!(opening_size((900, 700), 144, 1920, 1040), (1350, 1040));
+        assert_eq!(opening_size((5000, 5000), 96, 1920, 1040), (1920, 1040));
+        assert_eq!(opening_size((10, 10), 96, 1920, 1040), (600, 360));
+        // A work area under the minimum wins.
+        assert_eq!(opening_size((900, 700), 96, 450, 300), (450, 300));
+        let layout = Layout::sized(144, 1350, 1050, 90);
+        assert_eq!(saved_size(&layout), (900, 700));
     }
 
     #[test]

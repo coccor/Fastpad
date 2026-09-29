@@ -4003,11 +4003,12 @@ pub(crate) fn change_setting(
     };
     let theme_changed = unsafe { app_ptr(hwnd) }
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
-    // The sidebar's view, width and icon set change only the sidebar, which their callers redo;
-    // the editor and the Markdown preview are not restyled for them.
+    // The sidebar's view, width and icon set change only the sidebar, which their callers redo,
+    // and the Settings dialog's size only that dialog; the editor and the Markdown preview are
+    // not restyled for them.
     let sidebar_only = matches!(
         key,
-        "sidebar_view" | "sidebar_width" | "file_icons" | "open_editors_expanded"
+        "sidebar_view" | "sidebar_width" | "file_icons" | "open_editors_expanded" | "settings_size"
     );
     if theme_changed {
         apply_theme(hwnd);
@@ -20426,6 +20427,79 @@ three"
         });
         super::show_keyboard_shortcuts(window.hwnd);
         assert_eq!(*tops.borrow(), [Some(0), Some(3), Some(0)]);
+    }
+
+    #[test]
+    fn settings_remembers_the_size_it_was_dragged_to_and_shows_sizing_cursors() {
+        // Break caught: Settings reopening at its default size after the user sized it, a move
+        // (no resize) rewriting fastpad.ini, or the arrow cursor over the edges hiding that they
+        // size the dialog.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetCursor, GetWindowRect, HTRIGHT, IDC_SIZEWE, LoadCursorW, PostMessageW, SWP_NOMOVE,
+            SWP_NOZORDER, SendMessageW, SetWindowPos, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEMOVE,
+            WM_SETCURSOR,
+        };
+        let scratch = RecoveryScratch::new("settings-size");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let sizing_cursor = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = sizing_cursor.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            SendMessageW(
+                dialog,
+                WM_SETCURSOR,
+                dialog as usize,
+                ((WM_MOUSEMOVE as isize) << 16) | HTRIGHT as isize,
+            );
+            seen.set(GetCursor() == LoadCursorW(std::ptr::null_mut(), IDC_SIZEWE));
+            // A drag that ends where it began only moved it: nothing is written.
+            SendMessageW(dialog, WM_EXITSIZEMOVE, 0, 0);
+            SetWindowPos(
+                dialog,
+                std::ptr::null_mut(),
+                0,
+                0,
+                700,
+                500,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+            SendMessageW(dialog, WM_EXITSIZEMOVE, 0, 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        let saved = || std::fs::read_to_string(&ini).unwrap();
+        let before = std::cell::Cell::new(String::new());
+        super::show_settings(window.hwnd);
+        before.set(saved());
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+        let size = std::rc::Rc::new(std::cell::Cell::new((0, 0)));
+        let reopened = size.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let mut rect = RECT::default();
+            GetWindowRect(dialog, &mut rect);
+            reopened.set((rect.right - rect.left, rect.bottom - rect.top));
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_settings(window.hwnd);
+        super::save_settings_to(None);
+        assert!(sizing_cursor.get(), "the edge shows the sizing cursor");
+        let expected = |pixels: i32| (pixels * 96 + dpi as i32 / 2) / dpi as i32;
+        assert_eq!(
+            before.take(),
+            format!(
+                "# kept\r\nsettings_size={}x{}\r\n",
+                expected(700),
+                expected(500)
+            )
+        );
+        assert_eq!(
+            app_mut(window.hwnd).settings.settings_size,
+            Some((expected(700) as u16, expected(500) as u16))
+        );
+        assert_eq!(size.get(), (700, 500), "reopens at the saved size");
     }
 
     #[test]
