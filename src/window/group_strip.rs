@@ -195,6 +195,23 @@ impl StripLayout {
         Rect::new(0, 0, self.tabs.right, self.height)
     }
 
+    /// The insertion point (0 to the tab count) nearest strip `x`: the boundary between two tabs
+    /// the point is closest to (split editors spec §6.1).
+    pub fn insertion_index(&self, x: i32) -> usize {
+        if self.tab_width == 0 {
+            return 0;
+        }
+        let count = self.tab_rects.len() as i32;
+        (x + self.scroll + self.tab_width / 2)
+            .div_euclid(self.tab_width)
+            .clamp(0, count) as usize
+    }
+
+    /// Where insertion point `index`'s bar is drawn, kept inside the tab viewport.
+    pub fn insertion_x(&self, index: usize) -> i32 {
+        (index as i32 * self.tab_width - self.scroll).clamp(self.tabs.left, self.tabs.right)
+    }
+
     /// The scroll offset that brings the whole of tab `index` into the viewport.
     pub fn scroll_to_reveal(&self, index: usize) -> i32 {
         let left = index as i32 * self.tab_width;
@@ -547,5 +564,35 @@ mod tests {
             super::tab_accent(false, 2, &palette),
             Some(palette.muted_foreground)
         );
+    }
+
+    #[test]
+    fn the_insertion_point_is_the_nearest_tab_boundary() {
+        // Break caught: a drop on the right half of a tab landing before it.
+        let layout = StripLayout::calculate(1200, 96, 3, 0);
+        let width = layout.tab(0).unwrap().right;
+        assert_eq!(layout.insertion_index(-5), 0);
+        assert_eq!(layout.insertion_index(width / 2 - 1), 0);
+        assert_eq!(layout.insertion_index(width / 2 + 1), 1);
+        assert_eq!(layout.insertion_index(10_000), 3);
+        assert_eq!(layout.insertion_x(0), 0);
+        assert_eq!(layout.insertion_x(1), width);
+        assert_eq!(
+            StripLayout::calculate(1200, 96, 0, 0).insertion_index(300),
+            0
+        );
+    }
+
+    #[test]
+    fn the_insertion_point_follows_the_scroll_and_its_bar_stays_in_view() {
+        // Break caught: insertion points computed as if the strip were not scrolled.
+        let layout = StripLayout::calculate(300, 96, 10, 100);
+        let width = layout.tab(1).unwrap().right - layout.tab(1).unwrap().left;
+        assert_eq!(
+            layout.insertion_index(0),
+            ((100 + width / 2) / width) as usize
+        );
+        assert_eq!(layout.insertion_x(0), 0, "clamped to the viewport");
+        assert_eq!(layout.insertion_x(10), layout.tabs.right);
     }
 }
