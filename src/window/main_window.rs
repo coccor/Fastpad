@@ -26317,10 +26317,12 @@ three"
     #[test]
     fn settings_opens_an_owned_modal_dialog_that_escape_closes() {
         // Break caught: a dialog that can hide behind the main window, leaves it disabled after
-        // closing, or never ends its modal scope.
+        // closing, or never ends its modal scope; or one with no native frame (no DWM shadow)
+        // or a visible one.
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GW_OWNER, GetWindow, PostMessageW, WM_KEYDOWN,
+            GW_OWNER, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
+            HTCAPTION, HTCLIENT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST, WS_CAPTION,
         };
         let window = ProductionWindow::new(make_app());
         let owner = window.hwnd;
@@ -26331,14 +26333,43 @@ three"
             let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
             let modal = crate::window::modal::modal_active(owner)
                 && crate::window::settings_dialog::open_dialog(owner) == Some(dialog);
-            seen.set(Some((dialog, owned, owner_disabled, modal)));
+            // A hidden native frame: WS_CAPTION earns the DWM shadow, WM_NCCALCSIZE leaves no
+            // visible frame, so the client is the whole window.
+            let style = unsafe { GetWindowLongW(dialog, GWL_STYLE) } as u32;
+            let (mut client, mut frame) = (RECT::default(), RECT::default());
+            unsafe {
+                GetClientRect(dialog, &mut client);
+                GetWindowRect(dialog, &mut frame);
+            }
+            let framed = style & WS_CAPTION == WS_CAPTION
+                && client.right - client.left == frame.right - frame.left
+                && client.bottom - client.top == frame.bottom - frame.top
+                && client.right > 0;
+            // The title row still drags the dialog; its × does not.
+            let hit = |x: i32, y: i32| unsafe {
+                SendMessageW(
+                    dialog,
+                    WM_NCHITTEST,
+                    0,
+                    ((u32::from(y as u16) << 16) | u32::from(x as u16)) as LPARAM,
+                )
+            };
+            let framed = framed
+                && hit(frame.left + 30, frame.top + 10) == HTCAPTION as LRESULT
+                && hit(frame.right - 5, frame.top + 10) == HTCLIENT as LRESULT;
+            seen.set(Some((dialog, owned, owner_disabled, modal, framed)));
             unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
         });
 
         super::show_settings(owner);
 
-        let (dialog, owned, owner_disabled, modal) = shown.get().expect("Settings was shown");
+        let (dialog, owned, owner_disabled, modal, framed) =
+            shown.get().expect("Settings was shown");
         assert!(owned && owner_disabled && modal);
+        assert!(
+            framed,
+            "WS_CAPTION, a client rect the size of the window, and the title row still a caption"
+        );
         assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
         assert_eq!(crate::window::settings_dialog::open_dialog(owner), None);
         assert_ne!(unsafe { IsWindowEnabled(owner) }, 0);

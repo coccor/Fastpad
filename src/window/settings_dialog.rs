@@ -21,7 +21,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
+    DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
@@ -32,6 +33,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
+use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
@@ -39,15 +41,15 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW,
-    GW_OWNER, GWLP_USERDATA, GetCursorPos, GetMessageTime, GetMessageW, GetSystemMetrics,
-    GetWindow, GetWindowLongPtrW, GetWindowRect, HCURSOR, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND,
-    IsWindow, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXDOUBLECLK,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, GW_OWNER,
+    GWLP_USERDATA, GetCursorPos, GetMessageTime, GetMessageW, GetSystemMetrics, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, HCURSOR, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND, IsWindow,
+    LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXDOUBLECLK,
     SM_CYDOUBLECLK, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WNDCLASSW,
-    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR,
+    WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const TITLE: &str = "Settings";
@@ -64,6 +66,8 @@ const GLYPH_CLOSE: &str = "\u{E8BB}";
 const WIDTH_AT_96_DPI: i32 = 520;
 const PADDING_AT_96_DPI: i32 = 20;
 const TITLE_HEIGHT_AT_96_DPI: i32 = 44;
+/// The title row's × is as wide as the main window's caption close button.
+const TITLE_CLOSE_WIDTH_AT_96_DPI: i32 = 46;
 const HEADING_HEIGHT_AT_96_DPI: i32 = 30;
 const ROW_HEIGHT_AT_96_DPI: i32 = 32;
 const CONTROL_HEIGHT_AT_96_DPI: i32 = 26;
@@ -135,14 +139,16 @@ impl Layout {
         let row_height = scale(ROW_HEIGHT_AT_96_DPI, dpi);
         let footer_height = scale(FOOTER_HEIGHT_AT_96_DPI, dpi);
 
+        // The × fills the title row's top-right corner, full height, like a caption button.
+        let title_close_left = width - scale(TITLE_CLOSE_WIDTH_AT_96_DPI, dpi);
         let title = RECT {
             left: padding,
             top: 0,
-            right: width - title_height,
+            right: title_close_left,
             bottom: title_height,
         };
         let title_close = RECT {
-            left: width - title_height,
+            left: title_close_left,
             top: 0,
             right: width,
             bottom: title_height,
@@ -472,7 +478,9 @@ fn create(
             WS_EX_TOOLWINDOW,
             class.as_ptr(),
             title.as_ptr(),
-            WS_POPUP | WS_CLIPCHILDREN,
+            // WS_CAPTION gives it a native frame, hidden by WM_NCCALCSIZE, so DWM draws the
+            // window shadow; no system menu and no sizing border.
+            WS_POPUP | WS_CAPTION | WS_CLIPCHILDREN,
             0,
             0,
             0,
@@ -541,7 +549,8 @@ fn create(
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
 
     // Centered over the owner, kept inside the work area, with rounded corners where Windows
-    // 11 draws them.
+    // 11 draws them and the DWM shadow of the hidden frame (a 1-px frame margin keeps DWM
+    // drawing it though the client covers the whole window).
     let mut left = frame.left + (frame.right - frame.left - layout.width) / 2;
     let mut top = frame.top + (frame.bottom - frame.top - layout.height) / 2;
     if work.bottom > work.top {
@@ -565,6 +574,13 @@ fn create(
             (&raw const corners).cast(),
             std::mem::size_of_val(&corners) as u32,
         );
+        let margins = MARGINS {
+            cxLeftWidth: 1,
+            cxRightWidth: 1,
+            cyTopHeight: 1,
+            cyBottomHeight: 1,
+        };
+        DwmExtendFrameIntoClientArea(dialog, &margins);
     }
     Some(dialog)
 }
@@ -586,8 +602,8 @@ fn register_class() -> Option<&'static [u16]> {
     static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let name = CLASS_NAME.get_or_init(|| wide_null("FastPadSettings"));
     let registered = *REGISTERED.get_or_init(|| {
+        // No CS_DROPSHADOW: the hidden native frame's DWM shadow replaces it.
         let class = WNDCLASSW {
-            style: CS_DROPSHADOW,
             lpfnWndProc: Some(dialog_proc),
             hInstance: unsafe { GetModuleHandleW(std::ptr::null()) },
             hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
@@ -1028,6 +1044,9 @@ unsafe extern "system" fn dialog_proc(
             }
             0
         }
+        // The native frame stays hidden: the client is the whole window. Both forms leave the
+        // proposed rect as it is.
+        WM_NCCALCSIZE => 0,
         // A press on the title row is a non-client click that starts the move loop without a
         // WM_LBUTTONDOWN or a deactivation: close the list here, as any click elsewhere does.
         WM_NCLBUTTONDOWN => {
@@ -1173,11 +1192,20 @@ fn paint_into(dc: HDC, client: RECT, dialog: &Dialog) {
     let layout = &dialog.layout;
     let view = &dialog.view;
     unsafe {
+        let inside = inset(client, 1);
         fill(dc, client, colors.muted_foreground);
-        fill(dc, inset(client, 1), colors.panel_background());
+        fill(dc, inside, colors.panel_background());
         SetBkMode(dc, TRANSPARENT as i32);
 
-        // Title row: the name and the × button.
+        // Title row: a strip-colored band inside the border with the name and the × button.
+        fill(
+            dc,
+            RECT {
+                bottom: layout.title.bottom,
+                ..inside
+            },
+            colors.strip_background,
+        );
         draw_text(
             dc,
             dialog.title_font,
@@ -1188,9 +1216,14 @@ fn paint_into(dc: HDC, client: RECT, dialog: &Dialog) {
         );
         let close_hot = dialog.hot == Some(Hit::TitleClose);
         if close_hot {
+            // Full height to the separator, flush against the border.
             fill(
                 dc,
-                inset(layout.title_close, 1),
+                RECT {
+                    top: inside.top,
+                    right: inside.right,
+                    ..layout.title_close
+                },
                 colors.close_hover_background,
             );
         }
@@ -1212,8 +1245,10 @@ fn paint_into(dc: HDC, client: RECT, dialog: &Dialog) {
             right: client.right - 1,
             bottom: top + 1,
         };
-        fill(dc, rule(layout.body.top - 1), colors.strip_background);
-        fill(dc, rule(layout.body.bottom), colors.strip_background);
+        // pressed_background, not strip_background: the rule must show against the strip-colored
+        // title row as well as the panel.
+        fill(dc, rule(layout.body.top - 1), colors.pressed_background);
+        fill(dc, rule(layout.body.bottom), colors.pressed_background);
 
         // The scrolling body, clipped to its area.
         let saved = SaveDC(dc);
@@ -1634,6 +1669,25 @@ mod tests {
         assert_eq!(double.width, normal.width * 2);
         assert_eq!(double.content_height, normal.content_height * 2);
         assert_eq!(double.rows[5].top, normal.rows[5].top * 2);
+        assert_eq!(
+            double.title_close.right - double.title_close.left,
+            (normal.title_close.right - normal.title_close.left) * 2
+        );
+    }
+
+    #[test]
+    fn the_title_close_button_fills_the_title_row_corner_like_the_caption_close() {
+        // Break caught: a × inset from the corner or shorter than the title row, unlike the
+        // main window's caption close button, or a title that runs under it.
+        let layout = Layout::calculate(96, 2000, 100);
+        let close = layout.title_close;
+        assert_eq!(
+            (close.left, close.top, close.right, close.bottom),
+            (520 - 46, 0, 520, 44)
+        );
+        assert_eq!(layout.title.bottom, close.bottom);
+        assert_eq!(layout.title.right, close.left);
+        assert_eq!(layout.body.top, close.bottom);
     }
 
     #[test]
