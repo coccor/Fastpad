@@ -1,4 +1,7 @@
-#![allow(dead_code, reason = "used by the settings dialog, added in the next tasks")]
+#![allow(
+    dead_code,
+    reason = "used by the settings dialog, added in the next tasks"
+)]
 
 //! The Settings dialog's rows and what each input does to them (settings dialog spec §3, §4.1).
 //! Pure: no window handles, so the dialog's behaviour is tested without a window.
@@ -256,7 +259,9 @@ impl SettingsView {
     }
 
     pub(crate) fn selected_segment(&self, row: Row) -> Option<usize> {
-        self.segments(row).iter().position(|segment| segment.selected)
+        self.segments(row)
+            .iter()
+            .position(|segment| segment.selected)
     }
 
     /// What picking segment `index` of `row` does. The custom tab width segment is already the
@@ -496,9 +501,7 @@ impl DialogModel {
                 Effect::Repaint
             }
             Key::Backspace => {
-                self.typed
-                    .get_or_insert_with(|| current.to_string())
-                    .pop();
+                self.typed.get_or_insert_with(|| current.to_string()).pop();
                 Effect::Repaint
             }
             Key::Enter => self.commit_typed(view),
@@ -580,8 +583,14 @@ mod tests {
             next_focus(Focus::Row(Row::RestoreSession), true, &closed),
             Focus::EditIni
         );
-        assert_eq!(next_focus(Focus::Close, true, &closed), Focus::Row(Row::Theme));
-        assert_eq!(next_focus(Focus::Row(Row::Theme), false, &closed), Focus::Close);
+        assert_eq!(
+            next_focus(Focus::Close, true, &closed),
+            Focus::Row(Row::Theme)
+        );
+        assert_eq!(
+            next_focus(Focus::Row(Row::Theme), false, &closed),
+            Focus::Close
+        );
         let open = SettingsView {
             notebook_autosave: Some(true),
             ..view()
@@ -602,7 +611,10 @@ mod tests {
         custom.settings.tab_width = 3;
         let segments = custom.segments(Row::TabWidth);
         assert_eq!(
-            segments.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
+            segments
+                .iter()
+                .map(|s| s.label.as_str())
+                .collect::<Vec<_>>(),
             ["2", "4", "8", "3"]
         );
         assert_eq!(custom.selected_segment(Row::TabWidth), Some(3));
@@ -622,7 +634,11 @@ mod tests {
         assert_eq!(step_font_size(11, false), 10);
         assert_eq!(step_font_size(72, true), 72);
         assert_eq!(step_font_size(6, false), 6);
-        assert_eq!(step_font_size(100, true), 72, "a hand-edited 100 comes back");
+        assert_eq!(
+            step_font_size(100, true),
+            72,
+            "a hand-edited 100 comes back"
+        );
         assert_eq!(step_font_size(3, false), 6);
     }
 
@@ -670,7 +686,11 @@ mod tests {
             Effect::Apply(SettingsAction::SetFontSize(72))
         );
         model.key(Key::Backspace, &view);
-        assert_eq!(model.font_size_text(&view), "1", "backspace edits the current 11");
+        assert_eq!(
+            model.font_size_text(&view),
+            "1",
+            "backspace edits the current 11"
+        );
         assert_eq!(
             model.key(Key::Up, &view),
             Effect::Apply(SettingsAction::SetFontSize(12))
@@ -692,12 +712,22 @@ mod tests {
         let view = view();
         let mut model = DialogModel::new();
         assert_eq!(model.focus, Focus::Row(Row::Theme));
-        assert_eq!(model.key(Key::Enter, &view), Effect::OpenDropdown(Row::Theme));
-        assert_eq!(model.key(Key::AltDown, &view), Effect::OpenDropdown(Row::Theme));
+        assert_eq!(
+            model.key(Key::Enter, &view),
+            Effect::OpenDropdown(Row::Theme)
+        );
+        assert_eq!(
+            model.key(Key::AltDown, &view),
+            Effect::OpenDropdown(Row::Theme)
+        );
         assert_eq!(model.key(Key::Space, &view), Effect::None);
 
         model.focus = Focus::Row(Row::FileIcons);
-        assert_eq!(model.key(Key::Left, &view), Effect::None, "already the first");
+        assert_eq!(
+            model.key(Key::Left, &view),
+            Effect::None,
+            "already the first"
+        );
         assert_eq!(
             model.key(Key::Right, &view),
             Effect::Apply(SettingsAction::SetFileIcons(FileIconSet::Minimal))

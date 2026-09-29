@@ -1,4 +1,7 @@
-#![allow(dead_code, reason = "used by the settings dialog, added in the next task")]
+#![allow(
+    dead_code,
+    reason = "used by the settings dialog, added in the next task"
+)]
 //! The Settings dialog's dropdown list: a themed popup under a dropdown that never takes the
 //! activation, so the keyboard stays with the dialog, which forwards keys here (settings dialog
 //! spec §3.5). `ListModel` is the pure part: selection, scrolling and type-ahead.
@@ -193,8 +196,10 @@ impl DropdownList {
             ..Default::default()
         };
         let top = unsafe {
-            if GetMonitorInfoW(MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST), &mut monitor)
-                != 0
+            if GetMonitorInfoW(
+                MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            ) != 0
                 && anchor.bottom + height > monitor.rcWork.bottom
             {
                 anchor.top - height
@@ -368,7 +373,9 @@ fn paint(hwnd: HWND, list: &ListState) {
             };
             let foreground = if index == list.model.selected {
                 fill(dc, rect, colors.selection_background);
-                colors.selection_foreground.unwrap_or(colors.editor_foreground)
+                colors
+                    .selection_foreground
+                    .unwrap_or(colors.editor_foreground)
             } else {
                 if list.hot == Some(index) {
                     fill(dc, rect, colors.hover_background);
@@ -395,8 +402,8 @@ fn paint(hwnd: HWND, list: &ListState) {
         if count > VISIBLE_ROWS {
             let track = client.bottom - 2;
             let thumb = (track * VISIBLE_ROWS as i32 / count as i32).max(8);
-            let top = 1 + (track - thumb) * list.model.top as i32
-                / (count - VISIBLE_ROWS).max(1) as i32;
+            let top =
+                1 + (track - thumb) * list.model.top as i32 / (count - VISIBLE_ROWS).max(1) as i32;
             fill(
                 dc,
                 RECT {
@@ -459,7 +466,13 @@ mod tests {
         // Break caught: typing "cas" in a list of hundreds of fonts landing on "Calibri", or a
         // prefix that never resets so the list stops responding to letters.
         let mut model = ListModel::new(
-            items(&["Arial", "Calibri", "Cascadia Code", "Cascadia Mono", "Consolas"]),
+            items(&[
+                "Arial",
+                "Calibri",
+                "Cascadia Code",
+                "Cascadia Mono",
+                "Consolas",
+            ]),
             Some(0),
         );
         model.key(ListKey::Char('c'), 5_000);
@@ -468,12 +481,18 @@ mod tests {
         model.key(ListKey::Char('s'), 5_200);
         assert_eq!(model.selected, 2, "Cascadia Code");
         model.key(ListKey::Char('c'), 9_000);
-        assert_eq!(model.selected, 3, "after a pause a single c moves on to the next C item");
+        assert_eq!(
+            model.selected, 3,
+            "after a pause a single c moves on to the next C item"
+        );
         assert_eq!(model.key(ListKey::Char('c'), 9_100), ListOutcome::Ignored);
         assert_eq!(model.selected, 3, "\"cc\" matches nothing and stays put");
         model.key(ListKey::Char('c'), 11_000);
         assert_eq!(model.selected, 4, "after another pause: Consolas");
         assert_eq!(model.key(ListKey::Char('z'), 20_000), ListOutcome::Ignored);
-        assert_eq!(model.key(ListKey::Char('\u{8}'), 21_000), ListOutcome::Ignored);
+        assert_eq!(
+            model.key(ListKey::Char('\u{8}'), 21_000),
+            ListOutcome::Ignored
+        );
     }
 }
