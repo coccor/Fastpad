@@ -140,10 +140,6 @@ pub(crate) enum ShortcutsEffect {
     Reset(CommandId),
     CopyId(&'static str),
     FocusSearch,
-    #[allow(
-        dead_code,
-        reason = "Task 9: the search field's Down key hands focus to the table"
-    )]
     FocusTable,
     /// Put this text in the search field.
     SetSearchText(String),
@@ -215,10 +211,6 @@ impl ShortcutsModel {
         self.top = 0;
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 9: the search field's text filters the rows")
-    )]
     pub(crate) fn set_text(&mut self, text: &str) -> ShortcutsEffect {
         self.set_filter(Filter::Text(text.to_owned()));
         ShortcutsEffect::Repaint

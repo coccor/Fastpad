@@ -7,8 +7,17 @@ use super::palette::Palette;
 use super::panel::{inset, scale};
 use super::shortcuts_model::ShortcutsModel;
 use super::soft_paint::{Frame, Shape, Tones};
-use windows_sys::Win32::Foundation::RECT;
-use windows_sys::Win32::Graphics::Gdi::{DT_CENTER, DT_LEFT, DT_RIGHT, HFONT};
+use crate::platform::wide_null;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{DT_CENTER, DT_LEFT, DT_RIGHT, HFONT, InvalidateRect};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::{EM_REPLACESEL, EM_UNDO};
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, ES_AUTOHSCROLL, GetWindowTextLengthW, SendMessageW, WM_CHAR, WM_CLEAR, WM_CUT,
+    WM_KEYDOWN, WM_NCDESTROY, WM_PAINT, WM_PASTE, WM_SETFOCUS, WM_SETFONT, WM_SETTEXT, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_UNDO, WS_CHILD,
+};
 
 const PADDING_AT_96_DPI: i32 = 20;
 const SEARCH_TOP_AT_96_DPI: i32 = 12;
@@ -30,6 +39,10 @@ pub(crate) const GLYPH_PENCIL: &str = "\u{E70F}";
 pub(crate) const GLYPH_KEYBOARD: &str = "\u{E765}";
 const RECORD_PROMPT: &str = "Press desired key combination and then press ENTER.";
 const HEADERS: [&str; 3] = ["Command", "Keybinding", "Source"];
+/// The search field's control id, in its `WM_COMMAND` notifications.
+pub(crate) const SEARCH_CONTROL_ID: usize = 0x5348;
+const SEARCH_HOOK_ID: usize = 0x5348_4B53;
+const FIELD_TEXT_INSET_AT_96_DPI: i32 = 10;
 
 /// What the pointer is on. While the recording box is open, everything outside it is
 /// `OutsideRecordBox`: a click there closes the box.
@@ -275,6 +288,103 @@ fn keycaps(
         );
         x += width;
     }
+}
+
+/// The native EDIT inside the painted search box, vertically centred for a `text_height` font.
+pub(crate) fn field_rect(search: RECT, text_height: i32, dpi: u32) -> RECT {
+    let top = (search.top + search.bottom - text_height) / 2;
+    RECT {
+        left: search.left + scale(FIELD_TEXT_INSET_AT_96_DPI, dpi),
+        top,
+        right: search.right - scale(FIELD_TEXT_INSET_AT_96_DPI, dpi),
+        bottom: top + text_height,
+    }
+}
+
+/// The search field, hidden until the page shows. Its keys go to the dialog first through
+/// `search_proc`.
+pub(crate) fn create_search(dialog: HWND, rect: RECT, font: HFONT) -> HWND {
+    let class = wide_null("EDIT");
+    let edit = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            std::ptr::null(),
+            WS_CHILD | ES_AUTOHSCROLL as u32,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            dialog,
+            SEARCH_CONTROL_ID as _,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    };
+    if edit.is_null() {
+        return edit;
+    }
+    unsafe {
+        SendMessageW(edit, WM_SETFONT, font as usize, 0);
+        SetWindowSubclass(edit, Some(search_proc), SEARCH_HOOK_ID, dialog as usize);
+    }
+    edit
+}
+
+unsafe extern "system" fn search_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    dialog: usize,
+) -> LRESULT {
+    let dialog = dialog as HWND;
+    match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN if super::settings_dialog::search_key(dialog, wparam as u16) => {
+            return 0;
+        }
+        WM_CHAR | WM_SYSCHAR
+            if super::settings_dialog::search_swallows_char(
+                dialog,
+                wparam as u32,
+                message == WM_SYSCHAR,
+            ) =>
+        {
+            return 0;
+        }
+        WM_SETFOCUS => super::settings_dialog::search_focused(dialog),
+        // The empty field shows its cue (EM_SETCUEBANNER needs ComCtl32 v6).
+        WM_PAINT if unsafe { GetWindowTextLengthW(hwnd) } == 0 => {
+            super::settings_dialog::paint_search_cue(dialog, hwnd);
+            return 0;
+        }
+        WM_NCDESTROY => unsafe {
+            RemoveWindowSubclass(hwnd, Some(search_proc), SEARCH_HOOK_ID);
+            return DefSubclassProc(hwnd, message, wparam, lparam);
+        },
+        _ => {}
+    }
+    // The EDIT repaints only the text it changes; the cue must go (or come back) whole. Only
+    // for messages that edit: the length query is itself a message through this procedure.
+    let edits_text = matches!(
+        message,
+        WM_CHAR
+            | WM_KEYDOWN
+            | WM_PASTE
+            | WM_CUT
+            | WM_CLEAR
+            | WM_UNDO
+            | WM_SETTEXT
+            | EM_UNDO
+            | EM_REPLACESEL
+    );
+    let was_empty = edits_text && unsafe { GetWindowTextLengthW(hwnd) } == 0;
+    let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    if edits_text && was_empty != (unsafe { GetWindowTextLengthW(hwnd) } == 0) {
+        unsafe { InvalidateRect(hwnd, std::ptr::null(), 1) };
+    }
+    result
 }
 
 /// Paints the page. `measure` gives a text's width in the body font.

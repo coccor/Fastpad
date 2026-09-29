@@ -20491,6 +20491,65 @@ three"
     }
 
     #[test]
+    fn typing_in_the_search_filters_and_down_enters_the_table() {
+        // Break caught: EN_CHANGE not reaching the model, or Down leaving the focus in the field.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            // Read the state from inside the loop, before Escape closes the dialog.
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                *record.borrow_mut() =
+                    crate::window::settings_dialog::shortcuts_model(dialog).map(|model| {
+                        (
+                            model.rows.len(),
+                            model.rows[0].command,
+                            crate::window::settings_dialog::current_focus(dialog),
+                        )
+                    });
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let (count, command, focus) = seen.borrow().unwrap();
+        assert_eq!((count, command), (1, CommandId::SaveAs));
+        assert_eq!(focus, Some(crate::window::settings_model::Focus::Table));
+    }
+
+    #[test]
+    fn record_keys_search_shows_only_the_stroke() {
+        // Break caught: record-keys mode letting the key's character into the field ("Ss").
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowTextW, PostMessageW, WM_CHAR, WM_KEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            crate::window::settings_dialog::toggle_record_keys_for_test(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(b'S'), 0);
+            PostMessageW(search, WM_CHAR, usize::from(b's'), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let mut buffer = [0u16; 64];
+                let length = GetWindowTextW(search, buffer.as_mut_ptr(), 64);
+                *record.borrow_mut() = String::from_utf16_lossy(&buffer[..length as usize]);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(seen.borrow().as_str(), "S");
+    }
+
+    #[test]
     fn f6_order_skips_a_closed_panel_and_a_missing_sidebar() {
         // Break caught: F6 landing in a hidden panel, or getting stuck when notes mode is off.
         use super::{FocusPart, next_focus_part};
