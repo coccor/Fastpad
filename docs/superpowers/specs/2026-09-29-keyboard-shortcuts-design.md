@@ -20,9 +20,9 @@
 | Dispatch | Keep the Win32 accelerator table, rebuilt from the resolved keymap when settings load and after each change. |
 | Chords | Out of scope for now (no `Ctrl+K Ctrl+S`). If added later, the dispatcher is replaced by our own; the keymap and ini format don't change. |
 | Several keys per command | Yes. Zoom In already has three defaults. |
-| Conflicts | Allowed, with a warning. A user binding beats a default on the same key; between two of the same source, the earlier table entry wins. |
+| Conflicts | Allowed, with a warning. A user binding beats a default on the same key. Between two defaults the earlier table entry wins; between two user bindings, the command whose ID sorts first wins. |
 | Search | By command name, command ID or key text, plus a record-keys mode that filters by an exact key. |
-| Commands listed | Everything in the palette's `ENTRIES`, plus Select tab 1–9 and Command Palette. |
+| Commands listed | Every command: the palette's `ENTRIES`, plus the bound commands the palette leaves out (Select tab 1–9, Command Palette, Focus editor group 1–8 and last, Focus next/previous pane, Markdown preview cycle). |
 | How to open | The new **Preferences: Open Keyboard Shortcuts** palette command (no default key), and the dialog's left nav. |
 | Applying | Each confirmed change saves one ini line and applies at once. No OK/Cancel, like the rest of the dialog. |
 
@@ -40,7 +40,7 @@ A pure module: no HWNDs, fully unit-tested.
 ### 3.2 Commands
 
 - Every rebindable `CommandId` gets a stable text ID, grouped like VS Code: `file.save`, `file.saveAs`, `view.toggleSidebar`, `tabs.select1`, `groups.focus1`, and so on. The table of IDs lives in `keymap.rs`; a test checks they are unique and cover the listed commands.
-- Display names stay in the palette's `ENTRIES`. The page reads them from there, adding names for Select tab 1–9 and Command Palette.
+- Display names stay in the palette's `ENTRIES`. The page reads them from there, adding names for the bound commands the palette leaves out (§2).
 
 ### 3.3 Defaults and resolving
 
@@ -53,8 +53,8 @@ A pure module: no HWNDs, fully unit-tested.
 ## 4. Storage
 
 - One line per overridden command: `key.file.save=Ctrl+Alt+S, Ctrl+Shift+Q`. An empty value means unbound. Any change rewrites the command's whole list.
-- `persisted::parse` collects `key.*` lines into `SettingsDelta.key_overrides`; `apply_delta` hands them to `Settings`. A bad command ID or key is skipped with the usual config warning; the rest of the line is kept.
-- Reset deletes the line (`save_setting` with removal), restoring the defaults.
+- `persisted::parse` collects `key.*` lines, as text, into `SettingsDelta.key_overrides` (`config` stays free of window types); `apply_delta` hands them to `Settings`. The keymap validates them when settings load: an unknown command ID, an unknown key, or a key the recording box would refuse (§6.5) is skipped with a `fastpad.ini:` warning, and the rest of the line is kept. A line with a value but no usable key is ignored as a whole, so the defaults stay.
+- Reset deletes the line (a new `remove_setting`), restoring the defaults. Setting a command's keys to exactly its defaults does the same.
 - No migration: the format is new.
 
 ## 5. Dispatch and derived text
@@ -83,7 +83,7 @@ A pure module: no HWNDs, fully unit-tested.
 
 ### 6.3 Table
 
-- Columns: **Command**, **Keybinding**, **Source**. The command column shows the display name; the command ID appears as a tooltip-like dim line only when the row is selected.
+- Columns: **Command**, **Keybinding**, **Source**. The command column shows the display name; on the selected row the command ID is shown dimmed, right-aligned in the same column.
 - One row per binding. A command with no keys has one row showing "—". Rows are sorted by display name, then by binding order.
 - Keys are drawn as keycaps: each part of the stroke in a rounded box, joined by `+`, painted with `soft_paint`.
 - Only visible rows are painted; the list scrolls with the wheel, Page Up/Down, Home/End and the arrows.
@@ -97,7 +97,7 @@ A pure module: no HWNDs, fully unit-tested.
 | Add keybinding | Ctrl+Enter | Context menu |
 | Remove keybinding | Delete | Context menu |
 | Reset keybinding (User rows only) | — | Context menu |
-| Copy command ID | Ctrl+C | Context menu |
+| Copy command ID (to the clipboard) | Ctrl+C | Context menu |
 
 - Change on a "—" row adds. Change on a row replaces that one key in the command's list; the whole list is saved as the override.
 - Remove on the last key of a command leaves it unbound (an empty override) and shows the "—" row.
@@ -108,7 +108,7 @@ A pure module: no HWNDs, fully unit-tested.
 - A centred panel over the table: "Press desired key combination and then press ENTER."
 - Below it, the captured stroke as keycaps and, if other commands use it, a link "N existing commands have this keybinding". Clicking the link closes the box and puts the stroke in the search field in record-keys mode.
 - **Enter** confirms, **Escape** cancels, so plain Enter and Escape can't be bound (as in VS Code). A lone modifier changes nothing.
-- A stroke without Ctrl or Alt whose key types text or edits it (letters, digits, OEM punctuation, Space, Backspace, Delete, Tab) is refused with an inline line: "Needs Ctrl or Alt: it would stop typing." F-keys, arrows, Home/End, Page Up/Down and Insert are allowed alone or with Shift.
+- A stroke without Ctrl or Alt whose key types text or edits it (letters, digits, OEM punctuation, numpad digits and operators, Space, Backspace, Delete, Tab, Enter, Escape) is refused with an inline line: "Needs Ctrl or Alt: it would stop typing." Alt with a numpad digit is refused (it types Alt codes), and so are F10 and Shift+F10 (the menu and the context menu). Other F-keys, arrows, Home/End, Page Up/Down and Insert are allowed alone or with Shift.
 - Confirming the same key the row already has changes nothing.
 
 ### 6.6 Model
