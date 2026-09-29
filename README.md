@@ -89,8 +89,7 @@ Write on the left, see it rendered on the right. FastPad draws GitHub-flavored M
 (tables, task lists, strikethrough, code blocks and local images) and updates moments after you stop
 typing. Both panes scroll together.
 
-- **Ctrl+Shift+V** cycles between no preview, side by side and full width.
-- Drag the divider to resize; double-click it to reset.
+- Show the preview side by side or full width, and drag the divider to resize it.
 - Links just work: web links open in your browser, `#headings` jump inside the preview, and links to
   local files open in a new FastPad tab.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
@@ -120,8 +119,8 @@ you pin something. Turn notes off with `notes_mode=false` in `fastpad.ini`.
 <img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
 
 Syntax highlighting as soon as you open a `.json` file. **Validate JSON** points to the exact line
-and column of a mistake; **Format JSON** (Shift+Alt+F) pretty-prints the whole document in one step you can undo. Neither will touch a
-file that doesn't parse.
+and column of a mistake; **Format JSON** pretty-prints the whole document in one step you can undo. Neither will
+touch a file that doesn't parse.
 
 ### Syntax highlighting for the files you actually open
 
@@ -133,31 +132,30 @@ from **View → Language** or the command palette. The notebook lists all of the
 
 ### Tabs, done right
 
-Open as many files as you like in one window. **Ctrl+Tab** and **Alt+1…9** to jump, double-click
-the empty tab bar for a new tab, scroll the wheel over the tabs to browse them, and close one with **Ctrl+W** or a middle-click. Every tab keeps its caret and scroll position, across switches and restarts. Open a file from
-Explorer or the command line and it lands as a tab in the FastPad window you already have open, not
-in a new window.
+Open as many files as you like in one window. Every tab keeps its caret and scroll position, across
+switches and restarts. Open a file from Explorer or the command line and it lands as a tab in the
+FastPad window you already have open, not in a new window.
 
 ### Split editors
 
 <img src="docs/images/split-editors.png" alt="Four editor groups in a 2x2 grid showing Rust, Markdown, Python and JSON" width="800">
 
-Put files side by side in any grid of rows and columns. `Ctrl+\` splits right, `Ctrl+Shift+\`
-splits down, and dragging a tab onto another group or an editor's edge moves or splits it. Each group
-has its own tabs, and the layout comes back with your session.
+Put files side by side in any grid of rows and columns. Drag a tab onto another group to move it,
+or onto an editor's edge to split it. Each group has its own tabs, and the layout comes back with
+your session.
 
 ### Images next to your notes
 
 <img src="docs/images/image-preview.png" alt="An SVG open as text with its rendered preview beside it, and images in the notebook tree" width="800">
 
 PNG, JPEG, GIF, WebP and more open in an image tab you can zoom and pan. SVGs open as text, with
-**Ctrl+Shift+V** showing them rendered beside the source. The notebook lists images next to your notes.
+their rendered preview beside the source. The notebook lists images next to your notes.
 
 ### A command palette for everything
 
 <img src="docs/images/command-palette.png" alt="The command palette filtering theme commands" width="800">
 
-**Ctrl+Shift+P** and start typing. Switch theme, toggle word wrap or line numbers, change font size
+Open it and start typing. Switch theme, toggle word wrap or line numbers, change font size
 or tab width, all without leaving the keyboard. Every change is saved instantly. The
 **Settings** button at the bottom of the sidebar opens the palette with just the settings.
 
@@ -188,8 +186,8 @@ before closing again.
   leaves you with a half-written file.
 - **Encodings preserved.** UTF-8, UTF-8 with BOM, UTF-16 LE and UTF-16 BE are detected on open and
   kept on save.
-- **Find and replace**, with match case, whole word and regular expressions (Alt+C, Alt+W,
-  Alt+R) and F3 / Shift+F3, plus zoom, word wrap and line numbers.
+- **Find and replace** with match case, whole word and regular expressions, plus zoom, word wrap
+  and line numbers.
 - **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive
   technology and can be followed from it.
 
