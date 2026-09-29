@@ -2295,7 +2295,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
         RowKind::Note(relative) => {
             let path = root.join(relative);
             let entries = [
-                MenuEntry::command("Open in new tab", CommandId::Open),
+                MenuEntry::local("Open in new tab", CommandId::Open),
                 MenuEntry::command(
                     if row.pinned { "Unpin" } else { "Pin" },
                     CommandId::NoteTogglePin,

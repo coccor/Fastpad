@@ -276,6 +276,9 @@ impl Drop for MenuBar {
 
 pub(crate) enum MenuEntry {
     Command(&'static str, CommandId),
+    /// A command id reused for a local action: it shows no key, since the global key does
+    /// something else.
+    Local(&'static str, CommandId),
     Submenu(&'static str, Vec<MenuEntry>),
     Separator,
 }
@@ -283,6 +286,10 @@ pub(crate) enum MenuEntry {
 impl MenuEntry {
     pub(crate) const fn command(label: &'static str, command: CommandId) -> Self {
         Self::Command(label, command)
+    }
+
+    pub(crate) const fn local(label: &'static str, command: CommandId) -> Self {
+        Self::Local(label, command)
     }
 }
 
@@ -301,6 +308,10 @@ fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -
                     _ => (*label).to_owned(),
                 };
                 let text = wide_null(&text);
+                unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
+            }
+            MenuEntry::Local(label, command) => {
+                let text = wide_null(label);
                 unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
             }
             MenuEntry::Submenu(label, children) => {
@@ -701,6 +712,20 @@ mod tests {
             "&Save\tCtrl+Alt+S"
         );
         assert_eq!(label(custom.dropdown(1), CommandId::Undo), "&Undo");
+    }
+
+    #[test]
+    fn a_local_entry_shows_no_key_even_when_its_command_has_one() {
+        // Break caught: a context-menu "Open in new tab" reading Ctrl+O, which opens the dialog.
+        let entries = [
+            super::MenuEntry::local("Open in new tab", CommandId::Open),
+            super::MenuEntry::command("&Save", CommandId::Save),
+        ];
+        let menu =
+            super::create_popup(&entries, &crate::window::keymap::Keymap::defaults()).unwrap();
+        assert_eq!(label(menu, CommandId::Open), "Open in new tab");
+        assert_eq!(label(menu, CommandId::Save), "&Save\tCtrl+S");
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(menu) };
     }
 
     #[derive(Clone, Copy)]
