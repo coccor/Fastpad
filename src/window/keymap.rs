@@ -110,10 +110,6 @@ impl KeyStroke {
     }
 
     /// The stroke a key press makes, or `None` for a modifier alone or a key with no name.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-    )]
     pub(crate) fn from_key(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Self> {
         key_name(vk)?;
         Some(Self::new(ctrl, shift, alt, vk))
@@ -429,10 +425,6 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 66] = [
     (key(C | S, VK_OEM_5), CommandId::SplitDown),
 ];
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-)]
 pub(crate) fn default_keys(command: CommandId) -> Vec<KeyStroke> {
     DEFAULT_BINDINGS
         .iter()
@@ -510,19 +502,11 @@ pub(crate) fn bindable(stroke: KeyStroke) -> Result<(), &'static str> {
 }
 
 /// `key.<id>`, the `fastpad.ini` key of `command`'s override.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-)]
 pub(crate) fn ini_key(command: CommandId) -> Option<String> {
     command_id(command).map(|id| format!("key.{id}"))
 }
 
 /// The `fastpad.ini` value for `keys`: `Ctrl+S, Ctrl+T`, or empty when there are none.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-)]
 pub(crate) fn ini_value(keys: &[KeyStroke]) -> String {
     keys.iter()
         .map(|stroke| stroke.text())
@@ -625,10 +609,6 @@ impl Keymap {
         &self.bindings
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-    )]
     pub(crate) fn keys_of(&self, command: CommandId) -> Vec<KeyStroke> {
         self.bindings
             .iter()
@@ -637,21 +617,15 @@ impl Keymap {
             .collect()
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-    )]
     pub(crate) fn is_user(&self, command: CommandId) -> bool {
         self.overrides
             .iter()
             .any(|(overridden, _)| *overridden == command)
     }
 
-    /// The command `stroke` runs: the first binding in precedence order.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-    )]
+    /// The command `stroke` runs: the first binding in precedence order. The accelerator table
+    /// resolves keys in the app; the tests pin the precedence rule with this.
+    #[cfg(test)]
     pub(crate) fn command_for(&self, stroke: KeyStroke) -> Option<CommandId> {
         self.bindings
             .iter()
@@ -660,10 +634,6 @@ impl Keymap {
     }
 
     /// The commands other than `except` bound to `stroke`, each once, in precedence order.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-    )]
     pub(crate) fn conflicts(&self, stroke: KeyStroke, except: CommandId) -> Vec<CommandId> {
         let mut commands = Vec::new();
         for binding in &self.bindings {
@@ -687,10 +657,6 @@ impl Keymap {
 
     /// This keymap with `command` bound to exactly `keys` (repeats dropped). Keys equal to the
     /// defaults drop the override instead.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-    )]
     pub(crate) fn with_keys(&self, command: CommandId, keys: Vec<KeyStroke>) -> Self {
         let mut unique = Vec::with_capacity(keys.len());
         for stroke in keys {
@@ -706,10 +672,6 @@ impl Keymap {
         Self::resolve(overrides)
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-    )]
     pub(crate) fn without_override(&self, command: CommandId) -> Self {
         Self::resolve(
             self.overrides

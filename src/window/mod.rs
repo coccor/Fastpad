@@ -41,6 +41,7 @@ pub(crate) mod search_view;
 pub(crate) mod settings_dialog;
 pub(crate) mod settings_model;
 pub(crate) mod shortcuts_model;
+pub(crate) mod shortcuts_page;
 pub(crate) mod side_panel;
 pub(crate) mod sidebar_accessibility;
 pub(crate) mod soft_paint;

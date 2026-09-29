@@ -1,9 +1,5 @@
 //! The Keyboard Shortcuts page's rows and what each input does to them (keyboard shortcuts spec
 //! §6.2–§6.6). Pure: no window handles.
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-)]
 
 use crate::window::commands::CommandId;
 use crate::window::keymap::{COMMAND_IDS, KeyStroke, Keymap, bindable};
@@ -137,12 +133,16 @@ pub(crate) enum ShortcutsEffect {
     Repaint,
     /// Give the command exactly these keys; the dialog applies and saves them.
     SetKeys(CommandId, Vec<KeyStroke>),
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Task 10: the row context menu's Reset Keybinding")
+    )]
     Reset(CommandId),
     CopyId(&'static str),
     FocusSearch,
     #[allow(
         dead_code,
-        reason = "Task 8: the search field's Down key hands focus to the table"
+        reason = "Task 9: the search field's Down key hands focus to the table"
     )]
     FocusTable,
     /// Put this text in the search field.
@@ -215,6 +215,10 @@ impl ShortcutsModel {
         self.top = 0;
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Task 9: the search field's text filters the rows")
+    )]
     pub(crate) fn set_text(&mut self, text: &str) -> ShortcutsEffect {
         self.set_filter(Filter::Text(text.to_owned()));
         ShortcutsEffect::Repaint
@@ -386,6 +390,10 @@ impl ShortcutsModel {
         ShortcutsEffect::SetKeys(row.command, keys)
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Task 10: the row context menu's Reset Keybinding")
+    )]
     pub(crate) fn reset(&mut self) -> ShortcutsEffect {
         match self.selected_row() {
             Some(row) if row.user => ShortcutsEffect::Reset(row.command),

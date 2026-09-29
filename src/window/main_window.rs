@@ -3922,10 +3922,6 @@ fn install_keymap(app: &mut App, keymap: crate::window::keymap::Keymap) {
 
 /// Gives `command` exactly `keys` (keyboard shortcuts spec 6.6): applies at once and saves its
 /// `key.<id>=` line, or removes the line when `keys` are the defaults.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-)]
 pub(crate) fn set_command_keys(
     hwnd: HWND,
     command: CommandId,
@@ -3968,10 +3964,6 @@ pub(crate) fn set_command_keys(
 }
 
 /// Gives `command` its default keys back and removes its `key.<id>=` line.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-)]
 pub(crate) fn reset_command_keys(hwnd: HWND, command: CommandId) {
     set_command_keys(hwnd, command, crate::window::keymap::default_keys(command));
 }
@@ -4010,10 +4002,6 @@ pub(crate) fn change_setting(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
-)]
 #[cfg(not(test))]
 fn remove_setting(key: &str) -> Result<()> {
     crate::config::remove_setting(key)
@@ -20393,6 +20381,81 @@ three"
         assert_eq!(
             crate::window::settings_dialog::open_dialog(window.hwnd),
             None
+        );
+    }
+
+    #[test]
+    fn the_wheel_on_the_shortcuts_page_scrolls_the_table() {
+        // Break caught: the wheel scrolling General's hidden cards while the table stays put.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, SendMessageW, WM_KEYDOWN, WM_MOUSEWHEEL,
+        };
+        let window = ProductionWindow::new(make_app());
+        let tops = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = tops.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let top = || crate::window::settings_dialog::shortcuts_model(dialog).map(|m| m.top);
+            seen.borrow_mut().push(top());
+            // One notch down, then one back up.
+            for delta in [-120i16, 120] {
+                SendMessageW(dialog, WM_MOUSEWHEEL, usize::from(delta as u16) << 16, 0);
+                seen.borrow_mut().push(top());
+            }
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*tops.borrow(), [Some(0), Some(3), Some(0)]);
+    }
+
+    #[test]
+    fn a_double_click_on_a_row_opens_the_recording_box_and_f9_rebinds_it() {
+        // Break caught: rows that select but never open the box, or a confirmed key that the
+        // window never applies.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F9, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-double-click");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let (x, y) = crate::window::settings_dialog::page_row_point(dialog, 0);
+            let at = ((y as isize) << 16 | (x as isize & 0xffff)) as LPARAM;
+            for _ in 0..2 {
+                PostMessageW(dialog, WM_LBUTTONDOWN, 1, at);
+                PostMessageW(dialog, WM_LBUTTONUP, 0, at);
+            }
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            key(VK_F9);
+            key(VK_RETURN);
+            key(VK_ESCAPE);
+            // Should the box never open, Escape only closes it: this ends the dialog anyway, so
+            // the test fails instead of hanging.
+            PostMessageW(dialog, WM_CLOSE, 0, 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let first = crate::window::shortcuts_model::ShortcutsModel::new(
+            crate::window::keymap::Keymap::defaults(),
+            1,
+        )
+        .rows[0]
+            .clone();
+        assert_eq!(
+            app_mut(window.hwnd)
+                .keymap
+                .keys_of(first.command)
+                .last()
+                .map(|stroke| stroke.text())
+                .as_deref(),
+            Some("F9")
+        );
+        super::save_settings_to(None);
+        assert!(
+            std::fs::read_to_string(&ini)
+                .unwrap()
+                .contains(&format!("key.{}=", first.id))
         );
     }
 

@@ -7,6 +7,7 @@
 use super::dropdown_list::{
     DropdownList, ListKey, ListModel, ListOutcome, ListStyle, WM_LIST_PICKED,
 };
+use super::keymap::KeyStroke;
 use super::modal::ModalScope;
 use super::palette::Palette;
 use super::panel::{inset, scale};
@@ -43,7 +44,7 @@ use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, GW_OWNER,
@@ -129,6 +130,8 @@ pub(crate) enum Hit {
     EditIni,
     Close,
     TitleClose,
+    /// Something on the Keyboard Shortcuts page.
+    Page(super::shortcuts_page::PageHit),
 }
 
 /// Where everything sits. Headings and rows are in content coordinates, placed in the
@@ -502,6 +505,10 @@ struct Dialog {
     outcome: Rc<Cell<Outcome>>,
     /// Direct2D for the rounded shapes, loaded as the dialog opens.
     canvas: Canvas,
+    page_layout: super::shortcuts_page::PageLayout,
+    shortcuts: super::shortcuts_model::ShortcutsModel,
+    /// When and on which row the last click in the table was, for double-clicks.
+    last_row_click: Option<(u32, usize)>,
 }
 
 impl Drop for Dialog {
@@ -627,6 +634,12 @@ fn create(
         max_height,
         measure(dialog, link_font, EDIT_INI_LABEL),
     );
+    // Built here, as the dialog opens: nothing of the shortcuts page runs before.
+    let page_layout = super::shortcuts_page::PageLayout::calculate(layout.body, dpi);
+    let shortcuts = super::shortcuts_model::ShortcutsModel::new(
+        super::main_window::keymap(owner),
+        page_layout.visible_rows(),
+    );
     let view = super::main_window::settings_view(owner);
     let fonts = crate::platform::fonts::dropdown_names(
         crate::platform::fonts::installed_font_families(),
@@ -653,6 +666,9 @@ fn create(
         swallowing: false,
         outcome,
         canvas: Canvas::load(),
+        page_layout,
+        shortcuts,
+        last_row_click: None,
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
 
@@ -969,6 +985,119 @@ fn pick(hwnd: HWND, index: usize) {
     }
 }
 
+/// What client point `x`, `y` is on, on the page shown. The recording box takes every click.
+fn hit_at(dialog: &Dialog, x: i32, y: i32) -> Option<Hit> {
+    let shortcuts = dialog.model.page == Page::Shortcuts;
+    if shortcuts && dialog.shortcuts.recording.is_some() {
+        return dialog
+            .page_layout
+            .hit(x, y, &dialog.shortcuts)
+            .map(Hit::Page);
+    }
+    dialog
+        .layout
+        .hit(x, y, dialog.scroll, &dialog.view, dialog.model.page)
+        .or_else(|| {
+            shortcuts
+                .then(|| dialog.page_layout.hit(x, y, &dialog.shortcuts))
+                .flatten()
+                .map(Hit::Page)
+        })
+}
+
+/// A click released on the shortcuts page.
+fn page_click(hwnd: HWND, hit: super::shortcuts_page::PageHit) {
+    use super::shortcuts_model::ShortcutsEffect;
+    use super::shortcuts_page::PageHit;
+    let now = unsafe { GetMessageTime() } as u32;
+    let double_click_time = unsafe { GetDoubleClickTime() };
+    let effect = state(hwnd).map(|dialog| {
+        let model = &mut dialog.shortcuts;
+        match hit {
+            PageHit::RecordToggle => model.toggle_record_keys(),
+            PageHit::Row(index) => {
+                let double = dialog.last_row_click.is_some_and(|(time, row)| {
+                    row == index && now.wrapping_sub(time) <= double_click_time
+                });
+                dialog.last_row_click = (!double).then_some((now, index));
+                model.select(index);
+                if double {
+                    model.start_change()
+                } else {
+                    ShortcutsEffect::Repaint
+                }
+            }
+            PageHit::Pencil(index) => {
+                model.select(index);
+                model.start_change()
+            }
+            PageHit::ConflictLink => model.follow_conflicts(),
+            PageHit::RecordBox => ShortcutsEffect::None,
+            PageHit::OutsideRecordBox => model.cancel_recording(),
+        }
+    });
+    if let Some(effect) = effect {
+        run_shortcuts(hwnd, effect);
+    }
+    if hit == PageHit::RecordToggle {
+        run_shortcuts(hwnd, ShortcutsEffect::FocusSearch);
+    }
+}
+
+/// Carries out a shortcuts page effect. As in `run`, no `Dialog` borrow may be alive: applying
+/// keys runs main window code.
+pub(crate) fn run_shortcuts(hwnd: HWND, effect: super::shortcuts_model::ShortcutsEffect) {
+    use super::shortcuts_model::ShortcutsEffect;
+    match effect {
+        ShortcutsEffect::None => {}
+        ShortcutsEffect::Repaint => invalidate(hwnd),
+        ShortcutsEffect::SetKeys(command, keys) => {
+            super::main_window::set_command_keys(owner(hwnd), command, keys);
+            after_keymap_change(hwnd);
+        }
+        ShortcutsEffect::Reset(command) => {
+            super::main_window::reset_command_keys(owner(hwnd), command);
+            after_keymap_change(hwnd);
+        }
+        ShortcutsEffect::CopyId(id) => {
+            // Task 10 puts `id` on the clipboard.
+            let _ = id;
+        }
+        ShortcutsEffect::FocusSearch | ShortcutsEffect::FocusTable => {
+            let focus = if effect == ShortcutsEffect::FocusSearch {
+                Focus::Search
+            } else {
+                Focus::Table
+            };
+            let repaint = state(hwnd).map(|dialog| dialog.model.set_focus(focus, &dialog.view));
+            if let Some(repaint) = repaint {
+                run(hwnd, repaint);
+            }
+        }
+        // Task 9 writes it to the search field.
+        ShortcutsEffect::SetSearchText(_) => invalidate(hwnd),
+        ShortcutsEffect::Close => close(hwnd),
+    }
+}
+
+/// Re-reads the keymap after a change applied, keeping the selection.
+fn after_keymap_change(hwnd: HWND) {
+    let keymap = super::main_window::keymap(owner(hwnd));
+    if let Some(dialog) = state(hwnd) {
+        dialog.shortcuts.refresh(keymap);
+    }
+    if unsafe { GetFocus() } != hwnd {
+        unsafe { SetFocus(hwnd) };
+    }
+    invalidate(hwnd);
+}
+
+/// The stroke `virtual_key` makes with the modifiers held now.
+fn current_stroke(virtual_key: u16) -> Option<KeyStroke> {
+    let held = |key: u16| unsafe { GetKeyState(i32::from(key)) } < 0;
+    KeyStroke::from_key(virtual_key, held(VK_CONTROL), held(VK_SHIFT), held(VK_MENU))
+}
+
 /// What releasing the mouse on `hit` does.
 fn click_effect(dialog: &mut Dialog, hit: Hit) -> Effect {
     let view = &dialog.view;
@@ -998,6 +1127,8 @@ fn click_effect(dialog: &mut Dialog, hit: Hit) -> Effect {
             }
         }
         Hit::Row(_, Part::Value) => Effect::Repaint,
+        // Page clicks go through `page_click`.
+        Hit::Page(_) => Effect::None,
     }
 }
 
@@ -1008,6 +1139,8 @@ fn focus_of(hit: Hit) -> Focus {
         Hit::Nav(_) => Focus::Nav,
         Hit::EditIni => Focus::EditIni,
         Hit::Close | Hit::TitleClose => Focus::Close,
+        Hit::Page(super::shortcuts_page::PageHit::RecordToggle) => Focus::Search,
+        Hit::Page(_) => Focus::Table,
     }
 }
 
@@ -1041,6 +1174,39 @@ fn model_key(virtual_key: u16) -> Option<Key> {
     })
 }
 
+/// A key on the shortcuts page: the recording box takes every key, Alt+K toggles record-keys
+/// search, and the focused table takes its keys. False when the key is not the page's.
+fn shortcuts_key(hwnd: HWND, virtual_key: u16) -> bool {
+    let stroke = current_stroke(virtual_key);
+    let routed = state(hwnd).and_then(|dialog| {
+        if dialog.model.page != Page::Shortcuts {
+            return None;
+        }
+        if dialog.shortcuts.recording.is_some() {
+            // Every key goes to the box; a modifier alone records nothing.
+            return Some(
+                stroke.map_or(super::shortcuts_model::ShortcutsEffect::None, |stroke| {
+                    dialog.shortcuts.record_key(stroke)
+                }),
+            );
+        }
+        let stroke = stroke?;
+        if stroke == KeyStroke::new(false, false, true, u16::from(b'K')) {
+            return Some(dialog.shortcuts.toggle_record_keys());
+        }
+        if dialog.model.focus != Focus::Table {
+            return None;
+        }
+        let effect = dialog.shortcuts.table_key(stroke);
+        (effect != super::shortcuts_model::ShortcutsEffect::None).then_some(effect)
+    });
+    let Some(effect) = routed else {
+        return false;
+    };
+    run_shortcuts(hwnd, effect);
+    true
+}
+
 fn key_down(hwnd: HWND, virtual_key: u16) {
     // With a dropdown open, its keys go to the list; Tab closes it and moves on.
     let list_outcome = state(hwnd).and_then(|dialog| {
@@ -1060,6 +1226,9 @@ fn key_down(hwnd: HWND, virtual_key: u16) {
                 close_list(hwnd);
             }
         }
+    }
+    if shortcuts_key(hwnd, virtual_key) {
+        return;
     }
     let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
     let key = if ctrl && matches!(virtual_key, VK_PRIOR | VK_NEXT) {
@@ -1125,6 +1294,21 @@ unsafe extern "system" fn dialog_proc(
             key_down(hwnd, wparam as u16);
             0
         }
+        // On the shortcuts page Alt+K toggles record-keys search, and Alt combinations are
+        // strokes for the recording box and the table; the rest (Alt+F4) keep their defaults.
+        WM_SYSKEYDOWN if state(hwnd).is_some_and(|dialog| dialog.model.page == Page::Shortcuts) => {
+            if shortcuts_key(hwnd, wparam as u16) {
+                0
+            } else {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+        }
+        // No menu to open and no beep for Alt+letters on the shortcuts page.
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCHAR
+            if state(hwnd).is_some_and(|dialog| dialog.model.page == Page::Shortcuts) =>
+        {
+            0
+        }
         // Alt+Down opens a dropdown, as in a combo box.
         WM_SYSKEYDOWN if wparam as u16 == VK_DOWN => {
             let effect = state(hwnd).and_then(|dialog| {
@@ -1168,6 +1352,15 @@ unsafe extern "system" fn dialog_proc(
             if let Some(dialog) = state(hwnd) {
                 if let Some((_, list)) = &dialog.list {
                     list.wheel(delta);
+                } else if dialog.model.page == Page::Shortcuts {
+                    // Three rows a notch; General's scroll stays where it was.
+                    let top = dialog.shortcuts.top;
+                    dialog
+                        .shortcuts
+                        .scroll(-(i32::from(delta) * 3 / 120) as isize);
+                    if dialog.shortcuts.top != top {
+                        invalidate(hwnd);
+                    }
                 } else {
                     let pitch = dialog.layout.row_pitch();
                     let scroll = (dialog.scroll - i32::from(delta) * pitch / 40)
@@ -1210,13 +1403,10 @@ unsafe extern "system" fn dialog_proc(
                 ScreenToClient(hwnd, &mut point);
             }
             let on_link = state(hwnd).is_some_and(|dialog| {
-                dialog.layout.hit(
-                    point.x,
-                    point.y,
-                    dialog.scroll,
-                    &dialog.view,
-                    dialog.model.page,
-                ) == Some(Hit::EditIni)
+                matches!(
+                    hit_at(dialog, point.x, point.y),
+                    Some(Hit::EditIni | Hit::Page(super::shortcuts_page::PageHit::ConflictLink))
+                )
             });
             let cursor = if on_link { IDC_HAND } else { IDC_ARROW };
             unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor) as HCURSOR) };
@@ -1225,9 +1415,7 @@ unsafe extern "system" fn dialog_proc(
         WM_MOUSEMOVE => {
             let (x, y) = lparam_point(lparam);
             if let Some(dialog) = state(hwnd) {
-                let hot = dialog
-                    .layout
-                    .hit(x, y, dialog.scroll, &dialog.view, dialog.model.page);
+                let hot = hit_at(dialog, x, y);
                 if !dialog.tracking_leave {
                     let mut track = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -1280,16 +1468,19 @@ unsafe extern "system" fn dialog_proc(
             close_list(hwnd);
             let effect = state(hwnd).and_then(|dialog| {
                 dialog.pressed = None;
-                let hit =
-                    dialog
-                        .layout
-                        .hit(x, y, dialog.scroll, &dialog.view, dialog.model.page)?;
+                let hit = hit_at(dialog, x, y)?;
                 // A click on the dropdown whose list was open only closes that list.
                 dialog.pressed =
                     (open_row.map(|row| Hit::Row(row, Part::Whole)) != Some(hit)).then_some(hit);
-                // A greyed row takes no focus: it stays where it was.
+                // A greyed row takes no focus: it stays where it was; nor does the recording
+                // box, which keeps the table's.
                 Some(match hit {
                     Hit::Row(row, _) if !dialog.view.enabled(row) => Effect::None,
+                    Hit::Page(
+                        super::shortcuts_page::PageHit::RecordBox
+                        | super::shortcuts_page::PageHit::OutsideRecordBox
+                        | super::shortcuts_page::PageHit::ConflictLink,
+                    ) => Effect::None,
                     _ => dialog.model.set_focus(focus_of(hit), &dialog.view),
                 })
             });
@@ -1305,17 +1496,20 @@ unsafe extern "system" fn dialog_proc(
             }
             let (x, y) = lparam_point(lparam);
             unsafe { ReleaseCapture() };
-            let effect = state(hwnd).and_then(|dialog| {
+            let released = state(hwnd).and_then(|dialog| {
                 let pressed = dialog.pressed.take()?;
-                (dialog
-                    .layout
-                    .hit(x, y, dialog.scroll, &dialog.view, dialog.model.page)
-                    == Some(pressed))
-                .then(|| click_effect(dialog, pressed))
+                (hit_at(dialog, x, y) == Some(pressed)).then_some(pressed)
             });
             invalidate(hwnd);
-            if let Some(effect) = effect {
-                run(hwnd, effect);
+            match released {
+                Some(Hit::Page(hit)) => page_click(hwnd, hit),
+                Some(hit) => {
+                    let effect = state(hwnd).map(|dialog| click_effect(dialog, hit));
+                    if let Some(effect) = effect {
+                        run(hwnd, effect);
+                    }
+                }
+                None => {}
             }
             0
         }
@@ -1335,12 +1529,33 @@ fn paint(hwnd: HWND, dialog: &Dialog) {
 }
 
 fn paint_into(dc: HDC, client: RECT, dialog: &Dialog) {
+    let measure = |text: &str| text_width(dc, dialog.body_font, text);
     let mut frame = Frame::default();
-    compose(&mut frame, client, dialog);
+    compose(&mut frame, client, dialog, &measure);
     frame.paint(dc, client, &dialog.canvas);
 }
 
-fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
+/// `text`'s width in `font` on `dc`.
+fn text_width(dc: HDC, font: HFONT, text: &str) -> i32 {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::GetTextExtentPoint32W;
+    let wide = text.encode_utf16().collect::<Vec<_>>();
+    let mut size = SIZE::default();
+    unsafe {
+        let previous = SelectObject(dc, font as _);
+        GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size);
+        SelectObject(dc, previous);
+    }
+    size.cx
+}
+
+/// Everything the dialog paints. `measure` gives a text's width in the body font.
+fn compose<'a>(
+    frame: &mut Frame<'a>,
+    client: RECT,
+    dialog: &'a Dialog,
+    measure: &dyn Fn(&str) -> i32,
+) {
     let colors = &dialog.colors;
     let tones = Tones::new(colors);
     let layout = &dialog.layout;
@@ -1452,6 +1667,30 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
         }
     }
     frame.clip(None);
+    if dialog.model.page == Page::Shortcuts {
+        let style = super::shortcuts_page::PageStyle {
+            colors,
+            tones: &tones,
+            link_color: dialog.link_color,
+            body_font: dialog.body_font,
+            heading_font: dialog.heading_font,
+            link_font: dialog.link_font,
+            glyph_font: dialog.glyph_font,
+            radius,
+            hot: match dialog.hot {
+                Some(Hit::Page(hit)) => Some(hit),
+                _ => None,
+            },
+            table_focused: dialog.model.focus == Focus::Table,
+        };
+        super::shortcuts_page::compose(
+            frame,
+            measure,
+            &dialog.page_layout,
+            &dialog.shortcuts,
+            &style,
+        );
+    }
 
     // Footer: the link and a filled accent Close.
     frame.text(
@@ -1484,7 +1723,9 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
             inset(layout.nav_items[dialog.model.page as usize], -outside),
             radius + outside,
         )),
-        Focus::Search | Focus::Table => None,
+        Focus::Search => Some((inset(dialog.page_layout.search, -outside), radius + outside)),
+        // The selected row's accent bar shows the table's focus.
+        Focus::Table => None,
         Focus::EditIni => Some((inset(layout.edit_ini, -outside), radius + outside)),
         Focus::Close => Some((inset(layout.close, -outside), radius + outside)),
         Focus::Row(row) => {
@@ -1744,6 +1985,21 @@ pub(crate) fn answer_next(answer: impl FnOnce(HWND) + 'static) {
     ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }
 
+/// The client centre of the shortcuts table's `slot`th visible row.
+#[cfg(test)]
+pub(crate) fn page_row_point(dialog: HWND, slot: usize) -> (i32, i32) {
+    let rect = state(dialog)
+        .map(|dialog| dialog.page_layout.row_rect(slot))
+        .unwrap_or_default();
+    ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+}
+
+/// A copy of the open dialog's shortcuts page state.
+#[cfg(test)]
+pub(crate) fn shortcuts_model(dialog: HWND) -> Option<super::shortcuts_model::ShortcutsModel> {
+    state(dialog).map(|dialog| dialog.shortcuts.clone())
+}
+
 /// Whether the dialog kept the focus after each change applied since the last call.
 #[cfg(test)]
 pub(crate) fn take_focus_checks() -> Vec<bool> {
@@ -1999,6 +2255,15 @@ mod tests {
             swallowing: false,
             outcome: Rc::new(Cell::new(Outcome::Closed)),
             canvas,
+            page_layout: super::super::shortcuts_page::PageLayout::calculate(
+                Layout::calculate(96, 4000, 2000, 100).body,
+                96,
+            ),
+            shortcuts: super::super::shortcuts_model::ShortcutsModel::new(
+                crate::window::keymap::Keymap::defaults(),
+                1,
+            ),
+            last_row_click: None,
         }
     }
 
