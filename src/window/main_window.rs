@@ -22460,13 +22460,118 @@ three"
     }
 
     #[test]
-    fn open_editors_an_untitled_row_does_not_start_a_drag() {
+    fn open_editors_an_untitled_row_drags_but_no_folder_takes_it() {
+        // Break caught: an untitled row that cannot reach another group, or one the tree tries
+        // to copy with no file behind it (plan amendment 5).
         let _scintilla = load_native_scintilla();
         let scratch = LibraryScratch::new("editors-drag-untitled");
+        std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
         let (window, _editor) = notebook_window(&scratch);
         let panel = sidebar_windows(window.hwnd).1;
         start_tab_drag(window.hwnd, panel, 0);
-        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert!(
+            notebook_view(window.hwnd)
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.started)
+        );
+        let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+        drag_over(panel, work);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            None
+        );
+        drop_at(panel, work);
+    }
+
+    /// The Open Editors entry index (headers counted, as `editor_rect_at` counts them) of
+    /// document `id`'s first view.
+    fn open_editors_row_of(hwnd: HWND, id: crate::document::DocumentId) -> usize {
+        (0..64)
+            .find(|&index| {
+                notebook_view(hwnd)
+                    .editors
+                    .row(index)
+                    .is_some_and(|row| row.id == id)
+            })
+            .expect("an Open Editors row")
+    }
+
+    #[test]
+    fn open_editors_a_row_dropped_on_another_groups_content_moves_there() {
+        // Break caught: row drags stopping at the sidebar's edge (split editors spec §6.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-group");
+        let outside = scratch.root.join("draft.txt");
+        std::fs::write(&outside, "draft").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        let first = app_mut(window.hwnd).tabs.active_group();
+        let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::New);
+        // Close the split's view of `dragged`, so a move is visible.
+        super::focus_view(window.hwnd, second, dragged);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert!(super::activate_group(window.hwnd, first));
+        let panel = sidebar_windows(window.hwnd).1;
+        let row = open_editors_row_of(window.hwnd, dragged);
+        start_tab_drag(window.hwnd, panel, row);
+        let target = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let middle = super::with_group_id(window.hwnd, second, |state| state.content).unwrap();
+        let point = lparam_in(
+            panel,
+            target,
+            (middle.left + middle.right) / 2,
+            (middle.top + middle.bottom) / 2,
+        );
+        drag_over(panel, point);
+        assert!(app_mut(window.hwnd).drop_overlay.is_some());
+        drop_at(panel, point);
+        assert!(
+            app_mut(window.hwnd)
+                .tabs
+                .group(second)
+                .unwrap()
+                .contains(dragged)
+        );
+        assert!(
+            !app_mut(window.hwnd)
+                .tabs
+                .group(first)
+                .is_some_and(|group| group.contains(dragged))
+        );
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn open_editors_a_row_drag_cancelled_over_a_group_leaves_no_overlay() {
+        // Break caught: Esc mid-drag leaving the tint over the editor.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editors-drag-cancel");
+        let (window, _editor) = notebook_window(&scratch);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        let panel = sidebar_windows(window.hwnd).1;
+        // With two groups entry 0 is a header: press the first tab row.
+        let row = (0..64)
+            .find(|&index| notebook_view(window.hwnd).editors.row(index).is_some())
+            .unwrap();
+        start_tab_drag(window.hwnd, panel, row);
+        let target = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let middle = super::with_group_id(window.hwnd, second, |state| state.content).unwrap();
+        drag_over(
+            panel,
+            lparam_in(
+                panel,
+                target,
+                middle.left + 40,
+                (middle.top + middle.bottom) / 2,
+            ),
+        );
+        assert!(crate::window::notebook_view::cancel_drag(window.hwnd));
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
     }
 
     #[test]

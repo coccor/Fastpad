@@ -62,6 +62,7 @@ pub(crate) const STATE_OFFSCREEN: u32 = 0x0001_0000;
 pub(crate) const STATE_FOCUSABLE: u32 = 0x0010_0000;
 pub(crate) const STATE_SELECTABLE: u32 = 0x0020_0000;
 pub(crate) const MK_LBUTTON: WPARAM = 0x0001;
+pub(crate) const MK_CONTROL: WPARAM = 0x0008;
 
 /// One MSAA child of a sidebar window, in the window's client coordinates.
 #[derive(Clone)]

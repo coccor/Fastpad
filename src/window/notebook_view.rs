@@ -21,7 +21,7 @@ use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset, scale};
 use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
-use crate::window::sidebar_accessibility::MK_LBUTTON;
+use crate::window::sidebar_accessibility::{MK_CONTROL, MK_LBUTTON};
 use crate::window::tooltip::Tooltip;
 use crate::window::tree_drag::{self, Drag, DragSource, Hover};
 use std::collections::HashSet;
@@ -1355,9 +1355,12 @@ impl NotebookView {
                 let name = self.rows.iter().find(|row| &row.kind == kind)?.name.clone();
                 (item, name)
             }
-            DragSource::Tab { path, .. } => (
-                TreeItem::Note(note_kind(path)),
-                super::tree_copy::item_name(path),
+            DragSource::Tab { path, name, .. } => (
+                TreeItem::Note(
+                    path.as_deref()
+                        .map_or(crate::window::file_icons::NoteKind::Text, note_kind),
+                ),
+                name.clone(),
             ),
             DragSource::Files(_) | DragSource::GroupTab { .. } => return None,
         };
@@ -2446,7 +2449,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_LBUTTONUP => {
             let (x, y) = point_of(lparam);
-            if drag_release(hwnd, x, y) {
+            if drag_release(hwnd, x, y, wparam) {
                 return Some(0);
             }
             // Released after the borrow ends: ReleaseCapture sends WM_CAPTURECHANGED here.
@@ -2761,13 +2764,51 @@ fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
         move_drag_label(hwnd, panel, x, y);
     }
     let accepted = with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false);
-    set_drag_cursor(accepted);
+    let source = with_view(hwnd, |view| {
+        view.drag.as_ref().map(|drag| drag.source.clone())
+    })
+    .flatten();
+    let over_group = !accepted
+        && source.is_some_and(|source| {
+            group_drop_at(hwnd, panel, &source, x, y, buttons & MK_CONTROL != 0).is_some()
+        });
+    if accepted {
+        super::tab_drag::hide_feedback(hwnd);
+    }
+    // Last: `show_feedback` sets the cursor too.
+    set_drag_cursor(accepted || over_group);
     true
 }
 
 /// `WM_LBUTTONUP`: a drag under way drops where the button went up (tree drag spec §3.4). An
 /// armed drag was a click. True when a drag was under way.
-fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
+/// A started Open Editors drag of `source` at panel point `x`, `y`, off the panel: the group
+/// drop there, if any, and its feedback (split editors spec §6.2). `None` for any other drag or
+/// point, which also hides the overlay.
+fn group_drop_at(
+    hwnd: HWND,
+    panel: HWND,
+    source: &DragSource,
+    x: i32,
+    y: i32,
+    copy: bool,
+) -> Option<(super::group_drop::Source, super::group_drop::Action)> {
+    let DragSource::Tab { id, group, .. } = source else {
+        super::tab_drag::hide_feedback(hwnd);
+        return None;
+    };
+    let screen = screen_point(panel, x, y);
+    let target = super::tab_drag::target_at(hwnd, screen);
+    let found = super::tab_drag::source_of(hwnd, *group, *id)
+        .zip(target)
+        .and_then(|(from, target)| {
+            super::group_drop::decide(from, target, copy).map(|action| (from, action))
+        });
+    super::tab_drag::show_feedback(hwnd, target, found.map(|(_, action)| action));
+    found
+}
+
+fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
     let Some((drag, panel)) = with_view(hwnd, |view| {
         if view.drag.as_ref().is_some_and(|drag| drag.started) {
             view.drag_to(x, y, Instant::now());
@@ -2780,15 +2821,29 @@ fn drag_release(hwnd: HWND, x: i32, y: i32) -> bool {
     let Some(drag) = drag.filter(|drag| drag.started) else {
         return false;
     };
+    let group_drop = drag
+        .target
+        .is_none()
+        .then(|| group_drop_at(hwnd, panel, &drag.source, x, y, buttons & MK_CONTROL != 0))
+        .flatten();
     end_drag_input(panel);
     end_drag_label(hwnd);
+    super::tab_drag::hide_feedback(hwnd);
+    if let Some((from, action)) = group_drop {
+        super::tab_drag::apply(hwnd, from, action);
+    }
     if let Some(folder) = drag.target {
         match &drag.source {
             DragSource::Row(kind) => super::tree_move::drop_into(hwnd, kind, &folder),
-            DragSource::Tab { id, path } => {
+            DragSource::Tab {
+                id,
+                path: Some(path),
+                ..
+            } => {
                 super::copy_host::copy_tab_into(hwnd, *id, path, &folder);
             }
-            DragSource::Files(_) | DragSource::GroupTab { .. } => {}
+            DragSource::Tab { path: None, .. } | DragSource::GroupTab { .. } => {}
+            DragSource::Files(_) => {}
         }
     }
     true
@@ -2816,6 +2871,7 @@ pub(crate) fn cancel_drag(hwnd: HWND) -> bool {
     };
     end_drag_input(panel);
     end_drag_label(hwnd);
+    super::tab_drag::hide_feedback(hwnd);
     true
 }
 
@@ -2829,6 +2885,7 @@ fn cancel_drag_for_right_press(hwnd: HWND) -> bool {
     };
     end_drag_timer(panel);
     end_drag_label(hwnd);
+    super::tab_drag::hide_feedback(hwnd);
     set_drag_cursor(true);
     true
 }
@@ -3198,11 +3255,19 @@ fn left_down(hwnd: HWND, x: i32, y: i32) {
                 super::main_window::close_document_tab(hwnd, row.id);
             } else {
                 super::main_window::focus_view(hwnd, row.group, row.id);
-                // The path is taken now, so the drag outlives its tab closing (open editors spec
-                // §4.3). An untitled tab has no file to copy: no drag.
-                if let Some(path) = row.path {
-                    arm_drag(hwnd, DragSource::Tab { id: row.id, path }, x, y);
-                }
+                // The name and path are taken now, so the drag outlives its tab closing (open
+                // editors spec §4.3). An untitled tab drags onto groups only.
+                arm_drag(
+                    hwnd,
+                    DragSource::Tab {
+                        id: row.id,
+                        group: row.group,
+                        name: row.name.clone(),
+                        path: row.path.clone(),
+                    },
+                    x,
+                    y,
+                );
             }
         }
         Hit::Root => {

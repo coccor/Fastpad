@@ -34,8 +34,15 @@ pub(crate) enum Hover {
 pub(crate) enum DragSource {
     /// A tree row: a drop moves it.
     Row(RowKind),
-    /// An Open Editors tab, with its file's path taken when the drag armed: a drop copies it.
-    Tab { id: DocumentId, path: PathBuf },
+    /// An Open Editors tab, from group `group`. Its name and file are taken when the drag
+    /// armed, so the drag outlives its tab closing: a drop on a folder copies the file, one on a
+    /// group moves or copies the view (split editors spec §6.2). Untitled tabs have no file.
+    Tab {
+        id: DocumentId,
+        group: crate::window::split_tree::GroupId,
+        name: String,
+        path: Option<PathBuf>,
+    },
     /// Files dragged in from outside: a drop copies them.
     Files(Vec<PathBuf>),
     /// A tab dragged from an editor group's strip over the tree: a drop copies its file (split
@@ -154,9 +161,13 @@ pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
 pub(crate) fn source_accepts(source: &DragSource, root: &Path, folder: &Path) -> bool {
     match source {
         DragSource::Row(kind) => accepts(kind, folder),
-        DragSource::Tab { path, .. } | DragSource::GroupTab { path, .. } => {
+        DragSource::Tab {
+            path: Some(path), ..
+        }
+        | DragSource::GroupTab { path, .. } => {
             tree_copy::any_accepted(std::slice::from_ref(path), root, folder)
         }
+        DragSource::Tab { path: None, .. } => false,
         DragSource::Files(paths) => tree_copy::any_accepted(paths, root, folder),
     }
 }
@@ -444,13 +455,17 @@ mod tests {
         let root = Path::new(r"C:\notes");
         let inside = DragSource::Tab {
             id: DocumentId(1),
-            path: PathBuf::from(r"C:\notes\work\b.md"),
+            group: crate::window::split_tree::GroupId(1),
+            name: "b.md".into(),
+            path: Some(PathBuf::from(r"C:\notes\work\b.md")),
         };
         assert!(!source_accepts(&inside, root, Path::new("work")));
         assert!(source_accepts(&inside, root, Path::new("")));
         let outside = DragSource::Tab {
             id: DocumentId(2),
-            path: PathBuf::from(r"D:\x\draft.txt"),
+            group: crate::window::split_tree::GroupId(1),
+            name: "draft.txt".into(),
+            path: Some(PathBuf::from(r"D:\x\draft.txt")),
         };
         assert!(source_accepts(&outside, root, Path::new("work")));
         let mut drag = Drag::armed(outside, 1, 2).unwrap();
