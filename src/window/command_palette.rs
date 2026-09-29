@@ -50,7 +50,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 104] = [
+pub(crate) const ENTRIES: [PaletteEntry; 105] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -192,6 +192,10 @@ pub(crate) const ENTRIES: [PaletteEntry; 104] = [
     ),
     entry("File: Exit", CommandId::Exit),
     entry("Preferences: Open Settings", CommandId::OpenSettings),
+    entry(
+        "Preferences: Open Keyboard Shortcuts",
+        CommandId::OpenKeyboardShortcuts,
+    ),
     entry("Preferences: Edit fastpad.ini", CommandId::EditSettingsFile),
     entry("Help: About FastPad", CommandId::About),
 ];
@@ -1510,7 +1514,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 104);
+        assert_eq!(ENTRIES.len(), 105);
     }
 
     #[test]

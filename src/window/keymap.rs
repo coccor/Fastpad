@@ -317,6 +317,10 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::NoteRename, "note.rename"),
     (CommandId::NoteDelete, "note.delete"),
     (CommandId::OpenSettings, "preferences.openSettings"),
+    (
+        CommandId::OpenKeyboardShortcuts,
+        "preferences.openKeyboardShortcuts",
+    ),
     (CommandId::EditSettingsFile, "preferences.editSettingsFile"),
     (CommandId::About, "help.about"),
 ];

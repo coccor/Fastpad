@@ -11,7 +11,7 @@ use super::modal::ModalScope;
 use super::palette::Palette;
 use super::panel::{inset, scale};
 use super::settings_model::{
-    Control, DialogModel, Effect, Focus, Key, Row, Section, SettingsView, dropdown_action,
+    Control, DialogModel, Effect, Focus, Key, Page, Row, Section, SettingsView, dropdown_action,
     dropdown_step, step_font_size,
 };
 use super::side_panel::paint_buffered;
@@ -42,8 +42,8 @@ use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
-    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
-    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, GW_OWNER,
@@ -66,7 +66,11 @@ const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_REMOVE: &str = "\u{E738}";
 
 /// The width, unless the work area is narrower.
-const WIDTH_AT_96_DPI: i32 = 640;
+const WIDTH_AT_96_DPI: i32 = 860;
+const NAV_WIDTH_AT_96_DPI: i32 = 180;
+const NAV_ITEM_HEIGHT_AT_96_DPI: i32 = 32;
+const NAV_INSET_AT_96_DPI: i32 = 8;
+const NAV_BAR_WIDTH_AT_96_DPI: i32 = 3;
 const PADDING_AT_96_DPI: i32 = 20;
 const HEADING_HEIGHT_AT_96_DPI: i32 = 30;
 /// A heading's text sits this far below the top of its space, closer to its first card.
@@ -121,6 +125,7 @@ pub(crate) enum Part {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Hit {
     Row(Row, Part),
+    Nav(Page),
     EditIni,
     Close,
     TitleClose,
@@ -136,6 +141,8 @@ pub(crate) struct Layout {
     pub title: RECT,
     pub title_close: RECT,
     pub body: RECT,
+    pub nav: RECT,
+    pub nav_items: [RECT; 2],
     pub headings: [RECT; 3],
     pub rows: [RECT; 13],
     pub content_height: i32,
@@ -171,8 +178,9 @@ impl Layout {
             bottom: title_height,
         };
 
+        let nav_width = scale(NAV_WIDTH_AT_96_DPI, dpi).min(width / 3);
         let line = |top: i32, height: i32| RECT {
-            left: padding,
+            left: nav_width + padding,
             top,
             right: width - padding,
             bottom: top + height,
@@ -194,11 +202,28 @@ impl Layout {
         let smallest = title_height + row_pitch * MIN_VISIBLE_ROWS + footer_height;
         let height = (title_height + content_height + footer_height).min(max_height.max(smallest));
         let body = RECT {
-            left: 0,
+            left: nav_width,
             top: title_height,
             right: width,
             bottom: height - footer_height,
         };
+        let nav = RECT {
+            left: 0,
+            top: title_height,
+            right: nav_width,
+            bottom: body.bottom,
+        };
+        let item_height = scale(NAV_ITEM_HEIGHT_AT_96_DPI, dpi);
+        let nav_inset = scale(NAV_INSET_AT_96_DPI, dpi);
+        let nav_items = std::array::from_fn(|index| {
+            let top = nav.top + nav_inset + index as i32 * item_height;
+            RECT {
+                left: nav_inset,
+                top,
+                right: nav_width - nav_inset,
+                bottom: top + item_height,
+            }
+        });
         let button_height = scale(BUTTON_HEIGHT_AT_96_DPI, dpi);
         let button_top = body.bottom + (footer_height - button_height) / 2;
         let close = RECT {
@@ -219,6 +244,8 @@ impl Layout {
             title,
             title_close,
             body,
+            nav,
+            nav_items,
             headings,
             rows,
             content_height,
@@ -348,7 +375,14 @@ impl Layout {
 
     /// What client point `x`, `y` is on at `scroll`. A toggle row is hit anywhere on its card,
     /// label included. Other rows are hit only on their control.
-    pub(crate) fn hit(&self, x: i32, y: i32, scroll: i32, view: &SettingsView) -> Option<Hit> {
+    pub(crate) fn hit(
+        &self,
+        x: i32,
+        y: i32,
+        scroll: i32,
+        view: &SettingsView,
+        page: Page,
+    ) -> Option<Hit> {
         let inside =
             |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
         if inside(&self.title_close) {
@@ -360,7 +394,10 @@ impl Layout {
         if inside(&self.edit_ini) {
             return Some(Hit::EditIni);
         }
-        if !inside(&self.body) {
+        if let Some(index) = self.nav_items.iter().position(&inside) {
+            return Some(Hit::Nav(Page::ALL[index]));
+        }
+        if page != Page::General || !inside(&self.body) {
             return None;
         }
         let row = Row::ALL
@@ -484,11 +521,17 @@ impl Drop for Dialog {
     }
 }
 
+/// The page the open dialog shows.
+#[cfg(test)]
+pub(crate) fn current_page(dialog: HWND) -> Option<Page> {
+    state(dialog).map(|dialog| dialog.model.page)
+}
+
 /// Shows Settings over `owner` and returns once it is closed.
-pub(crate) fn show(owner: HWND, colors: Palette, link_color: u32) -> Outcome {
+pub(crate) fn show(owner: HWND, colors: Palette, link_color: u32, page: Page) -> Outcome {
     let _modal = ModalScope::enter(owner);
     let outcome = Rc::new(Cell::new(Outcome::Closed));
-    let Some(dialog) = create(owner, colors, link_color, outcome.clone()) else {
+    let Some(dialog) = create(owner, colors, link_color, page, outcome.clone()) else {
         return Outcome::Closed;
     };
     unsafe {
@@ -527,6 +570,7 @@ fn create(
     owner: HWND,
     colors: Palette,
     link_color: u32,
+    page: Page,
     outcome: Rc<Cell<Outcome>>,
 ) -> Option<HWND> {
     let class = register_class()?;
@@ -593,7 +637,7 @@ fn create(
         link_color,
         layout,
         view,
-        model: DialogModel::new(),
+        model: DialogModel::new(page),
         fonts,
         scroll: 0,
         title_font,
@@ -786,6 +830,12 @@ fn run(hwnd: HWND, effect: Effect) {
                 run(hwnd, Effect::Apply(action));
             }
         }
+        Effect::ShowPage(page) => {
+            if let Some(dialog) = state(hwnd) {
+                dialog.model.show_page(page);
+            }
+            invalidate(hwnd);
+        }
         Effect::EditIni => {
             if let Some(dialog) = state(hwnd) {
                 dialog.outcome.set(Outcome::EditIni);
@@ -925,6 +975,7 @@ fn click_effect(dialog: &mut Dialog, hit: Hit) -> Effect {
     match hit {
         Hit::Close | Hit::TitleClose => Effect::Close,
         Hit::EditIni => Effect::EditIni,
+        Hit::Nav(page) => Effect::ShowPage(page),
         Hit::Row(row, _) if !view.enabled(row) => Effect::None,
         Hit::Row(row, Part::Whole) => match (row.control(), row.toggle()) {
             (Control::Check, Some(toggle)) => {
@@ -954,6 +1005,7 @@ fn click_effect(dialog: &mut Dialog, hit: Hit) -> Effect {
 fn focus_of(hit: Hit) -> Focus {
     match hit {
         Hit::Row(row, _) => Focus::Row(row),
+        Hit::Nav(_) => Focus::Nav,
         Hit::EditIni => Focus::EditIni,
         Hit::Close | Hit::TitleClose => Focus::Close,
     }
@@ -1009,7 +1061,15 @@ fn key_down(hwnd: HWND, virtual_key: u16) {
             }
         }
     }
-    let Some(key) = model_key(virtual_key) else {
+    let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+    let key = if ctrl && matches!(virtual_key, VK_PRIOR | VK_NEXT) {
+        Some(Key::NextPage {
+            back: virtual_key == VK_PRIOR,
+        })
+    } else {
+        model_key(virtual_key)
+    };
+    let Some(key) = key else {
         return;
     };
     let effect = state(hwnd).map(|dialog| dialog.model.key(key, &dialog.view));
@@ -1150,10 +1210,13 @@ unsafe extern "system" fn dialog_proc(
                 ScreenToClient(hwnd, &mut point);
             }
             let on_link = state(hwnd).is_some_and(|dialog| {
-                dialog
-                    .layout
-                    .hit(point.x, point.y, dialog.scroll, &dialog.view)
-                    == Some(Hit::EditIni)
+                dialog.layout.hit(
+                    point.x,
+                    point.y,
+                    dialog.scroll,
+                    &dialog.view,
+                    dialog.model.page,
+                ) == Some(Hit::EditIni)
             });
             let cursor = if on_link { IDC_HAND } else { IDC_ARROW };
             unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor) as HCURSOR) };
@@ -1162,7 +1225,9 @@ unsafe extern "system" fn dialog_proc(
         WM_MOUSEMOVE => {
             let (x, y) = lparam_point(lparam);
             if let Some(dialog) = state(hwnd) {
-                let hot = dialog.layout.hit(x, y, dialog.scroll, &dialog.view);
+                let hot = dialog
+                    .layout
+                    .hit(x, y, dialog.scroll, &dialog.view, dialog.model.page);
                 if !dialog.tracking_leave {
                     let mut track = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -1215,7 +1280,10 @@ unsafe extern "system" fn dialog_proc(
             close_list(hwnd);
             let effect = state(hwnd).and_then(|dialog| {
                 dialog.pressed = None;
-                let hit = dialog.layout.hit(x, y, dialog.scroll, &dialog.view)?;
+                let hit =
+                    dialog
+                        .layout
+                        .hit(x, y, dialog.scroll, &dialog.view, dialog.model.page)?;
                 // A click on the dropdown whose list was open only closes that list.
                 dialog.pressed =
                     (open_row.map(|row| Hit::Row(row, Part::Whole)) != Some(hit)).then_some(hit);
@@ -1239,8 +1307,11 @@ unsafe extern "system" fn dialog_proc(
             unsafe { ReleaseCapture() };
             let effect = state(hwnd).and_then(|dialog| {
                 let pressed = dialog.pressed.take()?;
-                (dialog.layout.hit(x, y, dialog.scroll, &dialog.view) == Some(pressed))
-                    .then(|| click_effect(dialog, pressed))
+                (dialog
+                    .layout
+                    .hit(x, y, dialog.scroll, &dialog.view, dialog.model.page)
+                    == Some(pressed))
+                .then(|| click_effect(dialog, pressed))
             });
             invalidate(hwnd);
             if let Some(effect) = effect {
@@ -1317,23 +1388,68 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
         });
     }
 
-    // The scrolling body, clipped to its area.
-    frame.clip(Some(layout.body));
-    for section in Section::ALL {
-        let heading = layout.heading_rect(section, dialog.scroll);
+    // The page list on the left.
+    frame.shape(Shape::Fill {
+        rect: layout.nav,
+        color: colors.strip_background,
+    });
+    for page in Page::ALL {
+        let item = layout.nav_items[page as usize];
+        let current = dialog.model.page == page;
+        let hot = dialog.hot == Some(Hit::Nav(page));
+        if current || hot {
+            let fill = if current {
+                tones.control
+            } else {
+                tones.card_hot
+            };
+            tones.soft(frame, item, radius, fill);
+        }
+        if current {
+            let bar = scale(NAV_BAR_WIDTH_AT_96_DPI, dpi);
+            let middle = (item.top + item.bottom) / 2;
+            frame.shape(Shape::Round {
+                rect: RECT {
+                    left: item.left,
+                    top: middle - scale(8, dpi),
+                    right: item.left + bar,
+                    bottom: middle + scale(8, dpi),
+                },
+                radius: bar / 2,
+                color: tones.accent,
+            });
+        }
         frame.text(
-            dialog.heading_font,
+            dialog.body_font,
             colors.editor_foreground,
-            section.title(),
+            page.title(),
             RECT {
-                top: heading.top + scale(HEADING_SPACE_ABOVE_AT_96_DPI, dpi),
-                ..heading
+                left: item.left + scale(12, dpi),
+                ..item
             },
             DT_LEFT,
         );
     }
-    for row in Row::ALL {
-        compose_row(frame, &tones, dialog, row);
+
+    // The scrolling body, clipped to its area.
+    frame.clip(Some(layout.body));
+    if dialog.model.page == Page::General {
+        for section in Section::ALL {
+            let heading = layout.heading_rect(section, dialog.scroll);
+            frame.text(
+                dialog.heading_font,
+                colors.editor_foreground,
+                section.title(),
+                RECT {
+                    top: heading.top + scale(HEADING_SPACE_ABOVE_AT_96_DPI, dpi),
+                    ..heading
+                },
+                DT_LEFT,
+            );
+        }
+        for row in Row::ALL {
+            compose_row(frame, &tones, dialog, row);
+        }
     }
     frame.clip(None);
 
@@ -1364,6 +1480,11 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, dialog: &'a Dialog) {
     let width = scale(FOCUS_WIDTH_AT_96_DPI, dpi);
     let outside = width + scale(FOCUS_GAP_AT_96_DPI, dpi);
     let ring = match dialog.model.focus {
+        Focus::Nav => Some((
+            inset(layout.nav_items[dialog.model.page as usize], -outside),
+            radius + outside,
+        )),
+        Focus::Search | Focus::Table => None,
         Focus::EditIni => Some((inset(layout.edit_ini, -outside), radius + outside)),
         Focus::Close => Some((inset(layout.close, -outside), radius + outside)),
         Focus::Row(row) => {
@@ -1650,7 +1771,7 @@ mod tests {
         // cards flush with the dialog's edges, or a dialog over about 700 px tall at 96 DPI
         // (soft-look addendum).
         let layout = Layout::calculate(96, 4000, 2000, 100);
-        assert_eq!(layout.width, 640);
+        assert_eq!(layout.width, 860);
         assert_eq!(layout.max_scroll(), 0);
         let mut expected_top = 0;
         for section in Section::ALL {
@@ -1660,7 +1781,7 @@ mod tests {
                 let card = layout.rows[row as usize];
                 assert_eq!(card.top, expected_top, "{row:?}");
                 assert_eq!(card.bottom - card.top, 36, "{row:?}");
-                assert_eq!((card.left, card.right), (20, 620), "{row:?}");
+                assert_eq!((card.left, card.right), (200, 840), "{row:?}");
                 expected_top = card.bottom + 3;
             }
         }
@@ -1671,12 +1792,33 @@ mod tests {
     }
 
     #[test]
+    fn the_nav_sits_left_of_the_cards_and_hits_its_pages() {
+        // Break caught: cards painted under the nav, or a nav item that doesn't switch pages.
+        let layout = Layout::calculate(96, 4000, 2000, 100);
+        assert!(layout.nav.right <= layout.rows[0].left);
+        assert_eq!(layout.body.left, layout.nav.right);
+        for page in Page::ALL {
+            let (x, y) = center(layout.nav_items[page as usize]);
+            assert_eq!(
+                layout.hit(x, y, 0, &view(), Page::General),
+                Some(Hit::Nav(page))
+            );
+        }
+        let (x, y) = center(layout.row_rect(Row::Theme, 0));
+        assert_eq!(
+            layout.hit(x, y, 0, &view(), Page::Shortcuts),
+            None,
+            "no General rows on the other page"
+        );
+    }
+
+    #[test]
     fn hits_find_controls_checkbox_labels_segments_and_stepper_parts() {
         let layout = Layout::calculate(96, 4000, 2000, 100);
         let view = view();
         let hit = |rect: RECT| {
             let (x, y) = center(rect);
-            layout.hit(x, y, 0, &view)
+            layout.hit(x, y, 0, &view, Page::General)
         };
         let row = |row| layout.row_rect(row, 0);
         let control = |r: Row| layout.control_rect(r, row(r), view.segments(r).len());
@@ -1767,7 +1909,7 @@ mod tests {
         let close = layout.title_close;
         assert_eq!(
             (close.left, close.top, close.right, close.bottom),
-            (640 - 46, 0, 640, 44)
+            (860 - 46, 0, 860, 44)
         );
         assert_eq!(layout.title.bottom, close.bottom);
         assert_eq!(layout.title.right, close.left);
@@ -1841,7 +1983,7 @@ mod tests {
             link_color: 0,
             layout: Layout::calculate(96, 4000, 2000, 100),
             view: view(),
-            model: DialogModel::new(),
+            model: DialogModel::new(Page::General),
             fonts: Vec::new(),
             scroll: 0,
             title_font: std::ptr::null_mut(),
@@ -1962,7 +2104,7 @@ mod tests {
         let view = view();
         for row in [Row::Theme, Row::Font] {
             let card = layout.row_rect(row, 0);
-            assert_eq!((card.left, card.right), (20, 430));
+            assert_eq!((card.left, card.right), (170, 430));
             let control = layout.control_rect(row, card, 0);
             assert_eq!(control.right, card.right - 16);
             assert!(
@@ -1979,7 +2121,7 @@ mod tests {
         assert_eq!(track.right - track.left, 40, "a toggle keeps its size");
         assert_eq!(
             Layout::calculate(144, 4000, 2000, 100).width,
-            scale(640, 144),
+            scale(860, 144),
             "a wide work area leaves the scaled width alone"
         );
     }

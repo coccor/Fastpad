@@ -2099,8 +2099,17 @@ fn show_about(hwnd: HWND) {
 /// The Settings dialog: File → Settings…, Ctrl+, and the activity bar's gear (settings dialog
 /// spec §4.3).
 pub(crate) fn show_settings(hwnd: HWND) {
+    show_settings_page(hwnd, crate::window::settings_model::Page::General);
+}
+
+/// Preferences: Open Keyboard Shortcuts (keyboard shortcuts spec section 2).
+pub(crate) fn show_keyboard_shortcuts(hwnd: HWND) {
+    show_settings_page(hwnd, crate::window::settings_model::Page::Shortcuts);
+}
+
+fn show_settings_page(hwnd: HWND, page: crate::window::settings_model::Page) {
     let outcome =
-        crate::window::settings_dialog::show(hwnd, current_palette(hwnd), link_color(hwnd));
+        crate::window::settings_dialog::show(hwnd, current_palette(hwnd), link_color(hwnd), page);
     if outcome == crate::window::settings_dialog::Outcome::EditIni {
         edit_settings_file(hwnd);
     }
@@ -3560,6 +3569,7 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::About => show_about(hwnd),
         CommandId::OpenSettings => show_settings(hwnd),
         CommandId::EditSettingsFile => edit_settings_file(hwnd),
+        CommandId::OpenKeyboardShortcuts => show_keyboard_shortcuts(hwnd),
         CommandId::QuickOpen => open_quick_open(hwnd),
         CommandId::NoteNewFolder => crate::window::inline_name::new_folder(hwnd, None),
         CommandId::NoteNew => crate::window::inline_name::new_note(hwnd, None),
@@ -20364,6 +20374,26 @@ three"
         execute_command(window.hwnd, CommandId::EditSettingsFile);
         assert!(app_mut(window.hwnd).tabs.find_path(&ini).is_some());
         super::save_settings_to(None);
+    }
+
+    #[test]
+    fn open_keyboard_shortcuts_opens_settings_on_the_shortcuts_page() {
+        // Break caught: the palette command opening Settings on General, or not at all.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            assert_eq!(
+                crate::window::settings_dialog::current_page(dialog),
+                Some(crate::window::settings_model::Page::Shortcuts)
+            );
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::execute_command(window.hwnd, CommandId::OpenKeyboardShortcuts);
+        assert_eq!(
+            crate::window::settings_dialog::open_dialog(window.hwnd),
+            None
+        );
     }
 
     #[test]

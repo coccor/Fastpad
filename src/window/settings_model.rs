@@ -362,21 +362,57 @@ pub(crate) fn typed_font_size(text: &str, current: u16) -> u16 {
     }
 }
 
+/// The dialog's pages, in nav order (keyboard shortcuts spec section 6.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Page {
+    General,
+    Shortcuts,
+}
+
+impl Page {
+    pub(crate) const ALL: [Self; 2] = [Self::General, Self::Shortcuts];
+
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Shortcuts => "Keyboard Shortcuts",
+        }
+    }
+
+    /// The first Tab stop on the page.
+    const fn first_stop(self) -> Focus {
+        match self {
+            Self::General => Focus::Row(Row::ALL[0]),
+            Self::Shortcuts => Focus::Search,
+        }
+    }
+}
+
 /// What has the keyboard focus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
+    Nav,
+    Search,
+    Table,
     Row(Row),
     EditIni,
     Close,
 }
 
-/// Tab order: the rows top to bottom, skipping greyed-out ones, then the Edit fastpad.ini link,
-/// then Close. It wraps around.
-pub(crate) fn next_focus(current: Focus, forward: bool, view: &SettingsView) -> Focus {
-    let order = Row::ALL
-        .into_iter()
-        .filter(|row| view.enabled(*row))
-        .map(Focus::Row)
+/// Tab order: the nav, then the page's stops (General: its rows top to bottom, skipping
+/// greyed-out ones; Keyboard Shortcuts: the search field, then the table), then the Edit
+/// fastpad.ini link, then Close. It wraps around.
+pub(crate) fn next_focus(current: Focus, forward: bool, view: &SettingsView, page: Page) -> Focus {
+    let stops = match page {
+        Page::General => Row::ALL
+            .into_iter()
+            .filter(|row| view.enabled(*row))
+            .map(Focus::Row)
+            .collect::<Vec<_>>(),
+        Page::Shortcuts => vec![Focus::Search, Focus::Table],
+    };
+    let order = std::iter::once(Focus::Nav)
+        .chain(stops)
         .chain([Focus::EditIni, Focus::Close])
         .collect::<Vec<_>>();
     let count = order.len();
@@ -392,7 +428,9 @@ pub(crate) fn next_focus(current: Focus, forward: bool, view: &SettingsView) -> 
 /// A key the dialog passes on, already decoded from its window message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Key {
-    Tab { back: bool },
+    Tab {
+        back: bool,
+    },
     Space,
     Enter,
     Left,
@@ -403,6 +441,10 @@ pub(crate) enum Key {
     Escape,
     Backspace,
     Char(char),
+    /// Ctrl+PageDown (or Ctrl+PageUp when `back`): the next page, wrapping.
+    NextPage {
+        back: bool,
+    },
 }
 
 /// What the dialog does after an input.
@@ -417,6 +459,7 @@ pub(crate) enum Effect {
     StepDropdown(Row, bool),
     EditIni,
     Close,
+    ShowPage(Page),
 }
 
 /// The dialog's keyboard state: what has the focus, and a font size being typed but not yet
@@ -425,14 +468,27 @@ pub(crate) enum Effect {
 pub(crate) struct DialogModel {
     pub focus: Focus,
     pub typed: Option<String>,
+    pub page: Page,
 }
 
 impl DialogModel {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(page: Page) -> Self {
         Self {
-            focus: Focus::Row(Row::ALL[0]),
+            focus: page.first_stop(),
             typed: None,
+            page,
         }
+    }
+
+    /// Shows `page`. The focus stays on the nav when it is there, else moves to the page's
+    /// first stop.
+    pub(crate) fn show_page(&mut self, page: Page) -> Effect {
+        self.typed = None;
+        self.page = page;
+        if self.focus != Focus::Nav {
+            self.focus = page.first_stop();
+        }
+        Effect::Repaint
     }
 
     /// Moves the focus, committing a typed font size on the way out.
@@ -455,11 +511,31 @@ impl DialogModel {
     pub(crate) fn key(&mut self, key: Key, view: &SettingsView) -> Effect {
         match key {
             Key::Tab { back } => {
-                let next = next_focus(self.focus, !back, view);
+                let next = next_focus(self.focus, !back, view, self.page);
                 self.set_focus(next, view)
             }
             Key::Escape => Effect::Close,
+            Key::NextPage { back } => {
+                let index = self.page as usize;
+                let count = Page::ALL.len();
+                let next = if back {
+                    (index + count - 1) % count
+                } else {
+                    (index + 1) % count
+                };
+                Effect::ShowPage(Page::ALL[next])
+            }
             _ => match self.focus {
+                Focus::Nav => {
+                    let index = self.page as usize;
+                    let target = match key {
+                        Key::Up => index.checked_sub(1),
+                        Key::Down => (index + 1 < Page::ALL.len()).then_some(index + 1),
+                        _ => None,
+                    };
+                    target.map_or(Effect::None, |index| Effect::ShowPage(Page::ALL[index]))
+                }
+                Focus::Search | Focus::Table => Effect::None,
                 Focus::EditIni if matches!(key, Key::Space | Key::Enter) => Effect::EditIni,
                 Focus::Close if matches!(key, Key::Space | Key::Enter) => Effect::Close,
                 Focus::Row(row) => self.row_key(row, key, view),
@@ -597,27 +673,92 @@ mod tests {
     }
 
     #[test]
+    fn the_nav_is_the_first_tab_stop_and_each_page_has_its_own_stops() {
+        // Break caught: Tab never reaching the page list, or walking into the other page's
+        // controls.
+        let view = view();
+        assert_eq!(
+            next_focus(Focus::Close, true, &view, Page::General),
+            Focus::Nav
+        );
+        assert_eq!(
+            next_focus(Focus::Nav, true, &view, Page::General),
+            Focus::Row(Row::Theme)
+        );
+        assert_eq!(
+            next_focus(Focus::Nav, true, &view, Page::Shortcuts),
+            Focus::Search
+        );
+        assert_eq!(
+            next_focus(Focus::Search, true, &view, Page::Shortcuts),
+            Focus::Table
+        );
+        assert_eq!(
+            next_focus(Focus::Table, true, &view, Page::Shortcuts),
+            Focus::EditIni
+        );
+        assert_eq!(
+            next_focus(Focus::Nav, false, &view, Page::Shortcuts),
+            Focus::Close
+        );
+    }
+
+    #[test]
+    fn ctrl_page_keys_and_the_nav_arrows_switch_pages() {
+        // Break caught: Ctrl+PageDown or the nav arrows not switching pages, or the focus
+        // leaving the nav when it switched from there.
+        let view = view();
+        let mut model = DialogModel::new(Page::General);
+        assert_eq!(model.focus, Focus::Row(Row::Theme));
+        assert_eq!(
+            model.key(Key::NextPage { back: false }, &view),
+            Effect::ShowPage(Page::Shortcuts)
+        );
+        assert_eq!(model.show_page(Page::Shortcuts), Effect::Repaint);
+        assert_eq!(model.focus, Focus::Search);
+        model.focus = Focus::Nav;
+        assert_eq!(model.key(Key::Up, &view), Effect::ShowPage(Page::General));
+        assert_eq!(
+            model.key(Key::Down, &view),
+            Effect::None,
+            "already the last page"
+        );
+        model.show_page(Page::General);
+        assert_eq!(
+            model.focus,
+            Focus::Nav,
+            "switching from the nav keeps the focus there"
+        );
+        assert_eq!(DialogModel::new(Page::Shortcuts).focus, Focus::Search);
+    }
+
+    #[test]
     fn tab_order_wraps_and_skips_notebook_autosave_without_a_notebook() {
         // Break caught: Tab stopping on a greyed-out row that ignores every key.
         let closed = view();
         assert_eq!(
-            next_focus(Focus::Row(Row::RestoreSession), true, &closed),
+            next_focus(
+                Focus::Row(Row::RestoreSession),
+                true,
+                &closed,
+                Page::General
+            ),
             Focus::EditIni
         );
         assert_eq!(
-            next_focus(Focus::Close, true, &closed),
-            Focus::Row(Row::Theme)
+            next_focus(Focus::Close, true, &closed, Page::General),
+            Focus::Nav
         );
         assert_eq!(
-            next_focus(Focus::Row(Row::Theme), false, &closed),
-            Focus::Close
+            next_focus(Focus::Row(Row::Theme), false, &closed, Page::General),
+            Focus::Nav
         );
         let open = SettingsView {
             notebook_autosave: Some(true),
             ..view()
         };
         assert_eq!(
-            next_focus(Focus::Row(Row::RestoreSession), true, &open),
+            next_focus(Focus::Row(Row::RestoreSession), true, &open, Page::General),
             Focus::Row(Row::NotebookAutosave)
         );
         assert!(open.checked(Toggle::NotebookAutosave));
@@ -679,6 +820,7 @@ mod tests {
         let mut model = DialogModel {
             focus: Focus::Row(Row::FontSize),
             typed: None,
+            page: Page::General,
         };
         assert_eq!(model.key(Key::Char('1'), &view), Effect::Repaint);
         assert_eq!(model.key(Key::Char('6'), &view), Effect::Repaint);
@@ -697,6 +839,7 @@ mod tests {
         let mut model = DialogModel {
             focus: Focus::Row(Row::FontSize),
             typed: None,
+            page: Page::General,
         };
         for digit in ['1', '2', '3', '4'] {
             model.key(Key::Char(digit), &view);
@@ -731,7 +874,7 @@ mod tests {
     #[test]
     fn keys_act_on_the_focused_control() {
         let view = view();
-        let mut model = DialogModel::new();
+        let mut model = DialogModel::new(Page::General);
         assert_eq!(model.focus, Focus::Row(Row::Theme));
         assert_eq!(
             model.key(Key::Enter, &view),
@@ -774,7 +917,7 @@ mod tests {
         // Break caught: arrows that do nothing on a closed dropdown, or step the wrong way
         // (dropdown arrows brief).
         let view = view();
-        let mut model = DialogModel::new();
+        let mut model = DialogModel::new(Page::General);
         for row in [Row::Theme, Row::Font] {
             model.focus = Focus::Row(row);
             assert_eq!(model.key(Key::Down, &view), Effect::StepDropdown(row, true));
