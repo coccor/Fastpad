@@ -3918,6 +3918,18 @@ pub(crate) fn first_key_text(hwnd: HWND, command: CommandId) -> Option<String> {
     }
 }
 
+/// The commands with a `key.<id>=` line in `hwnd`'s settings, including lines the keymap ignored.
+pub(crate) fn key_line_commands(hwnd: HWND) -> Vec<CommandId> {
+    unsafe { app_ptr(hwnd) }.map_or_else(Vec::new, |app| {
+        unsafe { app.as_ref() }
+            .settings
+            .key_overrides
+            .keys()
+            .filter_map(|id| crate::window::keymap::command_for_id(id))
+            .collect()
+    })
+}
+
 /// Puts `keymap` in force: the accelerator table is rebuilt now; the menu bar, which spells the
 /// keys, is rebuilt the next time it opens.
 fn install_keymap(app: &mut App, keymap: crate::window::keymap::Keymap) {
@@ -20675,6 +20687,158 @@ three"
         });
         super::show_keyboard_shortcuts(window.hwnd);
         assert_eq!(*seen.borrow(), Some((true, false)));
+    }
+
+    #[test]
+    fn record_keys_turned_on_from_the_table_moves_the_focus_to_the_search_field() {
+        // Break caught: Alt+K from the table turning record-keys on with the focus left on the
+        // table, so the next stroke goes to the table (and Escape closes the dialog) instead of
+        // being recorded in the field. Alt can't be posted, so the hook runs Alt+K's own path.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetFocus, VK_DOWN, VK_ESCAPE, VK_F9,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowTextW, PostMessageW, WM_CLOSE, WM_KEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let before = crate::window::settings_dialog::current_focus(dialog);
+                crate::window::settings_dialog::toggle_record_keys_for_test(dialog);
+                // The stroke goes wherever the keyboard focus is, as a real key would.
+                let focused = GetFocus();
+                PostMessageW(focused, WM_KEYDOWN, usize::from(VK_F9), 0);
+                crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                    let mut buffer = [0u16; 64];
+                    let length = GetWindowTextW(search, buffer.as_mut_ptr(), 64);
+                    *record.borrow_mut() = Some((
+                        before,
+                        focused == search,
+                        crate::window::settings_dialog::current_focus(dialog),
+                        String::from_utf16_lossy(&buffer[..length as usize]),
+                    ));
+                    // Escape leaves record-keys; the second closes the dialog.
+                    PostMessageW(GetFocus(), WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+                    PostMessageW(dialog, WM_CLOSE, 0, 0);
+                });
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let (before, focused, focus, text) = seen.borrow().clone().unwrap();
+        assert_eq!(before, Some(crate::window::settings_model::Focus::Table));
+        assert!(focused, "the search field does not have the keyboard focus");
+        assert_eq!(focus, Some(crate::window::settings_model::Focus::Search));
+        assert_eq!(text, "F9");
+    }
+
+    #[test]
+    fn the_context_menu_key_opens_the_row_menu_and_resets() {
+        // Break caught: the row menu reachable only by right-click, so a keyboard user can't
+        // reset a command's keys; or the key opening a menu of its own besides the one its
+        // WM_CONTEXTMENU opens.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_APPS, VK_DELETE, VK_DOWN, VK_ESCAPE,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN, WM_KEYUP,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-apps-key");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = offered.clone();
+        crate::window::menus::answer_next_choice(move |items| {
+            *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+            items
+                .iter()
+                .find(|(label, _)| label.starts_with("Reset"))
+                .map(|(_, id)| *id)
+        });
+        let again = std::rc::Rc::new(std::cell::Cell::new(false));
+        let second = again.clone();
+        crate::window::menus::answer_next_choice(move |_| {
+            second.set(true);
+            None
+        });
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_DELETE), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, |dialog| {
+                // The key itself opens nothing; Windows follows it with a context menu with no
+                // point, which opens the menu once.
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_APPS), 0);
+                PostMessageW(dialog, WM_KEYUP, usize::from(VK_APPS), 0xC000_0001);
+                PostMessageW(dialog, WM_CONTEXTMENU, dialog as usize, -1isize as LPARAM);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        super::save_settings_to(None);
+        assert!(
+            offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Reset")),
+            "no menu, or no Reset in it: {:?}",
+            offered.borrow()
+        );
+        assert!(!again.get(), "the menu opened twice");
+        assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::SaveAs));
+    }
+
+    #[test]
+    fn an_ignored_key_line_can_be_reset_from_the_row_menu() {
+        // Break caught: `key.file.saveAs=Bogus` (ignored, so the keys are the defaults) offering
+        // no Reset, leaving the stale line in fastpad.ini for good.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-stale-line");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        app_mut(window.hwnd)
+            .settings
+            .key_overrides
+            .insert("file.saveAs".into(), "Bogus".into());
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = offered.clone();
+        crate::window::menus::answer_next_choice(move |items| {
+            *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+            items
+                .iter()
+                .find(|(label, _)| label.starts_with("Reset"))
+                .map(|(_, id)| *id)
+        });
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            // Shift+F10's message: a context menu with no point.
+            PostMessageW(dialog, WM_CONTEXTMENU, dialog as usize, -1isize as LPARAM);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        super::save_settings_to(None);
+        assert!(
+            offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Reset")),
+            "{:?}",
+            offered.borrow()
+        );
+        assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
     }
 
     #[test]

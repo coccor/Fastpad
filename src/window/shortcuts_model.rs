@@ -159,6 +159,12 @@ pub(crate) struct ShortcutsModel {
     pub recording: Option<Recording>,
     /// Whether the search field records keys instead of taking text.
     pub record_keys: bool,
+    /// Commands with a `key.<id>=` line in the settings, even one the keymap ignored
+    /// (`key.file.save=Bogus`): Reset removes the line, so it is offered for them too.
+    pub lines: Vec<CommandId>,
+    /// The key the last confirmed recording gave its command: the next `refresh` selects its
+    /// row.
+    changed: Option<(CommandId, KeyStroke)>,
 }
 
 impl ShortcutsModel {
@@ -174,6 +180,8 @@ impl ShortcutsModel {
             visible: visible.max(1),
             recording: None,
             record_keys: false,
+            lines: Vec::new(),
+            changed: None,
         }
     }
 
@@ -181,17 +189,25 @@ impl ShortcutsModel {
         self.rows.get(self.selected)
     }
 
-    /// Re-reads the rows from `keymap`, keeping the selected command (on the same key when it
-    /// still has it).
-    pub(crate) fn refresh(&mut self, keymap: Keymap) {
+    /// Re-reads the rows from `keymap`, and which commands have a `key.<id>=` line from
+    /// `lines`. The selection moves to the key a recording just confirmed when the filter shows
+    /// it; otherwise it keeps the selected command (on the same key when it still has it).
+    pub(crate) fn refresh(&mut self, keymap: Keymap, lines: Vec<CommandId>) {
+        let changed = self.changed.take();
         let kept = self.selected_row().map(|row| (row.command, row.stroke));
         self.keymap = keymap;
+        self.lines = lines;
         self.rows = rows(&self.keymap, &self.filter);
-        if let Some((command, stroke)) = kept {
-            let index = self
-                .rows
+        let row_of = |command: CommandId, stroke: Option<KeyStroke>| {
+            self.rows
                 .iter()
                 .position(|row| row.command == command && row.stroke == stroke)
+        };
+        let new = changed.and_then(|(command, stroke)| row_of(command, Some(stroke)));
+        if let Some(index) = new {
+            self.selected = index;
+        } else if let Some((command, stroke)) = kept {
+            let index = row_of(command, stroke)
                 .or_else(|| self.rows.iter().position(|row| row.command == command));
             if let Some(index) = index {
                 self.selected = index;
@@ -335,6 +351,7 @@ impl ShortcutsModel {
         if unique == current {
             ShortcutsEffect::Repaint
         } else {
+            self.changed = Some((recording.command, new));
             ShortcutsEffect::SetKeys(recording.command, unique)
         }
     }
@@ -378,9 +395,16 @@ impl ShortcutsModel {
         ShortcutsEffect::SetKeys(row.command, keys)
     }
 
+    /// Whether the selected row's command can be reset: its keys are the user's, or it has a
+    /// `key.<id>=` line the keymap ignored.
+    pub(crate) fn can_reset(&self) -> bool {
+        self.selected_row()
+            .is_some_and(|row| row.user || self.lines.contains(&row.command))
+    }
+
     pub(crate) fn reset(&mut self) -> ShortcutsEffect {
         match self.selected_row() {
-            Some(row) if row.user => ShortcutsEffect::Reset(row.command),
+            Some(row) if self.can_reset() => ShortcutsEffect::Reset(row.command),
             _ => ShortcutsEffect::None,
         }
     }
@@ -592,7 +616,10 @@ mod tests {
             model.table_key(stroke("Delete")),
             ShortcutsEffect::SetKeys(CommandId::SaveAs, vec![])
         );
-        model.refresh(Keymap::defaults().with_keys(CommandId::SaveAs, vec![]));
+        model.refresh(
+            Keymap::defaults().with_keys(CommandId::SaveAs, vec![]),
+            vec![CommandId::SaveAs],
+        );
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].stroke, None);
         assert!(model.rows[0].user);
@@ -614,9 +641,53 @@ mod tests {
             .position(|row| row.command == CommandId::ZoomOut)
             .unwrap();
         model.select(index);
-        model.refresh(Keymap::defaults().with_keys(CommandId::ZoomOut, vec![stroke("F9")]));
+        model.refresh(
+            Keymap::defaults().with_keys(CommandId::ZoomOut, vec![stroke("F9")]),
+            vec![CommandId::ZoomOut],
+        );
         assert_eq!(model.selected_row().unwrap().command, CommandId::ZoomOut);
         assert_eq!(model.selected_row().unwrap().stroke, Some(stroke("F9")));
+    }
+
+    #[test]
+    fn a_confirmed_key_selects_its_own_row() {
+        // Break caught: changing Zoom In's third key to F9 selecting Ctrl+= (the command's
+        // first row) instead of the new F9 row.
+        let mut model = model("zoom in");
+        model.select(2);
+        model.start_change();
+        model.record_key(stroke("F9"));
+        let ShortcutsEffect::SetKeys(command, keys) = model.record_key(stroke("Enter")) else {
+            panic!("no change");
+        };
+        model.refresh(
+            Keymap::defaults().with_keys(command, keys),
+            vec![CommandId::ZoomIn],
+        );
+        assert_eq!(model.selected_row().unwrap().stroke, Some(stroke("F9")));
+        // A later refresh with no recording behind it keeps the selection where it is.
+        model.select(0);
+        model.refresh(model.keymap.clone(), vec![CommandId::ZoomIn]);
+        assert_eq!(model.selected, 0);
+    }
+
+    #[test]
+    fn reset_is_offered_for_an_ignored_ini_line() {
+        // Break caught: `key.file.save=Bogus` (a line the keymap ignored, so the keys are the
+        // defaults) offering no Reset, so the stale line can't be removed from the page.
+        let mut model = model("file: save");
+        let index = model
+            .rows
+            .iter()
+            .position(|row| row.command == CommandId::Save)
+            .unwrap();
+        model.select(index);
+        assert!(!model.selected_row().unwrap().user);
+        assert!(!model.can_reset());
+        assert_eq!(model.reset(), ShortcutsEffect::None);
+        model.refresh(Keymap::defaults(), vec![CommandId::Save]);
+        assert!(model.can_reset());
+        assert_eq!(model.reset(), ShortcutsEffect::Reset(CommandId::Save));
     }
 
     #[test]

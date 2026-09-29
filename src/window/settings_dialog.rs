@@ -652,10 +652,11 @@ fn create(
     );
     // Built here, as the dialog opens: nothing of the shortcuts page runs before.
     let page_layout = super::shortcuts_page::PageLayout::calculate(layout.body, dpi);
-    let shortcuts = super::shortcuts_model::ShortcutsModel::new(
+    let mut shortcuts = super::shortcuts_model::ShortcutsModel::new(
         super::main_window::keymap(owner),
         page_layout.visible_rows(),
     );
+    shortcuts.lines = super::main_window::key_line_commands(owner);
     let view = super::main_window::settings_view(owner);
     let fonts = crate::platform::fonts::dropdown_names(
         crate::platform::fonts::installed_font_families(),
@@ -1106,7 +1107,9 @@ fn page_click(hwnd: HWND, hit: super::shortcuts_page::PageHit) {
     if let Some(effect) = effect {
         run_shortcuts(hwnd, effect);
     }
-    if hit == PageHit::RecordToggle {
+    // The toggle, and the conflict link (which turns record-keys on), hand the field the keys.
+    let record_keys = state(hwnd).is_some_and(|dialog| dialog.shortcuts.record_keys);
+    if hit == PageHit::RecordToggle || (hit == PageHit::ConflictLink && record_keys) {
         run_shortcuts(hwnd, ShortcutsEffect::FocusSearch);
     }
 }
@@ -1169,10 +1172,10 @@ const COPY_ID: usize = 5;
 /// The selected row's menu (keyboard shortcuts spec §6.4), at client point `at`.
 fn context_menu(hwnd: HWND, at: POINT) {
     let Some((user, has_key)) = state(hwnd).and_then(|dialog| {
-        dialog
-            .shortcuts
+        let shortcuts = &dialog.shortcuts;
+        shortcuts
             .selected_row()
-            .map(|row| (row.user, row.stroke.is_some()))
+            .map(|row| (shortcuts.can_reset(), row.stroke.is_some()))
     }) else {
         return;
     };
@@ -1205,11 +1208,51 @@ fn context_menu(hwnd: HWND, at: POINT) {
     }
 }
 
+/// Shift+F10 or the context-menu key (`WM_CONTEXTMENU` with no point): the selected row's
+/// menu, under the row, when the table has the focus and no recording box is open.
+fn keyboard_context_menu(hwnd: HWND) {
+    let at = state(hwnd).and_then(|dialog| {
+        if dialog.model.page != Page::Shortcuts
+            || dialog.model.focus != Focus::Table
+            || dialog.shortcuts.recording.is_some()
+        {
+            return None;
+        }
+        let selected = dialog.shortcuts.selected;
+        dialog.shortcuts.selected_row()?;
+        // Scrolled away, the row comes back into view first.
+        dialog.shortcuts.select(selected);
+        let rect = dialog.page_layout.row_rect(selected - dialog.shortcuts.top);
+        Some(POINT {
+            x: rect.left + (rect.bottom - rect.top) / 2,
+            y: rect.bottom,
+        })
+    });
+    if let Some(at) = at {
+        invalidate(hwnd);
+        context_menu(hwnd, at);
+    }
+}
+
+/// Alt+K from outside the search field: toggles record-keys search, and when that turns it on
+/// the field takes the focus so the next stroke is recorded there.
+fn toggle_record_keys(hwnd: HWND) {
+    use super::shortcuts_model::ShortcutsEffect;
+    let Some(effect) = state(hwnd).map(|dialog| dialog.shortcuts.toggle_record_keys()) else {
+        return;
+    };
+    run_shortcuts(hwnd, effect);
+    if state(hwnd).is_some_and(|dialog| dialog.shortcuts.record_keys) {
+        run_shortcuts(hwnd, ShortcutsEffect::FocusSearch);
+    }
+}
+
 /// Re-reads the keymap after a change applied, keeping the selection.
 fn after_keymap_change(hwnd: HWND) {
     let keymap = super::main_window::keymap(owner(hwnd));
+    let lines = super::main_window::key_line_commands(owner(hwnd));
     if let Some(dialog) = state(hwnd) {
-        dialog.shortcuts.refresh(keymap);
+        dialog.shortcuts.refresh(keymap, lines);
     }
     if unsafe { GetFocus() } != hwnd {
         unsafe { SetFocus(hwnd) };
@@ -1300,9 +1343,17 @@ fn model_key(virtual_key: u16) -> Option<Key> {
 }
 
 /// A key on the shortcuts page: the recording box takes every key, Alt+K toggles record-keys
-/// search, and the focused table takes its keys. False when the key is not the page's.
+/// search, and the focused table takes its keys. False when the key is not the page's: Shift+F10
+/// then reaches DefWindowProc, which sends `WM_CONTEXTMENU` for the row menu.
 fn shortcuts_key(hwnd: HWND, virtual_key: u16) -> bool {
     let stroke = current_stroke(virtual_key);
+    let idle = state(hwnd).is_some_and(|dialog| {
+        dialog.model.page == Page::Shortcuts && dialog.shortcuts.recording.is_none()
+    });
+    if idle && stroke == Some(KeyStroke::new(false, false, true, u16::from(b'K'))) {
+        toggle_record_keys(hwnd);
+        return true;
+    }
     let routed = state(hwnd).and_then(|dialog| {
         if dialog.model.page != Page::Shortcuts {
             return None;
@@ -1316,9 +1367,6 @@ fn shortcuts_key(hwnd: HWND, virtual_key: u16) -> bool {
             );
         }
         let stroke = stroke?;
-        if stroke == KeyStroke::new(false, false, true, u16::from(b'K')) {
-            return Some(dialog.shortcuts.toggle_record_keys());
-        }
         if dialog.model.focus != Focus::Table {
             return None;
         }
@@ -1812,6 +1860,15 @@ unsafe extern "system" fn dialog_proc(
                 }
                 None => {}
             }
+            0
+        }
+        // Shift+F10 and the context-menu key: a context menu with no point (-1), for the selected
+        // row, as in the notebook tree. The recording box keeps both keys (Shift+F10 is refused
+        // there), so none comes while it is open.
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU
+            if lparam as u32 == u32::MAX =>
+        {
+            keyboard_context_menu(hwnd);
             0
         }
         // A right-click on a row selects it and opens its menu; while the recording box is open
@@ -2351,13 +2408,10 @@ pub(crate) fn current_focus(dialog: HWND) -> Option<Focus> {
     state(dialog).map(|dialog| dialog.model.focus)
 }
 
-/// Alt+K's path, without a held Alt: toggles record-keys search.
+/// Alt+K's path from outside the search field, without a held Alt: toggles record-keys search.
 #[cfg(test)]
 pub(crate) fn toggle_record_keys_for_test(dialog: HWND) {
-    let effect = state(dialog).map(|dialog| dialog.shortcuts.toggle_record_keys());
-    if let Some(effect) = effect {
-        run_shortcuts(dialog, effect);
-    }
+    toggle_record_keys(dialog);
 }
 
 /// Whether the dialog kept the focus after each change applied since the last call.
