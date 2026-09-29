@@ -25565,7 +25565,6 @@ three"
         execute_command(window.hwnd, CommandId::New);
         let group = app_mut(window.hwnd).tabs.active_group();
         let ids = strip_ids(window.hwnd, group);
-        let area = content(window.hwnd, group);
         let own = group_window(window.hwnd, group);
         let source = start_strip_drag(window.hwnd, group, 0);
         // Shrink the window below two minimum-width groups mid-drag.
