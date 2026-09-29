@@ -153,13 +153,15 @@ pub(crate) fn draft_icon(purpose: &Purpose, text: &str) -> TreeItem {
     if purpose.is_folder() {
         return TreeItem::Folder { expanded: false };
     }
-    let extension = text
-        .trim()
+    let name = text.trim();
+    let listed = name
         .rsplit_once('.')
-        .map(|(_, extension)| extension)
-        .filter(|extension| title::is_listed_extension(extension))
-        .unwrap_or("md");
-    TreeItem::Note(note_kind(Some(extension)))
+        .is_some_and(|(_, extension)| title::is_listed_extension(extension));
+    TreeItem::Note(if listed {
+        note_kind(Path::new(name))
+    } else {
+        NoteKind::Markdown
+    })
 }
 
 /// The field's accessible name (spec §6). `notebook` names the root.
@@ -1428,7 +1430,7 @@ mod tests {
         assert_eq!(draft_icon(&note, ""), markdown);
         assert_eq!(
             draft_icon(&note, "data.json"),
-            TreeItem::Note(note_kind(Some("json")))
+            TreeItem::Note(note_kind(std::path::Path::new("a.json")))
         );
         assert_eq!(draft_icon(&note, "v1.2"), markdown);
         assert_eq!(

@@ -21,6 +21,11 @@ pub struct Flavor {
     pub base: u32,
     pub mantle: u32,
     pub crust: u32,
+    pub rosewater: u32,
+    pub flamingo: u32,
+    pub pink: u32,
+    pub mauve: u32,
+    pub sky: u32,
 }
 
 /// `0xRRGGBB` as written in the official palette, packed as a Windows `COLORREF`.
@@ -57,6 +62,11 @@ pub const LATTE: Flavor = Flavor {
     base: hex(0xEFF1F5),
     mantle: hex(0xE6E9EF),
     crust: hex(0xDCE0E8),
+    rosewater: hex(0xDC8A78),
+    flamingo: hex(0xDD7878),
+    pink: hex(0xEA76CB),
+    mauve: hex(0x8839EF),
+    sky: hex(0x04A5E5),
 };
 
 pub const FRAPPE: Flavor = Flavor {
@@ -75,6 +85,11 @@ pub const FRAPPE: Flavor = Flavor {
     base: hex(0x303446),
     mantle: hex(0x292C3C),
     crust: hex(0x232634),
+    rosewater: hex(0xF2D5CF),
+    flamingo: hex(0xEEBEBE),
+    pink: hex(0xF4B8E4),
+    mauve: hex(0xCA9EE6),
+    sky: hex(0x99D1DB),
 };
 
 pub const MACCHIATO: Flavor = Flavor {
@@ -93,6 +108,11 @@ pub const MACCHIATO: Flavor = Flavor {
     base: hex(0x24273A),
     mantle: hex(0x1E2030),
     crust: hex(0x181926),
+    rosewater: hex(0xF4DBD6),
+    flamingo: hex(0xF0C6C6),
+    pink: hex(0xF5BDE6),
+    mauve: hex(0xC6A0F6),
+    sky: hex(0x91D7E3),
 };
 
 pub const MOCHA: Flavor = Flavor {
@@ -111,6 +131,11 @@ pub const MOCHA: Flavor = Flavor {
     base: hex(0x1E1E2E),
     mantle: hex(0x181825),
     crust: hex(0x11111B),
+    rosewater: hex(0xF5E0DC),
+    flamingo: hex(0xF2CDCD),
+    pink: hex(0xF5C2E7),
+    mauve: hex(0xCBA6F7),
+    sky: hex(0x89DCEB),
 };
 
 #[cfg(test)]

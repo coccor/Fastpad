@@ -89,10 +89,30 @@ pub enum CommandId {
     FileIconsMaterial = 194,
     FileIconsMinimal = 195,
     FileIconsSolid = 196,
+    LanguageBash = 197,
+    LanguageBatch = 198,
+    LanguageC = 199,
+    LanguageCSharp = 200,
+    LanguageCpp = 201,
+    LanguageCss = 202,
+    LanguageEnv = 203,
+    LanguageHtml = 204,
+    LanguageIni = 205,
+    LanguageJavaScript = 206,
+    LanguagePowerShell = 207,
+    LanguageProperties = 208,
+    LanguagePython = 209,
+    LanguageRust = 210,
+    LanguageSql = 211,
+    LanguageSvg = 212,
+    LanguageToml = 213,
+    LanguageTypeScript = 214,
+    LanguageXml = 215,
+    LanguageYaml = 216,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 18] = [
+pub const TEXT_COMMANDS: [CommandId; 38] = [
     CommandId::Save,
     CommandId::SaveAs,
     CommandId::Undo,
@@ -109,6 +129,26 @@ pub const TEXT_COMMANDS: [CommandId; 18] = [
     CommandId::LanguagePlainText,
     CommandId::LanguageJson,
     CommandId::LanguageMarkdown,
+    CommandId::LanguageBash,
+    CommandId::LanguageBatch,
+    CommandId::LanguageC,
+    CommandId::LanguageCSharp,
+    CommandId::LanguageCpp,
+    CommandId::LanguageCss,
+    CommandId::LanguageEnv,
+    CommandId::LanguageHtml,
+    CommandId::LanguageIni,
+    CommandId::LanguageJavaScript,
+    CommandId::LanguagePowerShell,
+    CommandId::LanguageProperties,
+    CommandId::LanguagePython,
+    CommandId::LanguageRust,
+    CommandId::LanguageSql,
+    CommandId::LanguageSvg,
+    CommandId::LanguageToml,
+    CommandId::LanguageTypeScript,
+    CommandId::LanguageXml,
+    CommandId::LanguageYaml,
     CommandId::NoteReloadFromDisk,
     CommandId::NoteKeepMine,
 ];
@@ -205,6 +245,67 @@ impl CommandId {
         }
     }
 
+    /// The language a `Language*` command switches the active tab to.
+    pub const fn language(self) -> Option<crate::document::Language> {
+        use crate::document::Language as L;
+        Some(match self {
+            Self::LanguagePlainText => L::PlainText,
+            Self::LanguageJson => L::Json,
+            Self::LanguageMarkdown => L::Markdown,
+            Self::LanguageBash => L::Bash,
+            Self::LanguageBatch => L::Batch,
+            Self::LanguageC => L::C,
+            Self::LanguageCSharp => L::CSharp,
+            Self::LanguageCpp => L::Cpp,
+            Self::LanguageCss => L::Css,
+            Self::LanguageEnv => L::Env,
+            Self::LanguageHtml => L::Html,
+            Self::LanguageIni => L::Ini,
+            Self::LanguageJavaScript => L::JavaScript,
+            Self::LanguagePowerShell => L::PowerShell,
+            Self::LanguageProperties => L::Properties,
+            Self::LanguagePython => L::Python,
+            Self::LanguageRust => L::Rust,
+            Self::LanguageSql => L::Sql,
+            Self::LanguageSvg => L::Svg,
+            Self::LanguageToml => L::Toml,
+            Self::LanguageTypeScript => L::TypeScript,
+            Self::LanguageXml => L::Xml,
+            Self::LanguageYaml => L::Yaml,
+            _ => return None,
+        })
+    }
+
+    /// The command that switches the active tab to `language`.
+    pub const fn for_language(language: crate::document::Language) -> Self {
+        use crate::document::Language as L;
+        match language {
+            L::PlainText => Self::LanguagePlainText,
+            L::Json => Self::LanguageJson,
+            L::Markdown => Self::LanguageMarkdown,
+            L::Bash => Self::LanguageBash,
+            L::Batch => Self::LanguageBatch,
+            L::C => Self::LanguageC,
+            L::CSharp => Self::LanguageCSharp,
+            L::Cpp => Self::LanguageCpp,
+            L::Css => Self::LanguageCss,
+            L::Env => Self::LanguageEnv,
+            L::Html => Self::LanguageHtml,
+            L::Ini => Self::LanguageIni,
+            L::JavaScript => Self::LanguageJavaScript,
+            L::PowerShell => Self::LanguagePowerShell,
+            L::Properties => Self::LanguageProperties,
+            L::Python => Self::LanguagePython,
+            L::Rust => Self::LanguageRust,
+            L::Sql => Self::LanguageSql,
+            L::Svg => Self::LanguageSvg,
+            L::Toml => Self::LanguageToml,
+            L::TypeScript => Self::LanguageTypeScript,
+            L::Xml => Self::LanguageXml,
+            L::Yaml => Self::LanguageYaml,
+        }
+    }
+
     /// The zero-based tab a `SelectTabN` command activates.
     pub const fn tab_index(self) -> Option<usize> {
         let first = Self::SelectTab1 as u16;
@@ -221,7 +322,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 86] = [
+        const COMMANDS: [CommandId; 106] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -308,6 +409,26 @@ impl TryFrom<u16> for CommandId {
             CommandId::FileIconsMaterial,
             CommandId::FileIconsMinimal,
             CommandId::FileIconsSolid,
+            CommandId::LanguageBash,
+            CommandId::LanguageBatch,
+            CommandId::LanguageC,
+            CommandId::LanguageCSharp,
+            CommandId::LanguageCpp,
+            CommandId::LanguageCss,
+            CommandId::LanguageEnv,
+            CommandId::LanguageHtml,
+            CommandId::LanguageIni,
+            CommandId::LanguageJavaScript,
+            CommandId::LanguagePowerShell,
+            CommandId::LanguageProperties,
+            CommandId::LanguagePython,
+            CommandId::LanguageRust,
+            CommandId::LanguageSql,
+            CommandId::LanguageSvg,
+            CommandId::LanguageToml,
+            CommandId::LanguageTypeScript,
+            CommandId::LanguageXml,
+            CommandId::LanguageYaml,
         ];
         COMMANDS
             .into_iter()
@@ -518,6 +639,39 @@ mod tests {
         assert_eq!(CommandId::try_from(193), Ok(CommandId::NoteNew));
         assert!(!CommandId::NoteNew.needs_document());
         assert!(!CommandId::NoteNew.is_sidebar());
+    }
+
+    #[test]
+    fn language_commands_round_trip_and_keep_their_numbers() {
+        // Break caught: a renumbered language command, or one that maps to the wrong language.
+        use crate::document::Language;
+        assert_eq!(CommandId::LanguagePlainText as u16, 114);
+        assert_eq!(CommandId::LanguageJson as u16, 115);
+        assert_eq!(CommandId::LanguageMarkdown as u16, 116);
+        assert_eq!(CommandId::LanguageBash as u16, 197);
+        assert_eq!(CommandId::LanguageYaml as u16, 216);
+        for row in crate::languages::LANGUAGES.iter() {
+            let command = CommandId::for_language(row.language);
+            assert_eq!(command.language(), Some(row.language));
+            assert_eq!(CommandId::try_from(command as u16), Ok(command));
+        }
+        assert_eq!(CommandId::Save.language(), None);
+        assert_eq!(
+            CommandId::for_language(Language::Xml),
+            CommandId::LanguageXml
+        );
+    }
+
+    #[test]
+    fn every_language_command_needs_text() {
+        // Break caught: a language command left enabled on an image tab.
+        for row in crate::languages::LANGUAGES.iter() {
+            assert!(
+                CommandId::for_language(row.language).needs_text(),
+                "{}",
+                row.name
+            );
+        }
     }
 
     #[test]

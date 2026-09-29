@@ -5,10 +5,10 @@ use crate::editor::scintilla_constants::{
     SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETLENGTH, SCI_GETSELECTIONEND,
     SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTARGETEND, SCI_GETTEXT, SCI_GETTEXTLENGTH,
     SCI_PASTE, SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET,
-    SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETSAVEPOINT,
-    SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION,
-    SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
-    SCI_UNDO,
+    SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETKEYWORDS,
+    SCI_SETPROPERTY, SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
+    SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
+    SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_STYLESETITALIC, SCI_UNDO,
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{
@@ -30,6 +30,7 @@ use crate::editor::scintilla_constants::{
 use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETXOFFSET, SCI_SETXOFFSET};
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
+    STYLE_MAX,
 };
 use crate::{FastPadError, Result};
 use std::cell::Cell;
@@ -934,8 +935,8 @@ impl Editor {
         ))
     }
 
-    /// Applies user view settings to every style up to `STYLE_LINENUMBER` without touching text,
-    /// selection, or colors, then re-sizes the line-number margin for the new font.
+    /// Applies user view settings to every style number (lexer styles run past the predefined
+    /// ones) without touching text, selection, or colors, then re-sizes the line-number margin.
     #[cfg(windows)]
     pub fn apply_view_settings(
         &self,
@@ -947,7 +948,7 @@ impl Editor {
         let face = CString::new(face).map_err(|_| {
             FastPadError::Invariant("Scintilla font face may not contain NUL bytes")
         })?;
-        for style in 0..=STYLE_LINENUMBER as usize {
+        for style in 0..=STYLE_MAX as usize {
             self.endpoint
                 .send_direct_checked(SCI_STYLESETFONT, style, face.as_ptr() as isize)?;
             self.endpoint.send_direct_checked(
@@ -1218,6 +1219,7 @@ impl Editor {
         foreground: u32,
         background: u32,
         bold: bool,
+        italic: bool,
         face: &str,
     ) -> Result<()> {
         let face = CString::new(face).map_err(|_| {
@@ -1229,6 +1231,11 @@ impl Editor {
             .send_direct_checked(SCI_STYLESETBACK, style as usize, background as isize)?;
         self.endpoint
             .send_direct_checked(SCI_STYLESETBOLD, style as usize, isize::from(bold))?;
+        self.endpoint.send_direct_checked(
+            SCI_STYLESETITALIC,
+            style as usize,
+            isize::from(italic),
+        )?;
         self.endpoint.send_direct_checked(
             SCI_STYLESETFONT,
             style as usize,
@@ -1244,8 +1251,50 @@ impl Editor {
         _foreground: u32,
         _background: u32,
         _bold: bool,
+        _italic: bool,
         _face: &str,
     ) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Hands the installed lexer keyword set `set` (space-separated words), via `SCI_SETKEYWORDS`.
+    #[cfg(windows)]
+    pub fn set_keywords(&self, set: usize, words: &str) -> Result<()> {
+        let words = CString::new(words)
+            .map_err(|_| FastPadError::Invariant("keyword lists may not contain NUL bytes"))?;
+        self.endpoint
+            .send_direct_checked(SCI_SETKEYWORDS, set, words.as_ptr() as isize)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_keywords(&self, _set: usize, _words: &str) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Sets one of the installed lexer's named options, via `SCI_SETPROPERTY`.
+    #[cfg(windows)]
+    pub fn set_lexer_property(&self, key: &str, value: &str) -> Result<()> {
+        let key = CString::new(key).map_err(|_| {
+            FastPadError::Invariant("lexer property names may not contain NUL bytes")
+        })?;
+        let value = CString::new(value).map_err(|_| {
+            FastPadError::Invariant("lexer property values may not contain NUL bytes")
+        })?;
+        self.endpoint.send_direct_checked(
+            SCI_SETPROPERTY,
+            key.as_ptr() as usize,
+            value.as_ptr() as isize,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_lexer_property(&self, _key: &str, _value: &str) -> Result<()> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
@@ -1653,7 +1702,7 @@ mod tests {
         SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
         SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
         SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE,
-        SCI_UNDO,
+        SCI_STYLESETITALIC, SCI_UNDO,
     };
     use crate::editor::scintilla_constants::{
         SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_SETZOOM, SCI_STYLEGETBACK,
@@ -2163,7 +2212,7 @@ mod tests {
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
         editor
-            .set_style(2, 0xff0000, 0x00ff00, true, "Consolas")
+            .set_style(2, 0xff0000, 0x00ff00, true, true, "Consolas")
             .unwrap();
 
         assert_eq!(
@@ -2172,6 +2221,7 @@ mod tests {
                 SCI_STYLESETFORE,
                 SCI_STYLESETBACK,
                 SCI_STYLESETBOLD,
+                SCI_STYLESETITALIC,
                 SCI_STYLESETFONT
             ]
         );
@@ -2181,17 +2231,18 @@ mod tests {
                 (SCI_STYLESETFORE, 2, 0xff0000),
                 (SCI_STYLESETBACK, 2, 0x00ff00),
                 (SCI_STYLESETBOLD, 2, 1),
+                (SCI_STYLESETITALIC, 2, 1),
             ]
         );
         assert_eq!(harness.font_calls(), vec![(2, b"Consolas".to_vec())]);
     }
 
     #[test]
-    fn set_style_sends_a_zero_bold_flag_when_not_bold() {
+    fn set_style_sends_zero_bold_and_italic_flags_when_plain() {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        editor.set_style(0, 0, 0, false, "Consolas").unwrap();
+        editor.set_style(0, 0, 0, false, false, "Consolas").unwrap();
 
         assert_eq!(
             harness.style_calls(),
@@ -2199,6 +2250,7 @@ mod tests {
                 (SCI_STYLESETFORE, 0, 0),
                 (SCI_STYLESETBACK, 0, 0),
                 (SCI_STYLESETBOLD, 0, 0),
+                (SCI_STYLESETITALIC, 0, 0),
             ]
         );
     }
@@ -2208,7 +2260,11 @@ mod tests {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        assert!(editor.set_style(0, 0, 0, false, "bad\0face").is_err());
+        assert!(
+            editor
+                .set_style(0, 0, 0, false, false, "bad\0face")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2675,7 +2731,7 @@ mod tests {
                 state.lexer_calls.push(lparam);
                 0
             }
-            SCI_STYLESETFORE | SCI_STYLESETBACK | SCI_STYLESETBOLD => {
+            SCI_STYLESETFORE | SCI_STYLESETBACK | SCI_STYLESETBOLD | SCI_STYLESETITALIC => {
                 state.style_calls.push((message, wparam, lparam));
                 0
             }

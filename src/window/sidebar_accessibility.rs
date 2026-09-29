@@ -315,13 +315,11 @@ pub(crate) fn tree_item(
     visible: bool,
 ) -> AccessibleItem {
     let mut name = row.name.clone();
-    // The type comes from the extension, which the row's name leaves out (spec §5.4).
+    // The type comes from the extension, which the row's name leaves out (spec §5.4), or from
+    // the whole file name (`.env`).
     if let RowKind::Note(path) = &row.kind {
-        let extension = path
-            .extension()
-            .map(|extension| extension.to_string_lossy());
         name.push_str(", ");
-        name.push_str(crate::window::file_icons::type_name(extension.as_deref()));
+        name.push_str(crate::window::file_icons::type_name(path));
     }
     if row.pinned {
         name.push_str(", pinned");

@@ -524,12 +524,7 @@ fn draw_tree_row(
                 expanded: row.expanded,
             });
         }
-        RowKind::Note(path) => {
-            let extension = path
-                .extension()
-                .map(|extension| extension.to_string_lossy());
-            draw_icon(TreeItem::Note(note_kind(extension.as_deref())));
-        }
+        RowKind::Note(path) => draw_icon(TreeItem::Note(note_kind(path))),
         RowKind::Draft => {
             if let Some(item) = editing {
                 draw_icon(item);
@@ -603,12 +598,7 @@ fn draw_recent_row(
 fn drag_item(kind: &RowKind) -> Option<TreeItem> {
     match kind {
         RowKind::Folder(_) => Some(TreeItem::Folder { expanded: false }),
-        RowKind::Note(path) => {
-            let extension = path
-                .extension()
-                .map(|extension| extension.to_string_lossy());
-            Some(TreeItem::Note(note_kind(extension.as_deref())))
-        }
+        RowKind::Note(path) => Some(TreeItem::Note(note_kind(path))),
         RowKind::Draft => None,
     }
 }
@@ -1335,15 +1325,10 @@ impl NotebookView {
                 let name = self.rows.iter().find(|row| &row.kind == kind)?.name.clone();
                 (item, name)
             }
-            DragSource::Tab { path, .. } => {
-                let extension = path
-                    .extension()
-                    .map(|extension| extension.to_string_lossy());
-                (
-                    TreeItem::Note(note_kind(extension.as_deref())),
-                    super::tree_copy::item_name(path),
-                )
-            }
+            DragSource::Tab { path, .. } => (
+                TreeItem::Note(note_kind(path)),
+                super::tree_copy::item_name(path),
+            ),
             DragSource::Files(_) => return None,
         };
         let text = self
@@ -4244,7 +4229,7 @@ mod tests {
             paint_drag_label(
                 target.dc,
                 size,
-                TreeItem::Note(note_kind(Some("md"))),
+                TreeItem::Note(note_kind(std::path::Path::new("a.md"))),
                 "notes.md",
                 &paint,
                 &mut images,
@@ -4298,7 +4283,7 @@ mod tests {
         );
         assert_eq!(
             drag_item(&RowKind::Note(r"work\a.json".into())),
-            Some(TreeItem::Note(note_kind(Some("json"))))
+            Some(TreeItem::Note(note_kind(std::path::Path::new("a.json"))))
         );
         assert_eq!(drag_item(&RowKind::Draft), None);
     }

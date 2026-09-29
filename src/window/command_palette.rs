@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 73] = [
+pub(crate) const ENTRIES: [PaletteEntry; 93] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -105,9 +105,29 @@ pub(crate) const ENTRIES: [PaletteEntry; 73] = [
     ),
     entry("JSON: Format document", CommandId::FormatJson),
     entry("JSON: Validate document", CommandId::ValidateJson),
-    entry("Language: Plain text", CommandId::LanguagePlainText),
+    entry("Language: Plain Text", CommandId::LanguagePlainText),
+    entry("Language: Bash", CommandId::LanguageBash),
+    entry("Language: Batch", CommandId::LanguageBatch),
+    entry("Language: C", CommandId::LanguageC),
+    entry("Language: C#", CommandId::LanguageCSharp),
+    entry("Language: C++", CommandId::LanguageCpp),
+    entry("Language: CSS", CommandId::LanguageCss),
+    entry("Language: Env", CommandId::LanguageEnv),
+    entry("Language: HTML", CommandId::LanguageHtml),
+    entry("Language: INI", CommandId::LanguageIni),
+    entry("Language: JavaScript", CommandId::LanguageJavaScript),
     entry("Language: JSON", CommandId::LanguageJson),
     entry("Language: Markdown", CommandId::LanguageMarkdown),
+    entry("Language: PowerShell", CommandId::LanguagePowerShell),
+    entry("Language: Properties", CommandId::LanguageProperties),
+    entry("Language: Python", CommandId::LanguagePython),
+    entry("Language: Rust", CommandId::LanguageRust),
+    entry("Language: SQL", CommandId::LanguageSql),
+    entry("Language: SVG", CommandId::LanguageSvg),
+    entry("Language: TOML", CommandId::LanguageToml),
+    entry("Language: TypeScript", CommandId::LanguageTypeScript),
+    entry("Language: XML", CommandId::LanguageXml),
+    entry("Language: YAML", CommandId::LanguageYaml),
     entry(
         "Markdown Preview: Side by Side",
         CommandId::MarkdownPreviewSide,
@@ -1437,7 +1457,19 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 73);
+        assert_eq!(ENTRIES.len(), 93);
+    }
+
+    #[test]
+    fn every_language_is_in_the_palette() {
+        for row in crate::languages::LANGUAGES.iter() {
+            let command = CommandId::for_language(row.language);
+            let entry = ENTRIES
+                .iter()
+                .find(|entry| entry.command == command)
+                .unwrap_or_else(|| panic!("{} missing from the palette", row.name));
+            assert_eq!(entry.label, format!("Language: {}", row.name));
+        }
     }
 
     #[test]
