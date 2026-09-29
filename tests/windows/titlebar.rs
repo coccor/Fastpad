@@ -288,7 +288,10 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     // A plain launch ends with no tab; New opens the one the strip lists.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while accessible.child_count()? != 0 {
-        assert!(std::time::Instant::now() < deadline, "the startup tab stayed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the startup tab stayed"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };

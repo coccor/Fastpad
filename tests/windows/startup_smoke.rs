@@ -11,9 +11,9 @@ use support::process::{FastPadProcess, wait_for_process_exit};
 #[cfg(windows)]
 use support::win32::{find_child_by_class, focused_window, scintilla_text, send_text};
 #[cfg(windows)]
-use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
-#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
 
 #[cfg(windows)]
 #[test]
@@ -96,7 +96,10 @@ fn dropping_fastpad_process_reaps_the_running_child() {
 fn wait_for_text(editor: windows_sys::Win32::Foundation::HWND, text: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while scintilla_text(editor).unwrap() != text {
-        assert!(std::time::Instant::now() < deadline, "the editor never showed {text:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the editor never showed {text:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
