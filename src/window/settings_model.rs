@@ -523,7 +523,16 @@ impl DialogModel {
                 } else {
                     (index + 1) % count
                 };
-                Effect::ShowPage(Page::ALL[next])
+                let target = Page::ALL[next];
+                // A typed font size commits on the way out, as on any focus move; the page
+                // switches here because the one effect returned is the change to apply.
+                match self.commit_typed(view) {
+                    Effect::None => Effect::ShowPage(target),
+                    commit => {
+                        self.show_page(target);
+                        commit
+                    }
+                }
             }
             _ => match self.focus {
                 Focus::Nav => {
@@ -730,6 +739,22 @@ mod tests {
             "switching from the nav keeps the focus there"
         );
         assert_eq!(DialogModel::new(Page::Shortcuts).focus, Focus::Search);
+    }
+
+    #[test]
+    fn switching_pages_with_the_keyboard_commits_a_typed_font_size() {
+        // Break caught: Ctrl+PageDown discarding a font size that was typed but not committed.
+        let view = view();
+        let mut model = DialogModel::new(Page::General);
+        model.focus = Focus::Row(Row::FontSize);
+        model.key(Key::Char('1'), &view);
+        model.key(Key::Char('6'), &view);
+        assert_eq!(
+            model.key(Key::NextPage { back: false }, &view),
+            Effect::Apply(SettingsAction::SetFontSize(16))
+        );
+        assert_eq!(model.page, Page::Shortcuts);
+        assert_eq!(model.typed, None);
     }
 
     #[test]
