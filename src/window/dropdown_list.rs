@@ -1,7 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "used by the settings dialog, added in the next task"
-)]
 //! The Settings dialog's dropdown list: a themed popup under a dropdown that never takes the
 //! activation, so the keyboard stays with the dialog, which forwards keys here (settings dialog
 //! spec §3.5). `ListModel` is the pure part: selection, scrolling and type-ahead.

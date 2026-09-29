@@ -2280,7 +2280,6 @@ pub(crate) fn name_box_browse(hwnd: HWND) {
 
 /// The open notebook's autosave switch, or `None` while no notebook is open or its state is still
 /// loading. The Settings dialog greys its row out then (settings dialog spec §3.2).
-#[allow(dead_code)] // Temporary: Task 7 (Settings dialog) is the caller.
 pub(crate) fn notebook_autosave(hwnd: HWND) -> Option<bool> {
     host(hwnd, |host| {
         host.state.as_ref().map(|state| state.local.autosave)

@@ -37,6 +37,7 @@ pub(crate) mod preview_buttons;
 pub(crate) mod preview_host;
 pub(crate) mod row_list;
 pub(crate) mod search_view;
+pub(crate) mod settings_dialog;
 pub(crate) mod settings_model;
 pub(crate) mod side_panel;
 pub(crate) mod sidebar_accessibility;

@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "used by the settings dialog, added in the next tasks"
-)]
-
 //! The Settings dialog's rows and what each input does to them (settings dialog spec §3, §4.1).
 //! Pure: no window handles, so the dialog's behaviour is tested without a window.
 

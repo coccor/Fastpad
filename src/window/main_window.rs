@@ -2094,6 +2094,51 @@ fn show_about(hwnd: HWND) {
     crate::window::about::show(hwnd, current_palette(hwnd), link_color(hwnd));
 }
 
+/// The Settings dialog: File → Settings…, Ctrl+, and the activity bar's gear (settings dialog
+/// spec §4.3).
+#[allow(dead_code)] // Temporary: Task 8 wires the command, menu and gear button.
+pub(crate) fn show_settings(hwnd: HWND) {
+    let outcome =
+        crate::window::settings_dialog::show(hwnd, current_palette(hwnd), link_color(hwnd));
+    if outcome == crate::window::settings_dialog::Outcome::EditIni {
+        edit_settings_file(hwnd);
+    }
+}
+
+/// Preferences: Edit fastpad.ini. Creates the file (empty) when it doesn't exist yet, then opens
+/// it in a tab through the normal open path (settings dialog spec §3.6).
+#[allow(dead_code)] // Temporary: Task 8 wires the command, menu and gear button.
+pub(crate) fn edit_settings_file(hwnd: HWND) {
+    let result = settings_file_for_editing().and_then(|path| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        open_path(hwnd, &path)
+    });
+    if let Err(error) = result {
+        push_notice(hwnd, format!("FastPad could not open fastpad.ini: {error}"));
+    }
+}
+
+#[cfg(not(test))]
+fn settings_file_for_editing() -> Result<std::path::PathBuf> {
+    crate::config::persisted::settings_file_path()
+}
+
+/// Tests open only the file they chose with `save_settings_to`.
+#[cfg(test)]
+fn settings_file_for_editing() -> Result<std::path::PathBuf> {
+    TEST_SETTINGS_PATH
+        .with(|path| path.borrow().clone())
+        .ok_or(crate::FastPadError::Invariant(
+            "a test opened fastpad.ini without save_settings_to",
+        ))
+}
+
 pub(crate) fn open_command_palette(hwnd: HWND) {
     show_command_palette(hwnd, None);
 }
@@ -3804,7 +3849,6 @@ fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
 
 /// Makes one Settings dialog change through the same code the palette commands use, so it
 /// applies at once and saves its one `fastpad.ini` line (settings dialog spec §4.2).
-#[allow(dead_code)] // Temporary: Task 7 (Settings dialog) is the caller.
 pub(crate) fn apply_settings_action(
     hwnd: HWND,
     action: crate::window::settings_model::SettingsAction,
@@ -3826,7 +3870,6 @@ pub(crate) fn apply_settings_action(
 }
 
 /// What the Settings dialog shows. Call it with nothing of the App borrowed.
-#[allow(dead_code)] // Temporary: Task 7 (Settings dialog) is the caller.
 pub(crate) fn settings_view(hwnd: HWND) -> crate::window::settings_model::SettingsView {
     let settings = unsafe { app_ptr(hwnd) }.map_or_else(crate::config::default_settings, |app| {
         unsafe { app.as_ref() }.settings.clone()
@@ -26277,5 +26320,169 @@ three"
             crate::window::about::take_opened_urls(),
             [crate::window::about::Link::Repository.url()]
         );
+    }
+
+    #[test]
+    fn settings_opens_an_owned_modal_dialog_that_escape_closes() {
+        // Break caught: a dialog that can hide behind the main window, leaves it disabled after
+        // closing, or never ends its modal scope.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GW_OWNER, GetWindow, PostMessageW, WM_KEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let owner = window.hwnd;
+        let shown = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = shown.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| {
+            let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
+            let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
+            let modal = crate::window::modal::modal_active(owner);
+            seen.set(Some((dialog, owned, owner_disabled, modal)));
+            unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        });
+
+        super::show_settings(owner);
+
+        let (dialog, owned, owner_disabled, modal) = shown.get().expect("Settings was shown");
+        assert!(owned && owner_disabled && modal);
+        assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
+        assert_ne!(unsafe { IsWindowEnabled(owner) }, 0);
+        assert!(!crate::window::modal::modal_active(owner));
+    }
+
+    #[test]
+    fn the_settings_dialog_changes_settings_from_the_keyboard() {
+        // Break caught: arrows or Space that change nothing, a typed font size lost when Tab
+        // leaves the field, or changes that aren't saved (settings dialog spec §3.3).
+        use crate::config::FileIconSet;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_ESCAPE, VK_RIGHT, VK_SPACE, VK_TAB,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-keys");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            let char = |c: char| PostMessageW(dialog, WM_CHAR, c as usize, 0);
+            key(VK_TAB); // File icons
+            key(VK_RIGHT); // Minimal
+            key(VK_TAB); // Font
+            key(VK_TAB); // Font size
+            char('1');
+            char('6');
+            key(VK_TAB); // commits 16; Tab width
+            key(VK_RIGHT); // 4 → 8
+            key(VK_TAB); // Indent with spaces
+            key(VK_SPACE);
+            key(VK_ESCAPE);
+        });
+
+        super::show_settings(window.hwnd);
+
+        let settings = app_mut(window.hwnd).settings.clone();
+        assert_eq!(settings.file_icons, FileIconSet::Minimal);
+        assert_eq!(settings.font_size, 16);
+        assert_eq!(settings.tab_width, 8);
+        assert!(settings.insert_spaces);
+        super::save_settings_to(None);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\ntab_width=8\r\ninsert_spaces=true\r\n"
+        );
+    }
+
+    #[test]
+    fn the_theme_dropdown_opens_with_enter_and_picks_with_the_keyboard() {
+        // Break caught: a dropdown that opens but ignores the arrows, or picks without applying.
+        use crate::config::ThemePreference;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let scratch = RecoveryScratch::new("settings-dialog-theme");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            key(VK_RETURN); // opens the Theme list on System
+            key(VK_DOWN); // Light
+            key(VK_RETURN); // picks it and closes the list
+            key(VK_ESCAPE); // closes the dialog
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).settings.theme, ThemePreference::Light);
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn the_dialog_keeps_the_focus_after_a_change_that_moves_it() {
+        // Break caught: switching notes mode off from the dialog tears down the sidebar, the
+        // focus lands in the main window, and the dialog stops answering the keyboard (review
+        // focus 1). Posted test keys reach the dialog whatever the focus, so the dialog records
+        // the focus after each change and the test checks that record.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_SPACE, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-focus");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::settings_dialog::take_focus_checks();
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            // Theme → … → Notes mode is the 11th row: ten Tabs.
+            for _ in 0..10 {
+                key(VK_TAB);
+            }
+            key(VK_SPACE); // notes mode off
+            key(VK_SPACE); // and on again
+            key(VK_ESCAPE);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert!(app_mut(window.hwnd).settings.notes_mode, "both toggles ran");
+        assert_eq!(
+            crate::window::settings_dialog::take_focus_checks(),
+            [true, true],
+            "the dialog had the keyboard after each change"
+        );
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn edit_fastpad_ini_closes_the_dialog_and_opens_the_file_in_a_tab() {
+        // Break caught: the link doing nothing when fastpad.ini doesn't exist yet, or opening it
+        // under the still-modal dialog (settings dialog spec §3.6).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-edit-ini");
+        let ini = scratch.path().join("FastPad").join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            // 12 enabled rows (no notebook, so autosave is skipped): 12 Tabs reach the link.
+            for _ in 0..12 {
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+            }
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert!(ini.exists(), "created when missing");
+        assert!(
+            app_mut(window.hwnd).tabs.find_path(&ini).is_some(),
+            "opened in a tab"
+        );
+        super::save_settings_to(None);
     }
 }
