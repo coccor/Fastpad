@@ -15,6 +15,7 @@ use crate::window::messages::{
 };
 use crate::window::modal::prompt_close_decision;
 use crate::window::palette::Palette;
+use crate::window::settings_model::{MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::window::split_tree::GroupId;
 use crate::window::tabs::CloseReviewKey;
 use crate::window::titlebar::{
@@ -2077,17 +2078,20 @@ fn take_palette_note_target(hwnd: HWND) -> Option<std::path::PathBuf> {
     unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.palette_note_target.take())
 }
 
-/// Help → About FastPad, in the current theme's colors and the Markdown preview's link color.
-fn show_about(hwnd: HWND) {
-    let colors = current_palette(hwnd);
+/// The theme's link colour, as the Markdown preview draws links.
+pub(crate) fn link_color(hwnd: HWND) -> u32 {
     let theme = effective_theme(hwnd);
     let high_contrast = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         unsafe { app.as_ref() }
             .theme
             .is_some_and(|system| system.high_contrast)
     });
-    let link = crate::preview::colors::preview_colors(theme, high_contrast).link;
-    crate::window::about::show(hwnd, colors, link);
+    crate::preview::colors::preview_colors(theme, high_contrast).link
+}
+
+/// Help → About FastPad, in the current theme's colors and the Markdown preview's link color.
+fn show_about(hwnd: HWND) {
+    crate::window::about::show(hwnd, current_palette(hwnd), link_color(hwnd));
 }
 
 pub(crate) fn open_command_palette(hwnd: HWND) {
@@ -3757,11 +3761,6 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
     }
 }
 
-/// Font-size commands step within this range; a size set outside it in `fastpad.ini` is kept
-/// until a step moves it back toward the range.
-const MIN_FONT_SIZE: u16 = 6;
-const MAX_FONT_SIZE: u16 = 72;
-
 fn set_font_size(hwnd: HWND, next: impl FnOnce(u16) -> u16) {
     change_setting(hwnd, |settings| {
         let size = next(settings.font_size);
@@ -3800,6 +3799,41 @@ fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
     });
     if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
         unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+    }
+}
+
+/// Makes one Settings dialog change through the same code the palette commands use, so it
+/// applies at once and saves its one `fastpad.ini` line (settings dialog spec §4.2).
+#[allow(dead_code)] // Temporary: Task 7 (Settings dialog) is the caller.
+pub(crate) fn apply_settings_action(
+    hwnd: HWND,
+    action: crate::window::settings_model::SettingsAction,
+) {
+    use crate::window::settings_model::SettingsAction;
+    match action {
+        SettingsAction::SetTheme(theme) => set_theme(hwnd, theme),
+        SettingsAction::SetFileIcons(set) => set_file_icons(hwnd, set),
+        SettingsAction::SetFontFace(face) => change_setting(hwnd, |settings| {
+            (settings.font_face != face).then(|| {
+                settings.font_face.clone_from(&face);
+                ("font_face", face)
+            })
+        }),
+        SettingsAction::SetFontSize(size) => set_font_size(hwnd, |_| size),
+        SettingsAction::SetTabWidth(width) => set_tab_width(hwnd, width),
+        SettingsAction::Toggle(toggle) => execute_command(hwnd, toggle.command()),
+    }
+}
+
+/// What the Settings dialog shows. Call it with nothing of the App borrowed.
+#[allow(dead_code)] // Temporary: Task 7 (Settings dialog) is the caller.
+pub(crate) fn settings_view(hwnd: HWND) -> crate::window::settings_model::SettingsView {
+    let settings = unsafe { app_ptr(hwnd) }.map_or_else(crate::config::default_settings, |app| {
+        unsafe { app.as_ref() }.settings.clone()
+    });
+    crate::window::settings_model::SettingsView {
+        settings,
+        notebook_autosave: crate::window::library_host::notebook_autosave(hwnd),
     }
 }
 
@@ -11047,6 +11081,55 @@ three"
             std::fs::read_to_string(&ini).unwrap(),
             "# kept\r\ninsert_spaces=true\r\nshow_whitespace=true\r\n\
              highlight_current_line=true\r\ntheme=dark\r\n"
+        );
+    }
+
+    #[test]
+    fn settings_actions_apply_and_save_only_their_own_lines() {
+        // Break caught: a dialog change that updates the window but is lost on restart, one that
+        // rewrites the user's fastpad.ini, or a re-pick of the current value that writes anyway
+        // (settings dialog spec §4.2).
+        use crate::config::{FileIconSet, ThemePreference};
+        use crate::window::settings_model::{SettingsAction, Toggle};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-actions");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+
+        for action in [
+            SettingsAction::SetTheme(ThemePreference::CatppuccinMocha),
+            SettingsAction::SetFileIcons(FileIconSet::Solid),
+            SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
+            SettingsAction::SetFontSize(14),
+            SettingsAction::SetTabWidth(2),
+            SettingsAction::Toggle(Toggle::WordWrap),
+            // Picking what is already set writes nothing.
+            SettingsAction::SetFontSize(14),
+            SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
+        ] {
+            super::apply_settings_action(window.hwnd, action);
+        }
+
+        let settings = app_mut(window.hwnd).settings.clone();
+        assert_eq!(settings.theme, ThemePreference::CatppuccinMocha);
+        assert_eq!(settings.file_icons, FileIconSet::Solid);
+        assert_eq!(settings.font_face, "Cascadia Mono");
+        assert_eq!(settings.font_size, 14);
+        assert_eq!(settings.tab_width, 2);
+        assert!(settings.word_wrap);
+        let view = super::settings_view(window.hwnd);
+        assert_eq!(view.settings, settings);
+        assert_eq!(view.notebook_autosave, None, "no notebook is open");
+        super::save_settings_to(None);
+
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\ntheme=catppuccin-mocha\r\nfile_icons=solid\r\nfont_face=Cascadia Mono\r\n\
+             font_size=14\r\ntab_width=2\r\nword_wrap=true\r\n"
         );
     }
 
