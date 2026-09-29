@@ -20429,6 +20429,79 @@ three"
     }
 
     #[test]
+    fn resizing_settings_lays_out_the_table_and_the_search_field_again() {
+        // Break caught: a Settings dialog that can't be sized, or one whose table and search
+        // field keep their opening size (rows cut off, or space under the last row) after it is.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongW, GetWindowRect, PostMessageW, SWP_NOMOVE, SWP_NOZORDER,
+            SetWindowPos, WM_KEYDOWN, WS_THICKFRAME,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let sizable = GetWindowLongW(dialog, GWL_STYLE) as u32 & WS_THICKFRAME != 0;
+            let measure = || {
+                let visible = crate::window::settings_dialog::shortcuts_model(dialog)
+                    .map_or(0, |model| model.visible);
+                let mut dialog_rect = RECT::default();
+                let mut field = RECT::default();
+                GetWindowRect(dialog, &mut dialog_rect);
+                GetWindowRect(
+                    crate::window::settings_dialog::search_hwnd(dialog),
+                    &mut field,
+                );
+                (
+                    visible,
+                    field.right - field.left,
+                    dialog_rect.right - dialog_rect.left,
+                )
+            };
+            let before = measure();
+            let (_, _, width) = before;
+            SetWindowPos(
+                dialog,
+                std::ptr::null_mut(),
+                0,
+                0,
+                width + 200,
+                900,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+            let bigger = measure();
+            // Far below the minimum: held at it.
+            SetWindowPos(
+                dialog,
+                std::ptr::null_mut(),
+                0,
+                0,
+                100,
+                100,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+            let smallest = measure();
+            record
+                .borrow_mut()
+                .push((sizable, before, bigger, smallest));
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let seen = seen.borrow();
+        let (sizable, before, bigger, smallest) = seen[0];
+        assert!(sizable, "the dialog has a sizing frame");
+        assert!(bigger.0 > before.0, "a taller dialog shows more rows");
+        assert_eq!(
+            bigger.1,
+            before.1 + 200,
+            "the search field widens with the dialog"
+        );
+        assert!(smallest.2 > 100, "held at a minimum width");
+        assert!(smallest.0 >= 1 && smallest.1 > 0, "still a row and a field");
+    }
+
+    #[test]
     fn small_wheel_deltas_add_up_to_whole_rows_on_the_shortcuts_page() {
         // Break caught: a touchpad's small deltas each rounding to zero rows, so slow scrolling
         // never moves the table; or a leftover from one direction eating the first reverse step.
@@ -26930,7 +27003,8 @@ three"
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GW_OWNER, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
-            HTCAPTION, HTCLIENT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST, WS_CAPTION,
+            HTCAPTION, HTCLIENT, HTRIGHT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST,
+            WS_CAPTION,
         };
         let window = ProductionWindow::new(make_app());
         let owner = window.hwnd;
@@ -26953,7 +27027,8 @@ three"
                 && client.right - client.left == frame.right - frame.left
                 && client.bottom - client.top == frame.bottom - frame.top
                 && client.right > 0;
-            // The title row still drags the dialog; its × does not.
+            // The title row still drags the dialog; its × does not; the hidden frame's edges
+            // still size it.
             let hit = |x: i32, y: i32| unsafe {
                 SendMessageW(
                     dialog,
@@ -26964,7 +27039,8 @@ three"
             };
             let framed = framed
                 && hit(frame.left + 30, frame.top + 10) == HTCAPTION as LRESULT
-                && hit(frame.right - 5, frame.top + 10) == HTCLIENT as LRESULT;
+                && hit(frame.right - 20, frame.top + 20) == HTCLIENT as LRESULT
+                && hit(frame.right - 1, (frame.top + frame.bottom) / 2) == HTRIGHT as LRESULT;
             seen.set(Some((dialog, owned, owner_disabled, modal, framed)));
             unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
         });

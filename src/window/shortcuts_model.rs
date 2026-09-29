@@ -255,6 +255,13 @@ impl ShortcutsModel {
         self.clamp();
     }
 
+    /// The table now shows `visible` rows (the dialog was resized): the selection stays in view
+    /// and a taller table fills from the top rather than showing space under the last row.
+    pub(crate) fn set_visible(&mut self, visible: usize) {
+        self.visible = visible.max(1);
+        self.clamp();
+    }
+
     /// Scrolls by `rows` (negative: up) without moving the selection.
     pub(crate) fn scroll(&mut self, rows: isize) {
         let max_top = self.rows.len().saturating_sub(self.visible);
@@ -711,5 +718,29 @@ mod tests {
         assert_eq!(model.top, 0);
         model.scroll(isize::MAX);
         assert_eq!(model.top, model.rows.len() - 10);
+    }
+
+    #[test]
+    fn resizing_the_table_keeps_the_selection_in_view_and_fills_it() {
+        // Break caught: after a resize, the selected row hidden below a shorter table, or a
+        // taller one scrolled to the end showing empty space under the last row.
+        let mut model = model("");
+        let last = model.rows.len() - 1;
+        model.select(last);
+        assert_eq!(model.top, model.rows.len() - 10);
+        model.set_visible(20);
+        assert_eq!(
+            model.top,
+            model.rows.len() - 20,
+            "no space under the last row"
+        );
+        model.select(15);
+        model.set_visible(4);
+        assert!(
+            model.top <= 15 && 15 < model.top + 4,
+            "the selection stays in view"
+        );
+        model.set_visible(0);
+        assert_eq!(model.visible, 1);
     }
 }

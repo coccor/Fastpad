@@ -40,7 +40,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Controls::MARGINS;
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
@@ -49,14 +49,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, GW_OWNER,
     GWLP_USERDATA, GetCursorPos, GetMessageTime, GetMessageW, GetSystemMetrics, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HCURSOR, HTCAPTION,
-    HTCLIENT, IDC_ARROW, IDC_HAND, IsWindow, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassW, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-    SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-    WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HCURSOR, HTBOTTOM,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+    HTTOPRIGHT, IDC_ARROW, IDC_HAND, IsWindow, IsZoomed, LoadCursorW, MINMAXINFO, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SM_CXDOUBLECLK, SM_CXPADDEDBORDER,
+    SM_CXSIZEFRAME, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WA_INACTIVE,
+    WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION,
-    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_POPUP, WS_THICKFRAME,
 };
 
 const TITLE: &str = "Settings";
@@ -69,6 +71,9 @@ const GLYPH_REMOVE: &str = "\u{E738}";
 
 /// The width, unless the work area is narrower.
 const WIDTH_AT_96_DPI: i32 = 860;
+/// The smallest the user can size the dialog to: the nav, a usable card column and a few rows.
+const MIN_WIDTH_AT_96_DPI: i32 = 600;
+const MIN_HEIGHT_AT_96_DPI: i32 = 360;
 const NAV_WIDTH_AT_96_DPI: i32 = 180;
 const NAV_ITEM_HEIGHT_AT_96_DPI: i32 = 32;
 const NAV_INSET_AT_96_DPI: i32 = 8;
@@ -153,13 +158,37 @@ pub(crate) struct Layout {
     pub edit_ini: RECT,
     pub close: RECT,
     dpi: u32,
+    link_width: i32,
 }
 
 impl Layout {
-    /// The layout at `dpi`, at most `max_width` wide and `max_height` tall (the work area), with
-    /// the Edit fastpad.ini link `link_width` wide.
+    /// The layout at `dpi` at its natural size, at most `max_width` wide and `max_height` tall
+    /// (the work area), with the Edit fastpad.ini link `link_width` wide.
     pub(crate) fn calculate(dpi: u32, max_width: i32, max_height: i32, link_width: i32) -> Self {
-        let width = scale(WIDTH_AT_96_DPI, dpi).min(max_width);
+        let width = scale(WIDTH_AT_96_DPI, dpi);
+        // Only the content's height is read off this one.
+        let probe = Self::sized(dpi, width, 0, link_width);
+        let chrome = probe.title.bottom + scale(FOOTER_HEIGHT_AT_96_DPI, dpi);
+        let natural = chrome + probe.content_height;
+        let smallest = chrome + probe.row_pitch() * MIN_VISIBLE_ROWS;
+        Self::sized(
+            dpi,
+            width.min(max_width),
+            natural.min(max_height.max(smallest)),
+            link_width,
+        )
+    }
+
+    /// The smallest size the user can drag the dialog to.
+    pub(crate) fn min_size(dpi: u32) -> (i32, i32) {
+        (
+            scale(MIN_WIDTH_AT_96_DPI, dpi),
+            scale(MIN_HEIGHT_AT_96_DPI, dpi),
+        )
+    }
+
+    /// The layout `width` by `height`, as the dialog opens or as the user sized it.
+    pub(crate) fn sized(dpi: u32, width: i32, height: i32, link_width: i32) -> Self {
         let padding = scale(PADDING_AT_96_DPI, dpi);
         let title_height = scale(TITLE_HEIGHT_AT_96_DPI, dpi);
         let heading_height = scale(HEADING_HEIGHT_AT_96_DPI, dpi);
@@ -203,8 +232,6 @@ impl Layout {
         // The last card's gap separates it from the footer.
         let content_height = top;
 
-        let smallest = title_height + row_pitch * MIN_VISIBLE_ROWS + footer_height;
-        let height = (title_height + content_height + footer_height).min(max_height.max(smallest));
         let body = RECT {
             left: nav_width,
             top: title_height,
@@ -256,6 +283,7 @@ impl Layout {
             edit_ini,
             close,
             dpi,
+            link_width,
         }
     }
 
@@ -604,8 +632,10 @@ fn create(
             class.as_ptr(),
             title.as_ptr(),
             // WS_CAPTION gives it a native frame, hidden by WM_NCCALCSIZE, so DWM draws the
-            // window shadow; no system menu and no sizing border.
-            WS_POPUP | WS_CAPTION | WS_CLIPCHILDREN,
+            // window shadow; no system menu. It sizes like a window: WS_THICKFRAME for dragging
+            // its edges (hit-tested in WM_NCHITTEST, as the frame is hidden), snapping and
+            // maximizing, WS_MAXIMIZEBOX for a double-click on the title row.
+            WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
             0,
             0,
             0,
@@ -692,8 +722,7 @@ fn create(
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
     // Created here, with the dialog: nothing of the page exists before it opens.
-    let text_height = scale(18, dpi);
-    let field = super::shortcuts_page::field_rect(page_layout.search, text_height, dpi);
+    let field = search_field(&page_layout, dpi);
     let search = super::shortcuts_page::create_search(dialog, field, body_font);
     if let Some(created) = self::state(dialog) {
         created.search = Some(search).filter(|search| !search.is_null());
@@ -734,6 +763,72 @@ fn create(
         DwmExtendFrameIntoClientArea(dialog, &margins);
     }
     Some(dialog)
+}
+
+/// Where the search EDIT sits in the page's search box.
+fn search_field(page_layout: &super::shortcuts_page::PageLayout, dpi: u32) -> RECT {
+    super::shortcuts_page::field_rect(page_layout.search, scale(18, dpi), dpi)
+}
+
+/// Lays the dialog out again at its new client size, `width` by `height`.
+fn resized(hwnd: HWND, width: i32, height: i32) {
+    let moved = state(hwnd).and_then(|dialog| {
+        let layout = &dialog.layout;
+        if (layout.width, layout.height) == (width, height) {
+            return None;
+        }
+        let dpi = layout.dpi;
+        dialog.layout = Layout::sized(dpi, width, height, layout.link_width);
+        dialog.scroll = dialog
+            .layout
+            .scroll_to_show(dialog.model.focus, dialog.scroll)
+            .clamp(0, dialog.layout.max_scroll());
+        dialog.page_layout = super::shortcuts_page::PageLayout::calculate(dialog.layout.body, dpi);
+        dialog
+            .shortcuts
+            .set_visible(dialog.page_layout.visible_rows());
+        dialog.hot = None;
+        Some((dialog.search, search_field(&dialog.page_layout, dpi)))
+    });
+    let Some((search, field)) = moved else {
+        return;
+    };
+    // An open dropdown hangs off a row that has moved.
+    close_list(hwnd);
+    if let Some(search) = search {
+        unsafe {
+            SetWindowPos(
+                search,
+                std::ptr::null_mut(),
+                field.left,
+                field.top,
+                field.right - field.left,
+                field.bottom - field.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    invalidate(hwnd);
+}
+
+/// The sizing edge or corner under client point `x`, `y` of a `width` by `height` dialog, within
+/// `border` of its edges.
+pub(crate) fn sizing_edge(x: i32, y: i32, width: i32, height: i32, border: i32) -> Option<u32> {
+    let left = x < border;
+    let right = x >= width - border;
+    let top = y < border;
+    let bottom = y >= height - border;
+    Some(match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, ..) => HTLEFT,
+        (_, true, ..) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (.., true) => HTBOTTOM,
+        _ => return None,
+    })
 }
 
 /// Re-enables the owner before the dialog goes, so Windows hands activation back to it rather
@@ -1731,19 +1826,52 @@ unsafe extern "system" fn dialog_proc(
             close_list(hwnd);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
-        // Only the title row drags the dialog.
+        // The edges size the dialog (the native frame that would is hidden), and only the title
+        // row drags it.
         WM_NCHITTEST => {
             let (x, y) = lparam_point(lparam);
             let mut point = POINT { x, y };
             unsafe { ScreenToClient(hwnd, &mut point) };
-            let caption = state(hwnd).is_some_and(|dialog| {
-                point.y < dialog.layout.title.bottom && point.x < dialog.layout.title_close.left
-            });
-            if caption {
+            let Some(layout) = state(hwnd).map(|dialog| dialog.layout) else {
+                return HTCLIENT as LRESULT;
+            };
+            if unsafe { IsZoomed(hwnd) } == 0 {
+                let border = unsafe {
+                    GetSystemMetricsForDpi(SM_CXSIZEFRAME, layout.dpi)
+                        + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, layout.dpi)
+                };
+                if let Some(edge) =
+                    sizing_edge(point.x, point.y, layout.width, layout.height, border)
+                {
+                    return edge as LRESULT;
+                }
+            }
+            if point.y < layout.title.bottom && point.x < layout.title_close.left {
                 HTCAPTION as LRESULT
             } else {
                 HTCLIENT as LRESULT
             }
+        }
+        WM_SIZE => {
+            let (width, height) = lparam_point(lparam);
+            if width > 0 && height > 0 {
+                resized(hwnd, width, height);
+            }
+            0
+        }
+        // No smaller than a usable minimum, unless the work area is (the dialog opens smaller
+        // there); maximized, the work area, not the whole monitor (a popup would cover the
+        // taskbar).
+        WM_GETMINMAXINFO => {
+            let dpi = state(hwnd).map_or(96, |dialog| dialog.layout.dpi);
+            unsafe { super::titlebar::constrain_maximized_window(hwnd, lparam) };
+            let (width, height) = Layout::min_size(dpi);
+            let minmax = unsafe { &mut *(lparam as *mut MINMAXINFO) };
+            minmax.ptMinTrackSize = POINT {
+                x: width.min(minmax.ptMaxSize.x),
+                y: height.min(minmax.ptMaxSize.y),
+            };
+            0
         }
         WM_SETCURSOR => {
             let mut point = POINT::default();
@@ -2556,6 +2684,43 @@ mod tests {
             completes_double_click((u32::MAX - 10, picked.1), 100, near, limits),
             "the tick count wrapping between the clicks"
         );
+    }
+
+    #[test]
+    fn a_sized_layout_fills_the_size_it_is_given() {
+        // Break caught: a resized dialog painting its footer, cards or Close button where the
+        // old size put them.
+        let opened = Layout::calculate(96, 1920, 1080, 90);
+        let sized = Layout::sized(96, 1000, 900, 90);
+        assert_eq!((sized.width, sized.height), (1000, 900));
+        assert_eq!(sized.body.bottom, 900 - 56);
+        assert_eq!(sized.close.right, 1000 - 20);
+        assert_eq!(sized.rows[0].right, 1000 - 20);
+        assert_eq!(sized.title_close.right, 1000);
+        // Taller than everything: nothing to scroll.
+        assert_eq!(sized.max_scroll(), 0);
+        // The opening size is a sized layout too.
+        let again = Layout::sized(96, opened.width, opened.height, 90);
+        let edges = |rect: RECT| (rect.left, rect.top, rect.right, rect.bottom);
+        assert_eq!(edges(again.body), edges(opened.body));
+        assert_eq!(edges(again.close), edges(opened.close));
+    }
+
+    #[test]
+    fn the_edges_size_the_dialog_and_the_corners_size_both_ways() {
+        // Break caught: a dialog that can't be sized because its hidden frame takes no drags, or
+        // an edge band so wide it eats clicks meant for the nav or the cards.
+        let edge = |x, y| sizing_edge(x, y, 800, 600, 8);
+        assert_eq!(edge(2, 300), Some(HTLEFT));
+        assert_eq!(edge(797, 300), Some(HTRIGHT));
+        assert_eq!(edge(400, 3), Some(HTTOP));
+        assert_eq!(edge(400, 595), Some(HTBOTTOM));
+        assert_eq!(edge(1, 1), Some(HTTOPLEFT));
+        assert_eq!(edge(799, 0), Some(HTTOPRIGHT));
+        assert_eq!(edge(0, 599), Some(HTBOTTOMLEFT));
+        assert_eq!(edge(799, 599), Some(HTBOTTOMRIGHT));
+        assert_eq!(edge(8, 300), None);
+        assert_eq!(edge(400, 300), None);
     }
 
     #[test]
