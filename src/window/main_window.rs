@@ -7385,6 +7385,8 @@ pub(crate) fn activate_group(hwnd: HWND, id: GroupId) -> bool {
     };
     for group in [previous, id] {
         if let Some(window) = with_group_id(hwnd, group, |state| state.hwnd) {
+            // Only the active group floats the preview buttons.
+            layout_group(hwnd, window);
             unsafe { InvalidateRect(window, std::ptr::null(), 0) };
         }
     }
@@ -9615,6 +9617,38 @@ three"
         assert!(x + width >= group_width - crate::window::titlebar::scale(48, dpi));
         // Above the editor in z-order: no sibling before it.
         assert!(unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_null());
+    }
+
+    #[test]
+    fn only_the_active_group_shows_the_floating_preview_buttons() {
+        // Break caught: a Markdown document shown in two groups floats a pair of preview buttons
+        // over both, though only the selected one's act on the active tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(crate::document::Language::Markdown);
+        crate::window::preview_host::sync_visibility(window.hwnd);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        let shown = |id| {
+            super::with_group_id(window.hwnd, id, |state| state.preview_buttons.hwnd)
+                .filter(|hwnd| !hwnd.is_null())
+                .is_some_and(|hwnd| {
+                    (unsafe { GetWindowLongPtrW(hwnd, super::GWL_STYLE) }) as u32
+                        & super::WS_VISIBLE
+                        != 0
+                })
+        };
+        assert!(shown(second));
+        assert!(!shown(first));
+
+        assert!(super::activate_group(window.hwnd, first));
+
+        assert!(shown(first));
+        assert!(!shown(second));
     }
 
     #[test]

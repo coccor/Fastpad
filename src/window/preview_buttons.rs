@@ -111,8 +111,8 @@ pub(crate) fn rect_in_group(group: HWND, button: PreviewButton) -> Option<Rect> 
 }
 
 /// Shows `group`'s pair at the top-right of `area` (the group's content, in its client
-/// coordinates), clear of a vertical scroll bar, while that group's active tab can preview; hides
-/// it otherwise.
+/// coordinates), clear of a vertical scroll bar, while `group` is the active group and its active
+/// tab can preview; hides it otherwise.
 pub(crate) fn layout(main: HWND, group: HWND, area: RECT, dpi: u32) {
     let Some(id) = crate::window::main_window::group_id_of(main, group) else {
         return;
@@ -120,8 +120,10 @@ pub(crate) fn layout(main: HWND, group: HWND, area: RECT, dpi: u32) {
     let existing =
         crate::window::main_window::with_group_id(main, id, |state| state.preview_buttons.hwnd)
             .filter(|hwnd| !hwnd.is_null());
-    let previewable =
-        crate::window::preview_host::group_document(main, id).is_some_and(|(_, language, _)| {
+    let active = unsafe { crate::window::main_window::app_ptr(main) }
+        .is_some_and(|app| unsafe { app.as_ref() }.tabs.active_group() == id);
+    let previewable = active
+        && crate::window::preview_host::group_document(main, id).is_some_and(|(_, language, _)| {
             matches!(
                 language,
                 crate::document::Language::Markdown | crate::document::Language::Svg
