@@ -1417,7 +1417,7 @@ fn configure_editor(hwnd: HWND, editor: &Editor) {
         return;
     };
     apply_settings_to(editor, &settings, palette);
-    apply_colors_to(editor, palette);
+    apply_colors_to(editor, palette, settings.highlight_current_line);
     if let Some(zoom) = zoom {
         let _ = editor.set_zoom(zoom);
     }
@@ -1431,20 +1431,27 @@ fn apply_settings_to(editor: &Editor, settings: &crate::config::Settings, palett
         settings.tab_width,
         settings.word_wrap,
     );
+    let _ = editor.apply_whitespace_settings(settings.insert_spaces, settings.show_whitespace);
     let _ =
         editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    apply_chrome_colors_to(editor, palette, settings.highlight_current_line);
 }
 
-fn apply_colors_to(editor: &Editor, palette: Palette) {
+fn apply_colors_to(editor: &Editor, palette: Palette, highlight_current_line: bool) {
     let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
     let _ =
         editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    apply_chrome_colors_to(editor, palette, highlight_current_line);
+    let _ = editor.set_selection_text_colors(palette.selection_foreground);
+}
+
+/// The selection backgrounds, and the caret line's when `highlight_current_line` is on.
+fn apply_chrome_colors_to(editor: &Editor, palette: Palette, highlight_current_line: bool) {
     let _ = editor.set_chrome_colors(
         palette.selection_background,
         palette.inactive_selection_background,
-        palette.caret_line_background,
+        highlight_current_line.then_some(palette.caret_line_background),
     );
-    let _ = editor.set_selection_text_colors(palette.selection_foreground);
 }
 
 /// Every group's editor, the active group's first.
@@ -3540,6 +3547,21 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             settings.line_numbers = !settings.line_numbers;
             Some(("line_numbers", settings.line_numbers.to_string()))
         }),
+        CommandId::ToggleInsertSpaces => change_setting(hwnd, |settings| {
+            settings.insert_spaces = !settings.insert_spaces;
+            Some(("insert_spaces", settings.insert_spaces.to_string()))
+        }),
+        CommandId::ToggleShowWhitespace => change_setting(hwnd, |settings| {
+            settings.show_whitespace = !settings.show_whitespace;
+            Some(("show_whitespace", settings.show_whitespace.to_string()))
+        }),
+        CommandId::ToggleHighlightCurrentLine => change_setting(hwnd, |settings| {
+            settings.highlight_current_line = !settings.highlight_current_line;
+            Some((
+                "highlight_current_line",
+                settings.highlight_current_line.to_string(),
+            ))
+        }),
         CommandId::ToggleRestoreSession => {
             change_setting(hwnd, |settings| {
                 settings.restore_session = !settings.restore_session;
@@ -4190,8 +4212,10 @@ fn apply_theme(hwnd: HWND) {
     else {
         return;
     };
+    let highlight_current_line = unsafe { app_ptr(hwnd) }
+        .is_none_or(|app| unsafe { app.as_ref() }.settings.highlight_current_line);
     for editor in all_editors(hwnd) {
-        apply_colors_to(&editor, palette);
+        apply_colors_to(&editor, palette, highlight_current_line);
     }
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_ref() };
@@ -10977,6 +11001,53 @@ three"
         );
         assert!(!CommandId::FileIconsSolid.needs_document());
         assert!(!CommandId::FileIconsMaterial.needs_document());
+    }
+
+    #[test]
+    fn the_editor_display_toggles_apply_to_the_editor_and_a_theme_change_keeps_them() {
+        // Break caught: a toggle that saves but leaves the editor unchanged, a caret line that a
+        // theme change turns back on, or a toggle that rewrites the rest of fastpad.ini
+        // (settings dialog spec §4.4).
+        use crate::editor::scintilla_constants::{
+            SC_ELEMENT_CARET_LINE_BACK, SCI_GETELEMENTISSET, SCI_GETUSETABS, SCI_GETVIEWWS,
+            SCWS_INVISIBLE, SCWS_VISIBLEALWAYS,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("display-toggles");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+        let send = |message, wparam| unsafe { SendMessageW(editor.hwnd(), message, wparam, 0) };
+        let caret_line_set = || send(SCI_GETELEMENTISSET, SC_ELEMENT_CARET_LINE_BACK as usize);
+        assert_eq!(send(SCI_GETUSETABS, 0), 1, "tab characters by default");
+        assert_eq!(send(SCI_GETVIEWWS, 0), SCWS_INVISIBLE as isize);
+        assert_eq!(
+            caret_line_set(),
+            1,
+            "the current line is highlighted by default"
+        );
+
+        execute_command(window.hwnd, CommandId::ToggleInsertSpaces);
+        execute_command(window.hwnd, CommandId::ToggleShowWhitespace);
+        execute_command(window.hwnd, CommandId::ToggleHighlightCurrentLine);
+        assert_eq!(send(SCI_GETUSETABS, 0), 0);
+        assert_eq!(send(SCI_GETVIEWWS, 0), SCWS_VISIBLEALWAYS as isize);
+        assert_eq!(caret_line_set(), 0);
+
+        execute_command(window.hwnd, CommandId::ThemeDark);
+        assert_eq!(caret_line_set(), 0, "a theme change keeps it off");
+        execute_command(window.hwnd, CommandId::ToggleHighlightCurrentLine);
+        assert_eq!(caret_line_set(), 1);
+        super::save_settings_to(None);
+
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\ninsert_spaces=true\r\nshow_whitespace=true\r\n\
+             highlight_current_line=true\r\ntheme=dark\r\n"
+        );
     }
 
     #[test]

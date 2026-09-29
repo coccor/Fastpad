@@ -51,7 +51,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 99] = [
+pub(crate) const ENTRIES: [PaletteEntry; 102] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -179,6 +179,18 @@ pub(crate) const ENTRIES: [PaletteEntry; 99] = [
     entry("Editor: Tab width 2", CommandId::TabWidth2),
     entry("Editor: Tab width 4", CommandId::TabWidth4),
     entry("Editor: Tab width 8", CommandId::TabWidth8),
+    entry(
+        "Editor: Toggle indent with spaces",
+        CommandId::ToggleInsertSpaces,
+    ),
+    entry(
+        "Editor: Toggle show whitespace",
+        CommandId::ToggleShowWhitespace,
+    ),
+    entry(
+        "Editor: Toggle highlight current line",
+        CommandId::ToggleHighlightCurrentLine,
+    ),
     entry("File: Exit", CommandId::Exit),
     entry("Help: About FastPad", CommandId::About),
 ];
@@ -1457,6 +1469,32 @@ mod tests {
         hit_runs, match_rank, picker_row_label, picker_rows, shortcut_text,
     };
     use crate::window::commands::CommandId;
+
+    #[test]
+    fn the_editor_display_toggles_are_listed_once_under_editor() {
+        // Break caught: a new setting reachable only from the Settings dialog.
+        for (label, command) in [
+            (
+                "Editor: Toggle indent with spaces",
+                CommandId::ToggleInsertSpaces,
+            ),
+            (
+                "Editor: Toggle show whitespace",
+                CommandId::ToggleShowWhitespace,
+            ),
+            (
+                "Editor: Toggle highlight current line",
+                CommandId::ToggleHighlightCurrentLine,
+            ),
+        ] {
+            let labels = ENTRIES
+                .iter()
+                .filter(|entry| entry.command == command)
+                .map(|entry| entry.label)
+                .collect::<Vec<_>>();
+            assert_eq!(labels, [label]);
+        }
+    }
 
     #[test]
     fn hit_runs_cut_at_char_positions_not_bytes() {

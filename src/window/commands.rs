@@ -124,6 +124,9 @@ pub enum CommandId {
     MoveTabToNextGroup = 229,
     MoveTabToPreviousGroup = 230,
     About = 231,
+    ToggleInsertSpaces = 232,
+    ToggleShowWhitespace = 233,
+    ToggleHighlightCurrentLine = 234,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -235,6 +238,9 @@ impl CommandId {
                 | Self::FocusGroup8
                 | Self::FocusLastGroup
                 | Self::About
+                | Self::ToggleInsertSpaces
+                | Self::ToggleShowWhitespace
+                | Self::ToggleHighlightCurrentLine
         )
     }
 
@@ -366,7 +372,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 121] = [
+        const COMMANDS: [CommandId; 124] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -488,6 +494,9 @@ impl TryFrom<u16> for CommandId {
             CommandId::MoveTabToNextGroup,
             CommandId::MoveTabToPreviousGroup,
             CommandId::About,
+            CommandId::ToggleInsertSpaces,
+            CommandId::ToggleShowWhitespace,
+            CommandId::ToggleHighlightCurrentLine,
         ];
         COMMANDS
             .into_iter()
@@ -519,6 +528,23 @@ pub(crate) fn choose_save_path(
 #[cfg(test)]
 mod tests {
     use super::CommandId;
+
+    #[test]
+    fn the_editor_display_toggles_are_232_to_234_and_need_no_document() {
+        // Break caught: a toggle renumbered onto another command, or greyed out while no tab is
+        // open (settings dialog spec §4.3).
+        for (value, command) in [
+            (232, CommandId::ToggleInsertSpaces),
+            (233, CommandId::ToggleShowWhitespace),
+            (234, CommandId::ToggleHighlightCurrentLine),
+        ] {
+            assert_eq!(command as u16, value);
+            assert_eq!(CommandId::try_from(value), Ok(command));
+            assert!(!command.needs_document(), "{command:?}");
+            assert!(!command.needs_text(), "{command:?}");
+            assert!(!command.is_sidebar(), "{command:?}");
+        }
+    }
 
     #[test]
     fn native_command_values_are_stable_and_round_trip() {
