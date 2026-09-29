@@ -2,7 +2,7 @@
 name = "fastpad"
 version = "0.3.0"
 edition = "2024"
-description = "A startup-latency-first text editor for Windows"
+description = "Ultra fast note taking app."
 license = "MIT"
 repository = "https://github.com/coccor/FastPad"
 
