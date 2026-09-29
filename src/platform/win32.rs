@@ -114,6 +114,15 @@ pub(crate) fn dropped_paths(drop: windows_sys::Win32::UI::Shell::HDROP) -> Vec<s
 /// caller frees it (`GlobalFree`, `DragFinish` or `ReleaseStgMedium`).
 #[cfg(all(test, windows))]
 pub(crate) fn test_hdrop(paths: &[&std::path::Path]) -> windows_sys::Win32::Foundation::HGLOBAL {
+    test_hdrop_at(paths, windows_sys::Win32::Foundation::POINT { x: 0, y: 0 })
+}
+
+/// `test_hdrop` dropped at client point `point` of the window it is sent to.
+#[cfg(all(test, windows))]
+pub(crate) fn test_hdrop_at(
+    paths: &[&std::path::Path],
+    point: windows_sys::Win32::Foundation::POINT,
+) -> windows_sys::Win32::Foundation::HGLOBAL {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Memory::{
         GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock,
@@ -132,6 +141,7 @@ pub(crate) fn test_hdrop(paths: &[&std::path::Path]) -> windows_sys::Win32::Foun
         let base = GlobalLock(global).cast::<u8>();
         let files = DROPFILES {
             pFiles: header as u32,
+            pt: point,
             fWide: 1,
             ..Default::default()
         };

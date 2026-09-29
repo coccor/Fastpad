@@ -59,6 +59,9 @@ pub struct App {
     pub(crate) tab_drag: Option<crate::window::tab_drag::TabDrag>,
     /// The drop overlay of the drag under way: a tab drag or an Open Editors row drag.
     pub(crate) drop_overlay: Option<crate::window::drop_overlay::DropOverlay>,
+    /// `BUILD_CHROME` wrapped the group editors' drop targets: a group made from now on gets its
+    /// wrapper when it is created.
+    pub(crate) file_drops_accepted: bool,
     /// The Direct2D factories every group's preview and image view share, created on first use.
     pub(crate) graphics: Option<Rc<crate::preview::dwrite::Graphics>>,
     pub(crate) accessibility: AccessibilityState,
@@ -139,6 +142,7 @@ impl App {
             sash_drag: None,
             tab_drag: None,
             drop_overlay: None,
+            file_drops_accepted: false,
             last_sash_click: None,
             graphics: None,
             accessibility: AccessibilityState::default(),

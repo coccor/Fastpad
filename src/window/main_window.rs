@@ -294,7 +294,17 @@ unsafe extern "system" fn main_window_proc(
         WM_DROPFILES => {
             let drop = wparam as windows_sys::Win32::UI::Shell::HDROP;
             let paths = crate::platform::win32::dropped_paths(drop);
+            let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            let at = unsafe { windows_sys::Win32::UI::Shell::DragQueryPoint(drop, &mut point) };
             unsafe { windows_sys::Win32::UI::Shell::DragFinish(drop) };
+            // The group under the drop opens it: a strip, a preview or an image view (plan
+            // amendment 6).
+            if at != 0 {
+                unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point) };
+                if let Some((group, _)) = group_at(hwnd, point) {
+                    activate_group(hwnd, group);
+                }
+            }
             crate::window::library_host::files_dropped(hwnd, paths);
             0
         }
@@ -623,7 +633,7 @@ unsafe extern "system" fn main_window_proc(
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_FILES_DROPPED {
-                crate::window::library_host::editor_files_dropped(hwnd, lparam);
+                crate::window::library_host::editor_files_dropped(hwnd, wparam, lparam);
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_NOTEBOOK_CHECKED {
@@ -1340,12 +1350,18 @@ pub(crate) fn create_group(hwnd: HWND) -> Result<GroupId> {
             "main window app state was not available",
         ));
     };
+    let editor_hwnd = editor.hwnd();
     let app = unsafe { app.as_mut() };
     let id = app.tabs.add_group();
     app.groups
         .push(crate::window::editor_group::GroupWindow::new(
             id, window, editor,
         ));
+    // A group made after `BUILD_CHROME` takes Explorer drops too (split editors spec §6.2).
+    let wrap = app.file_drops_accepted;
+    if wrap {
+        crate::window::library_host::wrap_group_drop_target(hwnd, window, editor_hwnd);
+    }
     Ok(id)
 }
 
@@ -25810,5 +25826,88 @@ three"
             "the tab stays"
         );
         assert!(notebook_view(window.hwnd).drag.is_none());
+    }
+
+    #[test]
+    fn files_dropped_on_a_second_groups_editor_open_in_that_group() {
+        // Break caught: only group 1's editor taking Explorer drops, so a drop on the right-hand
+        // editor opens on the left (split editors spec §6.2).
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editor-drop-group");
+        let note = scratch.note("dropped.md", "dropped");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        crate::window::library_host::accept_editor_file_drops(window.hwnd);
+        let target = super::group_editor(window.hwnd, second).unwrap();
+        crate::editor::file_drop::test_support::drag_and_drop(target.hwnd(), &[note.as_path()]);
+        pump_until(window.hwnd, || {
+            app_mut(window.hwnd)
+                .tabs
+                .group_documents(second)
+                .iter()
+                .any(|document| document.path.as_deref() == Some(note.as_path()))
+        });
+        assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    }
+
+    #[test]
+    fn a_group_split_off_after_the_chrome_takes_explorer_drops() {
+        // Break caught: the wrapper installed once in BUILD_CHROME, so every later group's
+        // editor refuses files.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("editor-drop-late");
+        let note = scratch.note("late.md", "late");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::library_host::accept_editor_file_drops(window.hwnd);
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        let target = super::group_editor(window.hwnd, second).unwrap();
+        let effects =
+            crate::editor::file_drop::test_support::drag_and_drop(target.hwnd(), &[note.as_path()]);
+        assert_eq!(
+            effects,
+            [windows_sys::Win32::System::Ole::DROPEFFECT_COPY; 3]
+        );
+        pump_until(window.hwnd, || {
+            app_mut(window.hwnd)
+                .tabs
+                .group_documents(second)
+                .iter()
+                .any(|document| document.path.as_deref() == Some(note.as_path()))
+        });
+    }
+
+    #[test]
+    fn files_dropped_on_a_groups_strip_open_in_that_group() {
+        // Break caught: WM_DROPFILES (a drop on a strip, a preview or an image) always opening
+        // in the active group.
+        let _scintilla = load_native_scintilla();
+        let scratch = LibraryScratch::new("strip-drop");
+        let note = scratch.note("strip.md", "strip");
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let first = app_mut(window.hwnd).tabs.active_group();
+        execute_command(window.hwnd, CommandId::SplitRight);
+        let second = app_mut(window.hwnd).tabs.active_group();
+        assert!(super::activate_group(window.hwnd, first));
+        let strip = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+        let mut point = windows_sys::Win32::Foundation::POINT { x: 20, y: 10 };
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::MapWindowPoints(strip, window.hwnd, &mut point, 1)
+        };
+        let drop = crate::platform::win32::test_hdrop_at(&[note.as_path()], point);
+        unsafe { SendMessageW(window.hwnd, super::WM_DROPFILES, drop as usize, 0) };
+        assert!(
+            app_mut(window.hwnd)
+                .tabs
+                .group_documents(second)
+                .iter()
+                .any(|document| document.path.as_deref() == Some(note.as_path()))
+        );
     }
 }
