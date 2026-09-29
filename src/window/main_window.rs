@@ -3910,6 +3910,14 @@ pub(crate) fn keymap(hwnd: HWND) -> crate::window::keymap::Keymap {
     })
 }
 
+/// The text menus show for `command`'s key in `hwnd`'s keymap, without copying the keymap.
+pub(crate) fn first_key_text(hwnd: HWND, command: CommandId) -> Option<String> {
+    match unsafe { app_ptr(hwnd) } {
+        Some(app) => unsafe { app.as_ref() }.keymap.first_text(command),
+        None => crate::window::keymap::Keymap::defaults().first_text(command),
+    }
+}
+
 /// Puts `keymap` in force: the accelerator table is rebuilt now; the menu bar, which spells the
 /// keys, is rebuilt the next time it opens.
 fn install_keymap(app: &mut App, keymap: crate::window::keymap::Keymap) {

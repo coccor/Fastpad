@@ -624,8 +624,7 @@ impl Keymap {
     }
 
     /// The command `stroke` runs: the first binding in precedence order. The accelerator table
-    /// resolves keys in the app; the tests pin the precedence rule with this.
-    #[cfg(test)]
+    /// resolves keys in the app; `first_text` and the tests follow the same rule with this.
     pub(crate) fn command_for(&self, stroke: KeyStroke) -> Option<CommandId> {
         self.bindings
             .iter()
@@ -647,12 +646,15 @@ impl Keymap {
         commands
     }
 
-    /// The text menus and the palette show for `command`: its first key.
+    /// The text menus and the palette show for `command`: its first key that runs it. A key a
+    /// higher-precedence binding holds runs that command instead, so it is skipped.
     pub(crate) fn first_text(&self, command: CommandId) -> Option<String> {
         self.bindings
             .iter()
-            .find(|binding| binding.command == command)
-            .map(|binding| binding.stroke.text())
+            .filter(|binding| binding.command == command)
+            .map(|binding| binding.stroke)
+            .find(|stroke| self.command_for(*stroke) == Some(command))
+            .map(|stroke| stroke.text())
     }
 
     /// This keymap with `command` bound to exactly `keys` (repeats dropped). Keys equal to the
@@ -821,6 +823,8 @@ mod tests {
 
     #[test]
     fn the_defaults_resolve_with_first_key_text() {
+        // Break caught: a default key resolving to the wrong command, or menus hinting a
+        // command's second key (or any key) where its first belongs.
         let keymap = Keymap::defaults();
         assert_eq!(keymap.command_for(stroke("Ctrl+S")), Some(CommandId::Save));
         assert_eq!(
@@ -944,7 +948,24 @@ mod tests {
     }
 
     #[test]
+    fn first_text_skips_a_key_a_higher_binding_holds() {
+        // Break caught: Find next still hinting F3 after the user gave F3 to Save As, so the
+        // menu shows a key that saves instead of finding.
+        let keymap = Keymap::defaults().with_keys(CommandId::SaveAs, vec![stroke("F3")]);
+        assert_eq!(keymap.command_for(stroke("F3")), Some(CommandId::SaveAs));
+        assert_eq!(keymap.first_text(CommandId::SaveAs).as_deref(), Some("F3"));
+        assert_eq!(keymap.first_text(CommandId::FindNext), None);
+        let keymap = keymap.with_keys(CommandId::FindNext, vec![stroke("F3"), stroke("F8")]);
+        assert_eq!(
+            keymap.first_text(CommandId::FindNext).as_deref(),
+            Some("F8")
+        );
+    }
+
+    #[test]
     fn with_keys_drops_repeats_and_keeps_order() {
+        // Break caught: a repeated key saved twice (`F9, F8, F9`), or the order the user gave
+        // lost, so the first key menus show changes.
         let keymap = Keymap::defaults().with_keys(
             CommandId::Save,
             vec![stroke("F9"), stroke("F8"), stroke("F9")],

@@ -78,7 +78,7 @@ pub(crate) struct PreviewHost {
     pub(crate) scroll_origin: ScrollOrigin,
     pub(crate) sync_count: u64,
     pub(crate) hover_text: Option<String>,
-    button_hint: Option<&'static str>,
+    button_hint: Option<String>,
     /// Set while this preview has edits for the next `PREVIEW_TIMER_ID` flush.
     flush_pending: bool,
 }
@@ -135,9 +135,7 @@ impl Default for PreviewHost {
 
 impl PreviewHost {
     pub(crate) fn status_hint(&self) -> Option<String> {
-        self.button_hint
-            .map(str::to_owned)
-            .or_else(|| self.hover_text.clone())
+        self.button_hint.clone().or_else(|| self.hover_text.clone())
     }
 }
 
@@ -1372,16 +1370,29 @@ pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
     with_host(hwnd, |host| host.dragging).unwrap_or(false) || over_divider(hwnd, point.x, point.y)
 }
 
-pub(crate) fn button_hover(hwnd: HWND, button: Option<PreviewButton>) {
-    let hint = match button {
-        Some(PreviewButton::Side) => {
-            Some("Open Preview to the Side (Ctrl+Shift+V cycles preview modes)")
-        }
-        Some(PreviewButton::Full) => Some("Open Preview (Ctrl+Shift+V cycles preview modes)"),
-        None => None,
+/// The status bar's hint for a preview button, naming `cycle`, the key that cycles the preview
+/// modes, when there is one.
+fn button_hint(button: PreviewButton, cycle: Option<&str>) -> String {
+    let action = match button {
+        PreviewButton::Side => "Open Preview to the Side",
+        PreviewButton::Full => "Open Preview",
     };
+    match cycle {
+        Some(key) => format!("{action} ({key} cycles preview modes)"),
+        None => action.to_owned(),
+    }
+}
+
+pub(crate) fn button_hover(hwnd: HWND, button: Option<PreviewButton>) {
+    let hint = button.map(|button| {
+        // The cycle key comes from the keymap, so a rebound key shows here too.
+        let cycle = super::main_window::first_key_text(hwnd, CommandId::MarkdownPreviewCycle);
+        button_hint(button, cycle.as_deref())
+    });
     let changed = with_host(hwnd, |host| {
-        std::mem::replace(&mut host.button_hint, hint) != hint
+        let changed = host.button_hint != hint;
+        host.button_hint = hint;
+        changed
     })
     .unwrap_or(false);
     if changed {
@@ -1399,6 +1410,28 @@ mod tests {
         right: 1004,
         bottom: 700,
     };
+
+    #[test]
+    fn button_hints_name_the_keymaps_cycle_key() {
+        // Break caught: the hint still saying Ctrl+Shift+V after the user rebound the cycle
+        // command, or naming a key when it has none.
+        assert_eq!(
+            button_hint(PreviewButton::Side, Some("F9")),
+            "Open Preview to the Side (F9 cycles preview modes)"
+        );
+        assert_eq!(
+            button_hint(PreviewButton::Full, Some("Ctrl+Shift+V")),
+            "Open Preview (Ctrl+Shift+V cycles preview modes)"
+        );
+        assert_eq!(button_hint(PreviewButton::Full, None), "Open Preview");
+        let keymap = crate::window::keymap::Keymap::defaults();
+        assert_eq!(
+            keymap
+                .first_text(CommandId::MarkdownPreviewCycle)
+                .as_deref(),
+            Some("Ctrl+Shift+V")
+        );
+    }
 
     #[test]
     fn off_or_hidden_previews_give_the_editor_the_whole_area() {

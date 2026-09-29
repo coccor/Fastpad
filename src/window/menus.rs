@@ -276,8 +276,9 @@ impl Drop for MenuBar {
 
 pub(crate) enum MenuEntry {
     Command(&'static str, CommandId),
-    /// A command id reused for a local action: it shows no key, since the global key does
-    /// something else.
+    /// A command id reused for a local action: it shows no key from the keymap, since the
+    /// global key does something else. Its label may spell the view's own key (the tree's F2
+    /// and Del, which the tree handles itself).
     Local(&'static str, CommandId),
     Submenu(&'static str, Vec<MenuEntry>),
     Separator,
@@ -301,11 +302,10 @@ fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -
     for entry in entries {
         let ok = match entry {
             MenuEntry::Command(label, command) => {
-                // A label that spells its own key (the tree's F2, Del) keeps it; every other
-                // command shows its first key from the keymap (keyboard shortcuts spec §5).
+                // Every command shows its first key from the keymap (keyboard shortcuts spec §5).
                 let text = match keymap.first_text(*command) {
-                    Some(key) if !label.contains('\t') => format!("{label}\t{key}"),
-                    _ => (*label).to_owned(),
+                    Some(key) => format!("{label}\t{key}"),
+                    None => (*label).to_owned(),
                 };
                 let text = wide_null(&text);
                 unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
