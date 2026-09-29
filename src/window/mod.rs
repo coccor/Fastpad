@@ -6,6 +6,7 @@ pub mod commands;
 pub(crate) mod copy_host;
 pub(crate) mod document_store;
 pub(crate) mod drag_label;
+pub(crate) mod dropdown_list;
 pub(crate) mod drop_overlay;
 pub(crate) mod editor_group;
 pub(crate) mod favorites_view;
