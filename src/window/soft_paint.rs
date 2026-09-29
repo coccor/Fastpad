@@ -1,10 +1,10 @@
 //! Soft, antialiased shapes for the owner-drawn Settings dialog, its dropdown list and the About
 //! box, and the look they share: the tones, the corner radius, the focus ring and the title
 //! row's ×. A paint
-//! builds a `Frame`: shapes first, then text. The shapes go through Direct2D, bound to the
-//! off-screen memory DC that `side_panel::paint_buffered` hands over; the text is drawn on top
-//! with GDI afterwards, so it keeps ClearType. Direct2D is never held across a GDI call on the
-//! same DC.
+//! builds a `Frame` of layers, each shapes first, then text. The shapes go through Direct2D,
+//! bound to the off-screen memory DC that `side_panel::paint_buffered` hands over; the text is
+//! drawn on top with GDI afterwards, so it keeps ClearType. Direct2D is never held across a GDI
+//! call on the same DC.
 //!
 //! Direct2D is loaded when a dialog opens, never at startup, through `preview::dwrite`'s
 //! loader so d2d1.dll stays out of FastPad.exe's import table. Without it, or when a frame
@@ -168,13 +168,19 @@ struct Text<'a> {
     align: u32,
 }
 
-/// What one paint draws: every shape, then every text, each clipped to the clip current when it
-/// was added.
+/// What one paint draws, layer by layer: each layer's shapes, then its text, each clipped to the
+/// clip current when it was added. A later layer covers an earlier one's text too, as a box over
+/// a table must.
 #[derive(Default)]
 pub(crate) struct Frame<'a> {
+    layers: Vec<Layer<'a>>,
+    clip: Option<RECT>,
+}
+
+#[derive(Default)]
+struct Layer<'a> {
     shapes: Vec<(Shape, Option<RECT>)>,
     texts: Vec<(Text<'a>, Option<RECT>)>,
-    clip: Option<RECT>,
 }
 
 impl<'a> Frame<'a> {
@@ -183,8 +189,23 @@ impl<'a> Frame<'a> {
         self.clip = clip;
     }
 
+    /// Starts a layer: what is added from now on paints over everything added before, text
+    /// included.
+    pub(crate) fn layer(&mut self) {
+        self.layers.push(Layer::default());
+    }
+
+    fn top(&mut self) -> &mut Layer<'a> {
+        if self.layers.is_empty() {
+            self.layers.push(Layer::default());
+        }
+        let last = self.layers.len() - 1;
+        &mut self.layers[last]
+    }
+
     pub(crate) fn shape(&mut self, shape: Shape) {
-        self.shapes.push((shape, self.clip));
+        let clip = self.clip;
+        self.top().shapes.push((shape, clip));
     }
 
     /// A single line of `text` in `rect`, vertically centred, ellipsized; `align` is `DT_LEFT`,
@@ -204,25 +225,29 @@ impl<'a> Frame<'a> {
             rect,
             align,
         };
-        self.texts.push((text, self.clip));
+        let clip = self.clip;
+        self.top().texts.push((text, clip));
     }
 
     /// Every text added so far: its string, its rect and the clip it was added under.
     #[cfg(test)]
     pub(crate) fn test_texts(&self) -> Vec<(String, RECT, Option<RECT>)> {
-        self.texts
+        self.layers
             .iter()
+            .flat_map(|layer| &layer.texts)
             .map(|(text, clip)| (text.text.to_string(), text.rect, *clip))
             .collect()
     }
 
-    /// Draws the shapes through `canvas`, then the text with GDI.
+    /// Draws each layer: its shapes through `canvas`, then its text with GDI.
     pub(crate) fn paint(&self, dc: HDC, client: RECT, canvas: &Canvas) {
-        canvas.draw(dc, client, &self.shapes);
-        unsafe {
-            SetBkMode(dc, TRANSPARENT as i32);
-            for (text, clip) in &self.texts {
-                with_clip(dc, *clip, || draw_text(dc, text));
+        for layer in &self.layers {
+            canvas.draw(dc, client, &layer.shapes);
+            unsafe {
+                SetBkMode(dc, TRANSPARENT as i32);
+                for (text, clip) in &layer.texts {
+                    with_clip(dc, *clip, || draw_text(dc, text));
+                }
             }
         }
     }
@@ -588,6 +613,42 @@ mod tests {
         assert_eq!(surface.pixel(75, 25), WHITE, "an outline leaves its inside");
         assert_eq!(surface.pixel(10, 50), BLUE, "inside the clip");
         assert_eq!(surface.pixel(30, 50), WHITE, "outside the clip");
+    }
+
+    #[test]
+    fn a_later_layer_covers_the_text_of_an_earlier_one() {
+        // Break caught: the Keyboard Shortcuts recording box looking transparent, the table's
+        // text drawn over its fill because every text painted after every shape.
+        use windows_sys::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
+        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) } as HFONT;
+        let blue_in_the_middle = |layered: bool| {
+            let mut frame = Frame::default();
+            frame.shape(Shape::Fill {
+                rect: rect(0, 0, 100, 60),
+                color: WHITE,
+            });
+            frame.text(font, BLUE, "MMMMMMMM", rect(0, 0, 100, 60), DT_CENTER);
+            if layered {
+                frame.layer();
+            }
+            frame.shape(Shape::Fill {
+                rect: rect(0, 0, 100, 60),
+                color: RED,
+            });
+            let surface = TestSurface::new(100, 60);
+            frame.paint(surface.dc, rect(0, 0, 100, 60), &Canvas::gdi());
+            // Antialiased text is only bluish, not exactly BLUE; red has no blue in it.
+            let bluish = |pixel: u32| (pixel >> 16 & 0xff) > (pixel & 0xff) + 50;
+            (0..100).any(|x| (20..40).any(|y| bluish(surface.pixel(x, y))))
+        };
+        assert!(
+            blue_in_the_middle(false),
+            "one layer: text over every shape"
+        );
+        assert!(
+            !blue_in_the_middle(true),
+            "the later layer's fill covers the text"
+        );
     }
 
     #[test]

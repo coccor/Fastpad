@@ -543,8 +543,9 @@ pub(crate) fn compose<'a>(
     }
     frame.clip(None);
 
-    // The recording box, over the table.
+    // The recording box, over the table: a layer of its own, so its fill covers the rows' text.
     if let Some(recording) = &model.recording {
+        frame.layer();
         let box_rect = layout.record_box;
         tones.soft(frame, box_rect, style.radius, colors.panel_background());
         frame.shape(Shape::Ring {
