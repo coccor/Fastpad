@@ -26464,6 +26464,10 @@ three"
             key(VK_DOWN); // Dark
             key(VK_UP); // Light
             key(VK_ESCAPE);
+            // Break caught: were a step to open the list, the first Escape would close only the
+            // list and show_settings would never return; this one closes the dialog, so the
+            // assertions below fail instead.
+            key(VK_ESCAPE);
         });
 
         super::show_settings(window.hwnd);

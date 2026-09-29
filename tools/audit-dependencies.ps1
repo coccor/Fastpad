@@ -23,7 +23,8 @@ $AllowedRoots = @(
 $AllowedWindowsFeatures = @(
     "Win32", "Win32_Foundation", "Win32_Graphics", "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Imaging", "Win32_System", "Win32_System_Com",
+    "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Imaging", "Win32_System",
+    "Win32_System_Com",
     "Win32_System_Com_StructuredStorage", "Win32_System_Variant"
 )
 $RegistrySource = "registry+https://github.com/rust-lang/crates.io-index"

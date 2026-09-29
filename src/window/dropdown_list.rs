@@ -181,33 +181,45 @@ pub(crate) struct DropdownList {
     hwnd: HWND,
 }
 
+/// How a list looks, from its dialog.
+pub(crate) struct ListStyle {
+    pub(crate) row_height: i32,
+    /// The corner radius of the item highlight.
+    pub(crate) radius: i32,
+    /// Borrowed from the dialog, which outlives the list.
+    pub(crate) font: HFONT,
+    pub(crate) colors: Palette,
+    /// The dialog's Direct2D, shared for the rounded highlight.
+    pub(crate) canvas: Canvas,
+}
+
 struct ListState {
     owner: HWND,
     model: ListModel,
     colors: Palette,
-    /// Borrowed from the dialog, which outlives the list.
     font: HFONT,
     row_height: i32,
-    /// The corner radius of the item highlight.
     radius: i32,
     hot: Option<usize>,
-    /// Direct2D for the rounded highlight, loaded as the list opens.
     canvas: Canvas,
 }
 
 impl DropdownList {
     /// Shows `model` directly under `anchor` (screen coordinates), as wide as it, or above it when
     /// the monitor's work area has no room below. It never takes the activation from `owner`.
-    /// Its item highlight is rounded by `radius`.
     pub(crate) fn show(
         owner: HWND,
         anchor: RECT,
-        row_height: i32,
-        radius: i32,
-        font: HFONT,
-        colors: Palette,
+        style: ListStyle,
         model: ListModel,
     ) -> Option<Self> {
+        let ListStyle {
+            row_height,
+            radius,
+            font,
+            colors,
+            canvas,
+        } = style;
         let class = register_class()?;
         let height = model.visible_rows().max(1) as i32 * row_height + 2;
         let mut monitor = MONITORINFO {
@@ -253,7 +265,7 @@ impl DropdownList {
             row_height,
             radius,
             hot: None,
-            canvas: Canvas::load(),
+            canvas,
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);

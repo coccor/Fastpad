@@ -4,7 +4,9 @@
 //! window disabled. All behaviour lives in `settings_model`; this module decodes input and
 //! paints.
 
-use super::dropdown_list::{DropdownList, ListKey, ListModel, ListOutcome, WM_LIST_PICKED};
+use super::dropdown_list::{
+    DropdownList, ListKey, ListModel, ListOutcome, ListStyle, WM_LIST_PICKED,
+};
 use super::modal::ModalScope;
 use super::palette::Palette;
 use super::panel::{inset, scale};
@@ -875,10 +877,13 @@ fn open_list(hwnd: HWND, row: Row) {
     dialog.list = DropdownList::show(
         hwnd,
         anchor,
-        dialog.layout.list_row_height(),
-        dialog.layout.radius(),
-        dialog.body_font,
-        dialog.colors,
+        ListStyle {
+            row_height: dialog.layout.list_row_height(),
+            radius: dialog.layout.radius(),
+            font: dialog.body_font,
+            colors: dialog.colors,
+            canvas: dialog.canvas.clone(),
+        },
         ListModel::new(items, selected),
     )
     .map(|list| (row, list));

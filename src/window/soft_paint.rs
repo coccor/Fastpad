@@ -4,7 +4,7 @@
 //! with GDI afterwards, so it keeps ClearType. Direct2D is never held across a GDI call on the
 //! same DC.
 //!
-//! Direct2D is loaded when a dialog or list opens, never at startup, through `preview::dwrite`'s
+//! Direct2D is loaded when a dialog opens, never at startup, through `preview::dwrite`'s
 //! loader so d2d1.dll stays out of FastPad.exe's import table. Without it, or when a frame
 //! fails, the shapes fall back to square GDI fills: every control still shows, only the corners
 //! are square.
@@ -14,13 +14,15 @@ use crate::platform::{OwnedModule, wide_null};
 use crate::preview::dwrite::{create_d2d_factory, load_system_library};
 use crate::preview::render::color_f;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_ROUNDED_RECT, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
+    D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_ROUNDED_RECT, ID2D1DCRenderTarget, ID2D1Factory,
+    ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows_sys::Win32::Foundation::RECT;
@@ -134,9 +136,11 @@ fn with_clip(dc: HDC, clip: Option<RECT>, draw: impl FnOnce()) {
     }
 }
 
-/// Draws shapes: with Direct2D when it loaded, else with GDI.
+/// Draws shapes: with Direct2D when it loaded, else with GDI. A clone shares the one Direct2D
+/// stack, so a dropdown list reuses its dialog's instead of loading another on every open.
+#[derive(Clone)]
 pub(crate) struct Canvas {
-    direct2d: Option<Direct2D>,
+    direct2d: Option<Rc<Direct2D>>,
 }
 
 /// Field order matters: the target drops before the factory, and both before the module that
@@ -144,9 +148,14 @@ pub(crate) struct Canvas {
 struct Direct2D {
     /// Recreated on the next paint after a frame fails (a lost device).
     target: RefCell<Option<Target>>,
+    /// Paints in a row that failed to produce a target or a frame; at `MAX_FAILURES` the canvas
+    /// gives up on Direct2D and uses GDI for the rest of its life.
+    failures: Cell<u32>,
     factory: ID2D1Factory,
     _module: OwnedModule,
 }
+
+const MAX_FAILURES: u32 = 3;
 
 struct Target {
     brush: ID2D1SolidColorBrush,
@@ -158,7 +167,7 @@ impl Canvas {
     /// window opens, never at startup.
     pub(crate) fn load() -> Self {
         Self {
-            direct2d: Direct2D::load(),
+            direct2d: Direct2D::load().map(Rc::new),
         }
     }
 
@@ -174,18 +183,22 @@ impl Canvas {
     }
 
     fn draw(&self, dc: HDC, client: RECT, shapes: &[(Shape, Option<RECT>)]) {
-        if let Some(direct2d) = &self.direct2d {
+        if let Some(direct2d) = self.direct2d.as_deref()
+            && direct2d.failures.get() < MAX_FAILURES
+        {
             let mut slot = direct2d.target.borrow_mut();
             if slot.is_none() {
                 *slot = Target::create(&direct2d.factory).ok();
             }
             if let Some(target) = slot.as_ref() {
                 if unsafe { target.draw(dc, client, shapes) }.is_ok() {
+                    direct2d.failures.set(0);
                     return;
                 }
                 // The frame may be half drawn: GDI paints over all of it.
                 *slot = None;
             }
+            direct2d.failures.set(direct2d.failures.get() + 1);
         }
         for (shape, clip) in shapes {
             with_clip(dc, *clip, || unsafe { draw_gdi(dc, *shape) });
@@ -200,6 +213,7 @@ impl Direct2D {
         let target = Target::create(&factory).ok()?;
         Some(Self {
             target: RefCell::new(Some(target)),
+            failures: Cell::new(0),
             factory,
             _module: module,
         })
@@ -214,6 +228,8 @@ impl Target {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 alphaMode: D2D1_ALPHA_MODE_IGNORE,
             },
+            // Software: cheaper than a GPU device and readback for a small DC-bound target.
+            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             dpiX: 96.0,
             dpiY: 96.0,
             ..Default::default()
