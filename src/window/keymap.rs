@@ -1,10 +1,6 @@
 //! Keyboard shortcuts: key strokes, the commands' stable IDs, the default bindings, and the
 //! user's overrides resolved into the bindings every surface reads (keyboard shortcuts spec §3).
 //! Pure: no window handles.
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Task 4 wires the keymap into the app")
-)]
 
 use crate::window::commands::CommandId;
 use std::collections::BTreeMap;
@@ -114,6 +110,10 @@ impl KeyStroke {
     }
 
     /// The stroke a key press makes, or `None` for a modifier alone or a key with no name.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    )]
     pub(crate) fn from_key(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Self> {
         key_name(vk)?;
         Some(Self::new(ctrl, shift, alt, vk))
@@ -425,6 +425,10 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 66] = [
     (key(C | S, VK_OEM_5), CommandId::SplitDown),
 ];
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+)]
 pub(crate) fn default_keys(command: CommandId) -> Vec<KeyStroke> {
     DEFAULT_BINDINGS
         .iter()
@@ -502,11 +506,19 @@ pub(crate) fn bindable(stroke: KeyStroke) -> Result<(), &'static str> {
 }
 
 /// `key.<id>`, the `fastpad.ini` key of `command`'s override.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+)]
 pub(crate) fn ini_key(command: CommandId) -> Option<String> {
     command_id(command).map(|id| format!("key.{id}"))
 }
 
 /// The `fastpad.ini` value for `keys`: `Ctrl+S, Ctrl+T`, or empty when there are none.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+)]
 pub(crate) fn ini_value(keys: &[KeyStroke]) -> String {
     keys.iter()
         .map(|stroke| stroke.text())
@@ -609,6 +621,10 @@ impl Keymap {
         &self.bindings
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    )]
     pub(crate) fn keys_of(&self, command: CommandId) -> Vec<KeyStroke> {
         self.bindings
             .iter()
@@ -617,6 +633,10 @@ impl Keymap {
             .collect()
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    )]
     pub(crate) fn is_user(&self, command: CommandId) -> bool {
         self.overrides
             .iter()
@@ -624,6 +644,10 @@ impl Keymap {
     }
 
     /// The command `stroke` runs: the first binding in precedence order.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    )]
     pub(crate) fn command_for(&self, stroke: KeyStroke) -> Option<CommandId> {
         self.bindings
             .iter()
@@ -632,6 +656,10 @@ impl Keymap {
     }
 
     /// The commands other than `except` bound to `stroke`, each once, in precedence order.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    )]
     pub(crate) fn conflicts(&self, stroke: KeyStroke, except: CommandId) -> Vec<CommandId> {
         let mut commands = Vec::new();
         for binding in &self.bindings {
@@ -655,6 +683,10 @@ impl Keymap {
 
     /// This keymap with `command` bound to exactly `keys` (repeats dropped). Keys equal to the
     /// defaults drop the override instead.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    )]
     pub(crate) fn with_keys(&self, command: CommandId, keys: Vec<KeyStroke>) -> Self {
         let mut unique = Vec::with_capacity(keys.len());
         for stroke in keys {
@@ -670,6 +702,10 @@ impl Keymap {
         Self::resolve(overrides)
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    )]
     pub(crate) fn without_override(&self, command: CommandId) -> Self {
         Self::resolve(
             self.overrides
@@ -815,20 +851,6 @@ mod tests {
         }
         assert_eq!(seen.len(), COMMAND_IDS.len());
         assert_eq!(command_for_id("File.Save"), None, "IDs are case-sensitive");
-    }
-
-    #[test]
-    fn defaults_match_the_accelerator_table() {
-        // Break caught: a shortcut lost or changed while moving the table into the keymap.
-        // Deleted in Task 4 together with `menus::accelerator_specs`.
-        let old = crate::window::menus::accelerator_specs();
-        assert_eq!(old.len(), DEFAULT_BINDINGS.len());
-        for (spec, (stroke, command)) in old.iter().zip(DEFAULT_BINDINGS) {
-            assert_eq!(
-                (spec.modifiers, spec.key, spec.command),
-                (stroke.accel_flags(), stroke.vk, command)
-            );
-        }
     }
 
     #[test]

@@ -6,7 +6,6 @@
 use crate::library::quick_open::QuickMatch;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
-use crate::window::menus::{AcceleratorSpec, accelerator_specs};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
 use std::cell::Cell;
@@ -25,7 +24,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN,
-    VK_SHIFT, VK_TAB, VK_UP,
+    VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -381,31 +380,7 @@ pub(crate) fn picker_row_label(picker: &Picker, row: &PickerRow) -> String {
 
 /// The first keyboard shortcut bound to `command`, spelled the way the menus spell shortcuts.
 pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
-    let spec: AcceleratorSpec = accelerator_specs()
-        .into_iter()
-        .find(|spec| spec.command == command)?;
-    let mut text = String::new();
-    for (flag, name) in [(FCONTROL, "Ctrl+"), (FSHIFT, "Shift+"), (FALT, "Alt+")] {
-        if spec.modifiers & flag != 0 {
-            text.push_str(name);
-        }
-    }
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_F1, VK_F24, VK_LEFT, VK_OEM_5, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT,
-    };
-    match spec.key {
-        VK_TAB => text.push_str("Tab"),
-        VK_OEM_5 => text.push('\\'),
-        VK_LEFT => text.push_str("Left"),
-        VK_RIGHT => text.push_str("Right"),
-        VK_OEM_PLUS => text.push('+'),
-        VK_OEM_MINUS => text.push('-'),
-        VK_OEM_COMMA => text.push(','),
-        key @ VK_F1..=VK_F24 => text.push_str(&format!("F{}", key - VK_F1 + 1)),
-        key => text.push(char::from_u32(u32::from(key))?),
-    }
-    Some(text)
+    crate::window::keymap::Keymap::defaults().first_text(command)
 }
 
 const WIDTH_AT_96_DPI: i32 = 560;
@@ -1713,7 +1688,7 @@ mod tests {
             shortcut_text(CommandId::NextTab).as_deref(),
             Some("Ctrl+Tab")
         );
-        assert_eq!(shortcut_text(CommandId::ZoomIn).as_deref(), Some("Ctrl++"));
+        assert_eq!(shortcut_text(CommandId::ZoomIn).as_deref(), Some("Ctrl+="));
         assert_eq!(shortcut_text(CommandId::ZoomOut).as_deref(), Some("Ctrl+-"));
         assert_eq!(
             shortcut_text(CommandId::CommandPalette).as_deref(),

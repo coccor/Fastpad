@@ -3892,6 +3892,77 @@ pub(crate) fn set_open_editors_expanded(hwnd: HWND, expanded: bool) {
     }
 }
 
+/// The shortcuts in force for `hwnd`'s window (the defaults before it has an App).
+#[allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")]
+pub(crate) fn keymap(hwnd: HWND) -> crate::window::keymap::Keymap {
+    unsafe { app_ptr(hwnd) }.map_or_else(crate::window::keymap::Keymap::defaults, |app| {
+        unsafe { app.as_ref() }.keymap.clone()
+    })
+}
+
+/// Puts `keymap` in force: the accelerator table is rebuilt now; the menu bar, which spells the
+/// keys, is rebuilt the next time it opens.
+fn install_keymap(app: &mut App, keymap: crate::window::keymap::Keymap) {
+    app.accelerators = crate::window::menus::AcceleratorTable::create(&keymap).ok();
+    if app.menu_mode.is_none() {
+        app.menu_bar = None;
+    }
+    app.keymap = keymap;
+}
+
+/// Gives `command` exactly `keys` (keyboard shortcuts spec 6.6): applies at once and saves its
+/// `key.<id>=` line, or removes the line when `keys` are the defaults.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+)]
+pub(crate) fn set_command_keys(
+    hwnd: HWND,
+    command: CommandId,
+    keys: Vec<crate::window::keymap::KeyStroke>,
+) {
+    use crate::window::keymap::{ini_key, ini_value};
+    let Some(key) = ini_key(command) else {
+        return;
+    };
+    let id = key["key.".len()..].to_owned();
+    // The App borrow ends before saving: a failed save pushes a notice, which borrows it again.
+    let Some(saved) = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let keymap = app.keymap.with_keys(command, keys);
+        if keymap == app.keymap {
+            return None;
+        }
+        let value = keymap
+            .is_user(command)
+            .then(|| ini_value(&keymap.keys_of(command)));
+        match &value {
+            Some(value) => app.settings.key_overrides.insert(id, value.clone()),
+            None => app.settings.key_overrides.remove(&id),
+        };
+        install_keymap(app, keymap);
+        Some(value)
+    }) else {
+        return;
+    };
+    let result = match saved {
+        Some(value) => save_setting(&key, &value),
+        None => remove_setting(&key),
+    };
+    if let Err(error) = result {
+        push_notice(hwnd, format!("FastPad could not save fastpad.ini: {error}"));
+    }
+}
+
+/// Gives `command` its default keys back and removes its `key.<id>=` line.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+)]
+pub(crate) fn reset_command_keys(hwnd: HWND, command: CommandId) {
+    set_command_keys(hwnd, command, crate::window::keymap::default_keys(command));
+}
+
 /// Applies one settings change from a command and saves it to `fastpad.ini`. `change` edits the
 /// in-memory settings and names the `key=value` it made, or returns `None` when nothing changed.
 pub(crate) fn change_setting(
@@ -3924,6 +3995,24 @@ pub(crate) fn change_setting(
     if let Err(error) = save_setting(key, &value) {
         push_notice(hwnd, format!("FastPad could not save fastpad.ini: {error}"));
     }
+}
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+)]
+#[cfg(not(test))]
+fn remove_setting(key: &str) -> Result<()> {
+    crate::config::remove_setting(key)
+}
+
+/// Like `save_setting` in tests: only a path a test chose with `save_settings_to` is touched.
+#[cfg(test)]
+fn remove_setting(key: &str) -> Result<()> {
+    TEST_SETTINGS_PATH.with(|path| match path.borrow().as_deref() {
+        Some(path) => crate::config::remove_setting_to(path, key),
+        None => Ok(()),
+    })
 }
 
 #[cfg(not(test))]
@@ -4079,6 +4168,14 @@ fn apply_loaded_settings(
         app.settings = settings;
         for warning in &warnings {
             app.notifications.push(settings_warning_message(warning));
+        }
+        let (keymap, problems) =
+            crate::window::keymap::Keymap::from_ini(&app.settings.key_overrides);
+        for problem in problems {
+            app.notifications.push(format!("fastpad.ini: {problem}"));
+        }
+        if keymap != app.keymap {
+            install_keymap(app, keymap);
         }
     }
     apply_editor_settings(hwnd);
@@ -26406,6 +26503,112 @@ three"
         assert_eq!(crate::window::settings_dialog::open_dialog(owner), None);
         assert_ne!(unsafe { IsWindowEnabled(owner) }, 0);
         assert!(!crate::window::modal::modal_active(owner));
+    }
+
+    #[test]
+    fn rebinding_save_rebuilds_the_accelerator_table_and_saves_one_line() {
+        // Break caught: a new key saved but the old table still dispatching, or Reset leaving a
+        // `key.file.save=` line that unbinds Save on the next start.
+        use crate::window::keymap::KeyStroke;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FVIRTKEY};
+        let scratch = RecoveryScratch::new("keymap-rebind");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let save_entries = |hwnd| {
+            app_mut(hwnd)
+                .accelerators
+                .as_ref()
+                .unwrap()
+                .entries()
+                .into_iter()
+                .filter(|entry| entry.cmd == CommandId::Save as u16)
+                .map(|entry| (entry.fVirt, entry.key))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            save_entries(window.hwnd),
+            [(FVIRTKEY | FCONTROL, u16::from(b'S'))]
+        );
+
+        super::set_command_keys(
+            window.hwnd,
+            CommandId::Save,
+            vec![KeyStroke::parse("Ctrl+Alt+S").unwrap()],
+        );
+        assert_eq!(
+            save_entries(window.hwnd),
+            [(FVIRTKEY | FCONTROL | FALT, u16::from(b'S'))]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nkey.file.save=Ctrl+Alt+S\r\n"
+        );
+        assert_eq!(
+            app_mut(window.hwnd)
+                .settings
+                .key_overrides
+                .get("file.save")
+                .map(String::as_str),
+            Some("Ctrl+Alt+S")
+        );
+
+        super::reset_command_keys(window.hwnd, CommandId::Save);
+        assert_eq!(
+            save_entries(window.hwnd),
+            [(FVIRTKEY | FCONTROL, u16::from(b'S'))]
+        );
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+        assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
+
+        // Keys equal to the defaults are a reset too.
+        super::set_command_keys(window.hwnd, CommandId::Save, vec![]);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nkey.file.save=\r\n"
+        );
+        super::set_command_keys(
+            window.hwnd,
+            CommandId::Save,
+            vec![KeyStroke::parse("Ctrl+S").unwrap()],
+        );
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn loaded_key_overrides_rebuild_the_table_and_warn_about_bad_lines() {
+        // Break caught: `key.` lines read but never applied, or an unknown command dropped
+        // without telling the user.
+        let window = ProductionWindow::new(make_app());
+        let mut settings = crate::config::default_settings();
+        settings
+            .key_overrides
+            .insert("search.find".into(), "F9".into());
+        settings
+            .key_overrides
+            .insert("nope.command".into(), "F8".into());
+        super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+        let app = app_mut(window.hwnd);
+        assert!(app.keymap.is_user(CommandId::Find));
+        assert!(
+            app.accelerators
+                .as_ref()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| {
+                    entry.cmd == CommandId::Find as u16
+                        && entry.key == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9
+                })
+        );
+        assert!(
+            app.notifications
+                .pending()
+                .iter()
+                .any(|notification| notification.message.contains("key.nope.command"))
+        );
     }
 
     #[test]

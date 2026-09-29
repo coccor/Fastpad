@@ -1593,11 +1593,11 @@ mod tests {
             VK_BACK, VK_DELETE, VK_END, VK_HOME, VK_LEFT, VK_RIGHT,
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::{FCONTROL, FSHIFT};
-        let specs = crate::window::menus::accelerator_specs();
+        let keymap = crate::window::keymap::Keymap::defaults();
         let bound = |modifiers: u8, key: u16| {
-            specs
-                .iter()
-                .any(|spec| spec.modifiers == modifiers && spec.key == key)
+            keymap.bindings().iter().any(|binding| {
+                binding.stroke.accel_flags() == modifiers && binding.stroke.vk == key
+            })
         };
         let letter = |key: u8| u16::from(key);
         for (modifiers, key) in [
