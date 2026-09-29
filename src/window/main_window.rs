@@ -3914,7 +3914,7 @@ fn install_keymap(app: &mut App, keymap: crate::window::keymap::Keymap) {
 /// `key.<id>=` line, or removes the line when `keys` are the defaults.
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
 )]
 pub(crate) fn set_command_keys(
     hwnd: HWND,
@@ -3960,7 +3960,7 @@ pub(crate) fn set_command_keys(
 /// Gives `command` its default keys back and removes its `key.<id>=` line.
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
 )]
 pub(crate) fn reset_command_keys(hwnd: HWND, command: CommandId) {
     set_command_keys(hwnd, command, crate::window::keymap::default_keys(command));
@@ -4002,7 +4002,7 @@ pub(crate) fn change_setting(
 
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")
+    allow(dead_code, reason = "Task 8 wires the shortcuts page into the dialog")
 )]
 #[cfg(not(test))]
 fn remove_setting(key: &str) -> Result<()> {
