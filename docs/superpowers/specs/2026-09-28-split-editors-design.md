@@ -49,7 +49,7 @@
   - its tabs in strip order;
   - the active index;
   - which of its tabs, if any, is the preview tab.
-- The preview flag stays on `Document`. A document that gets a second view becomes a normal tab, so a preview tab always has exactly one view and each group has at most one preview tab. The first edit clears the flag, as today.
+- The preview flag stays on `Document`. A document that gets a second view becomes a normal tab, so a preview tab always has exactly one view and each group has at most one preview tab. A view arriving in a group that already has a preview tab becomes a normal tab. The first edit clears the flag, as today.
 - **Reference counting of views.** A document is removed from the store when its last view closes.
   - Closing a view of a dirty document that has another view **does not prompt**.
   - Closing its last view prompts as today.
@@ -219,6 +219,7 @@ It is an in-window `SetCapture` drag, the same pattern as `tree_drag`, not OLE. 
 | Pointer over | Drop does |
 |---|---|
 | Its own strip | Reorders the tab to the insertion point. Tab reordering is new. |
+| Its own strip, with Ctrl | Reorders, as without Ctrl. |
 | Another group's strip | Moves the view to that position in that group. With **Ctrl** held, it copies: a new view of the same document, and the source view stays. |
 | A group's content area, middle | Moves (or with Ctrl copies) the view into that group, appended at the end and activated. |
 | A group's content area, outer third on the left, right, top or bottom | Splits that group in that direction and puts the view in the new group. |
@@ -226,7 +227,7 @@ It is an in-window `SetCapture` drag, the same pattern as `tree_drag`, not OLE. 
 | A notebook folder in the sidebar tree | Copies the file there, today's `copy_tab_into` behaviour for Open Editors rows, now also from a strip. |
 | Anywhere else | Nothing (the no-drop cursor). |
 
-The zone is chosen by the pointer's position in the content rectangle. The outer third is measured against the rectangle's width for left and right, and its height for top and bottom. Where the corner regions overlap, the nearer edge wins, and on a tie the horizontal edge wins.
+The zone is chosen by the pointer's position in the content rectangle. The outer third is measured against the rectangle's width for left and right, and its height for top and bottom. Where the corner regions overlap, the nearer edge wins, measured in pixels, and on a tie the top or bottom edge wins.
 
 ### 6.2 Rules
 
@@ -234,7 +235,7 @@ The zone is chosen by the pointer's position in the content rectangle. The outer
 - Moving a group's last tab out closes the source group after the drop completes.
 - Dropping a tab on its own current position does nothing.
 - **Open Editors rows** can be dragged onto group strips and content areas with the same targets and rules.
-- **Explorer (OLE) file drops** open the files in the group under the pointer, or in the active group if the pointer isn't over one. They have no edge zones and no overlay.
+- **Explorer (OLE) file drops** open the files in the group under the pointer: the editor's own group, or for a drop on a strip, a preview or an image view, the group under the drop point. A drop over no group opens in the active group. They have no edge zones and no overlay.
 
 ## 7. Menus and the tab-strip context menu
 
@@ -318,6 +319,16 @@ Three PRs, stacked on `feat/split-editors`:
      15. Session group numbers are the groups' positions in layout order, from 1.
 3. **Drag and drop** (`feat/split-editors-dnd`).
    - Tab drags, reordering, moves and copies between groups, edge splits, the overlay, Open Editors row drags, and Explorer drops per group.
+   - PR 3 plan-time amendments (docs/superpowers/plans/2026-09-29-split-editors-3-dnd.md):
+     1. Corners (§6.1): "nearer" is measured in pixels, from the point to each edge whose outer third contains it; on a tie the top or bottom edge wins.
+     2. Ctrl on its own group: in its own strip a Ctrl drag reorders (no second view of a document in one group); on its own content's middle it does nothing.
+     3. One preview per group (§3.2): a view arriving in a group already holding a different preview tab becomes a normal tab. This covers drops, Ctrl+Alt+Left/Right and Open Editors drags.
+     4. Overlay colours: an area tint in `palette.selection_background` at alpha 80 of 255; the strip's insertion bar is 2 px (scaled) of `palette.editor_foreground`, opaque.
+     5. Open Editors untitled rows can be dragged. They drop on groups only: the tree refuses them, as there is no file to copy.
+     6. Explorer drops: a drop on an editor goes to that editor's group; a drop that reaches the main window's `WM_DROPFILES` (a strip, a preview, an image view) goes to the group under the drop point, and otherwise to the active group.
+     7. Keys during a started tab drag are swallowed. Esc cancels. Ctrl down or up re-targets, switching between move and copy.
+     8. A right press cancels a tab drag and keeps the capture until its own release, as the tree drag does, so the release never opens a menu.
+     9. A tab drag starts from a press on a tab's body, not its close button. A tab that closes mid-drag makes the drop do nothing.
 
 ## 11. Out of scope
 
