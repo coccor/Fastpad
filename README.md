@@ -89,8 +89,7 @@ Write on the left, see it rendered on the right. FastPad draws GitHub-flavored M
 (tables, task lists, strikethrough, code blocks and local images) and updates moments after you stop
 typing. Both panes scroll together.
 
-- **Ctrl+Shift+V** cycles between no preview, side by side and full width.
-- Drag the divider to resize; double-click it to reset.
+- Show the preview side by side or full width, and drag the divider to resize it.
 - Links just work: web links open in your browser, `#headings` jump inside the preview, and links to
   local files open in a new FastPad tab.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
@@ -98,63 +97,30 @@ typing. Both panes scroll together.
 
 ### Notes and notebooks
 
-Open any folder with **Ctrl+Shift+O** and it becomes your notebook. The sidebar on the left
-shows it as a tree: folders as they are on disk, pinned notes first. Click a note to open it
-in a preview tab that the next click replaces. Double-click it, or start typing, to keep it.
-Hover a note to pin it.
+<img src="docs/images/notebook.png" alt="The notebook sidebar with folders and notes, and a note open in the editor" width="800">
 
-- **Ctrl+N** gives you a new note, labelled by its first line as you type. The first Ctrl+S asks
-  for its name inline and saves it into the notebook. Notes in the notebook save themselves
-  from then on.
-- **+** on the notebook's row at the top of the tree, or **New note here** on a folder's menu,
-  names a new note right in the tree, where it will be: type `todo` and Enter makes `todo.md`
-  and opens it. Type an extension such as `data.json` to pick another kind.
-- **Ctrl+Shift+F** searches the text of every note in the notebook as you type, with match
-  case (**Alt+C**), whole word (**Alt+W**) and regular expression (**Alt+R**) toggles. Select
-  a word first and it becomes the search. Opening a result puts your search in the find bar,
-  so **F3** steps through every match in that note. Nothing is indexed: the notes are read
-  when you search, and results stream in as they're found.
-- **Ctrl+Shift+H** opens a replace field under the search; pressed in the field, it closes it.
-  **Replace all** (or **Ctrl+Alt+Enter**) replaces in every listed note after asking, and each result has its own
-  replace button (**Ctrl+Shift+1** on the selected one). Notes open in tabs change in the
-  editor, where one Ctrl+Z undoes it; the others are saved, skipping any that changed since the
-  search. With regular expressions on, `$1` inserts a group, in the find bar's Replace too.
-- **Ctrl+P** opens a note by typing part of its name or folder, its letters in order, as in
-  VS Code. With nothing typed it lists the notes open in tabs, the most recent first, so
-  Ctrl+P then Enter goes back to the previous note. Add `:42` to open a note at line 42, or
-  type `:42` alone to go to that line in the current tab.
-- **New folder** on the notebook's row, or **New folder here**, names a folder the same way.
-  **F2** renames a note or a folder in place, without opening it, and **Del** sends it to the
-  Recycle Bin. A name that is taken says so as you type. Empty folders show in the tree, and each note
-  has a coloured icon for its type.
-- Drag a note or a folder onto another folder in the tree to move it there, or onto empty
-  space to move it to the notebook's top level. A label with its name follows the pointer while
-  you drag. Open tabs and pins follow it, nothing is ever overwritten, and Esc cancels the drag.
-- **Open Editors.** The top of the Notebook view lists every open tab, the notebook's own notes
-  and any other file alike. Click a row to switch to it; its ✕ or a middle-click closes it. The
-  notebook itself is the collapsible row below.
-- **Adding a file to the notebook.** Drag its row from Open Editors onto a folder in the tree, or
-  drag files and folders from Explorer onto the tree. They are copied there; the original stays
-  where it is. If the name is taken, FastPad asks before replacing it, and the replaced item goes
-  to the Recycle Bin.
-- The tree's icons come from Material Icon Theme. **File icons: Minimal** in the palette switches
-  to single-colour outlines, and **File icons: Solid** to filled shapes. Designers can edit both
-  as SVGs (`assets/icons/README.md`).
-- Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
-- **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
-  Everything is reachable from the keyboard and exposed to screen readers.
+Open any folder and it becomes your notebook: a tree in the sidebar, folders as they are on disk,
+pinned notes first. Notes are plain files, so nothing is locked in.
 
-Pins are stored in `.fastpad\library.ini` inside the notebook, so they travel with it. Nothing
-is written into a folder until you pin something. Turn it all off with `notes_mode=false` in
-`fastpad.ini`.
+- **Write fast.** New notes are named inline and save themselves once they're in the notebook.
+  Create, rename, move (drag and drop) and delete notes and folders right in the tree.
+- **Find anything.** Search and replace across every note, with case, whole-word and regex
+  options, and jump to any note by typing part of its name. Nothing is indexed; results stream in.
+- **Open Editors** lists every open tab above the tree. Drag files in from Explorer or from Open
+  Editors to copy them into the notebook.
+- Star notebooks to keep them in **Favorites**, pick coloured, minimal or solid file icons, and
+  drive it all from the keyboard or a screen reader.
+
+Pins travel with the notebook in `.fastpad\library.ini`, and nothing is written into a folder until
+you pin something. Turn notes off with `notes_mode=false` in `fastpad.ini`.
 
 ### JSON you can trust
 
 <img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
 
 Syntax highlighting as soon as you open a `.json` file. **Validate JSON** points to the exact line
-and column of a mistake; **Format JSON** (Shift+Alt+F) pretty-prints the whole document in one step you can undo. Neither will touch a
-file that doesn't parse.
+and column of a mistake; **Format JSON** pretty-prints the whole document in one step you can undo. Neither will
+touch a file that doesn't parse.
 
 ### Syntax highlighting for the files you actually open
 
@@ -166,16 +132,30 @@ from **View → Language** or the command palette. The notebook lists all of the
 
 ### Tabs, done right
 
-Open as many files as you like in one window. **Ctrl+Tab** and **Alt+1…9** to jump, double-click
-the empty tab bar for a new tab, scroll the wheel over the tabs to browse them, and close one with **Ctrl+W** or a middle-click. Every tab keeps its caret and scroll position, across switches and restarts. Open a file from
-Explorer or the command line and it lands as a tab in the FastPad window you already have open, not
-in a new window.
+Open as many files as you like in one window. Every tab keeps its caret and scroll position, across
+switches and restarts. Open a file from Explorer or the command line and it lands as a tab in the
+FastPad window you already have open, not in a new window.
+
+### Split editors
+
+<img src="docs/images/split-editors.png" alt="Four editor groups in a 2x2 grid showing Rust, Markdown, Python and JSON" width="800">
+
+Put files side by side in any grid of rows and columns. Drag a tab onto another group to move it,
+or onto an editor's edge to split it. Each group has its own tabs, and the layout comes back with
+your session.
+
+### Images next to your notes
+
+<img src="docs/images/image-preview.png" alt="An SVG open as text with its rendered preview beside it, and images in the notebook tree" width="800">
+
+PNG, JPEG, GIF, WebP and more open in an image tab you can zoom and pan. SVGs open as text, with
+their rendered preview beside the source. The notebook lists images next to your notes.
 
 ### A command palette for everything
 
 <img src="docs/images/command-palette.png" alt="The command palette filtering theme commands" width="800">
 
-**Ctrl+Shift+P** and start typing. Switch theme, toggle word wrap or line numbers, change font size
+Open it and start typing. Switch theme, toggle word wrap or line numbers, change font size
 or tab width, all without leaving the keyboard. Every change is saved instantly. The
 **Settings** button at the bottom of the sidebar opens the palette with just the settings.
 
@@ -206,13 +186,8 @@ before closing again.
   leaves you with a half-written file.
 - **Encodings preserved.** UTF-8, UTF-8 with BOM, UTF-16 LE and UTF-16 BE are detected on open and
   kept on save.
-- **Images.** PNG, JPEG, GIF (first frame), BMP, ICO, TIFF, and WebP/HEIC/AVIF when Windows has
-  the codec, open in an image tab: it fits the window, Ctrl + wheel or Ctrl +/− zooms, Ctrl+0 fits
-  again, double-click toggles 100%, and drag or the arrow keys pan. SVG files open as text; press
-  Ctrl+Shift+V to see them rendered beside or instead of the source. The notebook lists images next
-  to notes; Search reads notes only.
-- **Find and replace**, with match case, whole word and regular expressions (Alt+C, Alt+W,
-  Alt+R) and F3 / Shift+F3, plus zoom, word wrap and line numbers.
+- **Find and replace** with match case, whole word and regular expressions, plus zoom, word wrap
+  and line numbers.
 - **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive
   technology and can be followed from it.
 
