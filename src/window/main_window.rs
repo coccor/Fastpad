@@ -46,9 +46,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE,
     WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
-    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -1245,6 +1245,34 @@ pub(crate) fn group_hwnd(hwnd: HWND) -> Option<HWND> {
 }
 
 /// The group whose window is `group`.
+/// The group whose window contains screen point `point`, with that window.
+pub(crate) fn group_at(
+    hwnd: HWND,
+    point: windows_sys::Win32::Foundation::POINT,
+) -> Option<(GroupId, HWND)> {
+    let windows = unsafe { app_ptr(hwnd) }.map(|app| {
+        unsafe { app.as_ref() }
+            .groups
+            .iter()
+            .map(|group| (group.id, group.hwnd))
+            .collect::<Vec<_>>()
+    })?;
+    windows.into_iter().find(|(_, window)| {
+        let mut rect = RECT::default();
+        let shown = unsafe {
+            // Its own style: the main window of a test is never shown.
+            GetWindowLongPtrW(*window, GWL_STYLE) as u32 & WS_VISIBLE != 0
+                && windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(*window, &mut rect)
+                    != 0
+        };
+        shown
+            && point.x >= rect.left
+            && point.x < rect.right
+            && point.y >= rect.top
+            && point.y < rect.bottom
+    })
+}
+
 pub(crate) fn group_id_of(hwnd: HWND, group: HWND) -> Option<GroupId> {
     let app = unsafe { app_ptr(hwnd) }?;
     unsafe { app.as_ref() }
@@ -1341,6 +1369,14 @@ pub(crate) fn fail_group_creation_after(count: usize) {
 /// Destroys group `id`'s window, its editor and what it showed. The caller has already emptied it
 /// and taken it out of the layout.
 pub(crate) fn destroy_group(hwnd: HWND, id: GroupId) {
+    if unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tab_drag
+            .as_ref()
+            .is_some_and(|drag| drag.source.group == id)
+    }) {
+        crate::window::tab_drag::cancel(hwnd);
+    }
     let removed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let index = app.groups.iter().position(|group| group.id == id)?;
@@ -1461,6 +1497,10 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
         right: width,
         bottom: client.bottom.max(top),
     };
+    with_group_id(hwnd, id, |state| {
+        state.content =
+            crate::window::titlebar::Rect::new(area.left, area.top, area.right, area.bottom)
+    });
     set_group_region(hwnd, group, &client, strip_height, band);
     let rects = crate::window::preview_host::layout(hwnd, id, area, dpi);
     crate::window::image_host::layout(hwnd, id, area);
@@ -2907,7 +2947,7 @@ pub(crate) fn strip_layout_of(
     ))
 }
 
-fn invalidate_group_strip(hwnd: HWND, id: GroupId) {
+pub(crate) fn invalidate_group_strip(hwnd: HWND, id: GroupId) {
     let (Some(group), Some(layout)) = (
         with_group_id(hwnd, id, |state| state.hwnd),
         strip_layout_of(hwnd, id),
@@ -2926,7 +2966,7 @@ fn invalidate_group_strip(hwnd: HWND, id: GroupId) {
     }
 }
 
-fn update_strip_pointer(
+pub(crate) fn update_strip_pointer(
     hwnd: HWND,
     id: GroupId,
     update: impl FnOnce(
@@ -2946,7 +2986,7 @@ fn update_strip_pointer(
 }
 
 /// What the group-client point is over in group `id`'s strip; `None` below it.
-fn strip_target(
+pub(crate) fn strip_target(
     hwnd: HWND,
     id: GroupId,
     x: i32,
@@ -3079,8 +3119,12 @@ pub(crate) fn group_strip_message(
         exit_menu_mode(hwnd);
     }
     match message {
+        WM_RBUTTONDOWN if crate::window::tab_drag::cancel_for_right_press(hwnd) => Some(0),
         WM_MOUSEMOVE => {
             if drag_tab_thumb(hwnd, id, x) {
+                return Some(0);
+            }
+            if crate::window::tab_drag::mouse_move(hwnd, group, x, y, wparam) {
                 return Some(0);
             }
             let mut track = windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
@@ -3116,11 +3160,18 @@ pub(crate) fn group_strip_message(
             if target == StripTarget::ScrollBar {
                 begin_tab_thumb_drag(hwnd, id, group, x);
             }
+            if let StripTarget::Tab(index) = target {
+                crate::window::tab_drag::arm(hwnd, id, group, index, x, y);
+            }
             Some(0)
         }
         // A release acts only over the target its press went down on, so the release that ends
         // a double-click on empty strip never hits the tab that double-click just opened.
         WM_LBUTTONUP => {
+            if crate::window::tab_drag::release(hwnd, group, x, y, wparam) {
+                update_strip_pointer(hwnd, id, |pointer| pointer.press(None));
+                return Some(0);
+            }
             let mut activated = None;
             update_strip_pointer(hwnd, id, |pointer| {
                 let (next, released) = pointer.release(strip_target(hwnd, id, x, y));
@@ -3148,6 +3199,7 @@ pub(crate) fn group_strip_message(
             }
             Some(0)
         }
+        WM_RBUTTONUP if crate::window::tab_drag::right_release(hwnd) => Some(0),
         WM_RBUTTONUP if strip_target(hwnd, id, x, y) == Some(StripTarget::Empty) => {
             show_group_strip_menu(hwnd, group, x, y);
             Some(0)
@@ -3203,6 +3255,9 @@ pub(crate) fn group_strip_message(
         }
         WM_CAPTURECHANGED => {
             with_group_id(hwnd, id, |state| state.thumb_grab = None);
+            if lparam as HWND != group {
+                crate::window::tab_drag::cancel(hwnd);
+            }
             Some(0)
         }
         _ => None,
@@ -3232,7 +3287,7 @@ pub(crate) fn group_accessible_object(hwnd: HWND, group: HWND, wparam: WPARAM) -
 
 /// Follows every change to the set of tabs or the active one: scrolls the active tab into view,
 /// shows the editor only while a tab is open, and repaints.
-fn refresh_tabs(hwnd: HWND) {
+pub(crate) fn refresh_tabs(hwnd: HWND) {
     let Some((count, active, editor_hwnd)) = (unsafe { app_ptr(hwnd) }).map(|app| {
         let app = unsafe { app.as_ref() };
         (
@@ -5370,6 +5425,41 @@ pub(crate) fn focus_group_number(hwnd: HWND, index: usize) {
 /// Ctrl+Alt+Right and Ctrl+Alt+Left: moves the active tab to the next or previous group in layout
 /// order. Past the last group a new one opens to the right; before the first there is nowhere
 /// to go. A group left without tabs closes (spec §5.2).
+/// Puts document `id`'s view from group `from` into group `to` at strip `index` (`None`: the
+/// end): moved, or with `copy` a second view at the same position. A group that already shows
+/// `id` activates that view, and a move still removes the source view (spec §6.2). The source
+/// group closes when that was its last tab; the focus goes to `to`.
+pub(crate) fn place_view(
+    hwnd: HWND,
+    from: GroupId,
+    id: DocumentId,
+    to: GroupId,
+    index: Option<usize>,
+    copy: bool,
+) -> bool {
+    remember_view(hwnd, from);
+    let placed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let tabs = &mut unsafe { app.as_mut() }.tabs;
+        if copy {
+            let state = tabs.view_state_in(from, id);
+            tabs.add_view_at(to, id, state, index)
+        } else {
+            tabs.move_view_at(from, id, to, index)
+        }
+    });
+    if !placed {
+        return false;
+    }
+    activate_group(hwnd, to);
+    show_group_view(hwnd, from);
+    show_group_view(hwnd, to);
+    remove_empty_group(hwnd, from);
+    layout_editor_and_find_bar(hwnd);
+    refresh_tabs(hwnd);
+    focus_content(hwnd);
+    true
+}
+
 pub(crate) fn move_active_view(hwnd: HWND, forward: bool) {
     let Some((id, source)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
@@ -5398,19 +5488,7 @@ pub(crate) fn move_active_view(hwnd: HWND, forward: bool) {
         }
         None => return,
     };
-    remember_view(hwnd, source);
-    let moved = unsafe { app_ptr(hwnd) }
-        .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.move_view(source, id, target));
-    if !moved {
-        return;
-    }
-    activate_group(hwnd, target);
-    show_group_view(hwnd, source);
-    show_group_view(hwnd, target);
-    remove_empty_group(hwnd, source);
-    layout_editor_and_find_bar(hwnd);
-    refresh_tabs(hwnd);
-    focus_content(hwnd);
+    place_view(hwnd, source, id, target, None, false);
 }
 
 /// Makes an empty group beside `target`, or says why not (split editors spec §4.3, §9).
@@ -7756,6 +7834,9 @@ pub(crate) unsafe fn translate_accelerator(
 ) -> bool {
     if !identity.is_live_for(hwnd) {
         return false;
+    }
+    if crate::window::tab_drag::keeps_key(hwnd, message) {
+        return true;
     }
     if menu_activation_message(hwnd, message)
         && unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0) } != 0
@@ -24951,5 +25032,317 @@ three"
         )
         .expect("label image");
         assert!(image.size.cx > image.size.cy);
+    }
+
+    /// Group `from`'s window, and a press on its tab `index` followed by a move past the drag
+    /// distance.
+    fn start_strip_drag(hwnd: HWND, from: GroupId, index: usize) -> HWND {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let window = super::with_group_id(hwnd, from, |state| state.hwnd).unwrap();
+        let tab = super::strip_layout_of(hwnd, from)
+            .unwrap()
+            .tab(index)
+            .unwrap()
+            .center();
+        unsafe {
+            SendMessageW(window, WM_LBUTTONDOWN, 1, client_lparam(tab.x, tab.y));
+            SendMessageW(window, WM_MOUSEMOVE, 1, client_lparam(tab.x + 30, tab.y));
+        }
+        window
+    }
+
+    /// Window `to`'s client point (`x`, `y`) in window `from`'s client coordinates, as an
+    /// `lParam`: where the source group, which has the capture, sees the pointer.
+    fn lparam_in(from: HWND, to: HWND, x: i32, y: i32) -> super::LPARAM {
+        let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(to, from, &mut point, 1) };
+        client_lparam(point.x, point.y)
+    }
+
+    /// Moves the drag to window `to`'s client point and releases there; `buttons` carries
+    /// `MK_CONTROL` for a copy.
+    fn drop_strip_drag(from: HWND, to: HWND, x: i32, y: i32, buttons: usize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_MOUSEMOVE};
+        let point = lparam_in(from, to, x, y);
+        unsafe {
+            SendMessageW(from, WM_MOUSEMOVE, 1 | buttons, point);
+            SendMessageW(from, WM_LBUTTONUP, buttons, point);
+        }
+    }
+
+    fn strip_ids(hwnd: HWND, group: GroupId) -> Vec<crate::document::DocumentId> {
+        app_mut(hwnd).tabs.group(group).unwrap().document_ids()
+    }
+
+    #[test]
+    fn a_tab_dragged_along_its_strip_moves_there_and_stays_active() {
+        // Break caught: a strip drag that does nothing, or reorders but leaves the editor on
+        // another tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        assert!(
+            app_mut(window.hwnd)
+                .tab_drag
+                .as_ref()
+                .is_some_and(|drag| drag.started)
+        );
+        let layout = super::strip_layout_of(window.hwnd, group).unwrap();
+        let end = layout.tab(2).unwrap();
+        drop_strip_drag(source, source, end.right - 2, end.center().y, 0);
+        assert_eq!(strip_ids(window.hwnd, group), [ids[1], ids[2], ids[0]]);
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, ids[0]);
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn a_wobble_under_the_drag_distance_is_still_a_click() {
+        // Break caught (Review Focus 1): a slightly shaky click starting a drag, so the tab
+        // never activates.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let first = strip_ids(window.hwnd, group)[0];
+        let tab = super::strip_layout_of(window.hwnd, group)
+            .unwrap()
+            .tab(0)
+            .unwrap()
+            .center();
+        let source = super::with_group_id(window.hwnd, group, |state| state.hwnd).unwrap();
+        unsafe {
+            SendMessageW(source, WM_LBUTTONDOWN, 1, client_lparam(tab.x, tab.y));
+            SendMessageW(source, WM_MOUSEMOVE, 1, client_lparam(tab.x + 1, tab.y));
+            SendMessageW(source, WM_LBUTTONUP, 0, client_lparam(tab.x + 1, tab.y));
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, first);
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+    }
+
+    #[test]
+    fn a_press_on_a_tabs_close_button_never_starts_a_drag() {
+        // Break caught: a jittery click on × dragging the tab instead of closing it.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let close = super::strip_layout_of(window.hwnd, group)
+            .unwrap()
+            .close_tab(0)
+            .unwrap()
+            .center();
+        let source = super::with_group_id(window.hwnd, group, |state| state.hwnd).unwrap();
+        unsafe {
+            SendMessageW(source, WM_LBUTTONDOWN, 1, client_lparam(close.x, close.y));
+            SendMessageW(
+                source,
+                WM_MOUSEMOVE,
+                1,
+                client_lparam(close.x - 40, close.y),
+            );
+        }
+        assert!(
+            app_mut(window.hwnd)
+                .tab_drag
+                .as_ref()
+                .is_none_or(|drag| !drag.started)
+        );
+    }
+
+    #[test]
+    fn esc_cancels_a_tab_drag_and_takes_its_label_and_overlay() {
+        // Break caught: Esc typed into the editor while a tab drag hangs on the pointer.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let ids = strip_ids(window.hwnd, group);
+        start_strip_drag(window.hwnd, group, 0);
+        let escape = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_KEYDOWN,
+            wParam: VK_ESCAPE as usize,
+            ..Default::default()
+        };
+        assert!(crate::window::tab_drag::keeps_key(window.hwnd, &escape));
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+        assert_eq!(strip_ids(window.hwnd, group), ids);
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() },
+            std::ptr::null_mut()
+        );
+    }
+
+    #[test]
+    fn a_lost_capture_cancels_a_tab_drag() {
+        // Break caught (Review Focus 2): Alt+Tab mid-drag leaving the label on screen and the
+        // next click dropping the tab somewhere.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        start_strip_drag(window.hwnd, group, 0);
+        unsafe { ReleaseCapture() };
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    }
+
+    #[test]
+    fn a_right_press_cancels_a_tab_drag_and_its_release_opens_no_menu() {
+        // Break caught: the right release after a cancel falling through to the strip's menu.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let menu = std::rc::Rc::new(std::cell::Cell::new(false));
+        let shown = menu.clone();
+        crate::window::menus::answer_next_popup_menu(move |_| {
+            shown.set(true);
+            None
+        });
+        let source = start_strip_drag(window.hwnd, group, 0);
+        unsafe { SendMessageW(source, WM_RBUTTONDOWN, 2, client_lparam(20, 10)) };
+        assert!(
+            app_mut(window.hwnd)
+                .tab_drag
+                .as_ref()
+                .is_some_and(|drag| drag.eat_right_up)
+        );
+        unsafe { SendMessageW(source, WM_RBUTTONUP, 0, client_lparam(20, 10)) };
+        assert!(app_mut(window.hwnd).tab_drag.is_none());
+        assert!(!menu.get(), "the release opened a menu");
+    }
+
+    #[test]
+    fn the_insertion_bar_shows_over_the_strip_under_the_pointer() {
+        // Break caught: no feedback until the drop, so the user cannot see where the tab lands.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let source = start_strip_drag(window.hwnd, group, 0);
+        let layout = super::strip_layout_of(window.hwnd, group).unwrap();
+        let x = layout.insertion_x(2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, client_lparam(x + 1, 10)) };
+        let overlay = app_mut(window.hwnd).drop_overlay.expect("an insertion bar");
+        let mut origin = windows_sys::Win32::Foundation::POINT { x, y: 0 };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(source, &mut origin) };
+        let rect = overlay.rect();
+        assert!(
+            (rect.left - origin.x).abs() <= 2,
+            "bar at {} vs insertion point {}",
+            rect.left,
+            origin.x
+        );
+        assert_eq!(rect.bottom - rect.top, layout.height);
+        crate::window::tab_drag::cancel(window.hwnd);
+    }
+
+    #[test]
+    fn near_a_content_edge_the_half_the_new_group_takes_is_tinted() {
+        // Break caught: no zone highlight near the edges, a tint over the whole group for an edge
+        // (the user cannot tell a split from a move), the wrong half, or a tint where the drop
+        // does nothing.
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        let group = app_mut(window.hwnd).tabs.active_group();
+        let area = super::with_group_id(window.hwnd, group, |state| state.content).unwrap();
+        let area = RECT {
+            left: area.left,
+            top: area.top,
+            right: area.right,
+            bottom: area.bottom,
+        };
+        let screen = |source: HWND, rect: RECT| {
+            let mut corners = [
+                windows_sys::Win32::Foundation::POINT {
+                    x: rect.left,
+                    y: rect.top,
+                },
+                windows_sys::Win32::Foundation::POINT {
+                    x: rect.right,
+                    y: rect.bottom,
+                },
+            ];
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::MapWindowPoints(
+                    source,
+                    std::ptr::null_mut(),
+                    corners.as_mut_ptr(),
+                    2,
+                )
+            };
+            (corners[0].x, corners[0].y, corners[1].x, corners[1].y)
+        };
+        let tint = || {
+            app_mut(window.hwnd).drop_overlay.map(|overlay| {
+                let rect = overlay.rect();
+                (rect.left, rect.top, rect.right, rect.bottom)
+            })
+        };
+        let (width, height) = (area.right - area.left, area.bottom - area.top);
+        let source = start_strip_drag(window.hwnd, group, 0);
+
+        // The right edge: the right half.
+        let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert_eq!(
+            tint(),
+            Some(screen(
+                source,
+                RECT {
+                    left: area.right - width / 2,
+                    ..area
+                }
+            ))
+        );
+        // The bottom edge: the bottom half; the zone follows the pointer.
+        let point = client_lparam((area.left + area.right) / 2, area.bottom - 5);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert_eq!(
+            tint(),
+            Some(screen(
+                source,
+                RECT {
+                    top: area.bottom - height / 2,
+                    ..area
+                }
+            ))
+        );
+        crate::window::tab_drag::cancel(window.hwnd);
+        assert!(app_mut(window.hwnd).drop_overlay.is_none());
+
+        // A lone tab over its own edge would do nothing: no tint.
+        execute_command(window.hwnd, CommandId::CloseTab);
+        let source = start_strip_drag(window.hwnd, group, 0);
+        let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+        unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+        assert!(tint().is_none());
+        crate::window::tab_drag::cancel(window.hwnd);
     }
 }

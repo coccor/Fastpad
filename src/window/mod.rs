@@ -39,6 +39,7 @@ pub(crate) mod side_panel;
 pub(crate) mod sidebar_accessibility;
 pub(crate) mod split_tree;
 pub mod status;
+pub(crate) mod tab_drag;
 pub mod tabs;
 pub(crate) mod text_search_host;
 pub mod titlebar;

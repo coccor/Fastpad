@@ -2,9 +2,6 @@
 //! dragged tab would end up in, or a thin bar at a strip's insertion point. The same technique
 //! as `drag_label`, painted with one flat colour.
 
-// Used by tab drags from Task 4.
-#![allow(dead_code)]
-
 use crate::platform::wide_null;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
@@ -16,10 +13,10 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW,
-    GetWindowRect, HTTRANSPARENT, LWA_ALPHA, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    HTTRANSPARENT, LWA_ALPHA, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_ERASEBKGND,
+    WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const CLASS: &str = "FastPadDropOverlay";
@@ -107,9 +104,10 @@ impl DropOverlay {
     }
 
     /// Where the overlay is, on the screen.
+    #[cfg(test)]
     pub(crate) fn rect(&self) -> RECT {
         let mut rect = RECT::default();
-        unsafe { GetWindowRect(self.hwnd, &mut rect) };
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut rect) };
         rect
     }
 

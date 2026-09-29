@@ -606,7 +606,6 @@ fn drag_item(kind: &RowKind) -> Option<TreeItem> {
 /// A tab's drag label for window `window` (a group window): its icon and name, painted like a
 /// tree drag's (split editors spec §6). `None` if GDI can't make the image. Needs no notebook
 /// view, so it works with the sidebar hidden.
-#[allow(dead_code)] // Used by tab drags from Task 4.
 pub(crate) fn tab_label_image(
     hwnd: HWND,
     window: HWND,

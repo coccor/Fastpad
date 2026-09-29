@@ -55,6 +55,10 @@ pub struct App {
     /// The last press on a sash and its message time, so a second press there within the
     /// double-click time equalizes its branch.
     pub(crate) last_sash_click: Option<(crate::window::split_tree::SashId, u32)>,
+    /// A tab pressed on a strip, and dragged once past the drag distance (split editors spec §6).
+    pub(crate) tab_drag: Option<crate::window::tab_drag::TabDrag>,
+    /// The drop overlay of the drag under way: a tab drag or an Open Editors row drag.
+    pub(crate) drop_overlay: Option<crate::window::drop_overlay::DropOverlay>,
     /// The Direct2D factories every group's preview and image view share, created on first use.
     pub(crate) graphics: Option<Rc<crate::preview::dwrite::Graphics>>,
     pub(crate) accessibility: AccessibilityState,
@@ -133,6 +137,8 @@ impl App {
             groups: Vec::new(),
             layout,
             sash_drag: None,
+            tab_drag: None,
+            drop_overlay: None,
             last_sash_click: None,
             graphics: None,
             accessibility: AccessibilityState::default(),

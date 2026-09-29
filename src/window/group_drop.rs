@@ -1,9 +1,6 @@
 //! Where a dragged tab would land and what dropping it there does (split editors spec §6.1, §6.2).
 //! Pure: no window. The window half is `tab_drag`.
 
-// Wired into the window in Task 4.
-#![allow(dead_code)]
-
 use crate::document::DocumentId;
 use crate::window::split_tree::{Direction, GroupId};
 use crate::window::titlebar::{Point, Rect};

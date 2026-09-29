@@ -36,6 +36,9 @@ pub(crate) struct GroupWindow {
     /// Between a middle-button press on a tab and its release: the tab's strip index and the
     /// document it showed then (quick-open spec §5).
     pub(crate) middle_press: Option<(usize, crate::document::DocumentId)>,
+    /// The content area (below the strip, band and find bar), in group-client coordinates, as
+    /// last laid out.
+    pub(crate) content: super::titlebar::Rect,
     /// The last tab click (its document and message time), so a second click on the same tab
     /// within the double-click time keeps a preview tab.
     pub(crate) last_tab_click: Option<(crate::document::DocumentId, u32)>,
@@ -61,6 +64,7 @@ impl GroupWindow {
             pointer: Default::default(),
             thumb_grab: None,
             middle_press: None,
+            content: Default::default(),
             last_tab_click: None,
             accessibility: Default::default(),
             preview_buttons: Default::default(),
