@@ -100,55 +100,20 @@ typing. Both panes scroll together.
 
 <img src="docs/images/notebook.png" alt="The notebook sidebar with folders and notes, and a note open in the editor" width="800">
 
-Open any folder with **Ctrl+Shift+O** and it becomes your notebook. The sidebar on the left
-shows it as a tree: folders as they are on disk, pinned notes first. Click a note to open it
-in a preview tab that the next click replaces. Double-click it, or start typing, to keep it.
-Hover a note to pin it.
+Open any folder and it becomes your notebook: a tree in the sidebar, folders as they are on disk,
+pinned notes first. Notes are plain files, so nothing is locked in.
 
-- **Ctrl+N** gives you a new note, labelled by its first line as you type. The first Ctrl+S asks
-  for its name inline and saves it into the notebook. Notes in the notebook save themselves
-  from then on.
-- **+** on the notebook's row at the top of the tree, or **New note here** on a folder's menu,
-  names a new note right in the tree, where it will be: type `todo` and Enter makes `todo.md`
-  and opens it. Type an extension such as `data.json` to pick another kind.
-- **Ctrl+Shift+F** searches the text of every note in the notebook as you type, with match
-  case (**Alt+C**), whole word (**Alt+W**) and regular expression (**Alt+R**) toggles. Select
-  a word first and it becomes the search. Opening a result puts your search in the find bar,
-  so **F3** steps through every match in that note. Nothing is indexed: the notes are read
-  when you search, and results stream in as they're found.
-- **Ctrl+Shift+H** opens a replace field under the search; pressed in the field, it closes it.
-  **Replace all** (or **Ctrl+Alt+Enter**) replaces in every listed note after asking, and each result has its own
-  replace button (**Ctrl+Shift+1** on the selected one). Notes open in tabs change in the
-  editor, where one Ctrl+Z undoes it; the others are saved, skipping any that changed since the
-  search. With regular expressions on, `$1` inserts a group, in the find bar's Replace too.
-- **Ctrl+P** opens a note by typing part of its name or folder, its letters in order, as in
-  VS Code. With nothing typed it lists the notes open in tabs, the most recent first, so
-  Ctrl+P then Enter goes back to the previous note. Add `:42` to open a note at line 42, or
-  type `:42` alone to go to that line in the current tab.
-- **New folder** on the notebook's row, or **New folder here**, names a folder the same way.
-  **F2** renames a note or a folder in place, without opening it, and **Del** sends it to the
-  Recycle Bin. A name that is taken says so as you type. Empty folders show in the tree, and each note
-  has a coloured icon for its type.
-- Drag a note or a folder onto another folder in the tree to move it there, or onto empty
-  space to move it to the notebook's top level. A label with its name follows the pointer while
-  you drag. Open tabs and pins follow it, nothing is ever overwritten, and Esc cancels the drag.
-- **Open Editors.** The top of the Notebook view lists every open tab, the notebook's own notes
-  and any other file alike. Click a row to switch to it; its ✕ or a middle-click closes it. The
-  notebook itself is the collapsible row below.
-- **Adding a file to the notebook.** Drag its row from Open Editors onto a folder in the tree, or
-  drag files and folders from Explorer onto the tree. They are copied there; the original stays
-  where it is. If the name is taken, FastPad asks before replacing it, and the replaced item goes
-  to the Recycle Bin.
-- The tree's icons come from Material Icon Theme. **File icons: Minimal** in the palette switches
-  to single-colour outlines, and **File icons: Solid** to filled shapes. Designers can edit both
-  as SVGs (`assets/icons/README.md`).
-- Star a notebook to keep it in **Favorites**, and switch between notebooks from there.
-- **Ctrl+B** hides or shows the sidebar, and **F6** moves between the sidebar and the editor.
-  Everything is reachable from the keyboard and exposed to screen readers.
+- **Write fast.** New notes are named inline and save themselves once they're in the notebook.
+  Create, rename, move (drag and drop) and delete notes and folders right in the tree.
+- **Find anything.** Search and replace across every note, with case, whole-word and regex
+  options, and jump to any note by typing part of its name. Nothing is indexed; results stream in.
+- **Open Editors** lists every open tab above the tree. Drag files in from Explorer or from Open
+  Editors to copy them into the notebook.
+- Star notebooks to keep them in **Favorites**, pick coloured, minimal or solid file icons, and
+  drive it all from the keyboard or a screen reader.
 
-Pins are stored in `.fastpad\library.ini` inside the notebook, so they travel with it. Nothing
-is written into a folder until you pin something. Turn it all off with `notes_mode=false` in
-`fastpad.ini`.
+Pins travel with the notebook in `.fastpad\library.ini`, and nothing is written into a folder until
+you pin something. Turn notes off with `notes_mode=false` in `fastpad.ini`.
 
 ### JSON you can trust
 
