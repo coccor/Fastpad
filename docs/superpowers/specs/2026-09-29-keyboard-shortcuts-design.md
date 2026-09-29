@@ -96,12 +96,12 @@ A pure module: no HWNDs, fully unit-tested.
 | Change keybinding | Enter | Double-click, ✎ |
 | Add keybinding | Ctrl+Enter | Context menu |
 | Remove keybinding | Delete | Context menu |
-| Reset keybinding (User rows only) | — | Context menu |
+| Reset keybinding (User rows, or a command whose `key.` line was ignored) | — | Context menu |
 | Copy command ID (to the clipboard) | Ctrl+C | Context menu |
 
 - Change on a "—" row adds. Change on a row replaces that one key in the command's list; the whole list is saved as the override.
 - Remove on the last key of a command leaves it unbound (an empty override) and shows the "—" row.
-- The context menu uses the app's existing themed context menu.
+- The context menu uses the app's existing themed context menu. Shift+F10 and the context-menu key open it for the selected row while the table has the focus.
 
 ### 6.5 Recording box
 
