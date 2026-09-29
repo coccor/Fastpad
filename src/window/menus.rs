@@ -97,102 +97,108 @@ pub(crate) struct MenuBar(HMENU);
 /// View ▸ Editor Layout (split editors spec §7).
 fn editor_layout() -> Vec<MenuEntry> {
     vec![
-        MenuEntry::command("Split &Right\tCtrl+\\", CommandId::SplitRight),
-        MenuEntry::command("Split &Down\tCtrl+Shift+\\", CommandId::SplitDown),
+        MenuEntry::command("Split &Right", CommandId::SplitRight),
+        MenuEntry::command("Split &Down", CommandId::SplitDown),
         MenuEntry::Separator,
-        MenuEntry::command(
-            "Move to &Next Group\tCtrl+Alt+Right",
-            CommandId::MoveTabToNextGroup,
-        ),
-        MenuEntry::command(
-            "Move to &Previous Group\tCtrl+Alt+Left",
-            CommandId::MoveTabToPreviousGroup,
-        ),
+        MenuEntry::command("Move to &Next Group", CommandId::MoveTabToNextGroup),
+        MenuEntry::command("Move to &Previous Group", CommandId::MoveTabToPreviousGroup),
         MenuEntry::Separator,
         MenuEntry::command("&Close Group", CommandId::CloseGroup),
     ]
 }
 
 impl MenuBar {
-    pub(crate) fn create() -> Result<Self> {
+    pub(crate) fn create(keymap: &crate::window::keymap::Keymap) -> Result<Self> {
         let root = unsafe { CreateMenu() };
         if root.is_null() {
             return Err(last_error());
         }
         let result = (|| {
-            let file = create_popup(&[
-                MenuEntry::command("&New\tCtrl+N", CommandId::New),
-                MenuEntry::command("&Open...\tCtrl+O", CommandId::Open),
-                MenuEntry::command("Open &Notebook...\tCtrl+Shift+O", CommandId::OpenFolder),
-                MenuEntry::command("&Go to note\u{2026}\tCtrl+P", CommandId::QuickOpen),
-                MenuEntry::command("&Save\tCtrl+S", CommandId::Save),
-                MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
-                MenuEntry::command("&Close tab	Ctrl+W", CommandId::CloseTab),
-                MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
-                MenuEntry::command("Close &group", CommandId::CloseGroup),
-                MenuEntry::Separator,
-                MenuEntry::command("Se&ttings...	Ctrl+,", CommandId::OpenSettings),
-                MenuEntry::command(
-                    "&Restore session on startup",
-                    CommandId::ToggleRestoreSession,
-                ),
-                MenuEntry::Separator,
-                MenuEntry::command("E&xit", CommandId::Exit),
-            ])?;
+            let file = create_popup(
+                &[
+                    MenuEntry::command("&New", CommandId::New),
+                    MenuEntry::command("&Open...", CommandId::Open),
+                    MenuEntry::command("Open &Notebook...", CommandId::OpenFolder),
+                    MenuEntry::command("&Go to note\u{2026}", CommandId::QuickOpen),
+                    MenuEntry::command("&Save", CommandId::Save),
+                    MenuEntry::command("Save &As...", CommandId::SaveAs),
+                    MenuEntry::command("&Close tab", CommandId::CloseTab),
+                    MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
+                    MenuEntry::command("Close &group", CommandId::CloseGroup),
+                    MenuEntry::Separator,
+                    MenuEntry::command("Se&ttings...", CommandId::OpenSettings),
+                    MenuEntry::command(
+                        "&Restore session on startup",
+                        CommandId::ToggleRestoreSession,
+                    ),
+                    MenuEntry::Separator,
+                    MenuEntry::command("E&xit", CommandId::Exit),
+                ],
+                keymap,
+            )?;
             append_popup(root, MENU_TITLES[0], file)?;
-            let edit = create_popup(&[
-                MenuEntry::command("&Undo\tCtrl+Z", CommandId::Undo),
-                MenuEntry::command("&Redo\tCtrl+Y", CommandId::Redo),
-                MenuEntry::Separator,
-                MenuEntry::command("Cu&t", CommandId::Cut),
-                MenuEntry::command("&Copy", CommandId::Copy),
-                MenuEntry::command("&Paste", CommandId::Paste),
-                MenuEntry::Separator,
-                MenuEntry::command("&Format JSON\tShift+Alt+F", CommandId::FormatJson),
-            ])?;
+            let edit = create_popup(
+                &[
+                    MenuEntry::command("&Undo", CommandId::Undo),
+                    MenuEntry::command("&Redo", CommandId::Redo),
+                    MenuEntry::Separator,
+                    MenuEntry::command("Cu&t", CommandId::Cut),
+                    MenuEntry::command("&Copy", CommandId::Copy),
+                    MenuEntry::command("&Paste", CommandId::Paste),
+                    MenuEntry::Separator,
+                    MenuEntry::command("&Format JSON", CommandId::FormatJson),
+                ],
+                keymap,
+            )?;
             append_popup(root, MENU_TITLES[1], edit)?;
-            let search = create_popup(&[
-                MenuEntry::command("&Find\tCtrl+F", CommandId::Find),
-                MenuEntry::command("Find &next\tF3", CommandId::FindNext),
-                MenuEntry::command("Find pre&vious\tShift+F3", CommandId::FindPrevious),
-                MenuEntry::command("&Replace\tCtrl+H", CommandId::Replace),
-            ])?;
+            let search = create_popup(
+                &[
+                    MenuEntry::command("&Find", CommandId::Find),
+                    MenuEntry::command("Find &next", CommandId::FindNext),
+                    MenuEntry::command("Find pre&vious", CommandId::FindPrevious),
+                    MenuEntry::command("&Replace", CommandId::Replace),
+                ],
+                keymap,
+            )?;
             append_popup(root, MENU_TITLES[2], search)?;
-            let view = create_popup(&[
-                MenuEntry::Submenu(
-                    "&Language",
-                    crate::languages::LANGUAGES
-                        .iter()
-                        .map(|row| {
-                            MenuEntry::command(row.name, CommandId::for_language(row.language))
-                        })
-                        .collect(),
-                ),
-                MenuEntry::Separator,
-                MenuEntry::command("Zoom &in	Ctrl++", CommandId::ZoomIn),
-                MenuEntry::command("Zoom &out	Ctrl+-", CommandId::ZoomOut),
-                MenuEntry::command("Reset &zoom	Ctrl+0", CommandId::ZoomReset),
-                MenuEntry::Separator,
-                MenuEntry::command("&Word wrap	Alt+Z", CommandId::ToggleWordWrap),
-                MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
-                MenuEntry::Separator,
-                MenuEntry::command("Side&bar	Ctrl+B", CommandId::ToggleSidebar),
-                MenuEntry::Submenu("Editor &Layout", editor_layout()),
-                MenuEntry::Separator,
-                MenuEntry::command(
-                    "Markdown preview &side by side",
-                    CommandId::MarkdownPreviewSide,
-                ),
-                MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
-                MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
-                MenuEntry::Separator,
-                MenuEntry::command(
-                    "Command &palette...	Ctrl+Shift+P",
-                    CommandId::CommandPalette,
-                ),
-            ])?;
+            let view = create_popup(
+                &[
+                    MenuEntry::Submenu(
+                        "&Language",
+                        crate::languages::LANGUAGES
+                            .iter()
+                            .map(|row| {
+                                MenuEntry::command(row.name, CommandId::for_language(row.language))
+                            })
+                            .collect(),
+                    ),
+                    MenuEntry::Separator,
+                    MenuEntry::command("Zoom &in", CommandId::ZoomIn),
+                    MenuEntry::command("Zoom &out", CommandId::ZoomOut),
+                    MenuEntry::command("Reset &zoom", CommandId::ZoomReset),
+                    MenuEntry::Separator,
+                    MenuEntry::command("&Word wrap", CommandId::ToggleWordWrap),
+                    MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
+                    MenuEntry::Separator,
+                    MenuEntry::command("Side&bar", CommandId::ToggleSidebar),
+                    MenuEntry::Submenu("Editor &Layout", editor_layout()),
+                    MenuEntry::Separator,
+                    MenuEntry::command(
+                        "Markdown preview &side by side",
+                        CommandId::MarkdownPreviewSide,
+                    ),
+                    MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
+                    MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
+                    MenuEntry::Separator,
+                    MenuEntry::command("Command &palette...", CommandId::CommandPalette),
+                ],
+                keymap,
+            )?;
             append_popup(root, MENU_TITLES[menu_band::VIEW_MENU_INDEX], view)?;
-            let help = create_popup(&[MenuEntry::command("&About FastPad", CommandId::About)])?;
+            let help = create_popup(
+                &[MenuEntry::command("&About FastPad", CommandId::About)],
+                keymap,
+            )?;
             append_popup(root, MENU_TITLES[menu_band::HELP_MENU_INDEX], help)
         })();
         match result {
@@ -280,7 +286,7 @@ impl MenuEntry {
     }
 }
 
-fn create_popup(entries: &[MenuEntry]) -> Result<HMENU> {
+fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -> Result<HMENU> {
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return Err(last_error());
@@ -288,11 +294,17 @@ fn create_popup(entries: &[MenuEntry]) -> Result<HMENU> {
     for entry in entries {
         let ok = match entry {
             MenuEntry::Command(label, command) => {
-                let label = wide_null(label);
-                unsafe { AppendMenuW(menu, MF_STRING, *command as usize, label.as_ptr()) }
+                // A label that spells its own key (the tree's F2, Del) keeps it; every other
+                // command shows its first key from the keymap (keyboard shortcuts spec §5).
+                let text = match keymap.first_text(*command) {
+                    Some(key) if !label.contains('\t') => format!("{label}\t{key}"),
+                    _ => (*label).to_owned(),
+                };
+                let text = wide_null(&text);
+                unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
             }
             MenuEntry::Submenu(label, children) => {
-                let child = match create_popup(children) {
+                let child = match create_popup(children, keymap) {
                     Ok(child) => child,
                     Err(error) => {
                         unsafe { DestroyMenu(menu) };
@@ -334,15 +346,12 @@ fn append_popup(root: HMENU, label: &str, popup: HMENU) -> Result<()> {
 /// The context menu of a tab, at client coordinates `x`, `y` (split editors plan amendment 12).
 pub(crate) fn show_tab_menu(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
     let entries = [
-        MenuEntry::command("&Close tab\tCtrl+W", CommandId::CloseTab),
+        MenuEntry::command("&Close tab", CommandId::CloseTab),
         MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
         MenuEntry::Separator,
-        MenuEntry::command("Split &Right\tCtrl+\\", CommandId::SplitRight),
-        MenuEntry::command("Split &Down\tCtrl+Shift+\\", CommandId::SplitDown),
-        MenuEntry::command(
-            "Move to &Next Group\tCtrl+Alt+Right",
-            CommandId::MoveTabToNextGroup,
-        ),
+        MenuEntry::command("Split &Right", CommandId::SplitRight),
+        MenuEntry::command("Split &Down", CommandId::SplitDown),
+        MenuEntry::command("Move to &Next Group", CommandId::MoveTabToNextGroup),
     ];
     track_popup(hwnd, &entries, POINT { x, y })
 }
@@ -350,8 +359,8 @@ pub(crate) fn show_tab_menu(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
 /// The context menu of the empty tab-strip space, at client coordinates `x`, `y`.
 pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) -> Option<CommandId> {
     let mut entries = vec![
-        MenuEntry::command("New tab	Ctrl+N", CommandId::New),
-        MenuEntry::command("Open...	Ctrl+O", CommandId::Open),
+        MenuEntry::command("New tab", CommandId::New),
+        MenuEntry::command("Open...", CommandId::Open),
     ];
     if has_tabs {
         entries.extend([
@@ -361,8 +370,8 @@ pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) ->
     }
     entries.extend([
         MenuEntry::Separator,
-        MenuEntry::command("Split Right\tCtrl+\\", CommandId::SplitRight),
-        MenuEntry::command("Split Down\tCtrl+Shift+\\", CommandId::SplitDown),
+        MenuEntry::command("Split Right", CommandId::SplitRight),
+        MenuEntry::command("Split Down", CommandId::SplitDown),
         MenuEntry::command("Close group", CommandId::CloseGroup),
     ]);
     track_popup(hwnd, &entries, POINT { x, y })
@@ -377,7 +386,8 @@ pub(crate) fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> O
     if let Some(answer) = POPUP_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return answer(hwnd);
     }
-    let menu = create_popup(entries).ok()?;
+    let keymap = crate::window::main_window::keymap(hwnd);
+    let menu = create_popup(entries, &keymap).ok()?;
     let mut point = client;
     unsafe {
         ClientToScreen(hwnd, &mut point);
@@ -640,6 +650,59 @@ pub(crate) fn answer_next_popup_menu(answer: impl FnOnce(HWND) -> Option<Command
 mod tests {
     use crate::window::commands::CommandId;
 
+    fn label(
+        menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
+        command: CommandId,
+    ) -> String {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuStringW, MF_BYCOMMAND};
+        let mut buffer = [0u16; 128];
+        let length = unsafe {
+            GetMenuStringW(
+                menu,
+                command as u32,
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+                MF_BYCOMMAND,
+            )
+        };
+        String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+    }
+
+    #[test]
+    fn menu_labels_spell_the_keymaps_first_key() {
+        // Break caught: a rebound command whose menu still shows the old key, or an unbound one
+        // still showing a key that does nothing.
+        use super::MenuBar;
+        use crate::window::keymap::{KeyStroke, Keymap};
+        let defaults = MenuBar::create(&Keymap::defaults()).unwrap();
+        assert_eq!(
+            label(defaults.dropdown(0), CommandId::Save),
+            "&Save\tCtrl+S"
+        );
+        assert_eq!(
+            label(defaults.dropdown(0), CommandId::CloseAllTabs),
+            "Close a&ll tabs"
+        );
+        let view = crate::window::menu_band::VIEW_MENU_INDEX;
+        assert_eq!(
+            label(defaults.dropdown(view), CommandId::ZoomIn),
+            "Zoom &in\tCtrl+="
+        );
+
+        let keymap = Keymap::defaults()
+            .with_keys(
+                CommandId::Save,
+                vec![KeyStroke::parse("Ctrl+Alt+S").unwrap()],
+            )
+            .with_keys(CommandId::Undo, vec![]);
+        let custom = MenuBar::create(&keymap).unwrap();
+        assert_eq!(
+            label(custom.dropdown(0), CommandId::Save),
+            "&Save\tCtrl+Alt+S"
+        );
+        assert_eq!(label(custom.dropdown(1), CommandId::Undo), "&Undo");
+    }
+
     #[derive(Clone, Copy)]
     struct Spec {
         modifiers: u8,
@@ -827,7 +890,7 @@ mod tests {
         // menu band now carries instead.
         use super::MenuBar;
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND};
-        let bar = MenuBar::create().unwrap();
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let has = |menu: usize, command: CommandId| unsafe {
             GetMenuState(bar.dropdown(menu), command as u32, MF_BYCOMMAND) != u32::MAX
         };
@@ -844,7 +907,7 @@ mod tests {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND};
         assert_eq!(MENU_TITLES[HELP_MENU_INDEX], "&Help");
         assert_eq!(HELP_MENU_INDEX, MENU_TITLES.len() - 1);
-        let bar = MenuBar::create().unwrap();
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let state = unsafe {
             GetMenuState(
                 bar.dropdown(HELP_MENU_INDEX),
@@ -861,7 +924,7 @@ mod tests {
         // which is hidden with notes mode off.
         use super::MenuBar;
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND};
-        let bar = MenuBar::create().unwrap();
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let state = unsafe {
             GetMenuState(
                 bar.dropdown(0),
@@ -878,7 +941,7 @@ mod tests {
         // nothing, or no entry at all.
         use super::{MenuBar, set_sidebar_enabled};
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_GRAYED};
-        let bar = MenuBar::create().unwrap();
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
         let state = || unsafe { GetMenuState(view, CommandId::ToggleSidebar as u32, MF_BYCOMMAND) };
         assert_ne!(state(), u32::MAX, "the View menu has a Sidebar entry");
@@ -931,7 +994,7 @@ mod tests {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetSubMenu, MENUITEMINFOW, MFS_HILITE, MIIM_STATE, SetMenuItemInfoW,
         };
-        let bar = MenuBar::create().unwrap();
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
         let hilite = |menu, position: u32| {
             let info = MENUITEMINFOW {
@@ -968,7 +1031,7 @@ mod tests {
         use super::{MenuBar, set_checked_language};
         use crate::document::Language;
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_CHECKED};
-        let bar = MenuBar::create().unwrap();
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
         let state = |language| unsafe {
             GetMenuState(view, CommandId::for_language(language) as u32, MF_BYCOMMAND)
@@ -995,7 +1058,7 @@ mod tests {
     fn preview_entries_gray_out_and_re_enable() {
         use super::{MenuBar, set_markdown_preview_enabled};
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_GRAYED};
-        let bar = MenuBar::create().unwrap();
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
         set_markdown_preview_enabled(view, false);
         let state =

@@ -378,11 +378,6 @@ pub(crate) fn picker_row_label(picker: &Picker, row: &PickerRow) -> String {
     }
 }
 
-/// The first keyboard shortcut bound to `command`, spelled the way the menus spell shortcuts.
-pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
-    crate::window::keymap::Keymap::defaults().first_text(command)
-}
-
 const WIDTH_AT_96_DPI: i32 = 560;
 const PADDING_AT_96_DPI: i32 = 6;
 const FIELD_HEIGHT_AT_96_DPI: i32 = 28;
@@ -459,6 +454,8 @@ pub(crate) struct CommandPalette {
     query_edit: HWND,
     list: HWND,
     shown: Vec<PaletteEntry>,
+    /// Each shown row's key text, from the window's keymap when the rows were set.
+    shown_keys: Vec<Option<String>>,
     /// `Some` while the palette lists runtime items instead of commands.
     picker: Option<Picker>,
     /// The rows `picker` currently shows, filtered by the query.
@@ -514,6 +511,7 @@ impl CommandPalette {
             query_edit,
             list,
             shown: Vec::new(),
+            shown_keys: Vec::new(),
             picker: None,
             picker_rows: Vec::new(),
             picker_selected: None,
@@ -602,9 +600,23 @@ impl CommandPalette {
         }
     }
 
-    /// Records the rows to list; `fill_list` then puts them in the list box.
-    pub(crate) fn set_entries(&mut self, entries: Vec<PaletteEntry>) {
+    /// Records the rows to list and their keys; `fill_list` then puts them in the list box.
+    pub(crate) fn set_entries(
+        &mut self,
+        entries: Vec<PaletteEntry>,
+        keymap: &crate::window::keymap::Keymap,
+    ) {
+        self.shown_keys = entries
+            .iter()
+            .map(|entry| keymap.first_text(entry.command))
+            .collect();
         self.shown = entries;
+    }
+
+    /// The key text shown on row `index`.
+    #[cfg(test)]
+    pub(crate) fn shown_shortcut(&self, index: usize) -> Option<&str> {
+        self.shown_keys.get(index)?.as_deref()
     }
 
     /// Switches between command mode (`None`) and picker mode; also clears any rows from a
@@ -891,7 +903,11 @@ impl CommandPalette {
             let Some(entry) = index.and_then(|index| self.shown.get(index)) else {
                 return;
             };
-            (entry.label.to_owned(), shortcut_text(entry.command))
+            let shortcut = index
+                .and_then(|index| self.shown_keys.get(index))
+                .cloned()
+                .flatten();
+            (entry.label.to_owned(), shortcut)
         };
         let selected = item.itemState & ODS_SELECTED != 0;
         let colors = self.colors;
@@ -1404,9 +1420,28 @@ unsafe extern "system" fn palette_control_proc(
 mod tests {
     use super::{
         ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, filter_entries, hit_runs, match_rank,
-        picker_row_label, picker_rows, shortcut_text,
+        picker_row_label, picker_rows,
     };
     use crate::window::commands::CommandId;
+
+    fn shortcut_text(command: CommandId) -> Option<String> {
+        crate::window::keymap::Keymap::defaults().first_text(command)
+    }
+
+    #[test]
+    fn palette_rows_show_the_windows_keys() {
+        // Break caught: the palette hinting the default key after the user rebound it.
+        use crate::window::keymap::{KeyStroke, Keymap};
+        let keymap =
+            Keymap::defaults().with_keys(CommandId::Save, vec![KeyStroke::parse("F9").unwrap()]);
+        let entries = filter_entries("file: save", |_| true);
+        assert_eq!(entries[0].command, CommandId::Save);
+        let shown = entries
+            .iter()
+            .map(|entry| keymap.first_text(entry.command))
+            .collect::<Vec<_>>();
+        assert_eq!(shown[0].as_deref(), Some("F9"));
+    }
 
     #[test]
     fn the_editor_display_toggles_are_listed_once_under_editor() {

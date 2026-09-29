@@ -2547,10 +2547,11 @@ fn refilter_command_palette(hwnd: HWND) {
                 // Close Group with one empty group would do nothing.
                 && (has_tabs || groups > 1 || command != CommandId::CloseGroup)
         });
+        let keymap = keymap(hwnd);
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
         {
-            palette.set_entries(entries);
+            palette.set_entries(entries, &keymap);
         }
     }
     with_command_palette(hwnd, CommandPalette::fill_list);
@@ -3893,7 +3894,6 @@ pub(crate) fn set_open_editors_expanded(hwnd: HWND, expanded: bool) {
 }
 
 /// The shortcuts in force for `hwnd`'s window (the defaults before it has an App).
-#[allow(dead_code, reason = "Tasks 5-6 build the shortcuts page on it")]
 pub(crate) fn keymap(hwnd: HWND) -> crate::window::keymap::Keymap {
     unsafe { app_ptr(hwnd) }.map_or_else(crate::window::keymap::Keymap::defaults, |app| {
         unsafe { app.as_ref() }.keymap.clone()
@@ -7902,7 +7902,7 @@ fn enter_menu_mode(hwnd: HWND, hot: usize) {
     let ready = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let app = unsafe { app.as_mut() };
         if app.menu_bar.is_none() {
-            app.menu_bar = MenuBar::create().ok();
+            app.menu_bar = MenuBar::create(&app.keymap).ok();
         }
         app.menu_return_focus = unsafe { GetFocus() };
         app.menu_bar.is_some()
@@ -10275,6 +10275,7 @@ three"
             shown,
             [CommandId::ZoomIn, CommandId::ZoomOut, CommandId::ZoomReset]
         );
+        assert_eq!(palette(window.hwnd).shown_shortcut(0), Some("Ctrl+="));
 
         unsafe { SendMessageW(query, WM_KEYDOWN, VK_DOWN as usize, 0) };
         assert_eq!(

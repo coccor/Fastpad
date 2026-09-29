@@ -2301,10 +2301,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                     CommandId::NoteTogglePin,
                 ),
                 MenuEntry::Separator,
-                MenuEntry::command(
-                    "Move to notebook...\tCtrl+Shift+M",
-                    CommandId::NoteMoveToNotebook,
-                ),
+                MenuEntry::command("Move to notebook...", CommandId::NoteMoveToNotebook),
                 MenuEntry::command("Rename...\tF2", CommandId::NoteRename),
                 MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
                 MenuEntry::Separator,
