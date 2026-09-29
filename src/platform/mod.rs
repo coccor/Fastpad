@@ -1,6 +1,7 @@
 pub mod annotation;
 pub mod dialogs;
 pub mod files;
+pub mod fonts;
 pub mod handles;
 pub(crate) mod ole_drop;
 pub mod paths;
