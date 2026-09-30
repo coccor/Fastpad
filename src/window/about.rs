@@ -8,6 +8,7 @@
 
 use super::design::metrics::scale;
 use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
+use super::design::type_ramp::{self, TextStyle};
 use super::modal::ModalScope;
 use super::palette::Palette;
 use super::panel::{inset, text_height};
@@ -27,8 +28,7 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DeleteObject, DrawTextW,
-    FW_NORMAL, FW_SEMIBOLD, GetDC, HDC, HFONT, InvalidateRect, ReleaseDC, ScreenToClient,
-    SelectObject,
+    FW_NORMAL, GetDC, HDC, HFONT, InvalidateRect, ReleaseDC, ScreenToClient, SelectObject,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::MARGINS;
@@ -389,8 +389,8 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
     }
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
     // The title matches Settings' title.
-    let title_font = create_ui_font(scale(18, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
-    let body_font = create_ui_font(scale(13, dpi), "Segoe UI", FW_NORMAL as i32, false);
+    let title_font = type_ramp::create(TextStyle::Title, dpi);
+    let body_font = type_ramp::create(TextStyle::DialogBody, dpi);
     let link_font = create_underlined_font(scale(13, dpi));
     let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
     let link_widths = Link::ALL.map(|link| measure(dialog, link_font, link.label()));

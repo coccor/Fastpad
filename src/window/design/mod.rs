@@ -5,3 +5,5 @@ pub(crate) mod metrics;
 
 #[cfg(test)]
 pub(crate) mod contrast;
+
+pub(crate) mod type_ramp;

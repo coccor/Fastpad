@@ -6,6 +6,7 @@
 
 use super::design::metrics::scale;
 use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
+use super::design::type_ramp::{self, TextStyle};
 use super::dropdown_list::{
     DropdownList, ListKey, ListModel, ListOutcome, ListStyle, WM_LIST_PICKED,
 };
@@ -35,9 +36,9 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DeleteObject, DrawTextW, FW_NORMAL, FW_SEMIBOLD, GetDC, GetMonitorInfoW, HBRUSH,
-    HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints,
-    MonitorFromWindow, ReleaseDC, ScreenToClient, SelectObject, SetBkColor, SetTextColor,
+    DT_SINGLELINE, DeleteObject, DrawTextW, FW_NORMAL, GetDC, GetMonitorInfoW, HBRUSH, HDC, HFONT,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow,
+    ReleaseDC, ScreenToClient, SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
@@ -308,9 +309,9 @@ fn create(
         return None;
     }
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
-    let title_font = create_ui_font(scale(18, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
-    let heading_font = create_ui_font(scale(14, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
-    let body_font = create_ui_font(scale(13, dpi), "Segoe UI", FW_NORMAL as i32, false);
+    let title_font = type_ramp::create(TextStyle::Title, dpi);
+    let heading_font = type_ramp::create(TextStyle::Heading, dpi);
+    let body_font = type_ramp::create(TextStyle::DialogBody, dpi);
     let link_font = create_underlined_font(scale(13, dpi));
     let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
 

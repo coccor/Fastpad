@@ -1,4 +1,5 @@
 use super::design::metrics::scale;
+use super::design::type_ramp::{self, TextStyle};
 use crate::window::palette::Palette;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
@@ -345,8 +346,8 @@ impl TitleFonts {
         Self {
             dpi,
             handles: TitleFontHandles {
-                text: create_font(scale(12, dpi), "Segoe UI"),
-                italic: create_ui_font(scale(12, dpi), "Segoe UI", FW_NORMAL as i32, true),
+                text: type_ramp::create(TextStyle::Body, dpi),
+                italic: type_ramp::create(TextStyle::BodyItalic, dpi),
                 glyph: create_font(scale(10, dpi), "Segoe MDL2 Assets"),
             },
         }

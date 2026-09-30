@@ -17,6 +17,7 @@ use crate::config::SidebarView;
 use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use crate::platform::wide_null;
 use crate::window::design::metrics::{PANEL_HEADER, scale};
+use crate::window::design::type_ramp::{self, TextStyle};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill};
 use crate::window::sidebar_accessibility::{
@@ -28,9 +29,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DRAW_TEXT_FORMAT, DT_CALCRECT,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FW_SEMIBOLD, HDC, HFONT,
-    InvalidateRect, PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, HDC, HFONT, InvalidateRect,
+    PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -91,10 +91,10 @@ impl UiFonts {
     fn create(dpi: u32) -> Self {
         let normal = FW_NORMAL as i32;
         Self {
-            text: create_ui_font(scale(12, dpi), "Segoe UI", normal, false),
+            text: type_ramp::create(TextStyle::Body, dpi),
             text_bold: std::ptr::null_mut(),
-            bold: create_ui_font(scale(11, dpi), "Segoe UI", FW_SEMIBOLD as i32, false),
-            italic: create_ui_font(scale(12, dpi), "Segoe UI", normal, true),
+            bold: type_ramp::create(TextStyle::PanelHeader, dpi),
+            italic: type_ramp::create(TextStyle::BodyItalic, dpi),
             glyph: create_ui_font(scale(12, dpi), "Segoe MDL2 Assets", normal, false),
             bar_glyph: create_ui_font(scale(16, dpi), "Segoe MDL2 Assets", normal, false),
         }
@@ -165,7 +165,7 @@ impl Sidebar {
         if !font.is_null() {
             return font;
         }
-        let font = create_ui_font(scale(12, dpi), "Segoe UI", FW_BOLD as i32, false);
+        let font = type_ramp::create(TextStyle::BodyBold, dpi);
         if let Some((_, fonts)) = self.fonts.as_mut() {
             fonts.text_bold = font;
         }
