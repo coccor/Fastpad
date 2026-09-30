@@ -118,6 +118,8 @@ pub struct Settings {
     pub show_whitespace: bool,
     /// Whether the caret's line gets the theme's caret-line background.
     pub highlight_current_line: bool,
+    /// Whether the fold margin is shown so blocks can be collapsed.
+    pub code_folding: bool,
     /// Whether the window stays above other windows.
     pub always_on_top: bool,
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
@@ -187,6 +189,9 @@ impl Settings {
         if let Some(highlight_current_line) = delta.highlight_current_line {
             self.highlight_current_line = highlight_current_line;
         }
+        if let Some(code_folding) = delta.code_folding {
+            self.code_folding = code_folding;
+        }
         if let Some(always_on_top) = delta.always_on_top {
             self.always_on_top = always_on_top;
         }
@@ -229,6 +234,7 @@ pub struct SettingsDelta {
     pub insert_spaces: Option<bool>,
     pub show_whitespace: Option<bool>,
     pub highlight_current_line: Option<bool>,
+    pub code_folding: Option<bool>,
     pub always_on_top: Option<bool>,
     pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
@@ -364,6 +370,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "highlight_current_line" => match parse_bool(value) {
             Some(highlight) => delta.highlight_current_line = Some(highlight),
+            None => warn(delta, line_number, key, value),
+        },
+        "code_folding" => match parse_bool(value) {
+            Some(code_folding) => delta.code_folding = Some(code_folding),
             None => warn(delta, line_number, key, value),
         },
         "always_on_top" => match parse_bool(value) {
@@ -1070,6 +1080,21 @@ mod tests {
             assert_eq!(delta.font_size, Some(12), "{key} keeps the other lines");
         }
         assert_eq!(parse("insert_spaces=maybe").insert_spaces, None);
+    }
+
+    #[test]
+    fn code_folding_parses_as_a_bool_and_defaults_on() {
+        // Break caught: the key reported as unknown, a typo silently turning folding off, or a
+        // default that hides the fold margin on a fresh profile.
+        assert!(default_settings().code_folding);
+
+        let delta = parse("code_folding=off\n");
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        assert_eq!(delta.code_folding, Some(false));
+        let mut settings = default_settings();
+        settings.apply_delta(&delta);
+        assert!(!settings.code_folding);
+        assert_eq!(parse("code_folding=maybe").warnings.len(), 1);
     }
 
     #[test]

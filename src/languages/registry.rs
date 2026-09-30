@@ -33,17 +33,32 @@ fn no_styles(_: Theme) -> &'static [LexerStyle] {
     &[]
 }
 
+/// Applied to every lexer before its own properties. Lexers without folding ignore them; the rest
+/// fold on a block's last non-blank line rather than swallowing the blank lines after it.
+pub(crate) const FOLD_PROPERTIES: &[(&str, &str)] = &[("fold", "1"), ("fold.compact", "0")];
+
 // Preprocessor tracking restyles inactive `#if` branches as styles 64-91, which no table maps, so
 // they would show as uncoloured text; colour every branch like the active one instead.
 const CPP_PROPERTIES: &[(&str, &str)] = &[
     ("lexer.cpp.escape.sequence", "1"),
     ("lexer.cpp.track.preprocessor", "0"),
+    ("fold.comment", "1"),
+    ("fold.preprocessor", "1"),
 ];
 const JS_PROPERTIES: &[(&str, &str)] = &[
     ("lexer.cpp.escape.sequence", "1"),
     ("lexer.cpp.backquoted.strings", "2"),
     ("lexer.cpp.track.preprocessor", "0"),
+    ("fold.comment", "1"),
+    ("fold.preprocessor", "1"),
 ];
+const CSS_PROPERTIES: &[(&str, &str)] = &[("fold.comment", "1")];
+const POWERSHELL_PROPERTIES: &[(&str, &str)] = &[("fold.comment", "1")];
+const PYTHON_PROPERTIES: &[(&str, &str)] =
+    &[("fold.comment.python", "1"), ("fold.quotes.python", "1")];
+const SQL_PROPERTIES: &[(&str, &str)] = &[("fold.comment", "1")];
+// Tag folding is off by default in the hypertext and XML lexers.
+const MARKUP_PROPERTIES: &[(&str, &str)] = &[("fold.html", "1"), ("fold.hypertext.comment", "1")];
 
 /// Plain Text first, then alphabetical by name: this is the menu and palette order.
 pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
@@ -114,7 +129,7 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
         file_names: &[],
         lexer: Some("css"),
         keywords: &[],
-        properties: &[],
+        properties: CSS_PROPERTIES,
         styles: css::styles,
     },
     LanguageSpec {
@@ -135,7 +150,7 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
         lexer: Some("hypertext"),
         // Set 0 empty: Lexilla then treats every tag and attribute as known.
         keywords: &["", kw::JAVASCRIPT],
-        properties: &[],
+        properties: MARKUP_PROPERTIES,
         styles: xml::styles,
     },
     LanguageSpec {
@@ -200,7 +215,7 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
             kw::POWERSHELL_CMDLETS,
             kw::POWERSHELL_ALIASES,
         ],
-        properties: &[],
+        properties: POWERSHELL_PROPERTIES,
         styles: powershell::styles,
     },
     LanguageSpec {
@@ -220,7 +235,7 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
         file_names: &[],
         lexer: Some("python"),
         keywords: &[kw::PYTHON, kw::PYTHON_BUILTINS],
-        properties: &[],
+        properties: PYTHON_PROPERTIES,
         styles: python::styles,
     },
     LanguageSpec {
@@ -240,7 +255,7 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
         file_names: &[],
         lexer: Some("sql"),
         keywords: &[kw::SQL, kw::SQL_TYPES],
-        properties: &[],
+        properties: SQL_PROPERTIES,
         styles: sql::styles,
     },
     LanguageSpec {
@@ -250,7 +265,7 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
         file_names: &[],
         lexer: Some("xml"),
         keywords: &[],
-        properties: &[],
+        properties: MARKUP_PROPERTIES,
         styles: xml::styles,
     },
     LanguageSpec {
@@ -283,7 +298,7 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
         file_names: &[],
         lexer: Some("xml"),
         keywords: &[],
-        properties: &[],
+        properties: MARKUP_PROPERTIES,
         styles: xml::styles,
     },
     LanguageSpec {

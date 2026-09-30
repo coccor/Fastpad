@@ -50,7 +50,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 109] = [
+pub(crate) const ENTRIES: [PaletteEntry; 112] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -197,6 +197,9 @@ pub(crate) const ENTRIES: [PaletteEntry; 109] = [
         CommandId::ToggleHighlightCurrentLine,
     ),
     entry("View: Toggle always on top", CommandId::ToggleAlwaysOnTop),
+    entry("View: Toggle code folding", CommandId::ToggleCodeFolding),
+    entry("Edit: Fold all", CommandId::FoldAll),
+    entry("Edit: Unfold all", CommandId::UnfoldAll),
     entry("File: Exit", CommandId::Exit),
     entry("Preferences: Open Settings", CommandId::OpenSettings),
     entry(
