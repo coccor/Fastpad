@@ -16,7 +16,7 @@ use super::tooltip::Tooltip;
 use crate::config::SidebarView;
 use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use crate::platform::wide_null;
-use crate::window::design::metrics::{PANEL_HEADER, scale};
+use crate::window::design::metrics::{ICON, PANEL_HEADER, scale};
 use crate::window::design::type_ramp::{self, TextStyle};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill};
@@ -59,18 +59,18 @@ pub(crate) const GRIP_WIDTH_96: i32 = 4;
 /// The sidebar's fonts at one DPI. Painting copies them out; `Sidebar` owns and deletes them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UiFonts {
-    /// Row and body text: Segoe UI, 12 px at 96 DPI.
+    /// Row and body text: Segoe UI, 13 px at 96 DPI.
     pub(crate) text: HFONT,
-    /// The match in a Search result's snippet: Segoe UI bold, 12 px. Made on the first paint of a
+    /// The match in a Search result's snippet: Segoe UI bold, 13 px. Made on the first paint of a
     /// snippet (`Sidebar::text_bold`), not with the others, so it adds nothing before first paint.
     pub(crate) text_bold: HFONT,
-    /// Header titles in small capitals: Segoe UI semibold, 11 px.
+    /// Header titles in small capitals: Segoe UI semibold, 13 px.
     pub(crate) bold: HFONT,
-    /// Notices inside the list: Segoe UI italic, 12 px.
+    /// Notices inside the list: Segoe UI italic, 13 px.
     pub(crate) italic: HFONT,
-    /// Row and header-button icons: Segoe MDL2 Assets, 12 px.
+    /// Row and header-button icons: Segoe MDL2 Assets, `ICON` px.
     pub(crate) glyph: HFONT,
-    /// The activity bar's icons: Segoe MDL2 Assets, 16 px.
+    /// The activity bar's icons: Segoe MDL2 Assets, `ICON` px.
     pub(crate) bar_glyph: HFONT,
 }
 
@@ -95,8 +95,8 @@ impl UiFonts {
             text_bold: std::ptr::null_mut(),
             bold: type_ramp::create(TextStyle::PanelHeader, dpi),
             italic: type_ramp::create(TextStyle::BodyItalic, dpi),
-            glyph: create_ui_font(scale(12, dpi), "Segoe MDL2 Assets", normal, false),
-            bar_glyph: create_ui_font(scale(16, dpi), "Segoe MDL2 Assets", normal, false),
+            glyph: create_ui_font(scale(ICON, dpi), "Segoe MDL2 Assets", normal, false),
+            bar_glyph: create_ui_font(scale(ICON, dpi), "Segoe MDL2 Assets", normal, false),
         }
     }
 
@@ -1276,7 +1276,7 @@ fn save_width(main: HWND, width: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PanelView, drag_width_96, sidebar_widths};
+    use super::{PanelView, UiFonts, drag_width_96, sidebar_widths};
     use crate::config::SidebarView;
     use crate::window::palette::Palette;
 
@@ -1327,5 +1327,36 @@ mod tests {
             Some(PanelView::Favorites)
         );
         assert_eq!(PanelView::of(SidebarView::Hidden), None);
+    }
+
+    #[test]
+    fn the_sidebar_and_activity_bar_glyph_fonts_are_icon_sized_at_every_dpi() {
+        // Break caught: row and header-button icons staying at 12 px after the icon size moved
+        // to 16, or the sidebar text not following the 13 px body style.
+        use crate::window::design::metrics::{ICON, scale};
+        use windows_sys::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
+        let height = |font| {
+            let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                GetObjectW(
+                    font,
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    (&mut log as *mut LOGFONTW).cast(),
+                )
+            };
+            assert!(written > 0);
+            log.lfHeight
+        };
+        for dpi in [96, 120, 144, 192] {
+            let fonts = UiFonts::create(dpi);
+            assert_eq!(height(fonts.glyph), -scale(ICON, dpi), "glyph at {dpi}");
+            assert_eq!(
+                height(fonts.bar_glyph),
+                -scale(ICON, dpi),
+                "bar glyph at {dpi}"
+            );
+            assert_eq!(height(fonts.text), -scale(13, dpi), "text at {dpi}");
+            fonts.delete();
+        }
     }
 }

@@ -17,6 +17,8 @@ pub(crate) const FOCUS_GAP: i32 = 1;
 pub(crate) const PANEL_HEADER: i32 = 38;
 /// The height of a row in the sidebar's lists (notebook tree, open editors, favorites).
 pub(crate) const SIDEBAR_ROW: i32 = 26;
+/// The size of the sidebar's and the activity bar's icon glyphs.
+pub(crate) const ICON: i32 = 16;
 /// The layout grid. Only tests use it, to track the sizes not yet on it.
 #[cfg(test)]
 pub(crate) const GRID: i32 = 4;
@@ -48,7 +50,7 @@ mod tests {
         assert_eq!(scale(44, 0), 44);
     }
 
-    use super::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, GRID, PANEL_HEADER, SIDEBAR_ROW};
+    use super::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, GRID, ICON, PANEL_HEADER, SIDEBAR_ROW};
 
     #[test]
     fn shared_metrics_keep_the_values_the_old_constants_had() {
@@ -58,6 +60,7 @@ mod tests {
         assert_eq!(FOCUS_GAP, 1); // was soft_paint::FOCUS_GAP_AT_96_DPI
         assert_eq!(PANEL_HEADER, 38); // was side_panel::HEADER_HEIGHT_96
         assert_eq!(SIDEBAR_ROW, 26); // was notebook_layout::ROW_HEIGHT
+        assert_eq!(ICON, 16); // the sidebar and activity bar icon size
     }
 
     #[test]
@@ -66,6 +69,7 @@ mod tests {
         // (the focus ring and gap) are exempt from the grid.
         let sizes = [
             ("CONTROL_RADIUS", CONTROL_RADIUS),
+            ("ICON", ICON),
             ("PANEL_HEADER", PANEL_HEADER),
             ("SIDEBAR_ROW", SIDEBAR_ROW),
         ];

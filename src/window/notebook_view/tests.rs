@@ -157,10 +157,10 @@ fn a_tree_row_draws_the_chosen_sets_icon_and_minimal_in_high_contrast() {
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL, FW_SEMIBOLD};
     let normal = FW_NORMAL as i32;
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", normal, false),
-        bold: create_ui_font(11, "Segoe UI", FW_SEMIBOLD as i32, false),
-        italic: create_ui_font(12, "Segoe UI", normal, true),
-        glyph: create_ui_font(12, "Segoe MDL2 Assets", normal, false),
+        text: create_ui_font(13, "Segoe UI", normal, false),
+        bold: create_ui_font(13, "Segoe UI", FW_SEMIBOLD as i32, false),
+        italic: create_ui_font(13, "Segoe UI", normal, true),
+        glyph: create_ui_font(16, "Segoe MDL2 Assets", normal, false),
         ..UiFonts::default()
     };
     let rect = RECT {
@@ -267,10 +267,10 @@ fn a_clipped_icon_box_draws_part_of_the_icon_not_a_shrunken_one() {
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL, FW_SEMIBOLD};
     let normal = FW_NORMAL as i32;
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", normal, false),
-        bold: create_ui_font(11, "Segoe UI", FW_SEMIBOLD as i32, false),
-        italic: create_ui_font(12, "Segoe UI", normal, true),
-        glyph: create_ui_font(12, "Segoe MDL2 Assets", normal, false),
+        text: create_ui_font(13, "Segoe UI", normal, false),
+        bold: create_ui_font(13, "Segoe UI", FW_SEMIBOLD as i32, false),
+        italic: create_ui_font(13, "Segoe UI", normal, true),
+        glyph: create_ui_font(16, "Segoe MDL2 Assets", normal, false),
         ..UiFonts::default()
     };
     // At depth 0 and 96 DPI: chevron sits at [8, 24), leaving only 6 px for the icon box
@@ -456,7 +456,7 @@ fn the_dragged_row_draws_its_name_dimmed() {
     use crate::window::titlebar::create_ui_font;
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL};
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", FW_NORMAL as i32, false),
+        text: create_ui_font(13, "Segoe UI", FW_NORMAL as i32, false),
         ..UiFonts::default()
     };
     let rect = RECT {
@@ -510,7 +510,7 @@ fn the_drag_label_has_a_border_a_fill_an_icon_and_its_name() {
     use crate::window::titlebar::create_ui_font;
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL};
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", FW_NORMAL as i32, false),
+        text: create_ui_font(13, "Segoe UI", FW_NORMAL as i32, false),
         ..UiFonts::default()
     };
     let size = drag_label_size(80, 96);
