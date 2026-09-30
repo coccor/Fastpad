@@ -11291,6 +11291,8 @@ three"
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         super::build_chrome(window.hwnd);
+        // Windows keeps a hidden window's z-order as it was, so the window must be showing.
+        unsafe { ShowWindow(window.hwnd, SW_SHOWNA) };
         let topmost =
             || unsafe { GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 };
         assert!(!topmost(), "off by default");
