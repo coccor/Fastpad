@@ -15,6 +15,7 @@ use crate::window::messages::{
 };
 use crate::window::modal::prompt_close_decision;
 use crate::window::palette::Palette;
+use crate::window::settings_model::{MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::window::split_tree::GroupId;
 use crate::window::tabs::CloseReviewKey;
 use crate::window::titlebar::{
@@ -53,8 +54,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
 
-pub(crate) const INPUT_MESSAGE_FIRST: u32 =
-    windows_sys::Win32::UI::WindowsAndMessaging::WM_INPUT_DEVICE_CHANGE;
+/// The input messages the startup chain yields to and the input drain takes: from the title
+/// bar's and frame's mouse messages (WM_NCMOUSEMOVE, 0xA0) through the pointer messages. Every
+/// kind `QS_INPUT` counts must be in range, or input the drain can't take keeps the chain
+/// yielding forever. The drain's `PM_QS_INPUT` keeps posted non-input messages in range out.
+pub(crate) const INPUT_MESSAGE_FIRST: u32 = WM_NCMOUSEMOVE;
 pub(crate) const INPUT_MESSAGE_LAST: u32 =
     windows_sys::Win32::UI::WindowsAndMessaging::WM_POINTERROUTEDRELEASED;
 
@@ -630,6 +634,8 @@ unsafe extern "system" fn main_window_proc(
             // The worker's boxed result: handled at once, since a held message would lose it.
             if message == crate::window::WM_FASTPAD_LIBRARY_READY {
                 crate::window::library_host::library_ready(hwnd, lparam);
+                // The notebook's autosave switch may be known now.
+                crate::window::settings_dialog::refresh_open(hwnd);
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_FILES_DROPPED {
@@ -1417,7 +1423,7 @@ fn configure_editor(hwnd: HWND, editor: &Editor) {
         return;
     };
     apply_settings_to(editor, &settings, palette);
-    apply_colors_to(editor, palette);
+    apply_colors_to(editor, palette, settings.highlight_current_line);
     if let Some(zoom) = zoom {
         let _ = editor.set_zoom(zoom);
     }
@@ -1431,20 +1437,27 @@ fn apply_settings_to(editor: &Editor, settings: &crate::config::Settings, palett
         settings.tab_width,
         settings.word_wrap,
     );
+    let _ = editor.apply_whitespace_settings(settings.insert_spaces, settings.show_whitespace);
     let _ =
         editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    apply_chrome_colors_to(editor, palette, settings.highlight_current_line);
 }
 
-fn apply_colors_to(editor: &Editor, palette: Palette) {
+fn apply_colors_to(editor: &Editor, palette: Palette, highlight_current_line: bool) {
     let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
     let _ =
         editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    apply_chrome_colors_to(editor, palette, highlight_current_line);
+    let _ = editor.set_selection_text_colors(palette.selection_foreground);
+}
+
+/// The selection backgrounds, and the caret line's when `highlight_current_line` is on.
+fn apply_chrome_colors_to(editor: &Editor, palette: Palette, highlight_current_line: bool) {
     let _ = editor.set_chrome_colors(
         palette.selection_background,
         palette.inactive_selection_background,
-        palette.caret_line_background,
+        highlight_current_line.then_some(palette.caret_line_background),
     );
-    let _ = editor.set_selection_text_colors(palette.selection_foreground);
 }
 
 /// Every group's editor, the active group's first.
@@ -2070,16 +2083,80 @@ fn take_palette_note_target(hwnd: HWND) -> Option<std::path::PathBuf> {
     unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.palette_note_target.take())
 }
 
+/// The theme's link colour, as the Markdown preview draws links.
+pub(crate) fn link_color(hwnd: HWND) -> u32 {
+    let theme = effective_theme(hwnd);
+    let high_contrast = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .theme
+            .is_some_and(|system| system.high_contrast)
+    });
+    crate::preview::colors::preview_colors(theme, high_contrast).link
+}
+
+/// Help → About FastPad, in the current theme's colors and the Markdown preview's link color.
+fn show_about(hwnd: HWND) {
+    crate::window::about::show(hwnd, current_palette(hwnd), link_color(hwnd));
+}
+
+/// The Settings dialog: File → Settings…, Ctrl+, and the activity bar's gear (settings dialog
+/// spec §4.3).
+pub(crate) fn show_settings(hwnd: HWND) {
+    show_settings_page(hwnd, crate::window::settings_model::Page::General);
+}
+
+/// Preferences: Open Keyboard Shortcuts (keyboard shortcuts spec section 2).
+pub(crate) fn show_keyboard_shortcuts(hwnd: HWND) {
+    show_settings_page(hwnd, crate::window::settings_model::Page::Shortcuts);
+}
+
+fn show_settings_page(hwnd: HWND, page: crate::window::settings_model::Page) {
+    let outcome =
+        crate::window::settings_dialog::show(hwnd, current_palette(hwnd), link_color(hwnd), page);
+    if outcome == crate::window::settings_dialog::Outcome::EditIni {
+        edit_settings_file(hwnd);
+    }
+}
+
+const EDIT_INI_NOTICE: &str = "Changes saved in fastpad.ini apply the next time FastPad starts.";
+
+/// Preferences: Edit fastpad.ini. Creates the file (empty) when it doesn't exist yet, then opens
+/// it in a tab through the normal open path (settings dialog spec §3.6).
+pub(crate) fn edit_settings_file(hwnd: HWND) {
+    let result = settings_file_for_editing().and_then(|path| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        open_path(hwnd, &path)
+    });
+    match result {
+        // Settings are read once, at startup: say so rather than leave a saved edit looking
+        // ignored.
+        Ok(()) => push_notice(hwnd, EDIT_INI_NOTICE.to_owned()),
+        Err(error) => push_notice(hwnd, format!("FastPad could not open fastpad.ini: {error}")),
+    }
+}
+
+#[cfg(not(test))]
+fn settings_file_for_editing() -> Result<std::path::PathBuf> {
+    crate::config::persisted::settings_file_path()
+}
+
+/// Tests open only the file they chose with `save_settings_to`.
+#[cfg(test)]
+fn settings_file_for_editing() -> Result<std::path::PathBuf> {
+    TEST_SETTINGS_PATH
+        .with(|path| path.borrow().clone())
+        .ok_or(crate::FastPadError::Invariant(
+            "a test opened fastpad.ini without save_settings_to",
+        ))
+}
+
 pub(crate) fn open_command_palette(hwnd: HWND) {
-    show_command_palette(hwnd, None);
-}
-
-/// The activity bar's Settings button: the palette listing only `SETTINGS_COMMANDS`.
-pub(crate) fn open_settings_palette(hwnd: HWND) {
-    show_command_palette(hwnd, Some(command_palette::SETTINGS_COMMANDS));
-}
-
-fn show_command_palette(hwnd: HWND, subset: Option<&'static [CommandId]>) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
@@ -2094,14 +2171,12 @@ fn show_command_palette(hwnd: HWND, subset: Option<&'static [CommandId]>) {
         let newly_shown = palette.mark_shown(colors);
         // Reopening the palette normally always shows commands, even right after a picker.
         palette.set_picker(None);
-        palette.set_subset(subset);
         Some(newly_shown)
     });
     let Some(newly_shown) = newly_shown else {
         return;
     };
-    // A query typed for the full list would hide most settings, so Settings always starts empty.
-    if newly_shown || subset.is_some() {
+    if newly_shown {
         // Clearing the field sends EN_CHANGE, which lists every available command.
         with_command_palette(hwnd, CommandPalette::clear_query);
     }
@@ -2184,7 +2259,6 @@ pub(crate) fn open_quick_open(hwnd: HWND) {
     let shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let palette = unsafe { app.as_mut() }.command_palette.as_mut()?;
         palette.mark_shown(colors);
-        palette.set_subset(None);
         palette.set_picker(Some(command_palette::Picker {
             kind: command_palette::PickerKind::QuickOpen,
             items: Vec::new(),
@@ -2476,10 +2550,8 @@ fn refilter_command_palette(hwnd: HWND) {
         // naming spec §3.1).
         let notebook = crate::window::library_host::folder(hwnd).is_some();
         let groups = unsafe { app_ptr(hwnd) }.map_or(1, |app| unsafe { app.as_ref() }.groups.len());
-        let subset = with_command_palette(hwnd, CommandPalette::subset).flatten();
         let entries = command_palette::filter_entries(&query, |command| {
-            subset.is_none_or(|subset| subset.contains(&command))
-                && (has_tabs || !command.needs_document())
+            (has_tabs || !command.needs_document())
                 && (!image || !command.needs_text())
                 && (markdown || !command.is_markdown_preview())
                 && (sidebar || !command.is_sidebar())
@@ -2487,10 +2559,11 @@ fn refilter_command_palette(hwnd: HWND) {
                 // Close Group with one empty group would do nothing.
                 && (has_tabs || groups > 1 || command != CommandId::CloseGroup)
         });
+        let keymap = keymap(hwnd);
         if let Some(mut app) = unsafe { app_ptr(hwnd) }
             && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
         {
-            palette.set_entries(entries);
+            palette.set_entries(entries, &keymap);
         }
     }
     with_command_palette(hwnd, CommandPalette::fill_list);
@@ -3496,6 +3569,10 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
         CommandId::FindNext => find_again(hwnd, false),
         CommandId::FindPrevious => find_again(hwnd, true),
         CommandId::CommandPalette => open_command_palette(hwnd),
+        CommandId::About => show_about(hwnd),
+        CommandId::OpenSettings => show_settings(hwnd),
+        CommandId::EditSettingsFile => edit_settings_file(hwnd),
+        CommandId::OpenKeyboardShortcuts => show_keyboard_shortcuts(hwnd),
         CommandId::QuickOpen => open_quick_open(hwnd),
         CommandId::NoteNewFolder => crate::window::inline_name::new_folder(hwnd, None),
         CommandId::NoteNew => crate::window::inline_name::new_note(hwnd, None),
@@ -3526,6 +3603,28 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
             settings.line_numbers = !settings.line_numbers;
             Some(("line_numbers", settings.line_numbers.to_string()))
         }),
+        CommandId::ToggleInsertSpaces => change_setting(hwnd, |settings| {
+            settings.insert_spaces = !settings.insert_spaces;
+            Some(("insert_spaces", settings.insert_spaces.to_string()))
+        }),
+        CommandId::ToggleShowWhitespace => change_setting(hwnd, |settings| {
+            settings.show_whitespace = !settings.show_whitespace;
+            Some(("show_whitespace", settings.show_whitespace.to_string()))
+        }),
+        CommandId::ToggleHighlightCurrentLine => change_setting(hwnd, |settings| {
+            settings.highlight_current_line = !settings.highlight_current_line;
+            Some((
+                "highlight_current_line",
+                settings.highlight_current_line.to_string(),
+            ))
+        }),
+        CommandId::ToggleAlwaysOnTop => {
+            change_setting(hwnd, |settings| {
+                settings.always_on_top = !settings.always_on_top;
+                Some(("always_on_top", settings.always_on_top.to_string()))
+            });
+            apply_always_on_top(hwnd);
+        }
         CommandId::ToggleRestoreSession => {
             change_setting(hwnd, |settings| {
                 settings.restore_session = !settings.restore_session;
@@ -3721,11 +3820,6 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
     }
 }
 
-/// Font-size commands step within this range; a size set outside it in `fastpad.ini` is kept
-/// until a step moves it back toward the range.
-const MIN_FONT_SIZE: u16 = 6;
-const MAX_FONT_SIZE: u16 = 72;
-
 fn set_font_size(hwnd: HWND, next: impl FnOnce(u16) -> u16) {
     change_setting(hwnd, |settings| {
         let size = next(settings.font_size);
@@ -3767,6 +3861,39 @@ fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
     }
 }
 
+/// Makes one Settings dialog change through the same code the palette commands use, so it
+/// applies at once and saves its one `fastpad.ini` line (settings dialog spec §4.2).
+pub(crate) fn apply_settings_action(
+    hwnd: HWND,
+    action: crate::window::settings_model::SettingsAction,
+) {
+    use crate::window::settings_model::SettingsAction;
+    match action {
+        SettingsAction::SetTheme(theme) => set_theme(hwnd, theme),
+        SettingsAction::SetFileIcons(set) => set_file_icons(hwnd, set),
+        SettingsAction::SetFontFace(face) => change_setting(hwnd, |settings| {
+            (settings.font_face != face).then(|| {
+                settings.font_face.clone_from(&face);
+                ("font_face", face)
+            })
+        }),
+        SettingsAction::SetFontSize(size) => set_font_size(hwnd, |_| size),
+        SettingsAction::SetTabWidth(width) => set_tab_width(hwnd, width),
+        SettingsAction::Toggle(toggle) => execute_command(hwnd, toggle.command()),
+    }
+}
+
+/// What the Settings dialog shows. Call it with nothing of the App borrowed.
+pub(crate) fn settings_view(hwnd: HWND) -> crate::window::settings_model::SettingsView {
+    let settings = unsafe { app_ptr(hwnd) }.map_or_else(crate::config::default_settings, |app| {
+        unsafe { app.as_ref() }.settings.clone()
+    });
+    crate::window::settings_model::SettingsView {
+        settings,
+        notebook_autosave: crate::window::library_host::notebook_autosave(hwnd),
+    }
+}
+
 /// Whether the Notebook view's Open Editors section is expanded (open editors spec §3.3).
 pub(crate) fn open_editors_expanded(hwnd: HWND) -> bool {
     unsafe { app_ptr(hwnd) }
@@ -3786,6 +3913,91 @@ pub(crate) fn set_open_editors_expanded(hwnd: HWND, expanded: bool) {
     }
 }
 
+/// The shortcuts in force for `hwnd`'s window (the defaults before it has an App).
+pub(crate) fn keymap(hwnd: HWND) -> crate::window::keymap::Keymap {
+    unsafe { app_ptr(hwnd) }.map_or_else(crate::window::keymap::Keymap::defaults, |app| {
+        unsafe { app.as_ref() }.keymap.clone()
+    })
+}
+
+/// The text menus show for `command`'s key in `hwnd`'s keymap, without copying the keymap.
+pub(crate) fn first_key_text(hwnd: HWND, command: CommandId) -> Option<String> {
+    match unsafe { app_ptr(hwnd) } {
+        Some(app) => unsafe { app.as_ref() }.keymap.first_text(command),
+        None => crate::window::keymap::Keymap::defaults().first_text(command),
+    }
+}
+
+/// The commands with a `key.<id>=` line in `hwnd`'s settings, including lines the keymap ignored.
+pub(crate) fn key_line_commands(hwnd: HWND) -> Vec<CommandId> {
+    unsafe { app_ptr(hwnd) }.map_or_else(Vec::new, |app| {
+        unsafe { app.as_ref() }
+            .settings
+            .key_overrides
+            .keys()
+            .filter_map(|id| crate::window::keymap::command_for_id(id))
+            .collect()
+    })
+}
+
+/// Puts `keymap` in force: the accelerator table is rebuilt now; the menu bar, which spells the
+/// keys, is rebuilt the next time it opens.
+fn install_keymap(app: &mut App, keymap: crate::window::keymap::Keymap) {
+    app.accelerators = crate::window::menus::AcceleratorTable::create(&keymap).ok();
+    if app.menu_mode.is_none() {
+        app.menu_bar = None;
+    }
+    app.keymap = keymap;
+}
+
+/// Gives `command` exactly `keys` (keyboard shortcuts spec 6.6): applies at once and saves its
+/// `key.<id>=` line, or removes the line when `keys` are the defaults.
+pub(crate) fn set_command_keys(
+    hwnd: HWND,
+    command: CommandId,
+    keys: Vec<crate::window::keymap::KeyStroke>,
+) {
+    use crate::window::keymap::{ini_key, ini_value};
+    let Some(key) = ini_key(command) else {
+        return;
+    };
+    let id = key["key.".len()..].to_owned();
+    // The App borrow ends before saving: a failed save pushes a notice, which borrows it again.
+    let Some(saved) = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let keymap = app.keymap.with_keys(command, keys);
+        // A line the keymap ignored (`key.file.save=Bogus`) is still in the settings and the
+        // file; it is stale, and resetting the command removes it.
+        let stale = !keymap.is_user(command) && app.settings.key_overrides.contains_key(&id);
+        if keymap == app.keymap && !stale {
+            return None;
+        }
+        let value = keymap
+            .is_user(command)
+            .then(|| ini_value(&keymap.keys_of(command)));
+        match &value {
+            Some(value) => app.settings.key_overrides.insert(id, value.clone()),
+            None => app.settings.key_overrides.remove(&id),
+        };
+        install_keymap(app, keymap);
+        Some(value)
+    }) else {
+        return;
+    };
+    let result = match saved {
+        Some(value) => save_setting(&key, &value),
+        None => remove_setting(&key),
+    };
+    if let Err(error) = result {
+        push_notice(hwnd, format!("FastPad could not save fastpad.ini: {error}"));
+    }
+}
+
+/// Gives `command` its default keys back and removes its `key.<id>=` line.
+pub(crate) fn reset_command_keys(hwnd: HWND, command: CommandId) {
+    set_command_keys(hwnd, command, crate::window::keymap::default_keys(command));
+}
+
 /// Applies one settings change from a command and saves it to `fastpad.ini`. `change` edits the
 /// in-memory settings and names the `key=value` it made, or returns `None` when nothing changed.
 pub(crate) fn change_setting(
@@ -3801,11 +4013,17 @@ pub(crate) fn change_setting(
     };
     let theme_changed = unsafe { app_ptr(hwnd) }
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
-    // The sidebar's view, width and icon set change only the sidebar, which their callers redo;
-    // the editor and the Markdown preview are not restyled for them.
+    // The sidebar's view, width and icon set change only the sidebar, which their callers redo,
+    // and the Settings dialog's size only that dialog; the editor and the Markdown preview are
+    // not restyled for them.
     let sidebar_only = matches!(
         key,
-        "sidebar_view" | "sidebar_width" | "file_icons" | "open_editors_expanded"
+        "sidebar_view"
+            | "sidebar_width"
+            | "file_icons"
+            | "open_editors_expanded"
+            | "settings_size"
+            | "always_on_top"
     );
     if theme_changed {
         apply_theme(hwnd);
@@ -3818,6 +4036,20 @@ pub(crate) fn change_setting(
     if let Err(error) = save_setting(key, &value) {
         push_notice(hwnd, format!("FastPad could not save fastpad.ini: {error}"));
     }
+}
+
+#[cfg(not(test))]
+fn remove_setting(key: &str) -> Result<()> {
+    crate::config::remove_setting(key)
+}
+
+/// Like `save_setting` in tests: only a path a test chose with `save_settings_to` is touched.
+#[cfg(test)]
+fn remove_setting(key: &str) -> Result<()> {
+    TEST_SETTINGS_PATH.with(|path| match path.borrow().as_deref() {
+        Some(path) => crate::config::remove_setting_to(path, key),
+        None => Ok(()),
+    })
 }
 
 #[cfg(not(test))]
@@ -3974,11 +4206,45 @@ fn apply_loaded_settings(
         for warning in &warnings {
             app.notifications.push(settings_warning_message(warning));
         }
+        let (keymap, problems) =
+            crate::window::keymap::Keymap::from_ini(&app.settings.key_overrides);
+        for problem in problems {
+            app.notifications.push(format!("fastpad.ini: {problem}"));
+        }
+        if keymap != app.keymap {
+            install_keymap(app, keymap);
+        }
     }
     apply_editor_settings(hwnd);
+    apply_always_on_top(hwnd);
     if sidebar_changed {
         let notes_mode = notes_mode_enabled(hwnd);
         crate::window::side_panel::notes_mode_changed(hwnd, notes_mode);
+    }
+}
+
+/// Puts the window above every non-topmost window, or back among them, to match the
+/// `always_on_top` setting. Neither move nor resize nor activate: only the z-order changes.
+fn apply_always_on_top(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST};
+    let Some(app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    let insert_after = if unsafe { app.as_ref() }.settings.always_on_top {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -4176,8 +4442,10 @@ fn apply_theme(hwnd: HWND) {
     else {
         return;
     };
+    let highlight_current_line = unsafe { app_ptr(hwnd) }
+        .is_none_or(|app| unsafe { app.as_ref() }.settings.highlight_current_line);
     for editor in all_editors(hwnd) {
-        apply_colors_to(&editor, palette);
+        apply_colors_to(&editor, palette, highlight_current_line);
     }
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_ref() };
@@ -7694,7 +7962,7 @@ fn enter_menu_mode(hwnd: HWND, hot: usize) {
     let ready = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let app = unsafe { app.as_mut() };
         if app.menu_bar.is_none() {
-            app.menu_bar = MenuBar::create().ok();
+            app.menu_bar = MenuBar::create(&app.keymap).ok();
         }
         app.menu_return_focus = unsafe { GetFocus() };
         app.menu_bar.is_some()
@@ -10067,6 +10335,7 @@ three"
             shown,
             [CommandId::ZoomIn, CommandId::ZoomOut, CommandId::ZoomReset]
         );
+        assert_eq!(palette(window.hwnd).shown_shortcut(0), Some("Ctrl+="));
 
         unsafe { SendMessageW(query, WM_KEYDOWN, VK_DOWN as usize, 0) };
         assert_eq!(
@@ -10722,7 +10991,7 @@ three"
             "no native menu bar"
         );
         assert_eq!(editor_top(), title_height + band);
-        assert_eq!(super::menu_headings(window.hwnd).len(), 4);
+        assert_eq!(super::menu_headings(window.hwnd).len(), 5);
 
         key_menu(0);
         assert_eq!(app_mut(window.hwnd).menu_mode, None);
@@ -10953,16 +11222,145 @@ three"
             std::fs::read_to_string(&ini).unwrap(),
             "# kept\r\nfile_icons=material\r\n"
         );
-        assert!(
-            crate::window::command_palette::SETTINGS_COMMANDS
-                .contains(&CommandId::FileIconsMaterial)
-                && crate::window::command_palette::SETTINGS_COMMANDS
-                    .contains(&CommandId::FileIconsMinimal)
-                && crate::window::command_palette::SETTINGS_COMMANDS
-                    .contains(&CommandId::FileIconsSolid)
-        );
         assert!(!CommandId::FileIconsSolid.needs_document());
         assert!(!CommandId::FileIconsMaterial.needs_document());
+    }
+
+    #[test]
+    fn the_editor_display_toggles_apply_to_the_editor_and_a_theme_change_keeps_them() {
+        // Break caught: a toggle that saves but leaves the editor unchanged, a caret line that a
+        // theme change turns back on, or a toggle that rewrites the rest of fastpad.ini
+        // (settings dialog spec §4.4).
+        use crate::editor::scintilla_constants::{
+            SC_ELEMENT_CARET_LINE_BACK, SCI_GETELEMENTISSET, SCI_GETUSETABS, SCI_GETVIEWWS,
+            SCWS_INVISIBLE, SCWS_VISIBLEALWAYS,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("display-toggles");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+        let send = |message, wparam| unsafe { SendMessageW(editor.hwnd(), message, wparam, 0) };
+        let caret_line_set = || send(SCI_GETELEMENTISSET, SC_ELEMENT_CARET_LINE_BACK as usize);
+        assert_eq!(send(SCI_GETUSETABS, 0), 1, "tab characters by default");
+        assert_eq!(send(SCI_GETVIEWWS, 0), SCWS_INVISIBLE as isize);
+        assert_eq!(
+            caret_line_set(),
+            1,
+            "the current line is highlighted by default"
+        );
+
+        execute_command(window.hwnd, CommandId::ToggleInsertSpaces);
+        execute_command(window.hwnd, CommandId::ToggleShowWhitespace);
+        execute_command(window.hwnd, CommandId::ToggleHighlightCurrentLine);
+        assert_eq!(send(SCI_GETUSETABS, 0), 0);
+        assert_eq!(send(SCI_GETVIEWWS, 0), SCWS_VISIBLEALWAYS as isize);
+        assert_eq!(caret_line_set(), 0);
+
+        execute_command(window.hwnd, CommandId::ThemeDark);
+        assert_eq!(caret_line_set(), 0, "a theme change keeps it off");
+        execute_command(window.hwnd, CommandId::ToggleHighlightCurrentLine);
+        assert_eq!(caret_line_set(), 1);
+        super::save_settings_to(None);
+
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\ninsert_spaces=true\r\nshow_whitespace=true\r\n\
+             highlight_current_line=true\r\ntheme=dark\r\n"
+        );
+    }
+
+    #[test]
+    fn always_on_top_pins_the_window_and_saves_only_its_own_line() {
+        // Break caught: a toggle that saves but never changes the window's z-order, one that
+        // leaves the window topmost after switching off, or one that rewrites the rest of
+        // fastpad.ini.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, SW_SHOWNA, ShowWindow, WS_EX_TOPMOST,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("always-on-top");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(
+            &ini, "# kept
+",
+        )
+        .unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+        // Windows keeps a hidden window's z-order as it was, so the window must be showing.
+        unsafe { ShowWindow(window.hwnd, SW_SHOWNA) };
+        let topmost =
+            || unsafe { GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 };
+        assert!(!topmost(), "off by default");
+
+        execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+        assert!(topmost());
+        execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+        assert!(!topmost());
+        execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+        super::save_settings_to(None);
+
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept
+always_on_top=true
+"
+        );
+    }
+
+    #[test]
+    fn settings_actions_apply_and_save_only_their_own_lines() {
+        // Break caught: a dialog change that updates the window but is lost on restart, one that
+        // rewrites the user's fastpad.ini, or a re-pick of the current value that writes anyway
+        // (settings dialog spec §4.2).
+        use crate::config::{FileIconSet, ThemePreference};
+        use crate::window::settings_model::{SettingsAction, Toggle};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-actions");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+
+        for action in [
+            SettingsAction::SetTheme(ThemePreference::CatppuccinMocha),
+            SettingsAction::SetFileIcons(FileIconSet::Solid),
+            SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
+            SettingsAction::SetFontSize(14),
+            SettingsAction::SetTabWidth(2),
+            SettingsAction::Toggle(Toggle::WordWrap),
+            // Picking what is already set writes nothing.
+            SettingsAction::SetFontSize(14),
+            SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
+        ] {
+            super::apply_settings_action(window.hwnd, action);
+        }
+
+        let settings = app_mut(window.hwnd).settings.clone();
+        assert_eq!(settings.theme, ThemePreference::CatppuccinMocha);
+        assert_eq!(settings.file_icons, FileIconSet::Solid);
+        assert_eq!(settings.font_face, "Cascadia Mono");
+        assert_eq!(settings.font_size, 14);
+        assert_eq!(settings.tab_width, 2);
+        assert!(settings.word_wrap);
+        let view = super::settings_view(window.hwnd);
+        assert_eq!(view.settings, settings);
+        assert_eq!(view.notebook_autosave, None, "no notebook is open");
+        super::save_settings_to(None);
+
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\ntheme=catppuccin-mocha\r\nfile_icons=solid\r\nfont_face=Cascadia Mono\r\n\
+             font_size=14\r\ntab_width=2\r\nword_wrap=true\r\n"
+        );
     }
 
     #[test]
@@ -12400,15 +12798,23 @@ three"
         assert_eq!(view(), SidebarView::Search);
         assert_eq!(saved(), "# kept\r\nsidebar_view=search\r\n");
 
-        // Settings opens the command palette listing only the settings commands.
+        // Settings opens the Settings dialog and leaves the panel alone.
+        let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = shown.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| {
+            seen.set(true);
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    dialog,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                    usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE),
+                    0,
+                )
+            };
+        });
         let (x, y) = button_center(window.hwnd, ActivityButton::Settings);
         click(bar, x, y);
-        let palette = app_mut(window.hwnd).command_palette.as_ref().unwrap();
-        assert!(palette.is_visible());
-        assert_eq!(
-            palette.subset(),
-            Some(crate::window::command_palette::SETTINGS_COMMANDS)
-        );
+        assert!(shown.get(), "the gear opened Settings");
         assert_eq!(view(), SidebarView::Search);
         super::save_settings_to(None);
     }
@@ -20036,30 +20442,635 @@ three"
     }
 
     #[test]
-    fn the_settings_button_lists_only_settings_and_the_next_palette_lists_everything() {
-        // Break caught: Settings showing the full command list, or its filter sticking to the
-        // next Ctrl+Shift+P.
+    fn ctrl_comma_and_edit_settings_file_run_from_the_command_table() {
+        // Break caught: OpenSettings or EditSettingsFile falling through to `App::execute`,
+        // which ignores them.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-commands");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
         let window = ProductionWindow::new(make_app());
-        super::open_settings_palette(window.hwnd);
-        let shown = with_command_palette(window.hwnd, |palette| {
-            palette
-                .shown()
-                .iter()
-                .map(|entry| entry.command)
-                .collect::<Vec<_>>()
-        })
-        .unwrap();
-        assert!(shown.contains(&CommandId::ThemeDark));
-        assert!(
-            shown
-                .iter()
-                .all(|command| crate::window::command_palette::SETTINGS_COMMANDS.contains(command))
-        );
-        super::close_command_palette(window.hwnd, false);
+        let _editor = install_test_editor(&window);
+        let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = shown.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| {
+            seen.set(true);
+            unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        });
+        execute_command(window.hwnd, CommandId::OpenSettings);
+        assert!(shown.get());
 
-        execute_command(window.hwnd, CommandId::CommandPalette);
-        let shown = with_command_palette(window.hwnd, |palette| palette.shown().len()).unwrap();
-        assert!(shown > crate::window::command_palette::SETTINGS_COMMANDS.len());
+        execute_command(window.hwnd, CommandId::EditSettingsFile);
+        assert!(app_mut(window.hwnd).tabs.find_path(&ini).is_some());
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn open_keyboard_shortcuts_opens_settings_on_the_shortcuts_page() {
+        // Break caught: the palette command opening Settings on General, or not at all.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            assert_eq!(
+                crate::window::settings_dialog::current_page(dialog),
+                Some(crate::window::settings_model::Page::Shortcuts)
+            );
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::execute_command(window.hwnd, CommandId::OpenKeyboardShortcuts);
+        assert_eq!(
+            crate::window::settings_dialog::open_dialog(window.hwnd),
+            None
+        );
+    }
+
+    #[test]
+    fn the_wheel_on_the_shortcuts_page_scrolls_the_table() {
+        // Break caught: the wheel scrolling General's hidden cards while the table stays put.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, SendMessageW, WM_KEYDOWN, WM_MOUSEWHEEL,
+        };
+        let window = ProductionWindow::new(make_app());
+        let tops = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = tops.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let top = || crate::window::settings_dialog::shortcuts_model(dialog).map(|m| m.top);
+            seen.borrow_mut().push(top());
+            // One notch down, then one back up.
+            for delta in [-120i16, 120] {
+                SendMessageW(dialog, WM_MOUSEWHEEL, usize::from(delta as u16) << 16, 0);
+                seen.borrow_mut().push(top());
+            }
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*tops.borrow(), [Some(0), Some(3), Some(0)]);
+    }
+
+    #[test]
+    fn settings_remembers_the_size_it_was_dragged_to_and_shows_sizing_cursors() {
+        // Break caught: Settings reopening at its default size after the user sized it, a move
+        // (no resize) rewriting fastpad.ini, or the arrow cursor over the edges hiding that they
+        // size the dialog.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetCursor, GetWindowRect, HTRIGHT, IDC_SIZEWE, LoadCursorW, PostMessageW, SWP_NOMOVE,
+            SWP_NOZORDER, SendMessageW, SetWindowPos, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEMOVE,
+            WM_SETCURSOR,
+        };
+        let scratch = RecoveryScratch::new("settings-size");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let sizing_cursor = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = sizing_cursor.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            SendMessageW(
+                dialog,
+                WM_SETCURSOR,
+                dialog as usize,
+                ((WM_MOUSEMOVE as isize) << 16) | HTRIGHT as isize,
+            );
+            seen.set(GetCursor() == LoadCursorW(std::ptr::null_mut(), IDC_SIZEWE));
+            // A drag that ends where it began only moved it: nothing is written.
+            SendMessageW(dialog, WM_EXITSIZEMOVE, 0, 0);
+            SetWindowPos(
+                dialog,
+                std::ptr::null_mut(),
+                0,
+                0,
+                700,
+                500,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+            SendMessageW(dialog, WM_EXITSIZEMOVE, 0, 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        let saved = || std::fs::read_to_string(&ini).unwrap();
+        let before = std::cell::Cell::new(String::new());
+        super::show_settings(window.hwnd);
+        before.set(saved());
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+        let size = std::rc::Rc::new(std::cell::Cell::new((0, 0)));
+        let reopened = size.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let mut rect = RECT::default();
+            GetWindowRect(dialog, &mut rect);
+            reopened.set((rect.right - rect.left, rect.bottom - rect.top));
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_settings(window.hwnd);
+        super::save_settings_to(None);
+        assert!(sizing_cursor.get(), "the edge shows the sizing cursor");
+        let expected = |pixels: i32| (pixels * 96 + dpi as i32 / 2) / dpi as i32;
+        assert_eq!(
+            before.take(),
+            format!(
+                "# kept\r\nsettings_size={}x{}\r\n",
+                expected(700),
+                expected(500)
+            )
+        );
+        assert_eq!(
+            app_mut(window.hwnd).settings.settings_size,
+            Some((expected(700) as u16, expected(500) as u16))
+        );
+        assert_eq!(size.get(), (700, 500), "reopens at the saved size");
+    }
+
+    #[test]
+    fn resizing_settings_lays_out_the_table_and_the_search_field_again() {
+        // Break caught: a Settings dialog that can't be sized, or one whose table and search
+        // field keep their opening size (rows cut off, or space under the last row) after it is.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongW, GetWindowRect, PostMessageW, SWP_NOMOVE, SWP_NOZORDER,
+            SetWindowPos, WM_KEYDOWN, WS_THICKFRAME,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let sizable = GetWindowLongW(dialog, GWL_STYLE) as u32 & WS_THICKFRAME != 0;
+            let measure = || {
+                let visible = crate::window::settings_dialog::shortcuts_model(dialog)
+                    .map_or(0, |model| model.visible);
+                let mut dialog_rect = RECT::default();
+                let mut field = RECT::default();
+                GetWindowRect(dialog, &mut dialog_rect);
+                GetWindowRect(
+                    crate::window::settings_dialog::search_hwnd(dialog),
+                    &mut field,
+                );
+                (
+                    visible,
+                    field.right - field.left,
+                    dialog_rect.right - dialog_rect.left,
+                )
+            };
+            // Small enough to fit a 1024 px wide screen (a CI runner's) from the 860 px opening
+            // width: the system holds a window to the screen, so a bigger step would come up short.
+            const GROWTH: i32 = 100;
+            let before = measure();
+            let (_, _, width) = before;
+            SetWindowPos(
+                dialog,
+                std::ptr::null_mut(),
+                0,
+                0,
+                width + GROWTH,
+                900,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+            let bigger = measure();
+            // Far below the minimum: held at it.
+            SetWindowPos(
+                dialog,
+                std::ptr::null_mut(),
+                0,
+                0,
+                100,
+                100,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+            let smallest = measure();
+            record
+                .borrow_mut()
+                .push((sizable, before, bigger, smallest));
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let seen = seen.borrow();
+        let (sizable, before, bigger, smallest) = seen[0];
+        assert!(sizable, "the dialog has a sizing frame");
+        assert!(bigger.0 > before.0, "a taller dialog shows more rows");
+        assert_eq!(
+            bigger.1,
+            before.1 + 100,
+            "the search field widens with the dialog"
+        );
+        assert!(smallest.2 > 100, "held at a minimum width");
+        assert!(smallest.0 >= 1 && smallest.1 > 0, "still a row and a field");
+    }
+
+    #[test]
+    fn small_wheel_deltas_add_up_to_whole_rows_on_the_shortcuts_page() {
+        // Break caught: a touchpad's small deltas each rounding to zero rows, so slow scrolling
+        // never moves the table; or a leftover from one direction eating the first reverse step.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, SendMessageW, WM_KEYDOWN, WM_MOUSEWHEEL,
+        };
+        let window = ProductionWindow::new(make_app());
+        let tops = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = tops.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let top = || crate::window::settings_dialog::shortcuts_model(dialog).map(|m| m.top);
+            let wheel = |delta: i16| {
+                SendMessageW(dialog, WM_MOUSEWHEEL, usize::from(delta as u16) << 16, 0);
+            };
+            // Four quarter notches down: one notch, three rows.
+            for _ in 0..4 {
+                wheel(-30);
+            }
+            seen.borrow_mut().push(top());
+            // A leftover third of a row down, then one notch up: exactly three rows back.
+            wheel(-30);
+            wheel(120);
+            seen.borrow_mut().push(top());
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*tops.borrow(), [Some(3), Some(0)]);
+    }
+
+    #[test]
+    fn a_double_click_on_a_row_opens_the_recording_box_and_f9_rebinds_it() {
+        // Break caught: rows that select but never open the box, or a confirmed key that the
+        // window never applies.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F9, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-double-click");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let (x, y) = crate::window::settings_dialog::page_row_point(dialog, 0);
+            let at = ((y as isize) << 16 | (x as isize & 0xffff)) as LPARAM;
+            for _ in 0..2 {
+                PostMessageW(dialog, WM_LBUTTONDOWN, 1, at);
+                PostMessageW(dialog, WM_LBUTTONUP, 0, at);
+            }
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            key(VK_F9);
+            key(VK_RETURN);
+            key(VK_ESCAPE);
+            // Should the box never open, Escape only closes it: this ends the dialog anyway, so
+            // the test fails instead of hanging.
+            PostMessageW(dialog, WM_CLOSE, 0, 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let first = crate::window::shortcuts_model::ShortcutsModel::new(
+            crate::window::keymap::Keymap::defaults(),
+            1,
+        )
+        .rows[0]
+            .clone();
+        assert_eq!(
+            app_mut(window.hwnd)
+                .keymap
+                .keys_of(first.command)
+                .last()
+                .map(|stroke| stroke.text())
+                .as_deref(),
+            Some("F9")
+        );
+        super::save_settings_to(None);
+        assert!(
+            std::fs::read_to_string(&ini)
+                .unwrap()
+                .contains(&format!("key.{}=", first.id))
+        );
+    }
+
+    #[test]
+    fn typing_in_the_search_filters_and_down_enters_the_table() {
+        // Break caught: EN_CHANGE not reaching the model, or Down leaving the focus in the field.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            // Read the state from inside the loop, before Escape closes the dialog.
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                *record.borrow_mut() =
+                    crate::window::settings_dialog::shortcuts_model(dialog).map(|model| {
+                        (
+                            model.rows.len(),
+                            model.rows[0].command,
+                            crate::window::settings_dialog::current_focus(dialog),
+                        )
+                    });
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let (count, command, focus) = seen.borrow().unwrap();
+        assert_eq!((count, command), (1, CommandId::SaveAs));
+        assert_eq!(focus, Some(crate::window::settings_model::Focus::Table));
+    }
+
+    #[test]
+    fn record_keys_search_shows_only_the_stroke() {
+        // Break caught: record-keys mode letting the key's character into the field ("Ss").
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowTextW, PostMessageW, WM_CHAR, WM_KEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            crate::window::settings_dialog::toggle_record_keys_for_test(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(b'S'), 0);
+            PostMessageW(search, WM_CHAR, usize::from(b's'), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let mut buffer = [0u16; 64];
+                let length = GetWindowTextW(search, buffer.as_mut_ptr(), 64);
+                *record.borrow_mut() = String::from_utf16_lossy(&buffer[..length as usize]);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(seen.borrow().as_str(), "S");
+    }
+
+    #[test]
+    fn delete_unbinds_and_the_context_menus_reset_restores_the_defaults() {
+        // Break caught: Reset offered for default rows, or leaving `key.file.saveAs=` behind.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_DOWN, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CHAR, WM_KEYDOWN, WM_RBUTTONUP,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-reset");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = offered.clone();
+        crate::window::menus::answer_next_choice(move |items| {
+            *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+            items
+                .iter()
+                .find(|(label, _)| label.starts_with("Reset"))
+                .map(|(_, id)| *id)
+        });
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_DELETE), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, |dialog| {
+                let (x, y) = crate::window::settings_dialog::page_row_point(dialog, 0);
+                PostMessageW(
+                    dialog,
+                    WM_RBUTTONUP,
+                    0,
+                    ((y as isize) << 16 | (x as isize & 0xffff)) as LPARAM,
+                );
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert!(
+            offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Reset"))
+        );
+        assert!(
+            !offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Remove")),
+            "the row has no key to remove"
+        );
+        assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::SaveAs));
+        super::save_settings_to(None);
+        assert_eq!(std::fs::read_to_string(&ini).unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn recording_sees_f10_and_refuses_it() {
+        // Break caught: F10 (a WM_SYSKEYDOWN) opening the dialog's system menu or beeping
+        // instead of reaching the recording box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DOWN, VK_ESCAPE, VK_F10, VK_RETURN,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_SYSKEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let refusal = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = refusal.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+            PostMessageW(dialog, WM_SYSKEYDOWN, usize::from(VK_F10), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                *record.borrow_mut() = crate::window::settings_dialog::shortcuts_model(dialog)
+                    .and_then(|model| model.recording)
+                    .and_then(|recording| recording.refusal);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*refusal.borrow(), Some("F10 and Shift+F10 open the menus."));
+    }
+
+    #[test]
+    fn a_click_on_the_search_field_cancels_the_recording_box() {
+        // Break caught: a click on the search field focusing it behind the open recording box,
+        // so typing filters the table and Escape closes the dialog instead of the box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let open = crate::window::settings_dialog::shortcuts_model(dialog)
+                    .is_some_and(|model| model.recording.is_some());
+                PostMessageW(search, WM_LBUTTONDOWN, 1, 0x0005_0005);
+                PostMessageW(search, WM_LBUTTONUP, 0, 0x0005_0005);
+                crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                    let still_open = crate::window::settings_dialog::shortcuts_model(dialog)
+                        .is_some_and(|model| model.recording.is_some());
+                    *record.borrow_mut() = Some((open, still_open));
+                    // With the box still open (the break), this Escape closes the dialog anyway.
+                    PostMessageW(search, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+                });
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        assert_eq!(*seen.borrow(), Some((true, false)));
+    }
+
+    #[test]
+    fn record_keys_turned_on_from_the_table_moves_the_focus_to_the_search_field() {
+        // Break caught: Alt+K from the table turning record-keys on with the focus left on the
+        // table, so the next stroke goes to the table (and Escape closes the dialog) instead of
+        // being recorded in the field. Alt can't be posted, so the hook runs Alt+K's own path.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetFocus, VK_DOWN, VK_ESCAPE, VK_F9,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowTextW, PostMessageW, WM_CLOSE, WM_KEYDOWN,
+        };
+        let window = ProductionWindow::new(make_app());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = seen.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let before = crate::window::settings_dialog::current_focus(dialog);
+                crate::window::settings_dialog::toggle_record_keys_for_test(dialog);
+                // The stroke goes wherever the keyboard focus is, as a real key would.
+                let focused = GetFocus();
+                PostMessageW(focused, WM_KEYDOWN, usize::from(VK_F9), 0);
+                crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                    let mut buffer = [0u16; 64];
+                    let length = GetWindowTextW(search, buffer.as_mut_ptr(), 64);
+                    *record.borrow_mut() = Some((
+                        before,
+                        focused == search,
+                        crate::window::settings_dialog::current_focus(dialog),
+                        String::from_utf16_lossy(&buffer[..length as usize]),
+                    ));
+                    // Escape leaves record-keys; the second closes the dialog.
+                    PostMessageW(GetFocus(), WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+                    PostMessageW(dialog, WM_CLOSE, 0, 0);
+                });
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        let (before, focused, focus, text) = seen.borrow().clone().unwrap();
+        assert_eq!(before, Some(crate::window::settings_model::Focus::Table));
+        assert!(focused, "the search field does not have the keyboard focus");
+        assert_eq!(focus, Some(crate::window::settings_model::Focus::Search));
+        assert_eq!(text, "F9");
+    }
+
+    #[test]
+    fn the_context_menu_key_opens_the_row_menu_and_resets() {
+        // Break caught: the row menu reachable only by right-click, so a keyboard user can't
+        // reset a command's keys; or the key opening a menu of its own besides the one its
+        // WM_CONTEXTMENU opens.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_APPS, VK_DELETE, VK_DOWN, VK_ESCAPE,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN, WM_KEYUP,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-apps-key");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = offered.clone();
+        crate::window::menus::answer_next_choice(move |items| {
+            *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+            items
+                .iter()
+                .find(|(label, _)| label.starts_with("Reset"))
+                .map(|(_, id)| *id)
+        });
+        let again = std::rc::Rc::new(std::cell::Cell::new(false));
+        let second = again.clone();
+        crate::window::menus::answer_next_choice(move |_| {
+            second.set(true);
+            None
+        });
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_DELETE), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, |dialog| {
+                // The key itself opens nothing; Windows follows it with a context menu with no
+                // point, which opens the menu once.
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_APPS), 0);
+                PostMessageW(dialog, WM_KEYUP, usize::from(VK_APPS), 0xC000_0001);
+                PostMessageW(dialog, WM_CONTEXTMENU, dialog as usize, -1isize as LPARAM);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        super::save_settings_to(None);
+        assert!(
+            offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Reset")),
+            "no menu, or no Reset in it: {:?}",
+            offered.borrow()
+        );
+        assert!(!again.get(), "the menu opened twice");
+        assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::SaveAs));
+    }
+
+    #[test]
+    fn an_ignored_key_line_can_be_reset_from_the_row_menu() {
+        // Break caught: `key.file.saveAs=Bogus` (ignored, so the keys are the defaults) offering
+        // no Reset, leaving the stale line in fastpad.ini for good.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN,
+        };
+        let scratch = RecoveryScratch::new("shortcuts-stale-line");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        app_mut(window.hwnd)
+            .settings
+            .key_overrides
+            .insert("file.saveAs".into(), "Bogus".into());
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = offered.clone();
+        crate::window::menus::answer_next_choice(move |items| {
+            *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+            items
+                .iter()
+                .find(|(label, _)| label.starts_with("Reset"))
+                .map(|(_, id)| *id)
+        });
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let search = crate::window::settings_dialog::search_hwnd(dialog);
+            for c in "save as".chars() {
+                PostMessageW(search, WM_CHAR, c as usize, 0);
+            }
+            PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+            // Shift+F10's message: a context menu with no point.
+            PostMessageW(dialog, WM_CONTEXTMENU, dialog as usize, -1isize as LPARAM);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+        super::show_keyboard_shortcuts(window.hwnd);
+        super::save_settings_to(None);
+        assert!(
+            offered
+                .borrow()
+                .iter()
+                .any(|label| label.starts_with("Reset")),
+            "{:?}",
+            offered.borrow()
+        );
+        assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
     }
 
     #[test]
@@ -26048,5 +27059,576 @@ three"
             std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
             "old"
         );
+    }
+
+    #[test]
+    fn about_shows_a_modal_window_over_the_disabled_main_window_until_escape() {
+        // Break caught: About doing nothing, leaving the main window usable behind the box (or
+        // disabled after it closes), or a modal scope that never ends, which holds back every
+        // deferred message for the rest of the session; or one with no native frame (no DWM
+        // shadow) or a visible one, as for Settings.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GW_OWNER, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
+            HTCAPTION, HTCLIENT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST, WS_CAPTION,
+        };
+        let window = ProductionWindow::new(make_app());
+        let owner = window.hwnd;
+        let shown = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = shown.clone();
+        crate::window::about::answer_next(move |dialog| {
+            let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
+            let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
+            let modal = crate::window::modal::modal_active(owner);
+            // A hidden native frame: WS_CAPTION earns the DWM shadow, WM_NCCALCSIZE leaves no
+            // visible frame, so the client is the whole window.
+            let style = unsafe { GetWindowLongW(dialog, GWL_STYLE) } as u32;
+            let (mut client, mut frame) = (RECT::default(), RECT::default());
+            unsafe {
+                GetClientRect(dialog, &mut client);
+                GetWindowRect(dialog, &mut frame);
+            }
+            let framed = style & WS_CAPTION == WS_CAPTION
+                && client.right - client.left == frame.right - frame.left
+                && client.bottom - client.top == frame.bottom - frame.top
+                && client.right > 0;
+            // The header still drags the box; its × and the body below do not.
+            let hit = |x: i32, y: i32| unsafe {
+                SendMessageW(
+                    dialog,
+                    WM_NCHITTEST,
+                    0,
+                    ((u32::from(y as u16) << 16) | u32::from(x as u16)) as LPARAM,
+                )
+            };
+            let framed = framed
+                && hit(frame.left + 30, frame.top + 10) == HTCAPTION as LRESULT
+                && hit(frame.right - 5, frame.top + 10) == HTCLIENT as LRESULT
+                && hit(frame.left + 5, frame.bottom - 5) == HTCLIENT as LRESULT;
+            seen.set(Some((dialog, owned, owner_disabled, modal, framed)));
+            unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        });
+
+        execute_command(owner, CommandId::About);
+
+        let (dialog, owned, owner_disabled, modal, framed) =
+            shown.get().expect("the About box was shown");
+        assert!(owned, "owned by the main window");
+        assert!(
+            framed,
+            "WS_CAPTION, a client rect the size of the window, and the header still a caption"
+        );
+        assert!(
+            owner_disabled,
+            "the main window is disabled while About is up"
+        );
+        assert!(modal, "About runs inside a modal scope");
+        assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
+        assert_ne!(
+            unsafe { IsWindowEnabled(owner) },
+            0,
+            "the main window is usable again"
+        );
+        assert!(!crate::window::modal::modal_active(owner));
+    }
+
+    #[test]
+    fn about_opens_the_repository_link_from_the_keyboard_and_stays_open() {
+        // Break caught: a link that Tab can't reach or Enter doesn't follow, or following a link
+        // that also closes the box.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let window = ProductionWindow::new(make_app());
+        crate::window::about::take_opened_urls();
+        crate::window::about::answer_next(move |dialog| unsafe {
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+
+        execute_command(window.hwnd, CommandId::About);
+
+        assert_eq!(
+            crate::window::about::take_opened_urls(),
+            [crate::window::about::Link::Repository.url()]
+        );
+    }
+
+    #[test]
+    fn settings_opens_an_owned_modal_dialog_that_escape_closes() {
+        // Break caught: a dialog that can hide behind the main window, leaves it disabled after
+        // closing, or never ends its modal scope; or one with no native frame (no DWM shadow)
+        // or a visible one.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GW_OWNER, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
+            HTCAPTION, HTCLIENT, HTRIGHT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST,
+            WS_CAPTION,
+        };
+        let window = ProductionWindow::new(make_app());
+        let owner = window.hwnd;
+        let shown = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = shown.clone();
+        crate::window::settings_dialog::answer_next(move |dialog| {
+            let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
+            let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
+            let modal = crate::window::modal::modal_active(owner)
+                && crate::window::settings_dialog::open_dialog(owner) == Some(dialog);
+            // A hidden native frame: WS_CAPTION earns the DWM shadow, WM_NCCALCSIZE leaves no
+            // visible frame, so the client is the whole window.
+            let style = unsafe { GetWindowLongW(dialog, GWL_STYLE) } as u32;
+            let (mut client, mut frame) = (RECT::default(), RECT::default());
+            unsafe {
+                GetClientRect(dialog, &mut client);
+                GetWindowRect(dialog, &mut frame);
+            }
+            let framed = style & WS_CAPTION == WS_CAPTION
+                && client.right - client.left == frame.right - frame.left
+                && client.bottom - client.top == frame.bottom - frame.top
+                && client.right > 0;
+            // The title row still drags the dialog; its × does not; the hidden frame's edges
+            // still size it.
+            let hit = |x: i32, y: i32| unsafe {
+                SendMessageW(
+                    dialog,
+                    WM_NCHITTEST,
+                    0,
+                    ((u32::from(y as u16) << 16) | u32::from(x as u16)) as LPARAM,
+                )
+            };
+            let framed = framed
+                && hit(frame.left + 30, frame.top + 10) == HTCAPTION as LRESULT
+                && hit(frame.right - 20, frame.top + 20) == HTCLIENT as LRESULT
+                && hit(frame.right - 1, (frame.top + frame.bottom) / 2) == HTRIGHT as LRESULT;
+            seen.set(Some((dialog, owned, owner_disabled, modal, framed)));
+            unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        });
+
+        super::show_settings(owner);
+
+        let (dialog, owned, owner_disabled, modal, framed) =
+            shown.get().expect("Settings was shown");
+        assert!(owned && owner_disabled && modal);
+        assert!(
+            framed,
+            "WS_CAPTION, a client rect the size of the window, and the title row still a caption"
+        );
+        assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
+        assert_eq!(crate::window::settings_dialog::open_dialog(owner), None);
+        assert_ne!(unsafe { IsWindowEnabled(owner) }, 0);
+        assert!(!crate::window::modal::modal_active(owner));
+    }
+
+    #[test]
+    fn rebinding_save_rebuilds_the_accelerator_table_and_saves_one_line() {
+        // Break caught: a new key saved but the old table still dispatching, or Reset leaving a
+        // `key.file.save=` line that unbinds Save on the next start.
+        use crate::window::keymap::KeyStroke;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FVIRTKEY};
+        let scratch = RecoveryScratch::new("keymap-rebind");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let save_entries = |hwnd| {
+            app_mut(hwnd)
+                .accelerators
+                .as_ref()
+                .unwrap()
+                .entries()
+                .into_iter()
+                .filter(|entry| entry.cmd == CommandId::Save as u16)
+                .map(|entry| (entry.fVirt, entry.key))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            save_entries(window.hwnd),
+            [(FVIRTKEY | FCONTROL, u16::from(b'S'))]
+        );
+
+        super::set_command_keys(
+            window.hwnd,
+            CommandId::Save,
+            vec![KeyStroke::parse("Ctrl+Alt+S").unwrap()],
+        );
+        assert_eq!(
+            save_entries(window.hwnd),
+            [(FVIRTKEY | FCONTROL | FALT, u16::from(b'S'))]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nkey.file.save=Ctrl+Alt+S\r\n"
+        );
+        assert_eq!(
+            app_mut(window.hwnd)
+                .settings
+                .key_overrides
+                .get("file.save")
+                .map(String::as_str),
+            Some("Ctrl+Alt+S")
+        );
+
+        super::reset_command_keys(window.hwnd, CommandId::Save);
+        assert_eq!(
+            save_entries(window.hwnd),
+            [(FVIRTKEY | FCONTROL, u16::from(b'S'))]
+        );
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+        assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
+
+        // Keys equal to the defaults are a reset too.
+        super::set_command_keys(window.hwnd, CommandId::Save, vec![]);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nkey.file.save=\r\n"
+        );
+        super::set_command_keys(
+            window.hwnd,
+            CommandId::Save,
+            vec![KeyStroke::parse("Ctrl+S").unwrap()],
+        );
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn resetting_a_command_removes_an_ignored_key_line() {
+        // Break caught: `key.file.save=Bogus` is ignored at load, so Reset saw an unchanged
+        // keymap, returned early and left the line (and its warning) forever.
+        let scratch = RecoveryScratch::new("keymap-stale");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(
+            &ini,
+            "# kept
+key.file.save=Bogus
+",
+        )
+        .unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let mut settings = crate::config::default_settings();
+        settings
+            .key_overrides
+            .insert("file.save".into(), "Bogus".into());
+        super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+        assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::Save));
+
+        super::reset_command_keys(window.hwnd, CommandId::Save);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept
+"
+        );
+        assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn loaded_key_overrides_rebuild_the_table_and_warn_about_bad_lines() {
+        // Break caught: `key.` lines read but never applied, or an unknown command dropped
+        // without telling the user.
+        let window = ProductionWindow::new(make_app());
+        let mut settings = crate::config::default_settings();
+        settings
+            .key_overrides
+            .insert("search.find".into(), "F9".into());
+        settings
+            .key_overrides
+            .insert("nope.command".into(), "F8".into());
+        super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+        let app = app_mut(window.hwnd);
+        assert!(app.keymap.is_user(CommandId::Find));
+        assert!(
+            app.accelerators
+                .as_ref()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| {
+                    entry.cmd == CommandId::Find as u16
+                        && entry.key == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9
+                })
+        );
+        assert!(
+            app.notifications
+                .pending()
+                .iter()
+                .any(|notification| notification.message.contains("key.nope.command"))
+        );
+    }
+
+    #[test]
+    fn the_settings_dialog_changes_settings_from_the_keyboard() {
+        // Break caught: arrows or Space that change nothing, a typed font size lost when Tab
+        // leaves the field, or changes that aren't saved (settings dialog spec §3.3).
+        use crate::config::FileIconSet;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_ESCAPE, VK_RIGHT, VK_SPACE, VK_TAB,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-keys");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            let char = |c: char| PostMessageW(dialog, WM_CHAR, c as usize, 0);
+            key(VK_TAB); // File icons
+            key(VK_RIGHT); // Minimal
+            key(VK_TAB); // Font
+            key(VK_TAB); // Font size
+            char('1');
+            char('6');
+            key(VK_TAB); // commits 16; Tab width
+            key(VK_RIGHT); // 4 → 8
+            key(VK_TAB); // Indent with spaces
+            key(VK_SPACE);
+            key(VK_ESCAPE);
+        });
+
+        super::show_settings(window.hwnd);
+
+        let settings = app_mut(window.hwnd).settings.clone();
+        assert_eq!(settings.file_icons, FileIconSet::Minimal);
+        assert_eq!(settings.font_size, 16);
+        assert_eq!(settings.tab_width, 8);
+        assert!(settings.insert_spaces);
+        super::save_settings_to(None);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\ntab_width=8\r\ninsert_spaces=true\r\n"
+        );
+    }
+
+    #[test]
+    fn the_theme_dropdown_opens_with_enter_and_picks_with_the_keyboard() {
+        // Break caught: a dropdown that opens but ignores the arrows, or picks without applying.
+        use crate::config::ThemePreference;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let scratch = RecoveryScratch::new("settings-dialog-theme");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            key(VK_RETURN); // opens the Theme list on System
+            key(VK_DOWN); // Light
+            key(VK_RETURN); // picks it and closes the list
+            key(VK_ESCAPE); // closes the dialog
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).settings.theme, ThemePreference::Light);
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn up_and_down_step_the_focused_theme_dropdown_without_opening_it() {
+        // Break caught: arrows that only work once the list is open, or a step that wraps past
+        // the first item (dropdown arrows brief).
+        use crate::config::ThemePreference;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_UP};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let scratch = RecoveryScratch::new("settings-dialog-theme-arrows");
+        let ini = scratch.path().join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            // The Theme row has the focus, on System, the first item.
+            key(VK_UP); // clamped: still System
+            key(VK_DOWN); // Light
+            key(VK_DOWN); // Dark
+            key(VK_UP); // Light
+            key(VK_ESCAPE);
+            // Break caught: were a step to open the list, the first Escape would close only the
+            // list and show_settings would never return; this one closes the dialog, so the
+            // assertions below fail instead.
+            key(VK_ESCAPE);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).settings.theme, ThemePreference::Light);
+        super::save_settings_to(None);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "theme=light\n",
+            "each step rewrote the one theme line"
+        );
+    }
+
+    #[test]
+    fn the_dialog_keeps_the_focus_after_a_change_that_moves_it() {
+        // Break caught: switching notes mode off from the dialog tears down the sidebar, the
+        // focus lands in the main window, and the dialog stops answering the keyboard (review
+        // focus 1). Posted test keys reach the dialog whatever the focus, so the dialog records
+        // the focus after each change and the test checks that record.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_SPACE, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-focus");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::settings_dialog::take_focus_checks();
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+            // Theme → … → Notes mode is the 11th row: ten Tabs.
+            for _ in 0..10 {
+                key(VK_TAB);
+            }
+            key(VK_SPACE); // notes mode off
+            key(VK_SPACE); // and on again
+            key(VK_ESCAPE);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert!(app_mut(window.hwnd).settings.notes_mode, "both toggles ran");
+        assert_eq!(
+            crate::window::settings_dialog::take_focus_checks(),
+            [true, true],
+            "the dialog had the keyboard after each change"
+        );
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn edit_fastpad_ini_closes_the_dialog_and_opens_the_file_in_a_tab() {
+        // Break caught: the link doing nothing when fastpad.ini doesn't exist yet, or opening it
+        // under the still-modal dialog (settings dialog spec §3.6).
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-edit-ini");
+        let ini = scratch.path().join("FastPad").join("fastpad.ini");
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            // 12 enabled rows (no notebook, so autosave is skipped): 12 Tabs reach the link.
+            for _ in 0..12 {
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+            }
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert!(ini.exists(), "created when missing");
+        assert!(
+            app_mut(window.hwnd).tabs.find_path(&ini).is_some(),
+            "opened in a tab"
+        );
+        // Break caught: a hand edit saved there looking ignored because FastPad reads the file
+        // only at startup, with nothing saying so (final review 5).
+        assert!(
+            app_mut(window.hwnd)
+                .notifications
+                .pending()
+                .iter()
+                .any(|notice| notice.message == super::EDIT_INI_NOTICE),
+            "the notice says when hand edits apply"
+        );
+        super::save_settings_to(None);
+    }
+
+    /// Point `(x, y)` packed as a mouse message's `lparam`.
+    fn settings_click_at(x: i32, y: i32) -> LPARAM {
+        (x as u16 as usize | ((y as u16 as usize) << 16)) as LPARAM
+    }
+
+    /// The center of `row` in the open Settings dialog's client area, before any scrolling.
+    fn settings_row_center(dialog: HWND, row: crate::window::settings_model::Row) -> (i32, i32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow};
+        let owner = unsafe { GetWindow(dialog, GW_OWNER) };
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(owner) }.max(96);
+        let layout =
+            crate::window::settings_dialog::Layout::calculate(dpi, i32::MAX, i32::MAX, 100);
+        let rect = layout.row_rect(row, 0);
+        ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+    }
+
+    #[test]
+    fn the_second_click_of_a_double_click_on_a_dropdown_item_changes_nothing_else() {
+        // Break caught: double-clicking a theme in the list picks it on the first click, the
+        // list goes, and the second click lands on the Word wrap row underneath and toggles it
+        // (final review 3). A later click still toggles it: only one press is swallowed.
+        use crate::config::ThemePreference;
+        use crate::window::settings_model::Row;
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings-dialog-double-click");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        assert!(!app_mut(window.hwnd).settings.word_wrap);
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let (x, y) = settings_row_center(dialog, Row::WordWrap);
+            let mut screen = POINT { x, y };
+            ClientToScreen(dialog, &mut screen);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0); // the Theme list
+            // The list's first click picks Light at a point over the Word wrap row.
+            PostMessageW(
+                dialog,
+                crate::window::dropdown_list::WM_LIST_PICKED,
+                1,
+                settings_click_at(screen.x, screen.y),
+            );
+            for _ in 0..2 {
+                PostMessageW(dialog, WM_LBUTTONDOWN, 1, settings_click_at(x, y));
+                PostMessageW(dialog, WM_LBUTTONUP, 0, settings_click_at(x, y));
+            }
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+
+        super::show_settings(window.hwnd);
+
+        let settings = app_mut(window.hwnd).settings.clone();
+        assert_eq!(settings.theme, ThemePreference::Light, "the pick applied");
+        assert!(settings.word_wrap, "toggled once: by the later click only");
+        super::save_settings_to(None);
+    }
+
+    #[test]
+    fn clicking_the_greyed_autosave_row_leaves_the_focus_where_it_was() {
+        // Break caught: a click on the Notebook autosave row, greyed with no notebook open,
+        // moving the focus onto a row the keyboard can't use (final review 6). Tab and Right
+        // after the click then change File icons, the row after Theme.
+        use crate::config::FileIconSet;
+        use crate::window::settings_model::Row;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RIGHT, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        };
+        let scratch = RecoveryScratch::new("settings-dialog-greyed-row");
+        super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+        let window = ProductionWindow::new(make_app());
+        crate::window::settings_dialog::answer_next(|dialog| unsafe {
+            let (x, y) = settings_row_center(dialog, Row::NotebookAutosave);
+            PostMessageW(dialog, WM_LBUTTONDOWN, 1, settings_click_at(x, y));
+            PostMessageW(dialog, WM_LBUTTONUP, 0, settings_click_at(x, y));
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RIGHT), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+
+        super::show_settings(window.hwnd);
+
+        assert_eq!(
+            app_mut(window.hwnd).settings.file_icons,
+            FileIconSet::Minimal
+        );
+        super::save_settings_to(None);
     }
 }

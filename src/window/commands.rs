@@ -123,6 +123,14 @@ pub enum CommandId {
     FocusLastGroup = 228,
     MoveTabToNextGroup = 229,
     MoveTabToPreviousGroup = 230,
+    About = 231,
+    ToggleInsertSpaces = 232,
+    ToggleShowWhitespace = 233,
+    ToggleHighlightCurrentLine = 234,
+    OpenSettings = 235,
+    EditSettingsFile = 236,
+    OpenKeyboardShortcuts = 237,
+    ToggleAlwaysOnTop = 238,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -233,6 +241,14 @@ impl CommandId {
                 | Self::FocusGroup7
                 | Self::FocusGroup8
                 | Self::FocusLastGroup
+                | Self::About
+                | Self::ToggleInsertSpaces
+                | Self::ToggleShowWhitespace
+                | Self::ToggleHighlightCurrentLine
+                | Self::OpenSettings
+                | Self::EditSettingsFile
+                | Self::OpenKeyboardShortcuts
+                | Self::ToggleAlwaysOnTop
         )
     }
 
@@ -364,7 +380,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 120] = [
+        const COMMANDS: [CommandId; 128] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -485,6 +501,14 @@ impl TryFrom<u16> for CommandId {
             CommandId::FocusLastGroup,
             CommandId::MoveTabToNextGroup,
             CommandId::MoveTabToPreviousGroup,
+            CommandId::About,
+            CommandId::ToggleInsertSpaces,
+            CommandId::ToggleShowWhitespace,
+            CommandId::ToggleHighlightCurrentLine,
+            CommandId::OpenSettings,
+            CommandId::EditSettingsFile,
+            CommandId::OpenKeyboardShortcuts,
+            CommandId::ToggleAlwaysOnTop,
         ];
         COMMANDS
             .into_iter()
@@ -516,6 +540,41 @@ pub(crate) fn choose_save_path(
 #[cfg(test)]
 mod tests {
     use super::CommandId;
+
+    #[test]
+    fn the_display_toggles_are_232_to_234_and_238_and_need_no_document() {
+        // Break caught: a toggle renumbered onto another command, or greyed out while no tab is
+        // open (settings dialog spec §4.3).
+        for (value, command) in [
+            (232, CommandId::ToggleInsertSpaces),
+            (233, CommandId::ToggleShowWhitespace),
+            (234, CommandId::ToggleHighlightCurrentLine),
+            (238, CommandId::ToggleAlwaysOnTop),
+        ] {
+            assert_eq!(command as u16, value);
+            assert_eq!(CommandId::try_from(value), Ok(command));
+            assert!(!command.needs_document(), "{command:?}");
+            assert!(!command.needs_text(), "{command:?}");
+            assert!(!command.is_sidebar(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn settings_commands_are_235_to_237_and_need_no_document() {
+        // Break caught: Ctrl+, renumbered onto another command, or Settings greyed out while no
+        // tab is open.
+        for (value, command) in [
+            (235, CommandId::OpenSettings),
+            (236, CommandId::EditSettingsFile),
+            (237, CommandId::OpenKeyboardShortcuts),
+        ] {
+            assert_eq!(command as u16, value);
+            assert_eq!(CommandId::try_from(value), Ok(command));
+            assert!(!command.needs_document(), "{command:?}");
+            assert!(!command.needs_text(), "{command:?}");
+            assert!(!command.is_sidebar(), "{command:?}");
+        }
+    }
 
     #[test]
     fn native_command_values_are_stable_and_round_trip() {
@@ -702,6 +761,17 @@ mod tests {
         assert_eq!(CommandId::try_from(193), Ok(CommandId::NoteNew));
         assert!(!CommandId::NoteNew.needs_document());
         assert!(!CommandId::NoteNew.is_sidebar());
+    }
+
+    #[test]
+    fn about_is_231_and_runs_without_a_document() {
+        // Break caught: About renumbered onto another command, or greyed out while no tab is open
+        // or an image tab is active.
+        assert_eq!(CommandId::About as u16, 231);
+        assert_eq!(CommandId::try_from(231), Ok(CommandId::About));
+        assert!(!CommandId::About.needs_document());
+        assert!(!CommandId::About.needs_text());
+        assert!(!CommandId::About.is_sidebar());
     }
 
     #[test]

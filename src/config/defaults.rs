@@ -21,6 +21,10 @@ pub const MIN_SIDEBAR_WIDTH: u16 = 180;
 pub const MAX_SIDEBAR_WIDTH: u16 = 480;
 pub const DEFAULT_FILE_ICONS: FileIconSet = FileIconSet::Material;
 pub const DEFAULT_OPEN_EDITORS_EXPANDED: bool = true;
+pub const DEFAULT_INSERT_SPACES: bool = false;
+pub const DEFAULT_SHOW_WHITESPACE: bool = false;
+pub const DEFAULT_HIGHLIGHT_CURRENT_LINE: bool = true;
+pub const DEFAULT_ALWAYS_ON_TOP: bool = false;
 
 /// `width` pulled into `MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH`.
 pub const fn clamp_sidebar_width(width: u16) -> u16 {
@@ -33,10 +37,11 @@ pub const fn clamp_sidebar_width(width: u16) -> u16 {
     }
 }
 
-/// FastPad's compiled defaults: Consolas 11pt, 4-wide tabs, word wrap off, line numbers on, system
-/// theme, a 30-second crash-recovery interval, session restore on, notes mode on, the side
-/// panel showing the Notebook view at 260 pixels, and Material Icon Theme file icons. Every value
-/// a settings file does not (validly) specify keeps whatever `default_settings()` produced.
+/// FastPad's compiled defaults: Consolas 11pt, 4-wide tabs inserted as tab characters, word wrap
+/// off, line numbers on, whitespace hidden, the current line highlighted, system theme, a
+/// 30-second crash-recovery interval, session restore on, notes mode on, the side panel showing
+/// the Notebook view at 260 pixels, and Material Icon Theme file icons. Every value a settings
+/// file does not (validly) specify keeps whatever `default_settings()` produced.
 pub fn default_settings() -> Settings {
     Settings {
         font_face: DEFAULT_FONT_FACE.to_owned(),
@@ -52,6 +57,12 @@ pub fn default_settings() -> Settings {
         sidebar_width: DEFAULT_SIDEBAR_WIDTH,
         file_icons: DEFAULT_FILE_ICONS,
         open_editors_expanded: DEFAULT_OPEN_EDITORS_EXPANDED,
+        insert_spaces: DEFAULT_INSERT_SPACES,
+        show_whitespace: DEFAULT_SHOW_WHITESPACE,
+        highlight_current_line: DEFAULT_HIGHLIGHT_CURRENT_LINE,
+        always_on_top: DEFAULT_ALWAYS_ON_TOP,
+        settings_size: None,
+        key_overrides: std::collections::BTreeMap::new(),
     }
 }
 
@@ -75,6 +86,10 @@ mod tests {
         assert!(settings.notes_mode);
         assert_eq!(settings.sidebar_view, SidebarView::Notebook);
         assert_eq!(settings.sidebar_width, 260);
+        assert!(!settings.insert_spaces);
+        assert!(!settings.show_whitespace);
+        assert!(settings.highlight_current_line);
+        assert!(!settings.always_on_top);
     }
 
     #[test]

@@ -693,7 +693,7 @@ fn show_menu(hwnd: HWND, panel: HWND, point: POINT, folder: PathBuf) -> Option<F
         ScreenToClient(hwnd, &mut at);
     }
     let entries = [
-        MenuEntry::Command("&Open", CommandId::OpenFolder),
+        MenuEntry::local("&Open", CommandId::OpenFolder),
         MenuEntry::Command("&Remove from favorites", CommandId::ToggleNotebookFavorite),
         MenuEntry::Command("Reveal in &Explorer", CommandId::NoteRevealInExplorer),
     ];

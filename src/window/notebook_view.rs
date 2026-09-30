@@ -2295,20 +2295,17 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
         RowKind::Note(relative) => {
             let path = root.join(relative);
             let entries = [
-                MenuEntry::command("Open in new tab", CommandId::Open),
+                MenuEntry::local("Open in new tab", CommandId::Open),
                 MenuEntry::command(
                     if row.pinned { "Unpin" } else { "Pin" },
                     CommandId::NoteTogglePin,
                 ),
                 MenuEntry::Separator,
-                MenuEntry::command(
-                    "Move to notebook...\tCtrl+Shift+M",
-                    CommandId::NoteMoveToNotebook,
-                ),
-                MenuEntry::command("Rename...\tF2", CommandId::NoteRename),
+                MenuEntry::command("Move to notebook...", CommandId::NoteMoveToNotebook),
+                MenuEntry::local("Rename...\tF2", CommandId::NoteRename),
                 MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
                 MenuEntry::Separator,
-                MenuEntry::command("Delete...\tDel", CommandId::NoteDelete),
+                MenuEntry::local("Delete...\tDel", CommandId::NoteDelete),
             ];
             match super::menus::track_popup(hwnd, &entries, point) {
                 Some(CommandId::Open) => {
@@ -2336,10 +2333,10 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 MenuEntry::command("New note here", CommandId::NoteNew),
                 MenuEntry::command("New folder here", CommandId::NoteNewFolder),
                 MenuEntry::Separator,
-                MenuEntry::command("Rename...\tF2", CommandId::NoteRename),
+                MenuEntry::local("Rename...\tF2", CommandId::NoteRename),
                 MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
                 MenuEntry::Separator,
-                MenuEntry::command("Delete...\tDel", CommandId::NoteDelete),
+                MenuEntry::local("Delete...\tDel", CommandId::NoteDelete),
             ];
             match super::menus::track_popup(hwnd, &entries, point) {
                 Some(CommandId::NoteNew) => {

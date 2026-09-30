@@ -16,8 +16,8 @@ use crate::editor::scintilla_constants::{
     SC_ELEMENT_SELECTION_INACTIVE_TEXT, SC_ELEMENT_SELECTION_TEXT, SC_WRAP_NONE, SC_WRAP_WORD,
     SCI_GOTOLINE, SCI_RESETELEMENTCOLOUR, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR,
     SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH,
-    SCI_SETSCROLLWIDTHTRACKING, SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL,
-    STYLE_DEFAULT,
+    SCI_SETSCROLLWIDTHTRACKING, SCI_SETTABWIDTH, SCI_SETUSETABS, SCI_SETVIEWWS, SCI_SETWRAPMODE,
+    SCI_STYLESETSIZEFRACTIONAL, SCWS_INVISIBLE, SCWS_VISIBLEALWAYS, STYLE_DEFAULT,
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
@@ -982,6 +982,37 @@ impl Editor {
         ))
     }
 
+    /// Applies the whitespace settings: whether Tab inserts spaces, and whether spaces and tabs
+    /// are drawn.
+    #[cfg(windows)]
+    pub fn apply_whitespace_settings(
+        &self,
+        insert_spaces: bool,
+        show_whitespace: bool,
+    ) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETUSETABS, usize::from(!insert_spaces), 0)?;
+        let view = if show_whitespace {
+            SCWS_VISIBLEALWAYS
+        } else {
+            SCWS_INVISIBLE
+        };
+        self.endpoint
+            .send_direct_checked(SCI_SETVIEWWS, view as usize, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn apply_whitespace_settings(
+        &self,
+        _insert_spaces: bool,
+        _show_whitespace: bool,
+    ) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
     /// Sets plain-text foreground/background on every style up to `STYLE_DEFAULT`, plus the caret.
     #[cfg(windows)]
     pub fn set_base_colors(&self, foreground: u32, background: u32) -> Result<()> {
@@ -1155,24 +1186,31 @@ impl Editor {
     }
 
     /// Sets the selection (focused and unfocused) and caret-line backgrounds as opaque Scintilla 5
-    /// element colours.
+    /// element colours. A `None` caret line resets that element, which turns the highlight off.
     #[cfg(windows)]
     pub fn set_chrome_colors(
         &self,
         selection: u32,
         inactive_selection: u32,
-        caret_line: u32,
+        caret_line: Option<u32>,
     ) -> Result<()> {
         for (element, colour) in [
-            (SC_ELEMENT_SELECTION_BACK, selection),
-            (SC_ELEMENT_SELECTION_INACTIVE_BACK, inactive_selection),
+            (SC_ELEMENT_SELECTION_BACK, Some(selection)),
+            (SC_ELEMENT_SELECTION_INACTIVE_BACK, Some(inactive_selection)),
             (SC_ELEMENT_CARET_LINE_BACK, caret_line),
         ] {
-            self.endpoint.send_direct_checked(
-                SCI_SETELEMENTCOLOUR,
-                element as usize,
-                ((colour & 0x00FF_FFFF) | 0xFF00_0000) as isize,
-            )?;
+            match colour {
+                Some(colour) => self.endpoint.send_direct_checked(
+                    SCI_SETELEMENTCOLOUR,
+                    element as usize,
+                    ((colour & 0x00FF_FFFF) | 0xFF00_0000) as isize,
+                )?,
+                None => self.endpoint.send_direct_checked(
+                    SCI_RESETELEMENTCOLOUR,
+                    element as usize,
+                    0,
+                )?,
+            };
         }
         Ok(())
     }
@@ -1182,7 +1220,7 @@ impl Editor {
         &self,
         _selection: u32,
         _inactive_selection: u32,
-        _caret_line: u32,
+        _caret_line: Option<u32>,
     ) -> Result<()> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
@@ -2482,7 +2520,7 @@ mod tests {
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
         editor
-            .set_chrome_colors(0x0078_4F26, 0x0041_3D3A, 0x0028_2828)
+            .set_chrome_colors(0x0078_4F26, 0x0041_3D3A, Some(0x0028_2828))
             .unwrap();
 
         assert_eq!(

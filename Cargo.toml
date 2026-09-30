@@ -2,7 +2,7 @@
 name = "fastpad"
 version = "0.3.0"
 edition = "2024"
-description = "A startup-latency-first text editor for Windows"
+description = "Ultra fast note taking app."
 license = "MIT"
 repository = "https://github.com/coccor/FastPad"
 
@@ -16,6 +16,7 @@ windows = { version = "=0.62.2", default-features = false, features = [
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
@@ -30,6 +31,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",

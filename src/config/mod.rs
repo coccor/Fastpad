@@ -7,5 +7,5 @@ pub use defaults::{
 };
 pub use persisted::{
     FileIconSet, SettingWarning, Settings, SettingsDelta, SidebarView, ThemePreference, load,
-    parse, save_setting, save_setting_to,
+    parse, remove_setting, remove_setting_to, save_setting, save_setting_to,
 };

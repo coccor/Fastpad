@@ -66,6 +66,8 @@ pub struct App {
     pub(crate) graphics: Option<Rc<crate::preview::dwrite::Graphics>>,
     pub(crate) accessibility: AccessibilityState,
     pub(crate) accelerators: Option<AcceleratorTable>,
+    /// The shortcuts in force: the defaults until settings load, then with the user's overrides.
+    pub(crate) keymap: crate::window::keymap::Keymap,
     pub(crate) menu_bar: Option<MenuBar>,
     /// Present while the Alt/F10 menu band is showing.
     pub(crate) menu_mode: Option<MenuMode>,
@@ -146,7 +148,8 @@ impl App {
             last_sash_click: None,
             graphics: None,
             accessibility: AccessibilityState::default(),
-            accelerators: AcceleratorTable::create().ok(),
+            keymap: crate::window::keymap::Keymap::defaults(),
+            accelerators: AcceleratorTable::create(&crate::window::keymap::Keymap::defaults()).ok(),
             menu_bar: None,
             menu_mode: None,
             menu_return_focus: std::ptr::null_mut(),

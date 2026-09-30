@@ -6,7 +6,6 @@
 use crate::library::quick_open::QuickMatch;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
-use crate::window::menus::{AcceleratorSpec, accelerator_specs};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
 use std::cell::Cell;
@@ -25,7 +24,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN,
-    VK_SHIFT, VK_TAB, VK_UP,
+    VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -51,7 +50,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 98] = [
+pub(crate) const ENTRIES: [PaletteEntry; 106] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -179,34 +178,27 @@ pub(crate) const ENTRIES: [PaletteEntry; 98] = [
     entry("Editor: Tab width 2", CommandId::TabWidth2),
     entry("Editor: Tab width 4", CommandId::TabWidth4),
     entry("Editor: Tab width 8", CommandId::TabWidth8),
+    entry(
+        "Editor: Toggle indent with spaces",
+        CommandId::ToggleInsertSpaces,
+    ),
+    entry(
+        "Editor: Toggle show whitespace",
+        CommandId::ToggleShowWhitespace,
+    ),
+    entry(
+        "Editor: Toggle highlight current line",
+        CommandId::ToggleHighlightCurrentLine,
+    ),
+    entry("View: Toggle always on top", CommandId::ToggleAlwaysOnTop),
     entry("File: Exit", CommandId::Exit),
-];
-
-/// What the activity bar's Settings button lists: every command that changes a `fastpad.ini`
-/// setting or the open notebook's autosave switch. The palette shows them in catalog order.
-pub(crate) const SETTINGS_COMMANDS: &[CommandId] = &[
-    CommandId::ToggleRestoreSession,
-    CommandId::ToggleNotesMode,
-    CommandId::ToggleFolderAutosave,
-    CommandId::ToggleWordWrap,
-    CommandId::ToggleLineNumbers,
-    CommandId::FontSizeIncrease,
-    CommandId::FontSizeDecrease,
-    CommandId::FontSizeReset,
-    CommandId::ThemeSystem,
-    CommandId::ThemeLight,
-    CommandId::ThemeDark,
-    CommandId::ThemeCatppuccin,
-    CommandId::ThemeCatppuccinLatte,
-    CommandId::ThemeCatppuccinFrappe,
-    CommandId::ThemeCatppuccinMacchiato,
-    CommandId::ThemeCatppuccinMocha,
-    CommandId::FileIconsMaterial,
-    CommandId::FileIconsMinimal,
-    CommandId::FileIconsSolid,
-    CommandId::TabWidth2,
-    CommandId::TabWidth4,
-    CommandId::TabWidth8,
+    entry("Preferences: Open Settings", CommandId::OpenSettings),
+    entry(
+        "Preferences: Open Keyboard Shortcuts",
+        CommandId::OpenKeyboardShortcuts,
+    ),
+    entry("Preferences: Edit fastpad.ini", CommandId::EditSettingsFile),
+    entry("Help: About FastPad", CommandId::About),
 ];
 
 /// How well `query` matches `label`, lower is better; `None` when it does not match at all.
@@ -391,34 +383,6 @@ pub(crate) fn picker_row_label(picker: &Picker, row: &PickerRow) -> String {
     }
 }
 
-/// The first keyboard shortcut bound to `command`, spelled the way the menus spell shortcuts.
-pub(crate) fn shortcut_text(command: CommandId) -> Option<String> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
-    let spec: AcceleratorSpec = accelerator_specs()
-        .into_iter()
-        .find(|spec| spec.command == command)?;
-    let mut text = String::new();
-    for (flag, name) in [(FCONTROL, "Ctrl+"), (FSHIFT, "Shift+"), (FALT, "Alt+")] {
-        if spec.modifiers & flag != 0 {
-            text.push_str(name);
-        }
-    }
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_F1, VK_F24, VK_LEFT, VK_OEM_5, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT,
-    };
-    match spec.key {
-        VK_TAB => text.push_str("Tab"),
-        VK_OEM_5 => text.push('\\'),
-        VK_LEFT => text.push_str("Left"),
-        VK_RIGHT => text.push_str("Right"),
-        VK_OEM_PLUS => text.push('+'),
-        VK_OEM_MINUS => text.push('-'),
-        key @ VK_F1..=VK_F24 => text.push_str(&format!("F{}", key - VK_F1 + 1)),
-        key => text.push(char::from_u32(u32::from(key))?),
-    }
-    Some(text)
-}
-
 const WIDTH_AT_96_DPI: i32 = 560;
 const PADDING_AT_96_DPI: i32 = 6;
 const FIELD_HEIGHT_AT_96_DPI: i32 = 28;
@@ -495,14 +459,14 @@ pub(crate) struct CommandPalette {
     query_edit: HWND,
     list: HWND,
     shown: Vec<PaletteEntry>,
+    /// Each shown row's key text, from the window's keymap when the rows were set.
+    shown_keys: Vec<Option<String>>,
     /// `Some` while the palette lists runtime items instead of commands.
     picker: Option<Picker>,
     /// The rows `picker` currently shows, filtered by the query.
     picker_rows: Vec<PickerRow>,
     /// The row `fill_list` selects in picker mode; `None` selects nothing.
     picker_selected: Option<usize>,
-    /// `Some` while command mode lists only these commands (the Settings button).
-    subset: Option<&'static [CommandId]>,
     visible: bool,
     colors: Palette,
     layout: Option<PanelLayout>,
@@ -552,10 +516,10 @@ impl CommandPalette {
             query_edit,
             list,
             shown: Vec::new(),
+            shown_keys: Vec::new(),
             picker: None,
             picker_rows: Vec::new(),
             picker_selected: None,
-            subset: None,
             visible: false,
             colors,
             layout: None,
@@ -624,7 +588,6 @@ impl CommandPalette {
         self.picker = None;
         self.picker_rows = Vec::new();
         self.picker_selected = None;
-        self.subset = None;
         std::mem::take(&mut self.visible)
     }
 
@@ -642,9 +605,23 @@ impl CommandPalette {
         }
     }
 
-    /// Records the rows to list; `fill_list` then puts them in the list box.
-    pub(crate) fn set_entries(&mut self, entries: Vec<PaletteEntry>) {
+    /// Records the rows to list and their keys; `fill_list` then puts them in the list box.
+    pub(crate) fn set_entries(
+        &mut self,
+        entries: Vec<PaletteEntry>,
+        keymap: &crate::window::keymap::Keymap,
+    ) {
+        self.shown_keys = entries
+            .iter()
+            .map(|entry| keymap.first_text(entry.command))
+            .collect();
         self.shown = entries;
+    }
+
+    /// The key text shown on row `index`.
+    #[cfg(test)]
+    pub(crate) fn shown_shortcut(&self, index: usize) -> Option<&str> {
+        self.shown_keys.get(index)?.as_deref()
     }
 
     /// Switches between command mode (`None`) and picker mode; also clears any rows from a
@@ -669,15 +646,6 @@ impl CommandPalette {
 
     pub(crate) fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
-    }
-
-    /// Limits command mode to `subset`, or lifts the limit with `None`.
-    pub(crate) fn set_subset(&mut self, subset: Option<&'static [CommandId]>) {
-        self.subset = subset;
-    }
-
-    pub(crate) fn subset(&self) -> Option<&'static [CommandId]> {
-        self.subset
     }
 
     /// Records the picker rows to list and the one to select; `fill_list` then puts them in the
@@ -940,7 +908,11 @@ impl CommandPalette {
             let Some(entry) = index.and_then(|index| self.shown.get(index)) else {
                 return;
             };
-            (entry.label.to_owned(), shortcut_text(entry.command))
+            let shortcut = index
+                .and_then(|index| self.shown_keys.get(index))
+                .cloned()
+                .flatten();
+            (entry.label.to_owned(), shortcut)
         };
         let selected = item.itemState & ODS_SELECTED != 0;
         let colors = self.colors;
@@ -1452,10 +1424,55 @@ unsafe extern "system" fn palette_control_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, SETTINGS_COMMANDS, filter_entries,
-        hit_runs, match_rank, picker_row_label, picker_rows, shortcut_text,
+        ENTRIES, PanelLayout, Picker, PickerKind, PickerRow, filter_entries, hit_runs, match_rank,
+        picker_row_label, picker_rows,
     };
     use crate::window::commands::CommandId;
+
+    fn shortcut_text(command: CommandId) -> Option<String> {
+        crate::window::keymap::Keymap::defaults().first_text(command)
+    }
+
+    #[test]
+    fn palette_rows_show_the_windows_keys() {
+        // Break caught: the palette hinting the default key after the user rebound it.
+        use crate::window::keymap::{KeyStroke, Keymap};
+        let keymap =
+            Keymap::defaults().with_keys(CommandId::Save, vec![KeyStroke::parse("F9").unwrap()]);
+        let entries = filter_entries("file: save", |_| true);
+        assert_eq!(entries[0].command, CommandId::Save);
+        let shown = entries
+            .iter()
+            .map(|entry| keymap.first_text(entry.command))
+            .collect::<Vec<_>>();
+        assert_eq!(shown[0].as_deref(), Some("F9"));
+    }
+
+    #[test]
+    fn the_editor_display_toggles_are_listed_once_under_editor() {
+        // Break caught: a new setting reachable only from the Settings dialog.
+        for (label, command) in [
+            (
+                "Editor: Toggle indent with spaces",
+                CommandId::ToggleInsertSpaces,
+            ),
+            (
+                "Editor: Toggle show whitespace",
+                CommandId::ToggleShowWhitespace,
+            ),
+            (
+                "Editor: Toggle highlight current line",
+                CommandId::ToggleHighlightCurrentLine,
+            ),
+        ] {
+            let labels = ENTRIES
+                .iter()
+                .filter(|entry| entry.command == command)
+                .map(|entry| entry.label)
+                .collect::<Vec<_>>();
+            assert_eq!(labels, [label]);
+        }
+    }
 
     #[test]
     fn hit_runs_cut_at_char_positions_not_bytes() {
@@ -1471,24 +1488,15 @@ mod tests {
     }
 
     #[test]
-    fn every_settings_command_has_exactly_one_palette_entry() {
-        // Break caught: a Settings button entry with no palette row, which the filtered palette
-        // could never show, or a settings list that lets non-settings commands through.
-        for command in SETTINGS_COMMANDS {
-            let listed = ENTRIES
-                .iter()
-                .filter(|entry| entry.command == *command)
-                .count();
-            assert_eq!(listed, 1, "{command:?}");
-        }
-        let listed = filter_entries("", |command| SETTINGS_COMMANDS.contains(&command));
-        assert_eq!(listed.len(), SETTINGS_COMMANDS.len());
-        assert!(listed.iter().all(|entry| entry.command != CommandId::Save));
-        assert!(
-            listed
-                .iter()
-                .any(|entry| entry.command == CommandId::ThemeCatppuccinMocha)
+    fn settings_is_listed_under_preferences_with_ctrl_comma() {
+        // Break caught: the dialog reachable only by mouse, or its row showing no shortcut.
+        assert_eq!(labels("open settings")[0], "Preferences: Open Settings");
+        assert_eq!(
+            shortcut_text(CommandId::OpenSettings).as_deref(),
+            Some("Ctrl+,")
         );
+        assert_eq!(labels("fastpad.ini")[0], "Preferences: Edit fastpad.ini");
+        assert_eq!(shortcut_text(CommandId::EditSettingsFile), None);
     }
 
     fn labels(query: &str) -> Vec<&'static str> {
@@ -1507,7 +1515,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 98);
+        assert_eq!(ENTRIES.len(), 106);
     }
 
     #[test]
@@ -1544,6 +1552,14 @@ mod tests {
             position(CommandId::NoteNew).map(|index| index + 1),
             position(CommandId::NoteNewFolder)
         );
+    }
+
+    #[test]
+    fn about_is_listed_under_help_without_a_shortcut() {
+        // Break caught: the About box reachable only from the menu band, or its row showing a
+        // shortcut it doesn't have.
+        assert_eq!(labels("about")[0], "Help: About FastPad");
+        assert_eq!(shortcut_text(CommandId::About), None);
     }
 
     #[test]
@@ -1712,7 +1728,7 @@ mod tests {
             shortcut_text(CommandId::NextTab).as_deref(),
             Some("Ctrl+Tab")
         );
-        assert_eq!(shortcut_text(CommandId::ZoomIn).as_deref(), Some("Ctrl++"));
+        assert_eq!(shortcut_text(CommandId::ZoomIn).as_deref(), Some("Ctrl+="));
         assert_eq!(shortcut_text(CommandId::ZoomOut).as_deref(), Some("Ctrl+-"));
         assert_eq!(
             shortcut_text(CommandId::CommandPalette).as_deref(),

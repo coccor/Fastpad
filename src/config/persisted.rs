@@ -106,6 +106,20 @@ pub struct Settings {
     pub file_icons: FileIconSet,
     /// Whether the Notebook view's Open Editors section is expanded.
     pub open_editors_expanded: bool,
+    /// Whether Tab inserts spaces instead of a tab character.
+    pub insert_spaces: bool,
+    /// Whether spaces and tabs are drawn as dots and arrows.
+    pub show_whitespace: bool,
+    /// Whether the caret's line gets the theme's caret-line background.
+    pub highlight_current_line: bool,
+    /// Whether the window stays above other windows.
+    pub always_on_top: bool,
+    /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
+    /// `None` opens it at its natural size. Saved when a resize drag ends.
+    pub settings_size: Option<(u16, u16)>,
+    /// `key.<command-id>=` lines, id to value, as written: the keymap validates them when
+    /// settings load (keyboard shortcuts spec §4).
+    pub key_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl Settings {
@@ -146,11 +160,29 @@ impl Settings {
         if let Some(sidebar_width) = delta.sidebar_width {
             self.sidebar_width = sidebar_width;
         }
+        if let Some(size) = delta.settings_size {
+            self.settings_size = Some(size);
+        }
         if let Some(file_icons) = delta.file_icons {
             self.file_icons = file_icons;
         }
         if let Some(expanded) = delta.open_editors_expanded {
             self.open_editors_expanded = expanded;
+        }
+        if let Some(insert_spaces) = delta.insert_spaces {
+            self.insert_spaces = insert_spaces;
+        }
+        if let Some(show_whitespace) = delta.show_whitespace {
+            self.show_whitespace = show_whitespace;
+        }
+        if let Some(highlight_current_line) = delta.highlight_current_line {
+            self.highlight_current_line = highlight_current_line;
+        }
+        if let Some(always_on_top) = delta.always_on_top {
+            self.always_on_top = always_on_top;
+        }
+        for (id, value) in &delta.key_overrides {
+            self.key_overrides.insert(id.clone(), value.clone());
         }
     }
 }
@@ -181,8 +213,14 @@ pub struct SettingsDelta {
     pub notes_mode: Option<bool>,
     pub sidebar_view: Option<SidebarView>,
     pub sidebar_width: Option<u16>,
+    pub settings_size: Option<(u16, u16)>,
     pub file_icons: Option<FileIconSet>,
     pub open_editors_expanded: Option<bool>,
+    pub insert_spaces: Option<bool>,
+    pub show_whitespace: Option<bool>,
+    pub highlight_current_line: Option<bool>,
+    pub always_on_top: Option<bool>,
+    pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
 }
 
@@ -190,10 +228,13 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
-/// `sidebar_view`, `sidebar_width`, `file_icons` and `open_editors_expanded` are recognized.
+/// `sidebar_view`, `sidebar_width`, `settings_size`, `file_icons`, `open_editors_expanded`,
+/// `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
-/// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `file_icons` is
-/// `material` or `minimal` (any case). Every line is handled independently: a line with an
+/// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
+/// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
+/// `file_icons` is
+/// `material` or `minimal` (any case). `key.<command-id>` lines are collected as text into `key_overrides` for the keymap to validate. Every line is handled independently: a line with an
 /// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
 /// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
@@ -218,7 +259,23 @@ pub fn parse(source: &str) -> SettingsDelta {
     delta
 }
 
+/// `<width>x<height>`, both above zero, as `settings_size` writes it.
+fn parse_size(value: &str) -> Option<(u16, u16)> {
+    let (width, height) = value.split_once(['x', 'X'])?;
+    let width = trim_ascii(width).parse::<u16>().ok()?;
+    let height = trim_ascii(height).parse::<u16>().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &str) {
+    if let Some(id) = key.strip_prefix("key.") {
+        if id.is_empty() {
+            warn(delta, line_number, key, value);
+        } else {
+            delta.key_overrides.insert(id.to_owned(), value.to_owned());
+        }
+        return;
+    }
     match key {
         "font_face" => {
             if value.is_empty() {
@@ -268,12 +325,32 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
             Ok(width) => delta.sidebar_width = Some(clamp_sidebar_width(width)),
             Err(_) => warn(delta, line_number, key, value),
         },
+        "settings_size" => match parse_size(value) {
+            Some(size) => delta.settings_size = Some(size),
+            None => warn(delta, line_number, key, value),
+        },
         "file_icons" => match FileIconSet::parse(value) {
             Some(set) => delta.file_icons = Some(set),
             None => warn(delta, line_number, key, value),
         },
         "open_editors_expanded" => match parse_bool(value) {
             Some(expanded) => delta.open_editors_expanded = Some(expanded),
+            None => warn(delta, line_number, key, value),
+        },
+        "insert_spaces" => match parse_bool(value) {
+            Some(insert_spaces) => delta.insert_spaces = Some(insert_spaces),
+            None => warn(delta, line_number, key, value),
+        },
+        "show_whitespace" => match parse_bool(value) {
+            Some(show_whitespace) => delta.show_whitespace = Some(show_whitespace),
+            None => warn(delta, line_number, key, value),
+        },
+        "highlight_current_line" => match parse_bool(value) {
+            Some(highlight) => delta.highlight_current_line = Some(highlight),
+            None => warn(delta, line_number, key, value),
+        },
+        "always_on_top" => match parse_bool(value) {
+            Some(always_on_top) => delta.always_on_top = Some(always_on_top),
             None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
@@ -441,6 +518,46 @@ pub fn save_setting_to(path: &Path, key: &str, value: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     crate::file::saver::save_atomic(path, set_setting(&source, key, value).as_bytes())
+}
+
+/// Returns `source` without any line naming `key`; everything else is kept byte for byte. A BOM
+/// on a removed first line stays at the start of the file.
+pub fn remove_setting_text(source: &str, key: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    for raw_line in source.split_inclusive('\n') {
+        let content = raw_line.trim_end_matches(['\r', '\n']);
+        let bom = content.starts_with('\u{feff}');
+        let names_key = trim_ascii(content.trim_start_matches('\u{feff}'))
+            .split_once('=')
+            .is_some_and(|(line_key, _)| trim_ascii(line_key) == key);
+        if names_key {
+            if bom {
+                output.push('\u{feff}');
+            }
+        } else {
+            output.push_str(raw_line);
+        }
+    }
+    output
+}
+
+/// Removes one setting from the settings file. A missing file has nothing to remove.
+pub fn remove_setting(key: &str) -> Result<()> {
+    remove_setting_to(&settings_file_path()?, key)
+}
+
+pub fn remove_setting_to(path: &Path, key: &str) -> Result<()> {
+    let source = match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map_err(|_| crate::FastPadError::Invariant("the settings file is not valid UTF-8"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let updated = remove_setting_text(&source, key);
+    if updated == source {
+        return Ok(());
+    }
+    crate::file::saver::save_atomic(path, updated.as_bytes())
 }
 
 #[cfg(test)]
@@ -767,6 +884,37 @@ mod tests {
     }
 
     #[test]
+    fn settings_size_reads_width_by_height_and_warns_about_anything_else() {
+        // Break caught: the Settings dialog forgetting the size it was dragged to, or a
+        // hand-edited size of 0x0 or nonsense opening it with no room for anything.
+        assert_eq!(
+            parse("settings_size=900x700").settings_size,
+            Some((900, 700))
+        );
+        assert_eq!(
+            parse("settings_size = 900 X 700").settings_size,
+            Some((900, 700))
+        );
+        for bad in [
+            "0x700",
+            "900x0",
+            "900",
+            "wide",
+            "900x700x3",
+            "-5x700",
+            "70000x700",
+        ] {
+            let delta = parse(&format!("settings_size={bad}"));
+            assert_eq!(delta.settings_size, None, "{bad}");
+            assert_eq!(delta.warnings.len(), 1, "{bad}");
+        }
+        let mut settings = default_settings();
+        assert_eq!(settings.settings_size, None);
+        settings.apply_delta(&parse("settings_size=900x700"));
+        assert_eq!(settings.settings_size, Some((900, 700)));
+    }
+
+    #[test]
     fn sidebar_width_is_pulled_into_its_range_and_warns_when_not_a_number() {
         // Break caught: a hand-edited sidebar_width=5000 leaving no room for the editor, 0
         // hiding a panel that reads as open, or a typo discarding the other settings.
@@ -837,5 +985,120 @@ mod tests {
         assert_eq!(warnings.len(), 2);
 
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn the_editor_display_keys_parse_as_bools_with_their_defaults() {
+        // Break caught: a new key reported as unknown, a typo silently flipping it, or a default
+        // that changes how a brand-new profile's editor looks (settings dialog spec §4.4).
+        let defaults = default_settings();
+        assert!(!defaults.insert_spaces);
+        assert!(!defaults.show_whitespace);
+        assert!(defaults.highlight_current_line);
+
+        let delta = parse("insert_spaces=yes\nshow_whitespace=ON\nhighlight_current_line=0\n");
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        assert_eq!(
+            (
+                delta.insert_spaces,
+                delta.show_whitespace,
+                delta.highlight_current_line
+            ),
+            (Some(true), Some(true), Some(false))
+        );
+        let mut settings = default_settings();
+        settings.apply_delta(&delta);
+        assert!(settings.insert_spaces);
+        assert!(settings.show_whitespace);
+        assert!(!settings.highlight_current_line);
+
+        for key in ["insert_spaces", "show_whitespace", "highlight_current_line"] {
+            let delta = parse(&format!("{key}=sometimes\nfont_size=12"));
+            assert_eq!(delta.warnings.len(), 1, "{key}");
+            assert_eq!(delta.font_size, Some(12), "{key} keeps the other lines");
+        }
+        assert_eq!(parse("insert_spaces=maybe").insert_spaces, None);
+    }
+
+    #[test]
+    fn always_on_top_parses_as_a_bool_and_defaults_off() {
+        // Break caught: the key reported as unknown, a typo silently turning it on, or the
+        // default pinning every fresh profile's window above the others.
+        assert!(!default_settings().always_on_top);
+
+        let delta = parse("always_on_top=yes\n");
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        assert_eq!(delta.always_on_top, Some(true));
+        let mut settings = default_settings();
+        settings.apply_delta(&delta);
+        assert!(settings.always_on_top);
+
+        let delta = parse("always_on_top=sometimes\nfont_size=12");
+        assert_eq!(delta.warnings.len(), 1);
+        assert_eq!(delta.always_on_top, None);
+        assert_eq!(delta.font_size, Some(12));
+    }
+
+    #[test]
+    fn key_lines_are_collected_as_text_for_the_keymap() {
+        // Break caught: `key.` lines reported as unknown settings, or their values trimmed of
+        // the `=` key's name.
+        let delta = parse(
+            "key.file.save = Ctrl+Alt+S\nkey.view.zoomIn=Ctrl+=, Ctrl+NumpadAdd\nkey.file.new=\nkey.=F9\n",
+        );
+        assert_eq!(
+            delta.key_overrides.get("file.save").map(String::as_str),
+            Some("Ctrl+Alt+S")
+        );
+        assert_eq!(
+            delta.key_overrides.get("view.zoomIn").map(String::as_str),
+            Some("Ctrl+=, Ctrl+NumpadAdd")
+        );
+        assert_eq!(
+            delta.key_overrides.get("file.new").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(delta.warnings.len(), 1, "{:?}", delta.warnings);
+        assert_eq!(delta.warnings[0].line, 4);
+        let mut settings = crate::config::default_settings();
+        settings.apply_delta(&delta);
+        assert_eq!(settings.key_overrides.len(), 3);
+    }
+
+    #[test]
+    fn removing_a_key_drops_only_its_lines() {
+        // Break caught: Reset leaving `key.file.save=` behind (which unbinds Save), or
+        // rewriting the rest of the user's file.
+        let source = "\u{feff}key.file.save=F9\r\n# mine\r\ntheme=dark\r\nkey.file.save = F8\r\n";
+        assert_eq!(
+            remove_setting_text(source, "key.file.save"),
+            "\u{feff}# mine\r\ntheme=dark\r\n"
+        );
+        assert_eq!(
+            remove_setting_text("theme=dark", "key.file.save"),
+            "theme=dark"
+        );
+        assert_eq!(
+            remove_setting_text("# key.file.save=F9\n", "key.file.save"),
+            "# key.file.save=F9\n"
+        );
+    }
+
+    #[test]
+    fn removing_from_a_missing_file_is_nothing_to_do() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastpad-remove-setting-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("fastpad.ini");
+        remove_setting_to(&path, "key.file.save").unwrap();
+        assert!(!path.exists());
+        save_setting_to(&path, "key.file.save", "F9").unwrap();
+        save_setting_to(&path, "theme", "dark").unwrap();
+        remove_setting_to(&path, "key.file.save").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theme=dark\n");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

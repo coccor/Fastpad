@@ -156,8 +156,9 @@ their rendered preview beside the source. The notebook lists images next to your
 <img src="docs/images/command-palette.png" alt="The command palette filtering theme commands" width="800">
 
 Open it and start typing. Switch theme, toggle word wrap or line numbers, change font size
-or tab width, all without leaving the keyboard. Every change is saved instantly. The
-**Settings** button at the bottom of the sidebar opens the palette with just the settings.
+or tab width, all without leaving the keyboard. Every change is saved instantly. Prefer to
+see everything at once? **Settings** (`Ctrl+,`, **File > Settings...** or the gear at the
+bottom of the sidebar) lists every setting, and changes apply as you make them.
 
 ### Themes that match your desk
 
@@ -210,10 +211,11 @@ before closing again.
 | Replace in the selected result | `Ctrl+Shift+1` | | Go to note | `Ctrl+P` |
 | Close tab | `Ctrl+W` or middle-click | | Split editor right / down | `Ctrl+\` / `Ctrl+Shift+\` |
 | Focus editor group 1–8 / last | `Ctrl+1` … `Ctrl+8` / `Ctrl+9` | | Move tab to next / previous group | `Ctrl+Alt+Right` / `Ctrl+Alt+Left` |
+| Settings | `Ctrl+,` | | | |
 
 ## Make it yours
 
-Everything in the command palette is saved to `%LocalAppData%\FastPad\fastpad.ini`. You can also
+Everything in the command palette or Settings is saved to `%LocalAppData%\FastPad\fastpad.ini`. You can also
 edit it by hand: one `key=value` per line. A typo never blocks startup; FastPad points out the bad
 line in a notification and applies the rest.
 
@@ -224,14 +226,19 @@ line in a notification and applies the rest.
 | `tab_width` | 1–255 | `4` |
 | `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `insert_spaces` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `show_whitespace` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `highlight_current_line` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
+| `settings_size` | `<width>x<height>` (pixels at 100% scaling), saved when you resize Settings | none: its natural size |
 | `file_icons` | `material`, `minimal` or `solid` | `material` |
 
-Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
+Hand edits keep your comments and other lines; the palette and Settings rewrite only the lines they change.
 
 ## Command line
 
