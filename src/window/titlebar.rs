@@ -27,8 +27,8 @@ const GLYPH_MINIMIZE: &str = "\u{E921}";
 const GLYPH_MAXIMIZE: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
 pub(crate) const GLYPH_CLOSE: &str = "\u{E8BB}";
-pub(crate) const GLYPH_PREVIEW_SIDE: &str = "\u{E90D}";
-pub(crate) const GLYPH_PREVIEW_FULL: &str = "\u{E8FF}";
+pub(crate) const GLYPH_PREVIEW_SIDE: &str = "\u{F57C}";
+pub(crate) const GLYPH_PREVIEW_FULL: &str = "\u{E7B3}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Point {

@@ -167,6 +167,20 @@ impl Matcher {
         all
     }
 
+    /// The first `limit` matches of `find_iter`, in order. It stops scanning once it has them, so
+    /// counting matches in a large text stays bounded by `limit`.
+    pub fn find_up_to(&self, text: &str, limit: usize) -> Vec<Range<usize>> {
+        let mut found = Vec::new();
+        if limit == 0 {
+            return found;
+        }
+        self.each_match(text, &mut |range| {
+            found.push(range);
+            found.len() < limit
+        });
+        found
+    }
+
     /// Every match, in `find_iter`'s order (ascending byte ranges into `text`, never overlapping),
     /// with the text that replaces it. No match gives an empty `Vec`.
     ///

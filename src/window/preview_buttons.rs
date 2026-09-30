@@ -4,15 +4,16 @@
 
 use crate::platform::wide_null;
 use crate::window::titlebar::{
-    GLYPH_PREVIEW_FULL, GLYPH_PREVIEW_SIDE, Point, Rect, draw_text, fill, restore_font, scale,
-    select_font,
+    GLYPH_PREVIEW_FULL, GLYPH_PREVIEW_SIDE, Point, Rect, create_ui_font, draw_text, fill,
+    restore_font, scale, select_font,
 };
+use crate::window::tooltip::Tooltip;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, EndPaint, InvalidateRect,
-    MapWindowPoints, PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, EndPaint,
+    FW_NORMAL, InvalidateRect, MapWindowPoints, PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -43,6 +44,18 @@ pub(crate) struct PreviewButtons {
     pub(crate) hwnd: HWND,
     hovered: Option<PreviewButton>,
     pressed: Option<PreviewButton>,
+    /// Made on the first pointer move over the buttons; destroyed with the group.
+    tooltip: Option<Tooltip>,
+    /// The tooltip could not be made, and that is not tried again.
+    tooltip_failed: bool,
+}
+
+impl Drop for PreviewButtons {
+    fn drop(&mut self) {
+        if let Some(tooltip) = self.tooltip.take() {
+            tooltip.destroy();
+        }
+    }
 }
 
 impl Default for PreviewButtons {
@@ -51,12 +64,14 @@ impl Default for PreviewButtons {
             hwnd: std::ptr::null_mut(),
             hovered: None,
             pressed: None,
+            tooltip: None,
+            tooltip_failed: false,
         }
     }
 }
 
 fn button_size(dpi: u32) -> i32 {
-    scale(28, dpi)
+    scale(32, dpi)
 }
 
 /// The active group's floating preview buttons, once created.
@@ -193,6 +208,57 @@ fn register_class() -> crate::Result<&'static [u16]> {
     }
 }
 
+/// The first pointer move over the buttons makes their tooltip and hands it that move, so the
+/// first hover starts the tip's timer like any later one. Nothing before that needs it.
+fn ensure_tooltip(main: HWND, buttons: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+    let wanted = crate::window::main_window::with_group(main, |group| {
+        group.preview_buttons.hwnd == buttons
+            && group.preview_buttons.tooltip.is_none()
+            && !group.preview_buttons.tooltip_failed
+    })
+    .unwrap_or(false);
+    if !wanted {
+        return;
+    }
+    // Made with nothing of the App borrowed: creating the control sends messages.
+    let created = Tooltip::create(buttons);
+    let stored = crate::window::main_window::with_group(main, |group| {
+        let state = &mut group.preview_buttons;
+        let stored = state.hwnd == buttons && state.tooltip.is_none();
+        if stored {
+            state.tooltip = created;
+            state.tooltip_failed = created.is_none();
+        }
+        stored
+    })
+    .unwrap_or(false);
+    match created {
+        Some(tooltip) if stored => {
+            for (id, button) in [PreviewButton::Side, PreviewButton::Full]
+                .into_iter()
+                .enumerate()
+            {
+                let rect = button_rect(buttons, button);
+                let rect = RECT {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                };
+                tooltip.set_tool(
+                    id,
+                    rect,
+                    &crate::window::preview_host::button_text(main, button),
+                );
+            }
+            tooltip.relay(message, wparam, lparam);
+        }
+        // The group went or the buttons were replaced while the tooltip was being made.
+        Some(tooltip) => tooltip.destroy(),
+        None => {}
+    }
+}
+
 fn update(main: HWND, buttons: HWND, change: impl FnOnce(&mut PreviewButtons)) {
     crate::window::main_window::with_group(main, |group| change(&mut group.preview_buttons));
     unsafe { InvalidateRect(buttons, std::ptr::null(), 0) };
@@ -216,6 +282,7 @@ unsafe extern "system" fn buttons_proc(
             0
         }
         WM_MOUSEMOVE => {
+            ensure_tooltip(main, hwnd, message, wparam, lparam);
             let mut track = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -265,7 +332,7 @@ fn paint(main: HWND, buttons: HWND) {
         return;
     }
     let dpi = unsafe { GetDpiForWindow(buttons) }.max(96);
-    let (palette, fonts, _) = crate::window::main_window::title_chrome(main);
+    let (palette, _, _) = crate::window::main_window::title_chrome(main);
     let mode = crate::window::preview_host::mode(main);
     let (hovered, pressed) = crate::window::main_window::with_group(main, |group| {
         (group.preview_buttons.hovered, group.preview_buttons.pressed)
@@ -282,7 +349,9 @@ fn paint(main: HWND, buttons: HWND) {
         );
         SetBkMode(dc, TRANSPARENT as i32);
     }
-    let previous = unsafe { select_font(dc, fonts.glyph()) };
+    // Larger than the title bar's caption glyphs: these are the buttons' whole content.
+    let font = create_ui_font(scale(17, dpi), "Segoe MDL2 Assets", FW_NORMAL as i32, false);
+    let previous = unsafe { select_font(dc, font) };
     for (button, glyph, active) in [
         (
             PreviewButton::Side,
@@ -306,7 +375,7 @@ fn paint(main: HWND, buttons: HWND) {
         };
         unsafe {
             if let Some(background) = background {
-                fill(dc, rect.centered_square(scale(24, dpi)), background);
+                fill(dc, rect.centered_square(scale(28, dpi)), background);
             }
             SetTextColor(
                 dc,
@@ -321,6 +390,7 @@ fn paint(main: HWND, buttons: HWND) {
     }
     unsafe {
         restore_font(dc, previous);
+        DeleteObject(font as _);
         EndPaint(buttons, &paint);
     }
 }

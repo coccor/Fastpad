@@ -364,6 +364,8 @@ pub(super) fn apply_settings_to(
     palette: Palette,
 ) {
     let _ = editor.set_line_numbers(settings.line_numbers);
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(editor.hwnd()) };
+    let _ = editor.set_code_folding(settings.code_folding, dpi);
     let _ = editor.apply_view_settings(
         &settings.font_face,
         settings.font_size,
@@ -384,8 +386,10 @@ pub(super) fn apply_colors_to(editor: &Editor, palette: Palette, highlight_curre
     let _ = editor.set_selection_text_colors(palette.selection_foreground);
 }
 
-/// The selection backgrounds, and the caret line's when `highlight_current_line` is on.
+/// The selection backgrounds, the caret line's when `highlight_current_line` is on, and the fold
+/// margin's markers.
 fn apply_chrome_colors_to(editor: &Editor, palette: Palette, highlight_current_line: bool) {
+    let _ = editor.set_fold_colors(palette.line_number_foreground, palette.editor_background);
     let _ = editor.set_chrome_colors(
         palette.selection_background,
         palette.inactive_selection_background,
@@ -605,8 +609,13 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
     if let Some(layout) = strip_layout_of(hwnd, id)
         && paint.rcPaint.top < layout.height
     {
-        let (titles, active, _, _, preview_tab) = tab_snapshot(hwnd, id);
-        let titles = titles.iter().map(String::as_str).collect::<Vec<_>>();
+        let snapshot = tab_snapshot(hwnd, id);
+        let titles = snapshot
+            .titles
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let (icon_set, light_theme) = current_icon_style(hwnd);
         let pointer = with_group_id(hwnd, id, |group| group.pointer).unwrap_or_default();
         let (is_active_group, group_count) = unsafe { app_ptr(hwnd) }
             .map(|app| {
@@ -621,8 +630,12 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
                 dpi,
                 &crate::window::group_strip::StripPaint {
                     titles: &titles,
-                    active,
-                    preview_tab,
+                    kinds: &snapshot.kinds,
+                    icons: current_file_icons(hwnd),
+                    icon_set,
+                    light_theme,
+                    active: snapshot.active,
+                    preview_tab: snapshot.preview_tab,
                     palette,
                     fonts,
                     pointer,

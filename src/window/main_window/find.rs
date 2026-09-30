@@ -2,6 +2,12 @@
 //! find again and replace.
 
 use super::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+/// The match counter recounts this long after the last change that affects it. Typing in the
+/// query field or the document restarts the wait, so a burst of keys counts once.
+const FIND_COUNT_DELAY_MS: u32 = 150;
+pub(crate) const FIND_COUNT_TIMER_ID: usize = 0x4650_4643;
 
 pub(super) fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
@@ -46,6 +52,8 @@ pub(super) fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
     {
         bar.focus_query();
     }
+    // A query kept from earlier is counted again in this document.
+    schedule_find_count(hwnd);
 }
 
 /// Makes the find bar the first time it's needed, with nothing of the `App` borrowed, because
@@ -134,6 +142,8 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
     match click {
         Some(find_bar::BarClick::Close) => close_find_bar(hwnd),
         Some(find_bar::BarClick::Toggle(option)) => toggle_find_option(hwnd, option),
+        Some(find_bar::BarClick::Nav(find_bar::NavButton::Previous)) => find_previous(hwnd),
+        Some(find_bar::BarClick::Nav(find_bar::NavButton::Next)) => find_next(hwnd),
         None => {}
     }
 }
@@ -154,7 +164,7 @@ fn ensure_find_tooltip(hwnd: HWND, panel: HWND, message: u32, wparam: WPARAM, lp
     let tools = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let bar = unsafe { app.as_ref() }.find_bar()?;
         bar.set_tooltip(created);
-        Some(bar.toggle_tools())
+        Some(bar.tooltip_tools())
     });
     match (created, tools) {
         (Some(_), Some(Some((tooltip, tools)))) => {
@@ -184,6 +194,7 @@ pub(crate) fn toggle_find_option(hwnd: HWND, option: crate::search::SearchOption
             Some(find_bar::toggle_child(option)),
         );
     }
+    schedule_find_count(hwnd);
 }
 
 /// `EN_CHANGE` from a find field. Its text is read with nothing of the `App` borrowed and kept
@@ -198,7 +209,64 @@ pub(super) fn find_field_changed(hwnd: HWND, control: HWND) {
     });
     if query {
         set_find_no_match(hwnd, false);
+        // The old count no longer describes the query. The new one waits for a pause in typing.
+        set_find_count(hwnd, None);
+        schedule_find_count(hwnd);
     }
+}
+
+fn set_find_count(hwnd: HWND, count: Option<find_bar::MatchCount>) {
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
+    {
+        bar.set_count(count);
+    }
+}
+
+/// Starts (or restarts) the wait before the match counter recounts. Called after every change
+/// that can change the count: the query, an option, the selection moving to another match, an edit
+/// to the document, another tab. Does nothing (no timer) while the bar is closed or its query is
+/// empty, so editing with the bar shut costs nothing.
+pub(crate) fn schedule_find_count(hwnd: HWND) {
+    let wanted = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .find_bar()
+            .is_some_and(|bar| bar.is_visible() && bar.has_query())
+    });
+    if wanted {
+        unsafe {
+            SetTimer(hwnd, FIND_COUNT_TIMER_ID, FIND_COUNT_DELAY_MS, None);
+        }
+    }
+}
+
+/// `WM_TIMER` for `FIND_COUNT_TIMER_ID`: the wait ended. While a file is being populated the
+/// document is not the one the bar's query belongs to, so it tries again at the next tick.
+pub(crate) fn find_count_timer(hwnd: HWND) {
+    if file_population_active(hwnd) {
+        return;
+    }
+    unsafe {
+        KillTimer(hwnd, FIND_COUNT_TIMER_ID);
+    }
+    refresh_find_count(hwnd);
+}
+
+/// Counts the matches of the bar's query in the active document now, with the current selection
+/// as the current match, and shows the result.
+pub(crate) fn refresh_find_count(hwnd: HWND) {
+    let Some((editor, query, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let bar = app.find_bar().filter(|bar| bar.is_visible())?;
+        Some((app.editor().cloned()?, bar.query_text(), bar.options()))
+    }) else {
+        return;
+    };
+    let count = editor
+        .selection()
+        .ok()
+        .and_then(|selection| find_bar::count_matches(&editor, &query, options, &selection));
+    set_find_count(hwnd, count);
 }
 
 /// `WM_PAINT` for an empty find field; false when there is no find bar to paint it.
@@ -301,6 +369,7 @@ pub(super) fn select_match(
         editor.scroll_caret_into_view();
     }
     set_find_no_match(hwnd, found.is_none());
+    schedule_find_count(hwnd);
 }
 
 fn set_find_no_match(hwnd: HWND, no_match: bool) {

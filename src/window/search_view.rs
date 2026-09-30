@@ -7,12 +7,14 @@
 
 use crate::library::text_search::{Progress, RunEnd, TextHit, hit_cmp};
 use crate::search::{MatchOptions, SearchOption};
+use crate::window::icon_sets::images::IconImages;
 use crate::window::palette::Palette;
 use crate::window::panel::scale;
 use crate::window::row_list::RowListState;
 use crate::window::side_panel::point_of;
 use crate::window::text_search_host::SearchBatch;
 use crate::window::tooltip::Tooltip;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, HBRUSH, InvalidateRect};
@@ -57,7 +59,6 @@ const FIELD_HEIGHT_AT_96_DPI: i32 = 28;
 const FIELD_TEXT_INSET_AT_96_DPI: i32 = 8;
 const GLYPH_AT_96_DPI: i32 = 20;
 const GAP_AT_96_DPI: i32 = 6;
-const DOCUMENT_GLYPH: &str = "\u{E8A5}";
 const SEARCH_HOOK_ID: usize = 0x4650_5356;
 /// The status line's tooltip. The toggles are tools 0 to 2, in `SearchOption::ALL` order.
 const STATUS_TOOL: usize = 3;
@@ -82,12 +83,24 @@ const REPLACE_HOOK_ID: usize = 0x4650_5352;
 const CHEVRON_TOOL: usize = 4;
 const REPLACE_ALL_TOOL: usize = 5;
 const ROW_REPLACE_TOOL: usize = 6;
+/// The clear-search button's tooltip.
+const CLEAR_TOOL: usize = 7;
+/// The clear button's gap to the toggles, and Segoe MDL2 Assets' Cancel glyph.
+const CLEAR_GAP_AT_96_DPI: i32 = 2;
+const CLEAR_GLYPH: &str = "\u{E711}";
+const TITLE: &str = "SEARCH";
+/// The title's left inset, as the Notebook view's.
+const TITLE_INSET_AT_96_DPI: i32 = 12;
+/// A result's file icon, as the tree's.
+const ICON_AT_96_DPI: i32 = 16;
 
 /// A painted button in the Search view's header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeaderButton {
     Chevron,
     ReplaceAll,
+    /// Clears the query and the results.
+    Clear,
 }
 
 /// A rectangle as an array, so the tooltip tools can be compared (`RECT` has no `PartialEq`).
@@ -236,6 +249,8 @@ pub(crate) struct SearchView {
     tooltip_failed: bool,
     /// The tools the tooltip has, so a pointer move changes them only when they differ.
     tools_shown: Vec<(usize, [i32; 4], String)>,
+    /// The result rows' file-icon bitmaps, made on first paint (which only borrows the view).
+    images: RefCell<IconImages>,
 }
 
 impl SearchView {
@@ -281,6 +296,7 @@ impl SearchView {
             tooltip: None,
             tooltip_failed: false,
             tools_shown: Vec::new(),
+            images: RefCell::new(IconImages::new()),
         }
     }
 

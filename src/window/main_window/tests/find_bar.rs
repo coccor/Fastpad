@@ -99,6 +99,72 @@ fn alt_keys_and_clicks_flip_the_find_bar_toggles() {
 }
 
 #[test]
+fn the_counter_counts_after_a_pause_and_the_arrow_buttons_step_through_matches() {
+    // Break caught: a counter that is never filled, one that keeps counting the old query or
+    // document, an empty query showing "No results", or arrow buttons that don't navigate.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("cat dog cat bird cat").unwrap();
+    execute_command(window.hwnd, CommandId::Find);
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+    let label = || bar().count().map(|count| count.label());
+
+    assert_eq!(label(), None, "an empty query shows nothing");
+    set_find_query(window.hwnd, "cat");
+    assert_eq!(label(), None, "the count waits for a pause in typing");
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(
+        label().as_deref(),
+        Some("3 results"),
+        "no selection is a match yet"
+    );
+
+    editor.set_selection(0..0).unwrap();
+    super::super::find_next(window.hwnd);
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(label().as_deref(), Some("1 of 3"));
+
+    let panel = bar().panel_hwnd();
+    let (_, next) = bar().nav_rects()[1];
+    let point = |rect: windows_sys::Win32::Foundation::RECT| {
+        let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        ((y as u32) << 16 | (x as u32 & 0xffff)) as super::super::LPARAM
+    };
+    super::super::panel_pointer(window.hwnd, panel, WM_LBUTTONUP, 0, point(next));
+    assert_eq!(
+        editor.selection().unwrap(),
+        8..11,
+        "the down arrow is find next"
+    );
+    let (_, previous) = bar().nav_rects()[0];
+    super::super::panel_pointer(window.hwnd, panel, WM_LBUTTONUP, 0, point(previous));
+    assert_eq!(
+        editor.selection().unwrap(),
+        0..3,
+        "the up arrow is find previous"
+    );
+
+    editor.populate_clean("cat").unwrap();
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(
+        label().as_deref(),
+        Some("1 result"),
+        "an edited document is counted again"
+    );
+    set_find_query(window.hwnd, "zebra");
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(label().as_deref(), Some("No results"));
+    set_find_query(window.hwnd, "");
+    assert_eq!(
+        label(),
+        None,
+        "clearing the query clears the counter at once"
+    );
+}
+
+#[test]
 fn replace_current_replaces_a_selection_that_matches_under_the_options() {
     // Break caught: Enter in Replace comparing the selection to the query byte for byte, so
     // a case-insensitive "CAT" is skipped instead of replaced.

@@ -236,7 +236,7 @@ impl NotebookView {
         if contains(layout.root, x, y) {
             if self.mode != Mode::NoNotebook {
                 let parts = notebook_layout::root_parts(layout.root, dpi);
-                for (button, rect) in parts.buttons {
+                for (button, rect) in parts.shown() {
                     if contains(rect, x, y) {
                         return Hit::Header(button);
                     }

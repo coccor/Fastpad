@@ -134,6 +134,7 @@ pub(crate) fn activate_document_in(
     if active {
         refresh_tabs(hwnd);
         crate::window::image_host::check_disk(hwnd);
+        schedule_find_count(hwnd);
     } else if let Some(window) = with_group_id(hwnd, group, |state| state.hwnd) {
         unsafe { InvalidateRect(window, std::ptr::null(), 0) };
         crate::window::notebook_view::editors_changed(hwnd);

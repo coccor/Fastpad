@@ -81,6 +81,32 @@ pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
     }
 }
 
+/// Collapses every folder (the root row stays as it is), or expands all of them, and remembers
+/// it in the per-PC file, the way `set_expanded` does for one folder.
+pub(crate) fn set_all_expanded(hwnd: HWND, expanded: bool) {
+    let changed = with_state(hwnd, |state| {
+        let folders = if expanded {
+            state.tree.folder_paths()
+        } else {
+            Vec::new()
+        };
+        state.local.set_all_expanded(expanded, &folders)
+    })
+    .unwrap_or(false);
+    if changed {
+        host(hwnd, |host| {
+            host.expansion_revision = host.expansion_revision.wrapping_add(1);
+        });
+        save_local_soon(hwnd);
+    }
+}
+
+/// Whether any folder of the open notebook is expanded: what the Collapse all / Expand all
+/// button offers.
+pub(crate) fn any_folder_expanded(hwnd: HWND) -> bool {
+    with_state(hwnd, |state| !state.local.expanded.is_empty()).unwrap_or(false)
+}
+
 /// Changes whenever a folder is expanded or collapsed.
 pub(crate) fn expansion_revision(hwnd: HWND) -> u64 {
     host(hwnd, |host| host.expansion_revision).unwrap_or(0)

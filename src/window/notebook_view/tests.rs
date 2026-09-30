@@ -617,3 +617,78 @@ fn is_dragged_row_never_matches_with_no_drag_even_past_the_last_row() {
     let other = DragSource::Row(RowKind::Note("b.md".into()));
     assert!(!is_dragged_row(Some(&other), &rows, 0), "a different row");
 }
+
+fn nested_tree() -> NoteTree {
+    let notes: Vec<PathBuf> = ["top.md", r"a\one.md", r"a\b\two.md", r"c\three.md"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    NoteTree::build(&notes, &[], &[])
+}
+
+#[test]
+fn expand_all_opens_every_folder_and_collapse_all_closes_them_without_touching_the_root() {
+    // Break caught: Expand all opening only the top level, Collapse all leaving a nested folder
+    // open, or either one flipping the root row's own state.
+    let tree = nested_tree();
+    let folders = tree.folder_paths();
+    assert_eq!(
+        folders,
+        [
+            PathBuf::from("a"),
+            PathBuf::from(r"a\b"),
+            PathBuf::from("c")
+        ]
+    );
+    let mut local = crate::library::local::LocalState::new(PathBuf::from(r"D:\Notes"));
+    assert!(local.set_all_expanded(true, &folders));
+    let rows = flatten(&tree, &local.expanded);
+    assert!(
+        rows.iter()
+            .any(|row| row.kind == RowKind::Note(r"a\b\two.md".into()))
+    );
+    assert!(
+        rows.iter()
+            .filter_map(|row| match row.kind {
+                RowKind::Folder(_) => Some(row.expanded),
+                _ => None,
+            })
+            .all(|open| open)
+    );
+    assert!(!local.root_collapsed, "the root row is not the toggle's");
+    assert!(
+        !local.set_all_expanded(true, &folders),
+        "nothing changed, nothing to write"
+    );
+
+    assert!(local.set_all_expanded(false, &folders));
+    assert!(local.expanded.is_empty());
+    assert!(!local.root_collapsed, "collapse keeps the root open");
+    let rows = flatten(&tree, &local.expanded);
+    assert_eq!(rows.len(), 3, "the folders a and c, and the root's note");
+    assert!(!local.set_all_expanded(false, &folders));
+}
+
+#[test]
+fn collapse_all_keeps_the_selected_row_when_it_is_still_listed() {
+    // Break caught: the selection jumping to the top after a collapse, for a row that is
+    // still in the list (a top-level note or folder).
+    let tree = nested_tree();
+    let open = [
+        PathBuf::from("a"),
+        PathBuf::from(r"a\b"),
+        PathBuf::from("c"),
+    ];
+    let before = flatten(&tree, &open);
+    let selected = RowKind::Note("top.md".into());
+    let index = tree::row_index(&before, &selected);
+    let after = flatten(&tree, &[]);
+    assert_eq!(
+        follow(&after, Some(&selected), index),
+        tree::row_index(&after, &selected)
+    );
+    // A row inside a collapsed folder is gone: the selection stays in range.
+    let hidden = RowKind::Note(r"a\b\two.md".into());
+    let index = tree::row_index(&before, &hidden);
+    assert!(follow(&after, Some(&hidden), index).is_some_and(|row| row < after.len()));
+}

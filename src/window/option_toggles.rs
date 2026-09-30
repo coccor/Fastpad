@@ -13,7 +13,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{WM_SYSCHAR, WM_SYSKEYDOWN};
 
-const SIZE_AT_96_DPI: i32 = 22;
+pub(crate) const SIZE_AT_96_DPI: i32 = 22;
 const GAP_AT_96_DPI: i32 = 2;
 const RIGHT_PADDING_AT_96_DPI: i32 = 3;
 /// Bit 29 of a key message's `lParam`: Alt is down.

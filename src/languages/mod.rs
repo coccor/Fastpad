@@ -385,7 +385,7 @@ impl LanguageManager {
         };
         let lexer = self.ensure_lexilla()?.create_lexer(name)?;
         editor.set_lexer(lexer)?;
-        for (key, value) in spec.properties {
+        for (key, value) in registry::FOLD_PROPERTIES.iter().chain(spec.properties) {
             editor.set_lexer_property(key, value)?;
         }
         for (set, words) in spec.keywords.iter().enumerate() {
@@ -583,10 +583,15 @@ mod tests {
         assert_eq!(
             harness.strings(SCI_SETPROPERTY),
             vec![
+                // Break caught: no `fold` property leaves every fold margin empty.
+                ("fold".to_owned(), "1".to_owned()),
+                ("fold.compact".to_owned(), "0".to_owned()),
                 ("lexer.cpp.escape.sequence".to_owned(), "1".to_owned()),
                 // Break caught: `#if DEBUG` blocks restyled as inactive (styles 64-91), which no
                 // table maps, so they showed as uncoloured text.
                 ("lexer.cpp.track.preprocessor".to_owned(), "0".to_owned()),
+                ("fold.comment".to_owned(), "1".to_owned()),
+                ("fold.preprocessor".to_owned(), "1".to_owned()),
             ]
         );
     }

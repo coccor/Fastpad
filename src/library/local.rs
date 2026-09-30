@@ -150,6 +150,19 @@ impl LocalState {
         }
     }
 
+    /// Collapses every folder, or expands `folders` (every folder the notebook has). Reports
+    /// whether anything changed, so an unchanged set causes no write.
+    pub fn set_all_expanded(&mut self, expanded: bool, folders: &[PathBuf]) -> bool {
+        if !expanded {
+            return !std::mem::take(&mut self.expanded).is_empty();
+        }
+        let before = self.expanded.len();
+        for folder in folders {
+            self.set_expanded(folder, true);
+        }
+        self.expanded.len() != before
+    }
+
     pub fn missing_since(&self, id: NoteId) -> Option<u64> {
         self.missing
             .iter()

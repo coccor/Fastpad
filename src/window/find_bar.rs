@@ -276,19 +276,23 @@ pub(crate) fn replace_all(
     editor.replace_ranges_with(&edits).unwrap_or(0)
 }
 
+mod count;
+pub(crate) use count::{MatchCount, count_matches};
+
 // --- Window integration: native child controls hosting Find/Replace ---
 
 use crate::platform::{last_error, wide_null};
 use crate::window::option_toggles;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::side_panel::draw_text;
 use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSource};
 use crate::window::tooltip::Tooltip;
 use std::cell::Cell;
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
     DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT,
     RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow, SelectObject, SetBkColor, SetBkMode,
     SetTextColor, TRANSPARENT,
@@ -314,6 +318,13 @@ const BAR_HEIGHT_AT_96_DPI: i32 = 36;
 const FIELD_HEIGHT_AT_96_DPI: i32 = 28;
 const PADDING_AT_96_DPI: i32 = 6;
 const FIELD_TEXT_INSET_AT_96_DPI: i32 = 8;
+/// The match counter's room inside the query field, left of the toggles: "3 of 1000+" fits.
+const COUNTER_WIDTH_AT_96_DPI: i32 = 88;
+/// The chevron buttons' glyphs (Segoe MDL2 Assets, as the close button's).
+const GLYPH_PREVIOUS: &str = "\u{E70E}";
+const GLYPH_NEXT: &str = "\u{E70D}";
+const PREVIOUS_TIP: &str = "Previous match (Shift+Enter)";
+const NEXT_TIP: &str = "Next match (Enter)";
 
 /// Height of the bar, reserved above the editor whenever it's visible.
 pub(crate) const fn find_bar_height(dpi: u32) -> i32 {
@@ -333,11 +344,46 @@ struct FieldLayout {
     edit: RECT,
 }
 
+/// The two buttons that step through the matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NavButton {
+    Previous,
+    Next,
+}
+
+impl NavButton {
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Previous => PREVIOUS_TIP,
+            Self::Next => NEXT_TIP,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Previous => "Previous match",
+            Self::Next => "Next match",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Previous => GLYPH_PREVIOUS,
+            Self::Next => GLYPH_NEXT,
+        }
+    }
+}
+
 /// The bar's parts in bar coordinates: the query field, in Replace mode the replacement field
-/// beside it (each half the width), and a square close button at the right end.
+/// beside it (each half the width), the previous and next match buttons, and a square close
+/// button at the right end. `counter` is the match counter's room inside the query field, between
+/// its text and the toggles.
 struct BarLayout {
     query: FieldLayout,
     replace: Option<FieldLayout>,
+    counter: RECT,
+    previous: RECT,
+    next: RECT,
     close: RECT,
 }
 
@@ -345,22 +391,36 @@ fn bar_layout(width: i32, dpi: u32, text_height: i32, mode: FindBarMode) -> BarL
     let padding = scale(PADDING_AT_96_DPI, dpi);
     let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
     let top = (find_bar_height(dpi) - 1 - field_height) / 2;
-    let close = RECT {
-        left: (width - padding - field_height).max(0),
+    let button = |left: i32| RECT {
+        left: left.max(0),
         top,
-        right: (width - padding).max(0),
+        right: (left + field_height).max(0),
         bottom: top + field_height,
     };
-    let (query, replace) = field_layouts(close.left, dpi, text_height, mode, top);
+    let close = button(width - padding - field_height);
+    let next = button(close.left - field_height);
+    let previous = button(next.left - field_height);
+    let (query, replace) = field_layouts(previous.left, dpi, text_height, mode, top);
+    let counter_left = query.edit.right;
+    let counter = RECT {
+        left: counter_left,
+        top: query.field.top,
+        right: (query.field.right - option_toggles::reserved_width(dpi)).max(counter_left),
+        bottom: query.field.bottom,
+    };
     BarLayout {
         query,
         replace,
+        counter,
+        previous,
+        next,
         close,
     }
 }
 
 /// The fields across `width` (the right padding included), starting `top` pixels down the bar.
-/// The query field's right end holds the three option toggles (spec §8).
+/// The query field's right end holds the three option toggles (spec §8), and the match counter
+/// sits left of them.
 fn field_layouts(
     width: i32,
     dpi: u32,
@@ -373,6 +433,7 @@ fn field_layouts(
     let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
     let text_height = text_height.clamp(1, (field_height - 2).max(1));
     let toggles = option_toggles::reserved_width(dpi);
+    let query_reserve = toggles + scale(COUNTER_WIDTH_AT_96_DPI, dpi);
     // `reserve` is how far the Edit stops short of the field's right edge.
     let field = |left: i32, right: i32, reserve: i32| {
         let field = RECT {
@@ -393,11 +454,11 @@ fn field_layouts(
         }
     };
     match mode {
-        FindBarMode::Find => (field(padding, width - padding, toggles), None),
+        FindBarMode::Find => (field(padding, width - padding, query_reserve), None),
         FindBarMode::Replace => {
             let half = (width - 3 * padding) / 2;
             (
-                field(padding, padding + half, toggles),
+                field(padding, padding + half, query_reserve),
                 // An odd leftover pixel stays at the right edge so both fields match.
                 Some(field(2 * padding + half, 2 * padding + 2 * half, inset_x)),
             )
@@ -424,7 +485,11 @@ pub(crate) struct FindBar {
     /// The last search found nothing. Cleared when the query changes or a search finds a match.
     no_match: Cell<bool>,
     hovered_toggle: Cell<Option<SearchOption>>,
-    /// The toggles' tooltip, made the first time the pointer moves over the bar.
+    hovered_nav: Cell<Option<NavButton>>,
+    /// The counter's last count, `None` while there is nothing to show (no query, or not counted
+    /// yet). Set by the main window's debounced recount.
+    count: Cell<Option<MatchCount>>,
+    /// The toggles' and navigation buttons' tooltip, made the first time the pointer moves over the bar.
     tooltip: Cell<Option<Tooltip>>,
     tooltip_failed: Cell<bool>,
     /// The fields' text, kept at each `EN_CHANGE` (`field_changed`), so screen readers read it
@@ -438,6 +503,7 @@ pub(crate) struct FindBar {
 pub(crate) enum BarClick {
     Close,
     Toggle(SearchOption),
+    Nav(NavButton),
 }
 
 /// Text to put in the query field once nothing of the `App` is borrowed. Setting it sends
@@ -488,6 +554,8 @@ impl FindBar {
             options: MatchOptions::default(),
             no_match: Cell::new(false),
             hovered_toggle: Cell::new(None),
+            hovered_nav: Cell::new(None),
+            count: Cell::new(None),
             tooltip: Cell::new(None),
             tooltip_failed: Cell::new(false),
             query_value: String::new(),
@@ -509,6 +577,11 @@ impl FindBar {
         !hwnd.is_null() && hwnd == self.query_edit
     }
 
+    /// Whether the query field holds text, by the value kept at its last `EN_CHANGE`.
+    pub(crate) fn has_query(&self) -> bool {
+        !self.query_value.is_empty()
+    }
+
     pub(crate) fn query_text(&self) -> String {
         control_text(self.query_edit)
     }
@@ -528,7 +601,7 @@ impl FindBar {
     }
 
     /// The bar's MSAA children, in order: the Find field, the three toggles, the Replace field
-    /// in Replace mode, and the close button.
+    /// in Replace mode, the previous and next match buttons, and the close button.
     pub(crate) fn accessible_items(&self) -> Vec<AccessibleItem> {
         let (layout, dpi) = self.current_layout();
         let focus = unsafe { GetFocus() };
@@ -556,6 +629,17 @@ impl FindBar {
                 self.replace_edit,
             ));
         }
+        for (button, rect) in [
+            (NavButton::Previous, layout.previous),
+            (NavButton::Next, layout.next),
+        ] {
+            items.push(sidebar_accessibility::button_item(
+                button.label(),
+                false,
+                false,
+                rect,
+            ));
+        }
         items.push(sidebar_accessibility::button_item(
             "Close",
             false,
@@ -577,6 +661,7 @@ impl FindBar {
         self.mode = mode;
         self.visible = true;
         self.no_match.set(false);
+        self.count.set(None);
         unsafe {
             ShowWindow(
                 self.replace_edit,
@@ -635,6 +720,25 @@ impl FindBar {
         }
     }
 
+    /// Shows `count` in the counter, or nothing for `None`.
+    pub(crate) fn set_count(&self, count: Option<MatchCount>) {
+        if self.count.replace(count) != count {
+            let (layout, _) = self.current_layout();
+            unsafe {
+                InvalidateRect(self.panel, &layout.counter, 0);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "consumed by the in-process window tests, not the source-linked targets"
+    )]
+    pub(crate) fn count(&self) -> Option<MatchCount> {
+        self.count.get()
+    }
+
     /// The three toggles, in bar coordinates, in `SearchOption::ALL` order.
     pub(crate) fn toggle_rects(&self) -> [RECT; 3] {
         let (layout, dpi) = self.current_layout();
@@ -653,17 +757,32 @@ impl FindBar {
         self.tooltip_failed.set(tooltip.is_none());
     }
 
-    /// The tooltip and each toggle's tool, to set with nothing of the `App` borrowed.
-    pub(crate) fn toggle_tools(&self) -> Option<(Tooltip, [(RECT, &'static str); 3])> {
+    /// The previous and next match buttons, in bar coordinates.
+    pub(crate) fn nav_rects(&self) -> [(NavButton, RECT); 2] {
+        let (layout, _) = self.current_layout();
+        [
+            (NavButton::Previous, layout.previous),
+            (NavButton::Next, layout.next),
+        ]
+    }
+
+    /// The tooltip and each tool (the three toggles, then previous and next), to set with
+    /// nothing of the `App` borrowed.
+    pub(crate) fn tooltip_tools(&self) -> Option<(Tooltip, [(RECT, &'static str); 5])> {
         let tooltip = self.tooltip.get()?;
-        let rects = self.toggle_rects();
+        let toggles = self.toggle_rects();
+        let nav = self.nav_rects();
         Some((
             tooltip,
-            std::array::from_fn(|index| {
-                (
-                    rects[index],
+            std::array::from_fn(|index| match index {
+                0..3 => (
+                    toggles[index],
                     option_toggles::tooltip(SearchOption::ALL[index]),
-                )
+                ),
+                _ => {
+                    let (button, rect) = nav[index - 3];
+                    (rect, button.tooltip())
+                }
             }),
         ))
     }
@@ -737,9 +856,9 @@ impl FindBar {
             );
             InvalidateRect(self.panel, std::ptr::null(), 0);
         }
-        // Keeps the tooltip's tools on the toggles. The tooltip is a control of this thread, and
-        // setting its tools calls nothing back in the main window.
-        if let Some((tooltip, tools)) = self.toggle_tools() {
+        // Keeps the tooltip's tools on the toggles and buttons. The tooltip is a control of this
+        // thread, and setting its tools calls nothing back in the main window.
+        if let Some((tooltip, tools)) = self.tooltip_tools() {
             for (index, (rect, text)) in tools.into_iter().enumerate() {
                 tooltip.set_tool(index, rect, text);
             }
@@ -771,11 +890,7 @@ impl FindBar {
             y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
         };
         let leaving = message == WM_MOUSELEAVE;
-        let over_close = !leaving
-            && point.x >= layout.close.left
-            && point.x < layout.close.right
-            && point.y >= layout.close.top
-            && point.y < layout.close.bottom;
+        let over_close = !leaving && contains(&layout.close, point);
         let over_toggle = if leaving {
             None
         } else {
@@ -783,6 +898,17 @@ impl FindBar {
                 &option_toggles::toggle_rects(layout.query.field, dpi),
                 point,
             )
+        };
+        let over_nav = if leaving {
+            None
+        } else {
+            [
+                (NavButton::Previous, layout.previous),
+                (NavButton::Next, layout.next),
+            ]
+            .into_iter()
+            .find(|(_, rect)| contains(rect, point))
+            .map(|(button, _)| button)
         };
         if message == WM_MOUSEMOVE {
             let mut track = TRACKMOUSEEVENT {
@@ -805,11 +931,19 @@ impl FindBar {
                 InvalidateRect(self.panel, &layout.query.field, 0);
             }
         }
+        if self.hovered_nav.replace(over_nav) != over_nav {
+            unsafe {
+                InvalidateRect(self.panel, &layout.previous, 0);
+                InvalidateRect(self.panel, &layout.next, 0);
+            }
+        }
         if message != WM_LBUTTONUP {
             return None;
         }
         if over_close {
             Some(BarClick::Close)
+        } else if let Some(button) = over_nav {
+            Some(BarClick::Nav(button))
         } else {
             over_toggle.map(BarClick::Toggle)
         }
@@ -873,7 +1007,8 @@ impl FindBar {
     }
 
     /// `WM_PAINT` for the bar: strip background, a hairline above the editor, each visible
-    /// field's box (outlined with the accent while it has the focus), and the close button.
+    /// field's box (outlined with the accent while it has the focus), the match counter, the toggles,
+    /// and the previous, next and close buttons.
     pub(crate) fn paint_panel(&self, panel: HWND, glyph_font: HFONT, text_font: HFONT) {
         let mut paint = PAINTSTRUCT::default();
         let dc = unsafe { BeginPaint(panel, &mut paint) };
@@ -889,6 +1024,9 @@ impl FindBar {
         let BarLayout {
             query,
             replace,
+            counter,
+            previous,
+            next,
             close,
         } = bar_layout(client.right, dpi, 0, self.mode);
         let focus = unsafe { GetFocus() };
@@ -927,33 +1065,68 @@ impl FindBar {
                     text_font,
                 );
             }
-            let hovered = self.close_hovered.get();
-            if hovered {
-                fill(dc, close, colors.hover_background);
+            if !text_font.is_null()
+                && let Some(count) = self.count.get()
+            {
+                let color = if count.total == 0 {
+                    colors.error_foreground
+                } else {
+                    colors.muted_foreground
+                };
+                draw_text(
+                    dc,
+                    &count.label(),
+                    counter,
+                    text_font,
+                    color,
+                    DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX | DT_END_ELLIPSIS,
+                );
+            }
+            let hovered_nav = self.hovered_nav.get();
+            let buttons = [
+                (
+                    previous,
+                    NavButton::Previous.glyph(),
+                    hovered_nav == Some(NavButton::Previous),
+                ),
+                (
+                    next,
+                    NavButton::Next.glyph(),
+                    hovered_nav == Some(NavButton::Next),
+                ),
+                (
+                    close,
+                    crate::window::titlebar::GLYPH_CLOSE,
+                    self.close_hovered.get(),
+                ),
+            ];
+            for (rect, _, hovered) in buttons {
+                if hovered {
+                    fill(dc, rect, colors.hover_background);
+                }
             }
             if !glyph_font.is_null() {
-                let previous = SelectObject(dc, glyph_font as _);
+                let previous_font = SelectObject(dc, glyph_font as _);
                 SetBkMode(dc, TRANSPARENT as i32);
-                SetTextColor(
-                    dc,
-                    if hovered {
-                        colors.hover_foreground
-                    } else {
-                        colors.muted_foreground
-                    },
-                );
-                let mut glyph = crate::window::titlebar::GLYPH_CLOSE
-                    .encode_utf16()
-                    .collect::<Vec<_>>();
-                let mut rect = close;
-                DrawTextW(
-                    dc,
-                    glyph.as_mut_ptr(),
-                    glyph.len() as i32,
-                    &mut rect,
-                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX,
-                );
-                SelectObject(dc, previous);
+                for (mut rect, glyph, hovered) in buttons {
+                    SetTextColor(
+                        dc,
+                        if hovered {
+                            colors.hover_foreground
+                        } else {
+                            colors.muted_foreground
+                        },
+                    );
+                    let mut glyph = glyph.encode_utf16().collect::<Vec<_>>();
+                    DrawTextW(
+                        dc,
+                        glyph.as_mut_ptr(),
+                        glyph.len() as i32,
+                        &mut rect,
+                        DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX,
+                    );
+                }
+                SelectObject(dc, previous_font);
             }
             EndPaint(panel, &paint);
         }
@@ -992,6 +1165,10 @@ impl Drop for FindBar {
             DeleteObject(self.field_brush);
         }
     }
+}
+
+fn contains(rect: &RECT, point: POINT) -> bool {
+    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
 }
 
 /// The 0-based MSAA child of `option`'s toggle: right after the Find field.

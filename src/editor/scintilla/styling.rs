@@ -3,6 +3,26 @@
 
 use super::*;
 
+/// The margin that draws the fold markers.
+#[cfg(windows)]
+const FOLD_MARGIN: usize = 2;
+
+/// The fold margin's width in pixels at 96 DPI.
+#[cfg(windows)]
+const FOLD_MARGIN_WIDTH: i64 = 14;
+
+/// The box-tree marker symbols, by folder marker number.
+#[cfg(windows)]
+const FOLD_MARKERS: [(u32, u32); 7] = [
+    (SC_MARKNUM_FOLDEROPEN, SC_MARK_BOXMINUS),
+    (SC_MARKNUM_FOLDER, SC_MARK_BOXPLUS),
+    (SC_MARKNUM_FOLDERSUB, SC_MARK_VLINE),
+    (SC_MARKNUM_FOLDERTAIL, SC_MARK_LCORNER),
+    (SC_MARKNUM_FOLDEREND, SC_MARK_BOXPLUSCONNECTED),
+    (SC_MARKNUM_FOLDEROPENMID, SC_MARK_BOXMINUSCONNECTED),
+    (SC_MARKNUM_FOLDERMIDTAIL, SC_MARK_TCORNER),
+];
+
 impl Editor {
     /// Installs `lexer` (an opaque `ILexer5*` from Lexilla's `CreateLexer`, or `0` for Scintilla's
     /// built-in null lexer) via `SCI_SETILEXER`. Scintilla takes ownership of a non-null pointer
@@ -136,7 +156,8 @@ impl Editor {
         ))
     }
 
-    /// Keeps margin 0 as the only (line-number) margin, on the text background rather than
+    /// Keeps margin 0 as the line-number margin and margin 2 as the (hidden until enabled) fold
+    /// margin, on the text background rather than
     /// Scintilla's grey band, pads the text area, lets the horizontal scrollbar follow the widest
     /// line instead of the default 2000 px scroll width, and shows line numbers until settings load.
     #[cfg(windows)]
@@ -147,6 +168,7 @@ impl Editor {
             self.endpoint
                 .send_direct_checked(SCI_SETMARGINWIDTHN, margin, 0)?;
         }
+        self.configure_fold_margin()?;
         let background =
             self.endpoint
                 .send_direct_checked(SCI_STYLEGETBACK, STYLE_DEFAULT as usize, 0)?;
@@ -165,6 +187,103 @@ impl Editor {
 
     #[cfg(not(windows))]
     pub fn apply_chrome_defaults(&self, _dpi: u32) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Makes margin 2 the fold margin: a click-sensitive symbol margin showing the folder markers as
+    /// a box tree. Scintilla then folds and unfolds on clicks and keeps caret lines visible itself.
+    /// Its width stays 0 until `set_code_folding`.
+    #[cfg(windows)]
+    fn configure_fold_margin(&self) -> Result<()> {
+        let send =
+            |message, wparam, lparam| self.endpoint.send_direct_checked(message, wparam, lparam);
+        send(SCI_SETMARGINTYPEN, FOLD_MARGIN, SC_MARGIN_SYMBOL as isize)?;
+        send(SCI_SETMARGINMASKN, FOLD_MARGIN, SC_MASK_FOLDERS as isize)?;
+        send(SCI_SETMARGINSENSITIVEN, FOLD_MARGIN, 1)?;
+        for (marker, symbol) in FOLD_MARKERS {
+            send(SCI_MARKERDEFINE, marker as usize, symbol as isize)?;
+        }
+        send(
+            SCI_SETAUTOMATICFOLD,
+            (SC_AUTOMATICFOLD_SHOW | SC_AUTOMATICFOLD_CLICK | SC_AUTOMATICFOLD_CHANGE) as usize,
+            0,
+        )?;
+        send(
+            SCI_SETFOLDFLAGS,
+            SC_FOLDFLAG_LINEAFTER_CONTRACTED as usize,
+            0,
+        )?;
+        Ok(())
+    }
+
+    /// Colours the fold margin and its markers: `line` for the tree lines and box outlines,
+    /// `background` for the margin and the box interiors.
+    #[cfg(windows)]
+    pub fn set_fold_colors(&self, line: u32, background: u32) -> Result<()> {
+        for margin_colour in [SCI_SETFOLDMARGINCOLOUR, SCI_SETFOLDMARGINHICOLOUR] {
+            self.endpoint
+                .send_direct_checked(margin_colour, 1, background as isize)?;
+        }
+        for (marker, _) in FOLD_MARKERS {
+            let marker = marker as usize;
+            self.endpoint
+                .send_direct_checked(SCI_MARKERSETFORE, marker, background as isize)?;
+            self.endpoint
+                .send_direct_checked(SCI_MARKERSETBACK, marker, line as isize)?;
+            self.endpoint
+                .send_direct_checked(SCI_MARKERSETBACKSELECTED, marker, line as isize)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_fold_colors(&self, _line: u32, _background: u32) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Shows the fold margin (`FOLD_MARGIN_WIDTH` at 96 DPI, scaled to `dpi`), or hides it and
+    /// expands every fold so no text stays hidden behind a margin that can no longer be clicked.
+    #[cfg(windows)]
+    pub fn set_code_folding(&self, enabled: bool, dpi: u32) -> Result<()> {
+        let width = if enabled {
+            ((FOLD_MARGIN_WIDTH * i64::from(dpi.max(96)) + 48) / 96) as isize
+        } else {
+            0
+        };
+        self.endpoint
+            .send_direct_checked(SCI_SETMARGINWIDTHN, FOLD_MARGIN, width)?;
+        if !enabled {
+            self.fold_all(false)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_code_folding(&self, _enabled: bool, _dpi: u32) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Contracts (`contract`) or expands every fold in the document.
+    #[cfg(windows)]
+    pub fn fold_all(&self, contract: bool) -> Result<()> {
+        let action = if contract {
+            SC_FOLDACTION_CONTRACT
+        } else {
+            SC_FOLDACTION_EXPAND
+        };
+        self.endpoint
+            .send_direct_checked(SCI_FOLDALL, action as usize, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn fold_all(&self, _contract: bool) -> Result<()> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))

@@ -5,15 +5,30 @@ use super::*;
 use crate::search::SearchOption;
 use crate::window::option_toggles;
 use crate::window::panel::scale;
+use crate::window::side_panel::HEADER_HEIGHT_96;
 use crate::window::sidebar_accessibility;
 use windows_sys::Win32::Foundation::{POINT, RECT};
 
 impl SearchView {
+    /// The title band along the top ("SEARCH"): the window's title strip, as in the Notebook
+    /// view, so all of it is caption.
+    pub(crate) fn title_rect(client: RECT, dpi: u32) -> RECT {
+        RECT {
+            bottom: (client.top + scale(HEADER_HEIGHT_96, dpi)).min(client.bottom),
+            ..client
+        }
+    }
+
+    /// Where the header (the search field's row) begins: under the title band.
+    fn header_top(client: RECT, dpi: u32) -> i32 {
+        Self::title_rect(client, dpi).bottom
+    }
+
     /// The painted search field, border included, right of the chevron.
     pub(crate) fn field_rect(client: RECT, dpi: u32) -> RECT {
         let margin = scale(FIELD_MARGIN_AT_96_DPI, dpi);
         let height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
-        let top = client.top + (scale(HEADER_AT_96_DPI, dpi) - height) / 2;
+        let top = Self::header_top(client, dpi) + (scale(HEADER_AT_96_DPI, dpi) - height) / 2;
         let left = client.left
             + scale(CHEVRON_LEFT_AT_96_DPI, dpi)
             + scale(CHEVRON_WIDTH_AT_96_DPI, dpi)
@@ -23,6 +38,20 @@ impl SearchView {
             top,
             right: (client.right - margin).max(left),
             bottom: top + height,
+        }
+    }
+
+    /// The clear-search button: a square left of the toggles, at the field's right end.
+    pub(crate) fn clear_rect(client: RECT, dpi: u32) -> RECT {
+        let field = Self::field_rect(client, dpi);
+        let toggles = option_toggles::toggle_rects(field, dpi);
+        let size = scale(option_toggles::SIZE_AT_96_DPI, dpi);
+        let right = (toggles[0].left - scale(CLEAR_GAP_AT_96_DPI, dpi)).max(field.left);
+        RECT {
+            left: (right - size).max(field.left),
+            top: toggles[0].top,
+            right,
+            bottom: toggles[0].top + size,
         }
     }
 
@@ -42,7 +71,7 @@ impl SearchView {
     pub(crate) fn replace_all_rect(client: RECT, dpi: u32) -> RECT {
         let field = Self::field_rect(client, dpi);
         let height = field.bottom - field.top;
-        let top = client.top
+        let top = Self::header_top(client, dpi)
             + scale(HEADER_AT_96_DPI, dpi)
             + (scale(REPLACE_ROW_AT_96_DPI, dpi) - height) / 2;
         RECT {
@@ -86,7 +115,7 @@ impl SearchView {
         } else {
             0
         };
-        (client.top + scale(HEADER_AT_96_DPI, dpi) + replace).min(client.bottom)
+        (Self::header_top(client, dpi) + scale(HEADER_AT_96_DPI, dpi) + replace).min(client.bottom)
     }
 
     /// Where the results are: under the header, the replace row while it shows, and the summary
@@ -143,8 +172,13 @@ impl SearchView {
         inside(Self::row_replace_rect(row, dpi), point).then_some(index)
     }
 
-    /// The header button under `point`: the chevron while the box shows, Replace all while the
-    /// replace field is open.
+    /// Whether the clear button shows: the box has text.
+    pub(super) fn clear_shown(&self) -> bool {
+        self.edit.is_some() && !self.box_text.is_empty()
+    }
+
+    /// The header button under `point`: the chevron while the box shows, the clear button while
+    /// the box has text, Replace all while the replace field is open.
     pub(super) fn header_button_at(
         &self,
         point: POINT,
@@ -154,6 +188,8 @@ impl SearchView {
         self.edit?;
         if inside(Self::chevron_rect(client, dpi), point) {
             Some(HeaderButton::Chevron)
+        } else if self.clear_shown() && inside(Self::clear_rect(client, dpi), point) {
+            Some(HeaderButton::Clear)
         } else if self.replace_open && inside(Self::replace_all_rect(client, dpi), point) {
             Some(HeaderButton::ReplaceAll)
         } else {
@@ -213,6 +249,16 @@ impl SearchView {
             CHEVRON_TOOL,
             edges(Self::chevron_rect(client, dpi)),
             chevron.to_owned(),
+        ));
+        let clear = if self.clear_shown() {
+            "Clear search"
+        } else {
+            ""
+        };
+        tools.push((
+            CLEAR_TOOL,
+            edges(Self::clear_rect(client, dpi)),
+            clear.to_owned(),
         ));
         let all = if self.replace_open {
             "Replace all (Ctrl+Alt+Enter)"

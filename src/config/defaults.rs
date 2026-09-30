@@ -26,6 +26,7 @@ pub const DEFAULT_OPEN_EDITORS_EXPANDED: bool = true;
 pub const DEFAULT_INSERT_SPACES: bool = false;
 pub const DEFAULT_SHOW_WHITESPACE: bool = false;
 pub const DEFAULT_HIGHLIGHT_CURRENT_LINE: bool = true;
+pub const DEFAULT_CODE_FOLDING: bool = true;
 pub const DEFAULT_ALWAYS_ON_TOP: bool = false;
 
 /// `width` pulled into `MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH`.
@@ -63,6 +64,7 @@ pub fn default_settings() -> Settings {
         insert_spaces: DEFAULT_INSERT_SPACES,
         show_whitespace: DEFAULT_SHOW_WHITESPACE,
         highlight_current_line: DEFAULT_HIGHLIGHT_CURRENT_LINE,
+        code_folding: DEFAULT_CODE_FOLDING,
         always_on_top: DEFAULT_ALWAYS_ON_TOP,
         settings_size: None,
         key_overrides: std::collections::BTreeMap::new(),
@@ -93,6 +95,7 @@ mod tests {
         assert!(!settings.insert_spaces);
         assert!(!settings.show_whitespace);
         assert!(settings.highlight_current_line);
+        assert!(settings.code_folding);
         assert!(!settings.always_on_top);
     }
 

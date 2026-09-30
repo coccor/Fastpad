@@ -202,6 +202,16 @@ pub(super) fn execute_command_with_note(
                 settings.highlight_current_line.to_string(),
             ))
         }),
+        CommandId::ToggleCodeFolding => change_setting(hwnd, |settings| {
+            settings.code_folding = !settings.code_folding;
+            Some(("code_folding", settings.code_folding.to_string()))
+        }),
+        CommandId::FoldAll => with_editor(hwnd, |editor| {
+            let _ = editor.fold_all(true);
+        }),
+        CommandId::UnfoldAll => with_editor(hwnd, |editor| {
+            let _ = editor.fold_all(false);
+        }),
         CommandId::ToggleAlwaysOnTop => {
             change_setting(hwnd, |settings| {
                 settings.always_on_top = !settings.always_on_top;

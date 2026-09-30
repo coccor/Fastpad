@@ -45,13 +45,14 @@ pub(crate) enum Row {
     LineNumbers,
     ShowWhitespace,
     HighlightCurrentLine,
+    CodeFolding,
     NotesMode,
     RestoreSession,
     NotebookAutosave,
 }
 
 impl Row {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::Theme,
         Self::FileIcons,
         Self::Font,
@@ -63,6 +64,7 @@ impl Row {
         Self::LineNumbers,
         Self::ShowWhitespace,
         Self::HighlightCurrentLine,
+        Self::CodeFolding,
         Self::NotesMode,
         Self::RestoreSession,
         Self::NotebookAutosave,
@@ -81,6 +83,7 @@ impl Row {
             Self::LineNumbers => "Line numbers",
             Self::ShowWhitespace => "Show whitespace",
             Self::HighlightCurrentLine => "Highlight current line",
+            Self::CodeFolding => "Code folding",
             Self::NotesMode => "Notes mode",
             Self::RestoreSession => "Restore session",
             Self::NotebookAutosave => "Notebook autosave",
@@ -114,6 +117,7 @@ impl Row {
             Self::LineNumbers => Toggle::LineNumbers,
             Self::ShowWhitespace => Toggle::ShowWhitespace,
             Self::HighlightCurrentLine => Toggle::HighlightCurrentLine,
+            Self::CodeFolding => Toggle::CodeFolding,
             Self::NotesMode => Toggle::NotesMode,
             Self::RestoreSession => Toggle::RestoreSession,
             Self::NotebookAutosave => Toggle::NotebookAutosave,
@@ -130,6 +134,7 @@ pub(crate) enum Toggle {
     LineNumbers,
     ShowWhitespace,
     HighlightCurrentLine,
+    CodeFolding,
     NotesMode,
     RestoreSession,
     NotebookAutosave,
@@ -145,6 +150,7 @@ impl Toggle {
             Self::LineNumbers => CommandId::ToggleLineNumbers,
             Self::ShowWhitespace => CommandId::ToggleShowWhitespace,
             Self::HighlightCurrentLine => CommandId::ToggleHighlightCurrentLine,
+            Self::CodeFolding => CommandId::ToggleCodeFolding,
             Self::NotesMode => CommandId::ToggleNotesMode,
             Self::RestoreSession => CommandId::ToggleRestoreSession,
             Self::NotebookAutosave => CommandId::ToggleFolderAutosave,
@@ -225,6 +231,7 @@ impl SettingsView {
             Toggle::LineNumbers => settings.line_numbers,
             Toggle::ShowWhitespace => settings.show_whitespace,
             Toggle::HighlightCurrentLine => settings.highlight_current_line,
+            Toggle::CodeFolding => settings.code_folding,
             Toggle::NotesMode => settings.notes_mode,
             Toggle::RestoreSession => settings.restore_session,
             Toggle::NotebookAutosave => self.notebook_autosave.unwrap_or(false),
@@ -671,8 +678,8 @@ mod tests {
         }
         let sections = Row::ALL.map(Row::section);
         assert_eq!(&sections[..2], [Section::Appearance; 2]);
-        assert_eq!(&sections[2..11], [Section::Editor; 9]);
-        assert_eq!(&sections[11..], [Section::NotesAndSession; 3]);
+        assert_eq!(&sections[2..12], [Section::Editor; 10]);
+        assert_eq!(&sections[12..], [Section::NotesAndSession; 3]);
         for (index, section) in Section::ALL.into_iter().enumerate() {
             assert_eq!(section as usize, index);
         }
@@ -694,6 +701,7 @@ mod tests {
                 CommandId::ToggleLineNumbers,
                 CommandId::ToggleShowWhitespace,
                 CommandId::ToggleHighlightCurrentLine,
+                CommandId::ToggleCodeFolding,
                 CommandId::ToggleNotesMode,
                 CommandId::ToggleRestoreSession,
                 CommandId::ToggleFolderAutosave,

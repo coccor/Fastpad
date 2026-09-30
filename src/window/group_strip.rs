@@ -3,15 +3,30 @@
 //! are on right-click and in the menus. Pure geometry and hit-testing first, then painting; the group window routes the
 //! pointer here.
 
-use crate::window::palette::Palette;
+use crate::config::FileIconSet;
+use crate::window::file_icons::NoteKind;
+use crate::window::icon_sets::TreeItem;
+use crate::window::icon_sets::images::IconImages;
+use crate::window::notebook_view::draw_item_icon;
+use crate::window::palette::{FileIcons, Palette};
 use crate::window::titlebar::{
     GLYPH_CLOSE, Point, Rect, TitleFontHandles, draw_text, fill, restore_font, scale, select_font,
 };
+use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
     DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, HDC, IntersectClipRect,
     RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
+
+/// A tab's file icon box, in 96 dpi pixels, and the gap after it.
+const ICON_BOX: i32 = 16;
+const ICON_GAP: i32 = 6;
+
+/// The width a tab's icon and its gap take from the label at `dpi`.
+fn icon_slot(dpi: u32) -> i32 {
+    scale(ICON_BOX + ICON_GAP, dpi)
+}
 
 /// What a point in the strip is over.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,7 +147,10 @@ impl StripLayout {
         let tab_width = if tab_count == 0 {
             0
         } else {
-            (viewport / tab_count as i32).clamp(scale(120, dpi), scale(200, dpi))
+            (viewport / tab_count as i32).clamp(
+                scale(120, dpi) + icon_slot(dpi),
+                scale(200, dpi) + icon_slot(dpi),
+            )
         };
         let content_width = tab_width.saturating_mul(tab_count as i32);
         let max_scroll = (content_width - viewport).max(0);
@@ -264,6 +282,11 @@ impl StripLayout {
 
 pub(crate) struct StripPaint<'a> {
     pub(crate) titles: &'a [&'a str],
+    /// Each tab's icon kind, parallel to `titles`.
+    pub(crate) kinds: &'a [NoteKind],
+    pub(crate) icons: FileIcons,
+    pub(crate) icon_set: FileIconSet,
+    pub(crate) light_theme: bool,
     pub(crate) active: usize,
     /// The preview tab's index; its label is drawn in italics.
     pub(crate) preview_tab: Option<usize>,
@@ -335,6 +358,7 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
             layout.tabs.bottom,
         );
     }
+    let mut images = IconImages::new();
     for (index, title) in input.titles.iter().enumerate() {
         let (Some(tab), Some(close)) = (layout.tab(index), layout.close_tab(index)) else {
             continue;
@@ -364,6 +388,28 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
                     accent,
                 );
             }
+            if let Some(&kind) = input.kinds.get(index) {
+                let px = scale(ICON_BOX, dpi);
+                let left = tab.left + scale(12, dpi);
+                let top = tab.top + (tab.bottom - tab.top - px) / 2;
+                draw_item_icon(
+                    dc,
+                    TreeItem::Note(kind),
+                    RECT {
+                        left,
+                        top,
+                        right: left + px,
+                        bottom: top + px,
+                    },
+                    px,
+                    palette.muted_foreground,
+                    &palette,
+                    &input.icons,
+                    &mut images,
+                    input.icon_set,
+                    input.light_theme,
+                );
+            }
             select_font(
                 dc,
                 if input.preview_tab == Some(index) {
@@ -377,7 +423,7 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
                 dc,
                 title,
                 Rect::new(
-                    tab.left + scale(12, dpi),
+                    tab.left + scale(12, dpi) + icon_slot(dpi),
                     tab.top,
                     close.left.max(tab.left),
                     tab.bottom,
@@ -461,6 +507,25 @@ mod tests {
                 }
             }
             assert_eq!(layout.tabs.right, width);
+        }
+    }
+
+    #[test]
+    fn a_tab_keeps_room_for_its_icon_and_a_label() {
+        // Break caught: the icon eating the label's width, so a crowded tab shows only an icon
+        // and an ellipsis.
+        for dpi in [96, 144, 192] {
+            let layout = StripLayout::calculate(4000, dpi, 30, 0);
+            let (tab, close) = (layout.tab(0).unwrap(), layout.close_tab(0).unwrap());
+            let label_left = tab.left + super::scale(12, dpi) + super::icon_slot(dpi);
+            assert!(close.left - label_left >= super::scale(120 - 12 - 32, dpi));
+            assert_eq!(
+                tab.right - tab.left,
+                super::scale(120, dpi) + super::icon_slot(dpi)
+            );
+            // The icon and label area is the tab, not the close button.
+            let label = Point::new(label_left + 2, tab.top + 2);
+            assert_eq!(layout.hit_test(label), StripTarget::Tab(0));
         }
     }
 

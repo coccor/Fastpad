@@ -67,16 +67,27 @@ impl NotebookView {
 
     /// Every push button painted, in paint order, with its accessible name: the header's star,
     /// New note and "…" (not in the no-notebook state), then the state's own button.
+    /// The folders toggle's name, which follows what a press would do.
+    pub(super) fn toggle_folders_name(&self) -> &'static str {
+        if self.folders_open {
+            "Collapse all"
+        } else {
+            "Expand all"
+        }
+    }
+
     pub(crate) fn buttons(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
         let mut buttons = Vec::new();
         if self.mode != Mode::NoNotebook {
             let root = self.layout(client, dpi).root;
-            for (button, rect) in notebook_layout::root_parts(root, dpi).buttons {
+            for (button, rect) in notebook_layout::root_parts(root, dpi).shown() {
                 let name = match button {
                     HeaderButton::Favorite if self.favorite => "Remove from favorites",
                     HeaderButton::Favorite => "Add to favorites",
                     HeaderButton::NewNote => "New note",
                     HeaderButton::NewFolder => "New folder",
+                    HeaderButton::Refresh => "Refresh",
+                    HeaderButton::ToggleFolders => self.toggle_folders_name(),
                     HeaderButton::More => "More actions",
                 };
                 buttons.push((name.to_owned(), rect));

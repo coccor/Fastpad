@@ -343,6 +343,12 @@ pub(crate) fn handle(
                     }
                     return Some(0);
                 }
+                Some(HeaderButton::Clear) => {
+                    if pressed {
+                        clear_search(hwnd);
+                    }
+                    return Some(0);
+                }
                 Some(HeaderButton::ReplaceAll) => {
                     if pressed {
                         replace_all_requested(hwnd);
