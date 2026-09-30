@@ -100,7 +100,7 @@ fn a_closed_session_reopens_its_tabs_and_unsaved_text_on_the_next_launch() {
     let deadline = Deadline::after(WAIT);
     loop {
         command(hwnd, CommandId::SelectTab1);
-        wait_for_text(editor, "saved text");
+        // A Ctrl+1 handled before the restore finishes is undone by it, so ask again.
         std::thread::sleep(Duration::from_millis(500));
         if scintilla_text(editor).is_ok_and(|text| text == "saved text") {
             break;
