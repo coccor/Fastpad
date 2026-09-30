@@ -1,7 +1,7 @@
 use super::{SearchDirection, SearchState};
 use crate::editor::Editor;
 use crate::editor::scintilla_constants::{
-    SCI_GETTARGETEND, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
+    SCI_GETLENGTH, SCI_GETTARGETEND, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -75,6 +75,8 @@ struct TargetLog {
     /// Scripted target ends; otherwise a hit ends one needle-length after it starts.
     ends: VecDeque<isize>,
     last_end: isize,
+    /// The document length the stub reports; the tests that count set it.
+    length: isize,
 }
 
 unsafe extern "C" fn target_range_stub(
@@ -91,6 +93,7 @@ unsafe extern "C" fn target_range_stub(
             0
         }
         SCI_SETSEARCHFLAGS => 0,
+        SCI_GETLENGTH => log.length,
         SCI_SEARCHINTARGET => {
             let found = log.responses.pop_front().unwrap_or(-1);
             if found >= 0 {
@@ -234,4 +237,148 @@ fn next_editor_match_with_an_empty_query_never_calls_scintilla() {
 
     assert_eq!(state.next_editor_match(&editor, 0, 11).unwrap(), None);
     assert!(log.lock().unwrap().ranges.is_empty());
+}
+
+#[test]
+fn the_counter_and_nav_buttons_fit_between_the_text_toggles_and_close_button() {
+    // Break caught: typed text running under the counter, the counter under the toggles, nav
+    // buttons overlapping the fields or each other, or the row not scaling on a 150% monitor.
+    use super::{FindBarMode, bar_layout};
+    use crate::window::option_toggles::toggle_rects;
+    for dpi in [96, 144] {
+        for mode in [FindBarMode::Find, FindBarMode::Replace] {
+            let layout = bar_layout(900, dpi, 16, mode);
+            let rects = toggle_rects(layout.query.field, dpi);
+            let label = format!("{dpi} {mode:?}");
+            assert!(layout.query.edit.right <= layout.counter.left, "{label}");
+            assert!(layout.counter.left < layout.counter.right, "{label}: room");
+            assert!(layout.counter.right <= rects[0].left, "{label}");
+            assert_eq!(layout.counter.top, layout.query.field.top);
+            let far_field = layout.replace.map_or(layout.query.field, |r| r.field);
+            assert!(far_field.right < layout.previous.left, "{label}");
+            assert!(layout.previous.right <= layout.next.left, "{label}");
+            assert!(layout.next.right <= layout.close.left, "{label}");
+            assert!(layout.close.right < 900, "{label}");
+            for rect in [layout.previous, layout.next] {
+                assert_eq!(
+                    rect.bottom - rect.top,
+                    layout.close.bottom - layout.close.top
+                );
+                assert_eq!(rect.top, layout.close.top);
+            }
+        }
+    }
+    let narrow = bar_layout(100, 96, 16, FindBarMode::Find);
+    assert!(
+        narrow.counter.right >= narrow.counter.left,
+        "never inverted"
+    );
+}
+
+#[test]
+fn nav_buttons_name_their_keys_in_the_tooltips() {
+    // Break caught: tips that name keys the field doesn't take (Enter is next, Shift+Enter
+    // previous).
+    use super::NavButton;
+    assert_eq!(
+        NavButton::Previous.tooltip(),
+        "Previous match (Shift+Enter)"
+    );
+    assert_eq!(NavButton::Next.tooltip(), "Next match (Enter)");
+}
+
+#[test]
+fn a_count_reads_as_its_index_of_its_total_and_marks_a_capped_total() {
+    // Break caught: "0 of 0", a capped total shown as exact, or an unknown index shown as 0.
+    use super::MatchCount;
+    let count = |total, capped, index| MatchCount {
+        total,
+        capped,
+        index,
+    };
+    assert_eq!(count(12, false, Some(3)).label(), "3 of 12");
+    assert_eq!(count(1000, true, Some(7)).label(), "7 of 1000+");
+    assert_eq!(count(12, false, None).label(), "12 results");
+    assert_eq!(count(1, false, None).label(), "1 result");
+    assert_eq!(count(1000, true, None).label(), "1000+ results");
+    assert_eq!(count(0, false, None).label(), "No results");
+}
+
+#[test]
+fn tally_finds_the_selected_match_and_caps_the_count_without_reading_past_it() {
+    // Break caught: an off-by-one index, an uncapped scan of a huge match list, a selection that
+    // is not exactly a match given an index, or "1000+" shown for exactly 1000.
+    use super::count::tally;
+    let ranges = |n: usize| (0..n).map(|i| i * 2..i * 2 + 1);
+    let found = tally(ranges(12), &(4..5), 1000);
+    assert_eq!(
+        (found.total, found.capped, found.index),
+        (12, false, Some(3))
+    );
+    let found = tally(ranges(12), &(4..6), 1000);
+    assert_eq!(found.index, None, "the selection is not exactly a match");
+    let found = tally(ranges(12), &(0..0), 1000);
+    assert_eq!(found.index, None, "a caret");
+
+    let exactly = tally(ranges(1000), &(0..1), 1000);
+    assert_eq!((exactly.total, exactly.capped), (1000, false));
+    let read = std::cell::Cell::new(0);
+    let counted = ranges(50_000).inspect(|_| read.set(read.get() + 1));
+    let over = tally(counted, &(1998..1999), 1000);
+    assert_eq!(
+        (over.total, over.capped, over.index),
+        (1000, true, Some(1000))
+    );
+    assert_eq!(read.get(), 1001, "reads one past the cap, no more");
+    let beyond = tally(ranges(50_000), &(2500..2501), 1000);
+    assert_eq!(
+        beyond.index, None,
+        "a selection past the cap has no known index"
+    );
+    assert_eq!(tally(std::iter::empty(), &(0..0), 1000).total, 0);
+}
+
+#[test]
+fn plain_counting_walks_the_matches_through_scintilla_and_finds_the_selection() {
+    // Break caught: counting from the caret instead of the document start, not advancing past a
+    // match, a miss counted as a match, or an empty query searched at all.
+    use super::count_matches;
+    use crate::search::MatchOptions;
+    let log = Mutex::new(TargetLog {
+        responses: VecDeque::from([0_isize, 8, -1]),
+        length: 11,
+        ..TargetLog::default()
+    });
+    let editor = Editor::test_fixture(target_range_stub, &log as *const Mutex<TargetLog> as isize);
+    let found = count_matches(&editor, "one", MatchOptions::default(), &(8..11)).unwrap();
+    assert_eq!(
+        (found.total, found.capped, found.index),
+        (2, false, Some(2))
+    );
+    assert_eq!(log.lock().unwrap().ranges, vec![(0, 11), (3, 11)]);
+
+    let none = Mutex::new(TargetLog {
+        length: 11,
+        ..TargetLog::default()
+    });
+    let editor = Editor::test_fixture(target_range_stub, &none as *const Mutex<TargetLog> as isize);
+    let found = count_matches(&editor, "zzz", MatchOptions::default(), &(0..0)).unwrap();
+    assert_eq!(found.label(), "No results");
+    assert_eq!(
+        count_matches(&editor, "", MatchOptions::default(), &(0..0)),
+        None
+    );
+    assert_eq!(none.lock().unwrap().ranges, vec![(0, 11)]);
+}
+
+#[test]
+fn regex_counting_stops_scanning_at_the_limit() {
+    // Break caught: collecting every match of a huge text before capping it.
+    use super::regex_matcher;
+    use crate::search::MatchOptions;
+    let matcher = regex_matcher(r"\d", MatchOptions::default()).unwrap();
+    let text = "1 ".repeat(5000);
+    assert_eq!(matcher.find_up_to(&text, 1001).len(), 1001);
+    assert_eq!(matcher.find_up_to(&text, 0).len(), 0);
+    assert_eq!(matcher.find_up_to("1 2", 1001), vec![0..1, 2..3]);
 }
