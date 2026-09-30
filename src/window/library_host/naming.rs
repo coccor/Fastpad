@@ -2,8 +2,8 @@
 //! and the Browse… fallback to the Save As dialog.
 
 use super::*;
+use crate::library;
 use crate::library::title;
-use crate::library::{self};
 use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use crate::window::name_box::{NameBox, NamePurpose};
 use std::path::Path;

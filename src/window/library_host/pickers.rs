@@ -1,7 +1,7 @@
 //! What a command palette picker row does once chosen.
 
 use super::*;
-use crate::library::{self};
+use crate::library;
 use crate::window::command_palette::{PickerChoice, PickerKind};
 use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use windows_sys::Win32::Foundation::HWND;

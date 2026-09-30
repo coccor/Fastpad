@@ -1,9 +1,9 @@
 //! Actions on a note file: Move to notebook, Reveal in Explorer and Delete.
 
 use super::*;
+use crate::library;
 use crate::library::ops::PendingOp;
 use crate::library::title;
-use crate::library::{self};
 use crate::window::command_palette::{Picker, PickerKind};
 use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use std::path::{Path, PathBuf};

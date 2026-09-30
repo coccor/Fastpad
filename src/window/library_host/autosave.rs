@@ -2,8 +2,8 @@
 //! before close, a changed file's Reload or Keep mine, and the disk stamps after loads and saves.
 
 use super::*;
+use crate::library;
 use crate::library::title;
-use crate::library::{self};
 use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::HWND;

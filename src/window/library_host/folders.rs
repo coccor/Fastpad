@@ -2,8 +2,8 @@
 //! a rename a tab could not follow, and Delete on a folder row.
 
 use super::*;
+use crate::library;
 use crate::library::tree::RowKind;
-use crate::library::{self};
 use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{

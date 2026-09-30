@@ -6,7 +6,7 @@ use crate::library::tree::{self, RowKind, TreeRow};
 use crate::window::commands::CommandId;
 use crate::window::main_window::OpenMode;
 use crate::window::menus::MenuEntry;
-use crate::window::notebook_layout::{self};
+use crate::window::notebook_layout;
 use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey};
 use crate::window::side_panel::point_of;

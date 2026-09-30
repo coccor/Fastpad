@@ -2,8 +2,8 @@
 //! untitled tab's first save goes (Ctrl+N, Ctrl+S, Save As).
 
 use super::*;
+use crate::library;
 use crate::library::title;
-use crate::library::{self};
 use crate::window::main_window::{app_ptr, push_notice};
 use crate::window::name_box::NamePurpose;
 use std::path::PathBuf;

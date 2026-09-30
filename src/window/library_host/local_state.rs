@@ -2,7 +2,7 @@
 //! row, rescans, rebinding moved tabs, and the debounced and before-close metadata flushes.
 
 use super::*;
-use crate::library::{self};
+use crate::library;
 use crate::window::main_window::{app_ptr, push_notice};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

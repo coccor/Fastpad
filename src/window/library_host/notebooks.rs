@@ -2,7 +2,7 @@
 //! folders dropped on the window or an editor.
 
 use super::*;
-use crate::library::{self};
+use crate::library;
 use crate::window::command_palette::{Picker, PickerKind};
 use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use std::path::{Path, PathBuf};

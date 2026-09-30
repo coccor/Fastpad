@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::library::tree::TreeRow;
-use crate::window::notebook_layout::{self};
+use crate::window::notebook_layout;
 use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::RowListState;
 use windows_sys::Win32::Foundation::{POINT, RECT};
