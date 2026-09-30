@@ -449,8 +449,8 @@ fn edit_fastpad_ini_closes_the_dialog_and_opens_the_file_in_a_tab() {
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
     crate::window::settings_dialog::answer_next(|dialog| unsafe {
-        // 13 enabled rows (no notebook, so autosave is skipped): 13 Tabs reach the link.
-        for _ in 0..13 {
+        // 14 enabled rows (no notebook, so autosave is skipped): 14 Tabs reach the link.
+        for _ in 0..14 {
             PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
         }
         PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
