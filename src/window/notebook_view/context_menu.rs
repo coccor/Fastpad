@@ -3,9 +3,9 @@
 use super::*;
 use crate::library::tree::RowKind;
 use crate::window::commands::CommandId;
+use crate::window::design::metrics::scale;
 use crate::window::main_window::OpenMode;
 use crate::window::menus::MenuEntry;
-use crate::window::panel::scale;
 use crate::window::panel_cursor::Cursor;
 use crate::window::side_panel::point_of;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT};

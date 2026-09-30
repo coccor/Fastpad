@@ -1,7 +1,8 @@
 //! The layout of the editor groups (split editors spec §4.3): rows and columns whose leaves are
 //! groups. Pure: it computes rectangles and never touches a window.
 
-use super::titlebar::{Point, Rect, scale};
+use super::design::metrics::scale;
+use super::titlebar::{Point, Rect};
 use crate::session::{SessionAxis, SessionLayout};
 
 /// The sash between two groups, and the smallest a group may get, at 96 DPI (spec §4.3).

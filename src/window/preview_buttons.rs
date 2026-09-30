@@ -3,9 +3,10 @@
 //! z-order, shown only while the active tab can preview.
 
 use crate::platform::wide_null;
+use crate::window::design::metrics::scale;
 use crate::window::titlebar::{
     GLYPH_PREVIEW_FULL, GLYPH_PREVIEW_SIDE, Point, Rect, create_ui_font, draw_text, fill,
-    restore_font, scale, select_font,
+    restore_font, select_font,
 };
 use crate::window::tooltip::Tooltip;
 use windows_sys::Win32::Foundation::{

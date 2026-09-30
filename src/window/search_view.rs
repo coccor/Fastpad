@@ -7,9 +7,9 @@
 
 use crate::library::text_search::{Progress, RunEnd, TextHit, hit_cmp};
 use crate::search::{MatchOptions, SearchOption};
+use crate::window::design::metrics::scale;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::palette::Palette;
-use crate::window::panel::scale;
 use crate::window::row_list::RowListState;
 use crate::window::side_panel::point_of;
 use crate::window::text_search_host::SearchBatch;

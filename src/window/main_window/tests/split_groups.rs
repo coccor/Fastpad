@@ -247,7 +247,7 @@ fn groups_side_by_side_both_reach_into_the_title_row_with_a_sash_between() {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) };
     assert_eq!(
         b.left - a.right,
-        crate::window::titlebar::scale(crate::window::split_tree::SASH_96, dpi)
+        crate::window::design::metrics::scale(crate::window::split_tree::SASH_96, dpi)
     );
     assert_eq!(
         super::super::tree_layout(window.hwnd).unwrap().sashes.len(),
@@ -306,7 +306,7 @@ fn dragging_a_sash_resizes_both_groups_and_stops_at_the_minimum() {
         .unwrap();
     assert_eq!(
         a.right - a.left,
-        crate::window::titlebar::scale(crate::window::split_tree::MIN_WIDTH_96, dpi)
+        crate::window::design::metrics::scale(crate::window::split_tree::MIN_WIDTH_96, dpi)
     );
     let group = app_mut(window.hwnd).group(first).unwrap().hwnd;
     let rect = window_rect_in_main(window.hwnd, group);

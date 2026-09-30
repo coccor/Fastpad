@@ -282,9 +282,10 @@ pub(crate) use count::{MatchCount, count_matches};
 // --- Window integration: native child controls hosting Find/Replace ---
 
 use crate::platform::{last_error, wide_null};
+use crate::window::design::metrics::scale;
 use crate::window::option_toggles;
 use crate::window::palette::Palette;
-use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
 use crate::window::side_panel::draw_text;
 use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSource};
 use crate::window::tooltip::Tooltip;

@@ -4,13 +4,14 @@
 //! window disabled. All behaviour lives in `settings_model`; this module decodes input and
 //! paints.
 
+use super::design::metrics::scale;
 use super::dropdown_list::{
     DropdownList, ListKey, ListModel, ListOutcome, ListStyle, WM_LIST_PICKED,
 };
 use super::keymap::KeyStroke;
 use super::modal::ModalScope;
 use super::palette::Palette;
-use super::panel::{inset, scale};
+use super::panel::inset;
 use super::settings_model::{
     Control, DialogModel, Effect, Focus, Key, Page, Row, Section, SettingsView, dropdown_action,
     dropdown_step, step_font_size,

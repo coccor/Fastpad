@@ -5,12 +5,12 @@
 
 use crate::document::DocumentId;
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow};
+use crate::window::design::metrics::scale;
 use crate::window::drag_label::DragLabel;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::inline_name::InlineName;
 use crate::window::notebook_layout::ROW_HEIGHT;
 use crate::window::open_editors::OpenEditors;
-use crate::window::panel::scale;
 use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::RowListState;
 use crate::window::tooltip::Tooltip;
@@ -38,7 +38,7 @@ pub(crate) use input::*;
 pub(crate) use paint::*;
 pub(crate) use rebuild::*;
 
-// Sizes at 96 DPI; everything is scaled with `panel::scale`.
+// Sizes at 96 DPI; everything is scaled with `design::metrics::scale`.
 const INDENT: i32 = 12;
 const LEFT_PAD: i32 = 8;
 const GLYPH_BOX: i32 = 16;

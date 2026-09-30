@@ -4,9 +4,10 @@
 
 use crate::document::DocumentId;
 use crate::platform::{last_error, wide_null};
+use crate::window::design::metrics::scale;
 use crate::window::palette::Palette;
 use crate::window::panel::{
-    create_child, create_child_with_id, create_panel, fill, inset, scale, text_height,
+    create_child, create_child_with_id, create_panel, fill, inset, text_height,
 };
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, SIZE, WPARAM};

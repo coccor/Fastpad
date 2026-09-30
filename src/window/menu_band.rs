@@ -4,8 +4,9 @@
 //! other band; each heading opens its native dropdown from `menus::MenuBar`.
 
 use crate::platform::wide_null;
+use crate::window::design::metrics::scale;
 use crate::window::palette::Palette;
-use crate::window::panel::{fill, scale};
+use crate::window::panel::fill;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     DT_CALCRECT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DrawTextW, GetDC, HDC, HFONT, ReleaseDC,

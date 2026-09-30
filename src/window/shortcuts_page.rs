@@ -2,9 +2,10 @@
 //! on, and how it paints (keyboard shortcuts spec §6.2–§6.5). Behaviour lives in
 //! `shortcuts_model`; `settings_dialog` routes input here.
 
+use super::design::metrics::scale;
 use super::keymap::KeyStroke;
 use super::palette::Palette;
-use super::panel::{inset, scale};
+use super::panel::inset;
 use super::shortcuts_model::ShortcutsModel;
 use super::soft_paint::{Frame, Shape, Tones};
 use crate::platform::wide_null;

@@ -21,9 +21,9 @@ use crate::preview::{
 };
 use crate::window::WM_FASTPAD_PREVIEW_PARSED;
 use crate::window::commands::CommandId;
+use crate::window::design::metrics::scale;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
-use crate::window::panel::scale;
 use crate::window::preview_buttons::PreviewButton;
 use crate::window::split_tree::GroupId;
 use std::borrow::Cow;

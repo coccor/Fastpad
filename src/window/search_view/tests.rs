@@ -6,8 +6,8 @@ use super::{
 };
 use crate::library::text_search::{Progress, RunEnd, TextHit};
 use crate::search::{MatchOptions, SearchOption, Snippet};
+use crate::window::design::metrics::scale;
 use crate::window::notebook_view::LOAD_FAILED;
-use crate::window::panel::scale;
 use crate::window::text_search_host::SearchBatch;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{POINT, RECT};

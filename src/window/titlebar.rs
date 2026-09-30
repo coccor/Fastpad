@@ -1,3 +1,4 @@
+use super::design::metrics::scale;
 use crate::window::palette::Palette;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
@@ -202,11 +203,6 @@ pub struct TitleBarLayout {
     pub height: i32,
     /// Height of the top band that resizes a restored window.
     pub resize_border: i32,
-}
-
-pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
-    let dpi = if dpi == 0 { 1 } else { dpi };
-    ((value as i64 * dpi as i64 + 48) / 96) as i32
 }
 
 impl TitleBarLayout {

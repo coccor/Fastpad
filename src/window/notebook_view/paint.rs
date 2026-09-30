@@ -5,6 +5,7 @@
 use super::*;
 use crate::config::FileIconSet;
 use crate::library::tree::{RowKind, TreeRow};
+use crate::window::design::metrics::scale;
 use crate::window::drag_label::LabelImage;
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::images::IconImages;
@@ -12,7 +13,7 @@ use crate::window::icon_sets::{TreeIcon, TreeItem, minimal, tree_icon};
 use crate::window::inline_name::FieldLayout;
 use crate::window::notebook_layout::{self, PanelLayout, ROW_HEIGHT};
 use crate::window::palette::{FileIcons, Palette};
-use crate::window::panel::{fill, inset, scale};
+use crate::window::panel::{fill, inset};
 use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::{self, RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{UiFonts, ViewPaint, draw_text};

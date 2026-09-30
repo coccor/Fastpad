@@ -2,8 +2,8 @@
 //! title strip, the Open Editors header and its rows, the notebook's root row with its buttons,
 //! and the body below, which holds the tree or the view's state. Pure: rectangles only.
 
+use crate::window::design::metrics::scale;
 use crate::window::notebook_view::HeaderButton;
-use crate::window::panel::scale;
 use crate::window::side_panel::HEADER_HEIGHT_96;
 use windows_sys::Win32::Foundation::RECT;
 

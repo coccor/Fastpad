@@ -72,7 +72,7 @@ pub(crate) fn logo_icon(hwnd: HWND, dpi: u32) -> Option<HICON> {
 /// size. No file I/O: it is already resident in the module. `None` if the resource is missing
 /// (e.g. a test binary built without it) or the load otherwise fails.
 pub(super) fn load_logo_icon(dpi: u32) -> Option<HICON> {
-    let px = crate::window::panel::scale(20, dpi);
+    let px = crate::window::design::metrics::scale(20, dpi);
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
     let handle = unsafe {
         LoadImageW(

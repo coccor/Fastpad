@@ -22,11 +22,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
-pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
-    let dpi = if dpi == 0 { 96 } else { dpi };
-    ((value as i64 * dpi as i64 + 48) / 96) as i32
-}
-
 /// Creates a hidden panel over the main window's other children; the editor clips against it.
 pub(crate) fn create_panel(parent: HWND) -> crate::Result<HWND> {
     create_child(

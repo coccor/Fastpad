@@ -3,12 +3,13 @@
 
 use super::*;
 use crate::search::Snippet;
+use crate::window::design::metrics::scale;
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::TreeItem;
 use crate::window::notebook_view::draw_item_icon;
 use crate::window::option_toggles;
 use crate::window::palette::Palette;
-use crate::window::panel::{fill, inset, scale};
+use crate::window::panel::{fill, inset};
 use crate::window::row_list::{self, RowLook, row_foreground};
 use crate::window::side_panel::{UiFonts, ViewPaint, draw_text};
 use windows_sys::Win32::Foundation::{HWND, RECT};

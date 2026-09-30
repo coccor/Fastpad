@@ -3,8 +3,9 @@
 //! bar share their geometry, painting, hit-testing, Alt keys and wording.
 
 use crate::search::{MatchOptions, SearchOption};
+use crate::window::design::metrics::scale;
 use crate::window::palette::Palette;
-use crate::window::panel::{fill, scale};
+use crate::window::panel::fill;
 use crate::window::side_panel::draw_text;
 use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{

@@ -760,7 +760,7 @@ fn the_toggles_change_by_click_and_by_alt_keys_in_the_box_and_the_results() {
             .search
             .list
             .row_height,
-        crate::window::panel::scale(42, dpi),
+        crate::window::design::metrics::scale(42, dpi),
         "two-line rows"
     );
     let options = || crate::window::search_view::options(window.hwnd);

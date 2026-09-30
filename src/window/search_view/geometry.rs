@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::search::SearchOption;
+use crate::window::design::metrics::scale;
 use crate::window::option_toggles;
-use crate::window::panel::scale;
 use crate::window::side_panel::HEADER_HEIGHT_96;
 use crate::window::sidebar_accessibility;
 use windows_sys::Win32::Foundation::{POINT, RECT};

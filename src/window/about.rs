@@ -6,9 +6,10 @@
 //! It shares the Settings dialog's look: a hidden native frame for the DWM shadow, a header band
 //! that drags it with a × in its corner, and soft controls drawn through `soft_paint`.
 
+use super::design::metrics::scale;
 use super::modal::ModalScope;
 use super::palette::Palette;
-use super::panel::{inset, scale, text_height};
+use super::panel::{inset, text_height};
 use super::side_panel::paint_buffered;
 use super::soft_paint::{
     Canvas, FOCUS_GAP_AT_96_DPI, FOCUS_WIDTH_AT_96_DPI, Frame, GLYPH_FONT, RADIUS_AT_96_DPI, Shape,

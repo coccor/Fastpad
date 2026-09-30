@@ -305,9 +305,12 @@ fn markdown_tabs_show_floating_preview_buttons_at_the_content_top_right() {
     let (group_width, _) = client_size(group);
     let (x, y) = origin_in(hwnd, group);
     let (width, _) = client_size(hwnd);
-    assert_eq!(y, strip.height + crate::window::titlebar::scale(8, dpi));
+    assert_eq!(
+        y,
+        strip.height + crate::window::design::metrics::scale(8, dpi)
+    );
     assert!(x + width < group_width, "clear of the vertical scroll bar");
-    assert!(x + width >= group_width - crate::window::titlebar::scale(48, dpi));
+    assert!(x + width >= group_width - crate::window::design::metrics::scale(48, dpi));
     // Above the editor in z-order: no sibling before it.
     assert!(unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_null());
 }

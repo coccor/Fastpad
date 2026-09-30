@@ -16,8 +16,9 @@ use super::tooltip::Tooltip;
 use crate::config::SidebarView;
 use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use crate::platform::wide_null;
+use crate::window::design::metrics::scale;
 use crate::window::palette::Palette;
-use crate::window::panel::{create_child, fill, scale};
+use crate::window::panel::{create_child, fill};
 use crate::window::sidebar_accessibility::{
     self, AccessibleItem, AccessibleMark, AccessibleSource, AccessibleView,
 };
@@ -49,7 +50,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_VISIBLE,
 };
 
-/// Sizes at 96 DPI, scaled with `panel::scale`.
+/// Sizes at 96 DPI, scaled with `design::metrics::scale`.
 pub(crate) const ACTIVITY_WIDTH_96: i32 = 44;
 pub(crate) const EDITOR_MIN_WIDTH_96: i32 = 320;
 pub(crate) const HEADER_HEIGHT_96: i32 = 38;

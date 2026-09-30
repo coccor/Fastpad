@@ -4,7 +4,7 @@
 //! popup shows that bitmap and only moves after. It never takes the focus or a click.
 
 use crate::platform::wide_null;
-use crate::window::panel::scale;
+use crate::window::design::metrics::scale;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE,

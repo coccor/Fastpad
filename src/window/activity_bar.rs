@@ -5,7 +5,8 @@
 
 use super::side_panel::{self, draw_text, paint_buffered, point_of, with_bar_state};
 use crate::config::SidebarView;
-use crate::window::panel::{fill, scale};
+use crate::window::design::metrics::scale;
+use crate::window::panel::fill;
 use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSource, button_item};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -513,7 +514,7 @@ pub(crate) fn paint_keyboard_focus(bar: HWND, hdc: windows_sys::Win32::Graphics:
     let (client, dpi) = bar_geometry(bar);
     let rect = crate::window::panel::inset(
         button_rects(client, dpi)[super::side_panel::bar_focus(main)],
-        crate::window::panel::scale(3, dpi),
+        crate::window::design::metrics::scale(3, dpi),
     );
     unsafe {
         windows_sys::Win32::Graphics::Gdi::DrawFocusRect(hdc, &rect);

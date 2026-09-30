@@ -4,13 +4,14 @@
 //! pointer here.
 
 use crate::config::FileIconSet;
+use crate::window::design::metrics::scale;
 use crate::window::file_icons::NoteKind;
 use crate::window::icon_sets::TreeItem;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::notebook_view::draw_item_icon;
 use crate::window::palette::{FileIcons, Palette};
 use crate::window::titlebar::{
-    GLYPH_CLOSE, Point, Rect, TitleFontHandles, draw_text, fill, restore_font, scale, select_font,
+    GLYPH_CLOSE, Point, Rect, TitleFontHandles, draw_text, fill, restore_font, select_font,
 };
 use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::{

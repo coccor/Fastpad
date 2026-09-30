@@ -10,11 +10,12 @@ use crate::library;
 use crate::library::title;
 use crate::library::tree::{self, RowKind, TreeRow};
 use crate::platform::{last_error, wide_null};
+use crate::window::design::metrics::scale;
 use crate::window::file_icons::{NoteKind, note_kind};
 use crate::window::icon_sets::TreeItem;
 use crate::window::library_host::{self, with_state};
 use crate::window::palette::Palette;
-use crate::window::panel::{create_child, scale};
+use crate::window::panel::create_child;
 use crate::window::tree_move::{self, MoveError};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_CHAR, WM_KEYDOWN, WM_KILLFOCUS, WM_NCDESTROY, WM_SETFONT, WS_CHILD, WS_VISIBLE,
 };
 
-// Sizes at 96 DPI; everything is scaled with `panel::scale`.
+// Sizes at 96 DPI; everything is scaled with `design::metrics::scale`.
 /// How far the frame starts before the row's name.
 const FRAME_OUTSET: i32 = 3;
 /// The frame's gap to the row's top and bottom edges.

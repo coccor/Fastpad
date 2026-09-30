@@ -6,8 +6,9 @@
 use crate::library::quick_open::QuickMatch;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
+use crate::window::design::metrics::scale;
 use crate::window::palette::Palette;
-use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;

@@ -5,12 +5,13 @@
 //! which the notebook panel runs, use `target_at`, `show_feedback` and `apply` too.
 
 use crate::document::DocumentId;
+use crate::window::design::metrics::scale;
 use crate::window::drag_label::DragLabel;
 use crate::window::drop_overlay::{BAR_ALPHA, DropOverlay, TINT_ALPHA};
 use crate::window::group_drop::{self, Action, Source, Target};
 use crate::window::main_window::{self, app_ptr};
 use crate::window::split_tree::{Direction, GroupId};
-use crate::window::titlebar::{Point, scale};
+use crate::window::titlebar::Point;
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, MapWindowPoints, ScreenToClient};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
