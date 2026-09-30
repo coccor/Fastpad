@@ -239,7 +239,7 @@ fn the_sidebar_top_strip_and_panel_header_are_caption() {
 
     let header_y = layout.resize_border + 2;
     let header =
-        crate::window::design::metrics::scale(crate::window::side_panel::HEADER_HEIGHT_96, dpi);
+        crate::window::design::metrics::scale(crate::window::design::metrics::PANEL_HEADER, dpi);
     assert!(header_y < header);
     // The Notebook view's title band holds only its caption, "NOTEBOOK": all of it is a
     // drag area, the old title point included.

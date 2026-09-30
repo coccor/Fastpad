@@ -6,7 +6,7 @@ use crate::library::model::same_path;
 use crate::library::tree::natural_cmp;
 use crate::library::{local, normalize_folder};
 use crate::window::commands::CommandId;
-use crate::window::design::metrics::scale;
+use crate::window::design::metrics::{PANEL_HEADER, SIDEBAR_ROW, scale};
 use crate::window::library_host;
 use crate::window::menus::{self, MenuEntry};
 use crate::window::panel::fill;
@@ -29,8 +29,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
 };
 
-const HEADER_AT_96_DPI: i32 = 38;
-const ROW_AT_96_DPI: i32 = 26;
 const PADDING_AT_96_DPI: i32 = 12;
 const GLYPH_AT_96_DPI: i32 = 20;
 const GAP_AT_96_DPI: i32 = 6;
@@ -123,7 +121,7 @@ pub(crate) struct FavoritesView {
 
 impl FavoritesView {
     pub(crate) fn new(dpi: u32) -> Self {
-        let mut list = RowListState::new(scale(ROW_AT_96_DPI, dpi));
+        let mut list = RowListState::new(scale(SIDEBAR_ROW, dpi));
         list.set_count(1);
         Self {
             rows: Vec::new(),
@@ -150,7 +148,7 @@ impl FavoritesView {
             self.order = self.order.wrapping_add(1);
         }
         self.rows = rows;
-        self.list.row_height = scale(ROW_AT_96_DPI, dpi);
+        self.list.row_height = scale(SIDEBAR_ROW, dpi);
         self.list.set_count(self.rows.len() + 1);
         let index = kept
             .and_then(|folder| {
@@ -169,7 +167,7 @@ impl FavoritesView {
     /// The header's "Open notebook…" button.
     pub(crate) fn header_button(client: RECT, dpi: u32) -> RECT {
         let size = scale(HEADER_BUTTON_AT_96_DPI, dpi);
-        let header = scale(HEADER_AT_96_DPI, dpi);
+        let header = scale(PANEL_HEADER, dpi);
         let right = client.right - scale(GAP_AT_96_DPI, dpi);
         let top = client.top + (header - size) / 2;
         RECT {
@@ -182,9 +180,9 @@ impl FavoritesView {
 
     /// Where the rows are. With no favorites, the empty-state line sits above the footer row.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
-        let mut top = client.top + scale(HEADER_AT_96_DPI, dpi);
+        let mut top = client.top + scale(PANEL_HEADER, dpi);
         if self.rows.is_empty() {
-            top += scale(ROW_AT_96_DPI, dpi);
+            top += scale(SIDEBAR_ROW, dpi);
         }
         RECT {
             top: top.min(client.bottom),
@@ -193,7 +191,7 @@ impl FavoritesView {
     }
 
     fn star_left(area: RECT, dpi: u32) -> i32 {
-        area.right - scale(ROW_AT_96_DPI, dpi)
+        area.right - scale(SIDEBAR_ROW, dpi)
     }
 
     pub(crate) fn paint(&self, paint: &ViewPaint) {
@@ -203,7 +201,7 @@ impl FavoritesView {
         let pad = scale(PADDING_AT_96_DPI, dpi);
         let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
         let header = RECT {
-            bottom: client.top + scale(HEADER_AT_96_DPI, dpi),
+            bottom: client.top + scale(PANEL_HEADER, dpi),
             ..client
         };
         unsafe {
@@ -236,7 +234,7 @@ impl FavoritesView {
                     left: client.left + pad,
                     top: header.bottom,
                     right: client.right - pad,
-                    bottom: header.bottom + scale(ROW_AT_96_DPI, dpi),
+                    bottom: header.bottom + scale(SIDEBAR_ROW, dpi),
                 };
                 draw_text(
                     paint.hdc,

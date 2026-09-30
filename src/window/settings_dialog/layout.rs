@@ -160,7 +160,7 @@ impl Layout {
 
     /// The corner radius of cards and controls.
     pub(crate) fn radius(&self) -> i32 {
-        scale(RADIUS_AT_96_DPI, self.dpi)
+        scale(CONTROL_RADIUS, self.dpi)
     }
 
     /// A card and the gap under it, as `calculate` stacks them; a wheel notch scrolls three.

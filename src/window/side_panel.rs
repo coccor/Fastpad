@@ -16,7 +16,7 @@ use super::tooltip::Tooltip;
 use crate::config::SidebarView;
 use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use crate::platform::wide_null;
-use crate::window::design::metrics::scale;
+use crate::window::design::metrics::{PANEL_HEADER, scale};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill};
 use crate::window::sidebar_accessibility::{
@@ -53,7 +53,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// Sizes at 96 DPI, scaled with `design::metrics::scale`.
 pub(crate) const ACTIVITY_WIDTH_96: i32 = 44;
 pub(crate) const EDITOR_MIN_WIDTH_96: i32 = 320;
-pub(crate) const HEADER_HEIGHT_96: i32 = 38;
 /// The strip along the panel's right edge that resizes it.
 pub(crate) const GRIP_WIDTH_96: i32 = 4;
 
@@ -1107,7 +1106,7 @@ fn panel_hit_test(main: HWND, panel: HWND, wparam: WPARAM, lparam: LPARAM) -> LR
     unsafe { ScreenToClient(panel, &mut point) };
     let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
     let caption = point.y >= 0
-        && point.y < scale(HEADER_HEIGHT_96, dpi)
+        && point.y < scale(PANEL_HEADER, dpi)
         && !over_grip(panel, point.x)
         && PanelView::of(current_view(main))
             .is_some_and(|view| header_is_caption(main, view, panel, point.x, point.y));

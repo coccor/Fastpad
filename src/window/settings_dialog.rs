@@ -5,6 +5,7 @@
 //! paints.
 
 use super::design::metrics::scale;
+use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
 use super::dropdown_list::{
     DropdownList, ListKey, ListModel, ListOutcome, ListStyle, WM_LIST_PICKED,
 };
@@ -18,8 +19,8 @@ use super::settings_model::{
 };
 use super::side_panel::paint_buffered;
 use super::soft_paint::{
-    Canvas, FOCUS_GAP_AT_96_DPI, FOCUS_WIDTH_AT_96_DPI, Frame, GLYPH_FONT, RADIUS_AT_96_DPI, Shape,
-    TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones, title_close,
+    Canvas, Frame, GLYPH_FONT, Shape, TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones,
+    title_close,
 };
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;

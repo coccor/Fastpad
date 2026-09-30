@@ -7,13 +7,14 @@
 //! that drags it with a × in its corner, and soft controls drawn through `soft_paint`.
 
 use super::design::metrics::scale;
+use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
 use super::modal::ModalScope;
 use super::palette::Palette;
 use super::panel::{inset, text_height};
 use super::side_panel::paint_buffered;
 use super::soft_paint::{
-    Canvas, FOCUS_GAP_AT_96_DPI, FOCUS_WIDTH_AT_96_DPI, Frame, GLYPH_FONT, RADIUS_AT_96_DPI, Shape,
-    TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones, title_close,
+    Canvas, Frame, GLYPH_FONT, Shape, TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones,
+    title_close,
 };
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
@@ -274,7 +275,7 @@ impl Layout {
 
     /// The corner radius of the button and the focus ring, as in Settings.
     fn radius(&self) -> i32 {
-        scale(RADIUS_AT_96_DPI, self.dpi)
+        scale(CONTROL_RADIUS, self.dpi)
     }
 
     fn rect_of(&self, target: Target) -> RECT {
@@ -843,8 +844,8 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, about: &'a About) {
     );
 
     // The focus ring: a rounded accent stroke just outside the focused link or button.
-    let width = scale(FOCUS_WIDTH_AT_96_DPI, layout.dpi);
-    let outside = width + scale(FOCUS_GAP_AT_96_DPI, layout.dpi);
+    let width = scale(FOCUS_RING, layout.dpi);
+    let outside = width + scale(FOCUS_GAP, layout.dpi);
     frame.shape(Shape::Ring {
         rect: inset(layout.rect_of(about.focus), -outside),
         radius: radius + outside,

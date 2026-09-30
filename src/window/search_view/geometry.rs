@@ -3,9 +3,9 @@
 
 use super::*;
 use crate::search::SearchOption;
+use crate::window::design::metrics::PANEL_HEADER;
 use crate::window::design::metrics::scale;
 use crate::window::option_toggles;
-use crate::window::side_panel::HEADER_HEIGHT_96;
 use crate::window::sidebar_accessibility;
 use windows_sys::Win32::Foundation::{POINT, RECT};
 
@@ -14,7 +14,7 @@ impl SearchView {
     /// view, so all of it is caption.
     pub(crate) fn title_rect(client: RECT, dpi: u32) -> RECT {
         RECT {
-            bottom: (client.top + scale(HEADER_HEIGHT_96, dpi)).min(client.bottom),
+            bottom: (client.top + scale(PANEL_HEADER, dpi)).min(client.bottom),
             ..client
         }
     }

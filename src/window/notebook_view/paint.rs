@@ -5,13 +5,13 @@
 use super::*;
 use crate::config::FileIconSet;
 use crate::library::tree::{RowKind, TreeRow};
-use crate::window::design::metrics::scale;
+use crate::window::design::metrics::{SIDEBAR_ROW, scale};
 use crate::window::drag_label::LabelImage;
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::icon_sets::{TreeIcon, TreeItem, minimal, tree_icon};
 use crate::window::inline_name::FieldLayout;
-use crate::window::notebook_layout::{self, PanelLayout, ROW_HEIGHT};
+use crate::window::notebook_layout::{self, PanelLayout};
 use crate::window::palette::{FileIcons, Palette};
 use crate::window::panel::{fill, inset};
 use crate::window::panel_cursor::Cursor;
@@ -621,8 +621,8 @@ impl NotebookView {
             paint.focused,
         );
         let palette = &paint.palette;
-        self.list.row_height = scale(ROW_HEIGHT, dpi);
-        self.editors.list.row_height = scale(ROW_HEIGHT, dpi);
+        self.list.row_height = scale(SIDEBAR_ROW, dpi);
+        self.editors.list.row_height = scale(SIDEBAR_ROW, dpi);
         let sections = self.layout(area, dpi);
         // A panel sized after the rows came (startup) or resized: the scroll stays in range.
         let editors_height = height(sections.editors_list);

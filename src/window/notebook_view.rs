@@ -5,11 +5,11 @@
 
 use crate::document::DocumentId;
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow};
+use crate::window::design::metrics::SIDEBAR_ROW;
 use crate::window::design::metrics::scale;
 use crate::window::drag_label::DragLabel;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::inline_name::InlineName;
-use crate::window::notebook_layout::ROW_HEIGHT;
 use crate::window::open_editors::OpenEditors;
 use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::RowListState;
@@ -419,7 +419,7 @@ impl NotebookView {
             mode: Mode::Loading,
             rows: Vec::new(),
             truncated: false,
-            list: RowListState::new(scale(ROW_HEIGHT, dpi)),
+            list: RowListState::new(scale(SIDEBAR_ROW, dpi)),
             recent: Vec::new(),
             recent_names: Vec::new(),
             root: None,
@@ -440,7 +440,7 @@ impl NotebookView {
             order: 0,
             inline: InlineName::new(),
             images: IconImages::new(),
-            editors: OpenEditors::new(scale(ROW_HEIGHT, dpi)),
+            editors: OpenEditors::new(scale(SIDEBAR_ROW, dpi)),
             editors_expanded: true,
             root_expanded: true,
             middle_press: None,

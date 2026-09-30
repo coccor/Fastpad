@@ -2,13 +2,11 @@
 //! title strip, the Open Editors header and its rows, the notebook's root row with its buttons,
 //! and the body below, which holds the tree or the view's state. Pure: rectangles only.
 
-use crate::window::design::metrics::scale;
+use crate::window::design::metrics::{PANEL_HEADER, SIDEBAR_ROW, scale};
 use crate::window::notebook_view::HeaderButton;
-use crate::window::side_panel::HEADER_HEIGHT_96;
 use windows_sys::Win32::Foundation::RECT;
 
 /// Every row's height at 96 DPI: section headers, Open Editors rows and tree rows alike.
-pub(crate) const ROW_HEIGHT: i32 = 26;
 /// Open Editors rows visible before the section scrolls on its own (spec §3.1).
 pub(crate) const MAX_EDITOR_ROWS: usize = 9;
 const ROOT_BUTTON: i32 = 22;
@@ -42,9 +40,9 @@ pub(crate) fn panel_layout(
     editors: usize,
     editors_expanded: bool,
 ) -> PanelLayout {
-    let row = scale(ROW_HEIGHT, dpi);
+    let row = scale(SIDEBAR_ROW, dpi);
     let cut = |y: i32| y.min(client.bottom);
-    let title_bottom = cut(client.top + scale(HEADER_HEIGHT_96, dpi));
+    let title_bottom = cut(client.top + scale(PANEL_HEADER, dpi));
     let header_bottom = cut(title_bottom + row);
     let shown = if editors_expanded {
         editors.min(MAX_EDITOR_ROWS)
