@@ -22,6 +22,8 @@ pub(super) struct Snapshot {
     pub(super) recent: Vec<PathBuf>,
     pub(super) root: Option<PathBuf>,
     pub(super) favorite: bool,
+    /// Some folder is expanded.
+    pub(super) folders_open: bool,
     /// The notebook's root row is expanded (true without a notebook).
     pub(super) root_expanded: bool,
     /// The Open Editors section is expanded.
@@ -61,6 +63,7 @@ pub(super) fn snapshot(hwnd: HWND) -> Snapshot {
             recent: crate::window::library_host::recent_notebooks(hwnd),
             root: None,
             favorite: false,
+            folders_open: false,
             root_expanded: true,
             editors_expanded,
             key,
@@ -84,6 +87,7 @@ pub(super) fn snapshot(hwnd: HWND) -> Snapshot {
         recent: Vec::new(),
         root: Some(root),
         favorite,
+        folders_open: crate::window::library_host::any_folder_expanded(hwnd),
         root_expanded: key.root_expanded,
         editors_expanded,
         key,

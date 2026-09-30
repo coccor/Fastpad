@@ -598,9 +598,13 @@ impl NotebookView {
                 HeaderButton::Favorite => (TOOL_FAVORITE, favorite),
                 HeaderButton::NewNote => (TOOL_NEW, "New note"),
                 HeaderButton::NewFolder => (TOOL_NEW_FOLDER, "New folder"),
+                HeaderButton::Refresh => (TOOL_REFRESH, "Refresh"),
+                HeaderButton::ToggleFolders => (TOOL_TOGGLE_FOLDERS, self.toggle_folders_name()),
                 HeaderButton::More => (TOOL_MORE, "More actions"),
             };
-            let text = if buttons_shown { text } else { "" };
+            // A button a narrow panel left out has an empty rectangle and no tip.
+            let shown = buttons_shown && rect.right > rect.left;
+            let text = if shown { text } else { "" };
             tools.push((id, rect, text.to_owned()));
         }
         tools.push((TOOL_ROW, row_rect, row_text));
@@ -886,7 +890,7 @@ impl NotebookView {
                 parts.name,
                 palette.muted_foreground,
             );
-            for (button, rect) in parts.buttons {
+            for (button, rect) in parts.shown() {
                 let hot = self.hover == Some(Hit::Header(button));
                 if hot {
                     unsafe { fill(dc, rect, palette.hover_background) };
@@ -896,6 +900,9 @@ impl NotebookView {
                     HeaderButton::Favorite => GLYPH_STAR,
                     HeaderButton::NewNote => GLYPH_ADD,
                     HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
+                    HeaderButton::Refresh => GLYPH_REFRESH,
+                    HeaderButton::ToggleFolders if self.folders_open => GLYPH_COLLAPSE_ALL,
+                    HeaderButton::ToggleFolders => GLYPH_EXPAND_ALL,
                     HeaderButton::More => GLYPH_MORE,
                 };
                 let color = if hot {

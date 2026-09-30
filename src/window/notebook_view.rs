@@ -70,6 +70,10 @@ const GLYPH_STAR_FILLED: &str = "\u{E735}";
 const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_MORE: &str = "\u{E712}";
 const GLYPH_NEW_FOLDER: &str = "\u{E8F4}";
+const GLYPH_REFRESH: &str = "\u{E72C}";
+/// ChevronUpMed and ChevronDownMed: collapse all and expand all.
+const GLYPH_COLLAPSE_ALL: &str = "\u{E971}";
+const GLYPH_EXPAND_ALL: &str = "\u{E972}";
 
 // Tooltip tool IDs.
 const TOOL_ROW: usize = 1;
@@ -78,6 +82,8 @@ const TOOL_FAVORITE: usize = 3;
 const TOOL_NEW: usize = 4;
 const TOOL_MORE: usize = 5;
 const TOOL_NEW_FOLDER: usize = 6;
+const TOOL_REFRESH: usize = 7;
+const TOOL_TOGGLE_FOLDERS: usize = 8;
 
 /// What the view shows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +106,10 @@ pub(crate) enum HeaderButton {
     Favorite,
     NewNote,
     NewFolder,
+    /// Scans the notebook's folder again.
+    Refresh,
+    /// Collapse all while a folder is open, Expand all when none is.
+    ToggleFolders,
     More,
 }
 
@@ -334,6 +344,8 @@ pub(crate) struct NotebookView {
     root: Option<PathBuf>,
     name: String,
     favorite: bool,
+    /// Some folder is expanded: the toggle button reads Collapse all, else Expand all.
+    folders_open: bool,
     /// The header button (or state button) under the pointer.
     hover: Option<Hit>,
     /// The pointer is over the hovered row's pin button.
@@ -413,6 +425,7 @@ impl NotebookView {
             root: None,
             name: String::new(),
             favorite: false,
+            folders_open: false,
             hover: None,
             hover_pin: false,
             tooltip: None,
@@ -529,6 +542,7 @@ impl NotebookView {
             .unwrap_or_default();
         self.root = snapshot.root;
         self.favorite = snapshot.favorite;
+        self.folders_open = snapshot.folders_open;
         self.rows = snapshot.rows;
         self.truncated = snapshot.truncated;
         self.recent = snapshot.recent;

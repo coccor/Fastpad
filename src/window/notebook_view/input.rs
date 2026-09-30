@@ -511,27 +511,66 @@ pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
         HeaderButton::Favorite => crate::window::library_host::toggle_notebook_favorite(hwnd),
         HeaderButton::NewNote => run(hwnd, CommandId::NoteNew),
         HeaderButton::NewFolder => run(hwnd, CommandId::NoteNewFolder),
+        HeaderButton::Refresh => crate::window::library_host::request_rescan(hwnd),
+        HeaderButton::ToggleFolders => toggle_folders(hwnd),
         HeaderButton::More => more_menu(hwnd),
     }
 }
 
-/// "…": the notebook's own actions.
+/// Collapse all or Expand all, whichever the button offers: collapsing closes every folder and
+/// leaves the root row and the selection where they are; expanding opens every folder.
+pub(crate) fn toggle_folders(hwnd: HWND) {
+    let collapse = crate::window::library_host::any_folder_expanded(hwnd);
+    crate::window::library_host::set_all_expanded(hwnd, !collapse);
+    rebuild(hwnd);
+}
+
+/// "…": the notebook's own actions, after the buttons a narrow panel left out.
 pub(super) fn more_menu(hwnd: HWND) {
-    let Some(at) = with_view(hwnd, |view| {
+    let Some((at, hidden)) = with_view(hwnd, |view| {
         let dpi = view.dpi();
         let root = view.layout(view.client(), dpi).root;
-        let rect = notebook_layout::root_parts(root, dpi).buttons[3].1;
-        view.to_main(POINT {
+        let parts = notebook_layout::root_parts(root, dpi);
+        let rect = parts.buttons[5].1;
+        let at = view.to_main(POINT {
             x: rect.left,
             y: rect.bottom,
-        })
+        });
+        (at, parts.hidden().collect::<Vec<_>>())
     }) else {
         return;
     };
-    let entries = [
+    let favorite = if crate::window::library_host::is_favorite(hwnd) {
+        "Remove from favorites"
+    } else {
+        "Add to favorites"
+    };
+    let mut entries = Vec::new();
+    for button in hidden {
+        match button {
+            HeaderButton::Favorite => {
+                entries.push(MenuEntry::command(
+                    favorite,
+                    CommandId::ToggleNotebookFavorite,
+                ));
+            }
+            HeaderButton::NewNote => {
+                entries.push(MenuEntry::command("New note", CommandId::NoteNew))
+            }
+            HeaderButton::NewFolder => {
+                entries.push(MenuEntry::command("New folder", CommandId::NoteNewFolder));
+            }
+            // Always shown.
+            HeaderButton::Refresh | HeaderButton::ToggleFolders | HeaderButton::More => {}
+        }
+    }
+    if !entries.is_empty() {
+        entries.push(MenuEntry::Separator);
+    }
+    entries.extend([
         MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
         MenuEntry::command("Close notebook", CommandId::CloseNotebook),
-    ];
+    ]);
     match crate::window::menus::track_popup(hwnd, &entries, at) {
         Some(CommandId::NoteRevealInExplorer) => {
             if let Some(root) = crate::window::library_host::folder(hwnd) {
