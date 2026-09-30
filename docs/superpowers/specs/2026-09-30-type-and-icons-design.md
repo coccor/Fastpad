@@ -1,8 +1,16 @@
 # Type and icons, first visible step: design
 
-- Status: approved in conversation on 2026-09-30 (scope only). Written spec awaiting review.
+- Status: approved in conversation on 2026-09-30. Amended after the preview builds (see Amendments).
 - Branch: `feat/type-and-icons`, stacked on `feat/ui-quality-improvements` (PR #44, the design tokens).
 - Step 2 of the Windows design alignment, taken in small pieces. This piece is the first one you can see.
+
+## Amendments after the preview builds
+
+The first build showed 16px sidebar icons and uppercase 13px headers as too large. As shipped:
+
+- **Sidebar icons stay 12px**, including the tree carets, through `metrics::SIDEBAR_ICON = 12`. Only the activity bar uses `metrics::ICON = 16`, which is the size it already had. Sections 1, 2 and 3.2 below describe the original 16px sidebar plan and the "tight 16px boxes" risk; neither applies.
+- **Sidebar headers use sentence case** at 13px semibold: "Notebook", "Open editors  N", "Search", "Favorites". The notebook name is drawn as typed, and the empty state reads "No notebook".
+- The notebook tests' hand-built fonts use the 13px text and `SIDEBAR_ICON` glyph sizes.
 
 ## 1. Goal
 

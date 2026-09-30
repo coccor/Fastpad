@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Amended after the preview builds:** sidebar icons shipped at 12px (`metrics::SIDEBAR_ICON`) and headers in sentence case; only the activity bar uses `ICON = 16`. See the spec's Amendments section. Task 2 below is the original 16px plan.
+
 **Goal:** Move FastPad's chrome text to 13px and its sidebar icons to 16px, fix the one layout that breaks (Search results at 144%), and produce a runnable build.
 
 **Architecture:** The four body-text styles change in the one table in `design/type_ramp.rs`; `DialogBody` folds into `Body`. A new `metrics::ICON = 16` sizes the sidebar and activity-bar glyph fonts. The Search result row grows so two 13px lines fit at every DPI. Tests that pin the old sizes change with them.

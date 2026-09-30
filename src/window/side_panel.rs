@@ -1331,8 +1331,12 @@ mod tests {
 
     #[test]
     fn the_sidebar_and_activity_bar_glyph_fonts_are_icon_sized_at_every_dpi() {
-        // Break caught: sidebar icons drifting from 12 px or the activity bar icons from 16 px, or the sidebar text not following the 13 px body style.
-        use crate::window::design::metrics::{ICON, SIDEBAR_ICON, scale};
+        // Break caught: a glyph font built at the wrong size or scaled differently from the
+        // metrics, or the sidebar text not following the body style.
+        use crate::window::design::{
+            metrics::{ICON, SIDEBAR_ICON, scale},
+            type_ramp,
+        };
         use windows_sys::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
         let height = |font| {
             let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
@@ -1358,7 +1362,11 @@ mod tests {
                 -scale(ICON, dpi),
                 "bar glyph at {dpi}"
             );
-            assert_eq!(height(fonts.text), -scale(13, dpi), "text at {dpi}");
+            assert_eq!(
+                height(fonts.text),
+                -scale(type_ramp::TextStyle::Body.spec().px, dpi),
+                "text at {dpi}"
+            );
             fonts.delete();
         }
     }

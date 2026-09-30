@@ -160,7 +160,12 @@ fn a_tree_row_draws_the_chosen_sets_icon_and_minimal_in_high_contrast() {
         text: create_ui_font(13, "Segoe UI", normal, false),
         bold: create_ui_font(13, "Segoe UI", FW_SEMIBOLD as i32, false),
         italic: create_ui_font(13, "Segoe UI", normal, true),
-        glyph: create_ui_font(16, "Segoe MDL2 Assets", normal, false),
+        glyph: create_ui_font(
+            crate::window::design::metrics::SIDEBAR_ICON,
+            "Segoe MDL2 Assets",
+            normal,
+            false,
+        ),
         ..UiFonts::default()
     };
     let rect = RECT {
@@ -270,7 +275,12 @@ fn a_clipped_icon_box_draws_part_of_the_icon_not_a_shrunken_one() {
         text: create_ui_font(13, "Segoe UI", normal, false),
         bold: create_ui_font(13, "Segoe UI", FW_SEMIBOLD as i32, false),
         italic: create_ui_font(13, "Segoe UI", normal, true),
-        glyph: create_ui_font(16, "Segoe MDL2 Assets", normal, false),
+        glyph: create_ui_font(
+            crate::window::design::metrics::SIDEBAR_ICON,
+            "Segoe MDL2 Assets",
+            normal,
+            false,
+        ),
         ..UiFonts::default()
     };
     // At depth 0 and 96 DPI: chevron sits at [8, 24), leaving only 6 px for the icon box
