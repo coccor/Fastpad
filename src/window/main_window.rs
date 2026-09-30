@@ -11278,7 +11278,9 @@ three"
         // Break caught: a toggle that saves but never changes the window's z-order, one that
         // leaves the window topmost after switching off, or one that rewrites the rest of
         // fastpad.ini.
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, WS_EX_TOPMOST};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, SW_SHOWNA, ShowWindow, WS_EX_TOPMOST,
+        };
         let _scintilla = load_native_scintilla();
         let scratch = RecoveryScratch::new("always-on-top");
         let ini = scratch.path().join("fastpad.ini");
