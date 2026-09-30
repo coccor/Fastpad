@@ -737,6 +737,33 @@ mod tests {
     }
 
     #[test]
+    fn the_input_drain_takes_mouse_messages_over_the_title_bar_and_frame() {
+        // Break caught: FastPad starting up unresponsive with its theme and settings never
+        // loaded whenever the pointer rests on the title bar as the window appears. Windows
+        // counts the non-client mouse message as pending input, so the deferred startup chain
+        // yields to it, but a drain that can't take WM_NCMOUSEMOVE (0xA0, below the client
+        // messages) leaves it queued and the chain yields forever, until a click in the editor.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            QS_POSTMESSAGE, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE,
+        };
+        let main = ProductionWindow::new(make_app());
+        pump_thread_messages();
+        super::TEST_DISPATCHED_MESSAGES.with(|messages| messages.borrow_mut().clear());
+        with_test_input_queue_status(QS_POSTMESSAGE, || {
+            for message in [WM_NCMOUSEMOVE, WM_NCLBUTTONDOWN] {
+                // HTNOWHERE: on the caption (2), the click would start a real move loop.
+                assert_ne!(unsafe { PostMessageW(main.hwnd, message, 0, 0) }, 0);
+                assert!(
+                    super::dispatch_next_input_message(main.hwnd, &main.identity).unwrap(),
+                    "the drain takes message {message:#x}"
+                );
+            }
+        });
+        let dispatched = super::TEST_DISPATCHED_MESSAGES.with(|messages| messages.borrow().clone());
+        assert_eq!(dispatched, vec![WM_NCMOUSEMOVE, WM_NCLBUTTONDOWN]);
+    }
+
+    #[test]
     fn message_loop_failure_destroys_parent_before_return() {
         // Break caught: disarming the parent teardown guard before entering the fallible message
         // loop can leak a live HWND and unload Scintilla without running WM_NCDESTROY cleanup.

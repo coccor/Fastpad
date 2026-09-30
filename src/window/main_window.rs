@@ -54,8 +54,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
 
-pub(crate) const INPUT_MESSAGE_FIRST: u32 =
-    windows_sys::Win32::UI::WindowsAndMessaging::WM_INPUT_DEVICE_CHANGE;
+/// The input messages the startup chain yields to and the input drain takes: from the title
+/// bar's and frame's mouse messages (WM_NCMOUSEMOVE, 0xA0) through the pointer messages. Every
+/// kind `QS_INPUT` counts must be in range, or input the drain can't take keeps the chain
+/// yielding forever. The drain's `PM_QS_INPUT` keeps posted non-input messages in range out.
+pub(crate) const INPUT_MESSAGE_FIRST: u32 = WM_NCMOUSEMOVE;
 pub(crate) const INPUT_MESSAGE_LAST: u32 =
     windows_sys::Win32::UI::WindowsAndMessaging::WM_POINTERROUTEDRELEASED;
 
