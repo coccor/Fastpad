@@ -6,7 +6,6 @@ use crate::window::design::metrics::{PANEL_HEADER, SIDEBAR_ROW, scale};
 use crate::window::notebook_view::HeaderButton;
 use windows_sys::Win32::Foundation::RECT;
 
-/// Every row's height at 96 DPI: section headers, Open Editors rows and tree rows alike.
 /// Open Editors rows visible before the section scrolls on its own (spec §3.1).
 pub(crate) const MAX_EDITOR_ROWS: usize = 9;
 const ROOT_BUTTON: i32 = 22;
