@@ -11282,15 +11282,17 @@ three"
         let _scintilla = load_native_scintilla();
         let scratch = RecoveryScratch::new("always-on-top");
         let ini = scratch.path().join("fastpad.ini");
-        std::fs::write(&ini, "# kept
-").unwrap();
+        std::fs::write(
+            &ini, "# kept
+",
+        )
+        .unwrap();
         super::save_settings_to(Some(ini.clone()));
         let window = ProductionWindow::new(make_app());
         let _editor = install_test_editor(&window);
         super::build_chrome(window.hwnd);
-        let topmost = || unsafe {
-            GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0
-        };
+        let topmost =
+            || unsafe { GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 };
         assert!(!topmost(), "off by default");
 
         execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
