@@ -80,7 +80,7 @@ fn a_result_row_holds_two_lines_of_the_sidebar_text_at_every_dpi() {
     for dpi in [96, 120, 144, 192] {
         let mut tallest = 0;
         for weight in [FW_NORMAL, FW_BOLD] {
-            let font = create_ui_font(scale(12, dpi), "Segoe UI", weight as i32, false);
+            let font = create_ui_font(scale(13, dpi), "Segoe UI", weight as i32, false);
             unsafe {
                 let dc = GetDC(std::ptr::null_mut());
                 let previous = SelectObject(dc, font);
