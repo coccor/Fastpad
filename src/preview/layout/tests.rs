@@ -526,3 +526,30 @@ fn headings_after_a_collapsed_section_keep_their_document_index() {
         );
     });
 }
+
+#[test]
+fn the_preview_font_changes_the_body_text_layout() {
+    // Break caught: preview_font read and saved but never reaching the text the preview draws.
+    let width_with = |preview_font: &str| {
+        let graphics = Graphics::load().unwrap();
+        let window = TestWindow::new(400, 300);
+        let target = create_hwnd_target(&graphics, window.0, 400, 300, 96).unwrap();
+        let brushes = Brushes::create(&target, &preview_colors(Theme::Light, false)).unwrap();
+        let fonts = PreviewFonts::from_settings(preview_font, "Consolas", 12);
+        let details = HashMap::new();
+        let context = LayoutContext::new(
+            &graphics, &brushes, &fonts, None, &no_images, false, &details,
+        )
+        .unwrap();
+        let block = laid(
+            &context,
+            "The quick brown fox jumps over the lazy dog",
+            2000.0,
+        );
+        let (layout, _) = first_text_layout(&block);
+        let mut metrics = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+        unsafe { layout.GetMetrics(&mut metrics) }.unwrap();
+        metrics.widthIncludingTrailingWhitespace
+    };
+    assert_ne!(width_with("Segoe UI"), width_with("Times New Roman"));
+}

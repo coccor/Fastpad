@@ -5,7 +5,7 @@
 
 use crate::Result;
 use crate::preview::colors::ColorRole;
-use crate::preview::dwrite::{Graphics, hresult_error};
+use crate::preview::dwrite::{Graphics, ResolvedFamily, hresult_error};
 use crate::preview::inline_object::inline_box;
 use crate::preview::links::resolve_image_path;
 use crate::preview::model::{
@@ -220,6 +220,9 @@ pub struct LayoutContext<'a> {
     /// `<details>` sections the user toggled away from their `open` attribute.
     details: &'a HashMap<DetailsKey, bool>,
     formats: RefCell<HashMap<(bool, u32, i32), IDWriteTextFormat>>,
+    /// `fonts`' body and code names as DirectWrite knows them.
+    body_family: ResolvedFamily,
+    code_family: ResolvedFamily,
     line_height: f32,
 }
 
@@ -259,6 +262,8 @@ impl<'a> LayoutContext<'a> {
             dark,
             details,
             formats: RefCell::new(HashMap::new()),
+            body_family: graphics.resolve_family(&fonts.body_family),
+            code_family: graphics.resolve_family(&fonts.code_family),
             line_height: 0.0,
         };
         let sample = context.plain_layout(
@@ -287,13 +292,19 @@ impl<'a> LayoutContext<'a> {
             return Ok(format.clone());
         }
         let family = if code {
-            &self.fonts.code_family
+            &self.code_family
         } else {
-            &self.fonts.body_family
+            &self.body_family
         };
-        let format = self
-            .graphics
-            .text_format(family, size, weight, DWRITE_FONT_STYLE_NORMAL)?;
+        // A weight variant picked by name ("Newsreader Medium") is the weight of normal text.
+        let weight = if weight == DWRITE_FONT_WEIGHT_NORMAL {
+            family.weight
+        } else {
+            weight
+        };
+        let format =
+            self.graphics
+                .text_format(&family.name, size, weight, DWRITE_FONT_STYLE_NORMAL)?;
         self.formats.borrow_mut().insert(key, format.clone());
         Ok(format)
     }
@@ -326,7 +337,7 @@ impl<'a> LayoutContext<'a> {
         available: f32,
     ) -> Result<RichLayout> {
         let layout = self.plain_layout(&rich.text, false, size, weight, width)?;
-        let code_family = crate::platform::wide_null(&self.fonts.code_family);
+        let code_family = crate::platform::wide_null(&self.code_family.name);
         for span in &rich.spans {
             let range = text_range(span.range.start, span.range.end);
             unsafe {

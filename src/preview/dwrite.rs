@@ -11,9 +11,10 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE,
-    DWRITE_FONT_WEIGHT, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, IDWriteFactory, IDWriteTextFormat,
 };
-use windows::core::{GUID, HRESULT, Interface, PCWSTR};
+use windows::Win32::Graphics::Gdi::{LF_FACESIZE, LOGFONTW};
+use windows::core::{BOOL, GUID, HRESULT, Interface, PCWSTR};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
@@ -26,6 +27,12 @@ type D2D1CreateFactoryFn = unsafe extern "system" fn(
 ) -> HRESULT;
 type DWriteCreateFactoryFn =
     unsafe extern "system" fn(DWRITE_FACTORY_TYPE, *const GUID, *mut *mut c_void) -> HRESULT;
+
+/// A font family DirectWrite can draw with, and the weight the requested name stood for.
+pub struct ResolvedFamily {
+    pub name: String,
+    pub weight: DWRITE_FONT_WEIGHT,
+}
 
 /// Field order matters: the factories drop before the modules that implement them.
 pub struct Graphics {
@@ -104,6 +111,58 @@ impl Graphics {
         })
     }
 
+    /// The DirectWrite family and weight a font name from Windows' font list stands for. GDI lists
+    /// a weight variant of a family as a family of its own ("Newsreader Medium"), which
+    /// DirectWrite has no family for: its text formats would silently fall back to a default font.
+    /// A name DirectWrite already knows, or one it cannot map, is returned unchanged at normal
+    /// weight.
+    pub fn resolve_family(&self, name: &str) -> ResolvedFamily {
+        self.map_gdi_family(name).unwrap_or_else(|| ResolvedFamily {
+            name: name.to_owned(),
+            weight: DWRITE_FONT_WEIGHT_NORMAL,
+        })
+    }
+
+    fn map_gdi_family(&self, name: &str) -> Option<ResolvedFamily> {
+        unsafe {
+            let mut collection = None;
+            self.dwrite
+                .GetSystemFontCollection(&mut collection, false)
+                .ok()?;
+            let wide = wide_null(name);
+            let (mut index, mut exists) = (0, BOOL(0));
+            collection
+                .as_ref()?
+                .FindFamilyName(PCWSTR(wide.as_ptr()), &mut index, &mut exists)
+                .ok()?;
+            if exists.as_bool() {
+                return None;
+            }
+            let mut logfont = LOGFONTW::default();
+            for (slot, unit) in logfont
+                .lfFaceName
+                .iter_mut()
+                .zip(name.encode_utf16().take(LF_FACESIZE as usize - 1))
+            {
+                *slot = unit;
+            }
+            let font = self
+                .dwrite
+                .GetGdiInterop()
+                .ok()?
+                .CreateFontFromLOGFONT(&logfont)
+                .ok()?;
+            let names = font.GetFontFamily().ok()?.GetFamilyNames().ok()?;
+            let length = names.GetStringLength(0).ok()? as usize;
+            let mut buffer = vec![0u16; length + 1];
+            names.GetString(0, &mut buffer).ok()?;
+            Some(ResolvedFamily {
+                name: String::from_utf16_lossy(&buffer[..length]),
+                weight: font.GetWeight(),
+            })
+        }
+    }
+
     pub fn text_format(
         &self,
         family: &str,
@@ -132,8 +191,26 @@ impl Graphics {
 mod tests {
     use super::*;
     use windows::Win32::Graphics::DirectWrite::{
-        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        DWRITE_TEXT_METRICS,
     };
+
+    #[test]
+    fn a_gdi_weight_variant_name_resolves_to_its_family_and_weight() {
+        // Break caught: "Segoe UI Semibold" (a GDI family with no DirectWrite family of that
+        // name) drawn in a fallback font, which is how a picked "Newsreader Medium" was ignored.
+        let graphics = Graphics::load().unwrap();
+        let variant = graphics.resolve_family("Segoe UI Semibold");
+        assert_eq!(variant.name, "Segoe UI");
+        assert_eq!(variant.weight, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        let plain = graphics.resolve_family("Georgia");
+        assert_eq!(
+            (plain.name.as_str(), plain.weight),
+            ("Georgia", DWRITE_FONT_WEIGHT_NORMAL)
+        );
+        let unknown = graphics.resolve_family("No Such Font 123");
+        assert_eq!(unknown.name, "No Such Font 123");
+    }
 
     #[test]
     fn graphics_loads_both_factories_and_measures_text() {
