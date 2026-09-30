@@ -38,7 +38,7 @@ const FOLDER_GLYPH: &str = "\u{E8B7}";
 const FILLED_STAR_GLYPH: &str = "\u{E735}";
 const OPEN_GLYPH: &str = "\u{E838}";
 
-pub(crate) const HEADER_TEXT: &str = "FAVORITES";
+pub(crate) const HEADER_TEXT: &str = "Favorites";
 pub(crate) const EMPTY_TEXT: &str = "Star a notebook to keep it here.";
 pub(crate) const OPEN_NOTEBOOK: &str = "Open notebook\u{2026}";
 
@@ -225,7 +225,7 @@ impl FavoritesView {
                 paint.hdc,
                 OPEN_GLYPH,
                 button,
-                paint.fonts.glyph,
+                paint.fonts.button_glyph,
                 palette.editor_foreground,
                 line | DT_CENTER,
             );

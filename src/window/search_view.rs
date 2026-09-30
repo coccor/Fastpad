@@ -88,7 +88,7 @@ const CLEAR_TOOL: usize = 7;
 /// The clear button's gap to the toggles, and Segoe MDL2 Assets' Cancel glyph.
 const CLEAR_GAP_AT_96_DPI: i32 = 2;
 const CLEAR_GLYPH: &str = "\u{E711}";
-const TITLE: &str = "SEARCH";
+const TITLE: &str = "Search";
 /// The title's left inset, as the Notebook view's.
 const TITLE_INSET_AT_96_DPI: i32 = 12;
 /// A result's file icon, as the tree's.

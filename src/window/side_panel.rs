@@ -16,7 +16,7 @@ use super::tooltip::Tooltip;
 use crate::config::SidebarView;
 use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use crate::platform::wide_null;
-use crate::window::design::metrics::{ICON, PANEL_HEADER, scale};
+use crate::window::design::metrics::{BUTTON_ICON, ICON, PANEL_HEADER, scale};
 use crate::window::design::type_ramp::{self, TextStyle};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill};
@@ -64,12 +64,14 @@ pub(crate) struct UiFonts {
     /// The match in a Search result's snippet: Segoe UI bold, 13 px. Made on the first paint of a
     /// snippet (`Sidebar::text_bold`), not with the others, so it adds nothing before first paint.
     pub(crate) text_bold: HFONT,
-    /// Header titles in small capitals: Segoe UI semibold, 13 px.
+    /// Header titles: Segoe UI semibold, 13 px.
     pub(crate) bold: HFONT,
     /// Notices inside the list: Segoe UI italic, 13 px.
     pub(crate) italic: HFONT,
-    /// Row and header-button icons: Segoe MDL2 Assets, `ICON` px.
+    /// Row icons: Segoe MDL2 Assets, `ICON` px.
     pub(crate) glyph: HFONT,
+    /// Header-button icons: Segoe MDL2 Assets, `BUTTON_ICON` px.
+    pub(crate) button_glyph: HFONT,
     /// The activity bar's icons: Segoe MDL2 Assets, `ICON` px.
     pub(crate) bar_glyph: HFONT,
 }
@@ -82,6 +84,7 @@ impl Default for UiFonts {
             bold: std::ptr::null_mut(),
             italic: std::ptr::null_mut(),
             glyph: std::ptr::null_mut(),
+            button_glyph: std::ptr::null_mut(),
             bar_glyph: std::ptr::null_mut(),
         }
     }
@@ -96,6 +99,12 @@ impl UiFonts {
             bold: type_ramp::create(TextStyle::PanelHeader, dpi),
             italic: type_ramp::create(TextStyle::BodyItalic, dpi),
             glyph: create_ui_font(scale(ICON, dpi), "Segoe MDL2 Assets", normal, false),
+            button_glyph: create_ui_font(
+                scale(BUTTON_ICON, dpi),
+                "Segoe MDL2 Assets",
+                normal,
+                false,
+            ),
             bar_glyph: create_ui_font(scale(ICON, dpi), "Segoe MDL2 Assets", normal, false),
         }
     }
@@ -107,6 +116,7 @@ impl UiFonts {
             self.bold,
             self.italic,
             self.glyph,
+            self.button_glyph,
             self.bar_glyph,
         ] {
             if !font.is_null() {
@@ -1333,7 +1343,7 @@ mod tests {
     fn the_sidebar_and_activity_bar_glyph_fonts_are_icon_sized_at_every_dpi() {
         // Break caught: row and header-button icons staying at 12 px after the icon size moved
         // to 16, or the sidebar text not following the 13 px body style.
-        use crate::window::design::metrics::{ICON, scale};
+        use crate::window::design::metrics::{BUTTON_ICON, ICON, scale};
         use windows_sys::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
         let height = |font| {
             let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
@@ -1350,6 +1360,11 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let fonts = UiFonts::create(dpi);
             assert_eq!(height(fonts.glyph), -scale(ICON, dpi), "glyph at {dpi}");
+            assert_eq!(
+                height(fonts.button_glyph),
+                -scale(BUTTON_ICON, dpi),
+                "button glyph at {dpi}"
+            );
             assert_eq!(
                 height(fonts.bar_glyph),
                 -scale(ICON, dpi),

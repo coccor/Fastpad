@@ -241,7 +241,7 @@ fn the_sidebar_top_strip_and_panel_header_are_caption() {
     let header =
         crate::window::design::metrics::scale(crate::window::design::metrics::PANEL_HEADER, dpi);
     assert!(header_y < header);
-    // The Notebook view's title band holds only its caption, "NOTEBOOK": all of it is a
+    // The Notebook view's title band holds only its caption, "Notebook": all of it is a
     // drag area, the old title point included.
     let panel_x = crate::window::design::metrics::scale(4, dpi);
     assert_eq!(

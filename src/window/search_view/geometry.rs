@@ -10,7 +10,7 @@ use crate::window::sidebar_accessibility;
 use windows_sys::Win32::Foundation::{POINT, RECT};
 
 impl SearchView {
-    /// The title band along the top ("SEARCH"): the window's title strip, as in the Notebook
+    /// The title band along the top ("Search"): the window's title strip, as in the Notebook
     /// view, so all of it is caption.
     pub(crate) fn title_rect(client: RECT, dpi: u32) -> RECT {
         RECT {

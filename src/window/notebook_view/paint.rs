@@ -803,7 +803,7 @@ impl NotebookView {
             left: layout.title.left + scale(12, dpi),
             ..layout.title
         };
-        bold("NOTEBOOK", title, palette.muted_foreground);
+        bold("Notebook", title, palette.muted_foreground);
         // Open Editors header: chevron, label and count.
         let chevron = notebook_layout::section_chevron(layout.editors_header, dpi);
         let glyph = if self.editors_expanded {
@@ -827,7 +827,7 @@ impl NotebookView {
         };
         let count = self.editors.view_count();
         bold(
-            &format!("OPEN EDITORS  {count}"),
+            &format!("Open editors  {count}"),
             label,
             palette.muted_foreground,
         );
@@ -863,7 +863,7 @@ impl NotebookView {
         let parts = notebook_layout::root_parts(layout.root, dpi);
         if self.mode == Mode::NoNotebook {
             bold(
-                "NO NOTEBOOK",
+                "No notebook",
                 RECT {
                     left: parts.chevron.right,
                     ..layout.root
@@ -886,11 +886,7 @@ impl NotebookView {
                     CENTERED,
                 )
             };
-            bold(
-                &self.name.to_uppercase(),
-                parts.name,
-                palette.muted_foreground,
-            );
+            bold(&self.name, parts.name, palette.muted_foreground);
             for (button, rect) in parts.shown() {
                 let hot = self.hover == Some(Hit::Header(button));
                 if hot {
@@ -911,7 +907,7 @@ impl NotebookView {
                 } else {
                     palette.muted_foreground
                 };
-                unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
+                unsafe { draw_text(dc, glyph, rect, fonts.button_glyph, color, CENTERED) };
             }
         }
         // The keyboard selection on a header or tab row; the tree shows its own.

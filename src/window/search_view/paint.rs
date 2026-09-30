@@ -206,7 +206,7 @@ impl SearchView {
                         paint.hdc,
                         CLEAR_GLYPH,
                         clear,
-                        paint.fonts.glyph,
+                        paint.fonts.button_glyph,
                         button_color(true, hover, palette.muted_foreground, &palette),
                         glyph,
                     );
@@ -225,7 +225,7 @@ impl SearchView {
                         paint.hdc,
                         REPLACE_GLYPH,
                         all,
-                        paint.fonts.glyph,
+                        paint.fonts.button_glyph,
                         button_color(enabled, hover, palette.editor_foreground, &palette),
                         glyph,
                     );
