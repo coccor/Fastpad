@@ -10,6 +10,16 @@ use crate::editor::scintilla_constants::{
     SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_STYLESETITALIC, SCI_UNDO,
 };
 use crate::editor::scintilla_constants::{
+    SC_FOLDACTION_CONTRACT, SC_FOLDACTION_EXPAND, SC_FOLDFLAG_LINEAFTER_CONTRACTED,
+    SC_MARGIN_SYMBOL, SC_MARK_BOXMINUS, SC_MARK_BOXMINUSCONNECTED, SC_MARK_BOXPLUS,
+    SC_MARK_BOXPLUSCONNECTED, SC_MARK_LCORNER, SC_MARK_TCORNER, SC_MARK_VLINE, SC_MARKNUM_FOLDER,
+    SC_MARKNUM_FOLDEREND, SC_MARKNUM_FOLDERMIDTAIL, SC_MARKNUM_FOLDEROPEN,
+    SC_MARKNUM_FOLDEROPENMID, SC_MARKNUM_FOLDERSUB, SC_MARKNUM_FOLDERTAIL, SC_MASK_FOLDERS,
+    SCI_FOLDALL, SCI_MARKERDEFINE, SCI_MARKERSETBACK, SCI_MARKERSETBACKSELECTED, SCI_MARKERSETFORE,
+    SCI_SETAUTOMATICFOLD, SCI_SETFOLDFLAGS, SCI_SETFOLDMARGINCOLOUR, SCI_SETFOLDMARGINHICOLOUR,
+    SCI_SETMARGINMASKN, SCI_SETMARGINSENSITIVEN,
+};
+use crate::editor::scintilla_constants::{
     SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_SETZOOM, SCI_STYLEGETBACK,
     SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_DEFAULT, STYLE_LINENUMBER,
 };
@@ -606,6 +616,50 @@ fn chrome_defaults_show_only_a_line_number_margin_and_track_scroll_width() {
             (SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER as isize),
             (SCI_SETMARGINWIDTHN, 1, 0),
             (SCI_SETMARGINWIDTHN, 2, 0),
+            (SCI_SETMARGINTYPEN, 2, SC_MARGIN_SYMBOL as isize),
+            (SCI_SETMARGINMASKN, 2, SC_MASK_FOLDERS as isize),
+            (SCI_SETMARGINSENSITIVEN, 2, 1),
+            (
+                SCI_MARKERDEFINE,
+                SC_MARKNUM_FOLDEROPEN as usize,
+                SC_MARK_BOXMINUS as isize
+            ),
+            (
+                SCI_MARKERDEFINE,
+                SC_MARKNUM_FOLDER as usize,
+                SC_MARK_BOXPLUS as isize
+            ),
+            (
+                SCI_MARKERDEFINE,
+                SC_MARKNUM_FOLDERSUB as usize,
+                SC_MARK_VLINE as isize
+            ),
+            (
+                SCI_MARKERDEFINE,
+                SC_MARKNUM_FOLDERTAIL as usize,
+                SC_MARK_LCORNER as isize
+            ),
+            (
+                SCI_MARKERDEFINE,
+                SC_MARKNUM_FOLDEREND as usize,
+                SC_MARK_BOXPLUSCONNECTED as isize
+            ),
+            (
+                SCI_MARKERDEFINE,
+                SC_MARKNUM_FOLDEROPENMID as usize,
+                SC_MARK_BOXMINUSCONNECTED as isize
+            ),
+            (
+                SCI_MARKERDEFINE,
+                SC_MARKNUM_FOLDERMIDTAIL as usize,
+                SC_MARK_TCORNER as isize
+            ),
+            (SCI_SETAUTOMATICFOLD, 7, 0),
+            (
+                SCI_SETFOLDFLAGS,
+                SC_FOLDFLAG_LINEAFTER_CONTRACTED as usize,
+                0
+            ),
             (SCI_STYLEGETBACK, STYLE_DEFAULT as usize, 0),
             (
                 SCI_STYLESETBACK,
@@ -623,6 +677,85 @@ fn chrome_defaults_show_only_a_line_number_margin_and_track_scroll_width() {
     );
     // Two digits plus one digit of breathing room, so short files do not resize at line 10.
     assert_eq!(harness.text_width_texts(), vec![b"999".to_vec()]);
+}
+
+#[test]
+fn code_folding_shows_the_fold_margin_scaled_to_dpi_and_hiding_it_expands_every_fold() {
+    // Break caught: a fold margin left at width 0 when enabled (folding invisible), or left
+    // collapsed-but-folded after turning folding off, hiding text behind an unclickable margin.
+    let harness = TestDirectHarness::new();
+    let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+    editor.set_code_folding(true, 144).unwrap();
+    editor.set_code_folding(false, 144).unwrap();
+
+    assert_eq!(
+        harness.calls(),
+        vec![
+            (SCI_SETMARGINWIDTHN, 2, 21),
+            (SCI_SETMARGINWIDTHN, 2, 0),
+            (SCI_FOLDALL, SC_FOLDACTION_EXPAND as usize, 0),
+        ]
+    );
+}
+
+#[test]
+fn fold_all_contracts_or_expands_with_scintillas_fold_actions() {
+    // Break caught: Fold All and Unfold All sending the same action.
+    let harness = TestDirectHarness::new();
+    let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+    editor.fold_all(true).unwrap();
+    editor.fold_all(false).unwrap();
+
+    assert_eq!(
+        harness.calls(),
+        vec![
+            (SCI_FOLDALL, SC_FOLDACTION_CONTRACT as usize, 0),
+            (SCI_FOLDALL, SC_FOLDACTION_EXPAND as usize, 0),
+        ]
+    );
+}
+
+#[test]
+fn fold_colors_paint_the_margin_and_every_folder_marker_from_the_palette() {
+    // Break caught: markers keeping Scintilla's default white and grey, invisible or garish on
+    // the dark, Paper, Lamp and high-contrast themes.
+    let harness = TestDirectHarness::new();
+    let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+    editor.set_fold_colors(0x0033_4455, 0x0000_1122).unwrap();
+
+    let calls = harness.calls();
+    assert_eq!(
+        &calls[..2],
+        [
+            (SCI_SETFOLDMARGINCOLOUR, 1, 0x1122),
+            (SCI_SETFOLDMARGINHICOLOUR, 1, 0x1122),
+        ]
+    );
+    for message in [
+        SCI_MARKERSETFORE,
+        SCI_MARKERSETBACK,
+        SCI_MARKERSETBACKSELECTED,
+    ] {
+        let markers = calls
+            .iter()
+            .filter(|call| call.0 == message)
+            .map(|call| (call.1, call.2))
+            .collect::<Vec<_>>();
+        let colour = if message == SCI_MARKERSETFORE {
+            0x1122
+        } else {
+            0x0033_4455
+        };
+        assert_eq!(markers.len(), 7, "{message}");
+        assert!(
+            markers
+                .iter()
+                .all(|&(marker, value)| (25..=31).contains(&marker) && value == colour)
+        );
+    }
 }
 
 #[test]

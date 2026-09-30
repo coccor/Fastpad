@@ -191,6 +191,8 @@ before closing again.
   kept on save.
 - **Find and replace** with match case, whole word and regular expressions, plus zoom, word wrap
   and line numbers.
+- **Code folding.** Collapse and expand blocks from the margin, or with Fold All and Unfold All in
+  the command palette. Turn it off in Settings.
 - **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive
   technology and can be followed from it.
 
@@ -232,6 +234,7 @@ line in a notification and applies the rest.
 | `insert_spaces` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `show_whitespace` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `highlight_current_line` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `code_folding` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |

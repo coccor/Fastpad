@@ -436,6 +436,10 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
             {
                 let _ = editor.set_text_padding(dpi);
+                if let Some(app) = unsafe { app_ptr(hwnd) } {
+                    let _ =
+                        editor.set_code_folding(unsafe { app.as_ref() }.settings.code_folding, dpi);
+                }
             }
             // Replaces (and drops, which destroys) any icon loaded for the old DPI. The bar's own
             // resize below repaints it, so no separate invalidate is needed here.

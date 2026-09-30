@@ -364,6 +364,8 @@ pub(super) fn apply_settings_to(
     palette: Palette,
 ) {
     let _ = editor.set_line_numbers(settings.line_numbers);
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(editor.hwnd()) };
+    let _ = editor.set_code_folding(settings.code_folding, dpi);
     let _ = editor.apply_view_settings(
         &settings.font_face,
         settings.font_size,
@@ -384,8 +386,10 @@ pub(super) fn apply_colors_to(editor: &Editor, palette: Palette, highlight_curre
     let _ = editor.set_selection_text_colors(palette.selection_foreground);
 }
 
-/// The selection backgrounds, and the caret line's when `highlight_current_line` is on.
+/// The selection backgrounds, the caret line's when `highlight_current_line` is on, and the fold
+/// margin's markers.
 fn apply_chrome_colors_to(editor: &Editor, palette: Palette, highlight_current_line: bool) {
+    let _ = editor.set_fold_colors(palette.line_number_foreground, palette.editor_background);
     let _ = editor.set_chrome_colors(
         palette.selection_background,
         palette.inactive_selection_background,
