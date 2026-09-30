@@ -225,7 +225,7 @@ impl FavoritesView {
                 paint.hdc,
                 OPEN_GLYPH,
                 button,
-                paint.fonts.button_glyph,
+                paint.fonts.glyph,
                 palette.editor_foreground,
                 line | DT_CENTER,
             );

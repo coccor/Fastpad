@@ -907,7 +907,7 @@ impl NotebookView {
                 } else {
                     palette.muted_foreground
                 };
-                unsafe { draw_text(dc, glyph, rect, fonts.button_glyph, color, CENTERED) };
+                unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
             }
         }
         // The keyboard selection on a header or tab row; the tree shows its own.
