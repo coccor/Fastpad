@@ -4,16 +4,16 @@
 
 use crate::platform::wide_null;
 use crate::window::titlebar::{
-    GLYPH_PREVIEW_FULL, GLYPH_PREVIEW_SIDE, Point, Rect, draw_text, fill, restore_font, scale,
-    select_font,
+    GLYPH_PREVIEW_FULL, GLYPH_PREVIEW_SIDE, Point, Rect, create_ui_font, draw_text, fill,
+    restore_font, scale, select_font,
 };
 use crate::window::tooltip::Tooltip;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, EndPaint, InvalidateRect,
-    MapWindowPoints, PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, EndPaint,
+    FW_NORMAL, InvalidateRect, MapWindowPoints, PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -71,7 +71,7 @@ impl Default for PreviewButtons {
 }
 
 fn button_size(dpi: u32) -> i32 {
-    scale(28, dpi)
+    scale(32, dpi)
 }
 
 /// The active group's floating preview buttons, once created.
@@ -332,7 +332,7 @@ fn paint(main: HWND, buttons: HWND) {
         return;
     }
     let dpi = unsafe { GetDpiForWindow(buttons) }.max(96);
-    let (palette, fonts, _) = crate::window::main_window::title_chrome(main);
+    let (palette, _, _) = crate::window::main_window::title_chrome(main);
     let mode = crate::window::preview_host::mode(main);
     let (hovered, pressed) = crate::window::main_window::with_group(main, |group| {
         (group.preview_buttons.hovered, group.preview_buttons.pressed)
@@ -349,7 +349,9 @@ fn paint(main: HWND, buttons: HWND) {
         );
         SetBkMode(dc, TRANSPARENT as i32);
     }
-    let previous = unsafe { select_font(dc, fonts.glyph()) };
+    // Larger than the title bar's caption glyphs: these are the buttons' whole content.
+    let font = create_ui_font(scale(17, dpi), "Segoe MDL2 Assets", FW_NORMAL as i32, false);
+    let previous = unsafe { select_font(dc, font) };
     for (button, glyph, active) in [
         (
             PreviewButton::Side,
@@ -373,7 +375,7 @@ fn paint(main: HWND, buttons: HWND) {
         };
         unsafe {
             if let Some(background) = background {
-                fill(dc, rect.centered_square(scale(24, dpi)), background);
+                fill(dc, rect.centered_square(scale(28, dpi)), background);
             }
             SetTextColor(
                 dc,
@@ -388,6 +390,7 @@ fn paint(main: HWND, buttons: HWND) {
     }
     unsafe {
         restore_font(dc, previous);
+        DeleteObject(font as _);
         EndPaint(buttons, &paint);
     }
 }
