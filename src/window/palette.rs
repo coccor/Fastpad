@@ -351,6 +351,7 @@ mod tests {
     ];
     use crate::languages::{rgb, syntax_colors};
     use crate::platform::theme::Theme;
+    use crate::window::design::contrast::ratio;
     use windows_sys::Win32::Graphics::Gdi::{
         COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
     };
@@ -487,24 +488,6 @@ mod tests {
         );
     }
 
-    /// WCAG relative luminance of a `COLORREF`.
-    fn luminance(color: u32) -> f64 {
-        let channel = |shift: u32| {
-            let value = f64::from((color >> shift) & 0xFF) / 255.0;
-            if value <= 0.040_45 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(16)
-    }
-
-    fn contrast(a: u32, b: u32) -> f64 {
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
-
     #[test]
     fn file_icon_colours_come_from_the_themes_flavour_and_high_contrast_mutes_them() {
         // Break caught: the Light theme drawing Mocha's pastel icons on white, a Catppuccin theme
@@ -574,10 +557,88 @@ mod tests {
                     palette.hover_background,
                     palette.panel_background(),
                 ] {
-                    let ratio = contrast(color, background);
+                    let ratio = ratio(color, background);
                     assert!(
                         ratio >= 1.5,
                         "{theme:?}: {color:06x} on {background:06x} is {ratio:.2}:1"
+                    );
+                }
+            }
+        }
+    }
+
+    struct Pair {
+        name: &'static str,
+        foreground: u32,
+        background: u32,
+        minimum: f64,
+    }
+
+    /// The text and UI pairs every themed palette must keep legible: 4.5:1 for text, 3:1 for
+    /// secondary text and interactive shapes.
+    fn contrast_pairs(p: &Palette) -> Vec<Pair> {
+        let pair = |name, foreground, background, minimum| Pair {
+            name,
+            foreground,
+            background,
+            minimum,
+        };
+        vec![
+            pair("editor text", p.editor_foreground, p.editor_background, 4.5),
+            pair("strip text", p.strip_foreground, p.strip_background, 4.5),
+            pair(
+                "muted text on strip",
+                p.muted_foreground,
+                p.strip_background,
+                4.5,
+            ),
+            pair(
+                "muted text on editor",
+                p.muted_foreground,
+                p.editor_background,
+                4.5,
+            ),
+            pair("error text", p.error_foreground, p.editor_background, 4.5),
+            pair(
+                "line numbers",
+                p.line_number_foreground,
+                p.editor_background,
+                3.0,
+            ),
+        ]
+    }
+
+    /// Pairs that fall short today, each recorded with the measured ratio and left as they are so
+    /// step 1 changes no color. A later step fixes the color and removes the entry. The test
+    /// below fails if an entry starts passing, so this list cannot go stale.
+    const KNOWN_SHORT: &[(Theme, &str)] = &[
+        (Theme::CatppuccinLatte, "muted text on strip"), // 4.06:1, needs 4.5:1
+        (Theme::CatppuccinLatte, "muted text on editor"), // 4.37:1, needs 4.5:1
+        (Theme::CatppuccinLatte, "line numbers"),        // 2.83:1, needs 3:1
+        (Theme::Paper, "muted text on strip"),           // 3.98:1, needs 4.5:1
+        (Theme::Paper, "muted text on editor"),          // 4.44:1, needs 4.5:1
+    ];
+
+    #[test]
+    fn every_theme_keeps_its_text_and_shapes_legible() {
+        // Break caught: a palette edit that leaves text or a control nearly invisible on its
+        // background, in any of the eight themes.
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
+            for pair in contrast_pairs(&palette) {
+                let measured = ratio(pair.foreground, pair.background);
+                let known = KNOWN_SHORT.contains(&(theme, pair.name));
+                if measured >= pair.minimum {
+                    assert!(
+                        !known,
+                        "{theme:?} {}: now {measured:.2}:1, so remove it from KNOWN_SHORT",
+                        pair.name
+                    );
+                } else {
+                    assert!(
+                        known,
+                        "{theme:?} {}: {measured:.2}:1 is below {}:1",
+                        pair.name, pair.minimum
                     );
                 }
             }
