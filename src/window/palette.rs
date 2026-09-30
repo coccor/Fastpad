@@ -91,6 +91,53 @@ const DARK: Palette = Palette {
     high_contrast: false,
 };
 
+/// Warm off-white reading theme: no pure white or black, a teal accent, chrome one step darker
+/// than the page.
+const PAPER: Palette = Palette {
+    strip_background: rgb(236, 235, 229),
+    editor_background: rgb(248, 247, 243),
+    editor_foreground: rgb(42, 41, 38),
+    muted_foreground: rgb(117, 115, 106),
+    hover_foreground: rgb(42, 41, 38),
+    hover_background: rgb(223, 221, 212),
+    pressed_background: rgb(207, 205, 194),
+    close_hover_background: CLOSE_HOVER,
+    close_hover_foreground: WHITE,
+    close_pressed_background: CLOSE_PRESSED,
+    selection_background: rgb(207, 224, 220),
+    inactive_selection_background: rgb(222, 228, 222),
+    selection_foreground: None,
+    caret_line_background: rgb(240, 238, 230),
+    line_number_foreground: rgb(140, 138, 127),
+    strip_foreground: rgb(42, 41, 38),
+    error_foreground: rgb(161, 55, 35),
+    dark_frame: false,
+    high_contrast: false,
+};
+
+/// Warm charcoal companion to `PAPER`: parchment text, desaturated sea-green accent.
+const LAMP: Palette = Palette {
+    strip_background: rgb(26, 25, 23),
+    editor_background: rgb(33, 31, 28),
+    editor_foreground: rgb(217, 212, 199),
+    muted_foreground: rgb(143, 139, 127),
+    hover_foreground: rgb(232, 228, 216),
+    hover_background: rgb(46, 44, 40),
+    pressed_background: rgb(62, 60, 55),
+    close_hover_background: CLOSE_HOVER,
+    close_hover_foreground: WHITE,
+    close_pressed_background: CLOSE_PRESSED,
+    selection_background: rgb(59, 74, 71),
+    inactive_selection_background: rgb(48, 56, 54),
+    selection_foreground: None,
+    caret_line_background: rgb(41, 39, 34),
+    line_number_foreground: rgb(110, 107, 98),
+    strip_foreground: rgb(217, 212, 199),
+    error_foreground: rgb(232, 131, 113),
+    dark_frame: true,
+    high_contrast: false,
+};
+
 /// Maps a Catppuccin flavor onto FastPad's UI roles per the Catppuccin style guide: `mantle`
 /// chrome around a `base` editor, `overlay2` selection at ~25% opacity, `text` caret line at ~10%.
 const fn catppuccin(flavor: &Flavor, dark: bool) -> Palette {
@@ -125,6 +172,8 @@ static PALETTES: [Palette; Theme::COUNT] = [
     catppuccin(&catppuccin::FRAPPE, true),
     catppuccin(&catppuccin::MACCHIATO, true),
     catppuccin(&catppuccin::MOCHA, true),
+    PAPER,
+    LAMP,
 ];
 
 /// The Notebook view's file-type icon colours (notebook folders spec §5.2): nine Catppuccin
@@ -164,6 +213,8 @@ static FILE_ICONS: [FileIcons; Theme::COUNT] = [
     file_icons(&catppuccin::LATTE),
     file_icons(&catppuccin::FRAPPE),
     file_icons(&catppuccin::MACCHIATO),
+    file_icons(&catppuccin::MOCHA),
+    file_icons(&catppuccin::LATTE),
     file_icons(&catppuccin::MOCHA),
 ];
 

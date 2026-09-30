@@ -17,7 +17,7 @@ fn with_setup<R>(
     let window = TestWindow::new(400, 300);
     let target = create_hwnd_target(&graphics, window.0, 400, 300, 96).unwrap();
     let brushes = Brushes::create(&target, &preview_colors(Theme::Light, false)).unwrap();
-    let fonts = PreviewFonts::from_settings("Consolas", 12);
+    let fonts = PreviewFonts::from_settings("Segoe UI", "Consolas", 12);
     let context = LayoutContext::new(
         &graphics,
         &brushes,

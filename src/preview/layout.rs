@@ -49,9 +49,9 @@ pub struct PreviewFonts {
 }
 
 impl PreviewFonts {
-    pub fn from_settings(font_face: &str, font_size_points: u16) -> Self {
+    pub fn from_settings(preview_font: &str, font_face: &str, font_size_points: u16) -> Self {
         Self {
-            body_family: "Segoe UI".to_owned(),
+            body_family: preview_font.to_owned(),
             code_family: font_face.to_owned(),
             body_size: f32::from(font_size_points) * 96.0 / 72.0,
         }

@@ -5,6 +5,8 @@ use super::persisted::{FileIconSet, Settings, SidebarView, ThemePreference};
 /// deliberately unconfigurable) even though both currently name the same font: this one is a
 /// user-facing default meant to be overridden by `fastpad.ini`, that one is an internal constant.
 pub const DEFAULT_FONT_FACE: &str = "Consolas";
+/// The Markdown preview's body and heading font; code in the preview uses the editor font.
+pub const DEFAULT_PREVIEW_FONT: &str = "Segoe UI";
 pub const DEFAULT_FONT_SIZE: u16 = 11;
 pub const DEFAULT_TAB_WIDTH: u8 = 4;
 pub const DEFAULT_WORD_WRAP: bool = false;
@@ -45,6 +47,7 @@ pub const fn clamp_sidebar_width(width: u16) -> u16 {
 pub fn default_settings() -> Settings {
     Settings {
         font_face: DEFAULT_FONT_FACE.to_owned(),
+        preview_font: DEFAULT_PREVIEW_FONT.to_owned(),
         font_size: DEFAULT_FONT_SIZE,
         tab_width: DEFAULT_TAB_WIDTH,
         word_wrap: DEFAULT_WORD_WRAP,
@@ -76,6 +79,7 @@ mod tests {
         // changes what a brand-new profile (no fastpad.ini yet) looks like.
         let settings = default_settings();
         assert_eq!(settings.font_face, "Consolas");
+        assert_eq!(settings.preview_font, "Segoe UI");
         assert_eq!(settings.font_size, 11);
         assert_eq!(settings.tab_width, 4);
         assert!(!settings.word_wrap);

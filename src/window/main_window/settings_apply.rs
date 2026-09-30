@@ -60,6 +60,12 @@ pub(crate) fn apply_settings_action(
                 ("font_face", face)
             })
         }),
+        SettingsAction::SetPreviewFont(face) => change_setting(hwnd, |settings| {
+            (settings.preview_font != face).then(|| {
+                settings.preview_font.clone_from(&face);
+                ("preview_font", face)
+            })
+        }),
         SettingsAction::SetFontSize(size) => set_font_size(hwnd, |_| size),
         SettingsAction::SetTabWidth(width) => set_tab_width(hwnd, width),
         SettingsAction::Toggle(toggle) => execute_command(hwnd, toggle.command()),

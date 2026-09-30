@@ -176,6 +176,9 @@ pub(super) fn execute_command_with_note(
         CommandId::ThemeCatppuccinMocha => {
             set_theme(hwnd, crate::config::ThemePreference::CatppuccinMocha)
         }
+        CommandId::ThemePaperLamp => set_theme(hwnd, crate::config::ThemePreference::PaperLamp),
+        CommandId::ThemePaper => set_theme(hwnd, crate::config::ThemePreference::Paper),
+        CommandId::ThemeLamp => set_theme(hwnd, crate::config::ThemePreference::Lamp),
         CommandId::ToggleWordWrap => change_setting(hwnd, |settings| {
             settings.word_wrap = !settings.word_wrap;
             Some(("word_wrap", settings.word_wrap.to_string()))

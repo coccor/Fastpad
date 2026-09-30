@@ -16,7 +16,7 @@ pub(crate) struct Layout {
     pub nav: RECT,
     pub nav_items: [RECT; 2],
     pub headings: [RECT; 3],
-    pub rows: [RECT; 13],
+    pub rows: [RECT; Row::ALL.len()],
     pub content_height: i32,
     pub edit_ini: RECT,
     pub close: RECT,
@@ -82,7 +82,7 @@ impl Layout {
             bottom: top + height,
         };
         let mut headings = [RECT::default(); 3];
-        let mut rows = [RECT::default(); 13];
+        let mut rows = [RECT::default(); Row::ALL.len()];
         let mut top = 0;
         for section in Section::ALL {
             headings[section as usize] = line(top, heading_height);

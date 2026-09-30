@@ -316,6 +316,7 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
         key(VK_TAB); // File icons
         key(VK_RIGHT); // Minimal
         key(VK_TAB); // Font
+        key(VK_TAB); // Preview font
         key(VK_TAB); // Font size
         char('1');
         char('6');
@@ -448,8 +449,8 @@ fn edit_fastpad_ini_closes_the_dialog_and_opens_the_file_in_a_tab() {
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
     crate::window::settings_dialog::answer_next(|dialog| unsafe {
-        // 12 enabled rows (no notebook, so autosave is skipped): 12 Tabs reach the link.
-        for _ in 0..12 {
+        // 13 enabled rows (no notebook, so autosave is skipped): 13 Tabs reach the link.
+        for _ in 0..13 {
             PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
         }
         PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);

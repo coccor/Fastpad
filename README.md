@@ -166,7 +166,9 @@ bottom of the sidebar) lists every setting, and changes apply as you make them.
 
 Light, dark, or **System** to follow Windows as it switches. Plus all four
 [Catppuccin](https://catppuccin.com/) flavors (Latte, Frappé, Macchiato, Mocha), or plain
-`catppuccin` to pick Latte by day and Mocha by night. Windows high contrast is always respected.
+`catppuccin` to pick Latte by day and Mocha by night. For long reading and writing sessions there are
+**Paper** (warm off-white) and **Lamp** (warm charcoal), or `paper-lamp` to pick Paper by day and Lamp by
+night. Windows high contrast is always respected.
 
 ### Crash recovery that just works
 
@@ -222,6 +224,7 @@ line in a notification and applies the rest.
 | Key | Values | Default |
 |---|---|---|
 | `font_face` | Any installed font name | `Consolas` |
+| `preview_font` | Any installed font name, for Markdown preview text (code in the preview uses `font_face`) | `Segoe UI` |
 | `font_size` | Points (positive integer) | `11` |
 | `tab_width` | 1–255 | `4` |
 | `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
@@ -230,7 +233,7 @@ line in a notification and applies the rest.
 | `show_whitespace` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `highlight_current_line` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
-| `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
+| `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |

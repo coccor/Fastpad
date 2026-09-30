@@ -531,14 +531,18 @@ fn appearance(hwnd: HWND) -> (PreviewColors, PreviewFonts, bool) {
             let dark = Palette::for_cached_theme(app.theme, app.settings.theme).dark_frame;
             (
                 preview_colors(theme, high_contrast),
-                PreviewFonts::from_settings(&app.settings.font_face, app.settings.font_size),
+                PreviewFonts::from_settings(
+                    &app.settings.preview_font,
+                    &app.settings.font_face,
+                    app.settings.font_size,
+                ),
                 dark,
             )
         })
         .unwrap_or_else(|| {
             (
                 preview_colors(theme, false),
-                PreviewFonts::from_settings("Consolas", 11),
+                PreviewFonts::from_settings("Segoe UI", "Consolas", 11),
                 false,
             )
         })

@@ -91,10 +91,10 @@ const PADDING_AT_96_DPI: i32 = 20;
 const HEADING_HEIGHT_AT_96_DPI: i32 = 30;
 /// A heading's text sits this far below the top of its space, closer to its first card.
 const HEADING_SPACE_ABOVE_AT_96_DPI: i32 = 6;
-/// Each setting sits on its own card, this tall with this gap under it: 13 cards and 3 headings
+/// Each setting sits on its own card, this tall with this gap under it: 14 cards and 3 headings
 /// keep the dialog under 700 px at 96 DPI.
-const CARD_HEIGHT_AT_96_DPI: i32 = 36;
-const CARD_GAP_AT_96_DPI: i32 = 3;
+const CARD_HEIGHT_AT_96_DPI: i32 = 34;
+const CARD_GAP_AT_96_DPI: i32 = 2;
 /// Between a card's sides and its label or control.
 const CARD_PADDING_AT_96_DPI: i32 = 16;
 const CONTROL_HEIGHT_AT_96_DPI: i32 = 26;
@@ -157,6 +157,8 @@ struct Dialog {
     view: SettingsView,
     model: DialogModel,
     fonts: Vec<String>,
+    /// The Preview font row's list: every family, sorted together.
+    preview_fonts: Vec<String>,
     scroll: i32,
     title_font: HFONT,
     heading_font: HFONT,
@@ -189,6 +191,17 @@ struct Dialog {
     search: Option<HWND>,
     /// The search field's background (`WM_CTLCOLOREDIT`).
     search_brush: HBRUSH,
+}
+
+impl Dialog {
+    /// The font list `row`'s dropdown shows.
+    fn fonts_for(&self, row: Row) -> &[String] {
+        if row == Row::PreviewFont {
+            &self.preview_fonts
+        } else {
+            &self.fonts
+        }
+    }
 }
 
 impl Drop for Dialog {
@@ -333,10 +346,12 @@ fn create(
         page_layout.visible_rows(),
     );
     shortcuts.lines = super::main_window::key_line_commands(owner);
-    let fonts = crate::platform::fonts::dropdown_names(
-        crate::platform::fonts::installed_font_families(),
-        &view.settings.font_face,
+    let families = crate::platform::fonts::installed_font_families();
+    let preview_fonts = crate::platform::fonts::preview_dropdown_names(
+        families.clone(),
+        &view.settings.preview_font,
     );
+    let fonts = crate::platform::fonts::dropdown_names(families, &view.settings.font_face);
     let state = Box::new(Dialog {
         colors,
         link_color,
@@ -344,6 +359,7 @@ fn create(
         view,
         model: DialogModel::new(page),
         fonts,
+        preview_fonts,
         scroll: 0,
         title_font,
         heading_font,
@@ -650,8 +666,9 @@ fn run(hwnd: HWND, effect: Effect) {
         Effect::OpenDropdown(row) => open_list(hwnd, row),
         Effect::StepDropdown(row, forward) => {
             // The borrow ends before the change applies, as for a pick from the list.
-            let action = state(hwnd)
-                .and_then(|dialog| dropdown_step(row, forward, &dialog.view, &dialog.fonts));
+            let action = state(hwnd).and_then(|dialog| {
+                dropdown_step(row, forward, &dialog.view, dialog.fonts_for(row))
+            });
             if let Some(action) = action {
                 run(hwnd, Effect::Apply(action));
             }
@@ -785,7 +802,7 @@ fn open_list(hwnd: HWND, row: Row) {
         return;
     };
     dialog.list = None;
-    let (items, selected) = dialog.view.dropdown(row, &dialog.fonts);
+    let (items, selected) = dialog.view.dropdown(row, dialog.fonts_for(row));
     let control = dialog
         .layout
         .control_rect(row, dialog.layout.row_rect(row, dialog.scroll), 0);
@@ -827,7 +844,7 @@ fn close_list(hwnd: HWND) -> bool {
 fn pick(hwnd: HWND, index: usize) {
     let action = state(hwnd).and_then(|dialog| {
         let (row, _) = dialog.list.take()?;
-        dropdown_action(row, index, &dialog.fonts)
+        dropdown_action(row, index, dialog.fonts_for(row))
     });
     invalidate(hwnd);
     if let Some(action) = action {
