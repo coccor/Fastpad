@@ -910,16 +910,16 @@ fn the_search_field_is_client_area_and_a_press_on_its_padding_focuses_the_box() 
         let lparam = ((point.y as u16 as u32) << 16 | point.x as u16 as u32) as LPARAM;
         unsafe { SendMessageW(panel, WM_NCHITTEST, 0, lparam) }
     };
-    // The field's top-left padding, outside the Edit, and the header left of the field.
+    // The field's top-left padding, outside the Edit, and the title band above the field.
     assert_ne!(
         hit_test(field.left + 1, field.top + 1),
         HTTRANSPARENT as LRESULT,
         "the field is client area"
     );
     assert_eq!(
-        hit_test(field.left - 2, field.top + 1),
+        hit_test(field.left - 2, 1),
         HTTRANSPARENT as LRESULT,
-        "the header around the field still drags the window"
+        "the title band above the field still drags the window"
     );
 
     let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();

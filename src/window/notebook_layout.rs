@@ -15,6 +15,11 @@ const ROOT_BUTTON: i32 = 22;
 const CHEVRON_LEFT: i32 = 4;
 const CHEVRON: i32 = 16;
 const RIGHT_PAD: i32 = 6;
+/// The notebook's name keeps at least this much of the root row before a button gives way to the
+/// "…" menu.
+const MIN_NAME: i32 = 72;
+/// The buttons that always show, whatever the width: Refresh, the folders toggle and "…".
+const ALWAYS_SHOWN: usize = 3;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PanelLayout {
@@ -78,32 +83,68 @@ pub(crate) fn section_chevron(row: RECT, dpi: u32) -> RECT {
 pub(crate) struct RootParts {
     pub chevron: RECT,
     pub name: RECT,
-    /// Left to right: star, New note, New folder, "…".
-    pub buttons: [(HeaderButton, RECT); 4],
+    /// Left to right: star, New note, New folder, Refresh, Collapse/Expand all, "…". A button
+    /// that does not fit the panel has an empty rectangle (`shown`, `hidden`).
+    pub buttons: [(HeaderButton, RECT); 6],
 }
 
-/// The root row's chevron, the notebook's name after it, and its four buttons at the right.
+impl RootParts {
+    /// The buttons painted, left to right.
+    pub(crate) fn shown(&self) -> impl Iterator<Item = (HeaderButton, RECT)> + '_ {
+        self.buttons
+            .iter()
+            .copied()
+            .filter(|(_, rect)| rect.right > rect.left)
+    }
+
+    /// The buttons a narrow panel left out, which the "…" menu offers instead.
+    pub(crate) fn hidden(&self) -> impl Iterator<Item = HeaderButton> + '_ {
+        self.buttons
+            .iter()
+            .filter(|(_, rect)| rect.right <= rect.left)
+            .map(|(button, _)| *button)
+    }
+}
+
+/// The root row's chevron, the notebook's name after it, and its six buttons at the right. In a
+/// narrow panel the leftmost buttons drop out, so the name keeps `MIN_NAME` (Refresh, the
+/// folders toggle and "…" stay).
 pub(crate) fn root_parts(row: RECT, dpi: u32) -> RootParts {
     let chevron = section_chevron(row, dpi);
     let size = scale(ROOT_BUTTON, dpi);
     let top = row.top + (row.bottom - row.top - size) / 2;
     let right = row.right - scale(RIGHT_PAD, dpi);
-    let slot = |from_right: i32| RECT {
-        left: (right - (from_right + 1) * size).max(chevron.right),
-        top,
-        right: (right - from_right * size).max(chevron.right),
-        bottom: top + size,
+    let room = (right - chevron.right - scale(MIN_NAME, dpi)).max(0);
+    let count = ((room / size.max(1)) as usize).clamp(ALWAYS_SHOWN, 6);
+    let slot = |from_right: usize| {
+        if from_right >= count {
+            return RECT {
+                left: chevron.right,
+                top,
+                right: chevron.right,
+                bottom: top + size,
+            };
+        }
+        let from_right = from_right as i32;
+        RECT {
+            left: (right - (from_right + 1) * size).max(chevron.right),
+            top,
+            right: (right - from_right * size).max(chevron.right),
+            bottom: top + size,
+        }
     };
     let buttons = [
-        (HeaderButton::Favorite, slot(3)),
-        (HeaderButton::NewNote, slot(2)),
-        (HeaderButton::NewFolder, slot(1)),
+        (HeaderButton::Favorite, slot(5)),
+        (HeaderButton::NewNote, slot(4)),
+        (HeaderButton::NewFolder, slot(3)),
+        (HeaderButton::Refresh, slot(2)),
+        (HeaderButton::ToggleFolders, slot(1)),
         (HeaderButton::More, slot(0)),
     ];
     let name = RECT {
         left: chevron.right,
         top: row.top,
-        right: buttons[0].1.left.max(chevron.right),
+        right: buttons[5 - (count - 1)].1.left.max(chevron.right),
         bottom: row.bottom,
     };
     RootParts {
@@ -184,25 +225,84 @@ mod tests {
             bottom: 168,
         };
         let parts = root_parts(row, 96);
-        let [(a, star), (b, new), (c, folder), (d, more)] = parts.buttons;
+        let [
+            (a, star),
+            (b, new),
+            (c, folder),
+            (d, refresh),
+            (e, toggle),
+            (f, more),
+        ] = parts.buttons;
         assert_eq!(
-            (a, b, c, d),
+            (a, b, c, d, e, f),
             (
                 HeaderButton::Favorite,
                 HeaderButton::NewNote,
                 HeaderButton::NewFolder,
+                HeaderButton::Refresh,
+                HeaderButton::ToggleFolders,
                 HeaderButton::More
             )
         );
         assert_eq!(edges(more), (232, 144, 254, 166));
         assert_eq!(
-            (star.right, new.right, folder.right),
-            (new.left, folder.left, more.left)
+            (
+                star.right,
+                new.right,
+                folder.right,
+                refresh.right,
+                toggle.right
+            ),
+            (new.left, folder.left, refresh.left, toggle.left, more.left)
         );
         assert_eq!(parts.name.right, star.left);
         assert_eq!(parts.name.left, parts.chevron.right);
         assert_eq!(edges(parts.chevron), (4, 142, 20, 168));
+        assert_eq!(parts.shown().count(), 6);
+        assert_eq!(parts.hidden().count(), 0);
         let narrow = root_parts(RECT { right: 40, ..row }, 96);
         assert!(narrow.name.left <= narrow.name.right);
+    }
+
+    #[test]
+    fn a_narrow_panel_drops_the_leftmost_buttons_but_keeps_refresh_toggle_and_more() {
+        // Break caught: six buttons squeezing the notebook's name to nothing at the narrowest
+        // panel (180 px), or a button that does not fit still painted or hit as a sliver.
+        let row = |right| RECT {
+            left: 0,
+            top: 0,
+            right,
+            bottom: 26,
+        };
+        let names = |right| {
+            let parts = root_parts(row(right), 96);
+            let shown: Vec<_> = parts.shown().map(|(button, _)| button).collect();
+            let hidden: Vec<_> = parts.hidden().collect();
+            (shown, hidden, parts.name.right - parts.name.left)
+        };
+        let (shown, hidden, name) = names(180);
+        assert_eq!(
+            shown,
+            [
+                HeaderButton::Refresh,
+                HeaderButton::ToggleFolders,
+                HeaderButton::More
+            ]
+        );
+        assert_eq!(
+            hidden,
+            [
+                HeaderButton::Favorite,
+                HeaderButton::NewNote,
+                HeaderButton::NewFolder
+            ]
+        );
+        assert!(name >= 72, "{name}");
+        let (shown, hidden, name) = names(220);
+        assert_eq!((shown.len(), hidden), (5, vec![HeaderButton::Favorite]));
+        assert!(name >= 72, "{name}");
+        assert_eq!(names(400).0.len(), 6);
+        let (_, _, name) = names(40);
+        assert!(name >= 0, "a degenerate panel never inverts the name");
     }
 }

@@ -1,7 +1,8 @@
 use super::{
-    FocusStop, LOADING, NO_MATCH, NO_NOTEBOOK, PADDING_AT_96_DPI, REPLACE_ROW_AT_96_DPI,
-    ROW_AT_96_DPI, ROW_INSET_AT_96_DPI, ROW_LINE_AT_96_DPI, SearchState, SearchView, TOO_SHORT,
-    fit_before, next_stop, notice_text, placeholder, skipped_tooltip, status_text, summary_text,
+    CLEAR_TOOL, FocusStop, HeaderButton, LOADING, NO_MATCH, NO_NOTEBOOK, PADDING_AT_96_DPI,
+    REPLACE_ROW_AT_96_DPI, ROW_AT_96_DPI, ROW_INSET_AT_96_DPI, ROW_LINE_AT_96_DPI, SearchState,
+    SearchView, TOO_SHORT, fit_before, next_stop, notice_text, placeholder, skipped_tooltip,
+    status_text, summary_text,
 };
 use crate::library::text_search::{Progress, RunEnd, TextHit};
 use crate::search::{MatchOptions, SearchOption, Snippet};
@@ -9,7 +10,7 @@ use crate::window::notebook_view::LOAD_FAILED;
 use crate::window::panel::scale;
 use crate::window::text_search_host::SearchBatch;
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::Foundation::{POINT, RECT};
 
 #[test]
 fn the_notice_explains_an_empty_list() {
@@ -598,4 +599,68 @@ fn tab_cycles_the_box_the_replace_field_and_the_results_and_wraps() {
     assert_eq!(next_stop(Replace, true, true, false), Box);
     assert_eq!(next_stop(Box, false, false, false), Box);
     assert_eq!(next_stop(Box, true, false, false), Box);
+}
+
+#[test]
+fn the_title_band_sits_above_the_field_and_the_clear_button_left_of_the_toggles() {
+    // Break caught: the field drawn inside the title band (it would be caption, not a field), or
+    // the clear button over a toggle or outside the field.
+    for dpi in [96, 144, 192] {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 320,
+            bottom: 600,
+        };
+        let title = SearchView::title_rect(client, dpi);
+        let field = SearchView::field_rect(client, dpi);
+        let clear = SearchView::clear_rect(client, dpi);
+        let toggles = crate::window::option_toggles::toggle_rects(field, dpi);
+        assert_eq!(title.bottom, scale(38, dpi));
+        assert!(field.top >= title.bottom, "{dpi}");
+        assert!(
+            clear.left >= field.left && clear.right <= toggles[0].left,
+            "{dpi}"
+        );
+        assert!(
+            clear.top >= field.top && clear.bottom <= field.bottom,
+            "{dpi}"
+        );
+        let view = SearchView::new(std::ptr::null_mut(), dpi);
+        assert!(view.summary_rect(client, dpi).top >= field.bottom, "{dpi}");
+    }
+}
+
+#[test]
+fn the_clear_button_shows_and_hits_only_while_the_box_has_text() {
+    // Break caught: an x on an empty field, or one that can't be clicked once text is typed.
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 320,
+        bottom: 600,
+    };
+    let mut view = SearchView::new(std::ptr::null_mut(), 96);
+    view.edit = Some(std::ptr::null_mut());
+    let clear = SearchView::clear_rect(client, 96);
+    let center = POINT {
+        x: (clear.left + clear.right) / 2,
+        y: (clear.top + clear.bottom) / 2,
+    };
+    assert!(!view.clear_shown());
+    assert_eq!(view.header_button_at(center, client, 96), None);
+    let tool = |view: &SearchView| {
+        view.tooltip_tools(client, 96)
+            .into_iter()
+            .find(|tool| tool.0 == CLEAR_TOOL)
+            .map(|tool| tool.2)
+    };
+    assert_eq!(tool(&view).as_deref(), Some(""));
+    view.box_text = "needle".to_owned();
+    assert!(view.clear_shown());
+    assert_eq!(
+        view.header_button_at(center, client, 96),
+        Some(HeaderButton::Clear)
+    );
+    assert_eq!(tool(&view).as_deref(), Some("Clear search"));
 }

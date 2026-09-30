@@ -551,6 +551,20 @@ impl NoteTree {
         self.count -= 1;
     }
 
+    /// Every folder's path, relative to the notebook, parents before their children.
+    pub fn folder_paths(&self) -> Vec<PathBuf> {
+        fn walk(folder: &Folder, path: &Path, out: &mut Vec<PathBuf>) {
+            for child in &folder.folders {
+                let path = path.join(&child.name);
+                out.push(path.clone());
+                walk(child, &path, out);
+            }
+        }
+        let mut paths = Vec::new();
+        walk(&self.root, Path::new(""), &mut paths);
+        paths
+    }
+
     /// Whether the tree has a folder at `path`, ignoring case.
     pub fn contains_folder(&self, path: &Path) -> bool {
         folder_parts(path).is_some_and(|parts| self.trail(&parts).is_some())

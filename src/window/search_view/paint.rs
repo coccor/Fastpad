@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::search::Snippet;
+use crate::window::file_icons::note_kind;
+use crate::window::icon_sets::TreeItem;
+use crate::window::notebook_view::draw_item_icon;
 use crate::window::option_toggles;
 use crate::window::palette::Palette;
 use crate::window::panel::{fill, inset, scale};
@@ -151,6 +154,18 @@ impl SearchView {
         let glyph = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
         unsafe {
             fill(paint.hdc, client, paint.background);
+            let title = Self::title_rect(client, dpi);
+            draw_text(
+                paint.hdc,
+                TITLE,
+                RECT {
+                    left: title.left + scale(TITLE_INSET_AT_96_DPI, dpi),
+                    ..title
+                },
+                paint.fonts.bold,
+                palette.muted_foreground,
+                line,
+            );
             if self.edit.is_some() {
                 let field = Self::field_rect(client, dpi);
                 fill(paint.hdc, field, palette.selection_background);
@@ -180,6 +195,21 @@ impl SearchView {
                     button_color(true, hover, palette.muted_foreground, &palette),
                     glyph,
                 );
+                if self.clear_shown() {
+                    let clear = Self::clear_rect(client, dpi);
+                    let hover = self.header_hover == Some(HeaderButton::Clear);
+                    if hover {
+                        fill(paint.hdc, clear, palette.hover_background);
+                    }
+                    draw_text(
+                        paint.hdc,
+                        CLEAR_GLYPH,
+                        clear,
+                        paint.fonts.glyph,
+                        button_color(true, hover, palette.muted_foreground, &palette),
+                        glyph,
+                    );
+                }
                 if self.replace_open {
                     let replace = Self::replace_field_rect(client, dpi);
                     fill(paint.hdc, replace, palette.selection_background);
@@ -295,13 +325,17 @@ impl SearchView {
             ..text
         };
         unsafe {
-            draw_text(
+            draw_item_icon(
                 hdc,
-                DOCUMENT_GLYPH,
+                TreeItem::Note(note_kind(&result.path)),
                 glyph,
-                paint.fonts.glyph,
+                scale(ICON_AT_96_DPI, dpi),
                 muted,
-                line | DT_CENTER,
+                &palette,
+                &paint.icons,
+                &mut self.images.borrow_mut(),
+                paint.icon_set,
+                paint.light_theme,
             );
             let width = draw_text(
                 hdc,
