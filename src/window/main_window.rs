@@ -20536,6 +20536,9 @@ three"
                     dialog_rect.right - dialog_rect.left,
                 )
             };
+            // Small enough to fit a 1024 px wide screen (a CI runner's) from the 860 px opening
+            // width: the system holds a window to the screen, so a bigger step would come up short.
+            const GROWTH: i32 = 100;
             let before = measure();
             let (_, _, width) = before;
             SetWindowPos(
@@ -20543,7 +20546,7 @@ three"
                 std::ptr::null_mut(),
                 0,
                 0,
-                width + 200,
+                width + GROWTH,
                 900,
                 SWP_NOMOVE | SWP_NOZORDER,
             );
@@ -20571,7 +20574,7 @@ three"
         assert!(bigger.0 > before.0, "a taller dialog shows more rows");
         assert_eq!(
             bigger.1,
-            before.1 + 200,
+            before.1 + 100,
             "the search field widens with the dialog"
         );
         assert!(smallest.2 > 100, "held at a minimum width");
