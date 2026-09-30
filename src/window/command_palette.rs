@@ -50,7 +50,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 105] = [
+pub(crate) const ENTRIES: [PaletteEntry; 106] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -190,6 +190,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 105] = [
         "Editor: Toggle highlight current line",
         CommandId::ToggleHighlightCurrentLine,
     ),
+    entry("View: Toggle always on top", CommandId::ToggleAlwaysOnTop),
     entry("File: Exit", CommandId::Exit),
     entry("Preferences: Open Settings", CommandId::OpenSettings),
     entry(
@@ -1514,7 +1515,7 @@ mod tests {
             shortcut_text(CommandId::QuickOpen).as_deref(),
             Some("Ctrl+P")
         );
-        assert_eq!(ENTRIES.len(), 105);
+        assert_eq!(ENTRIES.len(), 106);
     }
 
     #[test]

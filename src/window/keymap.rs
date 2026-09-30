@@ -299,6 +299,7 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
         CommandId::ToggleHighlightCurrentLine,
         "editor.toggleHighlightCurrentLine",
     ),
+    (CommandId::ToggleAlwaysOnTop, "view.toggleAlwaysOnTop"),
     (CommandId::ToggleNotesMode, "notes.toggleNotesMode"),
     (CommandId::ToggleFolderAutosave, "notes.toggleAutosave"),
     (CommandId::CloseNotebook, "notebook.close"),

@@ -112,6 +112,8 @@ pub struct Settings {
     pub show_whitespace: bool,
     /// Whether the caret's line gets the theme's caret-line background.
     pub highlight_current_line: bool,
+    /// Whether the window stays above other windows.
+    pub always_on_top: bool,
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
     /// `None` opens it at its natural size. Saved when a resize drag ends.
     pub settings_size: Option<(u16, u16)>,
@@ -176,6 +178,9 @@ impl Settings {
         if let Some(highlight_current_line) = delta.highlight_current_line {
             self.highlight_current_line = highlight_current_line;
         }
+        if let Some(always_on_top) = delta.always_on_top {
+            self.always_on_top = always_on_top;
+        }
         for (id, value) in &delta.key_overrides {
             self.key_overrides.insert(id.clone(), value.clone());
         }
@@ -214,6 +219,7 @@ pub struct SettingsDelta {
     pub insert_spaces: Option<bool>,
     pub show_whitespace: Option<bool>,
     pub highlight_current_line: Option<bool>,
+    pub always_on_top: Option<bool>,
     pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
 }
@@ -223,7 +229,7 @@ pub struct SettingsDelta {
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `file_icons`, `open_editors_expanded`,
-/// `insert_spaces`, `show_whitespace` and `highlight_current_line` are recognized.
+/// `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
@@ -341,6 +347,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "highlight_current_line" => match parse_bool(value) {
             Some(highlight) => delta.highlight_current_line = Some(highlight),
+            None => warn(delta, line_number, key, value),
+        },
+        "always_on_top" => match parse_bool(value) {
+            Some(always_on_top) => delta.always_on_top = Some(always_on_top),
             None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
@@ -1008,6 +1018,25 @@ mod tests {
             assert_eq!(delta.font_size, Some(12), "{key} keeps the other lines");
         }
         assert_eq!(parse("insert_spaces=maybe").insert_spaces, None);
+    }
+
+    #[test]
+    fn always_on_top_parses_as_a_bool_and_defaults_off() {
+        // Break caught: the key reported as unknown, a typo silently turning it on, or the
+        // default pinning every fresh profile's window above the others.
+        assert!(!default_settings().always_on_top);
+
+        let delta = parse("always_on_top=yes\n");
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        assert_eq!(delta.always_on_top, Some(true));
+        let mut settings = default_settings();
+        settings.apply_delta(&delta);
+        assert!(settings.always_on_top);
+
+        let delta = parse("always_on_top=sometimes\nfont_size=12");
+        assert_eq!(delta.warnings.len(), 1);
+        assert_eq!(delta.always_on_top, None);
+        assert_eq!(delta.font_size, Some(12));
     }
 
     #[test]

@@ -229,6 +229,7 @@ line in a notification and applies the rest.
 | `insert_spaces` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `show_whitespace` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `highlight_current_line` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |

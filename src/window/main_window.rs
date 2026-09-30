@@ -3618,6 +3618,13 @@ fn execute_command_with_note(hwnd: HWND, command: CommandId, recorded: Option<st
                 settings.highlight_current_line.to_string(),
             ))
         }),
+        CommandId::ToggleAlwaysOnTop => {
+            change_setting(hwnd, |settings| {
+                settings.always_on_top = !settings.always_on_top;
+                Some(("always_on_top", settings.always_on_top.to_string()))
+            });
+            apply_always_on_top(hwnd);
+        }
         CommandId::ToggleRestoreSession => {
             change_setting(hwnd, |settings| {
                 settings.restore_session = !settings.restore_session;
@@ -4011,7 +4018,12 @@ pub(crate) fn change_setting(
     // not restyled for them.
     let sidebar_only = matches!(
         key,
-        "sidebar_view" | "sidebar_width" | "file_icons" | "open_editors_expanded" | "settings_size"
+        "sidebar_view"
+            | "sidebar_width"
+            | "file_icons"
+            | "open_editors_expanded"
+            | "settings_size"
+            | "always_on_top"
     );
     if theme_changed {
         apply_theme(hwnd);
@@ -4204,9 +4216,35 @@ fn apply_loaded_settings(
         }
     }
     apply_editor_settings(hwnd);
+    apply_always_on_top(hwnd);
     if sidebar_changed {
         let notes_mode = notes_mode_enabled(hwnd);
         crate::window::side_panel::notes_mode_changed(hwnd, notes_mode);
+    }
+}
+
+/// Puts the window above every non-topmost window, or back among them, to match the
+/// `always_on_top` setting. Neither move nor resize nor activate: only the z-order changes.
+fn apply_always_on_top(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST};
+    let Some(app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    let insert_after = if unsafe { app.as_ref() }.settings.always_on_top {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -11232,6 +11270,41 @@ three"
             std::fs::read_to_string(&ini).unwrap(),
             "# kept\r\ninsert_spaces=true\r\nshow_whitespace=true\r\n\
              highlight_current_line=true\r\ntheme=dark\r\n"
+        );
+    }
+
+    #[test]
+    fn always_on_top_pins_the_window_and_saves_only_its_own_line() {
+        // Break caught: a toggle that saves but never changes the window's z-order, one that
+        // leaves the window topmost after switching off, or one that rewrites the rest of
+        // fastpad.ini.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, WS_EX_TOPMOST};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("always-on-top");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept
+").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+        let topmost = || unsafe {
+            GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0
+        };
+        assert!(!topmost(), "off by default");
+
+        execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+        assert!(topmost());
+        execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+        assert!(!topmost());
+        execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+        super::save_settings_to(None);
+
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept
+always_on_top=true
+"
         );
     }
 

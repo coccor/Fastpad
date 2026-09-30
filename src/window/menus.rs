@@ -183,6 +183,8 @@ impl MenuBar {
                     MenuEntry::command("Side&bar", CommandId::ToggleSidebar),
                     MenuEntry::Submenu("Editor &Layout", editor_layout()),
                     MenuEntry::Separator,
+                    MenuEntry::command("&Always on top", CommandId::ToggleAlwaysOnTop),
+                    MenuEntry::Separator,
                     MenuEntry::command(
                         "Markdown preview &side by side",
                         CommandId::MarkdownPreviewSide,

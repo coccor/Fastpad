@@ -130,6 +130,7 @@ pub enum CommandId {
     OpenSettings = 235,
     EditSettingsFile = 236,
     OpenKeyboardShortcuts = 237,
+    ToggleAlwaysOnTop = 238,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -247,6 +248,7 @@ impl CommandId {
                 | Self::OpenSettings
                 | Self::EditSettingsFile
                 | Self::OpenKeyboardShortcuts
+                | Self::ToggleAlwaysOnTop
         )
     }
 
@@ -378,7 +380,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 127] = [
+        const COMMANDS: [CommandId; 128] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -506,6 +508,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::OpenSettings,
             CommandId::EditSettingsFile,
             CommandId::OpenKeyboardShortcuts,
+            CommandId::ToggleAlwaysOnTop,
         ];
         COMMANDS
             .into_iter()
@@ -539,13 +542,14 @@ mod tests {
     use super::CommandId;
 
     #[test]
-    fn the_editor_display_toggles_are_232_to_234_and_need_no_document() {
+    fn the_display_toggles_are_232_to_234_and_238_and_need_no_document() {
         // Break caught: a toggle renumbered onto another command, or greyed out while no tab is
         // open (settings dialog spec §4.3).
         for (value, command) in [
             (232, CommandId::ToggleInsertSpaces),
             (233, CommandId::ToggleShowWhitespace),
             (234, CommandId::ToggleHighlightCurrentLine),
+            (238, CommandId::ToggleAlwaysOnTop),
         ] {
             assert_eq!(command as u16, value);
             assert_eq!(CommandId::try_from(value), Ok(command));
