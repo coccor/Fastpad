@@ -1,4 +1,12 @@
 use super::*;
+use crate::config::FileIconSet;
+use crate::window::file_icons::note_kind;
+use crate::window::icon_sets::TreeItem;
+use crate::window::palette::{FileIcons, Palette};
+use crate::window::panel::fill;
+use crate::window::row_list::RowLook;
+use crate::window::side_panel::{UiFonts, ViewPaint};
+use crate::window::tree_drag::DragSource;
 
 /// `RECT` has no `PartialEq` or `Debug` in windows-sys.
 fn edges(rect: RECT) -> (i32, i32, i32, i32) {
