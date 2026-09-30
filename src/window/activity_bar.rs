@@ -22,8 +22,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS,
 };
 
-/// Segoe MDL2 Assets glyphs: Library, Search, FavoriteStar, Setting.
-const GLYPH_NOTEBOOK: &str = "\u{E8F1}";
+/// Segoe MDL2 Assets glyphs: Book, Search, FavoriteStar, Setting.
+const GLYPH_NOTEBOOK: &str = "\u{E82D}";
 const GLYPH_SEARCH: &str = "\u{E721}";
 const GLYPH_FAVORITES: &str = "\u{E734}";
 const GLYPH_SETTINGS: &str = "\u{E713}";
