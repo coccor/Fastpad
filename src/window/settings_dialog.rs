@@ -311,7 +311,7 @@ fn create(
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
     let title_font = type_ramp::create(TextStyle::Title, dpi);
     let heading_font = type_ramp::create(TextStyle::Heading, dpi);
-    let body_font = type_ramp::create(TextStyle::DialogBody, dpi);
+    let body_font = type_ramp::create(TextStyle::Body, dpi);
     let link_font = create_underlined_font(scale(13, dpi));
     let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
 

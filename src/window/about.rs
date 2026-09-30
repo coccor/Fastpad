@@ -390,7 +390,7 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
     // The title matches Settings' title.
     let title_font = type_ramp::create(TextStyle::Title, dpi);
-    let body_font = type_ramp::create(TextStyle::DialogBody, dpi);
+    let body_font = type_ramp::create(TextStyle::Body, dpi);
     let link_font = create_underlined_font(scale(13, dpi));
     let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
     let link_widths = Link::ALL.map(|link| measure(dialog, link_font, link.label()));
