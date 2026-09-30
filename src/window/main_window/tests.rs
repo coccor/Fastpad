@@ -1,0 +1,19098 @@
+use super::{
+    MainWindowClass, WindowCreateContext, execute_command, handle_paint_with,
+    mark_first_paint_complete, pump_posted_messages, sidebar_command_runs,
+    take_deferred_start_pending, with_command_palette,
+};
+use crate::app::App;
+use crate::document::{CloseDecision, Language, RecoveryId};
+use crate::editor::scintilla_constants::SCI_GETMODIFY;
+use crate::file::encoding::Encoding;
+use crate::languages::LanguageManager;
+use crate::launch::LaunchOptions;
+use crate::perf::StartupMetrics;
+use crate::recovery::snapshot::snapshot_path;
+use crate::recovery::{Snapshot, write_snapshot};
+use crate::session::{Session, SessionEntry, SessionSource};
+use crate::window::commands::CommandId;
+use crate::window::menus::answer_next_popup_menu;
+use crate::window::modal::{answer_next_close_prompt, answer_next_save_dialog};
+use crate::window::split_tree::GroupId;
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow,
+    MSG, PM_REMOVE, PeekMessageW, SendMessageW, WM_CLOSE, WM_PAINT,
+};
+
+#[test]
+fn the_main_window_has_a_title_for_the_taskbar() {
+    // Break caught: WM_NCCREATE handled without the default processing leaves the window text
+    // empty, so the taskbar button and Alt+Tab show only the icon.
+    let window = ProductionWindow::new(make_app());
+    let mut text = [0u16; 32];
+    let len = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+            window.hwnd,
+            text.as_mut_ptr(),
+            text.len() as i32,
+        )
+    };
+    assert_eq!(String::from_utf16_lossy(&text[..len as usize]), "FastPad");
+}
+
+#[test]
+fn the_main_window_class_resets_the_cursor_over_its_client_area() {
+    // Break caught: without a class cursor, WM_SETCURSOR over the tab strip (HTCLIENT) leaves
+    // whatever cursor was last shown, such as the editor's I-beam or a resize arrow.
+    let window = ProductionWindow::new(make_app());
+    let cursor = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetClassLongPtrW(
+            window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::GCLP_HCURSOR,
+        )
+    };
+    assert_ne!(cursor, 0);
+}
+
+#[test]
+fn the_window_title_follows_the_active_tab_and_its_dirty_state() {
+    // Break caught: the taskbar button keeps showing a stale or bare title while the tab strip
+    // shows which file is open and whether it has unsaved changes.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let window_text = || {
+        unsafe {
+            SendMessageW(window.hwnd, WM_PAINT, 0, 0);
+        }
+        let mut text = [0u16; 64];
+        let len = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                window.hwnd,
+                text.as_mut_ptr(),
+                text.len() as i32,
+            )
+        };
+        String::from_utf16_lossy(&text[..len as usize])
+    };
+
+    assert_eq!(window_text(), "Untitled - FastPad");
+    editor.set_text("dirty").unwrap();
+    // Notes mode is on by default, so the untitled tab picks up "dirty" as its label.
+    assert_eq!(window_text(), "dirty * - FastPad");
+    assert_eq!(super::window_title(None), "FastPad");
+}
+
+#[test]
+fn a_forwarded_request_is_handled_before_the_close_review_starts() {
+    // Break caught: a launch forwarded just before WM_CLOSE is dropped when the window closes,
+    // so the file the user double-clicked silently never opens.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("dirty").unwrap();
+    app_mut(window.hwnd)
+        .ipc_requests
+        .push(crate::ipc::IpcRequest::New);
+    let tabs_at_prompt = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&tabs_at_prompt);
+    answer_next_close_prompt(move |hwnd| {
+        observed.store(app_mut(hwnd).tabs.len(), Ordering::SeqCst);
+        CloseDecision::Cancel
+    });
+
+    unsafe {
+        SendMessageW(window.hwnd, WM_CLOSE, 0, 0);
+    }
+
+    assert_ne!(
+        unsafe { IsWindow(window.hwnd) },
+        0,
+        "Cancel must abort the close"
+    );
+    assert_eq!(
+        tabs_at_prompt.load(Ordering::SeqCst),
+        2,
+        "the queued request must be handled before the review starts"
+    );
+    assert!(app_mut(window.hwnd).ipc_requests.is_empty());
+}
+
+#[test]
+fn a_confirmed_close_releases_the_pipe_server_and_the_instance_mutex() {
+    // Break caught: dropping the instance mutex before the pipe server lets the next launch
+    // claim the session and fail to bind a name this process still owns.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let names = crate::ipc::server::tests::unique_names();
+    app_mut(window.hwnd).instance_mutex = Some(unnamed_mutex());
+    super::start_ipc_server_with(window.hwnd, || {
+        crate::ipc::IpcServer::bind(&names, &crate::ipc::CurrentUserAcl::current()?)
+    });
+    assert!(app_mut(window.hwnd).ipc.is_some());
+
+    unsafe {
+        SendMessageW(window.hwnd, WM_CLOSE, 0, 0);
+    }
+
+    assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+    crate::ipc::IpcServer::bind(&names, &crate::ipc::CurrentUserAcl::current().unwrap())
+        .expect("the pipe name must be free once the window has closed");
+}
+
+#[test]
+fn deferred_startup_work_is_held_until_the_modal_prompt_closes() {
+    // Break caught: a nested modal loop dispatches deferred chain units, so recovery can push
+    // and activate tabs while a close prompt or file dialog is deciding about another one.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("modal-deferred");
+    write_snapshot(
+        root.path(),
+        &Snapshot::new(
+            RecoveryId::from_u128(0x5151),
+            None,
+            Encoding::Utf8,
+            "recovered elsewhere",
+        ),
+    )
+    .unwrap();
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+    editor.set_text("dirty").unwrap();
+    let before = app_mut(window.hwnd).tabs.len();
+
+    answer_next_close_prompt(|hwnd| {
+        unsafe {
+            SendMessageW(hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0);
+        }
+        CloseDecision::Cancel
+    });
+    execute_command(window.hwnd, CommandId::CloseTab);
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        before,
+        "the recovery unit ran inside the modal loop"
+    );
+
+    pump_posted_messages(window.hwnd);
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        before + 1,
+        "the held recovery unit must run once the modal loop ends"
+    );
+}
+
+#[test]
+fn recovery_never_reopens_a_snapshot_an_open_tab_already_holds() {
+    // Break caught: a later Open (every open re-runs the recovery unit) or a session restore
+    // opening a second copy of text that is already in a tab.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("claimed");
+    write_snapshot(
+        root.path(),
+        &Snapshot::new(
+            RecoveryId::from_u128(0x7171),
+            None,
+            Encoding::Utf8,
+            "held once",
+        ),
+    )
+    .unwrap();
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+
+    unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0) };
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+    unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0) };
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+}
+
+#[test]
+fn queued_ipc_requests_wait_for_the_overflow_menu_to_close() {
+    // Break caught: a popup menu's own modal loop dispatches a forwarded request, so a
+    // new tab becomes active underneath it and the command the user picks acts on that tab
+    // instead of the one they opened the menu on.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("dirty").unwrap();
+    app_mut(window.hwnd)
+        .ipc_requests
+        .push(crate::ipc::IpcRequest::New);
+    let before = app_mut(window.hwnd).tabs.len();
+
+    answer_next_popup_menu(|hwnd| {
+        unsafe {
+            SendMessageW(hwnd, crate::window::WM_FASTPAD_IPC_REQUEST, 0, 0);
+        }
+        None
+    });
+    assert!(crate::window::menus::show_tab_strip_menu(window.hwnd, 0, 0, true).is_none());
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        before,
+        "a forwarded request was handled inside the popup menu's modal loop"
+    );
+
+    pump_posted_messages(window.hwnd);
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        before + 1,
+        "the held request must run once the overflow menu closes"
+    );
+}
+
+#[test]
+fn closing_every_tab_hides_the_editor_until_the_empty_strip_opens_a_new_one() {
+    // Break caught: the last tab being silently replaced (its close button looks inert), the
+    // hidden editor still taking edits, or the empty strip's double-click and context menu
+    // not reaching New and Close all tabs.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongPtrW, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WS_VISIBLE,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let editor_visible =
+        || unsafe { GetWindowLongPtrW(editor.hwnd(), GWL_STYLE) } as u32 & WS_VISIBLE != 0;
+    assert!(editor_visible());
+
+    execute_command(window.hwnd, CommandId::CloseTab);
+
+    assert!(app_mut(window.hwnd).tabs.is_empty());
+    assert!(!editor_visible());
+    execute_command(window.hwnd, CommandId::Paste);
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert_eq!(editor.text().unwrap(), "");
+
+    // A double-click on the group's empty strip opens a tab; the caption maximizes instead.
+    // The far end of the tab viewport stays empty while two tabs fit.
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let layout = super::strip_layout(window.hwnd).unwrap();
+    let strip = client_lparam(layout.tabs.right - 10, layout.height / 2);
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDBLCLK, 1, strip);
+        SendMessageW(group, WM_LBUTTONDBLCLK, 1, strip);
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+    assert!(editor_visible());
+
+    answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
+    unsafe {
+        SendMessageW(group, WM_RBUTTONUP, 0, strip);
+    }
+    assert!(app_mut(window.hwnd).tabs.is_empty());
+    assert!(!editor_visible());
+}
+
+#[test]
+fn keyboard_shortcuts_reach_their_commands_through_the_accelerator_table() {
+    // Break caught: every shortcut dead in the running app while command-level tests pass,
+    // because nothing exercised the accelerator translation the message loop depends on.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let message = MSG {
+        hwnd: editor.hwnd(),
+        message: WM_KEYDOWN,
+        wParam: usize::from(b'T'),
+        ..Default::default()
+    };
+    let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+
+    assert!(translated, "Ctrl+T was not translated");
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+}
+
+#[test]
+fn tab_shortcuts_cycle_with_wrap_around_and_select_by_position() {
+    // Break caught: Ctrl+Tab stopping at the last tab, or Ctrl+9 with fewer than nine tabs
+    // activating some other tab instead of doing nothing.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    execute_command(window.hwnd, CommandId::New);
+    let active = || app_mut(window.hwnd).tabs.active_index();
+    assert_eq!(active(), 2);
+
+    execute_command(window.hwnd, CommandId::NextTab);
+    assert_eq!(active(), 0);
+    execute_command(window.hwnd, CommandId::PreviousTab);
+    assert_eq!(active(), 2);
+    execute_command(window.hwnd, CommandId::PreviousTab);
+    assert_eq!(active(), 1);
+    execute_command(window.hwnd, CommandId::SelectTab1);
+    assert_eq!(active(), 0);
+    execute_command(window.hwnd, CommandId::SelectTab3);
+    assert_eq!(active(), 2);
+    execute_command(window.hwnd, CommandId::SelectTab9);
+    assert_eq!(active(), 2);
+}
+
+#[test]
+fn switching_tabs_restores_each_tabs_caret_and_scroll() {
+    // Break caught: switching tabs resetting the caret and scroll to the start of the document.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text(&"line\n".repeat(2000)).unwrap();
+    let saved = crate::editor::ViewState {
+        caret: 1210 * 5 + 2,
+        anchor: 1210 * 5,
+        first_line: 1200,
+        x_offset: 0,
+    };
+    editor.apply_view_state(saved).unwrap();
+    execute_command(window.hwnd, CommandId::New);
+    editor.set_text("second").unwrap();
+    assert_eq!(editor.view_state().unwrap().first_line, 0);
+
+    execute_command(window.hwnd, CommandId::SelectTab1);
+    assert_eq!(editor.view_state().unwrap(), saved);
+}
+
+#[test]
+fn replacing_in_a_background_tab_leaves_the_active_view_alone() {
+    // Break caught: a background replace swapping the document through the visible editor,
+    // so the active tab's caret, selection direction or scroll jumps.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text(&"line\n".repeat(2000)).unwrap();
+    let first = app_mut(window.hwnd).tabs.active().unwrap().id;
+    execute_command(window.hwnd, CommandId::New);
+    editor.set_text("foo foo").unwrap();
+    let second = app_mut(window.hwnd).tabs.active().unwrap().id;
+    execute_command(window.hwnd, CommandId::SelectTab1);
+    let shown = crate::editor::ViewState {
+        caret: 1210 * 5,
+        anchor: 1210 * 5 + 3,
+        first_line: 1200,
+        x_offset: 0,
+    };
+    editor.apply_view_state(shown).unwrap();
+
+    let matcher = crate::search::Matcher::new("foo", Default::default()).unwrap();
+    assert_eq!(
+        super::replace_in_document(window.hwnd, second, &matcher, "bar"),
+        Some(2)
+    );
+
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, first);
+    assert_eq!(editor.view_state().unwrap(), shown);
+    assert_eq!(
+        super::document_text(window.hwnd, second).unwrap(),
+        "bar bar"
+    );
+    assert!(app_mut(window.hwnd).tabs.document(second).unwrap().dirty);
+}
+
+#[test]
+fn a_second_group_gets_its_own_editor_find_bar_and_preview() {
+    // Break caught: a second group sharing the first one's editor or find bar, so a find in
+    // one group moves the caret in the other, or its preview state leaking across.
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetParent;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let second = super::create_group(window.hwnd).expect("second group");
+    assert_ne!(first, second);
+    let (first_editor, second_editor) = (
+        super::group_editor(window.hwnd, first).unwrap(),
+        super::group_editor(window.hwnd, second).unwrap(),
+    );
+    assert_ne!(first_editor.hwnd(), second_editor.hwnd());
+    let second_window = app_mut(window.hwnd).group(second).unwrap().hwnd;
+    assert_eq!(unsafe { GetParent(second_editor.hwnd()) }, second_window);
+    assert!(second_editor.shares_documents_with(&first_editor));
+
+    // Find needs a tab, so group 2 shows the document too.
+    let document = app_mut(window.hwnd).tabs.active().unwrap().id;
+    assert!(
+        app_mut(window.hwnd)
+            .tabs
+            .add_view(second, document, Default::default())
+    );
+    app_mut(window.hwnd).tabs.set_active_group(second);
+    execute_command(window.hwnd, CommandId::Find);
+    let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
+    assert_eq!(unsafe { GetParent(panel) }, second_window);
+    assert!(
+        app_mut(window.hwnd)
+            .group(first)
+            .unwrap()
+            .find_bar
+            .is_none()
+    );
+    assert_eq!(
+        app_mut(window.hwnd).group_containing(first_editor.hwnd()),
+        Some(first)
+    );
+
+    app_mut(window.hwnd).tabs.set_active_group(first);
+    assert!(app_mut(window.hwnd).tabs.move_view(second, document, first));
+    super::destroy_group(window.hwnd, second);
+    assert!(app_mut(window.hwnd).group(second).is_none());
+    assert_eq!(app_mut(window.hwnd).tabs.group_ids(), vec![first]);
+}
+
+fn second_group_showing_the_active_document(hwnd: HWND) -> (GroupId, GroupId) {
+    let first = app_mut(hwnd).tabs.active_group();
+    let second = super::create_group(hwnd).expect("second group");
+    let id = app_mut(hwnd).tabs.active().unwrap().id;
+    assert!(
+        app_mut(hwnd)
+            .tabs
+            .add_view(second, id, crate::editor::ViewState::default())
+    );
+    super::show_group_view(hwnd, second);
+    (first, second)
+}
+
+/// A point on group `id`'s strip past its last tab, in the group's client coordinates.
+fn empty_strip_point(hwnd: HWND, id: GroupId) -> LPARAM {
+    let layout = super::strip_layout_of(hwnd, id).unwrap();
+    let count = app_mut(hwnd).tabs.group(id).unwrap().len();
+    let last = layout.tab(count - 1).unwrap();
+    client_lparam(last.right + 10, layout.height / 2)
+}
+
+#[test]
+fn an_edit_in_one_group_shows_in_the_other_and_counts_once() {
+    // Break caught: document-level effects run by every editor showing the document, so one
+    // keystroke bumps the generation twice, or the other group's caret jumps to the edit.
+    use crate::editor::ViewState;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor
+        .set_text(
+            "one
+two
+three",
+        )
+        .unwrap();
+    let (_, second) = second_group_showing_the_active_document(window.hwnd);
+    let other = super::group_editor(window.hwnd, second).unwrap();
+    let at = |caret| ViewState {
+        caret,
+        anchor: caret,
+        first_line: 0,
+        x_offset: 0,
+    };
+    editor.apply_view_state(at(0)).unwrap();
+    other.apply_view_state(at(8)).unwrap();
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let before = app_mut(window.hwnd).tabs.document(id).unwrap().generation;
+
+    editor.replace_target(0..0, "x").unwrap();
+
+    assert_eq!(
+        other.text().unwrap(),
+        "xone
+two
+three"
+    );
+    let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+    assert_eq!(document.generation, before + 1);
+    assert!(document.dirty);
+    assert_eq!(
+        other.view_state().unwrap().caret,
+        9,
+        "the other caret moves with its text only"
+    );
+}
+
+#[test]
+fn focus_in_a_groups_editor_or_find_bar_makes_that_group_active() {
+    // Break caught: a click into group 2 leaving group 1 active, so Ctrl+F, the status bar
+    // and the title act on the group the user left.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = second_group_showing_the_active_document(window.hwnd);
+    let other = super::group_editor(window.hwnd, second).unwrap();
+
+    unsafe { SetFocus(other.hwnd()) };
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    execute_command(window.hwnd, CommandId::Find);
+    let query = app_mut(window.hwnd).find_bar().unwrap().query_hwnd();
+
+    let first_editor = super::group_editor(window.hwnd, first).unwrap();
+    unsafe { SetFocus(first_editor.hwnd()) };
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+    unsafe { SetFocus(query) };
+    super::pump_posted_messages(window.hwnd);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+}
+
+#[test]
+fn a_strip_menu_command_acts_on_the_group_that_was_right_clicked() {
+    // Break caught: the strip's menu running New in the active group instead of the group
+    // under the pointer.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = second_group_showing_the_active_document(window.hwnd);
+    super::layout_editor_and_find_bar(window.hwnd);
+    let group = app_mut(window.hwnd).group(second).unwrap().hwnd;
+    // Until groups are laid out side by side, the second one gets its size here.
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::MoveWindow(group, 0, 0, 600, 400, 0) };
+    let empty = empty_strip_point(window.hwnd, second);
+    answer_next_popup_menu(|_| Some(CommandId::New));
+    unsafe {
+        SendMessageW(group, WM_RBUTTONDOWN, 0, empty);
+        SendMessageW(group, WM_RBUTTONUP, 0, empty);
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    assert_eq!(app_mut(window.hwnd).tabs.group(second).unwrap().len(), 2);
+    assert_eq!(app_mut(window.hwnd).tabs.group(first).unwrap().len(), 1);
+}
+
+#[test]
+fn a_preview_opened_in_one_group_leaves_the_other_group_alone() {
+    // Break caught: one preview mode shared by every group, so Full preview in group 2 hides
+    // group 1's editor or opens a preview there too.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetWindowLongPtrW, WS_VISIBLE};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("# title").unwrap();
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Markdown);
+    let (first, second) = second_group_showing_the_active_document(window.hwnd);
+    super::activate_group(window.hwnd, second);
+    execute_command(window.hwnd, CommandId::MarkdownPreviewFull);
+    let mode =
+        |id| crate::window::preview_host::with_group_host(window.hwnd, id, |host| host.mode());
+    assert_eq!(mode(second), Some(crate::preview::PreviewMode::Full));
+    assert_eq!(mode(first), Some(crate::preview::PreviewMode::Off));
+    // The test window is never shown, so the style says whether the editor would show.
+    let style = unsafe { GetWindowLongPtrW(editor.hwnd(), GWL_STYLE) } as u32;
+    assert!(style & WS_VISIBLE != 0, "group 1's editor still shows");
+    let other = super::group_editor(window.hwnd, second).unwrap();
+    let style = unsafe { GetWindowLongPtrW(other.hwnd(), GWL_STYLE) } as u32;
+    assert!(
+        style & WS_VISIBLE == 0,
+        "group 2's Full preview hides its editor"
+    );
+}
+
+fn split_for_test(hwnd: HWND, direction: crate::window::split_tree::Direction) -> GroupId {
+    let active = app_mut(hwnd).tabs.active_group();
+    let new = super::create_group(hwnd).expect("group");
+    assert!(app_mut(hwnd).layout.split(active, direction, new));
+    let id = app_mut(hwnd).tabs.active().unwrap().id;
+    app_mut(hwnd)
+        .tabs
+        .add_view(new, id, crate::editor::ViewState::default());
+    super::show_group_view(hwnd, new);
+    super::layout_editor_and_find_bar(hwnd);
+    new
+}
+
+fn window_rect_in_main(hwnd: HWND, child: HWND) -> RECT {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut rect = RECT::default();
+    unsafe {
+        GetWindowRect(child, &mut rect);
+        MapWindowPoints(
+            std::ptr::null_mut(),
+            hwnd,
+            &mut rect as *mut RECT as *mut POINT,
+            2,
+        );
+    }
+    rect
+}
+
+#[test]
+fn groups_side_by_side_both_reach_into_the_title_row_with_a_sash_between() {
+    // Break caught: a second column pushed below the title row (wasting a row), overlapping
+    // the first, or leaving no gap for the sash.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+    let (a, b) = (
+        window_rect_in_main(window.hwnd, app_mut(window.hwnd).group(first).unwrap().hwnd),
+        window_rect_in_main(
+            window.hwnd,
+            app_mut(window.hwnd).group(second).unwrap().hwnd,
+        ),
+    );
+    assert_eq!((a.top, b.top), (0, 0));
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) };
+    assert_eq!(
+        b.left - a.right,
+        crate::window::titlebar::scale(crate::window::split_tree::SASH_96, dpi)
+    );
+    assert_eq!(super::tree_layout(window.hwnd).unwrap().sashes.len(), 1);
+    assert_eq!(super::group_strip_bounds(window.hwnd).len(), 2);
+}
+
+#[test]
+fn a_group_below_another_draws_its_strip_at_its_own_top() {
+    // Break caught: a lower group's strip hit-tested as caption, so clicking its tabs drags
+    // the window.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_NCHITTEST};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Down);
+    let group = app_mut(window.hwnd).group(second).unwrap().hwnd;
+    let rect = window_rect_in_main(window.hwnd, group);
+    assert!(rect.top > 0);
+    let mut screen = windows_sys::Win32::Foundation::POINT {
+        x: rect.right - 20,
+        y: rect.top + 5,
+    };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut screen) };
+    let packed = ((screen.y as u32 & 0xffff) << 16 | (screen.x as u32 & 0xffff)) as LPARAM;
+    assert_eq!(
+        unsafe { SendMessageW(group, WM_NCHITTEST, 0, packed) },
+        HTCLIENT as LRESULT
+    );
+    assert_eq!(super::group_strip_bounds(window.hwnd).len(), 1);
+}
+
+#[test]
+fn dragging_a_sash_resizes_both_groups_and_stops_at_the_minimum() {
+    // Break caught: a sash that doesn't follow the pointer, or one dragged over the edge
+    // collapsing a group to nothing.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+    let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+    let (x, y) = (sash.rect.left + 1, (sash.rect.top + sash.rect.bottom) / 2);
+    let area = super::tree_area(window.hwnd).unwrap();
+    unsafe {
+        SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+        SendMessageW(window.hwnd, WM_MOUSEMOVE, 1, client_lparam(area.left, y));
+        SendMessageW(window.hwnd, WM_LBUTTONUP, 0, client_lparam(area.left, y));
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) };
+    let a = super::tree_layout(window.hwnd)
+        .unwrap()
+        .rect_of(first)
+        .unwrap();
+    assert_eq!(
+        a.right - a.left,
+        crate::window::titlebar::scale(crate::window::split_tree::MIN_WIDTH_96, dpi)
+    );
+    let group = app_mut(window.hwnd).group(first).unwrap().hwnd;
+    let rect = window_rect_in_main(window.hwnd, group);
+    assert_eq!(rect.right - rect.left, a.right - a.left);
+}
+
+#[test]
+fn a_double_click_on_a_sash_equalizes() {
+    // Break caught: a sash double-click read as two presses and ignored.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+    let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+    app_mut(window.hwnd)
+        .layout
+        .set_sash(&sash, sash.rect.left - 100, 96);
+    super::layout_editor_and_find_bar(window.hwnd);
+    let sash = super::tree_layout(window.hwnd).unwrap().sashes[0].clone();
+    let (x, y) = (sash.rect.left + 1, (sash.rect.top + sash.rect.bottom) / 2);
+    for _ in 0..2 {
+        unsafe {
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, client_lparam(x, y));
+        }
+    }
+    let layout = super::tree_layout(window.hwnd).unwrap();
+    let area = super::tree_area(window.hwnd).unwrap();
+    let a = layout.rect_of(first).unwrap();
+    assert!(((a.right - area.left) - (area.right - area.left) / 2).abs() <= 3);
+}
+
+#[test]
+fn only_the_group_under_the_caption_buttons_gives_them_up() {
+    // Break caught: every top group cutting the caption area out of its region, leaving a
+    // hole in the left group's strip.
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let second = split_for_test(window.hwnd, crate::window::split_tree::Direction::Right);
+    let region_has = |group: HWND, x: i32, y: i32| unsafe {
+        let region = CreateRectRgn(0, 0, 0, 0);
+        let kind = GetWindowRgn(group, region);
+        let inside =
+            kind == 0 /* ERROR: no region, the whole window */ || PtInRegion(region, x, y) != 0;
+        DeleteObject(region);
+        inside
+    };
+    let a = app_mut(window.hwnd).group(first).unwrap().hwnd;
+    let b = app_mut(window.hwnd).group(second).unwrap().hwnd;
+    let a_rect = window_rect_in_main(window.hwnd, a);
+    let b_rect = window_rect_in_main(window.hwnd, b);
+    assert!(region_has(a, a_rect.right - a_rect.left - 2, 2));
+    assert!(!region_has(b, b_rect.right - b_rect.left - 2, 2));
+}
+
+#[test]
+fn split_right_opens_the_active_document_in_a_new_group_to_the_right() {
+    // Break caught: Split Right opening an empty group, a copy of the document instead of a
+    // second view, or the new group landing on the left.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("shared").unwrap();
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let order = super::group_order(window.hwnd);
+    assert_eq!(order.len(), 2);
+    assert_eq!(order[0], first);
+    let second = order[1];
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![first, second]);
+    assert_eq!(
+        super::group_editor(window.hwnd, second)
+            .unwrap()
+            .text()
+            .unwrap(),
+        "shared"
+    );
+}
+
+/// The foreground group `id`'s editor draws JSON strings in.
+fn json_string_colour(hwnd: HWND, id: GroupId) -> isize {
+    const SCI_STYLEGETFORE: u32 = 2481;
+    let editor = super::group_editor(hwnd, id).unwrap();
+    unsafe {
+        SendMessageW(
+            editor.hwnd(),
+            SCI_STYLEGETFORE,
+            crate::editor::scintilla_constants::SCE_JSON_STRING as usize,
+            0,
+        )
+    }
+}
+
+fn theme_json_string_colour(hwnd: HWND) -> isize {
+    crate::languages::style_table(
+        crate::document::Language::Json,
+        super::effective_theme(hwnd),
+    )
+    .iter()
+    .find(|style| style.style == crate::editor::scintilla_constants::SCE_JSON_STRING)
+    .unwrap()
+    .foreground as isize
+}
+
+#[test]
+fn a_split_shows_the_documents_syntax_colours_in_the_new_group() {
+    // Break caught: a new group's editor keeps only the base colour in every style, so a JSON
+    // or Markdown document shows monochrome there (styles belong to each Scintilla view).
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("{\"a\": \"b\"}").unwrap();
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Json);
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    assert_eq!(
+        json_string_colour(window.hwnd, second),
+        theme_json_string_colour(window.hwnd)
+    );
+}
+
+#[test]
+fn a_theme_change_recolours_the_syntax_in_every_group() {
+    // Break caught: a theme change re-applies the language to the active editor only, and the
+    // other groups keep the base colour in every style.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("{\"a\": \"b\"}").unwrap();
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Json);
+    let (first, second) = second_group_showing_the_active_document(window.hwnd);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+    execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
+    assert_eq!(
+        json_string_colour(window.hwnd, second),
+        theme_json_string_colour(window.hwnd)
+    );
+}
+
+#[test]
+fn hovering_a_strip_that_is_not_active_highlights_its_own_tab() {
+    // Break caught: pointer messages on a group's strip hit-test and highlight the active
+    // group's strip instead of their own.
+    use crate::window::group_strip::StripTarget;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    assert!(super::activate_group(window.hwnd, first));
+    let tab = super::strip_layout_of(window.hwnd, second)
+        .unwrap()
+        .tab(0)
+        .unwrap()
+        .center();
+    let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    unsafe { SendMessageW(group, super::WM_MOUSEMOVE, 0, client_lparam(tab.x, tab.y)) };
+    let hovered =
+        |id| super::with_group_id(window.hwnd, id, |state| state.pointer.hovered).unwrap();
+    assert_eq!(hovered(second), Some(StripTarget::Tab(0)));
+    assert_eq!(hovered(first), None);
+}
+
+#[test]
+fn the_wheel_over_a_strip_that_is_not_active_leaves_the_active_strip_alone() {
+    // Break caught: the wheel over one group's strip scrolls the active group's tabs.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    for _ in 0..40 {
+        execute_command(window.hwnd, CommandId::New);
+    }
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    assert!(super::activate_group(window.hwnd, first));
+    let _ = app_mut(window.hwnd).tabs.set_scroll_offset(0);
+    let tab = super::strip_layout_of(window.hwnd, second)
+        .unwrap()
+        .tab(0)
+        .unwrap()
+        .center();
+    let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    let mut point = windows_sys::Win32::Foundation::POINT { x: tab.x, y: tab.y };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(group, &mut point) };
+    let wheel_down = ((-120_i16 as u16 as usize) << 16) as super::WPARAM;
+    unsafe {
+        SendMessageW(
+            group,
+            super::WM_MOUSEWHEEL,
+            wheel_down,
+            client_lparam(point.x, point.y),
+        )
+    };
+    assert_eq!(
+        app_mut(window.hwnd)
+            .tabs
+            .group(first)
+            .unwrap()
+            .scroll_offset(),
+        0
+    );
+}
+
+#[test]
+fn a_tab_click_in_another_group_moves_the_focus_there() {
+    // Break caught: the click makes the other group active but the caret stays in the first
+    // group's editor, so typing edits one document while Ctrl+S saves another.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    unsafe { SetFocus(editor.hwnd()) };
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+    let tab = super::strip_layout_of(window.hwnd, second)
+        .unwrap()
+        .tab(0)
+        .unwrap()
+        .center();
+    let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    let point = client_lparam(tab.x, tab.y);
+    unsafe {
+        SendMessageW(group, super::WM_LBUTTONDOWN, 1, point);
+        SendMessageW(group, super::WM_LBUTTONUP, 0, point);
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    assert_eq!(
+        unsafe { GetFocus() },
+        super::group_editor(window.hwnd, second).unwrap().hwnd()
+    );
+}
+
+#[test]
+fn closing_a_document_shown_only_elsewhere_leaves_the_focused_group_active() {
+    // Break caught: a file deleted on disk closes its view in another group by activating
+    // that group, and leaves it active while the caret stays in the first group.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    execute_command(window.hwnd, CommandId::New);
+    let elsewhere = app_mut(window.hwnd).tabs.active().unwrap().id;
+    unsafe { SetFocus(editor.hwnd()) };
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+
+    super::close_document_without_prompt(window.hwnd, elsewhere);
+
+    assert!(app_mut(window.hwnd).tabs.document(elsewhere).is_none());
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+    assert_eq!(unsafe { GetFocus() }, editor.hwnd());
+}
+
+#[test]
+fn an_accessible_tab_selection_in_another_group_selects_that_tab() {
+    // Break caught: the strip's MSAA selection is resolved against the active group, so a
+    // screen-reader user selecting a tab in another group's list gets no response.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let shared = app_mut(window.hwnd).tabs.active().unwrap().id;
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::New);
+    assert!(super::activate_group(window.hwnd, first));
+    let request = super::AccessibleSelectRequest {
+        document_id: shared,
+        revision: app_mut(window.hwnd)
+            .tabs
+            .group(second)
+            .unwrap()
+            .view()
+            .snapshot()
+            .revision,
+    };
+    let group = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    let selected = unsafe {
+        SendMessageW(
+            group,
+            super::WM_FASTPAD_ACCESSIBLE_SELECT,
+            0,
+            &request as *const super::AccessibleSelectRequest as LPARAM,
+        )
+    };
+    assert_eq!(selected, 1);
+    assert_eq!(
+        app_mut(window.hwnd)
+            .tabs
+            .group(second)
+            .unwrap()
+            .active_document(),
+        Some(shared)
+    );
+}
+
+#[test]
+fn a_split_without_room_is_refused_with_a_notice() {
+    // Break caught: a split into a sliver narrower than the minimum group.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOZORDER, SetWindowPos};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    unsafe {
+        SetWindowPos(
+            window.hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            360,
+            400,
+            SWP_NOMOVE | SWP_NOZORDER,
+        )
+    };
+    super::layout_editor_and_find_bar(window.hwnd);
+    execute_command(window.hwnd, CommandId::SplitRight);
+    assert_eq!(super::group_order(window.hwnd).len(), 1);
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|notice| notice == super::NO_ROOM_TO_SPLIT)
+    );
+}
+
+#[test]
+fn a_failed_group_window_leaves_the_layout_and_tabs_unchanged() {
+    // Break caught: a half-made group left in the tree when its Scintilla can't be created.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    super::fail_next_group_creation();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    assert_eq!(super::group_order(window.hwnd).len(), 1);
+    assert_eq!(app_mut(window.hwnd).tabs.group_ids().len(), 1);
+    assert!(!notices(window.hwnd).is_empty());
+}
+
+#[test]
+fn closing_a_group_with_a_dirty_document_shown_elsewhere_does_not_prompt() {
+    // Break caught: Close Group asking to save (or discarding) a document another group
+    // still shows, or leaving it clean.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("unsaved").unwrap();
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    assert!(app_mut(window.hwnd).tabs.document(id).unwrap().dirty);
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&prompted);
+    answer_next_close_prompt(move |_| {
+        seen.set(true);
+        CloseDecision::Cancel
+    });
+    execute_command(window.hwnd, CommandId::CloseGroup);
+    assert!(!prompted.get(), "another group still shows the document");
+    assert_eq!(super::group_order(window.hwnd), vec![first]);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+    let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+    assert!(document.dirty);
+    assert_eq!(
+        super::group_editor(window.hwnd, first)
+            .unwrap()
+            .text()
+            .unwrap(),
+        "unsaved"
+    );
+}
+
+#[test]
+fn closing_a_groups_last_tab_removes_the_group_but_never_the_only_one() {
+    // Break caught: an empty second group left on screen, or the only group destroyed.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitDown);
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert_eq!(super::group_order(window.hwnd), vec![first]);
+    execute_command(window.hwnd, CommandId::CloseAllTabs);
+    assert_eq!(super::group_order(window.hwnd), vec![first]);
+    assert!(app_mut(window.hwnd).groups.len() == 1);
+}
+
+#[test]
+fn ctrl_2_focuses_group_two_and_ctrl_3_without_one_splits_right_of_the_last() {
+    // Break caught: Ctrl+N still selecting tabs, or a missing group N doing nothing instead
+    // of VS Code's split to the right of the last group.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitDown);
+    let second = super::group_order(window.hwnd)[1];
+    execute_command(window.hwnd, CommandId::FocusGroup1);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+    execute_command(window.hwnd, CommandId::FocusGroup2);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    execute_command(window.hwnd, CommandId::FocusGroup1);
+    execute_command(window.hwnd, CommandId::FocusGroup3);
+    let order = super::group_order(window.hwnd);
+    assert_eq!(order.len(), 3);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+    let area = super::tree_area(window.hwnd).unwrap();
+    let layout = super::tree_layout(window.hwnd).unwrap();
+    assert_eq!(layout.rect_of(order[2]).unwrap().right, area.right);
+    assert_eq!(
+        layout.rect_of(order[2]).unwrap().top,
+        layout.rect_of(second).unwrap().top,
+        "beside the last group, as in VS Code"
+    );
+    execute_command(window.hwnd, CommandId::FocusGroup1);
+    execute_command(window.hwnd, CommandId::FocusLastGroup);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+}
+
+#[test]
+fn moving_a_tab_to_the_next_group_creates_one_and_the_empty_source_closes() {
+    // Break caught: Ctrl+Alt+Right doing nothing with one group, copying instead of moving,
+    // or leaving the emptied group behind.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("moved").unwrap();
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    execute_command(window.hwnd, CommandId::MoveTabToNextGroup);
+    let order = super::group_order(window.hwnd);
+    assert_eq!(order.len(), 1, "the emptied first group closed");
+    assert_ne!(order[0], first);
+    assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![order[0]]);
+    assert_eq!(
+        super::group_editor(window.hwnd, order[0])
+            .unwrap()
+            .text()
+            .unwrap(),
+        "moved"
+    );
+    execute_command(window.hwnd, CommandId::MoveTabToPreviousGroup);
+    assert_eq!(
+        super::group_order(window.hwnd),
+        order,
+        "nothing before group 1"
+    );
+}
+
+#[test]
+fn alt_digits_select_tabs_and_ctrl_digits_focus_groups_through_the_table() {
+    // Break caught: Alt+2 eaten by the menu band's mnemonic handling, or Ctrl+2 still bound
+    // to Select Tab 2.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    assert_eq!(
+        translate_key_with(window.hwnd, editor.hwnd(), b'2', true, false, false),
+        Some(CommandId::FocusGroup2)
+    );
+    assert_eq!(
+        translate_key_with(window.hwnd, editor.hwnd(), b'2', false, false, true),
+        Some(CommandId::SelectTab2)
+    );
+}
+
+#[test]
+fn right_clicking_a_tab_activates_it_and_runs_the_chosen_item() {
+    // Break caught: the tab menu acting on the previously active tab.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let first_tab = app_mut(window.hwnd).tabs.ids().collect::<Vec<_>>()[0];
+    let group = app_mut(window.hwnd).active_group().unwrap().hwnd;
+    let center = super::strip_layout(window.hwnd)
+        .unwrap()
+        .tab(0)
+        .unwrap()
+        .center();
+    let point = client_lparam(center.x, center.y);
+    answer_next_popup_menu(|_| Some(CommandId::SplitRight));
+    unsafe {
+        SendMessageW(group, WM_RBUTTONDOWN, 0, point);
+        SendMessageW(group, WM_RBUTTONUP, 0, point);
+    }
+    let order = super::group_order(window.hwnd);
+    assert_eq!(order.len(), 2);
+    assert_eq!(app_mut(window.hwnd).tabs.views_of(first_tab), order);
+}
+
+#[test]
+fn opening_a_file_open_in_another_group_adds_a_view_in_the_active_group() {
+    // Break caught: the open jumping back to group 1 (leaving group 2 where the user is
+    // working) or opening a second copy of the file.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("groups-open");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    let first = app_mut(window.hwnd).tabs.active_group();
+    super::open_path(window.hwnd, &b).unwrap();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    super::open_path(window.hwnd, &a).unwrap();
+    let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    assert_eq!(app_mut(window.hwnd).tabs.views_of(id), vec![first, second]);
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, id);
+    super::open_path(window.hwnd, &a).unwrap();
+    assert_eq!(
+        app_mut(window.hwnd).tabs.group(second).unwrap().len(),
+        2,
+        "no second view in one group"
+    );
+}
+
+#[test]
+fn a_tree_click_replaces_only_the_active_groups_preview() {
+    // Break caught: a click in the tree replacing group 1's italic tab while the user works
+    // in group 2.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("groups-preview");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let c = scratch.note("c.md", "c");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+    let first = app_mut(window.hwnd).tabs.active_group();
+    // An empty group 2, so group 1's preview is the only view of `a`.
+    let second = super::split_group(
+        window.hwnd,
+        first,
+        crate::window::split_tree::Direction::Right,
+    )
+    .unwrap();
+    super::activate_group(window.hwnd, second);
+    super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+    super::open_note(window.hwnd, &c, super::OpenMode::Preview, false).unwrap();
+    let a_id = app_mut(window.hwnd).tabs.find_path(&a);
+    assert!(a_id.is_some(), "group 1's preview kept");
+    assert!(
+        app_mut(window.hwnd).tabs.find_path(&b).is_none(),
+        "group 2's preview replaced"
+    );
+    assert_eq!(
+        app_mut(window.hwnd).tabs.views_of(a_id.unwrap()),
+        vec![first]
+    );
+    assert_eq!(app_mut(window.hwnd).tabs.group(second).unwrap().len(), 1);
+}
+
+#[test]
+fn deleting_a_note_open_in_two_groups_closes_both_views() {
+    // Break caught: a view left open on a deleted file in the group that wasn't active.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("groups-delete");
+    let a = scratch.note("a.md", "a");
+    scratch.note("keep.md", "k");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &scratch.folder().join("keep.md")).unwrap();
+    super::open_path(window.hwnd, &a).unwrap();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+    crate::window::answer_next_confirm(|_| true);
+    execute_command(window.hwnd, CommandId::NoteDelete);
+    assert!(!a.exists());
+    assert!(app_mut(window.hwnd).tabs.document(id).is_none());
+    assert!(app_mut(window.hwnd).tabs.views_of(id).is_empty());
+}
+
+#[test]
+fn a_background_replace_in_a_document_shown_in_the_other_group_counts_once() {
+    // Break caught: a replace through the document host double-counting a document another
+    // group's editor shows (host edit plus that editor's notifications), or moving the
+    // active group's caret.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("groups-replace");
+    let a = scratch.note("a.md", "alpha beta");
+    let b = scratch.note("b.md", "other");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    super::open_path(window.hwnd, &b).unwrap();
+    let first = super::group_order(window.hwnd)[0];
+    let second = super::group_order(window.hwnd)[1];
+    execute_command(window.hwnd, CommandId::FocusGroup2);
+    let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+    let before = app_mut(window.hwnd).tabs.document(id).unwrap().generation;
+    let caret = super::group_editor(window.hwnd, second)
+        .unwrap()
+        .view_state()
+        .unwrap();
+    let matcher = crate::search::Matcher::new("alpha", Default::default()).unwrap();
+    assert_eq!(
+        super::replace_in_document(window.hwnd, id, &matcher, "ALPHA"),
+        Some(1)
+    );
+    let document = app_mut(window.hwnd).tabs.document(id).unwrap();
+    assert!(document.dirty);
+    assert!(document.generation > before);
+    assert_eq!(
+        super::group_editor(window.hwnd, first)
+            .unwrap()
+            .text()
+            .unwrap(),
+        "ALPHA beta"
+    );
+    assert_eq!(
+        super::group_editor(window.hwnd, second)
+            .unwrap()
+            .view_state()
+            .unwrap(),
+        caret
+    );
+}
+
+#[test]
+fn clicking_an_open_editors_row_focuses_that_group_and_a_header_does_nothing() {
+    // Break caught: a click on group 2's row opening a copy in the active group, or a header
+    // row acting like a tab.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-groups");
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    execute_command(window.hwnd, CommandId::New);
+    let first = super::group_order(window.hwnd)[0];
+    let panel = sidebar_windows(window.hwnd).1;
+    let header = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+    mouse(panel, WM_LBUTTONUP, 0, centre(header));
+    assert_ne!(app_mut(window.hwnd).tabs.active_group(), first);
+    let row = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(row));
+    mouse(panel, WM_LBUTTONUP, 0, centre(row));
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), first);
+    let id = app_mut(window.hwnd).tabs.find_path(&a).unwrap();
+    assert_eq!(
+        app_mut(window.hwnd).tabs.views_of(id).len(),
+        2,
+        "no copy made"
+    );
+}
+
+#[test]
+fn ctrl_p_lists_views_in_every_group_and_picking_one_focuses_it() {
+    // Break caught: the MRU rows only covering the active group, or a pick adding a view to
+    // the active group instead of going to the one listed.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-groups");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    execute_command(window.hwnd, CommandId::FocusGroup2);
+    super::open_path(window.hwnd, &b).unwrap();
+    execute_command(window.hwnd, CommandId::FocusGroup1);
+    let (rows, _) = super::quick_open_rows(window.hwnd, "");
+    let groups: Vec<_> = rows
+        .iter()
+        .filter_map(|row| match row {
+            crate::window::command_palette::PickerRow::View { number, found, .. } => {
+                Some((found.name.clone(), *number))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(groups.contains(&("b.md".to_owned(), Some(2))), "{groups:?}");
+    let b_id = app_mut(window.hwnd).tabs.find_path(&b).unwrap();
+    let second = super::group_order(window.hwnd)[1];
+    assert!(super::focus_view(window.hwnd, second, b_id));
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    assert_eq!(app_mut(window.hwnd).tabs.views_of(b_id), vec![second]);
+}
+
+#[test]
+fn the_editor_and_find_bar_live_in_the_group_window() {
+    // Break caught: a child left parented to the main window, painting over or under the
+    // group and missing its layout.
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetParent;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let group = super::group_hwnd(window.hwnd).expect("the editor group window");
+    assert_eq!(unsafe { GetParent(group) }, window.hwnd);
+    assert_eq!(unsafe { GetParent(editor.hwnd()) }, group);
+    execute_command(window.hwnd, CommandId::Find);
+    let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
+    assert_eq!(unsafe { GetParent(panel) }, group);
+    let (width, height) = client_size(window.hwnd);
+    let (group_width, group_height) = client_size(group);
+    assert_eq!(left_of(group, window.hwnd) + group_width, width);
+    // The group reaches up into the title row, down to the status bar.
+    assert!(group_height > 0 && group_height <= height);
+}
+
+#[test]
+fn find_bar_keys_still_reach_the_main_window() {
+    // Break caught: the find field hook sending to its parent, now the group, so Enter and
+    // Escape in the query field do nothing.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("xyz abc abc").unwrap();
+    editor.set_selection(0..0).unwrap();
+    execute_command(window.hwnd, CommandId::Find);
+    let query = app_mut(window.hwnd).find_bar().unwrap().query_hwnd();
+    let text = crate::platform::wide_null("abc");
+    unsafe { SetWindowTextW(query, text.as_ptr()) };
+    editor.set_selection(0..0).unwrap();
+
+    unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(VK_RETURN), 0) };
+    assert_eq!(editor.selected_text().unwrap(), "abc");
+
+    unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    assert!(!app_mut(window.hwnd).find_bar().unwrap().is_visible());
+}
+
+#[test]
+fn typing_in_the_grouped_editor_still_marks_the_tab_dirty() {
+    // Break caught: WM_NOTIFY now going to the group, which drops it, so typing never dirties
+    // the tab and never autosaves.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    unsafe { SendMessageW(editor.hwnd(), WM_CHAR, usize::from(b'x'), 0) };
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn clicking_a_tab_in_the_group_strip_activates_it() {
+    // Break caught: strip input still handled by the main window, so clicks on the strip that
+    // moved into the group do nothing.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
+    let point = client_lparam(tab.left + 10, tab.bottom / 2);
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+        SendMessageW(group, WM_LBUTTONUP, 0, point);
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+}
+
+#[test]
+fn double_clicking_the_empty_strip_where_the_new_tab_closes_keeps_it_open() {
+    // Break caught: the release after the double-click acting on whatever the new tab put
+    // under the pointer, so a double-click on its close box's spot opens a tab and closes it.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let close = super::strip_layout(window.hwnd)
+        .unwrap()
+        .close_tab(1)
+        .unwrap()
+        .center();
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert_eq!(super::tab_count(window.hwnd), 1);
+    assert_eq!(
+        super::strip_target(
+            window.hwnd,
+            app_mut(window.hwnd).tabs.active_group(),
+            close.x,
+            close.y
+        ),
+        Some(crate::window::group_strip::StripTarget::Empty)
+    );
+
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let point = client_lparam(close.x, close.y);
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+        SendMessageW(group, WM_LBUTTONUP, 0, point);
+        SendMessageW(group, WM_LBUTTONDBLCLK, 1, point);
+        SendMessageW(group, WM_LBUTTONUP, 0, point);
+    }
+    assert_eq!(super::tab_count(window.hwnd), 2);
+}
+
+/// `child`'s top-left corner in `parent`'s client coordinates.
+fn origin_in(child: HWND, parent: HWND) -> (i32, i32) {
+    let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(child, parent, &mut point, 1) };
+    (point.x, point.y)
+}
+
+#[test]
+fn the_group_strip_is_the_title_row() {
+    // Break caught: the strip drawn in a row of its own under the title bar (the file name
+    // shown twice and a row of height lost), or running under the app menu and the caption
+    // buttons.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let title = super::title_layout(window.hwnd);
+    let left = crate::window::side_panel::left_edge(window.hwnd);
+    assert_eq!(origin_in(group, window.hwnd), (left, 0));
+    assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height);
+    let strip = super::strip_layout(window.hwnd).unwrap();
+    assert_eq!(strip.height, title.height);
+    assert_eq!(strip.bounds().right, title.minimize.left - left);
+}
+
+#[test]
+fn empty_title_row_strip_space_is_caption_and_tabs_are_client() {
+    // Break caught: a strip that swallows the caption, so the window can no longer be dragged
+    // or top-resized by the empty space beside the tabs.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTCAPTION, HTCLIENT, HTTRANSPARENT, WM_NCHITTEST,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let title = super::title_layout(window.hwnd);
+    let strip = super::strip_layout(window.hwnd).unwrap();
+    let left = crate::window::side_panel::left_edge(window.hwnd);
+    let hit = |target: HWND, x: i32, y: i32| unsafe {
+        SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
+    };
+    let y = strip.height - 2;
+    assert!(y >= title.resize_border);
+    let tab = strip.tab(0).unwrap().center();
+    let empty = strip.tabs.right - 10;
+    assert_eq!(hit(group, tab.x, y), HTCLIENT as LRESULT);
+    assert_eq!(hit(group, empty, y), HTTRANSPARENT as LRESULT);
+    assert_eq!(hit(window.hwnd, empty + left, y), HTCAPTION as LRESULT);
+    // A restored window's top band resizes, over the tabs too.
+    assert_eq!(hit(group, tab.x, 0), HTTRANSPARENT as LRESULT);
+}
+
+#[test]
+fn a_caption_double_click_over_the_strip_opens_a_tab_and_over_the_sidebar_does_not() {
+    // Break caught: the caption's double-click maximizing over the strip's empty space, where
+    // 0.2.0 opened a new tab, or opening tabs from the caption over the sidebar.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, WM_NCLBUTTONDBLCLK};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let title = super::title_layout(window.hwnd);
+    let strip = super::strip_layout(window.hwnd).unwrap();
+    let left = crate::window::side_panel::left_edge(window.hwnd);
+    let double_click = |x: i32, y: i32| unsafe {
+        SendMessageW(
+            window.hwnd,
+            WM_NCLBUTTONDBLCLK,
+            HTCAPTION as usize,
+            screen_lparam(window.hwnd, x, y),
+        )
+    };
+    double_click(strip.tabs.right - 10 + left, strip.height / 2);
+    assert_eq!(super::tab_count(window.hwnd), 2);
+    assert!(
+        title.sidebar.right > title.sidebar.left,
+        "no sidebar to test"
+    );
+    let sidebar = title.sidebar.center();
+    double_click(sidebar.x, sidebar.y);
+    assert_eq!(super::tab_count(window.hwnd), 2);
+}
+
+#[test]
+fn a_caption_right_click_over_the_strip_opens_the_strip_menu() {
+    // Break caught: the strip's menu lost once its empty space answers as caption.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, WM_NCRBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let strip = super::strip_layout(window.hwnd).unwrap();
+    let left = crate::window::side_panel::left_edge(window.hwnd);
+    answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
+    unsafe {
+        SendMessageW(
+            window.hwnd,
+            WM_NCRBUTTONUP,
+            HTCAPTION as usize,
+            screen_lparam(window.hwnd, strip.tabs.right - 10 + left, strip.height / 2),
+        )
+    };
+    assert!(app_mut(window.hwnd).tabs.is_empty());
+}
+
+#[test]
+fn the_group_region_leaves_the_caption_buttons_and_the_menu_band_to_the_main_window() {
+    // Break caught: the group window covering the app menu and caption buttons, or the menu
+    // band shown under it, so the main window can neither paint them nor get their clicks.
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let left = crate::window::side_panel::left_edge(window.hwnd);
+    let covers = |x: i32, y: i32| unsafe {
+        let region = CreateRectRgn(0, 0, 0, 0);
+        GetWindowRgn(group, region);
+        let inside = PtInRegion(region, x - left, y) != 0;
+        DeleteObject(region);
+        inside
+    };
+    let title = super::title_layout(window.hwnd);
+    let tab = super::strip_layout(window.hwnd)
+        .unwrap()
+        .tab(0)
+        .unwrap()
+        .center();
+    assert!(covers(tab.x + left, tab.y));
+    for button in [title.minimize, title.maximize, title.close] {
+        let center = button.center();
+        assert!(!covers(center.x, center.y));
+    }
+
+    super::enter_menu_mode(window.hwnd, 0);
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    let band = super::menu_band::band_height(dpi);
+    let heading = super::menu_headings(window.hwnd)[0];
+    assert!(!covers(
+        (heading.left + heading.right) / 2,
+        (heading.top + heading.bottom) / 2
+    ));
+    assert!(covers(tab.x + left, tab.y));
+    assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height + band);
+}
+
+#[test]
+fn markdown_tabs_show_floating_preview_buttons_at_the_content_top_right() {
+    // Break caught: preview buttons left in the strip, shown for tabs that cannot preview,
+    // or drawn under the editor.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, GetParent, GetWindow};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let buttons = || crate::window::preview_buttons::hwnd(window.hwnd);
+    let visible = |hwnd: HWND| {
+        (unsafe { GetWindowLongPtrW(hwnd, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
+    };
+    assert!(buttons().is_none_or(|hwnd| !visible(hwnd)));
+
+    // What a successful language switch does, without loading Lexilla.
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Markdown);
+    crate::window::preview_host::sync_visibility(window.hwnd);
+    let hwnd = buttons().expect("floating preview buttons");
+    assert!(visible(hwnd));
+    assert_eq!(unsafe { GetParent(hwnd) }, group);
+    let strip = super::strip_layout(window.hwnd).unwrap();
+    assert_eq!(
+        strip.tabs.right,
+        strip.bounds().right,
+        "the strip holds only tabs"
+    );
+    let dpi = unsafe { GetDpiForWindow(group) }.max(96);
+    let (group_width, _) = client_size(group);
+    let (x, y) = origin_in(hwnd, group);
+    let (width, _) = client_size(hwnd);
+    assert_eq!(y, strip.height + crate::window::titlebar::scale(8, dpi));
+    assert!(x + width < group_width, "clear of the vertical scroll bar");
+    assert!(x + width >= group_width - crate::window::titlebar::scale(48, dpi));
+    // Above the editor in z-order: no sibling before it.
+    assert!(unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_null());
+}
+
+#[test]
+fn a_plain_launch_leaves_no_empty_untitled_tab() {
+    // Break caught: double-clicking FastPad.exe opens on an untitled document nobody asked
+    // for.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+
+    super::handle_open_request(window.hwnd);
+
+    assert!(app_mut(window.hwnd).tabs.is_empty());
+}
+
+#[test]
+fn typing_into_a_window_with_no_tabs_starts_an_untitled_tab() {
+    // Break caught: a plain launch with no tab swallowing the first keystrokes, so FastPad is
+    // no longer instant-to-type.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    super::handle_open_request(window.hwnd);
+    assert!(app_mut(window.hwnd).tabs.is_empty());
+    let message = MSG {
+        hwnd: editor.hwnd(),
+        message: WM_CHAR,
+        wParam: usize::from(b'a'),
+        ..Default::default()
+    };
+
+    let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+    unsafe { SendMessageW(editor.hwnd(), WM_CHAR, message.wParam, 0) };
+
+    assert!(!translated, "the character still reaches the editor");
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+    assert_eq!(editor.text().unwrap(), "a");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn typing_with_the_focus_on_the_main_window_and_no_tabs_types_into_a_new_tab() {
+    // Break caught: closing the last tab hides the editor and leaves the focus on the main
+    // window, whose characters go nowhere.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    super::handle_open_request(window.hwnd);
+    let message = MSG {
+        hwnd: window.hwnd,
+        message: WM_CHAR,
+        wParam: usize::from(b'a'),
+        ..Default::default()
+    };
+
+    let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+
+    assert!(
+        translated,
+        "the character went to the new tab's editor instead"
+    );
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+    assert_eq!(editor.text().unwrap(), "a");
+}
+
+#[test]
+fn a_plain_launch_keeps_the_untitled_tab_once_it_has_text() {
+    // Break caught: text typed before the startup chain finished thrown away with its tab.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("typed early").unwrap();
+
+    super::handle_open_request(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+}
+
+#[test]
+fn only_the_active_group_shows_the_floating_preview_buttons() {
+    // Break caught: a Markdown document shown in two groups floats a pair of preview buttons
+    // over both, though only the selected one's act on the active tab.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Markdown);
+    crate::window::preview_host::sync_visibility(window.hwnd);
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    let shown = |id| {
+        super::with_group_id(window.hwnd, id, |state| state.preview_buttons.hwnd)
+            .filter(|hwnd| !hwnd.is_null())
+            .is_some_and(|hwnd| {
+                (unsafe { GetWindowLongPtrW(hwnd, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE
+                    != 0
+            })
+    };
+    assert!(shown(second));
+    assert!(!shown(first));
+
+    assert!(super::activate_group(window.hwnd, first));
+
+    assert!(shown(first));
+    assert!(!shown(second));
+}
+
+#[test]
+fn the_floating_side_button_opens_and_closes_the_side_preview() {
+    // Break caught: floating buttons that paint but do not act.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    // What a successful language switch does, without loading Lexilla.
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Markdown);
+    crate::window::preview_host::sync_visibility(window.hwnd);
+    let hwnd = crate::window::preview_buttons::hwnd(window.hwnd).unwrap();
+    let side = crate::window::preview_buttons::button_rect(
+        hwnd,
+        crate::window::preview_buttons::PreviewButton::Side,
+    )
+    .center();
+    let click = || unsafe {
+        SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(side.x, side.y));
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(side.x, side.y));
+    };
+    click();
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        crate::preview::PreviewMode::Split
+    );
+    click();
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        crate::preview::PreviewMode::Off
+    );
+}
+
+#[test]
+fn clicking_a_tab_in_menu_mode_leaves_menu_mode() {
+    // Break caught: the group taking strip clicks without the main window's menu-mode exit, so
+    // after Alt a tab click switches tabs while keystrokes still go to menu mnemonics.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    super::enter_menu_mode(window.hwnd, 0);
+    assert!(app_mut(window.hwnd).menu_mode.is_some());
+
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let tab = super::strip_layout(window.hwnd).unwrap().tab(0).unwrap();
+    let point = client_lparam(tab.left + 10, tab.bottom / 2);
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDOWN, 1, point);
+        SendMessageW(group, WM_LBUTTONUP, 0, point);
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+    assert_eq!(app_mut(window.hwnd).menu_mode, None);
+}
+
+#[test]
+fn the_command_palette_opens_below_the_tab_strip_and_the_find_bar() {
+    // Break caught: the palette's top still summing only the title and bar heights, so once
+    // the strip and find bar moved into the group it covers the strip and the find bar.
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::Find);
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    let rect = |hwnd| {
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut rect) };
+        rect
+    };
+    let app = app_mut(window.hwnd);
+    let find = rect(app.find_bar().unwrap().panel_hwnd());
+    let palette = rect(app.command_palette.as_ref().unwrap().panel_hwnd());
+    assert!(
+        palette.top >= find.bottom,
+        "palette top {} overlaps the find bar ending at {}",
+        palette.top,
+        find.bottom
+    );
+}
+
+#[test]
+fn the_tab_strip_paints_before_deferred_startup_begins() {
+    // Break caught: the group's first paint queued behind the deferred startup chain, whose
+    // posted steps outrank WM_PAINT, so the first frame shows no tabs until restore finishes.
+    use windows_sys::Win32::Graphics::Gdi::{GetUpdateRect, InvalidateRect};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let identity = app_mut(window.hwnd).window_identity();
+    app_mut(window.hwnd).mark_first_paint_complete();
+    // Only a visible window has an update region to wait on.
+    unsafe {
+        ShowWindow(window.hwnd, SW_SHOWNA);
+        InvalidateRect(group, std::ptr::null(), 0);
+    }
+    assert_ne!(unsafe { GetUpdateRect(group, std::ptr::null_mut(), 0) }, 0);
+
+    unsafe { super::maybe_post_deferred_start(window.hwnd, &identity) };
+    assert_eq!(
+        unsafe { GetUpdateRect(group, std::ptr::null_mut(), 0) },
+        0,
+        "the strip still waits for a WM_PAINT"
+    );
+}
+
+#[test]
+fn zoom_resizes_the_line_number_gutter() {
+    // Break caught: zoomed digits clipped by a gutter measured at the unzoomed size.
+    use crate::editor::scintilla_constants::SCI_GETZOOM;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let zoom = || unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) };
+    let unzoomed_width = line_number_margin_width(&editor);
+
+    execute_command(window.hwnd, CommandId::ZoomIn);
+    execute_command(window.hwnd, CommandId::ZoomIn);
+    assert_eq!(zoom(), 2);
+    assert!(line_number_margin_width(&editor) > unzoomed_width);
+    execute_command(window.hwnd, CommandId::ZoomOut);
+    assert_eq!(zoom(), 1);
+    execute_command(window.hwnd, CommandId::ZoomReset);
+    assert_eq!(zoom(), 0);
+    assert_eq!(line_number_margin_width(&editor), unzoomed_width);
+}
+
+#[test]
+fn the_command_palette_filters_as_typed_and_runs_the_selection_on_enter() {
+    // Break caught: a palette whose field never refilters the list, or whose Enter leaves the
+    // palette open or runs nothing.
+    use crate::editor::scintilla_constants::SCI_GETZOOM;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let palette = |hwnd| app_mut(hwnd).command_palette.as_ref().unwrap();
+
+    // The test window itself is never shown, so check the panel's own style bit.
+    let panel_visible = |hwnd| {
+        (unsafe { GetWindowLongPtrW(palette(hwnd).panel_hwnd(), super::GWL_STYLE) }) as u32
+            & super::WS_VISIBLE
+            != 0
+    };
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    assert!(palette(window.hwnd).is_visible());
+    assert!(panel_visible(window.hwnd));
+    // Markdown preview commands are listed only while the active tab is Markdown, and New
+    // note and New folder only while a notebook is open (this window has none).
+    assert_eq!(
+        palette(window.hwnd).shown().len(),
+        crate::window::command_palette::ENTRIES
+            .iter()
+            .filter(|entry| !entry.command.is_markdown_preview())
+            .filter(|entry| !matches!(entry.command, CommandId::NoteNew | CommandId::NoteNewFolder))
+            .count()
+    );
+    let query = palette(window.hwnd).query_hwnd();
+    let typed = crate::platform::wide_null("zoom");
+    unsafe { SetWindowTextW(query, typed.as_ptr()) };
+    let shown = palette(window.hwnd)
+        .shown()
+        .iter()
+        .map(|entry| entry.command)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shown,
+        [CommandId::ZoomIn, CommandId::ZoomOut, CommandId::ZoomReset]
+    );
+    assert_eq!(palette(window.hwnd).shown_shortcut(0), Some("Ctrl+="));
+
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_DOWN as usize, 0) };
+    assert_eq!(
+        palette(window.hwnd).selected_command(),
+        Some(CommandId::ZoomOut)
+    );
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+    assert!(!palette(window.hwnd).is_visible());
+    assert!(!panel_visible(window.hwnd));
+    assert_eq!(
+        unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) },
+        -1
+    );
+
+    // Reopening starts from an empty query; Escape closes without running anything.
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    assert_eq!(palette(window.hwnd).query_text(), "");
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    assert!(!palette(window.hwnd).is_visible());
+    assert_eq!(
+        unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) },
+        -1
+    );
+}
+
+#[test]
+fn a_picker_lists_its_items_and_enter_reports_the_choice() {
+    // Break caught: a picker whose choice never reaches library_host, or that leaves the
+    // palette stuck showing runtime items the next time it opens for commands.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    super::open_picker(
+        window.hwnd,
+        crate::window::command_palette::Picker {
+            kind: crate::window::command_palette::PickerKind::RecentFolder,
+            items: vec![r"D:\A".into(), r"D:\B".into()],
+            create: None,
+        },
+    );
+    super::move_command_palette_selection(window.hwnd, 1);
+    super::run_command_palette_selection(window.hwnd);
+    assert_eq!(
+        crate::window::library_host::take_last_pick(),
+        Some((
+            crate::window::command_palette::PickerKind::RecentFolder,
+            crate::window::command_palette::PickerChoice::Item(1)
+        ))
+    );
+    // The palette went back to command mode.
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    assert!(with_command_palette(window.hwnd, |p| p.picker().is_none()).unwrap());
+}
+
+#[test]
+fn another_picker_opened_over_quick_open_repaints_the_field_without_its_hint() {
+    // Break caught (review round 1): a picker opened from quick open's empty field (Move to
+    // notebook, Open recent notebook) skips clearing the query, so nothing repaints the
+    // field and it keeps showing "Go to note by name". Test windows are never shown, so
+    // the repaint is counted rather than read from the field's update region.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let palette = || app_mut(window.hwnd).command_palette.as_ref().unwrap();
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    assert!(palette().placeholder().is_some());
+    let repaints = palette().hint_repaints();
+
+    super::open_picker(
+        window.hwnd,
+        crate::window::command_palette::Picker {
+            kind: crate::window::command_palette::PickerKind::RecentFolder,
+            items: vec![r"D:\A".into()],
+            create: None,
+        },
+    );
+
+    assert_eq!(palette().placeholder(), None);
+    assert_eq!(palette().hint_repaints(), repaints + 1);
+    // Back to quick open, the hint returns; command mode, it goes again.
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    assert_eq!(palette().hint_repaints(), repaints + 2);
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    assert_eq!(palette().hint_repaints(), repaints + 3);
+}
+
+#[test]
+fn ctrl_w_closes_the_active_tab_and_in_the_palette_field_closes_the_palette() {
+    // Break caught (review focus 4): Ctrl+W dead, closing a background tab, or, typed in the
+    // palette's query field, closing the tab behind the palette (the accelerator table sees
+    // the key before the field's hook).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    execute_command(window.hwnd, CommandId::New);
+    execute_command(window.hwnd, CommandId::New);
+    let ids = || {
+        app_mut(window.hwnd)
+            .tabs
+            .documents()
+            .map(|document| document.id)
+            .collect::<Vec<_>>()
+    };
+    let &[first, second, _] = &ids()[..] else {
+        panic!("three tabs")
+    };
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let ctrl_w = |target: HWND| MSG {
+        hwnd: target,
+        message: WM_KEYDOWN,
+        wParam: usize::from(b'W'),
+        ..Default::default()
+    };
+
+    let closed =
+        unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl_w(editor.hwnd())) };
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    let query = with_command_palette(window.hwnd, |palette| palette.query_hwnd()).unwrap();
+    let in_palette =
+        unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl_w(query)) };
+    unsafe { SendMessageW(query, WM_KEYDOWN, usize::from(b'W'), 0) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+
+    assert!(closed, "Ctrl+W was not translated");
+    assert!(!in_palette, "the palette's field keeps Ctrl+W");
+    assert!(!with_command_palette(window.hwnd, |palette| palette.is_visible()).unwrap());
+    assert_eq!(ids(), [first, second], "only the active tab closed");
+}
+
+#[test]
+fn a_middle_click_closes_a_clean_background_tab_and_keeps_the_active_one() {
+    // Break caught (review focus 3): a middle-click switching to the tab it closes, closing
+    // the active tab instead, a press on one tab and a release on another closing either, a
+    // release with no press closing anything, or a press kept after the pointer left.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDOWN, WM_MBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    execute_command(window.hwnd, CommandId::New);
+    let ids = || {
+        app_mut(window.hwnd)
+            .tabs
+            .documents()
+            .map(|document| document.id)
+            .collect::<Vec<_>>()
+    };
+    let &[first, second, third] = &ids()[..] else {
+        panic!("three tabs")
+    };
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let center = |index: usize| {
+        super::strip_layout(window.hwnd)
+            .unwrap()
+            .tab(index)
+            .unwrap()
+            .center()
+    };
+    let send = |message: u32, index: usize| {
+        let point = center(index);
+        unsafe { SendMessageW(group, message, 0, client_lparam(point.x, point.y)) };
+    };
+
+    send(WM_MBUTTONDOWN, 0);
+    send(WM_MBUTTONUP, 1);
+    assert_eq!(ids(), [first, second, third], "released over another tab");
+    send(WM_MBUTTONUP, 0);
+    assert_eq!(ids(), [first, second, third], "a release with no press");
+    send(WM_MBUTTONDOWN, 0);
+    unsafe { SendMessageW(group, windows_sys::Win32::UI::Controls::WM_MOUSELEAVE, 0, 0) };
+    send(WM_MBUTTONUP, 0);
+    assert_eq!(ids(), [first, second, third], "the pointer left in between");
+
+    send(WM_MBUTTONDOWN, 0);
+    send(WM_MBUTTONUP, 0);
+    assert_eq!(ids(), [second, third]);
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, third);
+    assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+}
+
+#[test]
+fn a_middle_click_on_a_dirty_background_tab_shows_it_and_asks_first() {
+    // Break caught: the save prompt asking about a tab that isn't on screen, a dirty tab
+    // closed without asking, or Cancel putting the previously active tab back.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDOWN, WM_MBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("unsaved").unwrap();
+    let dirty = app_mut(window.hwnd).tabs.active().unwrap().id;
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    execute_command(window.hwnd, CommandId::New);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = asked.clone();
+    answer_next_close_prompt(move |hwnd| {
+        assert_eq!(
+            app_mut(hwnd).tabs.active().unwrap().id,
+            dirty,
+            "the prompt's tab is on screen"
+        );
+        seen.set(true);
+        CloseDecision::Cancel
+    });
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let center = super::strip_layout(window.hwnd)
+        .unwrap()
+        .tab(0)
+        .unwrap()
+        .center();
+
+    unsafe {
+        SendMessageW(group, WM_MBUTTONDOWN, 0, client_lparam(center.x, center.y));
+        SendMessageW(group, WM_MBUTTONUP, 0, client_lparam(center.x, center.y));
+    }
+
+    assert!(asked.get(), "no prompt");
+    assert_eq!(super::tab_count(window.hwnd), 2);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().id,
+        dirty,
+        "after Cancel it stays active"
+    );
+    answer_next_close_prompt(|_| CloseDecision::Discard);
+    super::close_tab_at(window.hwnd, 0);
+    assert_eq!(super::tab_count(window.hwnd), 1);
+}
+
+/// The quick-open rows as their names, or the row itself for a non-note row.
+fn quick_open_names(hwnd: HWND) -> Vec<String> {
+    with_command_palette(hwnd, |palette| {
+        palette
+            .shown_picker_rows()
+            .iter()
+            .map(|row| match row {
+                crate::window::command_palette::PickerRow::Note { found, .. }
+                | crate::window::command_palette::PickerRow::View { found, .. } => {
+                    found.name.clone()
+                }
+                other => format!("{other:?}"),
+            })
+            .collect()
+    })
+    .unwrap()
+}
+
+fn type_query(hwnd: HWND, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+    let query = with_command_palette(hwnd, |palette| palette.query_hwnd()).unwrap();
+    let typed = crate::platform::wide_null(text);
+    unsafe { SetWindowTextW(query, typed.as_ptr()) };
+}
+
+fn press_enter_in_palette(hwnd: HWND) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    let query = with_command_palette(hwnd, |palette| palette.query_hwnd()).unwrap();
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+}
+
+fn palette_visible(hwnd: HWND) -> bool {
+    with_command_palette(hwnd, |palette| palette.is_visible()).unwrap_or(false)
+}
+
+fn active_path(hwnd: HWND) -> Option<std::path::PathBuf> {
+    app_mut(hwnd)
+        .tabs
+        .active()
+        .and_then(|document| document.path.clone())
+}
+
+#[test]
+fn ctrl_p_then_enter_switches_to_the_previous_note() {
+    // Break caught: Ctrl+P dead in the running app, the open tabs listed in strip order, a
+    // file outside the notebook or an unopened note listed, or the selection on the current
+    // note, so Enter does nothing.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-previous");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    scratch.note("c.md", "c");
+    let outside = scratch.root.join("outside.txt");
+    std::fs::write(&outside, "outside").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &outside).unwrap();
+    super::open_note(window.hwnd, &b, super::OpenMode::Permanent, false).unwrap();
+
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let message = MSG {
+        hwnd: editor.hwnd(),
+        message: WM_KEYDOWN,
+        wParam: usize::from(b'P'),
+        ..Default::default()
+    };
+    let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+
+    assert!(translated, "Ctrl+P was not translated");
+    assert!(palette_visible(window.hwnd));
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.picker().map(|p| p.kind)).flatten(),
+        Some(crate::window::command_palette::PickerKind::QuickOpen)
+    );
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.query_text()).unwrap(),
+        ""
+    );
+    assert_eq!(quick_open_names(window.hwnd), ["b.md", "a.md"]);
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+        Some(1)
+    );
+    press_enter_in_palette(window.hwnd);
+    assert!(!palette_visible(window.hwnd));
+    assert_eq!(active_path(window.hwnd), Some(a));
+}
+
+#[test]
+fn typing_a_name_then_enter_opens_a_closed_note_as_a_normal_tab() {
+    // Break caught: typed letters never reaching the matcher, a folder-only match dropped,
+    // or the pick opening in the preview tab the next sidebar click replaces.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-type");
+    let alpha = scratch.note("alpha.md", "a");
+    scratch.note("beta.md", "b");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let gamma = scratch.note(r"work\gamma notes.md", "g");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &alpha).unwrap();
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "wk gmn");
+    assert_eq!(quick_open_names(window.hwnd), ["gamma notes.md"]);
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+        Some(0)
+    );
+    press_enter_in_palette(window.hwnd);
+
+    assert_eq!(active_path(window.hwnd), Some(gamma));
+    assert_eq!(super::tab_count(window.hwnd), 2);
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+}
+
+#[test]
+fn a_line_suffix_puts_the_caret_on_that_line_and_colon_digits_alone_moves_the_current_tab() {
+    // Break caught: "lines:3" matched as text, the line applied 0-based (caret on line 4),
+    // a line past the end ignored, or ":2" offering notes instead of moving the caret.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-line");
+    scratch.note("lines.md", "one\r\ntwo\r\nthree\r\nfour");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let caret_line = || {
+        editor
+            .line_from_position(editor.selection().unwrap().start)
+            .unwrap()
+    };
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "lines:3");
+    assert_eq!(quick_open_names(window.hwnd), ["lines.md"]);
+    press_enter_in_palette(window.hwnd);
+    assert_eq!(caret_line(), 2);
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, ":2");
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.shown_picker_rows().to_vec()).unwrap(),
+        [crate::window::command_palette::PickerRow::GoToLine(2)]
+    );
+    press_enter_in_palette(window.hwnd);
+    assert_eq!(caret_line(), 1);
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "lines:99");
+    press_enter_in_palette(window.hwnd);
+    assert_eq!(caret_line(), 3, "past the end goes to the last line");
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, ":0");
+    press_enter_in_palette(window.hwnd);
+    assert_eq!(caret_line(), 0, "line 0 behaves as line 1");
+}
+
+#[test]
+fn a_go_to_line_pick_focuses_the_editor_even_when_the_sidebar_had_focus() {
+    // Break caught: a note pick focuses the editor (`open_note(.., true)`), but a ":n" pick
+    // moved the caret and left the keyboard focus in the sidebar when it had it.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-line-focus");
+    let note = scratch.note("lines.md", "one\r\ntwo\r\nthree\r\nfour");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &note).unwrap();
+    let (_, panel) = sidebar_windows(window.hwnd);
+    unsafe { SetFocus(panel) };
+    assert_eq!(
+        unsafe { GetFocus() },
+        panel,
+        "the panel must hold focus to start"
+    );
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, ":3");
+    press_enter_in_palette(window.hwnd);
+
+    assert_eq!(
+        unsafe { GetFocus() },
+        editor.hwnd(),
+        "a :n pick focuses the editor, the same as a note pick"
+    );
+}
+
+#[test]
+fn with_no_notebook_open_the_picker_shows_one_row_that_cannot_be_picked() {
+    // Break caught: an empty list that looks broken, Enter closing the picker or opening
+    // something, or ":5" refused although it needs no notebook.
+    use crate::window::command_palette::{NO_NOTEBOOK, PickerRow};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    assert!(crate::window::library_host::folder(window.hwnd).is_none());
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    let rows = || with_command_palette(window.hwnd, |p| p.shown_picker_rows().to_vec()).unwrap();
+    assert_eq!(rows(), [PickerRow::Notice(NO_NOTEBOOK)]);
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+        None
+    );
+    press_enter_in_palette(window.hwnd);
+    assert!(palette_visible(window.hwnd), "Enter does nothing");
+    assert_eq!(super::tab_count(window.hwnd), 1);
+
+    type_query(window.hwnd, ":5");
+    assert_eq!(rows(), [PickerRow::GoToLine(5)]);
+}
+
+#[test]
+fn ctrl_p_again_keeps_the_query_and_a_query_of_spaces_lists_the_open_tabs() {
+    // Break caught (review focus 1 and 4): a second Ctrl+P clearing what was typed, or a
+    // query of spaces listing every note, or none.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-again");
+    let a = scratch.note("alpha.md", "a");
+    let b = scratch.note("beta.md", "b");
+    scratch.note("gamma.md", "g");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "gam");
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.query_text()).unwrap(),
+        "gam"
+    );
+    assert_eq!(quick_open_names(window.hwnd), ["gamma.md"]);
+
+    type_query(window.hwnd, "   ");
+    assert_eq!(quick_open_names(window.hwnd), ["beta.md", "alpha.md"]);
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.selected_row()).flatten(),
+        Some(1)
+    );
+}
+
+#[test]
+fn a_tab_closed_while_the_picker_is_open_drops_its_row() {
+    // Break caught (review focus 5): a row naming a tab that closed under the open picker
+    // switching to a dead document, or the row lingering after the close so a middle-click
+    // that closes a background tab leaves it pickable although the tab is gone.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-closed-tab");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    assert_eq!(quick_open_names(window.hwnd), ["b.md", "a.md"]);
+    // The clean background tab (index 0, "a") closes the way a middle-click closes it: no
+    // focus moves, so the palette stays open and must refresh its rows (spec §5).
+    super::close_tab_at(window.hwnd, 0);
+    assert_eq!(tab_paths(window.hwnd), [Some(b.clone())]);
+    assert!(palette_visible(window.hwnd), "the palette stayed open");
+    assert_eq!(
+        quick_open_names(window.hwnd),
+        ["b.md"],
+        "the closed tab's row is gone"
+    );
+    press_enter_in_palette(window.hwnd);
+
+    assert_eq!(tab_paths(window.hwnd), [Some(b.clone())]);
+    assert_eq!(active_path(window.hwnd), Some(b));
+}
+
+#[test]
+fn a_note_removed_from_the_library_after_listing_reports_it_and_opens_nothing() {
+    // Break caught (review focus 5): a note deleted after the list was shown opening an
+    // empty tab, failing silently, or crashing the pick.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-removed");
+    scratch.note("alpha.md", "a");
+    let gamma = scratch.note("gamma.md", "g");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let tabs_before = super::tab_count(window.hwnd);
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "gam");
+    assert_eq!(quick_open_names(window.hwnd), ["gamma.md"]);
+    crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&gamma));
+    std::fs::remove_file(&gamma).unwrap();
+    press_enter_in_palette(window.hwnd);
+
+    assert_eq!(super::tab_count(window.hwnd), tabs_before);
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("could not open") && n.contains("no longer in the notebook")),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn quick_open_rows_carry_their_text_for_screen_readers_and_draw_their_hits_in_bold() {
+    // Break caught: rows a screen reader reads as blank, the notice read as anything else,
+    // hits drawn in the regular font, or the hint missing from the empty field (no ComCtl32
+    // v6 manifest, so EM_SETCUEBANNER shows nothing) or left behind in command mode.
+    use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+    use windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let palette = || app_mut(window.hwnd).command_palette.as_ref().unwrap();
+
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    assert_eq!(
+        palette().list_text(0),
+        crate::window::command_palette::NO_NOTEBOOK
+    );
+    assert_eq!(palette().placeholder(), Some("Go to note by name"));
+    let query = palette().query_hwnd();
+    assert!(palette().paint_placeholder(query));
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    assert_eq!(palette().placeholder(), None);
+    assert!(!palette().paint_placeholder(query));
+
+    let scratch = LibraryScratch::new("quick-open-draw");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\gamma notes.md", "g");
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "wk gmn");
+    assert_eq!(palette().list_text(0), r"gamma notes.md, in work");
+
+    let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
+    let item = DRAWITEMSTRUCT {
+        itemID: 0,
+        hDC: dc,
+        rcItem: RECT {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 26,
+        },
+        ..Default::default()
+    };
+    palette().draw_item(&item);
+    unsafe { DeleteDC(dc) };
+    assert!(palette().has_bold_font());
+}
+
+#[test]
+fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_commands() {
+    // Break caught: Alt attached a native menu bar, which Windows drew unthemed over the editor
+    // (the reclaimed caption leaves it no room) and left a "File" remnant behind after Escape.
+    use crate::window::menus::{DropdownExit, answer_next_dropdown};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenu, GetWindowRect, SC_KEYMENU};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    super::build_chrome(window.hwnd);
+    let editor_top = || {
+        let mut rect = RECT::default();
+        let mut origin = windows_sys::Win32::Foundation::POINT::default();
+        unsafe {
+            GetWindowRect(editor.hwnd(), &mut rect);
+            windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut origin);
+        }
+        rect.top - origin.y
+    };
+    let key_menu = |letter: u8| unsafe {
+        SendMessageW(
+            window.hwnd,
+            super::WM_SYSCOMMAND,
+            SC_KEYMENU as usize,
+            letter as isize,
+        )
+    };
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    // The editor group's tab strip is the title row, so the editor starts right below it.
+    let title_height = super::title_layout(window.hwnd).height;
+    let band = super::menu_band::band_height(dpi);
+
+    key_menu(0);
+    assert_eq!(
+        app_mut(window.hwnd).menu_mode,
+        Some(super::MenuMode {
+            hot: 0,
+            open: false
+        })
+    );
+    assert!(
+        unsafe { GetMenu(window.hwnd) }.is_null(),
+        "no native menu bar"
+    );
+    assert_eq!(editor_top(), title_height + band);
+    assert_eq!(super::menu_headings(window.hwnd).len(), 5);
+
+    key_menu(0);
+    assert_eq!(app_mut(window.hwnd).menu_mode, None);
+    assert_eq!(editor_top(), title_height);
+
+    // Alt+E opens Edit; Right moves to Search, whose Escape leaves Search highlighted.
+    answer_next_dropdown(|hwnd, heading| {
+        assert_eq!(heading, 1);
+        assert_eq!(
+            app_mut(hwnd).menu_mode,
+            Some(super::MenuMode { hot: 1, open: true })
+        );
+        DropdownExit::Switch(2)
+    });
+    answer_next_dropdown(|_, heading| {
+        assert_eq!(heading, 2);
+        DropdownExit::Escape
+    });
+    key_menu(b'e');
+    assert_eq!(
+        app_mut(window.hwnd).menu_mode,
+        Some(super::MenuMode {
+            hot: 2,
+            open: false
+        })
+    );
+
+    // Down opens the highlighted heading; a picked command leaves menu mode before it runs.
+    answer_next_dropdown(|_, heading| {
+        assert_eq!(heading, 2);
+        DropdownExit::Command(CommandId::Find)
+    });
+    assert!(super::handle_menu_key(
+        window.hwnd,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+        super::VK_DOWN as usize,
+    ));
+    assert_eq!(app_mut(window.hwnd).menu_mode, None);
+    assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
+    assert_eq!(
+        editor_top(),
+        title_height + super::find_bar::find_bar_height(dpi)
+    );
+}
+
+#[test]
+fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_changes() {
+    // Break caught: a find bar whose painted band is not reserved (the editor draws over it),
+    // or that keeps the old colors after the theme changes while it is open.
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    super::build_chrome(window.hwnd);
+    let top_of = |child| {
+        let mut rect = RECT::default();
+        let mut origin = windows_sys::Win32::Foundation::POINT::default();
+        unsafe {
+            GetWindowRect(child, &mut rect);
+            windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut origin);
+        }
+        (rect.top - origin.y, rect.bottom - rect.top)
+    };
+    let visible = |child| {
+        (unsafe { GetWindowLongPtrW(child, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
+    };
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+    // The editor group's tab strip is the title row, so the editor starts right below it.
+    let title_height = super::title_layout(window.hwnd).height;
+
+    execute_command(window.hwnd, CommandId::Find);
+    let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
+    assert!(visible(panel));
+    let band = super::find_bar::find_bar_height(dpi);
+    assert_eq!(top_of(panel), (title_height, band));
+    assert_eq!(top_of(editor.hwnd()).0, title_height + band);
+
+    let brush_before = {
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
+        bar.control_color(std::ptr::null_mut())
+    };
+    execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
+    let bar = app_mut(window.hwnd).find_bar().unwrap();
+    assert!(bar.is_visible());
+    assert_ne!(bar.control_color(std::ptr::null_mut()), brush_before);
+
+    assert_eq!(bar.placeholder(bar.query_hwnd()), Some("Find"));
+    assert_eq!(bar.placeholder(bar.replace_hwnd()), Some("Replace"));
+
+    // A click released on the close button at the bar's right end closes it.
+    let mut client = RECT::default();
+    unsafe { GetClientRect(panel, &mut client) };
+    let point = |x: i32, y: i32| ((y as u32) << 16 | (x as u32 & 0xffff)) as super::LPARAM;
+    let close_point = point(client.right - band / 2, band / 2);
+    super::panel_pointer(
+        window.hwnd,
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+        0,
+        point(client.right / 2, band / 2),
+    );
+    assert!(
+        visible(panel),
+        "a click on the field area must not close the bar"
+    );
+    super::panel_pointer(
+        window.hwnd,
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+        0,
+        close_point,
+    );
+    assert!(!visible(panel));
+    assert_eq!(top_of(editor.hwnd()).0, title_height);
+}
+
+#[test]
+fn with_no_tab_open_the_command_palette_lists_only_commands_that_need_no_document() {
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::CloseAllTabs);
+    assert!(app_mut(window.hwnd).tabs.is_empty());
+
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    let shown = app_mut(window.hwnd)
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .shown()
+        .iter()
+        .map(|entry| entry.command)
+        .collect::<Vec<_>>();
+    assert!(shown.iter().all(|command| !command.needs_document()));
+    assert!(shown.contains(&CommandId::Open));
+    assert!(shown.contains(&CommandId::ThemeDark));
+    assert!(!shown.contains(&CommandId::Save));
+}
+
+#[test]
+fn file_icon_commands_save_the_set_and_repaint_the_tree_without_restyling_the_editor() {
+    // Break caught: a set that is lost on restart, a tree left showing the old set until
+    // something else repaints it, fastpad.ini rewritten beyond its own line (icon sets spec
+    // §4), or a file-icon command that leaks into the editor's own styling.
+    use crate::editor::scintilla_constants::STYLE_DEFAULT;
+    use windows_sys::Win32::Graphics::Gdi::{GetUpdateRect, ValidateRect};
+    const SCI_STYLEGETSIZEFRACTIONAL: u32 = 2062;
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("file-icons");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let panel = sidebar_panel(window.hwnd);
+    // An update region is only tracked for windows under a visible ancestor chain; without
+    // this, GetUpdateRect below would read 0 no matter what InvalidateRect did. SW_SHOWNA
+    // shows the window without activating it, so it doesn't steal focus from the test run.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+            window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNA,
+        )
+    };
+    let editor_style = || unsafe {
+        SendMessageW(
+            editor.hwnd(),
+            SCI_STYLEGETSIZEFRACTIONAL,
+            STYLE_DEFAULT as usize,
+            0,
+        )
+    };
+    let style_before = editor_style();
+
+    // Material -> Minimal: a real change, so the panel must repaint.
+    unsafe { ValidateRect(panel, std::ptr::null()) };
+    execute_command(window.hwnd, CommandId::FileIconsMinimal);
+    assert_ne!(
+        unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+        0,
+        "switching to Minimal must invalidate the tree panel"
+    );
+    assert_eq!(
+        app_mut(window.hwnd).settings.file_icons,
+        crate::config::FileIconSet::Minimal
+    );
+
+    // Minimal -> Minimal: no-op for the setting, but set_file_icons still invalidates
+    // unconditionally (main_window.rs set_file_icons), so assert what the code does.
+    unsafe { ValidateRect(panel, std::ptr::null()) };
+    execute_command(window.hwnd, CommandId::FileIconsMinimal);
+    assert_ne!(
+        unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+        0,
+        "the repeat command still repaints (set_file_icons invalidates unconditionally)"
+    );
+
+    // Minimal -> Solid: a real change, so the panel must repaint.
+    unsafe { ValidateRect(panel, std::ptr::null()) };
+    execute_command(window.hwnd, CommandId::FileIconsSolid);
+    assert_ne!(
+        unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+        0,
+        "switching to Solid must invalidate the tree panel"
+    );
+    assert_eq!(
+        app_mut(window.hwnd).settings.file_icons,
+        crate::config::FileIconSet::Solid
+    );
+
+    // Solid -> Material: a real change, so the panel must repaint again.
+    unsafe { ValidateRect(panel, std::ptr::null()) };
+    execute_command(window.hwnd, CommandId::FileIconsMaterial);
+    assert_ne!(
+        unsafe { GetUpdateRect(panel, std::ptr::null_mut(), 0) },
+        0,
+        "switching to Material must invalidate the tree panel"
+    );
+
+    assert_eq!(
+        editor_style(),
+        style_before,
+        "file-icon commands must not restyle the editor"
+    );
+
+    super::save_settings_to(None);
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\nfile_icons=material\r\n"
+    );
+    assert!(!CommandId::FileIconsSolid.needs_document());
+    assert!(!CommandId::FileIconsMaterial.needs_document());
+}
+
+#[test]
+fn the_editor_display_toggles_apply_to_the_editor_and_a_theme_change_keeps_them() {
+    // Break caught: a toggle that saves but leaves the editor unchanged, a caret line that a
+    // theme change turns back on, or a toggle that rewrites the rest of fastpad.ini
+    // (settings dialog spec §4.4).
+    use crate::editor::scintilla_constants::{
+        SC_ELEMENT_CARET_LINE_BACK, SCI_GETELEMENTISSET, SCI_GETUSETABS, SCI_GETVIEWWS,
+        SCWS_INVISIBLE, SCWS_VISIBLEALWAYS,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("display-toggles");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    super::build_chrome(window.hwnd);
+    let send = |message, wparam| unsafe { SendMessageW(editor.hwnd(), message, wparam, 0) };
+    let caret_line_set = || send(SCI_GETELEMENTISSET, SC_ELEMENT_CARET_LINE_BACK as usize);
+    assert_eq!(send(SCI_GETUSETABS, 0), 1, "tab characters by default");
+    assert_eq!(send(SCI_GETVIEWWS, 0), SCWS_INVISIBLE as isize);
+    assert_eq!(
+        caret_line_set(),
+        1,
+        "the current line is highlighted by default"
+    );
+
+    execute_command(window.hwnd, CommandId::ToggleInsertSpaces);
+    execute_command(window.hwnd, CommandId::ToggleShowWhitespace);
+    execute_command(window.hwnd, CommandId::ToggleHighlightCurrentLine);
+    assert_eq!(send(SCI_GETUSETABS, 0), 0);
+    assert_eq!(send(SCI_GETVIEWWS, 0), SCWS_VISIBLEALWAYS as isize);
+    assert_eq!(caret_line_set(), 0);
+
+    execute_command(window.hwnd, CommandId::ThemeDark);
+    assert_eq!(caret_line_set(), 0, "a theme change keeps it off");
+    execute_command(window.hwnd, CommandId::ToggleHighlightCurrentLine);
+    assert_eq!(caret_line_set(), 1);
+    super::save_settings_to(None);
+
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\ninsert_spaces=true\r\nshow_whitespace=true\r\n\
+         highlight_current_line=true\r\ntheme=dark\r\n"
+    );
+}
+
+#[test]
+fn always_on_top_pins_the_window_and_saves_only_its_own_line() {
+    // Break caught: a toggle that saves but never changes the window's z-order, one that
+    // leaves the window topmost after switching off, or one that rewrites the rest of
+    // fastpad.ini.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, SW_SHOWNA, ShowWindow, WS_EX_TOPMOST,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("always-on-top");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(
+        &ini, "# kept
+",
+    )
+    .unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    super::build_chrome(window.hwnd);
+    // Windows keeps a hidden window's z-order as it was, so the window must be showing.
+    unsafe { ShowWindow(window.hwnd, SW_SHOWNA) };
+    let topmost =
+        || unsafe { GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 };
+    assert!(!topmost(), "off by default");
+
+    execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+    assert!(topmost());
+    execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+    assert!(!topmost());
+    execute_command(window.hwnd, CommandId::ToggleAlwaysOnTop);
+    super::save_settings_to(None);
+
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept
+always_on_top=true
+"
+    );
+}
+
+#[test]
+fn settings_actions_apply_and_save_only_their_own_lines() {
+    // Break caught: a dialog change that updates the window but is lost on restart, one that
+    // rewrites the user's fastpad.ini, or a re-pick of the current value that writes anyway
+    // (settings dialog spec §4.2).
+    use crate::config::{FileIconSet, ThemePreference};
+    use crate::window::settings_model::{SettingsAction, Toggle};
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("settings-actions");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    super::build_chrome(window.hwnd);
+
+    for action in [
+        SettingsAction::SetTheme(ThemePreference::CatppuccinMocha),
+        SettingsAction::SetFileIcons(FileIconSet::Solid),
+        SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
+        SettingsAction::SetFontSize(14),
+        SettingsAction::SetTabWidth(2),
+        SettingsAction::Toggle(Toggle::WordWrap),
+        // Picking what is already set writes nothing.
+        SettingsAction::SetFontSize(14),
+        SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
+    ] {
+        super::apply_settings_action(window.hwnd, action);
+    }
+
+    let settings = app_mut(window.hwnd).settings.clone();
+    assert_eq!(settings.theme, ThemePreference::CatppuccinMocha);
+    assert_eq!(settings.file_icons, FileIconSet::Solid);
+    assert_eq!(settings.font_face, "Cascadia Mono");
+    assert_eq!(settings.font_size, 14);
+    assert_eq!(settings.tab_width, 2);
+    assert!(settings.word_wrap);
+    let view = super::settings_view(window.hwnd);
+    assert_eq!(view.settings, settings);
+    assert_eq!(view.notebook_autosave, None, "no notebook is open");
+    super::save_settings_to(None);
+
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\ntheme=catppuccin-mocha\r\nfile_icons=solid\r\nfont_face=Cascadia Mono\r\n\
+         font_size=14\r\ntab_width=2\r\nword_wrap=true\r\n"
+    );
+}
+
+#[test]
+fn setting_commands_apply_to_the_editor_and_save_only_their_own_ini_lines() {
+    // Break caught: a palette setting that changes the editor but is lost on restart, or that
+    // rewrites fastpad.ini and drops what the user wrote there by hand.
+    use crate::editor::scintilla_constants::{SCI_GETTABWIDTH, SCI_STYLEGETBACK, STYLE_DEFAULT};
+    const SCI_GETWRAPMODE: u32 = 2269;
+    const SCI_STYLEGETSIZEFRACTIONAL: u32 = 2062;
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("settings");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\nfont_face=Cascadia Mono\r\ntab_width=4\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let send = |message, wparam| unsafe { SendMessageW(editor.hwnd(), message, wparam, 0) };
+
+    execute_command(window.hwnd, CommandId::ToggleWordWrap);
+    assert_ne!(send(SCI_GETWRAPMODE, 0), 0);
+    execute_command(window.hwnd, CommandId::TabWidth8);
+    assert_eq!(send(SCI_GETTABWIDTH, 0), 8);
+    execute_command(window.hwnd, CommandId::FontSizeIncrease);
+    execute_command(window.hwnd, CommandId::FontSizeIncrease);
+    assert_eq!(
+        send(SCI_STYLEGETSIZEFRACTIONAL, STYLE_DEFAULT as usize),
+        1300
+    );
+    execute_command(window.hwnd, CommandId::FontSizeReset);
+    assert_eq!(
+        send(SCI_STYLEGETSIZEFRACTIONAL, STYLE_DEFAULT as usize),
+        1100
+    );
+    execute_command(window.hwnd, CommandId::ToggleLineNumbers);
+    assert!(!app_mut(window.hwnd).settings.line_numbers);
+
+    super::build_chrome(window.hwnd);
+    execute_command(window.hwnd, CommandId::ThemeDark);
+    assert_eq!(
+        send(SCI_STYLEGETBACK, STYLE_DEFAULT as usize) as u32,
+        crate::window::palette::Palette::for_theme(crate::platform::theme::Theme::Dark, false,)
+            .editor_background
+    );
+    execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
+    assert_eq!(
+        send(SCI_STYLEGETBACK, STYLE_DEFAULT as usize) as u32,
+        crate::window::palette::Palette::for_theme(
+            crate::platform::theme::Theme::CatppuccinMocha,
+            false,
+        )
+        .editor_background
+    );
+    execute_command(window.hwnd, CommandId::ThemeLight);
+    assert_eq!(
+        send(SCI_STYLEGETBACK, STYLE_DEFAULT as usize) as u32,
+        crate::window::palette::Palette::for_theme(crate::platform::theme::Theme::Light, false,)
+            .editor_background
+    );
+    super::save_settings_to(None);
+
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\nfont_face=Cascadia Mono\r\ntab_width=8\r\nword_wrap=true\r\n\
+         font_size=11\r\nline_numbers=false\r\ntheme=light\r\n"
+    );
+    let (reloaded, warnings) = {
+        let mut settings = crate::config::default_settings();
+        let delta = crate::config::parse(&std::fs::read_to_string(&ini).unwrap());
+        settings.apply_delta(&delta);
+        (settings, delta.warnings)
+    };
+    assert!(warnings.is_empty());
+    // The window never loaded this file, so only the hand-written font differs.
+    assert_eq!(reloaded.font_face, "Cascadia Mono");
+    assert_eq!(
+        crate::config::Settings {
+            font_face: app_mut(window.hwnd).settings.font_face.clone(),
+            ..reloaded
+        },
+        app_mut(window.hwnd).settings
+    );
+}
+
+#[test]
+fn session_toggle_saves_only_its_line_and_says_so() {
+    // Break caught: a toggle that flips the flag but is lost on restart, rewrites the user's
+    // fastpad.ini, or leaves no sign of which state it chose (menus show no checkmarks).
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-toggle");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    assert!(app_mut(window.hwnd).settings.restore_session);
+
+    execute_command(window.hwnd, CommandId::ToggleRestoreSession);
+
+    assert!(!app_mut(window.hwnd).settings.restore_session);
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\nrestore_session=false\r\n"
+    );
+    assert!(
+        app_mut(window.hwnd)
+            .notifications
+            .pending()
+            .iter()
+            .any(|notice| notice.message == crate::session::toggle_notice(false))
+    );
+    super::save_settings_to(None);
+}
+
+#[test]
+fn notes_mode_toggle_saves_only_its_line_and_says_so() {
+    // Break caught: a toggle lost on restart, or one that rewrites the rest of fastpad.ini.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("notes-toggle");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::ToggleNotesMode);
+    assert!(!app_mut(window.hwnd).settings.notes_mode);
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\nnotes_mode=false\r\n"
+    );
+    assert!(
+        notices(window.hwnd)
+            .contains(&crate::window::library_host::notes_mode_notice(false).to_owned())
+    );
+    super::save_settings_to(None);
+}
+
+#[test]
+fn an_untitled_tab_is_labelled_by_its_first_line_as_you_type() {
+    // Break caught: every untitled tab reading "Untitled", or the label recomputed on every
+    // keystroke far below the first line.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("\n## Meeting notes\nbody").unwrap();
+    pump_posted_messages(window.hwnd);
+    let title = || app_mut(window.hwnd).tabs.active().unwrap().title();
+    assert_eq!(title(), "Meeting notes *");
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().label_watch, 1);
+
+    app_mut(window.hwnd).settings.notes_mode = false;
+    crate::window::library_host::clear_labels(window.hwnd);
+    assert_eq!(title(), "Untitled *");
+}
+
+#[test]
+fn dragging_the_tab_scroll_thumb_scrolls_the_tabs_without_activating_one() {
+    // Break caught: a scroll bar that is only painted, so overflowing tabs cannot be reached
+    // without a mouse wheel, or a drag release that also clicks the tab under the pointer.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    for _ in 0..40 {
+        execute_command(window.hwnd, CommandId::New);
+    }
+    super::activate_tab(window.hwnd, 0);
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let scroll = || app_mut(window.hwnd).tabs.scroll_offset();
+    let layout = super::strip_layout(window.hwnd).unwrap();
+    assert_eq!(layout.scroll, 0);
+    let thumb = layout.scroll_thumb().expect("40 tabs overflow the strip");
+    let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
+    let y = thumb.center().y;
+    let far_right = layout.tabs.right + 500;
+
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDOWN, 1, pack(thumb.center().x, y));
+        SendMessageW(group, WM_MOUSEMOVE, 1, pack(far_right, y));
+    }
+    assert_eq!(scroll(), layout.max_scroll);
+    unsafe {
+        SendMessageW(group, WM_LBUTTONUP, 0, pack(far_right, y));
+        SendMessageW(group, WM_MOUSEMOVE, 0, pack(layout.tabs.left, y));
+    }
+    assert_eq!(
+        scroll(),
+        layout.max_scroll,
+        "moving after the release must not keep dragging"
+    );
+    assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+
+    // Pressing the track away from the thumb jumps there.
+    let track = super::strip_layout(window.hwnd)
+        .unwrap()
+        .scroll_bar
+        .unwrap();
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDOWN, 1, pack(track.left, y));
+        SendMessageW(group, WM_LBUTTONUP, 0, pack(track.left, y));
+    }
+    assert_eq!(scroll(), 0);
+}
+
+#[test]
+fn queued_ipc_requests_wait_for_the_modal_prompt_to_close() {
+    // Break caught: a forwarded launch is dispatched inside a close prompt (opening tabs the
+    // review never saw) or dropped entirely instead of staying queued.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("dirty").unwrap();
+    app_mut(window.hwnd)
+        .ipc_requests
+        .push(crate::ipc::IpcRequest::New);
+    let before = app_mut(window.hwnd).tabs.len();
+
+    answer_next_close_prompt(|hwnd| {
+        unsafe {
+            SendMessageW(hwnd, crate::window::WM_FASTPAD_IPC_REQUEST, 0, 0);
+        }
+        CloseDecision::Cancel
+    });
+    execute_command(window.hwnd, CommandId::CloseTab);
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        before,
+        "a forwarded request was handled inside the modal loop"
+    );
+    assert_eq!(
+        app_mut(window.hwnd).ipc_requests.len(),
+        1,
+        "the request must stay queued while a modal loop runs"
+    );
+
+    pump_posted_messages(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).tabs.len(), before + 1);
+    assert!(app_mut(window.hwnd).ipc_requests.is_empty());
+}
+
+#[test]
+fn recovery_snapshot_ticks_are_skipped_inside_a_modal_prompt() {
+    // Break caught: the recovery WM_TIMER fires inside a modal loop and swaps documents in and
+    // out of the view under the operation the modal dialog is about to complete.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("modal-snapshot");
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+    editor.set_text("typed").unwrap();
+    let snapshot = snapshot_path(
+        root.path(),
+        app_mut(window.hwnd).tabs.active().unwrap().recovery_id,
+    );
+
+    answer_next_close_prompt(|hwnd| {
+        super::snapshot_next_document(hwnd);
+        CloseDecision::Cancel
+    });
+    execute_command(window.hwnd, CommandId::CloseTab);
+
+    assert!(
+        !snapshot.exists(),
+        "a snapshot tick ran inside the modal loop"
+    );
+
+    super::snapshot_next_document(window.hwnd);
+
+    assert!(snapshot.exists(), "snapshots must resume after the modal");
+}
+
+#[test]
+fn save_as_writes_the_document_chosen_before_the_dialog_opened() {
+    // Break caught: the Save As dialog's modal loop activates another tab (a recovered one, a
+    // forwarded open), and complete_save then renames and overwrites whatever is active now.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("modal-save-as");
+    let target = root.path().join("chosen.txt");
+    editor.set_text("alpha").unwrap();
+    let chosen = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let destination = target.clone();
+    answer_next_save_dialog(move |hwnd| {
+        super::create_new_document(hwnd).unwrap();
+        Some(destination)
+    });
+
+    assert!(super::save_active_document_as(window.hwnd));
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"alpha");
+    let app = app_mut(window.hwnd);
+    assert_eq!(app.tabs.len(), 2);
+    assert_eq!(app.tabs.active().unwrap().id, chosen);
+    assert_eq!(
+        app.tabs.document(chosen).unwrap().path.as_deref(),
+        Some(target.as_path())
+    );
+}
+
+#[test]
+fn folder_and_confirm_seams_answer_inside_their_modal_scope() {
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    crate::window::answer_next_folder_dialog(|hwnd| {
+        assert!(crate::window::modal::modal_active(hwnd));
+        Some(std::path::PathBuf::from(r"D:\Notes"))
+    });
+    assert_eq!(
+        crate::window::modal::choose_folder(window.hwnd).unwrap(),
+        Some(std::path::PathBuf::from(r"D:\Notes"))
+    );
+    crate::window::answer_next_confirm(|hwnd| {
+        assert!(crate::window::modal::modal_active(hwnd));
+        false
+    });
+    assert!(!crate::window::modal::confirm(window.hwnd, "Delete?"));
+}
+
+#[test]
+fn failed_language_activation_leaves_document_language_unchanged_and_records_a_warning() {
+    // Break caught: a failed Lexilla load/lexer-creation must not record the requested
+    // language on Document metadata when the editor itself was left exactly as it was
+    // (LanguageManager::apply never installs a lexer before a real pointer is in hand), and
+    // must surface something the caller can show in a notification instead of failing silently.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    unsafe { super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create) }
+        .unwrap();
+
+    // Seed a LanguageManager pointed at a Lexilla.dll path that cannot possibly load, so the
+    // activation below fails deterministically without depending on the real native DLL.
+    let missing = std::env::temp_dir().join(format!(
+        "fastpad-main-window-missing-lexilla-test-{}.dll",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&missing);
+    unsafe {
+        super::app_ptr(window.hwnd)
+            .unwrap()
+            .as_mut()
+            .language_manager = Some(LanguageManager::with_dll_path_for_test(missing));
+    }
+    let language_before = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+        .tabs
+        .active()
+        .unwrap()
+        .language;
+    assert_eq!(language_before, Language::PlainText);
+
+    execute_command(window.hwnd, CommandId::LanguageJson);
+
+    assert_eq!(
+        notices(window.hwnd),
+        vec![
+            "FastPad could not enable syntax highlighting for this file. It will remain in \
+             plain text."
+                .to_owned()
+        ]
+    );
+    let language_after = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+        .tabs
+        .active()
+        .unwrap()
+        .language;
+    assert_eq!(language_after, Language::PlainText);
+}
+
+#[test]
+fn an_svg_keeps_its_preview_when_highlighting_cannot_load() {
+    // Break caught: SVG moved from the null lexer to Lexilla's xml lexer, so a missing
+    // Lexilla.dll left the tab as plain text and hid the SVG preview it never needed Lexilla
+    // for.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    unsafe { super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create) }
+        .unwrap();
+    let missing = std::env::temp_dir().join(format!(
+        "fastpad-main-window-missing-lexilla-svg-test-{}.dll",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&missing);
+    unsafe {
+        super::app_ptr(window.hwnd)
+            .unwrap()
+            .as_mut()
+            .language_manager = Some(LanguageManager::with_dll_path_for_test(missing));
+    }
+
+    execute_command(window.hwnd, CommandId::LanguageSvg);
+
+    assert_eq!(notices(window.hwnd).len(), 1);
+    let language_after = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+        .tabs
+        .active()
+        .unwrap()
+        .language;
+    assert_eq!(language_after, Language::Svg);
+    assert!(crate::window::preview_host::buttons_visible(window.hwnd));
+}
+
+#[test]
+fn corrupt_settings_are_reported_on_the_bottom_bar_that_chrome_reserves() {
+    // Break caught: nothing else asserts that invalid fastpad.ini lines actually reach the
+    // user. If load_settings stopped queuing warnings, the painted bottom bar stopped showing
+    // them, layout stopped reserving room for it, or dismissing a notice collapsed the bar,
+    // every other test would still pass.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    unsafe { super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create) }
+        .unwrap();
+    let editor_hwnd = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+        .editor()
+        .unwrap()
+        .hwnd();
+
+    // No bottom bar exists before WM_FASTPAD_BUILD_CHROME, regardless of pending warnings.
+    assert_eq!(super::current_status_text(window.hwnd), None);
+    assert_eq!(super::current_status_bar(window.hwnd), None);
+
+    let warnings = vec![
+        crate::config::SettingWarning {
+            line: 3,
+            message: "invalid value for tab_width: \"nope\"".to_owned(),
+        },
+        crate::config::SettingWarning {
+            line: 5,
+            message: "unknown setting key: bogus".to_owned(),
+        },
+    ];
+    super::apply_loaded_settings(window.hwnd, crate::config::default_settings(), warnings);
+
+    assert_eq!(
+        unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .notifications
+            .len(),
+        2
+    );
+    assert_eq!(
+        super::current_status_text(window.hwnd),
+        None,
+        "chrome has not been built yet, so there is still nowhere to paint the warning"
+    );
+
+    super::build_chrome(window.hwnd);
+
+    let status = super::current_status_text(window.hwnd);
+    assert!(
+        status
+            .as_deref()
+            .is_some_and(|text| text.contains("fastpad.ini line 3")),
+        "expected the first warning's line reference in {status:?}"
+    );
+    let mut client = RECT::default();
+    let mut shown = RECT::default();
+    unsafe {
+        GetClientRect(window.hwnd, &mut client);
+        GetClientRect(editor_hwnd, &mut shown);
+    }
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) };
+    // The editor group's tab strip is the title row, so the editor starts right below it.
+    let title_height = super::title_layout(window.hwnd).height;
+    assert_eq!(
+        (client.bottom - client.top) - (shown.bottom - shown.top),
+        title_height + crate::window::status::status_height(dpi),
+        "the editor should leave exactly the bottom bar's height below it"
+    );
+
+    super::dismiss_notifications(window.hwnd);
+
+    assert_eq!(super::current_status_text(window.hwnd), None);
+    let bar = super::current_status_bar(window.hwnd).unwrap();
+    assert_eq!(bar.left, "Ln 1, Col 1");
+    assert_eq!(bar.right, "Plain Text    UTF-8");
+    let mut dismissed = RECT::default();
+    unsafe {
+        GetClientRect(editor_hwnd, &mut dismissed);
+    }
+    assert_eq!(
+        dismissed.bottom - dismissed.top,
+        shown.bottom - shown.top,
+        "the bottom bar stays after its notices are dismissed"
+    );
+}
+
+fn line_number_margin_width(editor: &crate::editor::Editor) -> isize {
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+            editor.hwnd(),
+            crate::editor::scintilla_constants::SCI_GETMARGINWIDTHN,
+            0,
+            0,
+        )
+    }
+}
+
+#[test]
+fn line_numbers_follow_edits_and_the_line_numbers_setting() {
+    // Break caught: typing or pasting past line 99 without re-sizing the gutter clips the
+    // numbers, and line_numbers=false in fastpad.ini leaving the gutter visible.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let two_digits = line_number_margin_width(&editor);
+    assert!(two_digits > 0, "line numbers are shown by default");
+
+    editor.replace_target(0..0, &"\n".repeat(150)).unwrap();
+    let three_digits = line_number_margin_width(&editor);
+    assert!(
+        three_digits > two_digits,
+        "151 lines need a wider gutter than {two_digits}px, got {three_digits}px"
+    );
+
+    editor.undo().unwrap();
+    assert_eq!(line_number_margin_width(&editor), two_digits);
+
+    let mut settings = crate::config::default_settings();
+    settings.line_numbers = false;
+    super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+    assert_eq!(line_number_margin_width(&editor), 0);
+}
+
+#[test]
+fn format_json_command_reformats_with_two_spaces_in_one_undo_step() {
+    // Break caught: Format JSON not actually rewriting the buffer, or splitting the rewrite
+    // into more than one undo action (which would force repeated Ctrl+Z to fully undo it).
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("{\"a\":[1,2]}").unwrap();
+
+    execute_command(window.hwnd, CommandId::FormatJson);
+
+    assert_eq!(
+        editor.text().unwrap(),
+        "{\n  \"a\": [\n    1,\n    2\n  ]\n}"
+    );
+    assert!(notices(window.hwnd).is_empty());
+    assert!(editor.can_undo().unwrap());
+    editor.undo().unwrap();
+    assert_eq!(editor.text().unwrap(), "{\"a\":[1,2]}");
+    assert!(!editor.can_undo().unwrap());
+}
+
+#[test]
+fn format_json_command_on_invalid_json_leaves_bytes_unchanged_and_reports_an_issue() {
+    // Break caught: Format JSON starting an undo action or mutating the buffer before
+    // discovering the source does not parse, and/or swallowing the failure instead of
+    // surfacing it.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("{ bad").unwrap();
+
+    execute_command(window.hwnd, CommandId::FormatJson);
+
+    assert_eq!(editor.text().unwrap(), "{ bad");
+    assert!(!editor.can_undo().unwrap());
+    let issues = notices(window.hwnd);
+    assert_eq!(issues.len(), 1);
+    assert!(issues[0].contains("line 1"), "{}", issues[0]);
+}
+
+#[test]
+fn format_json_command_clamps_the_restored_selection_to_the_new_shorter_length() {
+    // Break caught: restoring the pre-format selection verbatim after formatting shrank the
+    // document, leaving an out-of-range SCI_SETSEL instead of a clamped one.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let padding = " ".repeat(50);
+    let source = format!("{{{padding}\"a\":1}}");
+    editor.populate_clean(&source).unwrap();
+    editor.set_selection(55..58).unwrap();
+
+    execute_command(window.hwnd, CommandId::FormatJson);
+
+    let formatted_len = editor.text().unwrap().len();
+    assert!(formatted_len < 55, "expected formatting to shrink the text");
+    assert_eq!(editor.selection().unwrap(), formatted_len..formatted_len);
+}
+
+#[test]
+fn format_json_command_snaps_the_restored_selection_to_a_utf8_char_boundary() {
+    // Break caught: reusing a pre-format byte offset verbatim (once only clamped to the new
+    // length) against the post-format text can land mid-character, since it has no guaranteed
+    // relationship to character boundaries in the reformatted bytes. Here the caret sits at an
+    // ordinary, valid boundary in the *compact* source (right after "héllo"'s closing quote);
+    // at that exact raw byte offset, the *pretty-printed* text — which keeps "é"'s literal
+    // two-byte UTF-8 encoding but reflows the surrounding whitespace — instead lands squarely
+    // between "é"'s two bytes.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let source = "{\"a\":\"h\u{e9}llo\",\"b\":1}";
+    let formatted = crate::languages::format_json(source).unwrap();
+
+    let boundary_in_source = source.find("\",\"b\"").unwrap(); // right before the closing '"'
+    assert!(source.is_char_boundary(boundary_in_source));
+
+    let e_char_start = formatted.find('\u{e9}').unwrap();
+    assert_eq!(
+        boundary_in_source,
+        e_char_start + 1,
+        "test setup: expected the reused raw byte offset to land inside é's encoding"
+    );
+    assert!(!formatted.is_char_boundary(boundary_in_source));
+
+    editor.populate_clean(source).unwrap();
+    editor
+        .set_selection(boundary_in_source..boundary_in_source)
+        .unwrap();
+
+    execute_command(window.hwnd, CommandId::FormatJson);
+
+    assert_eq!(editor.text().unwrap(), formatted);
+    let restored = editor.selection().unwrap();
+    assert!(
+        formatted.is_char_boundary(restored.start) && formatted.is_char_boundary(restored.end),
+        "restored selection {restored:?} is not on a UTF-8 character boundary"
+    );
+    // Snapped backward to the boundary immediately before "é", not forward past it.
+    assert_eq!(restored, e_char_start..e_char_start);
+}
+
+#[test]
+fn validate_json_command_reports_success_and_never_mutates_the_document() {
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("{\"a\":1}").unwrap();
+
+    execute_command(window.hwnd, CommandId::ValidateJson);
+
+    let reported = notices(window.hwnd);
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0].contains("valid JSON"), "{reported:?}");
+    assert_eq!(editor.text().unwrap(), "{\"a\":1}");
+    assert!(!editor.can_undo().unwrap());
+}
+
+#[test]
+fn validate_json_command_reports_the_line_and_column_for_invalid_json() {
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("{\n  bad\n}").unwrap();
+
+    execute_command(window.hwnd, CommandId::ValidateJson);
+
+    let issues = notices(window.hwnd);
+    assert_eq!(issues.len(), 1);
+    assert!(
+        issues[0].contains("line 2") && issues[0].contains("column 3"),
+        "{}",
+        issues[0]
+    );
+    assert_eq!(editor.text().unwrap(), "{\n  bad\n}");
+}
+
+#[test]
+fn recovery_discovery_opens_foreign_snapshots_as_dirty_recovered_tabs_with_one_notice() {
+    // Break caught: recovered text opened clean, untitled-looking, without a notice, or this
+    // process's own live snapshots reopened as duplicates.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("discover");
+    let source = write_snapshot(
+        root.path(),
+        &Snapshot::new(
+            RecoveryId::from_u128(0x77),
+            Some(PathBuf::from(r"C:\docs\notes.md")),
+            Encoding::Utf16Le,
+            "recovered body",
+        ),
+    )
+    .unwrap();
+    let own_id = app_mut(window.hwnd).allocate_recovery_id();
+    let own = write_snapshot(
+        root.path(),
+        &Snapshot::new(own_id, None, Encoding::Utf8, "live"),
+    )
+    .unwrap();
+    std::fs::write(root.path().join("torn.fps"), b"FPS1").unwrap();
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+
+    super::recover_snapshots(window.hwnd);
+
+    let (tabs, title, dirty, path, encoding, origin, notices) = {
+        let app = app_mut(window.hwnd);
+        let active = app.tabs.active().unwrap();
+        (
+            app.tabs.len(),
+            active.title(),
+            active.dirty,
+            active.path.clone(),
+            active.encoding,
+            active.recovery_origin.clone(),
+            app.notifications.len(),
+        )
+    };
+    assert_eq!(tabs, 2);
+    assert_eq!(title, "Recovered: notes.md *");
+    assert!(dirty);
+    assert_eq!(path, None);
+    assert_eq!(encoding, Encoding::Utf16Le);
+    assert_eq!(origin.unwrap().snapshot_path, source);
+    assert_eq!(notices, 1);
+    assert_eq!(editor.text().unwrap(), "recovered body");
+    assert_ne!(
+        unsafe { SendMessageW(editor.hwnd(), SCI_GETMODIFY, 0, 0) },
+        0,
+        "Scintilla itself must treat the recovered text as unsaved"
+    );
+    assert!(source.exists() && own.exists());
+    assert!(root.path().join("torn.fps.invalid").exists());
+}
+
+#[test]
+fn snapshots_write_one_changed_dirty_document_per_tick_without_disturbing_the_view() {
+    // Break caught: several documents written per tick, unchanged generations rewritten, or an
+    // inactive tab's snapshot swapping the visible document or selection.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("tick");
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+    editor.set_text("alpha").unwrap();
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("beta\nline").unwrap();
+    editor.set_selection(2..3).unwrap();
+    let ids = app_mut(window.hwnd)
+        .tabs
+        .documents()
+        .map(|document| document.recovery_id)
+        .collect::<Vec<_>>();
+    let first = snapshot_path(root.path(), ids[0]);
+    let second = snapshot_path(root.path(), ids[1]);
+
+    super::snapshot_next_document(window.hwnd);
+
+    assert_eq!(read_snapshot_text(&first), "alpha");
+    assert!(!second.exists());
+    assert_eq!(editor.text().unwrap(), "beta\nline");
+    assert_eq!(editor.selection().unwrap(), 2..3);
+    assert!(app_mut(window.hwnd).last_snapshot_duration.is_some());
+
+    super::snapshot_next_document(window.hwnd);
+    assert_eq!(read_snapshot_text(&second), "beta\nline");
+
+    std::fs::remove_file(&first).unwrap();
+    std::fs::remove_file(&second).unwrap();
+    super::snapshot_next_document(window.hwnd);
+    assert!(!first.exists() && !second.exists());
+}
+
+#[test]
+fn saving_a_recovered_tab_never_touches_the_original_and_removes_its_snapshots() {
+    // Break caught: Save silently writing the original path, or a saved recovered document
+    // leaving snapshots that resurrect it after the next crash.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("save");
+    let original = root.path().join("original.txt");
+    std::fs::write(&original, b"original").unwrap();
+    let source = write_snapshot(
+        root.path(),
+        &Snapshot::new(
+            RecoveryId::from_u128(0x99),
+            Some(original.clone()),
+            Encoding::Utf8,
+            "recovered",
+        ),
+    )
+    .unwrap();
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+    super::recover_snapshots(window.hwnd);
+    editor.set_text("recovered and edited").unwrap();
+
+    super::snapshot_next_document(window.hwnd);
+    let own = snapshot_path(
+        root.path(),
+        app_mut(window.hwnd).tabs.active().unwrap().recovery_id,
+    );
+    assert_eq!(read_snapshot_text(&own), "recovered and edited");
+    assert!(
+        !source.exists(),
+        "the stale source would reopen as a duplicate"
+    );
+
+    let target = root.path().join("saved.txt");
+    super::save_path_as(window.hwnd, &target);
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"recovered and edited");
+    assert_eq!(std::fs::read(&original).unwrap(), b"original");
+    assert!(!own.exists());
+    let app = app_mut(window.hwnd);
+    assert_eq!(app.tabs.active().unwrap().title(), "saved.txt");
+    assert_eq!(app.tabs.active().unwrap().recovery_origin, None);
+}
+
+#[test]
+fn clean_window_close_removes_this_sessions_snapshots() {
+    // Break caught: snapshots outliving a clean exit and restoring tabs on the next launch.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("close");
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+    editor.set_text("typed").unwrap();
+    super::snapshot_next_document(window.hwnd);
+    let own = snapshot_path(
+        root.path(),
+        app_mut(window.hwnd).tabs.active().unwrap().recovery_id,
+    );
+    assert!(own.exists());
+    editor.set_save_point();
+
+    unsafe {
+        SendMessageW(window.hwnd, WM_CLOSE, 0, 0);
+    }
+
+    assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+    assert!(!own.exists());
+}
+
+#[test]
+fn undoing_a_recovered_tab_keeps_it_dirty_and_its_source_through_clean_close_cleanup() {
+    // Break caught: undo reaching Scintilla's empty save point marks the recovered tab clean,
+    // so closing skips the prompt and deletes the only copy of its text.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("undo");
+    let source = write_snapshot(
+        root.path(),
+        &Snapshot::new(
+            RecoveryId::from_u128(0x55),
+            None,
+            Encoding::Utf8,
+            "only copy",
+        ),
+    )
+    .unwrap();
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+    super::recover_snapshots(window.hwnd);
+
+    while editor.can_undo().unwrap() {
+        editor.undo().unwrap();
+    }
+
+    assert_eq!(editor.text().unwrap(), "");
+    assert_eq!(
+        unsafe { SendMessageW(editor.hwnd(), SCI_GETMODIFY, 0, 0) },
+        0,
+        "test setup: Scintilla reached its save point"
+    );
+    let app = app_mut(window.hwnd);
+    let active = app.tabs.active().unwrap().id;
+    assert!(app.tabs.active().unwrap().dirty);
+    assert_eq!(
+        app.tabs.next_dirty_review(&[]).map(|review| review.id),
+        Some(active),
+        "window close must still prompt for the recovered tab"
+    );
+    super::remove_session_snapshots(window.hwnd, &[]);
+    assert!(source.exists());
+}
+
+#[test]
+fn discovery_skips_snapshots_whose_owner_process_is_still_running() {
+    // Break caught: a second instance opening, quarantining, or later deleting a live
+    // instance's snapshots.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let root = RecoveryScratch::new("live-owner");
+    let process_start = 0x5EED_0000_0000_0000 | u64::from(std::process::id());
+    let live = RecoveryId::compose(process_start, 4_000_000_001, 1);
+    let torn = snapshot_path(
+        root.path(),
+        RecoveryId::compose(process_start, 4_000_000_001, 2),
+    );
+    let owner = crate::recovery::create_owner_mutex(live).unwrap();
+    let valid = write_snapshot(
+        root.path(),
+        &Snapshot::new(live, None, Encoding::Utf8, "live elsewhere"),
+    )
+    .unwrap();
+    std::fs::write(&torn, b"FPS1").unwrap();
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+
+    super::recover_snapshots(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+    assert!(valid.exists() && torn.exists());
+
+    drop(owner);
+    super::recover_snapshots(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+    assert!(valid.exists());
+    assert!(
+        !torn.exists(),
+        "a dead owner's torn snapshot is quarantined"
+    );
+}
+
+fn app_mut<'a>(hwnd: HWND) -> &'a mut App {
+    unsafe { super::app_ptr(hwnd).unwrap().as_mut() }
+}
+
+/// The non-modal notification messages currently queued on the window (spec 239).
+fn notices(hwnd: HWND) -> Vec<String> {
+    app_mut(hwnd)
+        .notifications
+        .pending()
+        .iter()
+        .map(|notice| notice.message.clone())
+        .collect()
+}
+
+fn read_snapshot_text(path: &std::path::Path) -> String {
+    Snapshot::decode(&std::fs::read(path).unwrap())
+        .unwrap()
+        .text
+}
+
+struct RecoveryScratch(PathBuf);
+
+impl RecoveryScratch {
+    fn new(label: &str) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fastpad-window-recovery-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for RecoveryScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Installs a real Scintilla editor onto `window` (mirroring
+/// `failed_language_activation_leaves_document_language_unchanged_and_records_a_warning`'s own
+/// setup) and returns it for direct `text`/`set_text`/`selection` calls in JSON command tests.
+fn install_test_editor(window: &ProductionWindow) -> crate::editor::Editor {
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    unsafe { super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create) }
+        .unwrap();
+    // What the first WM_SIZE does once `bootstrap::run` shows the window.
+    super::layout_editor_and_find_bar(window.hwnd);
+    unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+        .editor()
+        .cloned()
+        .unwrap()
+}
+
+fn sidebar_windows(hwnd: HWND) -> (HWND, HWND) {
+    let sidebar = app_mut(hwnd)
+        .sidebar
+        .as_ref()
+        .expect("notes mode shows the sidebar");
+    (sidebar.bar, sidebar.panel)
+}
+
+/// Moves the pointer onto the activity bar, which makes its tooltip.
+fn hover_bar(bar: HWND) {
+    unsafe {
+        SendMessageW(
+            bar,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+            0,
+            client_lparam(10, 60),
+        );
+    }
+}
+
+fn client_lparam(x: i32, y: i32) -> super::LPARAM {
+    ((y as u32) << 16 | (x as u32 & 0xffff)) as super::LPARAM
+}
+
+/// `window`'s client point `x`, `y` as a screen-coordinate `lParam`, as WM_NCHITTEST gets it.
+fn screen_lparam(window: HWND, x: i32, y: i32) -> super::LPARAM {
+    let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window, &mut point) };
+    client_lparam(point.x, point.y)
+}
+
+fn client_size(window: HWND) -> (i32, i32) {
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(window, &mut rect) };
+    (rect.right, rect.bottom)
+}
+
+/// `child`'s left edge in `parent`'s client coordinates.
+fn left_of(child: HWND, parent: HWND) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut rect = RECT::default();
+    let mut origin = windows_sys::Win32::Foundation::POINT::default();
+    unsafe {
+        GetWindowRect(child, &mut rect);
+        windows_sys::Win32::Graphics::Gdi::ClientToScreen(parent, &mut origin);
+    }
+    rect.left - origin.x
+}
+
+/// The test window is never shown, so check the child's own style bit.
+fn is_shown(window: HWND) -> bool {
+    (unsafe { GetWindowLongPtrW(window, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
+}
+
+fn click(window: HWND, x: i32, y: i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    unsafe {
+        SendMessageW(window, WM_LBUTTONDOWN, 0, client_lparam(x, y));
+        SendMessageW(window, WM_LBUTTONUP, 0, client_lparam(x, y));
+    }
+}
+
+fn button_center(hwnd: HWND, button: crate::window::activity_bar::ActivityButton) -> (i32, i32) {
+    let (bar, _) = sidebar_windows(hwnd);
+    let (width, height) = client_size(bar);
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let dpi = unsafe { GetDpiForWindow(bar) }.max(96);
+    let rect = crate::window::activity_bar::button_rects(client, dpi)[button.index()];
+    ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+}
+
+/// Resizes the window so its client area is `client_width` wide.
+fn set_client_width(hwnd: HWND, client_width: i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
+    };
+    let mut frame = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut frame) };
+    let border = (frame.right - frame.left) - client_size(hwnd).0;
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            client_width + border,
+            frame.bottom - frame.top,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
+    }
+}
+
+/// A scratch `fastpad.ini` holding only a comment, which settings saves go to.
+fn settings_scratch(label: &str) -> (RecoveryScratch, PathBuf) {
+    let scratch = RecoveryScratch::new(label);
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    (scratch, ini)
+}
+
+#[test]
+fn with_notes_mode_off_there_is_no_sidebar_and_nothing_moves() {
+    // Break caught: an activity bar, or a gap where it would be, with notes mode off, where
+    // the layout must stay exactly what it was before the sidebar existed.
+    let _scintilla = load_native_scintilla();
+    let mut app = make_app();
+    app.settings.notes_mode = false;
+    let window = ProductionWindow::new(app);
+    let editor = install_test_editor(&window);
+    assert!(app_mut(window.hwnd).sidebar.is_none());
+    assert_eq!(crate::window::side_panel::left_edge(window.hwnd), 0);
+    assert_eq!(
+        left_of(super::group_hwnd(window.hwnd).unwrap(), window.hwnd),
+        0
+    );
+    assert_eq!(left_of(editor.hwnd(), window.hwnd), 0);
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        crate::config::SidebarView::Hidden
+    );
+    execute_command(window.hwnd, CommandId::ToggleSidebar);
+    assert!(app_mut(window.hwnd).sidebar.is_none());
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    assert!(
+        app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .shown()
+            .iter()
+            .all(|entry| !entry.command.is_sidebar())
+    );
+    super::close_command_palette(window.hwnd, false);
+
+    app_mut(window.hwnd).settings.notes_mode = true;
+    crate::window::side_panel::notes_mode_changed(window.hwnd, true);
+    let (bar, _) = sidebar_windows(window.hwnd);
+    hover_bar(bar);
+    let tip = app_mut(window.hwnd)
+        .sidebar
+        .as_ref()
+        .and_then(|sidebar| sidebar.tooltip)
+        .expect("the activity bar has a tooltip")
+        .hwnd();
+    let left = crate::window::side_panel::left_edge(window.hwnd);
+    assert!(left > 0);
+    assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
+
+    app_mut(window.hwnd).settings.notes_mode = false;
+    crate::window::side_panel::notes_mode_changed(window.hwnd, false);
+    assert_eq!(unsafe { IsWindow(bar) }, 0);
+    // Break caught: a tooltip left alive (owned by the main window, not the bar) each time
+    // notes mode goes off.
+    assert_eq!(unsafe { IsWindow(tip) }, 0);
+    assert_eq!(crate::window::side_panel::left_edge(window.hwnd), 0);
+    assert_eq!(left_of(editor.hwnd(), window.hwnd), 0);
+}
+
+#[test]
+fn the_sidebar_takes_the_left_edge_and_everything_else_starts_right_of_it() {
+    // Break caught: tabs, the find bar, the menu band or the editor still starting at x = 0,
+    // under the activity bar and panel.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let (bar, panel) = sidebar_windows(window.hwnd);
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    let (width, height) = client_size(window.hwnd);
+    let saved = app_mut(window.hwnd).settings.sidebar_width;
+    let (activity, panel_width) =
+        crate::window::side_panel::sidebar_widths(width, dpi, true, saved);
+    assert_eq!(client_size(bar), (activity, height));
+    assert_eq!(client_size(panel), (panel_width, height));
+    assert_eq!(left_of(panel, window.hwnd), activity);
+    let left = activity + panel_width;
+    assert_eq!(crate::window::side_panel::left_edge(window.hwnd), left);
+    assert_eq!(
+        left_of(super::group_hwnd(window.hwnd).unwrap(), window.hwnd),
+        left
+    );
+    assert_eq!(left_of(editor.hwnd(), window.hwnd), left);
+    assert_eq!(client_size(editor.hwnd()).0, width - left);
+    // Nothing before the pointer needs the tooltip, so the first frame goes without it.
+    assert!(
+        app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .tooltip
+            .is_none()
+    );
+    hover_bar(bar);
+    assert_eq!(
+        app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .tooltip
+            .unwrap()
+            .tool_count(),
+        4
+    );
+    // An empty text removes a tool instead of showing an empty tip.
+    let tooltip = app_mut(window.hwnd)
+        .sidebar
+        .as_ref()
+        .unwrap()
+        .tooltip
+        .unwrap();
+    tooltip.set_tool(9, RECT::default(), "extra");
+    assert_eq!(tooltip.tool_count(), 5);
+    tooltip.set_tool(9, RECT::default(), "");
+    assert_eq!(tooltip.tool_count(), 4);
+
+    execute_command(window.hwnd, CommandId::Find);
+    let find = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
+    assert_eq!(left_of(find, window.hwnd), left);
+    assert_eq!(client_size(find).0, width - left);
+    super::close_find_bar(window.hwnd);
+
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    let palette = app_mut(window.hwnd)
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .panel_hwnd();
+    assert!(left_of(palette, window.hwnd) >= left);
+    super::close_command_palette(window.hwnd, false);
+
+    unsafe {
+        SendMessageW(
+            window.hwnd,
+            super::WM_SYSCOMMAND,
+            super::SC_KEYMENU as usize,
+            0,
+        )
+    };
+    assert_eq!(
+        super::menu_headings(window.hwnd)[0].left,
+        left + crate::window::panel::scale(4, dpi)
+    );
+    unsafe {
+        SendMessageW(
+            window.hwnd,
+            super::WM_SYSCOMMAND,
+            super::SC_KEYMENU as usize,
+            0,
+        )
+    };
+}
+
+#[test]
+fn the_sidebar_top_strip_and_panel_header_are_caption() {
+    // Break caught: child windows under the title row that swallow the caption, so the
+    // window can no longer be dragged or top-resized there, or a lost left-border resize.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, HTCAPTION, HTCLIENT, HTLEFT, HTTRANSPARENT, WM_NCHITTEST,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (bar, panel) = sidebar_windows(window.hwnd);
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    let layout = super::title_layout(window.hwnd);
+    let hit = |target: HWND, x: i32, y: i32| unsafe {
+        SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
+    };
+    // Below the top resize band and above the first button.
+    let strip_y = layout.height - 2;
+    assert!(strip_y >= layout.resize_border);
+    let bar_x = client_size(bar).0 / 2;
+    assert_eq!(hit(bar, bar_x, strip_y), HTTRANSPARENT as LRESULT);
+    assert_eq!(hit(window.hwnd, bar_x, strip_y), HTCAPTION as LRESULT);
+    let (button_x, button_y) = button_center(
+        window.hwnd,
+        crate::window::activity_bar::ActivityButton::Notebook,
+    );
+    assert_eq!(hit(bar, button_x, button_y), HTCLIENT as LRESULT);
+
+    let header_y = layout.resize_border + 2;
+    let header = crate::window::panel::scale(crate::window::side_panel::HEADER_HEIGHT_96, dpi);
+    assert!(header_y < header);
+    // The Notebook view's title band holds only its caption, "NOTEBOOK": all of it is a
+    // drag area, the old title point included.
+    let panel_x = crate::window::panel::scale(4, dpi);
+    assert_eq!(
+        hit(panel, client_size(panel).0 / 2, header_y),
+        HTTRANSPARENT as LRESULT,
+        "the whole title band is caption"
+    );
+    assert_eq!(hit(panel, panel_x, header_y), HTTRANSPARENT as LRESULT);
+    assert_eq!(
+        hit(window.hwnd, left_of(panel, window.hwnd) + panel_x, header_y),
+        HTCAPTION as LRESULT
+    );
+    // Below the header, and on the resize edge, the panel keeps its own input.
+    assert_eq!(hit(panel, panel_x, header + 10), HTCLIENT as LRESULT);
+    assert_eq!(
+        hit(panel, client_size(panel).0 - 1, header_y),
+        HTCLIENT as LRESULT
+    );
+
+    // The left border is outside the client area, so no child covers it.
+    let mut frame = RECT::default();
+    let mut origin = windows_sys::Win32::Foundation::POINT::default();
+    unsafe {
+        GetWindowRect(window.hwnd, &mut frame);
+        windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut origin);
+    }
+    if origin.x > frame.left {
+        let border = client_lparam(
+            frame.left + (origin.x - frame.left) / 2,
+            origin.y + client_size(window.hwnd).1 / 2,
+        );
+        assert_eq!(
+            unsafe { SendMessageW(window.hwnd, WM_NCHITTEST, 0, border) },
+            HTLEFT as LRESULT
+        );
+    }
+}
+
+// The icon resource (`APP_ICON_RESOURCE_ID`) is embedded by `build.rs` only into the FastPad
+// binaries (`rustc-link-arg-bins`), not into this lib's own unit-test binary, so
+// `load_logo_icon` returns `None` here regardless of DPI. The two tests below cover what is
+// true either way: the load never runs before the deferred chrome step, and the square it
+// would draw into stays caption; `ensure_logo_icon`'s replace-on-a-different-DPI wiring is
+// exercised with a synthetic icon standing in for a loaded one. The real load, the drawn
+// pixels and the destroy-on-drop are covered end to end by
+// `tests/windows/titlebar.rs`'s `the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_square_stays_caption`
+// (a real `fastpad.exe`, which does have the resource) and by
+// `titlebar::tests::a_logo_icon_destroys_its_handle_on_drop`.
+#[test]
+fn the_deferred_chrome_step_is_the_first_to_touch_the_logo_and_its_square_stays_caption() {
+    // Break caught: the logo loaded before first paint (new startup latency), or its square
+    // stealing the caption hit test once something is drawn there.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTTRANSPARENT, WM_NCHITTEST};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    assert!(
+        app_mut(window.hwnd).logo_icon.is_none(),
+        "nothing loads the logo before the deferred chrome step"
+    );
+
+    super::build_chrome(window.hwnd);
+
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    let (bar, _panel) = sidebar_windows(window.hwnd);
+    let (width, height) = client_size(bar);
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let rect = crate::window::activity_bar::logo_rect(client, dpi);
+    let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+    let hit = |target: HWND| unsafe {
+        SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
+    };
+    assert_eq!(hit(bar), HTTRANSPARENT as LRESULT);
+    assert_eq!(hit(window.hwnd), HTCAPTION as LRESULT);
+}
+
+#[test]
+fn ensure_logo_icon_leaves_a_matching_dpi_alone_and_replaces_a_different_one() {
+    // Break caught: a DPI change that keeps the old icon around (never reloaded) or leaves it
+    // set at the wrong DPI.
+    use windows_sys::Win32::UI::WindowsAndMessaging::CreateIcon;
+    let window = ProductionWindow::new(make_app());
+    // Stands in for a load already having succeeded at 96 DPI; the real loader can't run in
+    // this test binary (see the comment above).
+    let and_mask = [0xffu8];
+    let xor_mask = [0x00u8];
+    let icon = unsafe {
+        CreateIcon(
+            std::ptr::null_mut(),
+            1,
+            1,
+            1,
+            1,
+            and_mask.as_ptr(),
+            xor_mask.as_ptr(),
+        )
+    };
+    assert!(!icon.is_null());
+    app_mut(window.hwnd).logo_icon = Some(crate::window::titlebar::LogoIcon::new(96, icon));
+
+    super::ensure_logo_icon(window.hwnd, 96);
+    assert_eq!(
+        app_mut(window.hwnd).logo_icon.as_ref().unwrap().icon(),
+        icon,
+        "the same DPI is a no-op, not a reload"
+    );
+
+    super::ensure_logo_icon(window.hwnd, 144);
+    assert!(
+        app_mut(window.hwnd)
+            .logo_icon
+            .as_ref()
+            .is_none_or(|logo| logo.dpi() != 96),
+        "a different DPI replaces the stale one"
+    );
+}
+
+#[test]
+fn clicking_the_active_view_icon_closes_the_sidebar_panel_and_saves_none() {
+    // Break caught: an icon that only ever opens its view, so the mouse cannot close the
+    // panel, or a closed panel that reopens after a restart.
+    use crate::config::SidebarView;
+    use crate::window::activity_bar::ActivityButton;
+    let _scintilla = load_native_scintilla();
+    let (_scratch, ini) = settings_scratch("sidebar-click");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (bar, panel) = sidebar_windows(window.hwnd);
+    let activity = client_size(bar).0;
+    let view = || crate::window::side_panel::current_view(window.hwnd);
+    let saved = || std::fs::read_to_string(&ini).unwrap();
+
+    let (x, y) = button_center(window.hwnd, ActivityButton::Notebook);
+    click(bar, x, y);
+    assert_eq!(view(), SidebarView::Hidden);
+    assert!(!is_shown(panel));
+    assert_eq!(crate::window::side_panel::left_edge(window.hwnd), activity);
+    assert_eq!(saved(), "# kept\r\nsidebar_view=none\r\n");
+
+    click(bar, x, y);
+    assert_eq!(view(), SidebarView::Notebook);
+    assert!(is_shown(panel));
+    assert_eq!(saved(), "# kept\r\nsidebar_view=notebook\r\n");
+
+    let (x, y) = button_center(window.hwnd, ActivityButton::Search);
+    click(bar, x, y);
+    assert_eq!(view(), SidebarView::Search);
+    assert_eq!(saved(), "# kept\r\nsidebar_view=search\r\n");
+
+    // Settings opens the Settings dialog and leaves the panel alone.
+    let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = shown.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| {
+        seen.set(true);
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                dialog,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE),
+                0,
+            )
+        };
+    });
+    let (x, y) = button_center(window.hwnd, ActivityButton::Settings);
+    click(bar, x, y);
+    assert!(shown.get(), "the gear opened Settings");
+    assert_eq!(view(), SidebarView::Search);
+    super::save_settings_to(None);
+}
+
+#[test]
+fn ctrl_b_toggles_the_sidebar_back_to_the_last_view_and_saves_each_change() {
+    // Break caught: a toggle that forgets which view was open, a shortcut that never
+    // reaches its command, or a change lost on restart.
+    use crate::config::SidebarView;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let (_scratch, ini) = settings_scratch("sidebar-ctrl-b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    let press = |key: u8, shift: bool| {
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let message = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_KEYDOWN,
+            wParam: usize::from(key),
+            ..Default::default()
+        };
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+        translated
+    };
+    let view = || crate::window::side_panel::current_view(window.hwnd);
+    let saved = || std::fs::read_to_string(&ini).unwrap();
+
+    assert_eq!(view(), SidebarView::Notebook);
+    assert!(press(b'B', false));
+    assert_eq!(view(), SidebarView::Hidden);
+    assert_eq!(saved(), "# kept\r\nsidebar_view=none\r\n");
+    // Break caught: Ctrl+K still bound after Search moved to Ctrl+Shift+F.
+    assert!(!press(b'K', false));
+    assert_eq!(view(), SidebarView::Hidden);
+    assert!(press(b'F', true));
+    assert_eq!(view(), SidebarView::Search);
+    assert!(press(b'B', false));
+    assert!(press(b'B', false));
+    assert_eq!(view(), SidebarView::Search, "Ctrl+B reopens the last view");
+    assert!(press(b'E', true));
+    assert_eq!(view(), SidebarView::Notebook);
+    execute_command(window.hwnd, CommandId::ShowFavoritesView);
+    assert_eq!(view(), SidebarView::Favorites);
+    assert_eq!(saved(), "# kept\r\nsidebar_view=favorites\r\n");
+    super::save_settings_to(None);
+}
+
+#[test]
+fn a_narrow_window_squeezes_the_panel_without_saving_it() {
+    // Break caught: an editor pushed below its 320 px minimum, a negative panel width, or a
+    // squeeze written to fastpad.ini so the panel stays narrow once the window widens again.
+    let _scintilla = load_native_scintilla();
+    let (_scratch, ini) = settings_scratch("sidebar-squeeze");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let (_, panel) = sidebar_windows(window.hwnd);
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    let scale = |value| crate::window::panel::scale(value, dpi);
+
+    set_client_width(window.hwnd, scale(44 + 320 + 200));
+    let (width, _) = client_size(window.hwnd);
+    let (activity, squeezed) = crate::window::side_panel::sidebar_widths(width, dpi, true, 260);
+    assert_eq!(squeezed, width - activity - scale(320));
+    assert!(
+        squeezed > 0 && squeezed < scale(260),
+        "the window squeezes the panel"
+    );
+    assert_eq!(client_size(panel).0, squeezed);
+    assert_eq!(
+        crate::window::side_panel::left_edge(window.hwnd),
+        activity + squeezed
+    );
+    assert_eq!(
+        client_size(editor.hwnd()).0,
+        scale(320).max(width - activity - squeezed)
+    );
+    assert_eq!(app_mut(window.hwnd).settings.sidebar_width, 260);
+
+    set_client_width(window.hwnd, scale(1200));
+    assert_eq!(client_size(panel).0, scale(260));
+
+    // Narrower than the activity bar and the editor minimum: the panel hides, never goes
+    // below zero.
+    set_client_width(window.hwnd, scale(300));
+    assert!(!is_shown(panel));
+    assert_eq!(
+        crate::window::side_panel::left_edge(window.hwnd),
+        scale(44).min(client_size(window.hwnd).0)
+    );
+    assert_eq!(app_mut(window.hwnd).settings.sidebar_width, 260);
+    assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+    super::save_settings_to(None);
+}
+
+#[test]
+fn dragging_the_sidebar_edge_resizes_it_and_saves_the_width_once_on_release() {
+    // Break caught: a drag that writes fastpad.ini on every mouse move, never saves, ignores
+    // the 180–480 range, or an edge double-click that leaves a custom width in place.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    };
+    let _scintilla = load_native_scintilla();
+    let (_scratch, ini) = settings_scratch("sidebar-drag");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (_, panel) = sidebar_windows(window.hwnd);
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    let scale = |value| crate::window::panel::scale(value, dpi);
+    set_client_width(window.hwnd, scale(1400));
+    let saved = || std::fs::read_to_string(&ini).unwrap();
+    let send = |message, x: i32| unsafe {
+        SendMessageW(
+            panel,
+            message,
+            0,
+            client_lparam(x, client_size(panel).1 / 2),
+        );
+    };
+
+    send(WM_LBUTTONDOWN, client_size(panel).0 - 1);
+    send(WM_MOUSEMOVE, scale(300));
+    assert_eq!(client_size(panel).0, scale(300));
+    assert_eq!(saved(), "# kept\r\n", "nothing is saved mid-drag");
+    send(WM_LBUTTONUP, scale(300));
+    assert_eq!(saved(), "# kept\r\nsidebar_width=300\r\n");
+    assert_eq!(app_mut(window.hwnd).settings.sidebar_width, 300);
+
+    send(WM_LBUTTONDOWN, client_size(panel).0 - 1);
+    send(WM_MOUSEMOVE, scale(900));
+    send(WM_LBUTTONUP, scale(900));
+    assert_eq!(saved(), "# kept\r\nsidebar_width=480\r\n");
+    assert_eq!(client_size(panel).0, scale(480));
+
+    send(WM_LBUTTONDBLCLK, client_size(panel).0 - 1);
+    assert_eq!(saved(), "# kept\r\nsidebar_width=260\r\n");
+    assert_eq!(client_size(panel).0, scale(260));
+    super::save_settings_to(None);
+}
+
+#[test]
+fn the_editor_reads_single_lines_without_their_line_endings() {
+    // Break caught: a line reader that keeps the CR/LF, misreads Scintilla's line count, or
+    // panics instead of returning empty text past the last line.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("first\r\nsecond\nthird").unwrap();
+    assert_eq!(editor.line_count().unwrap(), 3);
+    assert_eq!(editor.line_text(0).unwrap(), "first");
+    assert_eq!(editor.line_text(1).unwrap(), "second");
+    assert_eq!(editor.line_text(2).unwrap(), "third");
+    assert_eq!(editor.line_text(9).unwrap(), "");
+}
+
+#[test]
+fn the_editor_reads_multi_byte_utf8_lines_without_their_line_endings() {
+    // Break caught: a byte-length-based line reader splitting or corrupting a multi-byte
+    // UTF-8 character at the line boundary instead of returning the line whole.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.set_text("h\u{e9}llo \u{1f600}\r\nsecond").unwrap();
+    assert_eq!(editor.line_text(0).unwrap(), "h\u{e9}llo \u{1f600}");
+}
+
+#[test]
+fn create_context_drops_untransferred_value_on_pre_window_failure() {
+    // Break caught: bootstrap manually reclaiming a create-time App allocation is unsafe once
+    // ownership can also transfer through WM_NCCREATE.
+    let drops = Arc::new(AtomicUsize::new(0));
+    {
+        let _context = WindowCreateContext::new(Box::new(DropProbe::new(Arc::clone(&drops))));
+    }
+
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn production_nc_create_transfers_app_and_nc_destroy_clears_the_window() {
+    // Break caught: bypassing the real WM_NCCREATE/WM_NCDESTROY ownership path can leave the
+    // production window without App state or leave the HWND alive after teardown.
+    let window = ProductionWindow::new(make_app());
+    assert_ne!(unsafe { GetWindowLongPtrW(window.hwnd, GWLP_USERDATA) }, 0);
+    unsafe {
+        DestroyWindow(window.hwnd);
+    }
+    assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+}
+
+#[test]
+fn initial_editor_installation_updates_a_retained_empty_tab_view() {
+    // Break caught: accessibility requested before editor creation retains an obsolete view.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let view = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+        .tabs
+        .view();
+    assert!(view.snapshot().tabs.is_empty());
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    unsafe { super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create) }
+        .unwrap();
+    assert_eq!(view.snapshot().tabs.len(), 1);
+}
+
+#[test]
+fn native_wm_close_releases_all_owned_documents_before_editor_destruction() {
+    // Break caught: clearing tabs after DestroyWindow skips real releases at the dead endpoint.
+    if std::env::var_os("FASTPAD_REQUIRE_APPVERIF").is_some() {
+        let verifier = crate::platform::wide_null("verifier.dll");
+        assert!(
+            !unsafe { GetModuleHandleW(verifier.as_ptr()) }.is_null(),
+            "Application Verifier must actually be loaded for a claimed verifier run"
+        );
+    }
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    let editor = unsafe {
+        super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+    }
+    .unwrap();
+    super::create_new_document(window.hwnd).unwrap();
+    // Documents belong to the document host, so their releases go through its endpoint.
+    let host = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+        .document_host
+        .as_ref()
+        .unwrap()
+        .hwnd();
+    let (_, releases) = crate::editor::scintilla::release_observation::during(|| unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+            window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            0,
+            0,
+        )
+    });
+    assert_eq!(releases.len(), 2);
+    assert_ne!(releases[0].document, releases[1].document);
+    assert!(
+        releases
+            .iter()
+            .all(|release| release.hwnd == host && release.window_was_live)
+    );
+    assert_eq!(unsafe { IsWindow(editor) }, 0);
+    assert_eq!(unsafe { IsWindow(host) }, 0);
+    assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+}
+
+#[test]
+fn original_window_identity_stays_invalid_after_replacement_creation() {
+    // Break caught: an IsWindow-only liveness check can accept a recycled HWND and read the
+    // replacement window's GWLP_USERDATA as the original App.
+    let original_app = make_app();
+    let original_identity = original_app.window_identity();
+    let original = ProductionWindow::new(original_app);
+    assert!(original_identity.is_live_for(original.hwnd));
+
+    unsafe {
+        DestroyWindow(original.hwnd);
+    }
+    assert!(original_identity.is_invalidated());
+    drop(original);
+
+    let replacement_app = make_app();
+    let replacement_identity = replacement_app.window_identity();
+    let replacement = ProductionWindow::new(replacement_app);
+    assert!(replacement_identity.is_live_for(replacement.hwnd));
+    assert!(original_identity.is_invalidated());
+    assert!(!original_identity.is_live_for(replacement.hwnd));
+}
+
+#[test]
+fn reentrant_paint_completion_does_not_mutate_replacement_app() {
+    // Break caught: removing the post-DefWindowProc identity gate lets an old WM_PAINT
+    // completion mutate the App found in a recycled HWND's replacement GWLP_USERDATA slot.
+    const PAINT_RESULT: LRESULT = 73;
+    let mut original = Some(ProductionWindow::new(make_app()));
+    let original_hwnd = original.as_ref().unwrap().hwnd;
+    let replacement = RefCell::new(None::<ProductionWindow>);
+
+    let default_window_proc = |hwnd, _, _, _| {
+        assert_ne!(unsafe { DestroyWindow(hwnd) }, 0);
+        drop(original.take());
+        replacement.replace(Some(ProductionWindow::new(make_app())));
+        PAINT_RESULT
+    };
+    let complete_first_paint = |_| {
+        let replacement = replacement.borrow();
+        let replacement = replacement.as_ref().unwrap();
+        unsafe {
+            mark_first_paint_complete(replacement.hwnd);
+        }
+    };
+    let result = unsafe {
+        handle_paint_with(
+            original_hwnd,
+            WM_PAINT,
+            0,
+            0,
+            default_window_proc,
+            complete_first_paint,
+        )
+    };
+
+    assert_eq!(result, PAINT_RESULT);
+    let replacement = replacement.borrow();
+    let replacement = replacement.as_ref().unwrap();
+    assert!(!unsafe { take_deferred_start_pending(replacement.hwnd) });
+}
+
+fn unnamed_mutex() -> crate::platform::OwnedHandle {
+    let raw = unsafe {
+        windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, std::ptr::null())
+    };
+    unsafe { crate::platform::OwnedHandle::from_raw_owned(raw) }.unwrap()
+}
+
+#[test]
+fn ipc_bind_failure_releases_the_instance_mutex_and_notifies_exactly_once() {
+    // Break caught: keeping the mutex after a failed bind makes every later launch wait on a
+    // pipe that will never exist; retrying or re-notifying spams the status line.
+    let window = ProductionWindow::new(make_app());
+    unsafe { super::app_ptr(window.hwnd).unwrap().as_mut() }.instance_mutex = Some(unnamed_mutex());
+
+    super::start_ipc_server_with(window.hwnd, || {
+        Err(crate::FastPadError::Ipc("simulated bind failure"))
+    });
+    super::start_ipc_server_with(window.hwnd, || unreachable!("no mutex means no server"));
+
+    let app = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() };
+    assert!(app.ipc.is_none());
+    assert!(app.instance_mutex.is_none());
+    assert_eq!(app.notifications.len(), 1);
+}
+
+#[test]
+fn process_without_instance_mutex_never_binds_a_server() {
+    // Break caught: a --new-window or fallback process squats the primary's pipe name.
+    let window = ProductionWindow::new(make_app());
+    super::start_ipc_server_with(window.hwnd, || unreachable!("no mutex means no server"));
+    let app = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() };
+    assert!(app.ipc.is_none());
+    assert_eq!(app.notifications.len(), 0);
+}
+
+fn deliver_frame(window: &ProductionWindow, names: &crate::ipc::InstanceNames, frame: Vec<u8>) {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+    let pipe = names.clone();
+    let client = std::thread::spawn(move || {
+        crate::ipc::client::send_frame(&pipe, &frame, Duration::from_secs(2))
+    });
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut quiet_since = None;
+    while Instant::now() < deadline {
+        let event = super::ipc_wait_handle(window.hwnd, &identity).unwrap();
+        if unsafe { WaitForSingleObject(event, 20) } == WAIT_OBJECT_0 {
+            super::service_ipc(window.hwnd, &identity);
+            quiet_since = None;
+        } else if client.is_finished() {
+            let since = *quiet_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(150) {
+                break;
+            }
+        }
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+            unsafe {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+    client.join().unwrap().unwrap();
+}
+
+#[test]
+fn ipc_requests_reach_the_window_as_tabs_and_malformed_frames_change_nothing() {
+    // Break caught: decoded requests never leave the pipe, duplicate opens add tabs, Activate
+    // mutates tabs, or a malformed frame reaches application state.
+    use crate::ipc::{IpcRequest, encode_frame};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    unsafe {
+        SendMessageW(
+            editor.hwnd(),
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR,
+            b'x' as usize,
+            0,
+        );
+    }
+    unsafe { super::app_ptr(window.hwnd).unwrap().as_mut() }.instance_mutex = Some(unnamed_mutex());
+    let names = crate::ipc::server::tests::unique_names();
+    super::start_ipc_server_with(window.hwnd, || {
+        crate::ipc::IpcServer::bind(&names, &crate::ipc::CurrentUserAcl::current()?)
+    });
+    let scratch = RecoveryScratch::new("ipc-open");
+    let file = scratch.path().join("forwarded.txt");
+    std::fs::write(&file, b"forwarded text").unwrap();
+    let tabs = || {
+        unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .tabs
+            .len()
+    };
+
+    let open = encode_frame(&IpcRequest::Open(file.clone())).unwrap();
+    deliver_frame(&window, &names, open.clone());
+    assert_eq!(tabs(), 2);
+    assert_eq!(editor.text().unwrap(), "forwarded text");
+    deliver_frame(&window, &names, open);
+    assert_eq!(tabs(), 2);
+    deliver_frame(
+        &window,
+        &names,
+        encode_frame(&IpcRequest::Activate).unwrap(),
+    );
+    assert_eq!(tabs(), 2);
+    deliver_frame(&window, &names, b"FPI1\x09\0\0\0\0".to_vec());
+    assert_eq!(tabs(), 2);
+    deliver_frame(&window, &names, encode_frame(&IpcRequest::New).unwrap());
+    assert_eq!(tabs(), 3);
+    assert!(
+        unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .ipc_requests
+            .is_empty()
+    );
+}
+
+fn make_app() -> Box<App> {
+    Box::new(App::new(
+        LaunchOptions::default(),
+        StartupMetrics::with_frequency(1, 0),
+    ))
+}
+
+fn load_native_scintilla() -> crate::platform::OwnedModule {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("native/out/x64/Scintilla.dll");
+    let path = crate::platform::wide_null(path.to_str().unwrap());
+    let module = unsafe {
+        windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
+            path.as_ptr(),
+            std::ptr::null_mut(),
+            windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+                | windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    unsafe { crate::platform::OwnedModule::from_raw_owned(module) }.unwrap()
+}
+
+struct DropProbe {
+    drops: Arc<AtomicUsize>,
+}
+
+impl DropProbe {
+    fn new(drops: Arc<AtomicUsize>) -> Self {
+        Self { drops }
+    }
+}
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct ProductionWindow {
+    hwnd: HWND,
+    _class: MainWindowClass,
+}
+
+impl ProductionWindow {
+    fn new(app: Box<App>) -> Self {
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let class = MainWindowClass::register(instance).unwrap();
+        let mut context = WindowCreateContext::new(app);
+        let hwnd = class.create(&mut context).unwrap();
+
+        Self {
+            hwnd,
+            _class: class,
+        }
+    }
+}
+
+impl Drop for ProductionWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Makes the window a primary instance saving its session under `scratch`.
+fn enable_session(hwnd: HWND, scratch: &RecoveryScratch) {
+    let recovery = scratch.path().join("Recovery");
+    std::fs::create_dir_all(&recovery).unwrap();
+    let app = app_mut(hwnd);
+    app.instance_mutex = Some(unnamed_mutex());
+    app.recovery_root = Some(recovery);
+    app.session_path = Some(scratch.path().join("session.ini"));
+}
+
+fn write_session(scratch: &RecoveryScratch, entries: Vec<SessionEntry>, active: usize) {
+    crate::session::write(
+        &scratch.path().join("session.ini"),
+        &Session::single(active, entries),
+    )
+    .unwrap();
+}
+
+#[test]
+fn session_close_records_every_tab_without_prompting() {
+    // Break caught: a session close that still asks about unsaved text, drops an unsaved or
+    // clean tab from the manifest, loses the active tab, or deletes the snapshot the next
+    // launch needs.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-close");
+    let file = scratch.path().join("notes.txt");
+    std::fs::write(&file, "saved text").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    App::open_path(window.hwnd, &file).unwrap();
+    execute_command(window.hwnd, CommandId::New);
+    editor.set_text("unsaved words").unwrap();
+    execute_command(window.hwnd, CommandId::New);
+    let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&prompted);
+    answer_next_close_prompt(move |_| {
+        seen.set(true);
+        CloseDecision::Cancel
+    });
+
+    unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+    assert!(!prompted.get(), "session restore must not prompt");
+    assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+    let session = crate::session::read(&scratch.path().join("session.ini")).unwrap();
+    assert_eq!(
+        session.groups[0].entries.len(),
+        2,
+        "the empty untitled tab is skipped"
+    );
+    assert_eq!(
+        session.groups[0].entries[0].source,
+        SessionSource::File(file)
+    );
+    let SessionSource::Snapshot(id) = session.groups[0].entries[1].source else {
+        panic!("the unsaved tab must be recorded as a snapshot");
+    };
+    assert_eq!(
+        session.groups[0].active, 1,
+        "the skipped active tab falls back to the one before"
+    );
+    let snapshot = crate::recovery::snapshot::snapshot_path(&scratch.path().join("Recovery"), id);
+    let snapshot = Snapshot::decode(&std::fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(snapshot.text, "unsaved words");
+}
+
+#[test]
+fn session_close_still_prompts_when_restore_is_off() {
+    // Break caught: the setting being ignored, so unsaved text is kept silently even though
+    // the user asked to be prompted, or a manifest from an earlier close outliving it.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-off");
+    write_session(
+        &scratch,
+        vec![SessionEntry::new(SessionSource::Snapshot(
+            RecoveryId::from_u128(0x5e58),
+        ))],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    app_mut(window.hwnd).settings.restore_session = false;
+    editor.set_text("dirty").unwrap();
+    answer_next_close_prompt(|_| CloseDecision::Cancel);
+
+    unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+    assert_ne!(
+        unsafe { IsWindow(window.hwnd) },
+        0,
+        "Cancel keeps the window"
+    );
+    assert!(!scratch.path().join("session.ini").exists());
+}
+
+/// Runs only the session unit until it hands over to `WM_FASTPAD_OPEN_LIBRARY`, without
+/// pumping the rest of the chain (which would bind the real single-instance pipe).
+fn run_session_restore(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let restore = crate::window::WM_FASTPAD_RESTORE_SESSION;
+    unsafe { PostMessageW(hwnd, restore, 0, 0) };
+    let mut message = MSG::default();
+    while unsafe { PeekMessageW(&mut message, hwnd, restore, restore, PM_REMOVE) } != 0 {
+        unsafe { DispatchMessageW(&message) };
+    }
+}
+
+#[test]
+fn a_three_group_session_comes_back_with_its_layout_views_and_positions() {
+    // Break caught: the layout flattened into one group, a view's caret lost, or a document
+    // shown in two groups restored twice (or failing on its second snapshot entry).
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-groups");
+    let file = scratch.path().join("plan.txt");
+    std::fs::write(&file, "one\ntwo\nthree\nfour").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    super::open_path(window.hwnd, &file).unwrap();
+    editor
+        .apply_view_state(crate::editor::ViewState {
+            caret: 5,
+            anchor: 5,
+            first_line: 1,
+            x_offset: 0,
+        })
+        .unwrap();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    execute_command(window.hwnd, CommandId::New);
+    super::group_editor(window.hwnd, super::group_order(window.hwnd)[1])
+        .unwrap()
+        .set_text("unsaved and shared")
+        .unwrap();
+    execute_command(window.hwnd, CommandId::SplitDown);
+    assert_eq!(super::group_order(window.hwnd).len(), 3);
+    assert!(super::save_session_for_close(window.hwnd));
+    let saved = std::fs::read_to_string(scratch.path().join("session.ini")).unwrap();
+    assert!(
+        saved.contains("layout=row(1:0.5,column(2:0.5,3:0.5):0.5)"),
+        "{saved}"
+    );
+    drop(window);
+
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    run_session_restore(window.hwnd);
+    let order = super::group_order(window.hwnd);
+    assert_eq!(order.len(), 3);
+    let tabs = &app_mut(window.hwnd).tabs;
+    let shared = tabs
+        .documents()
+        .find(|document| document.path.is_none())
+        .map(|document| document.id)
+        .unwrap();
+    assert_eq!(tabs.views_of(shared), vec![order[1], order[2]]);
+    assert_eq!(tabs.documents().count(), 2);
+    let first_editor = super::group_editor(window.hwnd, order[0]).unwrap();
+    assert_eq!(first_editor.view_state().unwrap().caret, 5);
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), order[2]);
+    assert!(
+        notices(window.hwnd).is_empty(),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn a_group_whose_files_are_gone_or_whose_window_fails_folds_into_the_others() {
+    // Break caught: an empty group left in the layout after its files vanished, or a group
+    // whose window can't be made losing its tabs.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-groups-gone");
+    let kept = scratch.path().join("kept.txt");
+    std::fs::write(&kept, "kept").unwrap();
+    let other = scratch.path().join("other.txt");
+    std::fs::write(&other, "other").unwrap();
+    let gone = scratch.path().join("gone.txt");
+    let group = |number, path: &std::path::Path| crate::session::SessionGroup {
+        number,
+        active: 0,
+        entries: vec![SessionEntry::new(SessionSource::File(path.to_path_buf()))],
+    };
+    let session = crate::session::Session {
+        layout: crate::session::SessionLayout::parse("row(1:0.3,2:0.3,3:0.4)").unwrap(),
+        active_group: 0,
+        groups: vec![group(1, &kept), group(2, &gone), group(3, &other)],
+    };
+    crate::session::write(&scratch.path().join("session.ini"), &session).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    // Group 2's window is made; group 3's fails.
+    super::fail_group_creation_after(1);
+    run_session_restore(window.hwnd);
+    let order = super::group_order(window.hwnd);
+    assert_eq!(order.len(), 1, "group 2 emptied, group 3's window failed");
+    let tabs = &app_mut(window.hwnd).tabs;
+    assert!(tabs.find_path(&kept).is_some());
+    assert!(
+        tabs.find_path(&other).is_some(),
+        "group 3's views went to the first group"
+    );
+}
+
+#[test]
+fn session_restore_reopens_files_and_unsaved_text_in_order() {
+    // Break caught: restored tabs out of order, an unsaved file reopening untitled (so Ctrl+S
+    // asks for a path), a stray empty startup tab, a lost caret, a manifest that restores
+    // twice, crash recovery opening a restored snapshot again, or a restored tab still
+    // pointing at the exited process's snapshot, which other windows would recover.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-restore");
+    let recovery = scratch.path().join("Recovery");
+    let notes = scratch.path().join("notes.txt");
+    std::fs::write(&notes, "saved text").unwrap();
+    let draft = scratch.path().join("draft.txt");
+    std::fs::write(&draft, "on disk").unwrap();
+    let draft_id = RecoveryId::from_u128(0x5e55);
+    write_snapshot(
+        &recovery,
+        &Snapshot::new(
+            draft_id,
+            Some(draft.clone()),
+            Encoding::Utf8,
+            "unsaved draft",
+        ),
+    )
+    .unwrap();
+    let scratch_id = RecoveryId::from_u128(0x5e56);
+    write_snapshot(
+        &recovery,
+        &Snapshot::new(scratch_id, None, Encoding::Utf8, "scratch words"),
+    )
+    .unwrap();
+    write_session(
+        &scratch,
+        vec![
+            SessionEntry {
+                source: SessionSource::Snapshot(draft_id),
+                caret: 3,
+                anchor: 1,
+                first_line: 0,
+            },
+            SessionEntry::new(SessionSource::File(notes.clone())),
+            SessionEntry::new(SessionSource::Snapshot(scratch_id)),
+        ],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+
+    run_session_restore(window.hwnd);
+
+    {
+        let app = app_mut(window.hwnd);
+        let documents = app.tabs.documents().collect::<Vec<_>>();
+        assert_eq!(documents.len(), 3, "the empty startup tab is closed");
+        assert_eq!(documents[0].path.as_deref(), Some(draft.as_path()));
+        assert!(documents[0].dirty);
+        assert_eq!(documents[0].title(), "draft.txt *");
+        assert_eq!(documents[1].path.as_deref(), Some(notes.as_path()));
+        assert!(!documents[1].dirty);
+        assert_eq!(documents[2].path, None);
+        // Notes mode is on by default: this restored tab was briefly active while its
+        // document loaded, and its untitled label was picked up from its first line.
+        assert_eq!(documents[2].title(), "scratch words *");
+        assert_eq!(app.tabs.active_index(), 0);
+    }
+    assert_eq!(editor.text().unwrap(), "unsaved draft");
+    assert_eq!(editor.selection().unwrap(), 1..3);
+    assert!(
+        !scratch.path().join("session.ini").exists(),
+        "the manifest is consumed"
+    );
+    let own = |index: usize| {
+        let id = app_mut(window.hwnd)
+            .tabs
+            .documents()
+            .nth(index)
+            .unwrap()
+            .recovery_id;
+        crate::recovery::snapshot::snapshot_path(&recovery, id)
+    };
+    for (index, source, text) in [
+        (0, draft_id, "unsaved draft"),
+        (2, scratch_id, "scratch words"),
+    ] {
+        assert!(
+            !crate::recovery::snapshot::snapshot_path(&recovery, source).exists(),
+            "the dead process's snapshot would look like a crash leftover to other windows"
+        );
+        let adopted = Snapshot::decode(&std::fs::read(own(index)).unwrap()).unwrap();
+        assert_eq!(adopted.text, text);
+    }
+    let draft_snapshot = own(0);
+
+    unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0) };
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        3,
+        "recovery must not duplicate a tab"
+    );
+
+    execute_command(window.hwnd, CommandId::Save);
+    assert_eq!(std::fs::read_to_string(&draft).unwrap(), "unsaved draft");
+    assert!(
+        !draft_snapshot.exists(),
+        "saving a restored tab removes its snapshot"
+    );
+}
+
+#[test]
+fn restored_tabs_enter_the_activation_order_in_strip_order_with_the_active_tab_first() {
+    // Break caught: the restore wiring missing, so Ctrl+P after a restart lists the tabs in
+    // the reverse order they reopened in, not the saved active tab first.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-activation-order");
+    let files = ["one.txt", "two.txt", "three.txt"].map(|name| {
+        let path = scratch.path().join(name);
+        std::fs::write(&path, name).unwrap();
+        path
+    });
+    write_session(
+        &scratch,
+        files
+            .iter()
+            .map(|path| SessionEntry::new(SessionSource::File(path.clone())))
+            .collect(),
+        1,
+    );
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+
+    run_session_restore(window.hwnd);
+
+    let app = app_mut(window.hwnd);
+    let paths = app
+        .tabs
+        .activation_order()
+        .iter()
+        .map(|&(_, id)| app.tabs.document(id).unwrap().path.clone().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [files[1].clone(), files[0].clone(), files[2].clone()]
+    );
+}
+
+#[test]
+fn session_restore_skips_unreopenable_entries_with_one_notice() {
+    // Break caught: one missing file aborting the rest of the restore, a notice per file, or
+    // no tab activated when the saved active entry is the one that failed.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-missing");
+    let kept = scratch.path().join("kept.txt");
+    std::fs::write(&kept, "still here").unwrap();
+    write_session(
+        &scratch,
+        vec![
+            SessionEntry::new(SessionSource::File(scratch.path().join("gone.txt"))),
+            SessionEntry::new(SessionSource::File(kept.clone())),
+            SessionEntry::new(SessionSource::Snapshot(RecoveryId::from_u128(0xdead))),
+        ],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+
+    run_session_restore(window.hwnd);
+
+    let app = app_mut(window.hwnd);
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(
+        app.tabs.active().unwrap().path.as_deref(),
+        Some(kept.as_path())
+    );
+    assert_eq!(editor.text().unwrap(), "still here");
+    let notices = app
+        .notifications
+        .pending()
+        .iter()
+        .filter(|notice| notice.message.contains("last session"))
+        .map(|notice| notice.message.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(notices, vec![crate::session::restore_failure_notice(2)]);
+}
+
+#[test]
+fn session_restore_ignores_a_window_outside_the_session() {
+    // Break caught: a --new-window instance consuming the primary window's session.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-outside");
+    let notes = scratch.path().join("notes.txt");
+    std::fs::write(&notes, "saved text").unwrap();
+    write_session(
+        &scratch,
+        vec![SessionEntry::new(SessionSource::File(notes))],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+
+    app_mut(window.hwnd).instance_mutex = None;
+    run_session_restore(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().path, None);
+    assert!(scratch.path().join("session.ini").exists());
+}
+
+#[test]
+fn session_restore_with_the_setting_off_deletes_a_stale_manifest() {
+    // Break caught: a primary with the setting off leaving an old manifest behind, so turning
+    // the setting back on later reopens tabs crash recovery already brought back.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-stale");
+    let notes = scratch.path().join("notes.txt");
+    std::fs::write(&notes, "saved text").unwrap();
+    write_session(
+        &scratch,
+        vec![SessionEntry::new(SessionSource::File(notes))],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    app_mut(window.hwnd).settings.restore_session = false;
+
+    run_session_restore(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().path, None);
+    assert!(app_mut(window.hwnd).session_restore.is_none());
+    assert!(!scratch.path().join("session.ini").exists());
+}
+
+#[test]
+fn recovery_leaves_snapshots_a_saved_session_names_while_restore_is_on() {
+    // Break caught: a --new-window instance recovering the primary's saved unsaved tabs as
+    // "Recovered: ..." (and deleting them on Discard) before the next launch restores them.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-recover-skip");
+    let recovery = scratch.path().join("Recovery");
+    let saved_id = RecoveryId::from_u128(0x5e57);
+    write_snapshot(
+        &recovery,
+        &Snapshot::new(saved_id, None, Encoding::Utf8, "kept for the session"),
+    )
+    .unwrap();
+    write_session(
+        &scratch,
+        vec![SessionEntry::new(SessionSource::Snapshot(saved_id))],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    app_mut(window.hwnd).instance_mutex = None;
+
+    super::recover_snapshots(window.hwnd);
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        1,
+        "the saved snapshot waits"
+    );
+    assert!(crate::recovery::snapshot::snapshot_path(&recovery, saved_id).exists());
+
+    app_mut(window.hwnd).settings.restore_session = false;
+    super::recover_snapshots(window.hwnd);
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.len(),
+        2,
+        "with the setting off, crash recovery brings it back"
+    );
+}
+
+#[test]
+fn session_restore_holds_forwarded_launches_until_it_finishes() {
+    // Break caught: a forwarded file opening mid-restore and being buried under the rest of
+    // the session, or never opening because the held request is not replayed.
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-forwarded");
+    let first = scratch.path().join("first.txt");
+    std::fs::write(&first, "one").unwrap();
+    let second = scratch.path().join("second.txt");
+    std::fs::write(&second, "two").unwrap();
+    let forwarded = scratch.path().join("forwarded.txt");
+    std::fs::write(&forwarded, "asked for mid-restore").unwrap();
+    write_session(
+        &scratch,
+        vec![
+            SessionEntry::new(SessionSource::File(first)),
+            SessionEntry::new(SessionSource::File(second)),
+        ],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    let restore = crate::window::WM_FASTPAD_RESTORE_SESSION;
+    let request = crate::window::WM_FASTPAD_IPC_REQUEST;
+
+    unsafe { PostMessageW(window.hwnd, restore, 0, 0) };
+    let mut message = MSG::default();
+    assert_ne!(
+        unsafe { PeekMessageW(&mut message, window.hwnd, restore, restore, PM_REMOVE) },
+        0
+    );
+    unsafe { DispatchMessageW(&message) };
+    assert!(app_mut(window.hwnd).session_restore.is_some());
+    app_mut(window.hwnd)
+        .ipc_requests
+        .push(crate::ipc::IpcRequest::Open(forwarded.clone()));
+    unsafe { SendMessageW(window.hwnd, request, 0, 0) };
+
+    assert!(
+        app_mut(window.hwnd).tabs.find_path(&forwarded).is_none(),
+        "a forwarded file must wait for the restore"
+    );
+    assert_eq!(app_mut(window.hwnd).ipc_requests.len(), 1);
+
+    run_session_restore(window.hwnd);
+    assert!(app_mut(window.hwnd).session_restore.is_none());
+    assert_ne!(
+        unsafe { PeekMessageW(&mut message, window.hwnd, request, request, PM_REMOVE) },
+        0,
+        "finishing the restore replays the held requests"
+    );
+    unsafe { DispatchMessageW(&message) };
+    discard_posted(window.hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE);
+    discard_posted(window.hwnd, crate::window::WM_FASTPAD_RECOVERY);
+    discard_posted(window.hwnd, crate::window::WM_FASTPAD_OPEN_LIBRARY);
+
+    let app = app_mut(window.hwnd);
+    assert_eq!(app.tabs.len(), 3);
+    assert_eq!(
+        app.tabs.active().unwrap().path.as_deref(),
+        Some(forwarded.as_path())
+    );
+    assert_eq!(editor.text().unwrap(), "asked for mid-restore");
+}
+
+#[test]
+fn session_restore_opens_the_launch_file_last() {
+    // Break caught: the command-line file opening before the restored tabs, so a restored tab
+    // ends up active instead of the file the user just asked for.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-launch");
+    let restored = scratch.path().join("restored.txt");
+    std::fs::write(&restored, "from last time").unwrap();
+    let launched = scratch.path().join("launched.txt");
+    std::fs::write(&launched, "asked for now").unwrap();
+    write_session(
+        &scratch,
+        vec![SessionEntry::new(SessionSource::File(restored))],
+        0,
+    );
+    let mut app = make_app();
+    app.launch.request = crate::launch::LaunchRequest::Open(launched.into_os_string());
+    let window = ProductionWindow::new(app);
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+
+    run_session_restore(window.hwnd);
+    unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0) };
+
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+    assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+    assert_eq!(editor.text().unwrap(), "asked for now");
+}
+
+/// Removes every queued `message` for `hwnd` without dispatching it.
+fn discard_posted(hwnd: HWND, message: u32) {
+    let mut queued = MSG::default();
+    while unsafe { PeekMessageW(&mut queued, hwnd, message, message, PM_REMOVE) } != 0 {}
+}
+
+struct LibraryScratch {
+    root: std::path::PathBuf,
+}
+
+impl LibraryScratch {
+    fn new(label: &str) -> Self {
+        let root =
+            std::env::temp_dir().join(format!("fastpad-libhost-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        Self { root }
+    }
+    fn folder(&self) -> std::path::PathBuf {
+        self.root.join("notes")
+    }
+    fn data(&self) -> std::path::PathBuf {
+        self.root.join("data")
+    }
+    fn note(&self, name: &str, text: &str) -> std::path::PathBuf {
+        let path = self.folder().join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+    /// Loads the folder synchronously and installs it, as LIBRARY_READY would.
+    fn install(&self, hwnd: HWND) {
+        let local = crate::library::local::local_file(&self.data(), &self.folder());
+        let state =
+            crate::library::load(&self.folder(), &local, crate::library::now_unix()).unwrap();
+        crate::window::library_host::install_for_test(hwnd, state);
+    }
+}
+
+impl Drop for LibraryScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Pumps posted messages until `done` or 5 s.
+fn pump_until(hwnd: HWND, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        pump_posted_messages(hwnd);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn tab_paths(hwnd: HWND) -> Vec<Option<std::path::PathBuf>> {
+    app_mut(hwnd)
+        .tabs
+        .documents()
+        .map(|document| document.path.clone())
+        .collect()
+}
+
+#[test]
+fn the_first_edit_promotes_the_preview_so_a_later_click_opens_a_new_preview() {
+    // Break caught: a click replacing a preview the user had started typing into, which drops
+    // their text, or the edit not promoting so the tab keeps being replaced.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("preview-edit");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    // Autosave (unrelated to preview promotion) would otherwise clean `a` the moment `b` is
+    // opened, since opening a file autosaves the tab being left; see
+    // `switching_tabs_autosaves_the_tab_being_left`.
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+
+    super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+    assert_eq!(
+        tab_paths(window.hwnd),
+        [Some(a.clone())],
+        "the empty start tab is reused"
+    );
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+
+    editor.set_text("a, edited").unwrap();
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+
+    super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+    assert_eq!(tab_paths(window.hwnd), [Some(a.clone()), Some(b.clone())]);
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+    let a_tab = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+    assert!(app_mut(window.hwnd).tabs.document(a_tab).unwrap().dirty);
+}
+
+#[test]
+fn a_second_preview_replaces_the_first_in_place_keeping_its_tab_index() {
+    // Break caught: the replacement landing at the end of the strip, or a normal tab being
+    // replaced instead of the preview.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("preview-replace");
+    let x = scratch.note("x.md", "x");
+    let a = scratch.note("a.md", "a");
+    let y = scratch.note("y.md", "y");
+    let b = scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &x).unwrap();
+    super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+    super::open_path(window.hwnd, &y).unwrap();
+
+    super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+
+    assert_eq!(tab_paths(window.hwnd), [Some(x), Some(b), Some(y)]);
+    assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+}
+
+#[test]
+fn opening_an_already_open_note_switches_to_its_tab() {
+    // Break caught: a click on an open note replacing the preview with a second tab for the
+    // same file, or doing nothing.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("preview-open");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+
+    super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+
+    assert_eq!(super::tab_count(window.hwnd), 2);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(a.as_path())
+    );
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+}
+
+#[test]
+fn a_permanent_open_a_save_or_a_tab_double_click_keeps_the_preview() {
+    // Break caught: Ctrl+Enter or a double-click opening a second tab for a note already in the
+    // preview, or a saved preview still being replaced by the next click.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("preview-keep");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let c = scratch.note("c.md", "c");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+
+    super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+    super::open_note(window.hwnd, &a, super::OpenMode::Permanent, false).unwrap();
+    assert_eq!(super::tab_count(window.hwnd), 1);
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+
+    super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+    crate::window::library_host::document_saved(window.hwnd);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.preview_id(),
+        None,
+        "a save promotes"
+    );
+
+    super::open_note(window.hwnd, &c, super::OpenMode::Preview, false).unwrap();
+    let index = app_mut(window.hwnd).tabs.active_index();
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let center = super::strip_layout(window.hwnd)
+        .unwrap()
+        .tab(index)
+        .unwrap()
+        .center();
+    let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
+    // Both clicks carry the same message time, well inside the double-click time.
+    for _ in 0..2 {
+        unsafe {
+            SendMessageW(
+                group,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN,
+                1,
+                pack(center.x, center.y),
+            );
+            SendMessageW(
+                group,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+                0,
+                pack(center.x, center.y),
+            );
+        }
+    }
+    assert_eq!(
+        app_mut(window.hwnd).tabs.preview_id(),
+        None,
+        "a double-click promotes"
+    );
+    assert_eq!(super::tab_count(window.hwnd), 3);
+}
+
+#[test]
+fn the_session_keeps_every_tabs_position_and_restores_it() {
+    // Break caught: only the shown tab's caret saved, so every other tab reopens at the top;
+    // or a restored background tab's position overwritten when the next entry opens.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("session-positions");
+    let a = scratch.note("a.md", &"line\n".repeat(2000));
+    let b = scratch.note("b.md", "b");
+    let recovery = RecoveryScratch::new("session-positions");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_note(window.hwnd, &a, super::OpenMode::Permanent, false).unwrap();
+    let away = crate::editor::ViewState {
+        caret: 1210 * 5,
+        anchor: 1210 * 5,
+        first_line: 1200,
+        x_offset: 0,
+    };
+    editor.apply_view_state(away).unwrap();
+    super::open_note(window.hwnd, &b, super::OpenMode::Permanent, false).unwrap();
+
+    let session = super::build_session(window.hwnd, recovery.path()).unwrap();
+    let entries = &session.groups[0].entries;
+    assert_eq!((entries[0].caret, entries[0].first_line), (1210 * 5, 1200));
+    assert_eq!(session.groups[0].active, 1);
+
+    for id in [b.clone(), a.clone()].map(|path| app_mut(window.hwnd).tabs.find_path(&path)) {
+        super::close_document_without_prompt(window.hwnd, id.unwrap());
+    }
+    for entry in entries {
+        let group = app_mut(window.hwnd).tabs.active_group();
+        super::restore_session_entry(window.hwnd, group, entry).unwrap();
+    }
+    execute_command(window.hwnd, CommandId::SelectTab1);
+    let restored = editor.view_state().unwrap();
+    assert_eq!((restored.caret, restored.first_line), (1210 * 5, 1200));
+}
+
+#[test]
+fn a_preview_tab_is_kept_by_the_session_and_comes_back_as_a_normal_tab() {
+    // Break caught: the session skipping the preview tab, so it vanishes at restart, or the
+    // restored tab still being a preview that the next click silently replaces.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("preview-session");
+    let a = scratch.note("a.md", "a");
+    let recovery = RecoveryScratch::new("preview-session");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+
+    let session = super::build_session(window.hwnd, recovery.path()).unwrap();
+    assert_eq!(session.groups[0].entries.len(), 1);
+    assert!(
+        matches!(&session.groups[0].entries[0].source, SessionSource::File(path) if *path == a)
+    );
+
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    super::close_document_without_prompt(window.hwnd, id);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    super::restore_session_entry(window.hwnd, group, &session.groups[0].entries[0]).unwrap();
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
+}
+
+#[test]
+fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_tabs() {
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("switch-a");
+    let second = LibraryScratch::new("switch-b");
+    let a = first.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    first.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        let mut ids = crate::library::ids::IdSource::new(1, 1);
+        let target = state.note_ref(&mut ids, &a);
+        state
+            .apply(crate::library::ops::PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+    });
+
+    crate::window::answer_next_folder_dialog({
+        let folder = second.folder();
+        move |_| Some(folder)
+    });
+    execute_command(window.hwnd, CommandId::OpenFolder);
+
+    assert!(
+        crate::library::store::library_file(&first.folder()).exists(),
+        "old folder flushed"
+    );
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        Some(second.folder())
+    );
+    let recent =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&first.data()));
+    assert_eq!(recent.folders.first(), Some(&second.folder()));
+    assert_eq!(super::tab_count(window.hwnd), 1, "open tabs stay open");
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+}
+
+#[test]
+fn opening_a_path_that_is_not_a_folder_explains_why() {
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    crate::window::library_host::open_folder(
+        window.hwnd,
+        std::path::Path::new(r"Z:\no\such\folder"),
+    );
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("is not a folder"))
+    );
+    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+}
+
+#[test]
+fn a_failed_flush_keeps_the_current_folder_open() {
+    // Break caught: switching folders after library.ini could not be written, which drops
+    // the unsaved pins with the old state.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("flushfail-a");
+    let second = LibraryScratch::new("flushfail-b");
+    let a = first.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    first.install(window.hwnd);
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        let mut ids = crate::library::ids::IdSource::new(1, 1);
+        let target = state.note_ref(&mut ids, &a);
+        state
+            .apply(crate::library::ops::PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+    });
+    // A file where the .fastpad directory belongs makes the write fail.
+    std::fs::write(first.folder().join(".fastpad"), "not a directory").unwrap();
+
+    crate::window::library_host::open_folder(window.hwnd, &second.folder());
+
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        Some(first.folder())
+    );
+    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("kept this notebook open")),
+        "{:?}",
+        notices(window.hwnd)
+    );
+    let recent =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&first.data()));
+    assert!(!recent.folders.contains(&second.folder()));
+}
+
+#[test]
+fn a_recent_folder_pick_opens_the_row_that_was_shown() {
+    // Break caught: resolving the chosen row against folders.ini re-read after the picker
+    // opened, which opens a different folder when another window changed the list.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("recent-a");
+    let second = LibraryScratch::new("recent-b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let folders_file = crate::library::local::folders_file(&first.data());
+    let write = |order: Vec<std::path::PathBuf>| {
+        crate::library::local::write_folders(
+            &folders_file,
+            &crate::library::local::RecentFolders {
+                folders: order,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    write(vec![first.folder(), second.folder()]);
+    execute_command(window.hwnd, CommandId::OpenRecentFolder);
+    write(vec![second.folder(), first.folder()]);
+
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::RecentFolder,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+
+    pump_until(window.hwnd, || {
+        crate::window::library_host::folder(window.hwnd) == Some(first.folder())
+    });
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+}
+
+#[test]
+fn a_launch_argument_naming_a_folder_is_not_reported_as_a_failed_open() {
+    // Break caught: `fastpad D:\Notes` opening the folder as the library and then also
+    // trying to open it as a file, which reports "could not open".
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("launch-dir");
+    let mut app = make_app();
+    app.launch.request = crate::launch::LaunchRequest::Open(scratch.folder().into_os_string());
+    let window = ProductionWindow::new(app);
+    let _editor = install_test_editor(&window);
+    let tabs = super::tab_count(window.hwnd);
+
+    unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0) };
+
+    assert!(
+        !notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("could not open")),
+        "{:?}",
+        notices(window.hwnd)
+    );
+    assert_eq!(super::tab_count(window.hwnd), tabs);
+}
+
+#[test]
+fn files_dropped_on_the_editor_reach_the_drop_handler() {
+    // Break caught: Scintilla's own OLE drop target refusing Explorer's files, so a drop on
+    // the editor (most of the window) did nothing.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editor-drop");
+    let note = scratch.note("dropped.md", "dropped");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    crate::window::library_host::accept_editor_file_drops(window.hwnd);
+
+    let effects = crate::editor::file_drop::test_support::drag_and_drop(editor.hwnd(), &[&note]);
+
+    assert_eq!(
+        effects,
+        [windows_sys::Win32::System::Ole::DROPEFFECT_COPY; 3]
+    );
+    pump_until(window.hwnd, || editor.text().unwrap() == "dropped");
+}
+
+#[test]
+fn the_library_step_loads_the_remembered_folder_on_a_worker_thread() {
+    // Break caught: the scan running on the UI thread, or the remembered folder ignored.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("startup");
+    scratch.note("a.md", "a");
+    let mut folders = crate::library::local::RecentFolders::default();
+    folders.push(scratch.folder());
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(&scratch.data()),
+        &folders,
+    )
+    .unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    crate::window::library_host::open_library_step(window.hwnd);
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        Some(scratch.folder())
+    );
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    assert_eq!(
+        app_mut(window.hwnd)
+            .library
+            .state
+            .as_ref()
+            .unwrap()
+            .notes
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn with_notes_mode_off_the_library_step_does_nothing() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("off");
+    let window = ProductionWindow::new(make_app());
+    app_mut(window.hwnd).settings.notes_mode = false;
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    crate::window::library_host::open_library_step(window.hwnd);
+    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert!(!app_mut(window.hwnd).library.scanning);
+}
+
+#[test]
+fn a_stale_ready_message_is_dropped_and_writes_are_flushed_on_demand() {
+    // Break caught: a slow scan of the previous folder replacing the folder just opened.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("stale");
+    let a = scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let stale = crate::window::library_host::test_ready_payload(
+        app_mut(window.hwnd).library.generation.wrapping_sub(1),
+        Err("old".into()),
+    );
+    crate::window::library_host::library_ready(window.hwnd, stale);
+    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(notices(window.hwnd).iter().all(|n| !n.contains("old")));
+
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        let mut ids = crate::library::ids::IdSource::new(1, 1);
+        let target = state.note_ref(&mut ids, &a);
+        state
+            .apply(crate::library::ops::PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+    });
+    crate::window::library_host::flush_now(window.hwnd);
+    assert!(crate::library::store::library_file(&scratch.folder()).exists());
+}
+
+#[test]
+fn session_restore_holds_the_startup_chain_until_it_finishes() {
+    // Break caught: a tab reopened mid-restore posting the language unit, which then runs
+    // recovery, binds the IPC pipe and stamps FullyReady before the rest of the session is
+    // back, so a forwarded launch can open mid-restore and lose the active tab.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PM_NOREMOVE, PostMessageW};
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-chain");
+    let first = scratch.path().join("first.txt");
+    std::fs::write(&first, "one").unwrap();
+    let second = scratch.path().join("second.txt");
+    std::fs::write(&second, "two").unwrap();
+    write_session(
+        &scratch,
+        vec![
+            SessionEntry::new(SessionSource::File(first)),
+            SessionEntry::new(SessionSource::File(second)),
+        ],
+        0,
+    );
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    let restore = crate::window::WM_FASTPAD_RESTORE_SESSION;
+    let language = crate::window::WM_FASTPAD_APPLY_LANGUAGE;
+    let recovery = crate::window::WM_FASTPAD_RECOVERY;
+
+    unsafe { PostMessageW(window.hwnd, restore, 0, 0) };
+    let mut message = MSG::default();
+    assert_ne!(
+        unsafe { PeekMessageW(&mut message, window.hwnd, restore, restore, PM_REMOVE) },
+        0
+    );
+    unsafe { DispatchMessageW(&message) };
+    assert!(
+        app_mut(window.hwnd).session_restore.is_some(),
+        "one entry is still to come"
+    );
+    let mut languages = 0;
+    while unsafe { PeekMessageW(&mut message, window.hwnd, language, language, PM_REMOVE) } != 0 {
+        languages += 1;
+        unsafe { DispatchMessageW(&message) };
+    }
+
+    assert!(languages > 0, "the reopened tab posts the language unit");
+    let recovery_posted =
+        unsafe { PeekMessageW(&mut message, window.hwnd, recovery, recovery, PM_NOREMOVE) } != 0;
+    run_session_restore(window.hwnd);
+    discard_posted(window.hwnd, language);
+    discard_posted(window.hwnd, recovery);
+    assert!(
+        !recovery_posted,
+        "the chain must wait for the restore to finish"
+    );
+    assert!(app_mut(window.hwnd).session_restore.is_none());
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+}
+
+#[test]
+fn session_close_falls_back_to_the_prompt_when_the_manifest_cannot_be_written() {
+    // Break caught: a failed manifest write still closing silently, so the unsaved text is
+    // named by no session and the user was never asked about it.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-unwritable");
+    let blocker = scratch.path().join("blocker");
+    std::fs::write(&blocker, "a file, not a folder").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    app_mut(window.hwnd).session_path = Some(blocker.join("session.ini"));
+    editor.set_text("unsaved words").unwrap();
+    let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&prompted);
+    answer_next_close_prompt(move |_| {
+        seen.set(true);
+        CloseDecision::Cancel
+    });
+
+    unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+    assert!(
+        prompted.get(),
+        "an unwritable manifest must fall back to the prompt"
+    );
+    assert_ne!(
+        unsafe { IsWindow(window.hwnd) },
+        0,
+        "Cancel keeps the window"
+    );
+}
+
+#[test]
+fn session_close_falls_back_to_the_prompt_when_a_snapshot_cannot_be_written() {
+    // Break caught: a dirty tab whose text reached no snapshot file closing silently, so the
+    // manifest names nothing for it and the user was never asked.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-no-snapshot");
+    let blocker = scratch.path().join("blocker");
+    std::fs::write(&blocker, "a file, not a folder").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    app_mut(window.hwnd).recovery_root = Some(blocker);
+    editor.set_text("unsaved words").unwrap();
+    let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&prompted);
+    answer_next_close_prompt(move |_| {
+        seen.set(true);
+        CloseDecision::Cancel
+    });
+
+    unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+    assert!(
+        prompted.get(),
+        "a failed snapshot write must fall back to the prompt"
+    );
+    assert_ne!(
+        unsafe { IsWindow(window.hwnd) },
+        0,
+        "Cancel keeps the window"
+    );
+    assert!(!scratch.path().join("session.ini").exists());
+}
+
+#[test]
+fn session_close_during_a_restore_uses_the_prompt() {
+    // Break caught: a close mid-restore writing a manifest of only the tabs reopened so far,
+    // silently dropping the entries still to come.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-mid-restore");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+    app_mut(window.hwnd).session_restore = Some(crate::session::SessionRestore::new(
+        &Session::single(0, Vec::new()),
+        None,
+    ));
+    editor.set_text("unsaved words").unwrap();
+    let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&prompted);
+    answer_next_close_prompt(move |_| {
+        seen.set(true);
+        CloseDecision::Cancel
+    });
+
+    unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+    assert!(prompted.get(), "a close mid-restore must use the review");
+    assert_ne!(
+        unsafe { IsWindow(window.hwnd) },
+        0,
+        "Cancel keeps the window"
+    );
+    assert!(!scratch.path().join("session.ini").exists());
+    app_mut(window.hwnd).session_restore = None;
+}
+
+fn type_into_name_box(hwnd: HWND, text: &str) {
+    let edit = app_mut(hwnd).name_box.as_ref().unwrap().edit_hwnd();
+    let wide = crate::platform::wide_null(text);
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr()) };
+}
+
+#[test]
+fn the_first_save_of_an_untitled_note_asks_for_a_name_in_the_folder_prefilled_from_its_label() {
+    // Break caught: Ctrl+S on a new note opening the system dialog in some random folder, or
+    // saving without letting the user confirm the name.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("first-save");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("Meeting: notes?\nbody").unwrap();
+    pump_posted_messages(window.hwnd);
+
+    execute_command(window.hwnd, CommandId::Save);
+    let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+    assert!(name_box.is_visible());
+    assert_eq!(name_box.text(), "Meeting notes.md");
+
+    crate::window::library_host::name_box_submit(window.hwnd);
+    let saved = scratch.folder().join("Meeting notes.md");
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "Meeting: notes?\nbody"
+    );
+    assert!(!app_mut(window.hwnd).name_box.as_ref().unwrap().is_visible());
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(saved.as_path())
+    );
+    assert!(
+        app_mut(window.hwnd)
+            .library
+            .state
+            .as_ref()
+            .unwrap()
+            .notes
+            .iter()
+            .any(|n| n.path == std::path::Path::new("Meeting notes.md"))
+    );
+    assert!(
+        app_mut(window.hwnd)
+            .tabs
+            .active()
+            .unwrap()
+            .disk_stamp
+            .is_some()
+    );
+}
+
+#[test]
+fn a_name_that_already_exists_is_refused_with_a_suggestion() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("clash");
+    scratch.note("Plan.md", "old");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("Plan").unwrap();
+    execute_command(window.hwnd, CommandId::Save);
+    type_into_name_box(window.hwnd, "plan.MD");
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("Plan.md")).unwrap(),
+        "old"
+    );
+    let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+    assert!(name_box.is_visible());
+    assert_eq!(
+        name_box.error(),
+        Some("plan.MD already exists. Try plan 2.MD.")
+    );
+}
+
+#[test]
+fn browse_and_the_close_prompt_use_the_save_dialog_starting_with_the_suggested_name() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("browse");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("Ideas").unwrap();
+    assert_eq!(
+        crate::window::library_host::suggested_file_name(window.hwnd),
+        "Ideas.md"
+    );
+    let elsewhere = scratch.root.join("elsewhere.md");
+    crate::window::answer_next_save_dialog({
+        let elsewhere = elsewhere.clone();
+        move |_| Some(elsewhere)
+    });
+    execute_command(window.hwnd, CommandId::Save);
+    crate::window::library_host::name_box_browse(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "Ideas");
+}
+
+#[test]
+fn with_notes_mode_off_save_uses_the_dialog_as_before() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("mode-off-save");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).settings.notes_mode = false;
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("x").unwrap();
+    let target = scratch.root.join("x.txt");
+    crate::window::answer_next_save_dialog({
+        let target = target.clone();
+        move |_| Some(target)
+    });
+    execute_command(window.hwnd, CommandId::Save);
+    assert!(target.exists());
+    assert!(app_mut(window.hwnd).name_box.is_none());
+    // Break caught: notes-mode naming leaking into plain-editor Save As.
+    assert_eq!(
+        crate::window::modal::take_last_save_request(),
+        Some(("Untitled.txt".to_owned(), None))
+    );
+}
+
+#[test]
+fn save_as_on_a_tab_with_a_path_starts_where_the_dialog_always_did() {
+    // Break caught: Save As of an ordinary file jumping to the notes folder.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("save-as-titled");
+    let outside = scratch.root.join("outside.txt");
+    std::fs::write(&outside, "o").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &outside).unwrap();
+    crate::window::answer_next_save_dialog(|_| None);
+    execute_command(window.hwnd, CommandId::SaveAs);
+    assert_eq!(
+        crate::window::modal::take_last_save_request(),
+        Some(("outside.txt".to_owned(), None))
+    );
+    assert!(app_mut(window.hwnd).name_box.is_none());
+}
+
+#[test]
+fn a_first_save_never_replaces_a_file_that_took_the_name_after_the_check() {
+    // Break caught: a note created in Explorer between the name check and the write being
+    // overwritten by the first save.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("first-save-race");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("mine").unwrap();
+    let late = scratch.note("Late.md", "theirs");
+    let identity = unsafe { super::window_identity(window.hwnd) }.unwrap();
+    assert_eq!(
+        super::complete_first_save(window.hwnd, &identity, late.clone()),
+        super::SaveOutcome::NameTaken
+    );
+    assert_eq!(std::fs::read_to_string(&late).unwrap(), "theirs");
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert!(active.path.is_none());
+    assert!(active.dirty);
+}
+
+fn open_first_save_box(label: &str) -> (LibraryScratch, ProductionWindow, crate::editor::Editor) {
+    let scratch = LibraryScratch::new(label);
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("Draft").unwrap();
+    execute_command(window.hwnd, CommandId::Save);
+    assert!(app_mut(window.hwnd).name_box.as_ref().unwrap().is_visible());
+    (scratch, window, editor)
+}
+
+fn name_box_visible(hwnd: HWND) -> bool {
+    app_mut(hwnd)
+        .name_box
+        .as_ref()
+        .is_some_and(|name_box| name_box.is_visible())
+}
+
+#[test]
+fn escape_in_the_name_box_cancels_the_save() {
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = open_first_save_box("escape");
+    let edit = app_mut(window.hwnd).name_box.as_ref().unwrap().edit_hwnd();
+    unsafe {
+        SendMessageW(
+            edit,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE as usize,
+            0,
+        );
+    }
+    assert!(!name_box_visible(window.hwnd));
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert!(active.path.is_none());
+    assert!(active.dirty);
+}
+
+#[test]
+fn the_name_box_closes_with_its_tab_or_when_another_tab_is_activated() {
+    // Break caught: a box left naming a tab that is gone or not the one on screen.
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = open_first_save_box("tab-change");
+    super::create_new_document(window.hwnd).unwrap();
+    assert!(!name_box_visible(window.hwnd));
+
+    execute_command(window.hwnd, CommandId::Save);
+    assert!(name_box_visible(window.hwnd));
+    super::close_active_document(window.hwnd);
+    assert!(!name_box_visible(window.hwnd));
+}
+
+#[test]
+fn the_name_box_closes_once_its_tab_is_saved_another_way() {
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = open_first_save_box("saved-elsewhere");
+    super::save_path_as(window.hwnd, &scratch.root.join("elsewhere.md"));
+    assert!(!name_box_visible(window.hwnd));
+}
+
+#[test]
+fn saving_again_while_the_box_is_open_keeps_what_was_typed() {
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = open_first_save_box("save-twice");
+    type_into_name_box(window.hwnd, "Typed name.md");
+    execute_command(window.hwnd, CommandId::Save);
+    let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+    assert!(name_box.is_visible());
+    assert_eq!(name_box.text(), "Typed name.md");
+}
+
+#[test]
+fn opening_find_closes_the_name_box() {
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = open_first_save_box("find-closes");
+    execute_command(window.hwnd, CommandId::Find);
+    assert!(!name_box_visible(window.hwnd));
+    assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
+}
+
+#[test]
+fn typed_names_with_invalid_characters_or_device_names_save_under_the_sanitized_name() {
+    // Break caught: a typed "con" or "a/b" failing the save with a Windows path error.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = open_first_save_box("sanitize");
+    type_into_name_box(window.hwnd, "a/b: c?.md");
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("ab c.md")).unwrap(),
+        "Draft"
+    );
+
+    super::create_new_document(window.hwnd).unwrap();
+    app_mut(window.hwnd)
+        .editor()
+        .unwrap()
+        .set_text("Device")
+        .unwrap();
+    execute_command(window.hwnd, CommandId::Save);
+    type_into_name_box(window.hwnd, "con");
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("con_.md")).unwrap(),
+        "Device"
+    );
+    assert!(!name_box_visible(window.hwnd));
+}
+
+fn open_note(
+    window: &ProductionWindow,
+    scratch: &LibraryScratch,
+    name: &str,
+    text: &str,
+) -> std::path::PathBuf {
+    let path = scratch.note(name, text);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &path).unwrap();
+    pump_posted_messages(window.hwnd);
+    path
+}
+
+#[test]
+fn closing_the_notebook_saves_its_notes_keeps_the_tabs_and_is_remembered_as_closed() {
+    // Break caught: Close notebook dropping a dirty note's edits, closing its tab, or leaving
+    // folders.ini without open=none so the next start reopens the notebook anyway.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("close-notebook");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(&scratch.data()),
+        &crate::library::local::RecentFolders {
+            folders: vec![scratch.folder()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = open_note(&window, &scratch, "a.md", "one");
+    editor.set_text("two").unwrap();
+
+    execute_command(window.hwnd, CommandId::CloseNotebook);
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+    assert_eq!(super::tab_count(window.hwnd), 1);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(path.as_path())
+    );
+    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert!(app_mut(window.hwnd).library.state.is_none());
+    let folders =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
+    assert!(folders.closed);
+    assert!(
+        folders.folders.contains(&scratch.folder()),
+        "it stays in the recent list"
+    );
+    // The tab is a plain file now: an edit is not autosaved.
+    editor.set_text("three").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::NotEligible
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+}
+
+#[test]
+fn with_no_notebook_open_ctrl_s_uses_the_save_dialog_like_notes_mode_off() {
+    // Break caught: after Close notebook, Ctrl+S on a new tab opening the name box for a notebook
+    // that is gone, or the Save As dialog starting in the closed notebook under the tab's label.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("no-notebook-save");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::CloseNotebook);
+    execute_command(window.hwnd, CommandId::New);
+    editor.set_text("Plan\nbody").unwrap();
+    let target = scratch.root.join("plan.txt");
+    crate::window::answer_next_save_dialog({
+        let target = target.clone();
+        move |_| Some(target)
+    });
+
+    execute_command(window.hwnd, CommandId::Save);
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "Plan\nbody");
+    assert!(
+        app_mut(window.hwnd)
+            .name_box
+            .as_ref()
+            .is_none_or(|name_box| !name_box.is_visible())
+    );
+    assert_eq!(
+        crate::window::modal::take_last_save_request(),
+        Some(("Untitled.txt".to_owned(), None))
+    );
+}
+
+#[test]
+fn the_notebook_favorite_toggles_in_folders_ini_and_the_cached_lists() {
+    // Break caught: a star that changes the sidebar but not folders.ini (lost at restart), or
+    // favorite lists that read folders.ini on every sidebar paint.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("favorite-notebook");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    let file = crate::library::local::folders_file(&scratch.data());
+
+    execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+    assert!(crate::window::library_host::is_favorite(window.hwnd));
+    assert_eq!(
+        crate::window::library_host::favorites(window.hwnd),
+        vec![scratch.folder()]
+    );
+    assert!(crate::library::local::read_folders(&file).is_favorite(&scratch.folder()));
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("to favorite notebooks"))
+    );
+
+    execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+    assert!(!crate::window::library_host::is_favorite(window.hwnd));
+    assert!(!crate::library::local::read_folders(&file).is_favorite(&scratch.folder()));
+
+    execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+    crate::window::library_host::remove_favorite(window.hwnd, &scratch.folder());
+    assert!(crate::window::library_host::favorites(window.hwnd).is_empty());
+    assert!(!crate::library::local::read_folders(&file).is_favorite(&scratch.folder()));
+
+    // Listing answers from the cache: a file changed behind FastPad's back is not re-read.
+    execute_command(window.hwnd, CommandId::ToggleNotebookFavorite);
+    crate::library::local::write_folders(&file, &crate::library::local::RecentFolders::default())
+        .unwrap();
+    assert_eq!(
+        crate::window::library_host::favorites(window.hwnd),
+        vec![scratch.folder()]
+    );
+}
+
+#[test]
+fn opening_a_listed_notebook_that_is_missing_says_so_and_changes_nothing() {
+    // Break caught: a click on an offline favorite unloading the open notebook first, checking
+    // the drive on the UI thread, or falling back to Documents\FastPad the way startup does.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("listed-missing");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    let missing = scratch.root.join("gone");
+    let checks = crate::library::folder_checks();
+
+    crate::window::library_host::open_listed_notebook(window.hwnd, &missing);
+    assert_eq!(
+        crate::library::folder_checks(),
+        checks,
+        "checked on the worker"
+    );
+    pump_until(window.hwnd, || {
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("is not available"))
+    });
+
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        Some(scratch.folder())
+    );
+    assert!(app_mut(window.hwnd).library.state.is_some());
+    let folders =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
+    assert!(!folders.folders.contains(&missing));
+}
+
+#[test]
+fn opening_a_listed_notebook_switches_once_the_worker_finds_it() {
+    // Break caught: an explicit open that switches before the check lands (so a missing folder
+    // would already have unloaded the notebook), or never switches at all.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("listed-a");
+    let second = LibraryScratch::new("listed-b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    first.install(window.hwnd);
+
+    crate::window::library_host::open_listed_notebook(window.hwnd, &second.folder());
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        Some(first.folder()),
+        "nothing changes before the check lands"
+    );
+    pump_until(window.hwnd, || {
+        crate::window::library_host::folder(window.hwnd) == Some(second.folder())
+    });
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    assert_eq!(
+        crate::window::library_host::recent_notebooks(window.hwnd).first(),
+        Some(&second.folder())
+    );
+}
+
+#[test]
+fn a_stale_listed_notebook_check_is_dropped_once_the_user_has_moved_on() {
+    // Break caught: a slow existence check for a notebook landing after the user already
+    // closed the open notebook (or switched to another one), reopening or replacing it anyway.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("stale-check");
+    let stale = LibraryScratch::new("stale-check-target");
+    let fresh = LibraryScratch::new("stale-check-fresh");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+
+    crate::window::library_host::open_listed_notebook(window.hwnd, &stale.folder());
+    // Close notebook runs on this thread before the check's worker answer is pumped: the
+    // close must invalidate the still-in-flight check.
+    execute_command(window.hwnd, CommandId::CloseNotebook);
+    // Give the worker's existence check time to land and be pumped, then confirm it changed
+    // nothing: there is no positive signal for "was dropped", so this waits out a generous
+    // margin instead of polling for an effect that must not occur.
+    for _ in 0..60 {
+        pump_posted_messages(window.hwnd);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        None,
+        "a check that started before Close notebook must not reopen the notebook"
+    );
+
+    // A later, non-stale listed open still works normally.
+    crate::window::library_host::open_listed_notebook(window.hwnd, &fresh.folder());
+    pump_until(window.hwnd, || {
+        crate::window::library_host::folder(window.hwnd) == Some(fresh.folder())
+    });
+}
+
+#[test]
+fn a_note_inside_the_folder_autosaves_and_closing_it_never_prompts() {
+    // Break caught: a notes-folder file still asking "Save changes?" or losing edits on close.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("autosave");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "one");
+    editor.set_text("two").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Saved
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+
+    editor.set_text("three").unwrap();
+    super::close_active_document(window.hwnd); // no answer_next_close_prompt: a prompt would fail the test
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "three");
+}
+
+#[test]
+fn a_file_changed_on_disk_pauses_autosave_until_the_user_chooses() {
+    // Break caught: autosave silently overwriting an edit OneDrive just synced from another PC.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("guard");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "one");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, "from the other PC").unwrap();
+    editor.set_text("mine").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Paused
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "from the other PC");
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("changed on disk"))
+    );
+
+    execute_command(window.hwnd, CommandId::NoteReloadFromDisk);
+    assert_eq!(editor.text().unwrap(), "from the other PC");
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().autosave_paused);
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, "again").unwrap();
+    editor.set_text("mine for real").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Paused
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "again");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    execute_command(window.hwnd, CommandId::NoteKeepMine);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine for real");
+}
+
+#[test]
+fn files_outside_the_folder_and_folders_with_autosave_off_are_not_autosaved() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("not-eligible");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let outside = scratch.root.join("outside.md");
+    std::fs::write(&outside, "x").unwrap();
+    super::open_path(window.hwnd, &outside).unwrap();
+    editor.set_text("y").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::NotEligible
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
+
+    let inside = open_note(&window, &scratch, "b.md", "b");
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    editor.set_text("c").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::NotEligible
+    );
+    assert_eq!(std::fs::read_to_string(&inside).unwrap(), "b");
+    assert!(
+        !app_mut(window.hwnd)
+            .library
+            .state
+            .as_ref()
+            .unwrap()
+            .local
+            .autosave
+    );
+}
+
+#[test]
+fn switching_tabs_autosaves_the_tab_being_left() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("switch-save");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let a = open_note(&window, &scratch, "a.md", "a");
+    let b = scratch.note("b.md", "b");
+    super::open_path(window.hwnd, &b).unwrap();
+    editor.set_text("b2").unwrap();
+    execute_command(window.hwnd, CommandId::SelectTab1);
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "b2");
+    editor.set_text("a2").unwrap();
+    super::create_new_document(window.hwnd).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "a2",
+        "a new tab also leaves the old one"
+    );
+}
+
+#[test]
+fn a_note_with_no_known_disk_stamp_pauses_instead_of_overwriting() {
+    // Break caught: a tab restored from a snapshot autosaving over a file that changed while
+    // FastPad was closed, because it has no stamp to compare against.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("no-stamp");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "on disk");
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    app_mut(window.hwnd)
+        .tabs
+        .document_mut(id)
+        .unwrap()
+        .disk_stamp = None;
+    editor.set_text("restored").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Paused
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "on disk");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn a_single_edit_autosaves_once_the_idle_timer_fires() {
+    // Break caught: the first keystroke after a save not arming the timer, because the edit
+    // notification arrives before the tab is marked dirty.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("idle-timer");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "one");
+    editor.replace_target(0..0, "x").unwrap();
+    pump_until(window.hwnd, || {
+        std::fs::read_to_string(&path).is_ok_and(|text| text == "xone")
+    });
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn a_note_whose_file_was_deleted_and_has_no_stamp_is_not_recreated() {
+    // Break caught: a restored tab re-creating a note the user deleted on another PC.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("no-stamp-deleted");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "on disk");
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    app_mut(window.hwnd)
+        .tabs
+        .document_mut(id)
+        .unwrap()
+        .disk_stamp = None;
+    std::fs::remove_file(&path).unwrap();
+    editor.set_text("restored").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Paused
+    );
+    assert!(!path.exists());
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn a_folder_whose_state_has_not_loaded_is_not_autosaved() {
+    // Break caught: a folder with autosave turned off being autosaved while it (re)loads.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("state-loading");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "one");
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    assert!(
+        !app_mut(window.hwnd)
+            .library
+            .state
+            .as_ref()
+            .unwrap()
+            .local
+            .autosave
+    );
+    app_mut(window.hwnd).library.state = None;
+    editor.set_text("two").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::NotEligible
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn an_edit_made_while_the_folder_loads_autosaves_once_it_has_loaded() {
+    // Break caught: a keystroke that arrived before the folder's state never being autosaved,
+    // because it found no state to arm the idle timer and nothing armed it after the load.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("edit-while-loading");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "one");
+    app_mut(window.hwnd).library.state = None;
+    editor.replace_target(0..0, "x").unwrap();
+    let waited = std::time::Instant::now();
+    while waited.elapsed() < std::time::Duration::from_millis(1_300) {
+        pump_posted_messages(window.hwnd);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+    scratch.install(window.hwnd);
+    pump_until(window.hwnd, || {
+        std::fs::read_to_string(&path).is_ok_and(|text| text == "xone")
+    });
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn keep_my_version_on_an_untitled_tab_does_nothing() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("keep-untitled");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("draft").unwrap();
+    let before = notices(window.hwnd).len();
+    execute_command(window.hwnd, CommandId::NoteKeepMine);
+    assert_eq!(notices(window.hwnd).len(), before);
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert!(active.path.is_none() && active.dirty);
+}
+
+#[test]
+fn a_failed_autosave_names_the_note_once_and_keeps_the_tab_dirty() {
+    // Break caught: a failed write marking the note clean, or two notices for one failure.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("autosave-fails");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "one");
+    editor.set_text("two").unwrap();
+    // A file held open without sharing makes the atomic replace fail; its stamp is unchanged.
+    use std::os::windows::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    let before = notices(window.hwnd).len();
+    let outcome = crate::window::library_host::autosave_active(window.hwnd);
+    drop(lock);
+    assert_eq!(outcome, crate::window::library_host::Autosave::Failed);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    let added = &notices(window.hwnd)[before..];
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert!(added[0].starts_with("Autosave failed for "), "{added:?}");
+}
+
+#[test]
+fn closing_the_window_autosaves_every_eligible_note_and_keeps_the_active_tab() {
+    // Break caught: a close leaving a second dirty note unsaved, saving a file outside the
+    // folder or a paused note, or leaving the session on whichever tab saved last.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("autosave-all");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let a = open_note(&window, &scratch, "a.md", "a");
+    // Off while the tabs are made dirty, so switching between them does not save them.
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    editor.set_text("a2").unwrap();
+    let b = scratch.note("b.md", "b");
+    super::open_path(window.hwnd, &b).unwrap();
+    editor.set_text("b2").unwrap();
+    let paused = scratch.note("p.md", "p");
+    super::open_path(window.hwnd, &paused).unwrap();
+    editor.set_text("p2").unwrap();
+    let paused_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    app_mut(window.hwnd)
+        .tabs
+        .document_mut(paused_id)
+        .unwrap()
+        .autosave_paused = true;
+    let outside = scratch.root.join("outside.md");
+    std::fs::write(&outside, "x").unwrap();
+    super::open_path(window.hwnd, &outside).unwrap();
+    editor.set_text("x2").unwrap();
+    let outside_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+
+    crate::window::library_host::autosave_all(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a2");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "b2");
+    assert_eq!(std::fs::read_to_string(&paused).unwrap(), "p");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
+    let app = app_mut(window.hwnd);
+    let dirty = |path: &std::path::Path| {
+        app.tabs
+            .documents()
+            .find(|document| document.path.as_deref() == Some(path))
+            .unwrap()
+            .dirty
+    };
+    assert!(!dirty(&a) && !dirty(&b));
+    assert!(dirty(&paused) && dirty(&outside));
+    assert_eq!(app.tabs.active().unwrap().id, outside_id);
+}
+
+#[test]
+fn switching_to_another_app_autosaves_the_active_note() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("deactivate");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "one");
+    editor.set_text("two").unwrap();
+    crate::window::library_host::activation_changed(window.hwnd, false);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+fn library(hwnd: HWND) -> &'static crate::library::model::Library {
+    &app_mut(hwnd).library.state.as_ref().unwrap().library
+}
+
+#[test]
+fn toggling_a_pin_applies_to_the_active_note_and_persists() {
+    // Break caught: the pin command changing only memory, recording the wrong file, or an
+    // unpin leaving a record behind.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("pin");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "a");
+    let hwnd = window.hwnd;
+
+    execute_command(hwnd, CommandId::NoteTogglePin);
+    assert!(
+        app_mut(hwnd)
+            .library
+            .state
+            .as_ref()
+            .unwrap()
+            .is_pinned(&path)
+    );
+    assert!(notices(hwnd).iter().any(|n| n == "Pinned."));
+    crate::window::library_host::flush_now(hwnd);
+    let ini =
+        std::fs::read_to_string(crate::library::store::library_file(&scratch.folder())).unwrap();
+    assert!(ini.starts_with("version=2\r\n"), "{ini:?}");
+    assert!(ini.contains("|p|") && ini.ends_with("|a.md\r\n"), "{ini:?}");
+    let reloaded = crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
+    assert!(reloaded.is_pinned(&path));
+
+    execute_command(hwnd, CommandId::NoteTogglePin);
+    crate::window::library_host::flush_now(hwnd);
+    assert!(notices(hwnd).iter().any(|n| n == "Unpinned."));
+    assert!(
+        library(hwnd).notes.is_empty(),
+        "an unpinned note keeps no record"
+    );
+}
+
+#[test]
+fn pinning_a_file_outside_the_open_notebook_is_refused() {
+    // Break caught: a pin on a file outside the notebook writing an absolute-path record
+    // that version 2 of library.ini cannot hold.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("pin-outside");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let outside = scratch.root.join("outside.md");
+    std::fs::write(&outside, "x").unwrap();
+    super::open_path(window.hwnd, &outside).unwrap();
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n == "Only notes in the open notebook can be pinned.")
+    );
+    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    assert!(state.pending.is_empty());
+    assert!(state.library.notes.is_empty());
+}
+
+#[test]
+fn an_untitled_tab_must_be_saved_before_it_can_be_organized() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("untitled-organize");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::create_new_document(window.hwnd).unwrap();
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n == "Save this note first to organize it.")
+    );
+}
+
+#[test]
+fn an_unreadable_library_disables_pinning_with_an_explanation() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("readonly");
+    let ini = crate::library::store::library_file(&scratch.folder());
+    std::fs::create_dir_all(ini.parent().unwrap()).unwrap();
+    std::fs::write(&ini, "version=99\r\n").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    open_note(&window, &scratch, "a.md", "a");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::library_host::flush_now(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&ini).unwrap(), "version=99\r\n");
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("can't be read, so pins are off until it is fixed or removed"))
+    );
+}
+
+#[test]
+fn renaming_a_note_renames_its_file_and_keeps_its_metadata() {
+    // Break caught: a rename losing the note's pin, or the tab still pointing at the old path.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("rename");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let old = open_note(&window, &scratch, "a.md", "text");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    // The name bar itself: Note: Rename… would edit the note's row in the tree.
+    crate::window::library_host::rename_note(window.hwnd);
+    assert_eq!(
+        app_mut(window.hwnd).name_box.as_ref().unwrap().text(),
+        "a.md"
+    );
+    type_into_name_box(window.hwnd, "Plan");
+    crate::window::library_host::name_box_submit(window.hwnd);
+    let new = scratch.folder().join("Plan.md");
+    assert!(!old.exists());
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), "text");
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(new.as_path())
+    );
+    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    assert!(state.is_pinned(&new));
+}
+
+#[test]
+fn renaming_onto_an_existing_file_is_refused() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("rename-clash");
+    scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let a = open_note(&window, &scratch, "a.md", "a");
+    // The name bar itself: Note: Rename… would edit the note's row in the tree.
+    crate::window::library_host::rename_note(window.hwnd);
+    type_into_name_box(window.hwnd, "B.md");
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert!(a.exists());
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("b.md")).unwrap(),
+        "b"
+    );
+    assert!(
+        app_mut(window.hwnd)
+            .name_box
+            .as_ref()
+            .unwrap()
+            .error()
+            .is_some()
+    );
+}
+
+#[test]
+fn renaming_a_note_changing_only_letter_case_works() {
+    // Break caught: the clash check or the tab collision check treating the note's own file
+    // as a different one that already has the new name.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("rename-case");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    open_note(&window, &scratch, "plan.md", "text");
+    // The name bar itself: Note: Rename… would edit the note's row in the tree.
+    crate::window::library_host::rename_note(window.hwnd);
+    type_into_name_box(window.hwnd, "Plan.md");
+    crate::window::library_host::name_box_submit(window.hwnd);
+    let names: Vec<String> = std::fs::read_dir(scratch.folder())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".md"))
+        .collect();
+    assert_eq!(names, ["Plan.md"]);
+    let new = scratch.folder().join("Plan.md");
+    assert_eq!(
+        app_mut(window.hwnd)
+            .tabs
+            .active()
+            .unwrap()
+            .path
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned()),
+        Some("Plan.md".to_owned())
+    );
+    assert!(!name_box_visible(window.hwnd));
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), "text");
+}
+
+#[test]
+fn deleting_a_note_asks_then_recycles_it_and_keeps_its_record_hidden() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("delete-note");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "a");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::answer_next_confirm(|_| false);
+    execute_command(window.hwnd, CommandId::NoteDelete);
+    assert!(path.exists());
+    crate::window::answer_next_confirm(|_| true);
+    execute_command(window.hwnd, CommandId::NoteDelete);
+    assert!(!path.exists());
+    assert_eq!(super::tab_count(window.hwnd), 0);
+    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let record = state.record_for(&path).unwrap();
+    assert!(record.deleted);
+    assert!(state.local.missing_since(record.id).is_some());
+    assert!(state.notes.is_empty());
+}
+
+#[test]
+fn a_note_renamed_outside_fastpad_moves_its_open_tab_and_autosave_resumes() {
+    // Break caught: the rescan looking the tab up through the old, now missing path, so the
+    // tab kept it: autosave stayed paused, and Keep mine or Ctrl+S re-created the old file
+    // while the metadata followed the new one.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("outside-rename");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let old = open_note(&window, &scratch, "a.md", "text");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::library_host::flush_now(window.hwnd);
+    let new = scratch.folder().join("b.md");
+    std::fs::rename(&old, &new).unwrap();
+    editor.set_text("edited").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Paused,
+        "the old file is gone, so autosave pauses until the rescan"
+    );
+
+    scratch.install(window.hwnd);
+
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(new.as_path()));
+    assert!(!active.autosave_paused, "the moved file is unchanged");
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Saved
+    );
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), "edited");
+    assert!(!old.exists(), "the old name is not re-created");
+    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    assert!(state.record_for(&new).unwrap().pinned);
+}
+
+#[test]
+fn a_note_moved_and_changed_outside_fastpad_follows_but_does_not_autosave_over_the_change() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("outside-rename-changed");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let old = open_note(&window, &scratch, "a.md", "text");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::library_host::flush_now(window.hwnd);
+    let new = scratch.folder().join("b.md");
+    std::fs::rename(&old, &new).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&new)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b" and more"))
+        .unwrap();
+
+    scratch.install(window.hwnd);
+    editor.set_text("mine").unwrap();
+
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(new.as_path())
+    );
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Paused
+    );
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), "text and more");
+}
+
+#[test]
+fn renaming_to_the_prefilled_name_keeps_a_non_note_or_extensionless_file_as_it_is() {
+    // Break caught: "script.lua" prefilled and submitted as-is becoming script.lua.lua, and an
+    // extensionless README gaining ".md".
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("rename-kinds");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    for name in ["script.lua", "README"] {
+        let path = open_note(&window, &scratch, name, "x");
+        execute_command(window.hwnd, CommandId::NoteRename);
+        assert_eq!(app_mut(window.hwnd).name_box.as_ref().unwrap().text(), name);
+        crate::window::library_host::name_box_submit(window.hwnd);
+        assert!(!name_box_visible(window.hwnd));
+        assert!(path.exists(), "{name} is left alone");
+        assert_eq!(
+            app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+            Some(path.as_path())
+        );
+    }
+    let mut names: Vec<String> = std::fs::read_dir(scratch.folder())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["README", "script.lua"]);
+
+    execute_command(window.hwnd, CommandId::NoteRename);
+    type_into_name_box(window.hwnd, "tool");
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert!(
+        scratch.folder().join("tool").exists(),
+        "no extension is added"
+    );
+}
+
+#[test]
+fn turning_notes_mode_on_labels_every_untitled_tab_without_switching_to_it() {
+    // Break caught: only the active tab getting its label, every other untitled tab reading
+    // "Untitled" until the user visited it.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).settings.notes_mode = false;
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("First idea\nbody").unwrap();
+    let first = app_mut(window.hwnd).tabs.active().unwrap().id;
+    super::create_new_document(window.hwnd).unwrap();
+    editor.set_text("Second idea").unwrap();
+    pump_posted_messages(window.hwnd);
+    let title = |id| app_mut(window.hwnd).tabs.document(id).unwrap().title();
+    assert_eq!(title(first), "Untitled *");
+
+    let settings = RecoveryScratch::new("labels-toggle");
+    super::save_settings_to(Some(settings.path().join("fastpad.ini")));
+    execute_command(window.hwnd, CommandId::ToggleNotesMode);
+    super::save_settings_to(None);
+    assert!(app_mut(window.hwnd).settings.notes_mode);
+
+    assert_eq!(title(first), "First idea *");
+    let active = app_mut(window.hwnd).tabs.active().unwrap().id;
+    assert_ne!(active, first, "no tab switch");
+    assert_eq!(title(active), "Second idea *");
+}
+
+#[test]
+fn restored_and_recovered_untitled_tabs_are_labelled_from_their_text() {
+    // Break caught: a background untitled tab restored from the session reading "Untitled"
+    // because only the active tab's label is computed.
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("session-labels");
+    let recovery = scratch.path().join("Recovery");
+    let first_id = RecoveryId::from_u128(0x1ab1);
+    let second_id = RecoveryId::from_u128(0x1ab2);
+    for (id, text) in [(first_id, "# Shopping\nmilk"), (second_id, "Plans")] {
+        write_snapshot(&recovery, &Snapshot::new(id, None, Encoding::Utf8, text)).unwrap();
+    }
+    write_session(
+        &scratch,
+        vec![
+            SessionEntry::new(SessionSource::Snapshot(first_id)),
+            SessionEntry::new(SessionSource::Snapshot(second_id)),
+        ],
+        1,
+    );
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    enable_session(window.hwnd, &scratch);
+
+    run_session_restore(window.hwnd);
+
+    {
+        let app = app_mut(window.hwnd);
+        let documents = app.tabs.documents().collect::<Vec<_>>();
+        assert_eq!(documents[0].title(), "Shopping *");
+        assert_eq!(documents[0].label_watch, 0);
+        assert_eq!(documents[1].title(), "Plans *");
+    }
+
+    // A crash-recovered tab keeps its "Recovered:" title but knows its label for a save.
+    let root = RecoveryScratch::new("recovered-label");
+    write_snapshot(
+        root.path(),
+        &Snapshot::new(
+            RecoveryId::from_u128(0x1ab3),
+            None,
+            Encoding::Utf8,
+            "Lost thought",
+        ),
+    )
+    .unwrap();
+    app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+    super::recover_snapshots(window.hwnd);
+    let recovered = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(recovered.untitled_label.as_deref(), Some("Lost thought"));
+}
+
+#[test]
+fn a_metadata_flush_leaves_the_local_file_alone_and_an_expansion_change_writes_it() {
+    // Break caught: every 500 ms metadata flush, every rescan or every opened note
+    // re-encoding and rewriting the whole per-PC local file (with its scan cache) on the UI
+    // thread.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("local-untouched");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    open_note(&window, &scratch, "a.md", "a");
+    crate::window::library_host::flush_now(window.hwnd);
+    let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
+    assert!(local.exists(), "the load wrote it");
+    std::fs::remove_file(&local).unwrap();
+
+    let b = scratch.note("b.md", "b");
+    super::open_path(window.hwnd, &b).unwrap();
+    crate::window::library_host::flush_now(window.hwnd);
+    assert!(!local.exists(), "opening a note changes nothing local");
+
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::library_host::flush_now(window.hwnd);
+    assert!(crate::library::store::library_file(&scratch.folder()).exists());
+    assert!(!local.exists(), "only library.ini changed");
+
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        state.local.set_expanded(std::path::Path::new("sub"), true);
+    });
+    crate::window::library_host::flush_now(window.hwnd);
+    assert!(
+        std::fs::read_to_string(&local)
+            .unwrap()
+            .contains("expanded=sub\r\n"),
+        "an expansion change is written"
+    );
+}
+
+#[test]
+fn the_library_step_checks_no_folder_on_the_ui_thread_and_the_worker_falls_back() {
+    // Break caught: the startup existence check on a remembered folder on an offline mapped
+    // drive stalling the UI thread for an SMB timeout.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("startup-gone");
+    let gone = scratch.root.join("gone");
+    let mut folders = crate::library::local::RecentFolders::default();
+    folders.push(gone.clone());
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(&scratch.data()),
+        &folders,
+    )
+    .unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+
+    let before = crate::library::folder_checks();
+    crate::window::library_host::open_library_step(window.hwnd);
+    assert_eq!(crate::library::folder_checks(), before, "no stat here");
+    assert_eq!(crate::window::library_host::folder(window.hwnd), Some(gone));
+
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    let fallback =
+        crate::library::normalize_folder(&crate::platform::paths::default_notes_folder().unwrap());
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        Some(fallback)
+    );
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("could not find the notebook")),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn a_session_that_ended_with_no_notebook_open_opens_none_at_startup() {
+    // Break caught: open=none ignored, so a closed notebook came back at the next start, or
+    // a worker started (and stat-ed a folder) to find out there was nothing to open.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("startup-closed");
+    let mut folders = crate::library::local::RecentFolders::default();
+    folders.push(scratch.folder());
+    folders.set_closed(true);
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(&scratch.data()),
+        &folders,
+    )
+    .unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+
+    let before = crate::library::folder_checks();
+    crate::window::library_host::open_library_step(window.hwnd);
+    assert_eq!(crate::library::folder_checks(), before);
+    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert!(!app_mut(window.hwnd).library.scanning, "no worker starts");
+}
+
+#[test]
+fn turning_notes_mode_off_says_so_when_metadata_cannot_be_written_and_closes_the_name_box() {
+    // Break caught: the toggle dropping unsaved pins silently when the flush
+    // failed, or leaving a name box open that did nothing on Enter.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = open_first_save_box("mode-off-flush");
+    let a = scratch.note("a.md", "a");
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        let mut ids = crate::library::ids::IdSource::new(1, 1);
+        let target = state.note_ref(&mut ids, &a);
+        state
+            .apply(crate::library::ops::PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+    });
+    std::fs::write(scratch.folder().join(".fastpad"), "not a directory").unwrap();
+
+    app_mut(window.hwnd).settings.notes_mode = false;
+    crate::window::library_host::notes_mode_changed(window.hwnd, false);
+
+    assert!(!name_box_visible(window.hwnd));
+    assert!(
+        app_mut(window.hwnd).library.state.is_none(),
+        "the setting applies"
+    );
+    let expected = format!(
+        "Metadata changes could not be written to {}",
+        scratch
+            .folder()
+            .join(".fastpad")
+            .join("library.ini")
+            .display()
+    );
+    assert!(
+        notices(window.hwnd).contains(&expected),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn deleting_a_note_with_unsaved_edits_says_they_are_discarded() {
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("delete-dirty");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let path = open_note(&window, &scratch, "a.md", "a");
+    crate::window::answer_next_confirm(|_| false);
+    execute_command(window.hwnd, CommandId::NoteDelete);
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move \u{201c}a.md\u{201d} to the Recycle Bin?")
+    );
+    editor.set_text("unsaved").unwrap();
+    crate::window::answer_next_confirm(|_| false);
+    execute_command(window.hwnd, CommandId::NoteDelete);
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move \u{201c}a.md\u{201d} to the Recycle Bin and discard unsaved changes?")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "a",
+        "nothing is autosaved first"
+    );
+}
+
+#[test]
+fn opening_another_folder_autosaves_the_old_folders_notes_and_normalizes_the_new_path() {
+    // Break caught: a dirty note in the old folder left unsaved (and no longer autosaved)
+    // after a switch, or a folder spelled with a trailing separator becoming a second
+    // recent folder.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("switch-autosave-a");
+    let second = LibraryScratch::new("switch-autosave-b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "one");
+    // Off while editing, so nothing but the switch saves it.
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    editor.set_text("two").unwrap();
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+
+    let spelled = std::path::PathBuf::from(format!("{}\\", second.folder().display()));
+    crate::window::library_host::open_folder(window.hwnd, &spelled);
+
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "two");
+    assert_eq!(
+        crate::window::library_host::folder(window.hwnd),
+        Some(second.folder())
+    );
+    let recent =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&first.data()));
+    assert_eq!(recent.folders.first(), Some(&second.folder()));
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+}
+
+#[test]
+fn a_library_file_held_open_by_a_sync_keeps_the_operations_and_retries_without_a_notice() {
+    // Break caught: a sharing violation on library.ini turning organizing off or dropping
+    // the pending pins with an error notice.
+    use std::os::windows::fs::OpenOptionsExt;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("busy-flush-window");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let a = open_note(&window, &scratch, "a.md", "a");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    // Another PC's sync writes the file, so the flush must re-read it, and holds it open.
+    let ini = crate::library::store::library_file(&scratch.folder());
+    crate::library::store::write(&ini, &crate::library::model::Library::default()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&ini)
+        .unwrap();
+    let before = notices(window.hwnd).len();
+    crate::window::library_host::flush_now(window.hwnd);
+    drop(lock);
+    assert_eq!(
+        notices(window.hwnd).len(),
+        before,
+        "no notice for a brief sync"
+    );
+    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    assert_eq!(state.metadata, crate::library::Metadata::Ready);
+    assert_eq!(state.pending.len(), 1);
+
+    crate::window::library_host::flush_now(window.hwnd);
+    let reloaded = crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
+    assert!(reloaded.is_pinned(&a));
+}
+
+use crate::library::tree::RowKind;
+use crate::window::notebook_view::{Activation, Mode, NotebookView};
+use crate::window::tree_drag::DragSource;
+
+/// Task 6 creates the sidebar with the window when notes mode is on; this makes sure of it.
+fn ensure_sidebar(hwnd: HWND) {
+    if app_mut(hwnd).sidebar.is_none() {
+        crate::window::side_panel::notes_mode_changed(hwnd, true);
+    }
+}
+
+fn notebook_view<'a>(hwnd: HWND) -> &'a mut NotebookView {
+    &mut app_mut(hwnd).sidebar.as_mut().unwrap().notebook
+}
+
+fn row_of(hwnd: HWND, kind: &RowKind) -> usize {
+    crate::library::tree::row_index(&notebook_view(hwnd).rows, kind)
+        .unwrap_or_else(|| panic!("{kind:?} is not in {:?}", notebook_view(hwnd).rows))
+}
+
+fn selected_kind(hwnd: HWND) -> Option<RowKind> {
+    let view = notebook_view(hwnd);
+    view.list
+        .selected
+        .and_then(|index| view.rows.get(index))
+        .map(|row| row.kind.clone())
+}
+
+fn select_row(hwnd: HWND, kind: &RowKind) {
+    let index = row_of(hwnd, kind);
+    notebook_view(hwnd).list.selected = Some(index);
+}
+
+/// A window with a sidebar showing `scratch`'s notebook in the Notebook view.
+fn notebook_window(scratch: &LibraryScratch) -> (ProductionWindow, crate::editor::Editor) {
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    (window, editor)
+}
+
+fn inline_field(hwnd: HWND) -> HWND {
+    crate::window::inline_name::field_hwnd(hwnd).expect("the name field was made")
+}
+
+fn inline_open(hwnd: HWND) -> bool {
+    crate::window::inline_name::is_open(hwnd)
+}
+
+/// Types `text` into the name field as a paste would: the Edit sends EN_CHANGE to the panel.
+fn type_into_field(hwnd: HWND, text: &str) {
+    let wide = crate::platform::wide_null(text);
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+            inline_field(hwnd),
+            wide.as_ptr(),
+        )
+    };
+}
+
+fn field_key(hwnd: HWND, key: u16) {
+    unsafe {
+        SendMessageW(
+            inline_field(hwnd),
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            usize::from(key),
+            0,
+        )
+    };
+}
+
+/// A new untitled tab (Ctrl+N) whose first save goes to `folder`, as if that folder's row
+/// had been selected when it was made.
+fn untitled_tab_saving_in(hwnd: HWND, folder: std::path::PathBuf) {
+    execute_command(hwnd, CommandId::New);
+    let tabs = &mut app_mut(hwnd).tabs;
+    let id = tabs.active().unwrap().id;
+    tabs.document_mut(id).unwrap().save_folder = Some(folder);
+}
+
+fn field_text(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 260];
+    let copied = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+            inline_field(hwnd),
+            buffer.as_mut_ptr(),
+            buffer.len() as i32,
+        )
+    };
+    String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+}
+
+fn field_selection(hwnd: HWND) -> (u32, u32) {
+    let (mut start, mut end) = (0_u32, 0_u32);
+    unsafe {
+        SendMessageW(
+            inline_field(hwnd),
+            windows_sys::Win32::UI::Controls::EM_GETSEL,
+            &mut start as *mut u32 as usize,
+            &mut end as *mut u32 as isize,
+        )
+    };
+    (start, end)
+}
+
+/// The draft row's index and depth, while one shows.
+fn draft_row(hwnd: HWND) -> Option<(usize, u16)> {
+    let rows = &notebook_view(hwnd).rows;
+    rows.iter()
+        .position(|row| row.kind == RowKind::Draft)
+        .map(|index| (index, rows[index].depth))
+}
+
+/// The middle of the row showing `kind`, as a panel mouse message's `lParam`.
+fn row_lparam(hwnd: HWND, kind: &RowKind) -> super::LPARAM {
+    let index = row_of(hwnd, kind);
+    let rect = notebook_view(hwnd).row_rect_at(index).unwrap();
+    client_lparam((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+}
+
+fn rescan_and_wait(hwnd: HWND) {
+    crate::window::library_host::request_rescan(hwnd);
+    pump_until(hwnd, || !app_mut(hwnd).library.scanning);
+}
+
+#[test]
+fn a_rescan_keeps_selection_and_expansion_by_path() {
+    // Break caught: a rescan that rebuilds the rows and keeps the selected index, so the
+    // highlight jumps to another note; one that collapses the folder the user had open; or a
+    // vanished selection left pointing past the end of the list.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("rescan-selection");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\b.md", "b");
+    scratch.note("c.md", "c");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), true);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let b = RowKind::Note(r"sub\b.md".into());
+    select_row(window.hwnd, &b);
+
+    scratch.note(r"sub\a.md", "a");
+    rescan_and_wait(window.hwnd);
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(b.clone()),
+        "followed by path"
+    );
+    let sub = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+    assert!(notebook_view(window.hwnd).rows[sub].expanded);
+    assert!(row_of(window.hwnd, &RowKind::Note(r"sub\a.md".into())) < row_of(window.hwnd, &b));
+
+    let before = notebook_view(window.hwnd).list.selected.unwrap();
+    std::fs::remove_file(scratch.folder().join(r"sub\b.md")).unwrap();
+    rescan_and_wait(window.hwnd);
+    let view = notebook_view(window.hwnd);
+    let after = view
+        .list
+        .selected
+        .expect("the selection moves, it does not vanish");
+    assert!(after < view.rows.len());
+    assert_eq!(after, before.min(view.rows.len() - 1));
+    assert!(view.rows[sub].expanded);
+}
+
+#[test]
+fn enter_on_a_note_row_opens_a_normal_tab_and_promotes_the_preview() {
+    // Break caught: Enter opening the italic preview tab, so a keyboard user has no way to
+    // keep a note open short of Ctrl+Enter, and a second Enter on the preview does nothing.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-enter");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, editor) = notebook_window(&scratch);
+    let (_, panel) = sidebar_windows(window.hwnd);
+
+    select_row(window.hwnd, &RowKind::Note("a.md".into()));
+    unsafe { SetFocus(panel) };
+    crate::window::notebook_view::key_down(window.hwnd, VK_RETURN);
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(a.as_path()));
+    assert!(!active.preview, "Enter opens a normal tab");
+    assert_eq!(
+        unsafe { GetFocus() },
+        editor.hwnd(),
+        "and moves to the editor"
+    );
+
+    // A note already in the preview tab becomes a normal tab on Enter.
+    let row = row_of(window.hwnd, &RowKind::Note("b.md".into()));
+    crate::window::notebook_view::activate(window.hwnd, row, Activation::Click);
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().preview);
+    select_row(window.hwnd, &RowKind::Note("b.md".into()));
+    unsafe { SetFocus(panel) };
+    crate::window::notebook_view::key_down(window.hwnd, VK_RETURN);
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(b.as_path()));
+    assert!(!active.preview);
+    assert_eq!(super::tab_count(window.hwnd), 2);
+}
+
+#[test]
+fn clicking_a_note_row_opens_the_preview_and_a_double_click_keeps_it() {
+    // Break caught: a click opening a normal tab every time (tabs pile up), or a double-click
+    // opening a second tab instead of keeping the preview, or a click moving the keyboard to
+    // the editor so F2 and Del no longer reach the row just clicked.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-click");
+    let a = scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    let row = row_of(window.hwnd, &RowKind::Note("a.md".into()));
+    let (_, panel) = sidebar_windows(window.hwnd);
+    unsafe { SetFocus(panel) };
+
+    crate::window::notebook_view::activate(window.hwnd, row, Activation::Click);
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(a.as_path()));
+    assert!(active.preview);
+    assert_eq!(
+        unsafe { GetFocus() },
+        panel,
+        "a click keeps focus in the tree"
+    );
+
+    let row = row_of(window.hwnd, &RowKind::Note("a.md".into()));
+    crate::window::notebook_view::activate(window.hwnd, row, Activation::Permanent);
+    assert_eq!(super::tab_count(window.hwnd), 1);
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().preview);
+}
+
+#[test]
+fn switching_to_a_note_in_a_subfolder_selects_its_row_and_expands_its_folders() {
+    // Break caught: the tree not following the active tab, or following it into a collapsed
+    // folder so the selected row is hidden, or forgetting that expansion at the next start.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-reveal");
+    std::fs::create_dir_all(scratch.folder().join(r"sub\deep")).unwrap();
+    let b = scratch.note(r"sub\deep\b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+
+    super::open_path(window.hwnd, &b).unwrap();
+    crate::window::side_panel::active_tab_changed(window.hwnd);
+
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"sub\deep\b.md".into()))
+    );
+    let expanded = crate::window::library_host::expanded(window.hwnd);
+    assert!(expanded.contains(&std::path::PathBuf::from("sub")));
+    assert!(expanded.contains(&std::path::PathBuf::from(r"sub\deep")));
+    let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
+    let written = crate::library::local::read(&local, &scratch.folder());
+    assert!(
+        written
+            .expanded
+            .contains(&std::path::PathBuf::from(r"sub\deep"))
+    );
+}
+
+#[test]
+fn right_expands_a_folder_then_enters_it_and_left_climbs_back_out() {
+    // Break caught: arrow keys that only move up and down, so a folder cannot be opened from
+    // the keyboard, or Left on a child that does nothing.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-keys");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\a.md", "a");
+    scratch.note("z.md", "z");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    let sub = RowKind::Folder("sub".into());
+    select_row(window.hwnd, &sub);
+    let key = |key| crate::window::notebook_view::key_down(window.hwnd, key);
+
+    assert!(key(VK_RIGHT));
+    assert!(notebook_view(window.hwnd).rows[row_of(window.hwnd, &sub)].expanded);
+    assert!(key(VK_RIGHT));
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"sub\a.md".into()))
+    );
+    assert!(key(VK_LEFT));
+    assert_eq!(selected_kind(window.hwnd), Some(sub.clone()));
+    assert!(key(VK_LEFT));
+    assert!(!notebook_view(window.hwnd).rows[row_of(window.hwnd, &sub)].expanded);
+}
+
+#[test]
+fn the_view_says_loading_then_shows_the_tree_and_recent_notebooks_once_closed() {
+    // Break caught: an empty panel while the worker loads, a tree left on screen after Close
+    // notebook, or a no-notebook state without the RECENT list.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-states");
+    scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(&scratch.data()),
+        &crate::library::local::RecentFolders {
+            folders: vec![scratch.folder()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    app_mut(window.hwnd).library.folder = Some(scratch.folder());
+    crate::window::notebook_view::rebuild(window.hwnd);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
+
+    scratch.install(window.hwnd);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+
+    execute_command(window.hwnd, CommandId::CloseNotebook);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
+    assert_eq!(notebook_view(window.hwnd).recent, vec![scratch.folder()]);
+}
+
+#[test]
+fn a_failed_load_offers_retry_and_open_instead_of_loading_forever() {
+    // Break caught: a notebook whose load failed showing "Loading…" in both views for good,
+    // with no way to try again but reopening it.
+    use windows_sys::Win32::Foundation::LPARAM;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-failed");
+    scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    app_mut(window.hwnd).library.folder = Some(scratch.folder());
+    let generation = app_mut(window.hwnd).library.generation;
+    crate::window::library_host::library_ready(
+        window.hwnd,
+        crate::window::library_host::test_ready_payload(generation, Err("boom".to_owned())),
+    );
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Failed);
+    let panel = notebook_view(window.hwnd).panel;
+    let mut client = RECT::default();
+    unsafe { GetClientRect(panel, &mut client) };
+    let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+    let buttons = notebook_view(window.hwnd).buttons(client, dpi);
+    let names: Vec<&str> = buttons.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        names.ends_with(&["Retry", "Open notebook…"]),
+        "exposed to screen readers like the empty-state buttons: {names:?}"
+    );
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    assert_eq!(
+        crate::window::search_view::status(window.hwnd),
+        Some(crate::window::notebook_view::LOAD_FAILED)
+    );
+
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    let retry = buttons[buttons.len() - 2].1;
+    let lparam = ((((retry.top + retry.bottom) / 2) as u32) << 16
+        | ((retry.left + retry.right) / 2) as u32) as LPARAM;
+    unsafe {
+        SendMessageW(panel, WM_LBUTTONDOWN, 0, lparam);
+        SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
+    }
+    assert_eq!(
+        notebook_view(window.hwnd).mode,
+        Mode::Loading,
+        "Retry clears the failure and loads the same notebook again"
+    );
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+}
+
+#[test]
+fn at_startup_both_views_say_loading_for_the_notebook_being_opened() {
+    // Break caught: the Search view saying "Open a notebook to search it." while the
+    // remembered notebook loads.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("startup-loading");
+    scratch.note("a.md", "a");
+    write_notebooks(&scratch.data(), vec![scratch.folder()], vec![]);
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    assert_eq!(
+        crate::window::search_view::status(window.hwnd),
+        Some(crate::window::search_view::NO_NOTEBOOK)
+    );
+
+    crate::window::library_host::open_library_step(window.hwnd);
+    assert_eq!(
+        crate::window::search_view::status(window.hwnd),
+        Some(crate::window::search_view::LOADING)
+    );
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
+    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    assert_eq!(crate::window::search_view::status(window.hwnd), None);
+}
+
+#[test]
+fn an_empty_notebook_stays_empty_with_untitled_tabs_open() {
+    // Break caught: untitled tabs still listed in the tree as well as in Open Editors, or an
+    // empty notebook's state hidden by them (open editors spec §3.4).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("empty-untitled");
+    let (window, _editor) = notebook_window(&scratch);
+    execute_command(window.hwnd, CommandId::New);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let view = notebook_view(window.hwnd);
+    assert_eq!(view.mode, crate::window::notebook_view::Mode::Empty);
+    assert!(view.rows.is_empty());
+}
+
+#[test]
+fn the_header_star_favorites_the_notebook_and_every_state_paints() {
+    // Break caught: a star that does nothing, or a paint path that panics on an empty tree,
+    // the loading state or the no-notebook state.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-star");
+    scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+
+    crate::window::notebook_view::header_clicked(
+        window.hwnd,
+        crate::window::notebook_view::HeaderButton::Favorite,
+    );
+    assert!(crate::window::library_host::is_favorite(window.hwnd));
+
+    let panel = notebook_view(window.hwnd).panel;
+    let area = RECT {
+        left: 0,
+        top: 0,
+        right: 260,
+        bottom: 400,
+    };
+    let dc = unsafe { windows_sys::Win32::Graphics::Gdi::GetDC(panel) };
+    let paint = |hwnd: HWND| {
+        let view_paint = crate::window::side_panel::view_paint(hwnd, panel, dc, area);
+        crate::window::notebook_view::paint(hwnd, &view_paint);
+    };
+    paint(window.hwnd);
+    execute_command(window.hwnd, CommandId::CloseNotebook);
+    paint(window.hwnd);
+    app_mut(window.hwnd).library.folder = Some(scratch.folder());
+    crate::window::notebook_view::rebuild(window.hwnd);
+    paint(window.hwnd);
+    unsafe { windows_sys::Win32::Graphics::Gdi::ReleaseDC(panel, dc) };
+}
+
+#[test]
+fn switching_tabs_in_an_unchanged_notebook_does_not_reflatten() {
+    // Break caught: every tab switch flattening the whole tree again (tens of milliseconds
+    // in a big, expanded notebook).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-no-reflatten");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+    let id_of = |path: &std::path::Path| app_mut(window.hwnd).tabs.find_stored_path(path).unwrap();
+    let (a_id, b_id) = (id_of(&a), id_of(&b));
+    // The deferred startup steps (theme, chrome) refresh the sidebar once; let them run.
+    pump_posted_messages(window.hwnd);
+    let before = notebook_view(window.hwnd).rebuilds;
+
+    assert!(super::activate_document_by_id(window.hwnd, a_id));
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("a.md".into()))
+    );
+    assert!(super::activate_document_by_id(window.hwnd, b_id));
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("b.md".into()))
+    );
+    assert_eq!(notebook_view(window.hwnd).rebuilds, before, "no re-flatten");
+}
+
+#[test]
+fn switching_sidebar_views_saves_the_view_without_restyling_the_editor_or_reflattening() {
+    // Break caught: every view switch (and every panel resize) re-applying the editor
+    // settings, which lays the Markdown preview out again, or flattening an unchanged tree
+    // each time the Notebook view comes back.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-switch-cheap");
+    scratch.note("a.md", "a");
+    let settings = scratch.root.join("fastpad.ini");
+    super::save_settings_to(Some(settings.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    pump_posted_messages(window.hwnd);
+    let applied = super::editor_settings_applied();
+    let rebuilds = notebook_view(window.hwnd).rebuilds;
+    use crate::config::SidebarView;
+
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+    super::save_settings_to(None);
+
+    assert_eq!(super::editor_settings_applied(), applied);
+    assert_eq!(notebook_view(window.hwnd).rebuilds, rebuilds);
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        SidebarView::Notebook
+    );
+    let saved = std::fs::read_to_string(&settings).unwrap();
+    assert!(saved.contains("sidebar_view=notebook"), "{saved}");
+}
+
+#[test]
+fn a_notebooks_first_load_selects_the_restored_active_note_and_expands_its_folders() {
+    // Break caught: a restored session whose active note sits in a collapsed folder, with
+    // nothing selected, until the user switches tabs.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("view-restore-reveal");
+    std::fs::create_dir_all(scratch.folder().join(r"sub\deep")).unwrap();
+    let b = scratch.note(r"sub\deep\b.md", "b");
+    scratch.note("c.md", "c");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    super::open_path(window.hwnd, &b).unwrap();
+
+    scratch.install(window.hwnd);
+
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"sub\deep\b.md".into()))
+    );
+    let expanded = crate::window::library_host::expanded(window.hwnd);
+    assert!(expanded.contains(&std::path::PathBuf::from("sub")));
+    assert!(expanded.contains(&std::path::PathBuf::from(r"sub\deep")));
+}
+
+fn write_notebooks(
+    data: &std::path::Path,
+    folders: Vec<std::path::PathBuf>,
+    favorites: Vec<std::path::PathBuf>,
+) {
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(data),
+        &crate::library::local::RecentFolders {
+            folders,
+            favorites,
+            closed: false,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn moving_a_note_to_another_notebook_moves_the_file_drops_its_pin_and_its_tab_follows() {
+    // Break caught: a move that copies without deleting, a pin record left pointing at a file
+    // that left the notebook, or a tab still on the old path, where autosave would recreate it.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("move-a");
+    let second = LibraryScratch::new("move-b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "a");
+    crate::window::library_host::toggle_pin(window.hwnd, &a);
+    write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+
+    execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+
+    let moved = second.folder().join("a.md");
+    assert!(!a.exists());
+    assert_eq!(std::fs::read_to_string(&moved).unwrap(), "a");
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(moved.as_path())
+    );
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(!state.is_pinned(&a));
+        assert!(state.record_for(&a).is_none());
+        assert!(
+            !state
+                .notes
+                .iter()
+                .any(|note| note.path == std::path::Path::new("a.md"))
+        );
+    });
+    editor.set_text("b").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::NotEligible,
+        "a plain file outside the notebook now"
+    );
+}
+
+#[test]
+fn a_move_onto_an_existing_name_changes_nothing_and_says_why() {
+    // Break caught: MoveFileExW's replace flag, or a fallback copy, overwriting the other
+    // notebook's note of the same name.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("move-clash-a");
+    let second = LibraryScratch::new("move-clash-b");
+    let theirs = second.note("a.md", "theirs");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "mine");
+    write_notebooks(&first.data(), vec![second.folder()], vec![]);
+
+    crate::window::library_host::move_to_notebook(window.hwnd, &a);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "mine");
+    assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(a.as_path())
+    );
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("already exists"))
+    );
+}
+
+#[test]
+fn move_offers_favorites_by_name_then_recent_never_the_open_one_then_browse() {
+    // Break caught: the open notebook offered as a destination, a notebook listed twice, or
+    // Browse… not reachable.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("move-list");
+    let third = LibraryScratch::new("move-browse");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "a");
+    let (zeta, alpha, beta) = (
+        first.root.join("Zeta"),
+        first.root.join("alpha"),
+        first.root.join("beta"),
+    );
+    write_notebooks(
+        &first.data(),
+        vec![first.folder(), beta.clone(), alpha.clone()],
+        vec![zeta.clone(), alpha.clone(), first.folder()],
+    );
+
+    crate::window::library_host::move_to_notebook(window.hwnd, &a);
+    let (note, destinations) = app_mut(window.hwnd).library.shown_move.clone().unwrap();
+    assert_eq!(note, a);
+    assert_eq!(destinations, vec![alpha, zeta, beta]);
+
+    crate::window::answer_next_folder_dialog({
+        let folder = third.folder();
+        move |_| Some(folder)
+    });
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(3),
+    );
+    assert!(third.folder().join("a.md").exists());
+}
+
+#[test]
+fn a_new_note_saves_into_the_folder_selected_when_it_was_created_or_the_root_if_that_is_gone() {
+    // Break caught: Ctrl+N with a subfolder selected saving into the notebook root anyway, or
+    // a first save failing because the remembered folder was deleted meanwhile.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("new-note-folder");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), true);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    select_row(window.hwnd, &RowKind::Note(r"sub\b.md".into()));
+
+    execute_command(window.hwnd, CommandId::New);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().save_folder,
+        Some(scratch.folder().join("sub"))
+    );
+    editor.set_text("Idea").unwrap();
+    execute_command(window.hwnd, CommandId::Save);
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert!(scratch.folder().join(r"sub\Idea.md").exists());
+
+    let gone = scratch.folder().join("gone");
+    untitled_tab_saving_in(window.hwnd, gone);
+    editor.set_text("Other").unwrap();
+    execute_command(window.hwnd, CommandId::Save);
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert!(scratch.folder().join("Other.md").exists());
+}
+
+#[test]
+fn the_context_menu_acts_on_its_row_not_the_active_tab() {
+    // Break caught: Pin from a row's menu pinning the active tab's note instead, or "New
+    // note here" ignoring the folder.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("context-menu");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note("b.md", "b");
+    scratch.note(r"sub\c.md", "c");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    let a = open_note(&window, &scratch, "a.md", "a");
+    let menu = |kind: &RowKind, answer: CommandId| {
+        crate::window::menus::answer_next_popup_menu(move |_| Some(answer));
+        let index = row_of(window.hwnd, kind);
+        crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+    };
+
+    menu(&RowKind::Note("b.md".into()), CommandId::NoteTogglePin);
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(state.is_pinned(&scratch.folder().join("b.md")));
+        assert!(!state.is_pinned(&a));
+    });
+
+    menu(&RowKind::Folder("sub".into()), CommandId::NoteNew);
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::NewNote("sub".into()))
+    );
+    crate::window::inline_name::cancel(window.hwnd);
+
+    menu(
+        &RowKind::Folder("sub".into()),
+        CommandId::NoteRevealInExplorer,
+    );
+    execute_command(window.hwnd, CommandId::NoteRevealInExplorer);
+    assert_eq!(
+        crate::platform::shell::take_revealed(),
+        vec![scratch.folder().join("sub"), a.clone()]
+    );
+}
+
+#[test]
+fn f2_and_rename_on_a_note_row_rename_it_in_the_tree_without_opening_a_tab() {
+    // Break caught: F2 opening the note as a tab first, renaming the active tab's note, a
+    // prefill that selects the extension, or the renamed row losing the selection and the
+    // focus (inline naming spec §3.3, §5.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_F2, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-rename-note");
+    let a = scratch.note("a.md", "a");
+    scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    let tabs = super::tab_count(window.hwnd);
+    select_row(window.hwnd, &RowKind::Note("b.md".into()));
+
+    assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::RenameNote(
+            "b.md".into()
+        ))
+    );
+    assert_eq!(field_text(window.hwnd), "b.md");
+    assert_eq!(field_selection(window.hwnd), (0, 1), "the stem is selected");
+    assert_eq!(super::tab_count(window.hwnd), tabs, "no tab opened");
+    type_into_field(window.hwnd, "c");
+    field_key(window.hwnd, VK_RETURN);
+
+    assert!(!scratch.folder().join("b.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("c.md")).unwrap(),
+        "b"
+    );
+    assert_eq!(super::tab_count(window.hwnd), tabs);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(a.as_path())
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("c.md".into()))
+    );
+    assert_eq!(unsafe { GetFocus() }, sidebar_windows(window.hwnd).1);
+
+    let index = row_of(window.hwnd, &RowKind::Note("c.md".into()));
+    crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteRename));
+    crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::RenameNote(
+            "c.md".into()
+        ))
+    );
+    assert_eq!(super::tab_count(window.hwnd), tabs);
+}
+
+#[test]
+fn renaming_open_dirty_and_preview_notes_in_the_tree_rebinds_their_tabs() {
+    // Break caught: a rename that saves a dirty tab, turns the preview into a normal tab,
+    // or leaves either on the old path (spec §5.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F2, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-rename-tabs");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, editor) = notebook_window(&scratch);
+    // Autosave would save `a` the moment `b` opens; the rename must leave it dirty.
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &a).unwrap();
+    editor.set_text("a, edited").unwrap();
+    super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+    let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+    let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
+    let rename = |from: &str, to: &str| {
+        select_row(window.hwnd, &RowKind::Note(from.into()));
+        assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+        type_into_field(window.hwnd, to);
+        field_key(window.hwnd, VK_RETURN);
+    };
+
+    rename("a.md", "a2");
+    rename("b.md", "b2");
+
+    let tabs = &app_mut(window.hwnd).tabs;
+    assert_eq!(
+        tabs.document(a_id).unwrap().path,
+        Some(scratch.folder().join("a2.md"))
+    );
+    assert!(tabs.document(a_id).unwrap().dirty);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("a2.md")).unwrap(),
+        "a",
+        "nothing was saved"
+    );
+    assert_eq!(
+        tabs.document(b_id).unwrap().path,
+        Some(scratch.folder().join("b2.md"))
+    );
+    assert_eq!(
+        tabs.preview_id(),
+        Some(b_id),
+        "the preview stays the preview"
+    );
+    assert_eq!(super::tab_count(window.hwnd), 2);
+}
+
+#[test]
+fn a_case_only_rename_in_the_tree_renames_the_note_and_the_folder() {
+    // Break caught: "plan.md" → "Plan.md" or "sub" → "Sub" refused as a clash with itself,
+    // or a no-op on NTFS (spec §4.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-rename-case");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note("plan.md", "p");
+    let (window, _editor) = notebook_window(&scratch);
+    let names = || {
+        let mut names: Vec<String> = std::fs::read_dir(scratch.folder())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    };
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("plan.md".into()));
+    type_into_field(window.hwnd, "Plan.md");
+    assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+    field_key(window.hwnd, VK_RETURN);
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "Sub");
+    field_key(window.hwnd, VK_RETURN);
+
+    assert_eq!(names(), ["Plan.md", "Sub"]);
+    assert!(!inline_open(window.hwnd));
+}
+
+#[test]
+fn note_rename_from_the_palette_with_the_sidebar_hidden_reveals_the_row_and_edits_it() {
+    // Break caught: Note: Rename… on the active tab opening the name bar while the note has
+    // a row, or editing a row nobody can see in a hidden sidebar or a collapsed folder
+    // (spec §3.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-rename-reveal");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    open_note(&window, &scratch, r"sub\a.md", "a");
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), false);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Hidden, false);
+
+    execute_command(window.hwnd, CommandId::NoteRename);
+
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        crate::config::SidebarView::Notebook
+    );
+    assert!(
+        crate::window::library_host::expanded(window.hwnd)
+            .contains(&std::path::PathBuf::from("sub"))
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"sub\a.md".into()))
+    );
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::RenameNote(
+            r"sub\a.md".into()
+        ))
+    );
+    assert_eq!(field_text(window.hwnd), "a.md");
+    assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+    assert!(
+        !app_mut(window.hwnd)
+            .name_box
+            .as_ref()
+            .is_some_and(|name_box| name_box.is_visible())
+    );
+}
+
+#[test]
+fn note_rename_on_a_file_outside_the_notebook_uses_the_name_bar() {
+    // Break caught: a file with no row revealing nothing and doing nothing, or the tree
+    // edited for some other row (spec §3.3).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-rename-outside");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let outside = scratch.root.join("outside.md");
+    std::fs::write(&outside, "o").unwrap();
+    super::open_path(window.hwnd, &outside).unwrap();
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+
+    execute_command(window.hwnd, CommandId::NoteRename);
+
+    assert!(!inline_open(window.hwnd));
+    let name_box = app_mut(window.hwnd).name_box.as_ref().unwrap();
+    assert!(name_box.is_visible());
+    assert_eq!(
+        name_box.purpose(),
+        Some(&crate::window::name_box::NamePurpose::RenameNote(id))
+    );
+}
+
+#[test]
+fn note_rename_on_a_recorded_row_that_left_the_library_renames_nothing() {
+    // Break caught: Note: Rename… on a focused note row that vanished before Enter opening
+    // the name bar on the active tab's file, one the user did not choose (spec §3.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-rename-gone");
+    let active = scratch.note("active.md", "active");
+    let row = scratch.note("row.md", "row");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &active).unwrap();
+    select_row(window.hwnd, &RowKind::Note("row.md".into()));
+    let (_, panel) = sidebar_windows(window.hwnd);
+    unsafe { SetFocus(panel) };
+    assert_eq!(unsafe { GetFocus() }, panel);
+
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    let query = app_mut(window.hwnd)
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .query_hwnd();
+    let typed = crate::platform::wide_null("Note: Rename");
+    unsafe { SetWindowTextW(query, typed.as_ptr()) };
+    crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&row));
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+
+    assert!(!inline_open(window.hwnd));
+    assert!(
+        !app_mut(window.hwnd)
+            .name_box
+            .as_ref()
+            .is_some_and(|name_box| name_box.is_visible())
+    );
+    assert!(active.exists());
+    assert!(row.exists());
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(active.as_path())
+    );
+}
+
+#[test]
+fn a_note_rename_whose_tab_cannot_follow_and_cannot_be_undone_stands() {
+    // Break caught: a failed undo swallowed, leaving the file renamed on disk while the
+    // library still lists the old name and the field claims nothing happened (spec §5.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-rename-undo-fails");
+    let a = scratch.note("a.md", "a");
+    let top = scratch.note("top.md", "t");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &top).unwrap();
+    // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+    let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+    app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+        Some(scratch.folder().join("c.md"));
+    crate::window::library_host::fail_next_note_rename_back();
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+    type_into_field(window.hwnd, "c");
+    field_key(window.hwnd, VK_RETURN);
+
+    assert!(!inline_open(window.hwnd));
+    assert!(!a.exists());
+    assert!(scratch.folder().join("c.md").exists());
+    assert!(
+        app_mut(window.hwnd).tabs.find_stored_path(&a).is_some(),
+        "a's tab is left on its old path"
+    );
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
+        assert!(
+            notes.contains(&std::path::PathBuf::from("c.md")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.contains(&std::path::PathBuf::from("a.md")),
+            "{notes:?}"
+        );
+    });
+    let expected = "FastPad could not undo renaming \u{201c}a.md\u{201d} to \u{201c}c.md\u{201d}. \u{201c}a.md\u{201d} is still open at its old path.";
+    assert!(
+        notices(window.hwnd).iter().any(|notice| notice == expected),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn palette_commands_act_on_the_row_focused_when_the_palette_opened() {
+    // Break caught: opening the palette moves focus to its query field, so by the time the
+    // chosen command runs, a live focus check sees nothing on the panel and falls back to
+    // the active tab instead of the row the user actually picked -- wrong for spec §6.3, and
+    // dangerous for Delete.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("palette-note-target");
+    let active_path = scratch.note("active.md", "active");
+    scratch.note("row.md", "row");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &active_path).unwrap();
+    crate::window::notebook_view::rebuild(window.hwnd);
+    select_row(window.hwnd, &RowKind::Note("row.md".into()));
+    let (_, panel) = sidebar_windows(window.hwnd);
+    unsafe { SetFocus(panel) };
+    assert_eq!(
+        unsafe { GetFocus() },
+        panel,
+        "the panel must hold focus to record the row"
+    );
+
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    // Opening the palette moved focus to its own query field.
+    assert_ne!(unsafe { GetFocus() }, panel);
+    let query = app_mut(window.hwnd)
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .query_hwnd();
+    let typed = crate::platform::wide_null("Toggle pin");
+    unsafe { SetWindowTextW(query, typed.as_ptr()) };
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(state.is_pinned(&scratch.folder().join("row.md")));
+        assert!(!state.is_pinned(&active_path));
+    });
+    // The panel had focus when the palette opened, so it gets it back.
+    assert_eq!(unsafe { GetFocus() }, panel);
+}
+
+#[test]
+fn moving_a_note_onto_a_path_already_open_in_another_tab_is_refused() {
+    // Break caught: the target file having been deleted on disk lets the clash check through,
+    // then MoveFileExW succeeds and rebind_open_tab silently fails because another tab already
+    // has that path, leaving that tab pointing at a file that no longer exists anywhere.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("move-target-open-a");
+    let second = LibraryScratch::new("move-target-open-b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "a");
+    let target = second.note("a.md", "theirs");
+    super::open_path(window.hwnd, &target).unwrap();
+    std::fs::remove_file(&target).unwrap();
+    write_notebooks(&first.data(), vec![second.folder()], vec![]);
+
+    crate::window::library_host::move_to_notebook(window.hwnd, &a);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+
+    assert!(a.exists());
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
+    assert!(
+        !target.exists(),
+        "nothing was moved, so the deleted file stays deleted"
+    );
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|n| n.contains("already has"))
+    );
+}
+
+#[test]
+fn note_commands_reach_a_focused_tree_row_even_with_no_tab_open() {
+    // Break caught: the needs_document gate returning early for Ctrl+Shift+M and Reveal
+    // whenever no tab happens to be open, even though the tree still has a focused row.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("gate-no-tabs");
+    let path = scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    select_row(window.hwnd, &RowKind::Note("a.md".into()));
+    let (_, panel) = sidebar_windows(window.hwnd);
+    unsafe { SetFocus(panel) };
+    while super::tab_count(window.hwnd) > 0 {
+        super::close_active_document(window.hwnd);
+    }
+    assert_eq!(super::tab_count(window.hwnd), 0);
+
+    execute_command(window.hwnd, CommandId::NoteRevealInExplorer);
+
+    assert_eq!(crate::platform::shell::take_revealed(), vec![path]);
+}
+
+#[test]
+fn moving_a_note_with_unsaved_edits_keeps_them_and_writes_only_at_the_new_path() {
+    // Break caught: a move losing the tab's unsaved edits, or an autosave after the move
+    // recreating the file at the old location instead of writing it to the new one.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("move-dirty-a");
+    let second = LibraryScratch::new("move-dirty-b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "a");
+    editor.set_text("unsaved edit").unwrap();
+    write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+
+    execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+
+    let moved = second.folder().join("a.md");
+    assert!(!a.exists());
+    assert_eq!(
+        std::fs::read_to_string(&moved).unwrap(),
+        "unsaved edit",
+        "the edits were saved first, so they moved with the file"
+    );
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(moved.as_path()));
+    assert!(!active.dirty);
+    assert_eq!(editor.text().unwrap(), "unsaved edit");
+
+    // A later edit and save must land only at the new path, never re-create the old one.
+    editor.set_text("later edit").unwrap();
+    crate::window::library_host::save_command(window.hwnd);
+    assert!(
+        !a.exists(),
+        "a save must not recreate the file at the old location"
+    );
+    assert_eq!(std::fs::read_to_string(&moved).unwrap(), "later edit");
+}
+
+#[test]
+fn a_note_changed_outside_fastpad_is_not_moved_over_its_change() {
+    // Break caught: a move saving the tab's edits over a change made outside FastPad (a sync,
+    // another editor), which autosave refuses to do.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("move-changed-a");
+    let second = LibraryScratch::new("move-changed-b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "a");
+    editor.set_text("unsaved edit").unwrap();
+    write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+    std::fs::write(&a, "changed elsewhere").unwrap();
+    let before = notices(window.hwnd).len();
+
+    execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "changed elsewhere");
+    assert!(!second.folder().join("a.md").exists(), "nothing moved");
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(a.as_path()));
+    assert!(active.dirty && active.autosave_paused);
+    let added = &notices(window.hwnd)[before..];
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert!(added[0].contains("Nothing was moved"), "{added:?}");
+
+    // Already paused: refused again, without writing.
+    execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "changed elsewhere");
+    assert!(!second.folder().join("a.md").exists());
+}
+
+#[test]
+fn a_note_whose_edits_cannot_be_saved_is_not_moved() {
+    // Break caught: a move going ahead after the save of the tab's edits failed, so the
+    // moved file lacks them and the tab's text no longer matches either location.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("move-save-fails-a");
+    let second = LibraryScratch::new("move-save-fails-b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    let a = open_note(&window, &first, "a.md", "a");
+    editor.set_text("unsaved edit").unwrap();
+    write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+    // A file held open without sharing makes the save (and the move) fail.
+    use std::os::windows::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&a)
+        .unwrap();
+    let before = notices(window.hwnd).len();
+
+    execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+    drop(lock);
+
+    assert!(a.exists());
+    assert!(!second.folder().join("a.md").exists(), "nothing moved");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(a.as_path()));
+    assert!(active.dirty);
+    let added = &notices(window.hwnd)[before..];
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert!(added[0].contains("Nothing was moved"), "{added:?}");
+}
+
+#[test]
+fn a_palette_rename_and_a_move_turn_the_preview_into_a_normal_tab() {
+    // Break caught: a preview tab renamed from the palette, or moved to another notebook,
+    // staying the preview, so the next click in the tree replaces it.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("promote-a");
+    let second = LibraryScratch::new("promote-b");
+    let a = first.note("a.md", "a");
+    let b = first.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    first.install(window.hwnd);
+    write_notebooks(&first.data(), vec![first.folder(), second.folder()], vec![]);
+
+    super::open_note(window.hwnd, &a, super::OpenMode::Preview, false).unwrap();
+    assert!(app_mut(window.hwnd).tabs.preview_id().is_some());
+    // The name bar itself: Note: Rename… would edit the note's row in the tree.
+    crate::window::library_host::rename_note(window.hwnd);
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None, "rename");
+    crate::window::library_host::close_name_box(window.hwnd);
+
+    super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+    assert!(app_mut(window.hwnd).tabs.preview_id().is_some());
+    execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+    crate::window::library_host::picked(
+        window.hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+    assert!(second.folder().join("b.md").exists());
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None, "move");
+}
+
+fn sidebar_panel(hwnd: HWND) -> HWND {
+    crate::window::side_panel::windows(hwnd).unwrap().1
+}
+
+fn type_into_search(hwnd: HWND, text: &str) {
+    let edit = crate::window::search_view::edit_hwnd(hwnd).unwrap();
+    let wide = crate::platform::wide_null(text);
+    // The Edit sends EN_CHANGE to the panel, which restarts the 150 ms debounce.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
+    }
+}
+
+fn type_into_replace(hwnd: HWND, text: &str) {
+    let edit = crate::window::search_view::replace_edit_hwnd(hwnd).unwrap();
+    let wide = crate::platform::wide_null(text);
+    // The Edit sends EN_CHANGE to the panel, which keeps the text; no search runs.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
+    }
+}
+
+fn search_state(hwnd: HWND) -> crate::window::search_view::SearchState {
+    crate::window::search_view::search_state(hwnd)
+}
+
+fn search_generation(hwnd: HWND) -> u64 {
+    crate::window::text_search_host::generation(hwnd)
+}
+
+/// Waits until a search that began after generation `after` has finished.
+fn wait_for_search(hwnd: HWND, after: u64) {
+    pump_until(hwnd, || {
+        search_generation(hwnd) != after
+            && matches!(
+                search_state(hwnd),
+                crate::window::search_view::SearchState::Done { .. }
+            )
+    });
+}
+
+/// Types `text` into the Search box and waits past the debounce for its search to finish.
+fn search_for(hwnd: HWND, text: &str) {
+    type_into_search(hwnd, text);
+    wait_for_search(hwnd, search_generation(hwnd));
+}
+
+/// How many notes the finished search visited.
+fn searched_total(hwnd: HWND) -> usize {
+    match search_state(hwnd) {
+        crate::window::search_view::SearchState::Done { progress, .. } => progress.total,
+        other => panic!("the search has not finished: {other:?}"),
+    }
+}
+
+fn search_rows(hwnd: HWND) -> Vec<(String, String)> {
+    crate::window::search_view::shown_results(hwnd)
+}
+
+fn search_row(name: &str, snippet: &str) -> (String, String) {
+    (name.to_owned(), snippet.to_owned())
+}
+
+/// Pumps posted messages, timers included, for twice the debounce.
+fn pump_past_debounce(hwnd: HWND) {
+    let wait = 2 * u64::from(crate::window::text_search_host::DEBOUNCE_MS);
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+    while std::time::Instant::now() < until {
+        pump_posted_messages(hwnd);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn search_selected(hwnd: HWND) -> Option<usize> {
+    app_mut(hwnd).sidebar.as_ref().unwrap().search.list.selected
+}
+
+fn selected_name(hwnd: HWND) -> Option<String> {
+    let index = search_selected(hwnd)?;
+    search_rows(hwnd).get(index).map(|(name, _)| name.clone())
+}
+
+fn stray_hit(name: &str) -> crate::library::text_search::TextHit {
+    crate::library::text_search::TextHit {
+        path: PathBuf::from(format!("{name}.md")),
+        name: name.to_owned(),
+        folder: String::new(),
+        snippet: crate::search::Snippet {
+            text: format!("{name} needle"),
+            highlight: name.len() + 1..name.len() + 7,
+        },
+        stamp: None,
+    }
+}
+
+#[test]
+fn the_search_view_finds_note_text_shows_folders_and_enter_opens_a_normal_tab() {
+    // Break caught: a search over names instead of text, results without their folder, or
+    // Enter opening the preview tab, which a keyboard user cannot then keep.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-view");
+    scratch.note("Alpha.md", "the alpha plan");
+    scratch.note("beta.md", "nothing here");
+    scratch.note("gamma.md", "Alphabet soup");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\notes.md", "  alpha, indented");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    assert_eq!(crate::window::search_view::status(window.hwnd), None);
+
+    search_for(window.hwnd, "alpha");
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![
+            search_row("Alpha", "the alpha plan"),
+            search_row("gamma", "Alphabet soup"),
+            search_row("notes", "alpha, indented"),
+        ]
+    );
+    let results = &app_mut(window.hwnd)
+        .sidebar
+        .as_ref()
+        .unwrap()
+        .search
+        .results;
+    assert_eq!(results[0].folder, "");
+    assert_eq!(results[2].folder, "sub");
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some(("3 notes".to_owned(), false))
+    );
+    let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    unsafe {
+        SendMessageW(
+            edit,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN),
+            0,
+        )
+    };
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(
+        active.path.as_deref(),
+        Some(scratch.folder().join("Alpha.md").as_path())
+    );
+    assert!(!active.preview, "Enter opens a normal tab");
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+
+    search_for(window.hwnd, "zzz");
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some((crate::window::search_view::NO_MATCH.to_owned(), false))
+    );
+}
+
+#[test]
+fn the_search_query_survives_a_view_switch_but_not_a_notebook_switch() {
+    // Break caught: the query lost whenever another view is shown, or kept (with results
+    // from the old notebook, or its search still reading) after a different notebook opens.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("search-keep-a");
+    first.note("plan.md", "the plan");
+    let second = LibraryScratch::new("search-keep-b");
+    second.note("other.md", "the plan too");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    first.install(window.hwnd);
+    use crate::config::SidebarView;
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
+    search_for(window.hwnd, "plan");
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
+    assert_eq!(search_rows(window.hwnd).len(), 1);
+
+    crate::window::text_search_host::run_now(window.hwnd);
+    let flag = crate::window::text_search_host::cancel_flag(window.hwnd).unwrap();
+    second.install(window.hwnd);
+    assert!(
+        flag.load(Ordering::Relaxed),
+        "the notebook change cancelled it"
+    );
+    assert!(search_rows(window.hwnd).is_empty());
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::Idle
+    );
+    let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    assert_eq!(
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit) },
+        0
+    );
+    // A late batch of the cancelled search shows nothing.
+    pump_posted_messages(window.hwnd);
+    assert!(search_rows(window.hwnd).is_empty());
+}
+
+#[test]
+fn a_hidden_search_view_searches_again_only_once_it_shows() {
+    // Break caught: every library refresh re-running a query nobody sees, or the results
+    // staying stale when the Search view comes back.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-stale");
+    scratch.note("plan.md", "plan");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    use crate::config::SidebarView;
+    // The box is made when the Search view first shows, not with the sidebar.
+    assert!(crate::window::search_view::edit_hwnd(window.hwnd).is_none());
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
+    assert!(crate::window::search_view::edit_hwnd(window.hwnd).is_some());
+    search_for(window.hwnd, "pl");
+    assert_eq!(search_rows(window.hwnd).len(), 1);
+
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+    let added = scratch.note("planning.md", "planning");
+    crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+    let before = search_generation(window.hwnd);
+    crate::window::side_panel::refresh(window.hwnd);
+    // Past the debounce, so a re-run wrongly scheduled would have started.
+    pump_past_debounce(window.hwnd);
+    assert_eq!(
+        search_generation(window.hwnd),
+        before,
+        "a hidden Search view is not searched again"
+    );
+    assert_eq!(search_rows(window.hwnd).len(), 1);
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, false);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![
+            search_row("plan", "plan"),
+            search_row("planning", "planning")
+        ]
+    );
+}
+
+#[test]
+fn ctrl_shift_f_takes_a_single_line_selection_and_ignores_a_multi_line_one() {
+    // Break caught: Ctrl+Shift+F ignoring the selection, pasting a multi-line one into the
+    // box, or clearing the box when nothing is selected.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-prefill-selection");
+    scratch.note("a.md", "alpha beta");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let query = || crate::window::search_view::current_query(window.hwnd).map(|(query, _)| query);
+    editor.populate_clean("alpha beta\r\ngamma").unwrap();
+
+    editor.set_selection(6..10).unwrap();
+    execute_command(window.hwnd, CommandId::ShowSearchView);
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        crate::config::SidebarView::Search
+    );
+    assert_eq!(query().as_deref(), Some("beta"));
+    // The prefill searches at once, with no keystroke to start the debounce.
+    pump_until(window.hwnd, || {
+        crate::window::search_view::shown_results(window.hwnd).len() == 1
+    });
+
+    editor.set_selection(6..14).unwrap();
+    execute_command(window.hwnd, CommandId::ShowSearchView);
+    assert_eq!(query().as_deref(), Some("beta"), "a multi-line selection");
+
+    editor.set_selection(3..3).unwrap();
+    execute_command(window.hwnd, CommandId::ShowSearchView);
+    assert_eq!(query().as_deref(), Some("beta"), "no selection");
+}
+
+#[test]
+fn ctrl_shift_h_shows_search_with_the_replace_field_and_takes_a_single_line_selection() {
+    // Break caught: Ctrl+Shift+H dead in the running app, Search shown without the replace
+    // field, the selection Ctrl+Shift+F takes ignored, or Ctrl+Shift+F closing the field
+    // again (spec §11: it leaves the field as it is).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-shortcut");
+    scratch.note("a.md", "alpha beta");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    editor.populate_clean("alpha beta\r\ngamma").unwrap();
+    editor.set_selection(6..10).unwrap();
+    assert!(!crate::window::search_view::replace_open(window.hwnd));
+
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = 0x80;
+    keys[VK_SHIFT as usize] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let message = MSG {
+        hwnd: editor.hwnd(),
+        message: WM_KEYDOWN,
+        wParam: usize::from(b'H'),
+        ..Default::default()
+    };
+    let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+
+    assert!(translated, "Ctrl+Shift+H was not translated");
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        crate::config::SidebarView::Search
+    );
+    assert!(crate::window::search_view::replace_open(window.hwnd));
+    assert_eq!(
+        crate::window::search_view::current_query(window.hwnd)
+            .map(|(query, _)| query)
+            .as_deref(),
+        Some("beta")
+    );
+    // The prefill searches at once, as Ctrl+Shift+F's does.
+    pump_until(window.hwnd, || {
+        crate::window::search_view::shown_results(window.hwnd).len() == 1
+    });
+
+    execute_command(window.hwnd, CommandId::ShowSearchView);
+    assert!(
+        crate::window::search_view::replace_open(window.hwnd),
+        "Ctrl+Shift+F leaves the field open"
+    );
+}
+
+#[test]
+fn ctrl_shift_h_focuses_the_replace_field_and_typing_there_runs_no_search() {
+    // Break caught: the caret left in the search box, the replace text read by WM_GETTEXT
+    // under the App borrow instead of kept, a keystroke in the replace field restarting the
+    // search, or Esc and Up in it doing what they do in the box.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_UP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-field");
+    scratch.note("a.md", "alpha needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+
+    execute_command(window.hwnd, CommandId::ReplaceInNotes);
+    let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+    let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    assert!(is_shown(replace));
+    assert_eq!(unsafe { GetFocus() }, replace);
+
+    search_for(window.hwnd, "needle");
+    let generation = search_generation(window.hwnd);
+    type_into_replace(window.hwnd, "pin");
+    assert_eq!(crate::window::search_view::replace_text(window.hwnd), "pin");
+    pump_past_debounce(window.hwnd);
+    assert_eq!(
+        search_generation(window.hwnd),
+        generation,
+        "typing a replacement runs no search"
+    );
+    assert_eq!(search_rows(window.hwnd).len(), 1);
+
+    unsafe { SendMessageW(replace, WM_KEYDOWN, VK_UP as usize, 0) };
+    assert_eq!(unsafe { GetFocus() }, search_box, "Up goes to the box");
+    unsafe { SendMessageW(replace, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    assert_eq!(
+        crate::window::search_view::replace_text(window.hwnd),
+        "",
+        "Esc clears the field"
+    );
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(replace) };
+    unsafe { SendMessageW(replace, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    assert_eq!(
+        unsafe { GetFocus() },
+        editor.hwnd(),
+        "Esc in the empty field returns to the editor"
+    );
+}
+
+#[test]
+fn the_chevron_opens_and_closes_the_replace_field() {
+    // Break caught: a chevron that does nothing, a replace field made before the user asks
+    // for it, one left showing (or holding the caret) once closed, or the results kept under
+    // the replace row.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-chevron");
+    scratch.note("a.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "needle");
+    assert!(
+        crate::window::search_view::replace_edit_hwnd(window.hwnd).is_none(),
+        "made the first time it opens"
+    );
+    let panel = sidebar_panel(window.hwnd);
+    let (width, height) = client_size(panel);
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(panel) }.max(96);
+    let chevron = crate::window::search_view::SearchView::chevron_rect(client, dpi);
+    let (x, y) = (
+        (chevron.left + chevron.right) / 2,
+        (chevron.top + chevron.bottom) / 2,
+    );
+    let list_top = || {
+        app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .search
+            .list_area(client, dpi)
+            .top
+    };
+    let closed_top = list_top();
+
+    click(panel, x, y);
+    assert!(crate::window::search_view::replace_open(window.hwnd));
+    let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+    assert!(is_shown(replace));
+    assert_eq!(unsafe { GetFocus() }, replace);
+    assert!(
+        list_top() > closed_top,
+        "the results move under the replace row"
+    );
+
+    click(panel, x, y);
+    assert!(!crate::window::search_view::replace_open(window.hwnd));
+    assert!(!is_shown(replace));
+    assert_eq!(
+        unsafe { GetFocus() },
+        crate::window::search_view::edit_hwnd(window.hwnd).unwrap(),
+        "the caret goes back to the search box"
+    );
+    assert_eq!(list_top(), closed_top);
+}
+
+/// Opens the replace field, runs the search for `query` to its end, and types `replacement`.
+fn search_to_replace(hwnd: HWND, query: &str, replacement: &str) {
+    crate::window::search_view::show_replace(hwnd);
+    search_for(hwnd, query);
+    type_into_replace(hwnd, replacement);
+}
+
+/// Pumps until a replace report is pushed, and returns it.
+fn wait_for_report(hwnd: HWND) -> String {
+    let report = || {
+        notices(hwnd)
+            .into_iter()
+            .find(|notice| notice.starts_with("Replaced "))
+    };
+    pump_until(hwnd, || report().is_some());
+    report().unwrap()
+}
+
+/// Queues a No for the next question and returns whether it was asked.
+fn decline_next_confirm() -> std::rc::Rc<std::cell::Cell<bool>> {
+    let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let answered = std::rc::Rc::clone(&asked);
+    crate::window::answer_next_confirm(move |_| {
+        answered.set(true);
+        false
+    });
+    asked
+}
+
+const SAVED_LINE: &str = "\nNotes that aren't open are saved and can't be undone.";
+
+#[test]
+fn a_background_dirty_tab_is_replaced_in_the_editor_not_on_disk() {
+    // Break caught (Review Focus 5): a background tab's unsaved edits replaced from the
+    // note's disk text or written over on disk, the same note also written as a closed note,
+    // the active tab changed in the background tab's place, the background tab left clean,
+    // or its replacement taking more than one undo.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-background-dirty");
+    let a = scratch.note("a.md", "old needle\r\n");
+    let b = scratch.note("b.md", "b needle\n");
+    let c = scratch.note("c.md", "c needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    // Leaving a tab autosaves it (`switching_tabs_autosaves_the_tab_being_left`); a's edits
+    // must stay unsaved.
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    crate::window::modal::take_last_confirm();
+    super::open_path(window.hwnd, &a).unwrap();
+    pump_posted_messages(window.hwnd);
+    editor.set_text("typed needle here\r\n").unwrap();
+    let a_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    let b_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    assert_ne!(a_id, b_id);
+
+    search_to_replace(window.hwnd, "needle", "pin");
+    assert_eq!(search_rows(window.hwnd).len(), 3);
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 3 matches in 3 notes."
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        Some(format!(
+            "Replace 3 matches in 3 notes with \"pin\"?{SAVED_LINE}"
+        )),
+        "c is closed: the warning shows"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "old needle\r\n",
+        "a's file is never written"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "b needle\n",
+        "b is open too: changed in the editor only"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&c).unwrap(),
+        "c pin",
+        "c is closed: written"
+    );
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().id,
+        b_id,
+        "b stays in front"
+    );
+    assert_eq!(editor.text().unwrap(), "b pin\n");
+    assert!(app_mut(window.hwnd).tabs.document(a_id).unwrap().dirty);
+
+    assert!(super::activate_document_by_id(window.hwnd, a_id));
+    assert_eq!(
+        editor.text().unwrap(),
+        "typed pin here\r\n",
+        "replaced in the tab's live text"
+    );
+    editor.undo().unwrap();
+    assert_eq!(
+        editor.text().unwrap(),
+        "typed needle here\r\n",
+        "one undo action"
+    );
+}
+
+#[test]
+fn replace_all_writes_the_closed_notes_updates_the_library_and_searches_again() {
+    // Break caught: a closed note left unwritten, a note written that the search never
+    // listed, the library keeping the old size (the next rescan would read FastPad's own
+    // write as an outside change), or the results still listing notes with nothing left to
+    // match.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-closed");
+    let a = scratch.note("a.md", "one needle, two needle\r\n");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let b = scratch.note(r"sub\b.md", "needle\n");
+    let c = scratch.note("c.md", "nothing");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    let before = search_generation(window.hwnd);
+
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 3 matches in 2 notes."
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        Some(format!(
+            "Replace 3 matches in 2 notes with \"pin\"?{SAVED_LINE}"
+        ))
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "one pin, two pin\r\n");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "pin\n");
+    assert_eq!(std::fs::read_to_string(&c).unwrap(), "nothing");
+    let size = |relative: &str| {
+        crate::window::library_host::with_state(window.hwnd, |state| {
+            state
+                .notes
+                .iter()
+                .find(|note| {
+                    crate::library::model::same_path(&note.path, std::path::Path::new(relative))
+                })
+                .map(|note| note.size)
+        })
+        .flatten()
+    };
+    assert_eq!(size("a.md"), Some("one pin, two pin\r\n".len() as u64));
+    assert_eq!(size(r"sub\b.md"), Some("pin\n".len() as u64));
+    assert!(!crate::window::text_search_host::replacing(window.hwnd));
+
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some((crate::window::search_view::NO_MATCH.to_owned(), false))
+    );
+}
+
+#[test]
+fn declining_the_question_writes_nothing_and_a_later_replace_still_runs() {
+    // Break caught: a No that still writes the closed notes or changes the open tab, or one
+    // that leaves the replace marked as running, so Replace all never works again.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-declined");
+    let a = scratch.note("a.md", "needle");
+    let b = scratch.note("b.md", "b needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+
+    let asked = decline_next_confirm();
+    crate::window::text_search_host::replace_all(window.hwnd);
+    pump_until(window.hwnd, || asked.get());
+    pump_past_debounce(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+    assert_eq!(editor.text().unwrap(), "b needle");
+    assert!(
+        !notices(window.hwnd)
+            .iter()
+            .any(|notice| notice.starts_with("Replaced "))
+    );
+    assert!(!crate::window::text_search_host::replacing(window.hwnd));
+
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 2 matches in 2 notes."
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+    assert_eq!(editor.text().unwrap(), "b pin");
+}
+
+#[test]
+fn results_open_nothing_and_the_summary_says_replacing_while_a_replace_runs() {
+    // Break caught: a result opened (and so a tab made, whose text the split then changes in
+    // the editor instead of the file the question warned about) while the count or the
+    // write runs, or the summary still claiming the old results.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-busy");
+    scratch.note("a.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    let tabs = || tab_paths(window.hwnd).len();
+    let before = tabs();
+
+    let asked = decline_next_confirm();
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert!(crate::window::text_search_host::replacing(window.hwnd));
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some((crate::window::search_view::REPLACING.to_owned(), false))
+    );
+    crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+    crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Permanent, true);
+    assert_eq!(tabs(), before, "nothing opened");
+    assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None);
+
+    pump_until(window.hwnd, || asked.get());
+    assert!(!crate::window::text_search_host::replacing(window.hwnd));
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some(("1 note".to_owned(), false))
+    );
+    crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+    assert!(
+        app_mut(window.hwnd).tabs.preview_id().is_some(),
+        "opens again"
+    );
+}
+
+#[test]
+fn a_note_changed_on_disk_since_the_search_is_skipped_and_named_in_the_report() {
+    // Break caught (Review Focus 1, in the window): a sync client's newer text overwritten
+    // with a replacement of the text the search read, or the skip left out of the report.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-changed");
+    let a = scratch.note("a.md", "needle");
+    let b = scratch.note("b.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    std::fs::write(&b, "needle, edited elsewhere").unwrap();
+
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 1 match in 1 note. 1 note was skipped because it changed since the search. (b)"
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "needle, edited elsewhere"
+    );
+}
+
+#[test]
+fn the_row_replace_changes_one_note_and_asks_only_when_it_is_closed() {
+    // Break caught: a row's button replacing in every result, asking about a note whose
+    // change one Ctrl+Z undoes, or saving a closed note without asking.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-row");
+    let a = scratch.note("a.md", "needle");
+    let b = scratch.note("b.md", "b needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+    let before = search_generation(window.hwnd);
+
+    crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("b.md"));
+    assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
+    assert_eq!(crate::window::modal::take_last_confirm(), None, "b is open");
+    assert_eq!(editor.text().unwrap(), "b pin");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![search_row("a", "needle")],
+        "b's row is gone"
+    );
+
+    app_mut(window.hwnd).notifications.dismiss_all();
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("a.md"));
+    assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Replace 1 match in \"a\" with \"pin\"? The note is saved and this can't be undone.")
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+}
+
+#[test]
+fn ctrl_alt_enter_replaces_an_open_tab_with_its_groups_as_one_undo_action() {
+    // Break caught: Ctrl+Alt+Enter opening a result instead, `$1` inserted literally in regex
+    // mode (spec §12a), the tab saved, the warning shown with every note open, or the
+    // replacement taking one undo per match.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-ctrl-alt-enter");
+    let a = scratch.note("a.md", "x needle y needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &a).unwrap();
+    pump_posted_messages(window.hwnd);
+    crate::window::search_view::show_replace(window.hwnd);
+    crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+    search_for(window.hwnd, "n(ee)dle");
+    type_into_replace(window.hwnd, "[$1]");
+    let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+
+    crate::window::answer_next_confirm(|_| true);
+    press_with(replace, VK_RETURN, true, false, true);
+
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 2 matches in 1 note."
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Replace 2 matches in 1 note with \"[$1]\"?"),
+        "every note is open: no warning line"
+    );
+    assert_eq!(editor.text().unwrap(), "x [ee] y [ee]");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "x needle y needle");
+    editor.undo().unwrap();
+    assert_eq!(
+        editor.text().unwrap(),
+        "x needle y needle",
+        "one undo action"
+    );
+}
+
+#[test]
+fn the_replace_controls_are_exposed_with_their_names_and_states() {
+    // Break caught (spec §11 names): the chevron missing or read without its expanded state
+    // (or silent when it changes), the replace field or Replace all invisible to a screen
+    // reader, Replace all read as pressable while a search runs, or the row's button unnamed.
+    use crate::window::sidebar_accessibility::{
+        STATE_COLLAPSED, STATE_EXPANDED, STATE_UNAVAILABLE, take_raised,
+    };
+    use windows_sys::Win32::UI::Accessibility::{ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TEXT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_STATECHANGE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-msaa");
+    scratch.note("a.md", "one beta");
+    scratch.note("b.md", "beta two");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "beta");
+    let panel = sidebar_panel(window.hwnd);
+    let items = || {
+        (0..crate::window::side_panel::accessible_item_count(panel))
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .collect::<Vec<_>>()
+    };
+    let index_of = |name: &str| items().iter().position(|item| item.name == name);
+
+    let shown = items();
+    assert_eq!(shown[0].role, ROLE_SYSTEM_TEXT, "the box keeps child ID 1");
+    assert_eq!(
+        index_of("Toggle replace"),
+        Some(4),
+        "after the three toggles"
+    );
+    assert_eq!(shown[4].role, ROLE_SYSTEM_PUSHBUTTON);
+    assert_ne!(shown[4].state & STATE_COLLAPSED, 0);
+    assert_eq!(index_of("Replace"), None);
+    assert_eq!(index_of("Replace all"), None);
+    assert_eq!(index_of("Replace in a"), None);
+
+    take_raised();
+    crate::window::search_view::toggle_replace(window.hwnd);
+    assert!(
+        take_raised().contains(&(panel as usize, EVENT_OBJECT_STATECHANGE, 5)),
+        "the chevron (ID 5) raises a state change"
+    );
+    let shown = items();
+    assert_ne!(shown[4].state & STATE_EXPANDED, 0);
+    let field = &shown[index_of("Replace").expect("the replace field is a child")];
+    assert_eq!(field.role, ROLE_SYSTEM_TEXT);
+    assert_eq!(
+        field.window,
+        crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap()
+    );
+    let all = &shown[index_of("Replace all").expect("Replace all is a child")];
+    assert_eq!(all.role, ROLE_SYSTEM_PUSHBUTTON);
+    assert_eq!(all.state & STATE_UNAVAILABLE, 0);
+    let row = &shown[index_of("Replace in a").expect("the selected row's button")];
+    assert_eq!(row.role, ROLE_SYSTEM_PUSHBUTTON);
+    type_into_replace(window.hwnd, "x");
+    assert_eq!(items()[index_of("Replace").unwrap()].value, "x");
+
+    take_raised();
+    // The same query again: its results stay, and Replace all waits for the search.
+    crate::window::text_search_host::run_now(window.hwnd);
+    let all_index = index_of("Replace all").unwrap();
+    assert_ne!(items()[all_index].state & STATE_UNAVAILABLE, 0);
+    assert!(
+        take_raised().contains(&(
+            panel as usize,
+            EVENT_OBJECT_STATECHANGE,
+            all_index as i32 + 1
+        )),
+        "Replace all says it became unavailable"
+    );
+}
+
+#[test]
+fn replace_all_and_the_row_button_are_unavailable_while_a_replace_runs() {
+    // Break caught (final review FR3): Replace all and the row's button drawn and announced
+    // as pressable during the count, the question or the write, when a press does nothing,
+    // or left unavailable once the replace ends.
+    use crate::window::sidebar_accessibility::{STATE_UNAVAILABLE, take_raised};
+    use windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_STATECHANGE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-unavailable");
+    scratch.note("a.md", "one beta");
+    scratch.note("b.md", "beta two");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "beta");
+    crate::window::search_view::toggle_replace(window.hwnd);
+    let panel = sidebar_panel(window.hwnd);
+    let items = || {
+        (0..crate::window::side_panel::accessible_item_count(panel))
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .collect::<Vec<_>>()
+    };
+    let index_of = |name: &str| items().iter().position(|item| item.name == name).unwrap();
+    let unavailable = |name: &str| items()[index_of(name)].state & STATE_UNAVAILABLE != 0;
+    let raised_for = |raised: &[(usize, u32, i32)], name: &str| {
+        raised.contains(&(
+            panel as usize,
+            EVENT_OBJECT_STATECHANGE,
+            index_of(name) as i32 + 1,
+        ))
+    };
+    assert!(!unavailable("Replace all"));
+    assert!(!unavailable("Replace in a"));
+    assert!(crate::window::search_view::replace_all_enabled(window.hwnd));
+
+    take_raised();
+    let asked = decline_next_confirm();
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert!(crate::window::text_search_host::replacing(window.hwnd));
+    // What paints the buttons dim (`button_color` and `row_button_color` take it).
+    assert!(!crate::window::search_view::replace_all_enabled(
+        window.hwnd
+    ));
+    assert!(unavailable("Replace all"));
+    assert!(unavailable("Replace in a"));
+    let raised = take_raised();
+    assert!(raised_for(&raised, "Replace all"), "{raised:?}");
+    assert!(raised_for(&raised, "Replace in a"), "{raised:?}");
+
+    pump_until(window.hwnd, || asked.get());
+    assert!(!crate::window::text_search_host::replacing(window.hwnd));
+    assert!(crate::window::search_view::replace_all_enabled(window.hwnd));
+    assert!(!unavailable("Replace all"));
+    assert!(!unavailable("Replace in a"));
+    let raised = take_raised();
+    assert!(raised_for(&raised, "Replace all"), "{raised:?}");
+    assert!(raised_for(&raised, "Replace in a"), "{raised:?}");
+}
+
+#[test]
+fn a_closed_note_is_never_written_when_the_question_had_no_saved_line() {
+    // Break caught (final review FR1): a closed note whose read failed during the count (so
+    // it counted 0 and the question never said notes are saved) written at the apply,
+    // where its read succeeds, its stamp matches and it has a match.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-no-saved-line");
+    let a = scratch.note("a.md", "a needle");
+    let b = scratch.note("b.md", "b needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    assert_eq!(search_rows(window.hwnd).len(), 2);
+    crate::window::modal::take_last_confirm();
+
+    // The count as a failed read of a.md leaves it: b's match only, from its tab.
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_counted(
+        window.hwnd,
+        crate::window::text_search_host::test_counted(
+            window.hwnd,
+            crate::window::text_search_host::replace_generation(window.hwnd),
+            crate::library::text_replace::ReplaceCount {
+                matches: 1,
+                notes: 1,
+                closed_notes: 0,
+            },
+        ),
+    );
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 1 match in 1 note. 1 note was skipped because it changed since the search. (a)"
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Replace 1 match in 1 note with \"pin\"?"),
+        "no saved line"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "a needle",
+        "not written"
+    );
+    assert_eq!(
+        editor.text().unwrap(),
+        "b pin",
+        "the open tab still changes"
+    );
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "b needle");
+}
+
+#[test]
+fn a_plan_made_stale_before_its_write_starts_writes_nothing() {
+    // Break caught (Task 6 re-review New #1): `apply_plan`, finding no cancel flag (as a
+    // `cancel_replace` leaves it), making a fresh one and writing the notes of a replace
+    // that was already cancelled.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-stale-apply");
+    let a = scratch.note("a.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    let generation = crate::window::text_search_host::replace_generation(window.hwnd);
+    crate::window::text_search_host::cancel_replace(window.hwnd);
+    let ended = crate::window::text_search_host::writer_hooks::ended();
+
+    crate::window::text_search_host::test_apply(window.hwnd, generation);
+    pump_past_debounce(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "needle",
+        "nothing written"
+    );
+    assert_eq!(
+        crate::window::text_search_host::writer_hooks::ended(),
+        ended,
+        "no writer started"
+    );
+    assert!(
+        !notices(window.hwnd)
+            .iter()
+            .any(|notice| notice.starts_with("Replaced "))
+    );
+
+    // The same plan for the current generation, with no flag either, writes.
+    crate::window::text_search_host::test_apply(
+        window.hwnd,
+        crate::window::text_search_host::replace_generation(window.hwnd),
+    );
+    assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+}
+
+/// Runs `key` with Ctrl (and Shift) held through the accelerator table, as the message loop
+/// does for a key sent to `target`, and returns whether the table translated it.
+fn translate_key(hwnd: HWND, target: HWND, key: u8, shift: bool) -> bool {
+    translate_key_with(hwnd, target, key, true, shift, false).is_some()
+}
+
+/// Runs `key` with the given modifiers through the accelerator table, as the message loop
+/// does, and reports the command it ran.
+fn translate_key_with(
+    hwnd: HWND,
+    target: HWND,
+    key: u8,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+) -> Option<CommandId> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN, WM_SYSKEYDOWN};
+    let identity = unsafe { super::window_identity(hwnd).unwrap() };
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    let down = |on: bool| if on { 0x80 } else { 0 };
+    keys[VK_CONTROL as usize] = down(ctrl);
+    keys[VK_SHIFT as usize] = down(shift);
+    keys[VK_MENU as usize] = down(alt);
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let message = MSG {
+        hwnd: target,
+        message: if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN },
+        wParam: usize::from(key),
+        // Bit 29: the Alt key was down, as the system reports it.
+        lParam: if alt { 1 << 29 } else { 0 },
+        ..Default::default()
+    };
+    super::LAST_COMMAND.with(|last| last.set(None));
+    let translated = unsafe { super::translate_accelerator(hwnd, &identity, &message) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+    let command = super::LAST_COMMAND.with(std::cell::Cell::get);
+    translated.then_some(command).flatten()
+}
+
+#[test]
+fn ctrl_shift_h_in_the_replace_field_closes_it_and_the_chevron_action_toggles_it() {
+    // Break caught (final review FR6): a keyboard user unable to close the replace field
+    // once it is open (Ctrl+Shift+H only opening it), the caret left in the hidden field,
+    // Ctrl+Shift+H elsewhere closing it, or the chevron's default action doing nothing.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-close-key");
+    scratch.note("a.md", "alpha needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let open = || crate::window::search_view::replace_open(window.hwnd);
+
+    execute_command(window.hwnd, CommandId::ReplaceInNotes);
+    let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+    let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    assert!(open());
+    assert_eq!(unsafe { GetFocus() }, replace);
+
+    assert!(translate_key(window.hwnd, replace, b'H', true));
+    assert!(!open(), "closed from inside the field");
+    assert!(!is_shown(replace));
+    assert_eq!(
+        unsafe { GetFocus() },
+        search_box,
+        "the caret goes to the box"
+    );
+
+    assert!(translate_key(window.hwnd, search_box, b'H', true));
+    assert!(open(), "from the box it opens the field");
+    assert_eq!(unsafe { GetFocus() }, replace);
+    unsafe { SetFocus(search_box) };
+    assert!(translate_key(window.hwnd, search_box, b'H', true));
+    assert!(open(), "with the caret in the box it stays open");
+    assert_eq!(unsafe { GetFocus() }, replace);
+
+    let panel = sidebar_panel(window.hwnd);
+    let source = &crate::window::side_panel::PANEL_ACCESSIBLE;
+    let chevron = (0..(source.count)(panel))
+        .position(|index| {
+            (source.item)(panel, index).is_some_and(|item| item.name == "Toggle replace")
+        })
+        .unwrap();
+    (source.activate)(panel, chevron);
+    assert!(!open(), "the chevron's default action closes the field");
+    (source.activate)(panel, chevron);
+    assert!(open(), "and opens it again");
+    assert_eq!(unsafe { GetFocus() }, replace);
+}
+
+#[test]
+fn ctrl_shift_1_is_not_an_accelerator() {
+    // Break caught (Task 5 review Minor 1): a Ctrl+Shift+1 accelerator, or a change to how
+    // the table is built, eating the key before the Search view's row replace sees it.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-ctrl-shift-1");
+    scratch.note("a.md", "alpha needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    let panel = sidebar_panel(window.hwnd);
+    assert!(
+        !translate_key(window.hwnd, panel, b'1', true),
+        "in the results"
+    );
+    assert!(
+        !translate_key(window.hwnd, editor.hwnd(), b'1', true),
+        "in the editor"
+    );
+    assert!(
+        translate_key(window.hwnd, panel, b'H', true),
+        "the harness translates a real accelerator"
+    );
+}
+
+#[test]
+fn the_replace_field_never_takes_the_caret_without_a_search_box() {
+    // Break caught (Task 5 review Minor 2): with the search box not made, Ctrl+Shift+H
+    // making the replace field (which `layout` never places or shows) and focusing it, so
+    // keystrokes go into an invisible control.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-no-box");
+    scratch.note("a.md", "alpha needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    ensure_sidebar(window.hwnd);
+    assert_eq!(crate::window::search_view::edit_hwnd(window.hwnd), None);
+    assert!(crate::window::search_view::fail_search_box(window.hwnd));
+
+    execute_command(window.hwnd, CommandId::ReplaceInNotes);
+    assert_eq!(crate::window::search_view::edit_hwnd(window.hwnd), None);
+    assert_eq!(
+        crate::window::search_view::replace_edit_hwnd(window.hwnd),
+        None,
+        "no field made, so none focused"
+    );
+    assert!(!crate::window::search_view::replace_open(window.hwnd));
+}
+
+#[test]
+fn a_tab_closed_before_an_unasked_row_replace_applies_is_not_written() {
+    // Break caught: a note saved without the question ever saying so, because its tab (whose
+    // text the count read, so no question was asked) closed while the count ran.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-closed-meanwhile");
+    let b = scratch.note("b.md", "b needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+
+    crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("b.md"));
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert!(
+        tab_paths(window.hwnd)
+            .iter()
+            .all(|path| path.as_deref() != Some(b.as_path()))
+    );
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 0 matches in 0 notes. 1 note was skipped because it changed since the search. (b)"
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        None,
+        "never asked"
+    );
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "b needle");
+}
+
+#[test]
+fn a_hit_from_a_dirty_tab_that_has_closed_is_never_written() {
+    // Break caught (R-nostamp): a note whose hit came from a tab's unsaved text (no stamp,
+    // so no check that the file is what the search read) written from its file after the
+    // tab closed, or its skip left out of the report.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-no-stamp");
+    let a = scratch.note("a.md", "needle");
+    let b = scratch.note("b.md", "b needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    editor.set_text("b needle typed").unwrap();
+    search_to_replace(window.hwnd, "needle", "pin");
+    assert_eq!(search_rows(window.hwnd).len(), 2);
+    answer_next_close_prompt(|_| CloseDecision::Discard);
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert!(
+        tab_paths(window.hwnd)
+            .iter()
+            .all(|path| path.as_deref() != Some(b.as_path()))
+    );
+
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert_eq!(
+        wait_for_report(window.hwnd),
+        "Replaced 1 match in 1 note. 1 note was skipped because it changed since the search. (b)"
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        Some(format!(
+            "Replace 1 match in 1 note with \"pin\"?{SAVED_LINE}"
+        )),
+        "b is never read, so the question doesn't count it"
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "pin");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "b needle");
+}
+
+#[test]
+fn a_new_search_drops_a_replace_that_has_not_asked_yet() {
+    // Break caught (review Important 1): a count still running or held when the user types
+    // another query asking its question anyway, so a Yes saves the old query's replacement
+    // while the results show the new one.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-new-search");
+    let a = scratch.note("a.md", "needle other");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+    let asked = decline_next_confirm();
+
+    crate::window::text_search_host::replace_all(window.hwnd);
+    assert!(crate::window::text_search_host::replacing(window.hwnd));
+    type_into_search(window.hwnd, "other");
+    assert!(
+        !crate::window::text_search_host::replacing(window.hwnd),
+        "the keystroke dropped the replace"
+    );
+    // A count for the current generation, made for the old results: the box shows another
+    // query, so it is not asked about either.
+    crate::window::text_search_host::replace_counted(
+        window.hwnd,
+        crate::window::text_search_host::test_counted(
+            window.hwnd,
+            crate::window::text_search_host::replace_generation(window.hwnd),
+            one_closed_match(),
+        ),
+    );
+    assert!(!asked.get(), "nothing asked");
+    assert_eq!(crate::window::modal::take_last_confirm(), None);
+    assert!(!crate::window::text_search_host::replacing(window.hwnd));
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle other");
+    // The queued answer was never used: take it, so no later test gets it.
+    assert!(!crate::window::modal::confirm(window.hwnd, "drain"));
+    crate::window::modal::take_last_confirm();
+}
+
+#[test]
+fn a_reload_leaves_a_tab_edited_and_saved_since_its_file_was_read() {
+    // Break caught (review Minor 1): the user's edit, saved (by Ctrl+S or autosave) after the
+    // reload read the file but before its text arrived, replaced in the editor by the older
+    // file text, with the tab then claiming the older disk stamp.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-reload-edited");
+    let b = scratch.note("b.md", "b needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    std::fs::write(&b, "b pin").unwrap();
+    let report = crate::library::text_replace::ReplaceReport {
+        matches: 1,
+        written: vec![(
+            PathBuf::from("b.md"),
+            crate::library::text_search::Stamp { size: 5, mtime: 1 },
+        )],
+        ..Default::default()
+    };
+    crate::window::text_search_host::replace_written(
+        window.hwnd,
+        crate::window::text_search_host::test_written(
+            crate::window::text_search_host::replace_generation(window.hwnd),
+            report,
+        ),
+    );
+    // The reload has read "b pin" and posted it; it is not dispatched yet.
+    let message = crate::window::WM_FASTPAD_REPLACE_RELOADED;
+    pump_until_queued(window.hwnd, message);
+
+    editor.set_text("b mine").unwrap();
+    execute_command(window.hwnd, CommandId::Save);
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "b mine");
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    pump_posted_messages(window.hwnd);
+    let mut queued = MSG::default();
+    assert_eq!(
+        unsafe { PeekMessageW(&mut queued, window.hwnd, message, message, PM_NOREMOVE) },
+        0,
+        "the reload was dispatched"
+    );
+    assert_eq!(editor.text().unwrap(), "b mine", "the saved edit stays");
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().disk_stamp,
+        crate::library::disk_stamp(&b)
+    );
+}
+
+/// Waits, without dispatching anything, until `message` is queued for `hwnd`.
+fn pump_until_queued(hwnd: HWND, message: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut queued = MSG::default();
+    while unsafe { PeekMessageW(&mut queued, hwnd, message, message, PM_NOREMOVE) } == 0 {
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_write_report_and_its_reloads_wait_for_a_file_population_to_end() {
+    // Break caught (review Minor 6): a report's reloads swapping documents in the middle of a
+    // file population or a modal loop, or a held report or reload lost so the tab keeps the
+    // text from before the write.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-held-written");
+    let a = scratch.note("a.md", "a needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    pump_posted_messages(window.hwnd);
+    std::fs::write(&a, "a pin").unwrap();
+    let report = crate::library::text_replace::ReplaceReport {
+        matches: 1,
+        written: vec![(
+            PathBuf::from("a.md"),
+            crate::library::text_search::Stamp { size: 5, mtime: 1 },
+        )],
+        ..Default::default()
+    };
+    let reported = || {
+        notices(window.hwnd)
+            .iter()
+            .any(|notice| notice.starts_with("Replaced "))
+    };
+    let held = || crate::window::text_search_host::held_after_write(window.hwnd);
+
+    app_mut(window.hwnd).populating_file = true;
+    crate::window::text_search_host::replace_written(
+        window.hwnd,
+        crate::window::text_search_host::test_written(
+            crate::window::text_search_host::replace_generation(window.hwnd),
+            report,
+        ),
+    );
+    assert_eq!(held(), (true, 0));
+    crate::window::text_search_host::replace_timer(window.hwnd);
+    assert_eq!(held(), (true, 0), "still populating");
+    assert!(!reported());
+    app_mut(window.hwnd).populating_file = false;
+    crate::window::text_search_host::replace_timer(window.hwnd);
+    assert_eq!(held(), (false, 0));
+    assert!(reported());
+
+    app_mut(window.hwnd).populating_file = true;
+    pump_until(window.hwnd, || held().1 == 1);
+    assert_eq!(
+        editor.text().unwrap(),
+        "a needle",
+        "no reload during the population"
+    );
+    app_mut(window.hwnd).populating_file = false;
+    crate::window::text_search_host::replace_timer(window.hwnd);
+    assert_eq!(held(), (false, 0));
+    assert_eq!(editor.text().unwrap(), "a pin");
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+fn one_closed_match() -> crate::library::text_replace::ReplaceCount {
+    crate::library::text_replace::ReplaceCount {
+        matches: 1,
+        notes: 1,
+        closed_notes: 1,
+    }
+}
+
+#[test]
+fn a_count_of_an_earlier_replace_or_notebook_is_dropped() {
+    // Break caught: the question asked, or the old notebook's notes written, for a count
+    // that arrived after the user switched notebooks or after its replace was cancelled.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-stale");
+    let a = scratch.note("a.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+    let host = |lparam| crate::window::text_search_host::replace_counted(window.hwnd, lparam);
+    let generation = || crate::window::text_search_host::replace_generation(window.hwnd);
+    let counted = |generation| {
+        crate::window::text_search_host::test_counted(window.hwnd, generation, one_closed_match())
+    };
+
+    host(counted(generation().wrapping_sub(1)));
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        None,
+        "an older one"
+    );
+    // What a notebook change does (`library_host`'s notebook switch calls it).
+    let before_forget = generation();
+    crate::window::text_search_host::forget(window.hwnd);
+    host(counted(before_forget));
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        None,
+        "from before a notebook change"
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+    assert!(!crate::window::text_search_host::replacing(window.hwnd));
+
+    // The same count with the current generation is asked about: the generation dropped it.
+    let asked = decline_next_confirm();
+    host(counted(generation()));
+    assert!(asked.get());
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        Some(format!(
+            "Replace 1 match in 1 note with \"pin\"?{SAVED_LINE}"
+        ))
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+}
+
+#[test]
+fn a_count_that_arrives_while_a_file_is_populated_asks_once_it_ends() {
+    // Break caught: the question (a nested modal loop) or a background-tab swap run in the
+    // middle of a file population, or a held count lost so the replace never asks.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-held");
+    let a = scratch.note("a.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+    let counted = crate::window::text_search_host::test_counted(
+        window.hwnd,
+        crate::window::text_search_host::replace_generation(window.hwnd),
+        one_closed_match(),
+    );
+
+    app_mut(window.hwnd).populating_file = true;
+    crate::window::text_search_host::replace_counted(window.hwnd, counted);
+    assert!(crate::window::text_search_host::replace_held(window.hwnd));
+    crate::window::text_search_host::replace_timer(window.hwnd);
+    assert!(
+        crate::window::text_search_host::replace_held(window.hwnd),
+        "still populating"
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm(),
+        None,
+        "no question during the population"
+    );
+
+    app_mut(window.hwnd).populating_file = false;
+    let asked = decline_next_confirm();
+    crate::window::text_search_host::replace_timer(window.hwnd);
+    assert!(asked.get());
+    assert!(!crate::window::text_search_host::replace_held(window.hwnd));
+    assert!(!crate::window::text_search_host::replacing(window.hwnd));
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle");
+}
+
+#[test]
+fn a_clean_tab_on_a_written_note_reloads_from_disk_and_a_dirty_one_keeps_its_text() {
+    // Break caught: a clean tab opened while the write ran left showing the text from before
+    // it (its next save would undo the replace), a dirty tab's unsaved edits dropped for the
+    // file's text, or a reload that leaves the tab dirty or with an undo back to the old
+    // text.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-reload");
+    let a = scratch.note("a.md", "a needle");
+    let b = scratch.note("b.md", "b needle");
+    let c = scratch.note("c.md", "c needle");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &c).unwrap();
+    pump_posted_messages(window.hwnd);
+    editor.set_text("c typed").unwrap();
+    let c_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    super::open_path(window.hwnd, &a).unwrap();
+    pump_posted_messages(window.hwnd);
+    let a_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    let b_id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    // What the write did while those tabs opened.
+    let mut written = Vec::new();
+    for (path, text) in [(&a, "a pin"), (&b, "b pin"), (&c, "c pin")] {
+        std::fs::write(path, text).unwrap();
+        let relative = PathBuf::from(path.file_name().unwrap());
+        let stamp = crate::library::text_search::Stamp {
+            size: text.len() as u64,
+            mtime: 1,
+        };
+        written.push((relative, stamp));
+    }
+    let report = crate::library::text_replace::ReplaceReport {
+        matches: 3,
+        written,
+        ..Default::default()
+    };
+
+    crate::window::text_search_host::replace_written(
+        window.hwnd,
+        crate::window::text_search_host::test_written(
+            crate::window::text_search_host::replace_generation(window.hwnd),
+            report,
+        ),
+    );
+    assert_eq!(
+        notices(window.hwnd).last().map(String::as_str),
+        Some("Replaced 3 matches in 3 notes.")
+    );
+    pump_until(window.hwnd, || editor.text().unwrap() == "b pin");
+    let dirty = |id| app_mut(window.hwnd).tabs.document(id).unwrap().dirty;
+    assert!(!dirty(b_id), "the active tab stays clean");
+    assert_eq!(
+        app_mut(window.hwnd).tabs.document(b_id).unwrap().disk_stamp,
+        crate::library::disk_stamp(&b)
+    );
+    assert!(!editor.can_undo().unwrap(), "no undo back to the old text");
+
+    assert!(super::activate_document_by_id(window.hwnd, a_id));
+    assert_eq!(editor.text().unwrap(), "a pin", "a background tab too");
+    assert!(!dirty(a_id));
+    assert!(super::activate_document_by_id(window.hwnd, c_id));
+    assert_eq!(
+        editor.text().unwrap(),
+        "c typed",
+        "a dirty tab keeps its text"
+    );
+    assert!(dirty(c_id));
+    assert_eq!(std::fs::read_to_string(&c).unwrap(), "c pin");
+}
+
+#[test]
+fn closing_the_window_waits_for_the_write_worker_to_end() {
+    // Break caught (R-join): the write worker left running past the window's end, so a note
+    // is written (or half written) after FastPad has closed.
+    use crate::window::text_search_host::writer_hooks;
+    struct Unpause;
+    impl Drop for Unpause {
+        fn drop(&mut self) {
+            writer_hooks::set_pause(0);
+        }
+    }
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-join");
+    let paths = (0..50)
+        .map(|index| scratch.note(&format!("n{index:03}.md"), "needle"))
+        .collect::<Vec<_>>();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    search_to_replace(window.hwnd, "needle", "pin");
+    let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let answered = std::rc::Rc::clone(&asked);
+    crate::window::answer_next_confirm(move |_| {
+        answered.set(true);
+        true
+    });
+    // The worker is still running when the window closes: it waits after its notes.
+    let _unpause = Unpause;
+    writer_hooks::set_pause(300);
+    let ended = writer_hooks::ended();
+    crate::window::text_search_host::replace_all(window.hwnd);
+    pump_until(window.hwnd, || asked.get());
+    assert_eq!(writer_hooks::ended(), ended, "still writing");
+
+    drop(window);
+    assert_eq!(
+        writer_hooks::ended(),
+        ended + 1,
+        "WM_DESTROY waited for the worker"
+    );
+    let texts = || {
+        paths
+            .iter()
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        texts().iter().all(|text| text == "needle" || text == "pin"),
+        "every note whole"
+    );
+}
+
+/// Sends `key` to `window` as a key press with Ctrl and Shift held as given.
+fn press_with(window: HWND, key: u16, ctrl: bool, shift: bool, alt: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_SYSKEYDOWN};
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = if ctrl { 0x80 } else { 0 };
+    keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
+    keys[VK_MENU as usize] = if alt { 0x80 } else { 0 };
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let message = if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN };
+    unsafe { SendMessageW(window, message, usize::from(key), 0) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+}
+
+#[test]
+fn tab_cycles_the_search_box_the_replace_field_and_the_results() {
+    // Break caught: Tab beeping in the box, never reaching the replace field or the results,
+    // landing in the replace field while it is closed, or Shift+Tab not going back.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_TAB};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-tab");
+    scratch.note("a.md", "alpha needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let panel = sidebar_panel(window.hwnd);
+
+    execute_command(window.hwnd, CommandId::ReplaceInNotes);
+    search_for(window.hwnd, "needle");
+    let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+    let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    let focus = || unsafe { GetFocus() };
+    let tab = |back: bool| press_with(focus(), VK_TAB, false, back, false);
+
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(search_box) };
+    tab(false);
+    assert_eq!(focus(), replace, "box -> replace");
+    tab(false);
+    assert_eq!(focus(), panel, "replace -> results");
+    tab(false);
+    assert_eq!(focus(), search_box, "results -> box, wrapping");
+    tab(true);
+    assert_eq!(focus(), panel, "Shift+Tab: box -> results, wrapping");
+    tab(true);
+    assert_eq!(focus(), replace, "Shift+Tab: results -> replace");
+    tab(true);
+    assert_eq!(focus(), search_box, "Shift+Tab: replace -> box");
+
+    crate::window::search_view::toggle_replace(window.hwnd);
+    assert!(!crate::window::search_view::replace_open(window.hwnd));
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(search_box) };
+    tab(false);
+    assert_eq!(focus(), panel, "closed: box -> results");
+    tab(false);
+    assert_eq!(focus(), search_box, "closed: results -> box");
+    tab(true);
+    assert_eq!(focus(), panel, "closed: Shift+Tab box -> results");
+    tab(true);
+    assert_eq!(focus(), search_box, "closed: Shift+Tab results -> box");
+}
+
+#[test]
+fn the_replace_buttons_and_their_keys_route_to_the_replace_and_open_nothing() {
+    // Break caught: Ctrl+Shift+1 or a press on a row's replace button opening the result
+    // instead, Ctrl+Alt+Enter in a field opening one, either running with the replace field
+    // closed, or the row button and its key reaching different places.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("replace-routes");
+    scratch.note("a.md", "alpha needle");
+    scratch.note("b.md", "beta needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let panel = sidebar_panel(window.hwnd);
+    let requests = || crate::window::search_view::replace_requests(window.hwnd);
+    // Each request that runs starts a real replace of closed notes, whose question is
+    // declined before the next request: while one runs, Replace all and the row buttons are
+    // unavailable and a request is refused (below).
+    let declined = |asked: std::rc::Rc<std::cell::Cell<bool>>| {
+        pump_until(window.hwnd, || asked.get());
+        assert!(!crate::window::text_search_host::replacing(window.hwnd));
+        crate::window::modal::take_last_confirm()
+    };
+    let row_question =
+        "Replace 1 match in \"b\" with \"\"? The note is saved and this can't be undone.";
+    let all_question = format!("Replace 2 matches in 2 notes with \"\"?{SAVED_LINE}");
+
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "needle");
+    assert_eq!(search_rows(window.hwnd).len(), 2);
+    unsafe { SetFocus(panel) };
+    press_with(panel, u16::from(b'1'), true, true, false);
+    assert_eq!(requests(), (Vec::new(), 0), "the replace field is closed");
+
+    crate::window::search_view::toggle_replace(window.hwnd);
+    unsafe { SetFocus(panel) };
+    app_mut(window.hwnd)
+        .sidebar
+        .as_mut()
+        .unwrap()
+        .search
+        .list
+        .select(1, 400);
+    let asked = decline_next_confirm();
+    press_with(panel, u16::from(b'1'), true, true, false);
+    assert_eq!(requests(), (vec![1], 0), "Ctrl+Shift+1 on the selected row");
+    assert_eq!(
+        app_mut(window.hwnd).tabs.preview_id(),
+        None,
+        "nothing opened"
+    );
+    // While that replace runs, another request is refused.
+    assert!(crate::window::text_search_host::replacing(window.hwnd));
+    press_with(panel, u16::from(b'1'), true, true, false);
+    assert_eq!(requests(), (vec![1], 0), "refused while a replace runs");
+    assert_eq!(
+        declined(asked).as_deref(),
+        Some(row_question),
+        "the row's request ran the replace of that row's note"
+    );
+
+    let (width, height) = client_size(panel);
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(panel) }.max(96);
+    let button = {
+        let app = app_mut(window.hwnd);
+        let view = &app.sidebar.as_ref().unwrap().search;
+        let (row, _) = crate::window::sidebar_accessibility::row_rect(
+            view.list_area(client, dpi),
+            &view.list,
+            1,
+        );
+        crate::window::search_view::SearchView::row_replace_rect(row, dpi)
+    };
+    let asked = decline_next_confirm();
+    click(
+        panel,
+        (button.left + button.right) / 2,
+        (button.top + button.bottom) / 2,
+    );
+    assert_eq!(requests(), (vec![1, 1], 0), "the row's button");
+    assert_eq!(
+        app_mut(window.hwnd).tabs.preview_id(),
+        None,
+        "nothing opened"
+    );
+    assert_eq!(declined(asked).as_deref(), Some(row_question));
+
+    let all = crate::window::search_view::SearchView::replace_all_rect(client, dpi);
+    let asked = decline_next_confirm();
+    click(
+        panel,
+        (all.left + all.right) / 2,
+        (all.top + all.bottom) / 2,
+    );
+    assert_eq!(requests(), (vec![1, 1], 1), "Replace all");
+    assert_eq!(declined(asked), Some(all_question.clone()));
+
+    let replace = crate::window::search_view::replace_edit_hwnd(window.hwnd).unwrap();
+    let search_box = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    let asked = decline_next_confirm();
+    press_with(replace, VK_RETURN, true, false, true);
+    assert_eq!(declined(asked), Some(all_question.clone()));
+    let asked = decline_next_confirm();
+    press_with(search_box, VK_RETURN, true, false, true);
+    assert_eq!(declined(asked), Some(all_question.clone()));
+    // With Ctrl held Windows usually sends Ctrl+Alt+Enter as WM_KEYDOWN, not WM_SYSKEYDOWN.
+    for field in [replace, search_box] {
+        let asked = decline_next_confirm();
+        press_as_keydown(field, VK_RETURN, true, true);
+        assert_eq!(declined(asked), Some(all_question.clone()));
+    }
+    assert_eq!(
+        requests(),
+        (vec![1, 1], 5),
+        "Ctrl+Alt+Enter in either field, as either message"
+    );
+    assert_eq!(
+        app_mut(window.hwnd).tabs.preview_id(),
+        None,
+        "nothing opened"
+    );
+}
+
+/// Sends `key` to `window` as `WM_KEYDOWN` with Ctrl and Alt held as given (Shift up).
+fn press_as_keydown(window: HWND, key: u16, ctrl: bool, alt: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = if ctrl { 0x80 } else { 0 };
+    keys[VK_SHIFT as usize] = 0;
+    keys[VK_MENU as usize] = if alt { 0x80 } else { 0 };
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    unsafe { SendMessageW(window, WM_KEYDOWN, usize::from(key), 0) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+}
+
+#[test]
+fn ctrl_shift_f_escapes_the_selection_while_regex_is_on() {
+    // Break caught: "a.b" searched as a pattern that also matches "axb".
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-prefill-regex");
+    scratch.note("a.md", "see a.b here");
+    scratch.note("x.md", "see axb here");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+    editor.populate_clean("see a.b here").unwrap();
+    editor.set_selection(4..7).unwrap();
+
+    execute_command(window.hwnd, CommandId::ShowSearchView);
+
+    assert_eq!(
+        crate::window::search_view::current_query(window.hwnd).map(|(query, _)| query),
+        Some(r"a\.b".to_owned())
+    );
+    pump_until(window.hwnd, || {
+        !crate::window::search_view::shown_results(window.hwnd).is_empty()
+    });
+    assert_eq!(
+        crate::window::search_view::shown_results(window.hwnd),
+        vec![("a".to_owned(), "see a.b here".to_owned())]
+    );
+}
+
+#[test]
+fn a_regex_prefill_with_hash_and_dash_opens_to_its_match_in_the_find_bar() {
+    // Break caught (final review issue 1): `regex::escape` writes `\#` and `\-`, which the
+    // find bar's old ECMAScript regex rejected, so the result opened to no match.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-prefill-regex-open");
+    scratch.note("a.md", "see a-b#c here");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+    editor.populate_clean("x a-b#c").unwrap();
+    editor.set_selection(2..7).unwrap();
+
+    execute_command(window.hwnd, CommandId::ShowSearchView);
+    assert_eq!(
+        crate::window::search_view::current_query(window.hwnd).map(|(query, _)| query),
+        Some(r"a\-b\#c".to_owned())
+    );
+    pump_until(window.hwnd, || {
+        crate::window::search_view::shown_results(window.hwnd).len() == 1
+    });
+
+    crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, true);
+
+    assert_eq!(editor.text().unwrap(), "see a-b#c here");
+    assert_eq!(editor.selection().unwrap(), 4..9);
+    let bar = app_mut(window.hwnd).find_bar().unwrap();
+    assert!(bar.options().regex);
+    assert!(!bar.no_match());
+}
+
+#[test]
+fn the_search_toggle_commands_show_search_and_flip_its_options() {
+    // Break caught: a palette toggle that flips an option nobody can see, or flips the
+    // wrong one.
+    use crate::search::MatchOptions;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-toggle-commands");
+    scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    let options = || crate::window::search_view::options(window.hwnd);
+
+    execute_command(window.hwnd, CommandId::SearchToggleCase);
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        crate::config::SidebarView::Search
+    );
+    assert_eq!(
+        options(),
+        MatchOptions {
+            case: true,
+            ..MatchOptions::default()
+        }
+    );
+    execute_command(window.hwnd, CommandId::SearchToggleWholeWord);
+    execute_command(window.hwnd, CommandId::SearchToggleRegex);
+    assert_eq!(
+        options(),
+        MatchOptions {
+            case: true,
+            whole_word: true,
+            regex: true
+        }
+    );
+    execute_command(window.hwnd, CommandId::SearchToggleCase);
+    assert!(!options().case);
+}
+
+#[test]
+fn with_notes_mode_off_ctrl_shift_f_and_the_search_toggles_do_nothing() {
+    // Break caught: a sidebar command reaching code that assumes a sidebar, or reading and
+    // changing editor state with notes mode off.
+    let _scintilla = load_native_scintilla();
+    let mut app = make_app();
+    app.settings.notes_mode = false;
+    let window = ProductionWindow::new(app);
+    let editor = install_test_editor(&window);
+    editor.populate_clean("alpha beta").unwrap();
+    editor.set_selection(0..5).unwrap();
+    let before = sidebar_command_runs();
+
+    for command in [
+        CommandId::ShowSearchView,
+        CommandId::SearchToggleCase,
+        CommandId::SearchToggleWholeWord,
+        CommandId::SearchToggleRegex,
+        CommandId::ReplaceInNotes,
+    ] {
+        execute_command(window.hwnd, command);
+    }
+
+    // The Search view's own state already reads as empty with no sidebar to hold it, so this
+    // counts commands that ran past the notes-mode guard instead (see `sidebar_command_runs`).
+    assert_eq!(
+        sidebar_command_runs(),
+        before,
+        "the is_sidebar guard should have skipped every command"
+    );
+    assert!(app_mut(window.hwnd).sidebar.is_none());
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        crate::config::SidebarView::Hidden
+    );
+    assert_eq!(editor.selection().unwrap(), 0..5);
+    assert!(notices(window.hwnd).is_empty());
+}
+
+#[test]
+fn shift_alt_f_formats_json_and_ctrl_shift_f_no_longer_does() {
+    // Break caught: Format JSON left on Ctrl+Shift+F, where it would rewrite a JSON file
+    // the user only meant to search from, or not reachable from any shortcut.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN, WM_SYSKEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    // Presses F with the given modifiers held, through the accelerator table.
+    let press_f = |ctrl: bool, shift: bool, alt: bool| {
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = if ctrl { 0x80 } else { 0 };
+        keys[VK_SHIFT as usize] = if shift { 0x80 } else { 0 };
+        keys[VK_MENU as usize] = if alt { 0x80 } else { 0 };
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let message = MSG {
+            hwnd: editor.hwnd(),
+            message: if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN },
+            wParam: usize::from(b'F'),
+            // Bit 29, the context code, is set while Alt is down.
+            lParam: if alt { 1 << 29 } else { 0 },
+            ..Default::default()
+        };
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+        translated
+    };
+    editor.populate_clean("{\"a\":1}").unwrap();
+
+    assert!(press_f(true, true, false));
+    pump_posted_messages(window.hwnd);
+    assert_eq!(
+        editor.text().unwrap(),
+        "{\"a\":1}",
+        "Ctrl+Shift+F leaves JSON alone"
+    );
+
+    assert!(press_f(false, true, true));
+    pump_posted_messages(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "{\n  \"a\": 1\n}");
+}
+
+#[test]
+fn saving_a_listed_note_keeps_the_search_selection_and_does_not_rebuild_the_tree() {
+    // Break caught: every save (autosave included) rebuilding the sidebar, re-running the
+    // search, or snapping the Search selection back to the first result.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-save-keeps");
+    scratch.note("plan.md", "plan a");
+    let planning = scratch.note("planning.md", "plan b");
+    scratch.note("plans.md", "plan c");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    use crate::config::SidebarView;
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Search, true);
+    search_for(window.hwnd, "plan");
+    let results = search_rows(window.hwnd);
+    assert_eq!(results.len(), 3);
+    let index = results
+        .iter()
+        .position(|(name, _)| name == "planning")
+        .unwrap();
+    assert_ne!(index, 0);
+    app_mut(window.hwnd)
+        .sidebar
+        .as_mut()
+        .unwrap()
+        .search
+        .list
+        .selected = Some(index);
+    super::open_path(window.hwnd, &planning).unwrap();
+    pump_posted_messages(window.hwnd);
+    let rebuilds = notebook_view(window.hwnd).rebuilds;
+    let searches = search_generation(window.hwnd);
+
+    editor.set_text("edited plan").unwrap();
+    assert!(super::save_active_document(window.hwnd));
+    assert_eq!(std::fs::read_to_string(&planning).unwrap(), "edited plan");
+    assert_eq!(
+        search_selected(window.hwnd),
+        Some(index),
+        "kept by the save"
+    );
+    assert_eq!(
+        notebook_view(window.hwnd).rebuilds,
+        rebuilds,
+        "a save of a listed note changes no row"
+    );
+    // A refresh with the same notes runs nothing (spec §7).
+    crate::window::side_panel::refresh(window.hwnd);
+    // Past the debounce, so a re-run wrongly scheduled by the save or the refresh would have
+    // started.
+    pump_past_debounce(window.hwnd);
+    assert_eq!(search_generation(window.hwnd), searches, "no search re-ran");
+
+    // The same query run again keeps the selection by path.
+    let before = search_generation(window.hwnd);
+    crate::window::text_search_host::run_now(window.hwnd);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        search_selected(window.hwnd),
+        Some(index),
+        "kept by a re-run"
+    );
+    // A new query selects the same note again once it arrives.
+    search_for(window.hwnd, "pla");
+    assert_eq!(selected_name(window.hwnd).as_deref(), Some("planning"));
+}
+
+#[test]
+fn typing_waits_for_the_debounce_and_gives_sorted_results_with_the_selection_kept_by_path() {
+    // Break caught: a search per keystroke, results in the order the worker found them, or
+    // results arriving above the selected row moving the selection to another note.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-debounce");
+    scratch.note("c10.md", "needle");
+    scratch.note("b.md", "a needle here");
+    scratch.note("c9.md", "needle");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\b.md", "needle too");
+    scratch.note("d.md", "no match");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+
+    type_into_search(window.hwnd, "needle");
+    // The keystroke only restarted the timer: nothing has run yet.
+    assert!(search_rows(window.hwnd).is_empty());
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::Idle
+    );
+    assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+    wait_for_search(window.hwnd, search_generation(window.hwnd));
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![
+            search_row("b", "a needle here"),
+            search_row("b", "needle too"),
+            search_row("c9", "needle"),
+            search_row("c10", "needle"),
+        ]
+    );
+    let folders = app_mut(window.hwnd)
+        .sidebar
+        .as_ref()
+        .unwrap()
+        .search
+        .results
+        .iter()
+        .map(|result| result.folder.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(folders, ["", "sub", "", ""]);
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some(("4 notes".to_owned(), false))
+    );
+
+    // c9 is selected; a new note that sorts first arrives with the re-run.
+    app_mut(window.hwnd)
+        .sidebar
+        .as_mut()
+        .unwrap()
+        .search
+        .list
+        .selected = Some(2);
+    let added = scratch.note("a.md", "needle first");
+    crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+    let before = search_generation(window.hwnd);
+    crate::window::side_panel::refresh(window.hwnd);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(search_rows(window.hwnd)[0], search_row("a", "needle first"));
+    assert_eq!(selected_name(window.hwnd).as_deref(), Some("c9"));
+    assert_eq!(search_selected(window.hwnd), Some(3));
+}
+
+#[test]
+fn a_batch_from_an_older_generation_is_dropped() {
+    // Break caught: a slow batch from the previous query landing after the new one began, so
+    // the list flickers back to rows the new query never matched.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-generation");
+    scratch.note("a.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "needle");
+    let shown = vec![search_row("a", "needle")];
+    assert_eq!(search_rows(window.hwnd), shown);
+
+    let current = search_generation(window.hwnd);
+    let stale = crate::window::text_search_host::test_batch(
+        current.wrapping_sub(1),
+        vec![stray_hit("old")],
+        None,
+    );
+    crate::window::text_search_host::batch_arrived(window.hwnd, stale);
+    assert_eq!(
+        search_rows(window.hwnd),
+        shown,
+        "dropped when handled directly"
+    );
+    let stale = crate::window::text_search_host::test_batch(
+        current.wrapping_sub(1),
+        vec![stray_hit("older")],
+        Some(crate::library::text_search::RunEnd::Completed),
+    );
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            window.hwnd,
+            crate::window::WM_FASTPAD_TEXT_SEARCH_BATCH,
+            0,
+            stale,
+        );
+    }
+    pump_posted_messages(window.hwnd);
+    assert_eq!(
+        search_rows(window.hwnd),
+        shown,
+        "and when it comes through the queue"
+    );
+
+    // A keystroke cancels the running search, so its late batches are stale too.
+    type_into_search(window.hwnd, "needles");
+    let late = crate::window::text_search_host::test_batch(current, vec![stray_hit("late")], None);
+    crate::window::text_search_host::batch_arrived(window.hwnd, late);
+    assert_eq!(search_rows(window.hwnd), shown);
+    // The current generation's batch is the one that shows.
+    let now = crate::window::text_search_host::test_batch(
+        search_generation(window.hwnd),
+        vec![stray_hit("b")],
+        None,
+    );
+    crate::window::text_search_host::batch_arrived(window.hwnd, now);
+    assert_eq!(search_rows(window.hwnd).len(), 2);
+}
+
+#[test]
+fn a_dirty_tab_is_searched_as_the_editor_has_it() {
+    // Break caught: the search reading an open note from disk, so a phrase typed only in the
+    // editor is missed and a phrase deleted in the editor is still found, for the active tab
+    // or a tab in the background; or reading a background tab leaving it in the editor.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-dirty");
+    let a = scratch.note("a.md", "kept on disk only");
+    let b = scratch.note("b.md", "plain b");
+    scratch.note("c.md", "plain c");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    // No autosave may write the edits: opening `b` would save `a`, the tab being left.
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &a).unwrap();
+    pump_posted_messages(window.hwnd);
+    editor.set_text("typed in the editor only").unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+    pump_posted_messages(window.hwnd);
+    editor.set_text("b typed too").unwrap();
+    let dirty = app_mut(window.hwnd)
+        .tabs
+        .documents()
+        .filter(|document| document.dirty)
+        .count();
+    assert_eq!(dirty, 2);
+
+    let overlays = crate::window::text_search_host::dirty_overlays(window.hwnd, &scratch.folder());
+    assert_eq!(overlays.len(), 2);
+    assert_eq!(
+        overlays
+            .get(std::path::Path::new("a.md"))
+            .map(String::as_str),
+        Some("typed in the editor only"),
+        "a background tab"
+    );
+    assert_eq!(
+        overlays
+            .get(std::path::Path::new("b.md"))
+            .map(String::as_str),
+        Some("b typed too"),
+        "the active tab"
+    );
+    assert_eq!(
+        editor.text().unwrap(),
+        "b typed too",
+        "the active tab is back"
+    );
+
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "editor only");
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![search_row("a", "typed in the editor only")]
+    );
+    search_for(window.hwnd, "on disk");
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some((crate::window::search_view::NO_MATCH.to_owned(), false))
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "kept on disk only");
+}
+
+#[test]
+fn a_longer_plain_query_searches_only_the_previous_hits() {
+    // Break caught: every keystroke re-reading the whole notebook, or narrowing kept after a
+    // change of options.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-narrow");
+    scratch.note("a.md", "needle");
+    scratch.note("b.md", "needles");
+    scratch.note("c.md", "other");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "need");
+    assert_eq!(searched_total(window.hwnd), 3);
+    search_for(window.hwnd, "needl");
+    assert_eq!(
+        searched_total(window.hwnd),
+        2,
+        "only the notes \"need\" found"
+    );
+    assert_eq!(search_rows(window.hwnd).len(), 2);
+    let before = search_generation(window.hwnd);
+    crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Case);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        searched_total(window.hwnd),
+        3,
+        "new options search everything"
+    );
+}
+
+#[test]
+fn an_invalid_regex_shows_its_error_keeps_the_results_and_runs_nothing() {
+    // Break caught: a regex typo blanking the list, running a search anyway, or showing no
+    // reason.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-bad-regex");
+    scratch.note("a.md", "ab here");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "ab");
+    let before = search_generation(window.hwnd);
+    crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+    wait_for_search(window.hwnd, before);
+    assert!(crate::window::search_view::options(window.hwnd).regex);
+    assert_eq!(search_rows(window.hwnd).len(), 1);
+
+    type_into_search(window.hwnd, "(ab");
+    pump_until(window.hwnd, || {
+        matches!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::PatternError(_)
+        )
+    });
+    let (message, error) = crate::window::search_view::summary(window.hwnd).unwrap();
+    assert!(error, "shown as an error");
+    assert!(!message.is_empty());
+    assert_eq!(
+        search_rows(window.hwnd).len(),
+        1,
+        "the previous results stay"
+    );
+    assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+
+    search_for(window.hwnd, "(ab)");
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some(("1 note".to_owned(), false))
+    );
+}
+
+#[test]
+fn one_character_says_type_at_least_two_and_clears_the_results() {
+    // Break caught: a one-letter query reading the whole notebook, or the last query's rows
+    // left under a query they don't match.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-short");
+    scratch.note("a.md", "ab");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "ab");
+    assert_eq!(search_rows(window.hwnd).len(), 1);
+
+    type_into_search(window.hwnd, "a");
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::TooShort
+    );
+    assert!(search_rows(window.hwnd).is_empty());
+    assert_eq!(
+        crate::window::search_view::summary(window.hwnd),
+        Some((crate::window::search_view::TOO_SHORT.to_owned(), false))
+    );
+    assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+    // A second character clears "Type at least 2 characters." at once, not after the debounce.
+    type_into_search(window.hwnd, "ab");
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::Idle
+    );
+    assert_eq!(crate::window::search_view::summary(window.hwnd), None);
+    type_into_search(window.hwnd, "  ");
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::Idle
+    );
+    assert_eq!(crate::window::search_view::summary(window.hwnd), None);
+    // Run directly (as a toggle or Ctrl+Shift+F would), a query of spaces still runs nothing.
+    let before = search_generation(window.hwnd);
+    crate::window::text_search_host::run_now(window.hwnd);
+    assert!(crate::window::text_search_host::cancel_flag(window.hwnd).is_none());
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::Idle
+    );
+    pump_posted_messages(window.hwnd);
+    assert_ne!(search_generation(window.hwnd), before, "it only cancelled");
+    assert!(search_rows(window.hwnd).is_empty());
+}
+
+#[test]
+fn show_with_query_fills_the_box_escapes_it_for_regex_and_runs_at_once() {
+    // Break caught: Ctrl+Shift+F's selection waiting out the debounce, or "1+1" searched as
+    // a regex (one or more 1s, then 1) when regex is on.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-prefill");
+    scratch.note("a.md", "costs 1+1 here");
+    scratch.note("b.md", "costs 11 here");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    let before = search_generation(window.hwnd);
+    crate::window::search_view::show_with_query(window.hwnd, "1+1");
+    assert!(
+        matches!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::Running(_)
+                | crate::window::search_view::SearchState::Done { .. }
+        ),
+        "running without the debounce"
+    );
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![search_row("a", "costs 1+1 here")]
+    );
+
+    let before = search_generation(window.hwnd);
+    crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Regex);
+    wait_for_search(window.hwnd, before);
+    let before = search_generation(window.hwnd);
+    crate::window::search_view::show_with_query(window.hwnd, "1+1");
+    wait_for_search(window.hwnd, before);
+    let (query, options) = crate::window::search_view::current_query(window.hwnd).unwrap();
+    assert!(options.regex);
+    assert_eq!(query, r"1\+1");
+    assert_eq!(
+        crate::window::search_view::run_query(window.hwnd),
+        Some((query, options)),
+        "the results are for the escaped query, with regex on"
+    );
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![search_row("a", "costs 1+1 here")]
+    );
+}
+
+#[test]
+fn a_rescan_during_a_search_keeps_its_end_from_narrowing_the_next_one() {
+    // Break caught: a search still running when a rescan installs recording its pre-rescan
+    // hits for narrowing, so the next longer query misses a note edited outside FastPad.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-rescan-narrow");
+    scratch.note("a.md", "needle");
+    scratch.note("b.md", "needles");
+    scratch.note("c.md", "other");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "need");
+    crate::window::text_search_host::run_now(window.hwnd);
+    // The rescan lands while that search runs; then its end arrives.
+    crate::window::text_search_host::notes_reloaded(window.hwnd);
+    let end = crate::window::text_search_host::test_batch(
+        search_generation(window.hwnd),
+        Vec::new(),
+        Some(crate::library::text_search::RunEnd::Completed),
+    );
+    crate::window::text_search_host::batch_arrived(window.hwnd, end);
+
+    type_into_search(window.hwnd, "needl");
+    let before = search_generation(window.hwnd);
+    crate::window::text_search_host::run_now(window.hwnd);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        searched_total(window.hwnd),
+        3,
+        "every note, not the old hits"
+    );
+}
+
+#[test]
+fn a_save_of_a_listed_note_ends_narrowing() {
+    // Break caught: a longer query narrowed to the hits found before FastPad saved a new
+    // phrase into a clean note, so the note is never found.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-save-narrow");
+    let x = scratch.note("x.md", "nothing");
+    scratch.note("y.md", "foo bar");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "foo");
+    assert_eq!(search_rows(window.hwnd), vec![search_row("y", "foo bar")]);
+    super::open_path(window.hwnd, &x).unwrap();
+    pump_posted_messages(window.hwnd);
+    editor.set_text("food here").unwrap();
+    assert!(super::save_active_document(window.hwnd));
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+
+    search_for(window.hwnd, "food");
+    assert_eq!(search_rows(window.hwnd), vec![search_row("x", "food here")]);
+}
+
+#[test]
+fn a_narrowed_search_still_counts_the_notes_the_last_one_skipped() {
+    // Break caught: narrowing to the last hits only, so "1 note wasn't searched" disappears
+    // and a note that couldn't be read is never tried again.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-narrow-skipped");
+    scratch.note("a.md", "needle");
+    scratch.note("b.md", "needles");
+    let cloud = scratch.note("c.md", "needle in the cloud");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    let relative = crate::library::record_path(&scratch.folder(), &cloud);
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        for note in state.notes.iter_mut() {
+            note.online_only = note.path == relative;
+        }
+    });
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    let skipped = |hwnd| match search_state(hwnd) {
+        crate::window::search_view::SearchState::Done { progress, .. } => progress.skipped_total(),
+        other => panic!("the search has not finished: {other:?}"),
+    };
+    search_for(window.hwnd, "need");
+    assert_eq!((searched_total(window.hwnd), skipped(window.hwnd)), (3, 1));
+    search_for(window.hwnd, "needl");
+    assert_eq!(
+        (searched_total(window.hwnd), skipped(window.hwnd)),
+        (3, 1),
+        "the two hits and the skipped note"
+    );
+}
+
+#[test]
+fn the_debounce_waits_out_a_modal_loop_and_a_file_population() {
+    // Break caught: the timer firing inside a nested modal loop or while a file is being
+    // populated, and swapping editor documents under it to read the dirty tabs.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-modal");
+    scratch.note("a.md", "needle");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    type_into_search(window.hwnd, "needle");
+    let before = search_generation(window.hwnd);
+    crate::window::answer_next_confirm(|hwnd| {
+        crate::window::text_search_host::timer(hwnd);
+        true
+    });
+    assert!(crate::window::modal::confirm(window.hwnd, "Go on?"));
+    assert!(
+        crate::window::text_search_host::cancel_flag(window.hwnd).is_none(),
+        "nothing ran inside the modal loop"
+    );
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::Idle
+    );
+
+    app_mut(window.hwnd).populating_file = true;
+    crate::window::text_search_host::timer(window.hwnd);
+    app_mut(window.hwnd).populating_file = false;
+    assert!(
+        crate::window::text_search_host::cancel_flag(window.hwnd).is_none(),
+        "nothing ran during the population"
+    );
+    // The timer is still armed: the search runs once both are over.
+    wait_for_search(window.hwnd, before);
+    assert_eq!(search_rows(window.hwnd), vec![search_row("a", "needle")]);
+}
+
+#[test]
+fn closing_the_window_cancels_a_running_search() {
+    // Break caught: a worker reading a large notebook on after its window closed.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-destroy");
+    for index in 0..200 {
+        scratch.note(&format!("n{index}.md"), "needle");
+    }
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    type_into_search(window.hwnd, "needle");
+    crate::window::text_search_host::run_now(window.hwnd);
+    let flag = crate::window::text_search_host::cancel_flag(window.hwnd).expect("running");
+    unsafe {
+        DestroyWindow(window.hwnd);
+    }
+    assert!(flag.load(Ordering::Relaxed));
+}
+
+/// The search field's toggle rectangles in the Search view's panel.
+fn search_toggles(hwnd: HWND) -> (HWND, [RECT; 3]) {
+    let panel = sidebar_panel(hwnd);
+    let mut client = RECT::default();
+    unsafe { GetClientRect(panel, &mut client) };
+    let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+    let field = crate::window::search_view::SearchView::field_rect(client, dpi);
+    (
+        panel,
+        crate::window::option_toggles::toggle_rects(field, dpi),
+    )
+}
+
+const ALT_DOWN: LPARAM = 1 << 29;
+
+#[test]
+fn the_toggles_change_by_click_and_by_alt_keys_in_the_box_and_the_results() {
+    // Break caught: toggles that paint but ignore clicks, Alt+C/W/R going to the menu band
+    // instead of flipping the option, a toggle that flips it without searching again, or a
+    // regex error with no line saying so.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-toggles");
+    scratch.note("A.md", "Needle");
+    scratch.note("b.md", "needle");
+    scratch.note("c.md", "needles");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "needle");
+    assert_eq!(search_rows(window.hwnd).len(), 3);
+    let dpi = unsafe { GetDpiForWindow(sidebar_panel(window.hwnd)) }.max(96);
+    assert_eq!(
+        app_mut(window.hwnd)
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .search
+            .list
+            .row_height,
+        crate::window::panel::scale(42, dpi),
+        "two-line rows"
+    );
+    let options = || crate::window::search_view::options(window.hwnd);
+
+    // A click on Match case.
+    let (panel, rects) = search_toggles(window.hwnd);
+    let center = |rect: RECT| {
+        ((((rect.top + rect.bottom) / 2) as u32) << 16 | ((rect.left + rect.right) / 2) as u32)
+            as LPARAM
+    };
+    let before = search_generation(window.hwnd);
+    unsafe {
+        SendMessageW(panel, WM_LBUTTONDOWN, 0, center(rects[0]));
+        SendMessageW(panel, WM_LBUTTONUP, 0, center(rects[0]));
+    }
+    assert!(options().case);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![search_row("b", "needle"), search_row("c", "needles")]
+    );
+
+    // Alt+C in the box turns it off again.
+    let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    let before = search_generation(window.hwnd);
+    unsafe { SendMessageW(edit, WM_SYSKEYDOWN, usize::from(b'C'), ALT_DOWN) };
+    assert!(!options().case);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(search_rows(window.hwnd).len(), 3);
+    // The character that follows is swallowed, not handed to the menu band.
+    assert_eq!(
+        unsafe { SendMessageW(edit, WM_SYSCHAR, usize::from(b'c'), ALT_DOWN) },
+        0
+    );
+    assert!(app_mut(window.hwnd).menu_mode.is_none());
+
+    // Alt+W in the results: whole word drops "needles".
+    let before = search_generation(window.hwnd);
+    unsafe { SendMessageW(panel, WM_SYSKEYDOWN, usize::from(b'W'), ALT_DOWN) };
+    assert!(options().whole_word);
+    wait_for_search(window.hwnd, before);
+    assert_eq!(
+        search_rows(window.hwnd),
+        vec![search_row("A", "Needle"), search_row("b", "needle")]
+    );
+    // Without Alt held (F10 also sends WM_SYSKEYDOWN), nothing flips.
+    unsafe { SendMessageW(panel, WM_SYSKEYDOWN, usize::from(b'W'), 0) };
+    assert!(options().whole_word);
+
+    // Alt+R; an invalid pattern shows its error in place of the summary and keeps the rows.
+    let before = search_generation(window.hwnd);
+    unsafe { SendMessageW(edit, WM_SYSKEYDOWN, usize::from(b'R'), ALT_DOWN) };
+    assert!(options().regex);
+    wait_for_search(window.hwnd, before);
+    type_into_search(window.hwnd, "need(le");
+    pump_until(window.hwnd, || {
+        matches!(
+            search_state(window.hwnd),
+            crate::window::search_view::SearchState::PatternError(_)
+        )
+    });
+    let (message, error) = crate::window::search_view::summary(window.hwnd).unwrap();
+    assert!(error && !message.is_empty(), "{message}");
+    assert_eq!(
+        search_rows(window.hwnd).len(),
+        2,
+        "the previous results stay"
+    );
+}
+
+#[test]
+fn esc_in_the_search_box_clears_it_and_then_returns_to_the_editor() {
+    // Break caught: Esc leaving the query in place, or jumping to the editor with text still
+    // in the box.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-escape");
+    scratch.note("a.md", "ab");
+    let window = shown_window();
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(window.hwnd, "ab");
+    let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    unsafe { SetFocus(edit) };
+
+    unsafe { SendMessageW(edit, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    assert_eq!(unsafe { GetWindowTextLengthW(edit) }, 0);
+    assert!(search_rows(window.hwnd).is_empty());
+    assert_eq!(
+        search_state(window.hwnd),
+        crate::window::search_view::SearchState::Idle
+    );
+    assert_eq!(focused(), edit, "the first Esc only clears");
+
+    unsafe { SendMessageW(edit, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    assert_eq!(
+        focused(),
+        editor.hwnd(),
+        "Esc in the empty box goes to the editor"
+    );
+}
+
+#[test]
+fn with_no_notebook_the_search_box_and_its_toggles_still_work() {
+    // Break caught: the options impossible to set until a notebook opens.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    assert_eq!(
+        crate::window::search_view::status(window.hwnd),
+        Some(crate::window::search_view::NO_NOTEBOOK)
+    );
+    let edit = crate::window::search_view::edit_hwnd(window.hwnd).expect("the box shows");
+    unsafe { SendMessageW(edit, WM_SYSKEYDOWN, usize::from(b'C'), ALT_DOWN) };
+    assert!(crate::window::search_view::options(window.hwnd).case);
+}
+
+#[test]
+fn the_search_field_is_client_area_and_a_press_on_its_padding_focuses_the_box() {
+    // Break caught: a press on the field's border or padding starting a window drag (the
+    // whole Search header answered HTTRANSPARENT), so the box could only be focused by
+    // hitting its text line exactly.
+    use windows_sys::Win32::Foundation::{LPARAM, POINT};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTTRANSPARENT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCHITTEST,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-field-client");
+    scratch.note("plan.md", "p");
+    let window = shown_window();
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    let panel = sidebar_panel(window.hwnd);
+    let mut client = RECT::default();
+    unsafe { GetClientRect(panel, &mut client) };
+    let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
+    let field = crate::window::search_view::SearchView::field_rect(client, dpi);
+    let hit_test = |x: i32, y: i32| {
+        let mut point = POINT { x, y };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(panel, &mut point) };
+        let lparam = ((point.y as u16 as u32) << 16 | point.x as u16 as u32) as LPARAM;
+        unsafe { SendMessageW(panel, WM_NCHITTEST, 0, lparam) }
+    };
+    // The field's top-left padding, outside the Edit, and the header left of the field.
+    assert_ne!(
+        hit_test(field.left + 1, field.top + 1),
+        HTTRANSPARENT as LRESULT,
+        "the field is client area"
+    );
+    assert_eq!(
+        hit_test(field.left - 2, field.top + 1),
+        HTTRANSPARENT as LRESULT,
+        "the header around the field still drags the window"
+    );
+
+    let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    unsafe { SetFocus(window.hwnd) };
+    let lparam = (((field.top + 1) as u32) << 16 | (field.left + 1) as u32) as LPARAM;
+    unsafe {
+        SendMessageW(panel, WM_LBUTTONDOWN, 0, lparam);
+        SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
+    }
+    assert_eq!(
+        unsafe { GetFocus() },
+        edit,
+        "the press put the caret in the box"
+    );
+}
+
+#[test]
+fn with_no_notebook_the_search_view_says_to_open_one() {
+    // Break caught: an empty Search view with a live box that searches nothing.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    assert_eq!(
+        crate::window::search_view::status(window.hwnd),
+        Some(crate::window::search_view::NO_NOTEBOOK)
+    );
+}
+
+#[test]
+fn a_favorite_opens_from_the_favorites_view_and_its_menu_removes_it() {
+    // Break caught: a click on a favorite not switching the notebook or leaving the Favorites
+    // view up, or "Remove from favorites" in the row menu doing nothing.
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("favorites-a");
+    let second = LibraryScratch::new("favorites-b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(first.data());
+    second.install(window.hwnd);
+    crate::window::library_host::toggle_notebook_favorite(window.hwnd);
+    first.install(window.hwnd);
+    use crate::config::SidebarView;
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Favorites, true);
+    let rows = crate::window::favorites_view::shown_rows(window.hwnd);
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].open);
+
+    crate::window::favorites_view::run(
+        window.hwnd,
+        crate::window::favorites_view::FavoriteAction::Open(second.folder()),
+        true,
+    );
+    // The folder is checked on a worker; the view switches once the notebook is open.
+    pump_until(window.hwnd, || {
+        crate::window::side_panel::current_view(window.hwnd) == SidebarView::Notebook
+    });
+    assert!(crate::library::model::same_path(
+        &crate::window::library_host::folder(window.hwnd).unwrap(),
+        &second.folder()
+    ));
+
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Favorites, true);
+    let panel = sidebar_panel(window.hwnd);
+    unsafe {
+        SendMessageW(
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            0x24,
+            0,
+        );
+    }
+    crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::ToggleNotebookFavorite));
+    // Shift+F10 arrives as WM_CONTEXTMENU with (-1, -1).
+    unsafe {
+        SendMessageW(
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU,
+            panel as usize,
+            0xffff_ffff,
+        );
+    }
+    assert!(crate::window::favorites_view::shown_rows(window.hwnd).is_empty());
+}
+
+#[test]
+fn ctrl_comma_and_edit_settings_file_run_from_the_command_table() {
+    // Break caught: OpenSettings or EditSettingsFile falling through to `App::execute`,
+    // which ignores them.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("settings-commands");
+    let ini = scratch.path().join("fastpad.ini");
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = shown.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| {
+        seen.set(true);
+        unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    });
+    execute_command(window.hwnd, CommandId::OpenSettings);
+    assert!(shown.get());
+
+    execute_command(window.hwnd, CommandId::EditSettingsFile);
+    assert!(app_mut(window.hwnd).tabs.find_path(&ini).is_some());
+    super::save_settings_to(None);
+}
+
+#[test]
+fn open_keyboard_shortcuts_opens_settings_on_the_shortcuts_page() {
+    // Break caught: the palette command opening Settings on General, or not at all.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+    let window = ProductionWindow::new(make_app());
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        assert_eq!(
+            crate::window::settings_dialog::current_page(dialog),
+            Some(crate::window::settings_model::Page::Shortcuts)
+        );
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+    super::execute_command(window.hwnd, CommandId::OpenKeyboardShortcuts);
+    assert_eq!(
+        crate::window::settings_dialog::open_dialog(window.hwnd),
+        None
+    );
+}
+
+#[test]
+fn the_wheel_on_the_shortcuts_page_scrolls_the_table() {
+    // Break caught: the wheel scrolling General's hidden cards while the table stays put.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, SendMessageW, WM_KEYDOWN, WM_MOUSEWHEEL,
+    };
+    let window = ProductionWindow::new(make_app());
+    let tops = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let seen = tops.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let top = || crate::window::settings_dialog::shortcuts_model(dialog).map(|m| m.top);
+        seen.borrow_mut().push(top());
+        // One notch down, then one back up.
+        for delta in [-120i16, 120] {
+            SendMessageW(dialog, WM_MOUSEWHEEL, usize::from(delta as u16) << 16, 0);
+            seen.borrow_mut().push(top());
+        }
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    assert_eq!(*tops.borrow(), [Some(0), Some(3), Some(0)]);
+}
+
+#[test]
+fn settings_remembers_the_size_it_was_dragged_to_and_shows_sizing_cursors() {
+    // Break caught: Settings reopening at its default size after the user sized it, a move
+    // (no resize) rewriting fastpad.ini, or the arrow cursor over the edges hiding that they
+    // size the dialog.
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursor, GetWindowRect, HTRIGHT, IDC_SIZEWE, LoadCursorW, PostMessageW, SWP_NOMOVE,
+        SWP_NOZORDER, SendMessageW, SetWindowPos, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEMOVE,
+        WM_SETCURSOR,
+    };
+    let scratch = RecoveryScratch::new("settings-size");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let sizing_cursor = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = sizing_cursor.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        SendMessageW(
+            dialog,
+            WM_SETCURSOR,
+            dialog as usize,
+            ((WM_MOUSEMOVE as isize) << 16) | HTRIGHT as isize,
+        );
+        seen.set(GetCursor() == LoadCursorW(std::ptr::null_mut(), IDC_SIZEWE));
+        // A drag that ends where it began only moved it: nothing is written.
+        SendMessageW(dialog, WM_EXITSIZEMOVE, 0, 0);
+        SetWindowPos(
+            dialog,
+            std::ptr::null_mut(),
+            0,
+            0,
+            700,
+            500,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
+        SendMessageW(dialog, WM_EXITSIZEMOVE, 0, 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+    let saved = || std::fs::read_to_string(&ini).unwrap();
+    let before = std::cell::Cell::new(String::new());
+    super::show_settings(window.hwnd);
+    before.set(saved());
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+    let size = std::rc::Rc::new(std::cell::Cell::new((0, 0)));
+    let reopened = size.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(dialog, &mut rect);
+        reopened.set((rect.right - rect.left, rect.bottom - rect.top));
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+    super::show_settings(window.hwnd);
+    super::save_settings_to(None);
+    assert!(sizing_cursor.get(), "the edge shows the sizing cursor");
+    let expected = |pixels: i32| (pixels * 96 + dpi as i32 / 2) / dpi as i32;
+    assert_eq!(
+        before.take(),
+        format!(
+            "# kept\r\nsettings_size={}x{}\r\n",
+            expected(700),
+            expected(500)
+        )
+    );
+    assert_eq!(
+        app_mut(window.hwnd).settings.settings_size,
+        Some((expected(700) as u16, expected(500) as u16))
+    );
+    assert_eq!(size.get(), (700, 500), "reopens at the saved size");
+}
+
+#[test]
+fn resizing_settings_lays_out_the_table_and_the_search_field_again() {
+    // Break caught: a Settings dialog that can't be sized, or one whose table and search
+    // field keep their opening size (rows cut off, or space under the last row) after it is.
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongW, GetWindowRect, PostMessageW, SWP_NOMOVE, SWP_NOZORDER,
+        SetWindowPos, WM_KEYDOWN, WS_THICKFRAME,
+    };
+    let window = ProductionWindow::new(make_app());
+    let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let record = seen.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let sizable = GetWindowLongW(dialog, GWL_STYLE) as u32 & WS_THICKFRAME != 0;
+        let measure = || {
+            let visible = crate::window::settings_dialog::shortcuts_model(dialog)
+                .map_or(0, |model| model.visible);
+            let mut dialog_rect = RECT::default();
+            let mut field = RECT::default();
+            GetWindowRect(dialog, &mut dialog_rect);
+            GetWindowRect(
+                crate::window::settings_dialog::search_hwnd(dialog),
+                &mut field,
+            );
+            (
+                visible,
+                field.right - field.left,
+                dialog_rect.right - dialog_rect.left,
+            )
+        };
+        // Small enough to fit a 1024 px wide screen (a CI runner's) from the 860 px opening
+        // width: the system holds a window to the screen, so a bigger step would come up short.
+        const GROWTH: i32 = 100;
+        let before = measure();
+        let (_, _, width) = before;
+        SetWindowPos(
+            dialog,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width + GROWTH,
+            900,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
+        let bigger = measure();
+        // Far below the minimum: held at it.
+        SetWindowPos(
+            dialog,
+            std::ptr::null_mut(),
+            0,
+            0,
+            100,
+            100,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
+        let smallest = measure();
+        record
+            .borrow_mut()
+            .push((sizable, before, bigger, smallest));
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    let seen = seen.borrow();
+    let (sizable, before, bigger, smallest) = seen[0];
+    assert!(sizable, "the dialog has a sizing frame");
+    assert!(bigger.0 > before.0, "a taller dialog shows more rows");
+    assert_eq!(
+        bigger.1,
+        before.1 + 100,
+        "the search field widens with the dialog"
+    );
+    assert!(smallest.2 > 100, "held at a minimum width");
+    assert!(smallest.0 >= 1 && smallest.1 > 0, "still a row and a field");
+}
+
+#[test]
+fn small_wheel_deltas_add_up_to_whole_rows_on_the_shortcuts_page() {
+    // Break caught: a touchpad's small deltas each rounding to zero rows, so slow scrolling
+    // never moves the table; or a leftover from one direction eating the first reverse step.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, SendMessageW, WM_KEYDOWN, WM_MOUSEWHEEL,
+    };
+    let window = ProductionWindow::new(make_app());
+    let tops = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let seen = tops.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let top = || crate::window::settings_dialog::shortcuts_model(dialog).map(|m| m.top);
+        let wheel = |delta: i16| {
+            SendMessageW(dialog, WM_MOUSEWHEEL, usize::from(delta as u16) << 16, 0);
+        };
+        // Four quarter notches down: one notch, three rows.
+        for _ in 0..4 {
+            wheel(-30);
+        }
+        seen.borrow_mut().push(top());
+        // A leftover third of a row down, then one notch up: exactly three rows back.
+        wheel(-30);
+        wheel(120);
+        seen.borrow_mut().push(top());
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    assert_eq!(*tops.borrow(), [Some(3), Some(0)]);
+}
+
+#[test]
+fn a_double_click_on_a_row_opens_the_recording_box_and_f9_rebinds_it() {
+    // Break caught: rows that select but never open the box, or a confirmed key that the
+    // window never applies.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F9, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    };
+    let scratch = RecoveryScratch::new("shortcuts-double-click");
+    let ini = scratch.path().join("fastpad.ini");
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let (x, y) = crate::window::settings_dialog::page_row_point(dialog, 0);
+        let at = ((y as isize) << 16 | (x as isize & 0xffff)) as LPARAM;
+        for _ in 0..2 {
+            PostMessageW(dialog, WM_LBUTTONDOWN, 1, at);
+            PostMessageW(dialog, WM_LBUTTONUP, 0, at);
+        }
+        let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+        key(VK_F9);
+        key(VK_RETURN);
+        key(VK_ESCAPE);
+        // Should the box never open, Escape only closes it: this ends the dialog anyway, so
+        // the test fails instead of hanging.
+        PostMessageW(dialog, WM_CLOSE, 0, 0);
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    let first = crate::window::shortcuts_model::ShortcutsModel::new(
+        crate::window::keymap::Keymap::defaults(),
+        1,
+    )
+    .rows[0]
+        .clone();
+    assert_eq!(
+        app_mut(window.hwnd)
+            .keymap
+            .keys_of(first.command)
+            .last()
+            .map(|stroke| stroke.text())
+            .as_deref(),
+        Some("F9")
+    );
+    super::save_settings_to(None);
+    assert!(
+        std::fs::read_to_string(&ini)
+            .unwrap()
+            .contains(&format!("key.{}=", first.id))
+    );
+}
+
+#[test]
+fn typing_in_the_search_filters_and_down_enters_the_table() {
+    // Break caught: EN_CHANGE not reaching the model, or Down leaving the focus in the field.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
+    let window = ProductionWindow::new(make_app());
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let record = seen.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        for c in "save as".chars() {
+            PostMessageW(search, WM_CHAR, c as usize, 0);
+        }
+        PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        // Read the state from inside the loop, before Escape closes the dialog.
+        crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+            *record.borrow_mut() =
+                crate::window::settings_dialog::shortcuts_model(dialog).map(|model| {
+                    (
+                        model.rows.len(),
+                        model.rows[0].command,
+                        crate::window::settings_dialog::current_focus(dialog),
+                    )
+                });
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    let (count, command, focus) = seen.borrow().unwrap();
+    assert_eq!((count, command), (1, CommandId::SaveAs));
+    assert_eq!(focus, Some(crate::window::settings_model::Focus::Table));
+}
+
+#[test]
+fn record_keys_search_shows_only_the_stroke() {
+    // Break caught: record-keys mode letting the key's character into the field ("Ss").
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextW, PostMessageW, WM_CHAR, WM_KEYDOWN,
+    };
+    let window = ProductionWindow::new(make_app());
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let record = seen.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        crate::window::settings_dialog::toggle_record_keys_for_test(dialog);
+        PostMessageW(search, WM_KEYDOWN, usize::from(b'S'), 0);
+        PostMessageW(search, WM_CHAR, usize::from(b's'), 0);
+        crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+            let mut buffer = [0u16; 64];
+            let length = GetWindowTextW(search, buffer.as_mut_ptr(), 64);
+            *record.borrow_mut() = String::from_utf16_lossy(&buffer[..length as usize]);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    assert_eq!(seen.borrow().as_str(), "S");
+}
+
+#[test]
+fn delete_unbinds_and_the_context_menus_reset_restores_the_defaults() {
+    // Break caught: Reset offered for default rows, or leaving `key.file.saveAs=` behind.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_DOWN, VK_ESCAPE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_CHAR, WM_KEYDOWN, WM_RBUTTONUP,
+    };
+    let scratch = RecoveryScratch::new("shortcuts-reset");
+    let ini = scratch.path().join("fastpad.ini");
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let record = offered.clone();
+    crate::window::menus::answer_next_choice(move |items| {
+        *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+        items
+            .iter()
+            .find(|(label, _)| label.starts_with("Reset"))
+            .map(|(_, id)| *id)
+    });
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        for c in "save as".chars() {
+            PostMessageW(search, WM_CHAR, c as usize, 0);
+        }
+        PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_DELETE), 0);
+        crate::window::settings_dialog::answer_in_loop(dialog, |dialog| {
+            let (x, y) = crate::window::settings_dialog::page_row_point(dialog, 0);
+            PostMessageW(
+                dialog,
+                WM_RBUTTONUP,
+                0,
+                ((y as isize) << 16 | (x as isize & 0xffff)) as LPARAM,
+            );
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    assert!(
+        offered
+            .borrow()
+            .iter()
+            .any(|label| label.starts_with("Reset"))
+    );
+    assert!(
+        !offered
+            .borrow()
+            .iter()
+            .any(|label| label.starts_with("Remove")),
+        "the row has no key to remove"
+    );
+    assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::SaveAs));
+    super::save_settings_to(None);
+    assert_eq!(std::fs::read_to_string(&ini).unwrap_or_default(), "");
+}
+
+#[test]
+fn recording_sees_f10_and_refuses_it() {
+    // Break caught: F10 (a WM_SYSKEYDOWN) opening the dialog's system menu or beeping
+    // instead of reaching the recording box.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_F10, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN, WM_SYSKEYDOWN};
+    let window = ProductionWindow::new(make_app());
+    let refusal = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let record = refusal.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+        PostMessageW(dialog, WM_SYSKEYDOWN, usize::from(VK_F10), 0);
+        crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+            *record.borrow_mut() = crate::window::settings_dialog::shortcuts_model(dialog)
+                .and_then(|model| model.recording)
+                .and_then(|recording| recording.refusal);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    assert_eq!(*refusal.borrow(), Some("F10 and Shift+F10 open the menus."));
+}
+
+#[test]
+fn a_click_on_the_search_field_cancels_the_recording_box() {
+    // Break caught: a click on the search field focusing it behind the open recording box,
+    // so typing filters the table and Escape closes the dialog instead of the box.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    };
+    let window = ProductionWindow::new(make_app());
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let record = seen.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+        crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+            let open = crate::window::settings_dialog::shortcuts_model(dialog)
+                .is_some_and(|model| model.recording.is_some());
+            PostMessageW(search, WM_LBUTTONDOWN, 1, 0x0005_0005);
+            PostMessageW(search, WM_LBUTTONUP, 0, 0x0005_0005);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let still_open = crate::window::settings_dialog::shortcuts_model(dialog)
+                    .is_some_and(|model| model.recording.is_some());
+                *record.borrow_mut() = Some((open, still_open));
+                // With the box still open (the break), this Escape closes the dialog anyway.
+                PostMessageW(search, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+            });
+        });
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    assert_eq!(*seen.borrow(), Some((true, false)));
+}
+
+#[test]
+fn record_keys_turned_on_from_the_table_moves_the_focus_to_the_search_field() {
+    // Break caught: Alt+K from the table turning record-keys on with the focus left on the
+    // table, so the next stroke goes to the table (and Escape closes the dialog) instead of
+    // being recorded in the field. Alt can't be posted, so the hook runs Alt+K's own path.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_DOWN, VK_ESCAPE, VK_F9};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextW, PostMessageW, WM_CLOSE, WM_KEYDOWN,
+    };
+    let window = ProductionWindow::new(make_app());
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let record = seen.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+            let before = crate::window::settings_dialog::current_focus(dialog);
+            crate::window::settings_dialog::toggle_record_keys_for_test(dialog);
+            // The stroke goes wherever the keyboard focus is, as a real key would.
+            let focused = GetFocus();
+            PostMessageW(focused, WM_KEYDOWN, usize::from(VK_F9), 0);
+            crate::window::settings_dialog::answer_in_loop(dialog, move |dialog| {
+                let mut buffer = [0u16; 64];
+                let length = GetWindowTextW(search, buffer.as_mut_ptr(), 64);
+                *record.borrow_mut() = Some((
+                    before,
+                    focused == search,
+                    crate::window::settings_dialog::current_focus(dialog),
+                    String::from_utf16_lossy(&buffer[..length as usize]),
+                ));
+                // Escape leaves record-keys; the second closes the dialog.
+                PostMessageW(GetFocus(), WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+                PostMessageW(dialog, WM_CLOSE, 0, 0);
+            });
+        });
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    let (before, focused, focus, text) = seen.borrow().clone().unwrap();
+    assert_eq!(before, Some(crate::window::settings_model::Focus::Table));
+    assert!(focused, "the search field does not have the keyboard focus");
+    assert_eq!(focus, Some(crate::window::settings_model::Focus::Search));
+    assert_eq!(text, "F9");
+}
+
+#[test]
+fn the_context_menu_key_opens_the_row_menu_and_resets() {
+    // Break caught: the row menu reachable only by right-click, so a keyboard user can't
+    // reset a command's keys; or the key opening a menu of its own besides the one its
+    // WM_CONTEXTMENU opens.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_APPS, VK_DELETE, VK_DOWN, VK_ESCAPE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN, WM_KEYUP,
+    };
+    let scratch = RecoveryScratch::new("shortcuts-apps-key");
+    super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+    let window = ProductionWindow::new(make_app());
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let record = offered.clone();
+    crate::window::menus::answer_next_choice(move |items| {
+        *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+        items
+            .iter()
+            .find(|(label, _)| label.starts_with("Reset"))
+            .map(|(_, id)| *id)
+    });
+    let again = std::rc::Rc::new(std::cell::Cell::new(false));
+    let second = again.clone();
+    crate::window::menus::answer_next_choice(move |_| {
+        second.set(true);
+        None
+    });
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        for c in "save as".chars() {
+            PostMessageW(search, WM_CHAR, c as usize, 0);
+        }
+        PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_DELETE), 0);
+        crate::window::settings_dialog::answer_in_loop(dialog, |dialog| {
+            // The key itself opens nothing; Windows follows it with a context menu with no
+            // point, which opens the menu once.
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_APPS), 0);
+            PostMessageW(dialog, WM_KEYUP, usize::from(VK_APPS), 0xC000_0001);
+            PostMessageW(dialog, WM_CONTEXTMENU, dialog as usize, -1isize as LPARAM);
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+        });
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    super::save_settings_to(None);
+    assert!(
+        offered
+            .borrow()
+            .iter()
+            .any(|label| label.starts_with("Reset")),
+        "no menu, or no Reset in it: {:?}",
+        offered.borrow()
+    );
+    assert!(!again.get(), "the menu opened twice");
+    assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::SaveAs));
+}
+
+#[test]
+fn an_ignored_key_line_can_be_reset_from_the_row_menu() {
+    // Break caught: `key.file.saveAs=Bogus` (ignored, so the keys are the defaults) offering
+    // no Reset, leaving the stale line in fastpad.ini for good.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN,
+    };
+    let scratch = RecoveryScratch::new("shortcuts-stale-line");
+    super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+    let window = ProductionWindow::new(make_app());
+    app_mut(window.hwnd)
+        .settings
+        .key_overrides
+        .insert("file.saveAs".into(), "Bogus".into());
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let record = offered.clone();
+    crate::window::menus::answer_next_choice(move |items| {
+        *record.borrow_mut() = items.iter().map(|(label, _)| label.clone()).collect();
+        items
+            .iter()
+            .find(|(label, _)| label.starts_with("Reset"))
+            .map(|(_, id)| *id)
+    });
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let search = crate::window::settings_dialog::search_hwnd(dialog);
+        for c in "save as".chars() {
+            PostMessageW(search, WM_CHAR, c as usize, 0);
+        }
+        PostMessageW(search, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        // Shift+F10's message: a context menu with no point.
+        PostMessageW(dialog, WM_CONTEXTMENU, dialog as usize, -1isize as LPARAM);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+    super::show_keyboard_shortcuts(window.hwnd);
+    super::save_settings_to(None);
+    assert!(
+        offered
+            .borrow()
+            .iter()
+            .any(|label| label.starts_with("Reset")),
+        "{:?}",
+        offered.borrow()
+    );
+    assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
+}
+
+#[test]
+fn f6_order_skips_a_closed_panel_and_a_missing_sidebar() {
+    // Break caught: F6 landing in a hidden panel, or getting stuck when notes mode is off.
+    use super::{FocusPart, next_focus_part};
+    assert_eq!(
+        next_focus_part(FocusPart::Group(0), false, true, true, 1),
+        FocusPart::ActivityBar
+    );
+    assert_eq!(
+        next_focus_part(FocusPart::ActivityBar, false, true, true, 1),
+        FocusPart::Panel
+    );
+    assert_eq!(
+        next_focus_part(FocusPart::Panel, false, true, true, 1),
+        FocusPart::Group(0)
+    );
+    assert_eq!(
+        next_focus_part(FocusPart::ActivityBar, true, true, true, 1),
+        FocusPart::Group(0)
+    );
+    assert_eq!(
+        next_focus_part(FocusPart::ActivityBar, false, true, false, 1),
+        FocusPart::Group(0)
+    );
+    assert_eq!(
+        next_focus_part(FocusPart::Group(0), false, false, false, 1),
+        FocusPart::Group(0)
+    );
+}
+
+#[test]
+fn f6_visits_every_group_in_order() {
+    // Break caught: F6 skipping every group after the first.
+    use super::FocusPart::*;
+    assert_eq!(
+        super::next_focus_part(Group(0), false, true, true, 3),
+        Group(1)
+    );
+    assert_eq!(
+        super::next_focus_part(Group(2), false, true, true, 3),
+        ActivityBar
+    );
+    assert_eq!(
+        super::next_focus_part(ActivityBar, true, true, true, 3),
+        Group(2)
+    );
+    assert_eq!(
+        super::next_focus_part(Group(0), false, false, false, 1),
+        Group(0)
+    );
+}
+
+fn focused() -> HWND {
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() }
+}
+
+fn shown_window() -> ProductionWindow {
+    let window = ProductionWindow::new(make_app());
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+            window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+        );
+    }
+    window
+}
+
+#[test]
+fn f6_cycles_activity_bar_panel_and_editor_and_shift_f6_goes_back() {
+    // Break caught: F6 doing nothing, skipping the panel, or leaving the focus in a closed
+    // panel.
+    let _scintilla = load_native_scintilla();
+    let window = shown_window();
+    let _editor = install_test_editor(&window);
+    let (bar, panel) = crate::window::side_panel::windows(window.hwnd).unwrap();
+    use crate::config::SidebarView;
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+    super::return_focus_to_editor(window.hwnd);
+    let editor = focused();
+
+    execute_command(window.hwnd, CommandId::FocusNextPane);
+    assert_eq!(focused(), bar);
+    execute_command(window.hwnd, CommandId::FocusNextPane);
+    assert_eq!(focused(), panel);
+    execute_command(window.hwnd, CommandId::FocusNextPane);
+    assert_eq!(focused(), editor);
+    execute_command(window.hwnd, CommandId::FocusPreviousPane);
+    assert_eq!(focused(), panel);
+
+    crate::window::side_panel::toggle(window.hwnd);
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        SidebarView::Hidden
+    );
+    super::return_focus_to_editor(window.hwnd);
+    execute_command(window.hwnd, CommandId::FocusNextPane);
+    assert_eq!(focused(), bar);
+    execute_command(window.hwnd, CommandId::FocusNextPane);
+    assert_eq!(focused(), editor, "a closed panel is skipped");
+}
+
+#[test]
+fn escape_in_the_panel_returns_the_focus_to_the_editor() {
+    // Break caught: Esc in the tree leaving the keyboard stuck in the sidebar.
+    let _scintilla = load_native_scintilla();
+    let window = shown_window();
+    let _editor = install_test_editor(&window);
+    super::return_focus_to_editor(window.hwnd);
+    let editor = focused();
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, true);
+    let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+    assert_eq!(focused(), panel);
+    unsafe {
+        SendMessageW(
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE as usize,
+            0,
+        );
+    }
+    assert_eq!(focused(), editor);
+}
+
+#[test]
+fn the_activity_bar_moves_with_arrows_and_presses_with_enter() {
+    // Break caught: activity-bar buttons reachable only with the mouse, or their pressed
+    // state not following the shown view.
+    let _scintilla = load_native_scintilla();
+    let window = shown_window();
+    let _editor = install_test_editor(&window);
+    use crate::config::SidebarView;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_DOWN, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
+    let bar = crate::window::side_panel::windows(window.hwnd).unwrap().0;
+    unsafe {
+        SetFocus(bar);
+    }
+    assert_eq!(crate::window::side_panel::bar_focus(window.hwnd), 0);
+    let items = crate::window::activity_bar::accessible_items(bar);
+    assert_eq!(items.len(), 4);
+    assert_ne!(
+        items[0].state & crate::window::sidebar_accessibility::STATE_PRESSED,
+        0
+    );
+    assert_ne!(
+        items[0].state & crate::window::sidebar_accessibility::STATE_FOCUSED,
+        0
+    );
+    assert_eq!(items[3].name, "Settings");
+
+    unsafe {
+        SendMessageW(bar, WM_KEYDOWN, VK_DOWN as usize, 0);
+    }
+    assert_eq!(crate::window::side_panel::bar_focus(window.hwnd), 1);
+    unsafe {
+        SendMessageW(bar, WM_KEYDOWN, VK_RETURN as usize, 0);
+    }
+    assert_eq!(
+        crate::window::side_panel::current_view(window.hwnd),
+        SidebarView::Search
+    );
+    let items = crate::window::activity_bar::accessible_items(bar);
+    assert_ne!(
+        items[1].state & crate::window::sidebar_accessibility::STATE_PRESSED,
+        0
+    );
+    assert_eq!(
+        items[0].state & crate::window::sidebar_accessibility::STATE_PRESSED,
+        0
+    );
+}
+
+#[test]
+fn the_panel_exposes_the_tree_as_an_outline_with_pinned_and_folder_states() {
+    // Break caught: the tree invisible to screen readers, the child count not matching the
+    // visible rows, or a pin and a collapsed folder not reported.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("tree-msaa");
+    let a = scratch.note("a.md", "a");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::library_host::toggle_pin(window.hwnd, &a);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+    let count = crate::window::side_panel::accessible_item_count(panel);
+    let items = (0..count)
+        .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), count);
+    let outline = items
+        .iter()
+        .filter(|item| item.role == windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM)
+        .collect::<Vec<_>>();
+    // The tree's rows are the outline items after the notebook's root row: the section rows
+    // (the Open Editors header and the root row) are at level 0, each with its rows under it.
+    let root = outline
+        .iter()
+        .position(|item| item.value == "0" && !item.name.starts_with("Open editors, "))
+        .expect("the notebook's root row");
+    let rows = &outline[root + 1..];
+    // "sub" is collapsed, so b is not a row: pinned a first, then the folder.
+    assert_eq!(rows.len(), 2, "{items:?}");
+    assert_eq!(rows[0].name, "a.md, Markdown, pinned");
+    assert_eq!(rows[1].name, "sub");
+    assert!(
+        rows.iter().all(|row| row.value == "1"),
+        "top-level rows sit one level under the root row: {items:?}"
+    );
+    assert_ne!(
+        rows[1].state & crate::window::sidebar_accessibility::STATE_COLLAPSED,
+        0
+    );
+
+    let provider = crate::window::sidebar_accessibility::create_for_test(
+        panel,
+        &crate::window::side_panel::PANEL_ACCESSIBLE,
+    );
+    let table = &crate::window::sidebar_accessibility::SIDEBAR_VTABLE;
+    use crate::window::accessibility::{RawVariant, VariantValue};
+    unsafe {
+        let mut children = 0;
+        (table.get_acc_child_count)(provider, &mut children);
+        assert_eq!(children as usize, count);
+        let mut role = RawVariant::empty();
+        (table.get_acc_role)(provider, RawVariant::integer(0), &mut role);
+        assert_eq!(
+            role.child_id(),
+            Some(windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINE as i32)
+        );
+        (table.release)(provider);
+    }
+}
+
+#[test]
+fn the_search_view_exposes_its_box_toggles_summary_and_results() {
+    // Break caught (spec §10): the search box missing from the panel's children (the
+    // sidebar PR's known limitation), toggles read as push buttons or without their checked
+    // state, or results named without their snippet.
+    use crate::window::accessibility::{AccessibleVtable, RawVariant, VariantValue};
+    use crate::window::sidebar_accessibility::{
+        SIDEBAR_VTABLE, STATE_CHECKED, create_for_test, take_raised,
+    };
+    use windows_sys::Win32::UI::Accessibility::{
+        ROLE_SYSTEM_CHECKBUTTON, ROLE_SYSTEM_LISTITEM, ROLE_SYSTEM_STATICTEXT, ROLE_SYSTEM_TEXT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_STATECHANGE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-msaa");
+    scratch.note("a.md", "one beta");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\b.md", "beta two");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    type_into_search(window.hwnd, "beta");
+    pump_until(window.hwnd, || {
+        crate::window::search_view::shown_results(window.hwnd).len() == 2
+            && matches!(
+                search_state(window.hwnd),
+                crate::window::search_view::SearchState::Done { .. }
+            )
+    });
+    let panel = sidebar_panel(window.hwnd);
+    let items = || {
+        (0..crate::window::side_panel::accessible_item_count(panel))
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .collect::<Vec<_>>()
+    };
+
+    let shown = items();
+    let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
+    assert_eq!(shown[0].role, ROLE_SYSTEM_TEXT, "{shown:?}");
+    assert_eq!(shown[0].window, edit);
+    assert_eq!(shown[0].value, "beta");
+    let toggles = shown[1..4]
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        toggles,
+        ["Match case", "Match whole word", "Use regular expression"]
+    );
+    assert!(
+        shown[1..4]
+            .iter()
+            .all(|item| item.role == ROLE_SYSTEM_CHECKBUTTON && item.state & STATE_CHECKED == 0)
+    );
+    // The chevron comes after the toggles, so the box and the toggles keep IDs 1 to 4.
+    assert_eq!(shown[4].name, "Toggle replace");
+    assert_eq!(shown[5].role, ROLE_SYSTEM_STATICTEXT);
+    assert_eq!(shown[5].name, "2 notes");
+    let results = shown
+        .iter()
+        .filter(|item| item.role == ROLE_SYSTEM_LISTITEM)
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(results, ["a: one beta", "b, sub: beta two"]);
+
+    take_raised();
+    crate::window::search_view::toggle_option(window.hwnd, crate::search::SearchOption::Case);
+    assert_ne!(items()[1].state & STATE_CHECKED, 0);
+    assert!(
+        take_raised().contains(&(panel as usize, EVENT_OBJECT_STATECHANGE, 2)),
+        "the Match case child (ID 2) raises a state change"
+    );
+
+    // The box's full object is the Edit's own.
+    let com = unsafe {
+        windows_sys::Win32::System::Com::CoInitializeEx(
+            std::ptr::null(),
+            windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
+        )
+    };
+    let provider = create_for_test(panel, &crate::window::side_panel::PANEL_ACCESSIBLE);
+    unsafe {
+        let mut object = std::ptr::null_mut();
+        let result = (SIDEBAR_VTABLE.get_acc_child)(provider, RawVariant::integer(1), &mut object);
+        assert_eq!(result, 0, "S_OK");
+        assert!(!object.is_null());
+        let vtable = *(object as *const *const AccessibleVtable);
+        ((*vtable).release)(object);
+        let mut none = std::ptr::null_mut();
+        assert_eq!(
+            (SIDEBAR_VTABLE.get_acc_child)(provider, RawVariant::integer(2), &mut none),
+            windows_sys::Win32::Foundation::S_FALSE
+        );
+        (SIDEBAR_VTABLE.release)(provider);
+    }
+    if com >= 0 {
+        unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+    }
+}
+
+#[test]
+fn the_summary_speaks_at_most_once_a_second_while_a_search_runs() {
+    // Break caught: a name change per batch (up to 20 a second) flooding the screen reader,
+    // or the final count swallowed by the limit.
+    use crate::library::text_search::{Progress, RunEnd, TextHit};
+    use crate::window::sidebar_accessibility::take_raised;
+    use crate::window::text_search_host::SearchBatch;
+    use windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_NAMECHANGE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("search-speak");
+    scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    let panel = sidebar_panel(window.hwnd);
+    let hit = |name: &str| TextHit {
+        path: std::path::PathBuf::from(format!("{name}.md")),
+        name: name.to_owned(),
+        folder: String::new(),
+        snippet: crate::search::Snippet {
+            text: "beta".to_owned(),
+            highlight: 0..4,
+        },
+        stamp: None,
+    };
+    let progress = |visited| Progress {
+        visited,
+        total: 100,
+        skipped: [0; 4],
+    };
+    let name_changes = || {
+        take_raised()
+            .into_iter()
+            .filter(|&(hwnd, event, _)| hwnd == panel as usize && event == EVENT_OBJECT_NAMECHANGE)
+            .count()
+    };
+    take_raised();
+
+    crate::window::search_view::begin_search(window.hwnd, "beta", 100);
+    for (visited, name) in [(10, "a"), (20, "b"), (30, "c")] {
+        crate::window::search_view::apply_batch(
+            window.hwnd,
+            SearchBatch {
+                generation: 0,
+                hits: vec![hit(name)],
+                progress: progress(visited),
+                end: None,
+                skipped: Vec::new(),
+            },
+        );
+    }
+    assert!(
+        name_changes() <= 2,
+        "one announcement (summary and status) at most"
+    );
+
+    crate::window::search_view::apply_batch(
+        window.hwnd,
+        SearchBatch {
+            generation: 0,
+            hits: Vec::new(),
+            progress: progress(100),
+            end: Some(RunEnd::Completed),
+            skipped: Vec::new(),
+        },
+    );
+    assert!(name_changes() >= 1, "the finished search is announced");
+}
+
+#[test]
+fn the_find_bar_exposes_its_fields_toggles_and_close_button() {
+    // Break caught: the find bar's toggles invisible to screen readers, a field's value read
+    // with WM_GETTEXT under the App borrow instead of kept, or a default action that doesn't
+    // flip a toggle.
+    use crate::window::find_bar::FIND_BAR_ACCESSIBLE;
+    use crate::window::sidebar_accessibility::{STATE_CHECKED, take_raised};
+    use windows_sys::Win32::UI::Accessibility::{
+        ROLE_SYSTEM_CHECKBUTTON, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TEXT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_STATECHANGE, SetWindowTextW, WM_SYSKEYDOWN,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::Find);
+    let (panel, query, replace) = {
+        let bar = app_mut(window.hwnd).find_bar().unwrap();
+        (bar.panel_hwnd(), bar.query_hwnd(), bar.replace_hwnd())
+    };
+    let items = || {
+        (0..(FIND_BAR_ACCESSIBLE.count)(panel))
+            .filter_map(|index| (FIND_BAR_ACCESSIBLE.item)(panel, index))
+            .collect::<Vec<_>>()
+    };
+
+    let shown = items();
+    let roles = shown.iter().map(|item| item.role).collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        [
+            ROLE_SYSTEM_TEXT,
+            ROLE_SYSTEM_CHECKBUTTON,
+            ROLE_SYSTEM_CHECKBUTTON,
+            ROLE_SYSTEM_CHECKBUTTON,
+            ROLE_SYSTEM_PUSHBUTTON
+        ]
+    );
+    assert_eq!(shown[0].window, query);
+    assert_eq!(shown[2].name, "Match whole word");
+    let typed = crate::platform::wide_null("needle");
+    unsafe { SetWindowTextW(query, typed.as_ptr()) };
+    assert_eq!(items()[0].value, "needle", "the field's kept text");
+
+    take_raised();
+    unsafe { SendMessageW(query, WM_SYSKEYDOWN, usize::from(b'W'), 1 << 29) };
+    assert_ne!(items()[2].state & STATE_CHECKED, 0);
+    assert!(take_raised().contains(&(panel as usize, EVENT_OBJECT_STATECHANGE, 3)));
+
+    // The default action clicks the toggle, as the mouse does.
+    (FIND_BAR_ACCESSIBLE.activate)(panel, 1);
+    assert!(app_mut(window.hwnd).find_bar().unwrap().options().case);
+
+    execute_command(window.hwnd, CommandId::Replace);
+    assert_eq!((FIND_BAR_ACCESSIBLE.count)(panel), 6);
+    let typed = crate::platform::wide_null("pin");
+    unsafe { SetWindowTextW(replace, typed.as_ptr()) };
+    let shown = items();
+    assert_eq!(shown[4].name, "Replace");
+    assert_eq!(shown[4].window, replace);
+    assert_eq!(shown[4].value, "pin");
+}
+
+#[test]
+fn pinning_a_note_that_is_not_first_raises_reorder_and_state_change() {
+    // Break caught: a pin re-sorting the selected row to the top at the same count, so screen
+    // readers hear only a new selection: no state change and no reorder of its siblings.
+    use crate::window::sidebar_accessibility::take_raised;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_REORDER, EVENT_OBJECT_SELECTION, EVENT_OBJECT_STATECHANGE,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("pin-msaa");
+    scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+    let kind = RowKind::Note(crate::library::record_path(&scratch.folder(), &b));
+    let before = row_of(window.hwnd, &kind);
+    assert!(before > 0, "{:?}", notebook_view(window.hwnd).rows);
+    notebook_view(window.hwnd).list.selected = Some(before);
+    let source = &crate::window::side_panel::PANEL_ACCESSIBLE;
+    let count = (source.count)(panel);
+    take_raised();
+
+    crate::window::library_host::toggle_pin(window.hwnd, &b);
+
+    let after = row_of(window.hwnd, &kind);
+    assert!(after < before, "the pinned note moves up");
+    assert_eq!((source.count)(panel), count, "the same number of children");
+    let id = (source.current)(panel).unwrap() as i32 + 1;
+    let raised = take_raised()
+        .into_iter()
+        .filter(|&(hwnd, _, _)| hwnd == panel as usize)
+        .map(|(_, event, child)| (event, child))
+        .collect::<Vec<_>>();
+    assert!(raised.contains(&(EVENT_OBJECT_REORDER, 0)), "{raised:?}");
+    assert!(raised.contains(&(EVENT_OBJECT_SELECTION, id)), "{raised:?}");
+    assert!(
+        raised.contains(&(EVENT_OBJECT_STATECHANGE, id)),
+        "{raised:?}"
+    );
+    assert!(
+        (source.item)(panel, id as usize - 1)
+            .unwrap()
+            .name
+            .ends_with(", pinned")
+    );
+}
+
+#[test]
+fn arrowing_through_recent_notebooks_selects_and_announces_them() {
+    // Break caught: the no-notebook state's RECENT list reporting no selection, so arrowing
+    // through it raises no events and no item is ever STATE_SYSTEM_SELECTED.
+    use crate::window::sidebar_accessibility::{STATE_FOCUSED, STATE_SELECTED, take_raised};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DOWN;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_FOCUS, EVENT_OBJECT_SELECTION, WM_KEYDOWN,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("recent-msaa-a");
+    let other = LibraryScratch::new("recent-msaa-b");
+    scratch.note("a.md", "a");
+    let window = shown_window();
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(&scratch.data()),
+        &crate::library::local::RecentFolders {
+            folders: vec![scratch.folder(), other.folder()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::CloseNotebook);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
+    let recent = notebook_view(window.hwnd).recent.clone();
+    assert!(recent.len() >= 2, "{recent:?}");
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, true);
+    let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+    assert_eq!(focused(), panel);
+    let source = &crate::window::side_panel::PANEL_ACCESSIBLE;
+    let buttons = (source.count)(panel) - recent.len();
+
+    for _ in 0..2 {
+        take_raised();
+        unsafe {
+            SendMessageW(panel, WM_KEYDOWN, VK_DOWN as usize, 0);
+        }
+        let selected = notebook_view(window.hwnd).list.selected.unwrap();
+        let id = (buttons + selected) as i32 + 1;
+        assert_eq!((source.current)(panel), Some(buttons + selected));
+        let raised = take_raised();
+        let panel_id = panel as usize;
+        assert!(
+            raised.contains(&(panel_id, EVENT_OBJECT_SELECTION, id)),
+            "{raised:?}"
+        );
+        assert!(
+            raised.contains(&(panel_id, EVENT_OBJECT_FOCUS, id)),
+            "{raised:?}"
+        );
+        let item = (source.item)(panel, id as usize - 1).unwrap();
+        assert_ne!(item.state & STATE_SELECTED, 0, "{item:?}");
+        assert_ne!(item.state & STATE_FOCUSED, 0, "{item:?}");
+        assert_eq!(
+            item.name,
+            notebook_view(window.hwnd).recent_name(selected),
+            "indexed by list position"
+        );
+    }
+    assert_eq!(notebook_view(window.hwnd).list.selected, Some(1));
+}
+
+#[test]
+fn a_query_from_another_thread_is_answered_on_the_window_thread() {
+    // Break caught: an MSAA client's RPC thread reading App directly, or its marshalled query
+    // rejected by the pointer check meant for foreign senders.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    let panel = crate::window::side_panel::windows(window.hwnd).unwrap().1;
+    let expected = crate::window::side_panel::accessible_item_count(panel);
+    assert!(expected > 0);
+    let provider = crate::window::sidebar_accessibility::create_for_test(
+        panel,
+        &crate::window::side_panel::PANEL_ACCESSIBLE,
+    ) as usize;
+    let worker = std::thread::spawn(move || {
+        let provider = provider as *mut std::ffi::c_void;
+        let table = &crate::window::sidebar_accessibility::SIDEBAR_VTABLE;
+        let mut count = 0;
+        unsafe {
+            assert_eq!(
+                (table.get_acc_child_count)(provider, &mut count),
+                windows_sys::Win32::Foundation::S_OK
+            );
+            (table.release)(provider);
+        }
+        count
+    });
+    // Messages sent from the worker are delivered while this thread peeks.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !worker.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query was never answered"
+        );
+        let mut message = windows_sys::Win32::UI::WindowsAndMessaging::MSG::default();
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                &mut message,
+                std::ptr::null_mut(),
+                0,
+                0,
+                windows_sys::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+            );
+        }
+    }
+    assert_eq!(worker.join().unwrap() as usize, expected);
+}
+
+fn set_find_query(hwnd: HWND, text: &str) {
+    let edit = app_mut(hwnd).find_bar().unwrap().query_hwnd();
+    let wide = crate::platform::wide_null(text);
+    // Sends EN_CHANGE, handled with nothing of the App borrowed here.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
+    }
+}
+
+#[test]
+fn the_find_bar_passes_its_options_to_scintilla_and_a_bad_regex_is_a_miss() {
+    // Break caught: toggles that change nothing, whole word matching inside foo_bar, regex
+    // mode not reaching the `regex` crate (no `{2}`), or an invalid pattern reported as an
+    // error or leaving no trace.
+    use crate::search::SearchOption;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor
+        .populate_clean("Foo foo foobar foo_bar foo. a1 b22")
+        .unwrap();
+    execute_command(window.hwnd, CommandId::Find);
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+
+    set_find_query(window.hwnd, "foo");
+    super::toggle_find_option(window.hwnd, SearchOption::Case);
+    editor.set_selection(0..0).unwrap();
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 4..7, "match case skips Foo");
+
+    super::toggle_find_option(window.hwnd, SearchOption::Case);
+    super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+    editor.set_selection(7..7).unwrap();
+    super::find_next(window.hwnd);
+    assert_eq!(
+        editor.selection().unwrap(),
+        23..26,
+        "whole word skips foobar and foo_bar"
+    );
+
+    super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+    super::toggle_find_option(window.hwnd, SearchOption::Regex);
+    set_find_query(window.hwnd, r"b\d{2}");
+    editor.set_selection(0..0).unwrap();
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 31..34);
+    assert!(!bar().no_match());
+
+    set_find_query(window.hwnd, "(");
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 31..34, "the selection stays");
+    assert!(bar().no_match());
+    assert!(notices(window.hwnd).is_empty());
+    set_find_query(window.hwnd, "a1");
+    assert!(!bar().no_match(), "typing clears the no-match state");
+}
+
+#[test]
+fn alt_keys_and_clicks_flip_the_find_bar_toggles() {
+    // Break caught: Alt+C opening a menu instead of flipping match case, a toggle click that
+    // does nothing, or the letter reaching the menu band after the flip.
+    use crate::search::MatchOptions;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::Find);
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+    let (query, panel) = (bar().query_hwnd(), bar().panel_hwnd());
+    let alt = 1 << 29;
+
+    unsafe { SendMessageW(query, WM_SYSKEYDOWN, usize::from(b'C'), alt) };
+    assert!(bar().options().case);
+    unsafe { SendMessageW(query, WM_SYSCHAR, usize::from(b'c'), alt) };
+    assert_eq!(app_mut(window.hwnd).menu_mode, None);
+    unsafe {
+        SendMessageW(query, WM_SYSKEYDOWN, usize::from(b'W'), alt);
+        SendMessageW(query, WM_SYSKEYDOWN, usize::from(b'R'), alt);
+    }
+    assert_eq!(
+        bar().options(),
+        MatchOptions {
+            case: true,
+            whole_word: true,
+            regex: true
+        }
+    );
+
+    let rect = bar().toggle_rects()[0];
+    let x = (rect.left + rect.right) / 2;
+    let y = (rect.top + rect.bottom) / 2;
+    let point = ((y as u32) << 16 | (x as u32 & 0xffff)) as super::LPARAM;
+    super::panel_pointer(window.hwnd, panel, WM_LBUTTONUP, 0, point);
+    assert!(!bar().options().case, "a click on Aa turns match case off");
+}
+
+#[test]
+fn replace_current_replaces_a_selection_that_matches_under_the_options() {
+    // Break caught: Enter in Replace comparing the selection to the query byte for byte, so
+    // a case-insensitive "CAT" is skipped instead of replaced.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("CAT cat").unwrap();
+    execute_command(window.hwnd, CommandId::Replace);
+    set_find_query(window.hwnd, "cat");
+    let replace = app_mut(window.hwnd).find_bar().unwrap().replace_hwnd();
+    let dog = crate::platform::wide_null("dog");
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(replace, dog.as_ptr());
+    }
+    editor.set_selection(0..3).unwrap();
+
+    super::replace_current(window.hwnd);
+
+    assert_eq!(editor.text().unwrap(), "dog cat");
+    assert_eq!(editor.selection().unwrap(), 4..7);
+}
+
+#[test]
+fn opening_a_result_seeds_the_find_bar_with_search_options_and_f3_steps_on() {
+    // Break caught: the find bar keeping its own options (so match case is lost), the first
+    // match not selected, or F3 and Shift+F3 not reaching the next and previous matches.
+    use crate::search::{MatchOptions, SearchOption};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("result-seed");
+    scratch.note("a.md", "beta Beta beta Beta");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    crate::window::search_view::toggle_option(window.hwnd, SearchOption::Case);
+    type_into_search(window.hwnd, "Beta");
+    pump_until(window.hwnd, || {
+        crate::window::search_view::shown_results(window.hwnd).len() == 1
+    });
+
+    crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, true);
+
+    assert_eq!(editor.text().unwrap(), "beta Beta beta Beta");
+    assert_eq!(editor.selection().unwrap(), 5..9);
+    let bar = app_mut(window.hwnd).find_bar().unwrap();
+    assert!(bar.is_visible());
+    assert_eq!(bar.query_text(), "Beta");
+    assert_eq!(
+        bar.options(),
+        MatchOptions {
+            case: true,
+            ..MatchOptions::default()
+        }
+    );
+    assert!(!bar.no_match());
+    execute_command(window.hwnd, CommandId::FindNext);
+    assert_eq!(editor.selection().unwrap(), 15..19);
+    execute_command(window.hwnd, CommandId::FindPrevious);
+    assert_eq!(editor.selection().unwrap(), 5..9);
+}
+
+#[test]
+fn opening_a_result_whose_text_changed_shows_no_match() {
+    // Break caught (review focus 5): a stale result opening nothing, panicking on its
+    // snippet, selecting text that no longer matches, or reporting the miss as an error.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("result-stale");
+    let note = scratch.note("a.md", "alpha beta");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    scratch.install(window.hwnd);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, true);
+    type_into_search(window.hwnd, "beta");
+    pump_until(window.hwnd, || {
+        crate::window::search_view::shown_results(window.hwnd).len() == 1
+    });
+    std::fs::write(&note, "alpha gamma").unwrap();
+    let before = notices(window.hwnd).len();
+
+    crate::window::search_view::open_selected(window.hwnd, super::OpenMode::Preview, false);
+
+    assert_eq!(editor.text().unwrap(), "alpha gamma");
+    assert_eq!(editor.selection().unwrap(), 0..0);
+    let bar = app_mut(window.hwnd).find_bar().unwrap();
+    assert!(bar.is_visible());
+    assert_eq!(bar.query_text(), "beta");
+    assert!(bar.no_match());
+    assert_eq!(notices(window.hwnd).len(), before);
+}
+
+fn set_replace_text(hwnd: HWND, text: &str) {
+    let edit = app_mut(hwnd).find_bar().unwrap().replace_hwnd();
+    let wide = crate::platform::wide_null(text);
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, wide.as_ptr());
+    }
+}
+
+#[test]
+fn a_regex_that_can_match_empty_text_shows_no_match_and_replaces_nothing() {
+    // Break caught: `\d*` searched at all (a hang stepping past empty matches, or the empty
+    // match selected at the caret), or Replace All inserting the replacement between
+    // characters. Search rejects such a pattern too (spec §6).
+    use crate::search::SearchOption;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("abc 123").unwrap();
+    execute_command(window.hwnd, CommandId::Find);
+    super::toggle_find_option(window.hwnd, SearchOption::Regex);
+    set_find_query(window.hwnd, r"\d*");
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+
+    editor.set_selection(1..1).unwrap();
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 1..1, "F3");
+    assert!(bar().no_match());
+    super::find_previous(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 1..1, "Shift+F3");
+    assert!(bar().no_match());
+
+    execute_command(window.hwnd, CommandId::Replace);
+    set_find_query(window.hwnd, "a*");
+    set_replace_text(window.hwnd, "y");
+    super::replace_all_matches(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "abc 123");
+    assert!(bar().no_match());
+}
+
+#[test]
+fn the_find_bars_regex_replace_expands_groups_and_plain_replace_is_literal() {
+    // Break caught (spec §12a): the find bar's regex Replace inserting "$2/${year}" as
+    // typed, Replace All expanding every match with the first match's groups, Enter using
+    // another match's captures, group numbers shifted by the whole-word wrapper, or plain
+    // mode expanding `$1`.
+    use crate::search::SearchOption;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor
+        .populate_clean("2024-09 and 1999-01\r\n2001-12")
+        .unwrap();
+    execute_command(window.hwnd, CommandId::Replace);
+    super::toggle_find_option(window.hwnd, SearchOption::Regex);
+    set_find_query(window.hwnd, r"(?<year>\d{4})-(\d{2})");
+    set_replace_text(window.hwnd, "$2/${year} $$");
+
+    editor.set_selection(12..19).unwrap();
+    super::replace_current(window.hwnd);
+    assert_eq!(
+        editor.text().unwrap(),
+        "2024-09 and 01/1999 $\r\n2001-12",
+        "Enter expands the selected match's own groups"
+    );
+    assert_eq!(
+        editor.selection().unwrap(),
+        23..30,
+        "then moves to the next"
+    );
+
+    super::replace_all_matches(window.hwnd);
+    assert_eq!(
+        editor.text().unwrap(),
+        "09/2024 $ and 01/1999 $\r\n12/2001 $"
+    );
+    editor.undo().unwrap();
+    assert_eq!(
+        editor.text().unwrap(),
+        "2024-09 and 01/1999 $\r\n2001-12",
+        "Replace All is one undo step"
+    );
+
+    super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+    set_find_query(window.hwnd, "(fo+)");
+    set_replace_text(window.hwnd, "<$1>");
+    editor.populate_clean("foo foobar fooo").unwrap();
+    super::replace_all_matches(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "<foo> foobar <fooo>");
+
+    super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+    super::toggle_find_option(window.hwnd, SearchOption::Regex);
+    set_find_query(window.hwnd, "$1");
+    set_replace_text(window.hwnd, "$2$$");
+    editor.populate_clean("a $1 b $1").unwrap();
+    editor.set_selection(2..4).unwrap();
+    super::replace_current(window.hwnd);
+    assert_eq!(
+        editor.text().unwrap(),
+        "a $2$$ b $1",
+        "plain Enter is literal"
+    );
+    super::replace_all_matches(window.hwnd);
+    assert_eq!(
+        editor.text().unwrap(),
+        "a $2$$ b $2$$",
+        "plain Replace All too"
+    );
+}
+
+#[test]
+fn a_case_insensitive_regex_folds_accented_capitals_and_f3_wraps() {
+    // Break caught: case folding limited to ASCII (MSVC std::wregex), so "îndemn" never
+    // finds "Îndemn" though Search does, or F3 and Shift+F3 not wrapping at the ends.
+    use crate::search::SearchOption;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor
+        .populate_clean("Îndemn la drum, cu Élan\nîndemn")
+        .unwrap();
+    execute_command(window.hwnd, CommandId::Find);
+    super::toggle_find_option(window.hwnd, SearchOption::Regex);
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+
+    set_find_query(window.hwnd, "élan");
+    editor.set_selection(0..0).unwrap();
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 20..25);
+    assert!(!bar().no_match());
+
+    set_find_query(window.hwnd, "îndemn");
+    editor.set_selection(0..0).unwrap();
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 0..7);
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 26..33, "the next line");
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 0..7, "F3 wraps");
+    super::find_previous(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 26..33, "Shift+F3 wraps");
+    super::find_previous(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 0..7);
+    assert!(!bar().no_match());
+}
+
+#[test]
+fn typing_a_replacement_keeps_the_no_match_outline_and_typing_a_query_clears_it() {
+    // Break caught: the replacement field's EN_CHANGE clearing the query's no-match
+    // outline, though the query still matches nothing.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("alpha").unwrap();
+    execute_command(window.hwnd, CommandId::Replace);
+    set_find_query(window.hwnd, "zeta");
+    super::find_next(window.hwnd);
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+    assert!(bar().no_match());
+
+    set_replace_text(window.hwnd, "beta");
+    assert!(bar().no_match(), "the replacement doesn't change the match");
+    set_find_query(window.hwnd, "alp");
+    assert!(!bar().no_match());
+}
+
+#[test]
+fn a_whole_word_regex_matches_a_non_ascii_word_only_as_a_whole_word() {
+    // Break caught: a whole-word regex whose `\b` counts ă as a non-word character (as MSVC
+    // std::wregex's does), so "mașină" is missed as a whole word and found inside
+    // "mașinării". The `regex` crate's Unicode `\b` agrees with plain whole word here.
+    use crate::search::SearchOption;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::Find);
+    super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+    set_find_query(window.hwnd, "mașină");
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+    let find = |text: &str, backward: bool| {
+        editor.populate_clean(text).unwrap();
+        let end = editor.length().unwrap();
+        editor
+            .set_selection(if backward { end..end } else { 0..0 })
+            .unwrap();
+        if backward {
+            super::find_previous(window.hwnd);
+        } else {
+            super::find_next(window.hwnd);
+        }
+        (!bar().no_match()).then(|| editor.selection().unwrap())
+    };
+
+    // Plain whole word (SCFIND_WHOLEWORD) is the reference.
+    assert_eq!(find("o mașină nouă", false), Some(2..10), "plain");
+    assert_eq!(find("mașinării", false), None, "plain");
+
+    super::toggle_find_option(window.hwnd, SearchOption::Regex);
+    for backward in [false, true] {
+        assert_eq!(find("o mașină nouă", backward), Some(2..10), "{backward}");
+        assert_eq!(find("mașină", backward), Some(0..8), "{backward}");
+        assert_eq!(find("mașinării", backward), None, "{backward}");
+        assert_eq!(
+            find("mașinării mașină", backward),
+            Some(12..20),
+            "past the longer word, {backward}"
+        );
+    }
+}
+
+#[test]
+fn a_whole_word_regex_skips_longer_words_forward_backward_and_in_replace() {
+    // Break caught: a hit inside foobar or foo_bar accepted, a rejected hit ending the
+    // search instead of being stepped past, Shift+F3 stopping at the rejected hit, or
+    // Replace All replacing inside longer words.
+    use crate::search::SearchOption;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("foobar foo_bar foo x").unwrap();
+    execute_command(window.hwnd, CommandId::Find);
+    super::toggle_find_option(window.hwnd, SearchOption::Regex);
+    super::toggle_find_option(window.hwnd, SearchOption::WholeWord);
+    set_find_query(window.hwnd, "fo+");
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+
+    editor.set_selection(0..0).unwrap();
+    super::find_next(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 15..18, "F3");
+    editor.set_selection(20..20).unwrap();
+    super::find_previous(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 15..18, "Shift+F3");
+    editor.set_selection(15..15).unwrap();
+    super::find_previous(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 15..18, "Shift+F3 wraps to it");
+    assert!(!bar().no_match());
+
+    editor.set_selection(0..0).unwrap();
+    execute_command(window.hwnd, CommandId::Replace);
+    set_find_query(window.hwnd, "fo+");
+    set_replace_text(window.hwnd, "X");
+    super::replace_all_matches(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "foobar foo_bar X x");
+
+    // Several whole words go in one undo step.
+    editor.populate_clean("fooo foobar fo").unwrap();
+    super::replace_all_matches(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "X foobar X");
+    editor.undo().unwrap();
+    assert_eq!(editor.text().unwrap(), "fooo foobar fo");
+
+    // Enter in Replace replaces a selected whole word, and not a selection inside one.
+    editor.populate_clean("foo foobar").unwrap();
+    editor.set_selection(4..7).unwrap();
+    super::replace_current(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "foo foobar", "inside foobar");
+    editor.set_selection(0..3).unwrap();
+    super::replace_current(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "X foobar");
+}
+
+#[test]
+fn new_folder_from_the_header_names_it_in_an_empty_draft_row_and_selects_the_new_row() {
+    // Break caught: the header button opening the name bar, a "New folder" prefill, a
+    // folder made before Enter or on Escape, the draft left behind, or the new folder not
+    // selected with the focus in the tree (inline naming spec §3.2, §5.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-folder");
+    scratch.note("top.md", "t");
+    let (window, _editor) = notebook_window(&scratch);
+    select_row(window.hwnd, &RowKind::Note("top.md".into()));
+    let panel = sidebar_windows(window.hwnd).1;
+    let count = crate::window::side_panel::accessible_item_count(panel);
+    assert!(
+        (0..count)
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .any(|item| item.name == "New folder"),
+        "the header button has its accessible name"
+    );
+    let press = || {
+        crate::window::notebook_view::header_clicked(
+            window.hwnd,
+            crate::window::notebook_view::HeaderButton::NewFolder,
+        );
+    };
+
+    press();
+    assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::NewFolder(
+            std::path::PathBuf::new()
+        ))
+    );
+    assert_eq!(field_text(window.hwnd), "", "the field starts empty");
+    assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+    assert!(
+        !app_mut(window.hwnd)
+            .name_box
+            .as_ref()
+            .is_some_and(|name_box| name_box.is_visible())
+    );
+    type_into_field(window.hwnd, "Plans");
+    field_key(window.hwnd, VK_ESCAPE);
+    assert!(!inline_open(window.hwnd));
+    assert_eq!(
+        draft_row(window.hwnd),
+        None,
+        "Escape takes the draft row away"
+    );
+    assert!(
+        !scratch.folder().join("Plans").exists(),
+        "Escape creates nothing"
+    );
+    assert_eq!(unsafe { GetFocus() }, panel, "Escape returns to the tree");
+
+    press();
+    type_into_field(window.hwnd, "Plans");
+    assert!(
+        !scratch.folder().join("Plans").exists(),
+        "nothing before Enter"
+    );
+    field_key(window.hwnd, VK_RETURN);
+
+    assert!(!inline_open(window.hwnd));
+    assert!(scratch.folder().join("Plans").is_dir());
+    assert_eq!(draft_row(window.hwnd), None);
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Folder("Plans".into()))
+    );
+    assert_eq!(unsafe { GetFocus() }, panel, "the focus stays in the tree");
+}
+
+#[test]
+fn new_folder_here_drafts_inside_that_folder_and_a_taken_name_keeps_the_field_open() {
+    // Break caught: "New folder here" drafting at the root, the folder left collapsed, a
+    // name taken by a listed note missed while typing, Enter accepted over the message, or
+    // a clash with an unlisted file closing the field (spec §4.4, §5.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-folder-here");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\a.md", "a");
+    std::fs::write(scratch.folder().join(r"sub\notes.bin"), "x").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let index = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteNewFolder));
+    crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+
+    assert_eq!(
+        draft_row(window.hwnd),
+        Some((index + 1, 1)),
+        "its first child"
+    );
+    assert!(
+        crate::window::library_host::expanded(window.hwnd)
+            .contains(&std::path::PathBuf::from("sub"))
+    );
+    type_into_field(window.hwnd, "A.md");
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("A.md already exists here.")
+    );
+    field_key(window.hwnd, VK_RETURN);
+    assert!(
+        inline_open(window.hwnd),
+        "Enter is refused while a problem shows"
+    );
+    assert!(!scratch.folder().join(r"sub\A.md").is_dir());
+
+    type_into_field(window.hwnd, "notes.bin");
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd),
+        None,
+        "not listed"
+    );
+    field_key(window.hwnd, VK_RETURN);
+    assert!(inline_open(window.hwnd));
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("A folder or file named \u{201c}notes.bin\u{201d} already exists")
+    );
+
+    type_into_field(window.hwnd, "Plans");
+    assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+    field_key(window.hwnd, VK_RETURN);
+    assert!(!inline_open(window.hwnd));
+    assert!(scratch.folder().join(r"sub\Plans").is_dir());
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Folder(r"sub\Plans".into()))
+    );
+}
+
+#[test]
+fn a_typed_folder_name_is_sanitized_hidden_names_are_refused_and_an_empty_one_cancels() {
+    // Break caught: a name Windows refuses failing with a path error, "..." showing a
+    // message instead of cancelling, or a .git or node_modules folder that the next rescan
+    // hides (spec §4.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-folder-names");
+    scratch.note("top.md", "t");
+    let (window, _editor) = notebook_window(&scratch);
+    let create = |typed: &str| {
+        crate::window::inline_name::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
+        type_into_field(window.hwnd, typed);
+        field_key(window.hwnd, VK_RETURN);
+    };
+
+    create(" a/b: c?. ");
+    assert!(scratch.folder().join("ab c").is_dir());
+    create("CON");
+    assert!(scratch.folder().join("CON_").is_dir());
+    assert!(!inline_open(window.hwnd));
+
+    create("...");
+    assert!(
+        !inline_open(window.hwnd),
+        "nothing left of the name cancels"
+    );
+    assert_eq!(draft_row(window.hwnd), None);
+
+    for hidden in [".git", "node_modules"] {
+        create(hidden);
+        assert!(inline_open(window.hwnd), "{hidden}");
+        assert_eq!(
+            crate::window::inline_name::problem(window.hwnd),
+            Some(format!(
+                "FastPad hides folders named \u{201c}{hidden}\u{201d}. Choose another name."
+            ))
+        );
+        assert!(!scratch.folder().join(hidden).exists());
+        crate::window::inline_name::cancel(window.hwnd);
+    }
+}
+
+#[test]
+fn a_new_folder_draft_survives_a_rescan_but_goes_with_its_folder_or_notebook() {
+    // Break caught: a rescan dropping the draft row and what was typed, a draft left in a
+    // folder deleted in Explorer, or one outliving its notebook (spec §5.4).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-folder-rescan");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+    type_into_field(window.hwnd, "Typed");
+
+    rescan_and_wait(window.hwnd);
+    assert!(inline_open(window.hwnd));
+    assert_eq!(field_text(window.hwnd), "Typed");
+    let sub = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+    assert_eq!(draft_row(window.hwnd), Some((sub + 1, 1)));
+
+    std::fs::remove_dir_all(scratch.folder().join("sub")).unwrap();
+    rescan_and_wait(window.hwnd);
+    assert!(!inline_open(window.hwnd));
+    assert_eq!(draft_row(window.hwnd), None);
+
+    crate::window::inline_name::new_folder(window.hwnd, None);
+    assert!(inline_open(window.hwnd));
+    crate::window::library_host::close_notebook(window.hwnd);
+    assert!(!inline_open(window.hwnd));
+}
+
+#[test]
+fn the_field_sits_over_its_row_scrolls_with_it_and_is_left_out_of_the_tree_for_screen_readers() {
+    // Break caught: the field drawn away from its row or over the header, left behind
+    // when the list scrolls, losing the typing when scrolled out of view, or the draft row
+    // read out as an empty tree item (spec §5.4, §6).
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongPtrW, GetWindowRect, WM_MOUSEWHEEL, WS_VISIBLE,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-placement");
+    for index in 0..80 {
+        scratch.note(&format!("n{index:02}.md"), "x");
+    }
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let names = || {
+        let count = crate::window::side_panel::accessible_item_count(panel);
+        (0..count)
+            .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+            .map(|item| item.name)
+            .collect::<Vec<_>>()
+    };
+    let before = names();
+    // The test window is never shown, so the field's own style says whether it shows.
+    let shown =
+        |field: HWND| (unsafe { GetWindowLongPtrW(field, GWL_STYLE) } as u32) & WS_VISIBLE != 0;
+
+    crate::window::inline_name::new_folder(window.hwnd, None);
+    let field = inline_field(window.hwnd);
+    assert_eq!(names(), before, "the draft row is no MSAA item");
+    assert!(shown(field));
+    let draft = draft_row(window.hwnd).unwrap().0;
+    let row = notebook_view(window.hwnd).row_rect_at(draft).unwrap();
+    let mut rect = RECT::default();
+    unsafe {
+        GetWindowRect(field, &mut rect);
+        MapWindowPoints(
+            std::ptr::null_mut(),
+            panel,
+            &mut rect as *mut RECT as *mut POINT,
+            2,
+        );
+    }
+    assert!(
+        rect.top >= row.top && rect.bottom <= row.bottom,
+        "{}..{} in {}..{}",
+        rect.top,
+        rect.bottom,
+        row.top,
+        row.bottom
+    );
+
+    let down = ((-(120_i16 * 20)) as u16 as usize) << 16;
+    unsafe { SendMessageW(panel, WM_MOUSEWHEEL, down, 0) };
+    assert!(notebook_view(window.hwnd).list.top > 0, "the list scrolled");
+    assert!(!shown(field), "out of view, hidden");
+    assert_eq!(unsafe { GetFocus() }, field, "and still editing");
+    type_into_field(window.hwnd, "Kept");
+    let up = ((120_i16 * 20) as u16 as usize) << 16;
+    unsafe { SendMessageW(panel, WM_MOUSEWHEEL, up, 0) };
+    assert!(shown(field), "back in view");
+    assert_eq!(field_text(window.hwnd), "Kept");
+}
+
+#[test]
+fn the_name_field_is_named_for_screen_readers_and_its_problem_is_its_description() {
+    // Break caught: a field a screen reader announces as a bare "edit", or a problem it
+    // never hears (spec §6).
+    use crate::window::accessibility::{
+        AccessibleVtable, IID_IACCESSIBLE, RawVariant, VariantValue,
+    };
+    use crate::window::sidebar_accessibility::take_raised;
+    use windows_sys::Win32::Foundation::{SysFreeString, SysStringLen};
+    use windows_sys::Win32::UI::Accessibility::AccessibleObjectFromWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_DESCRIPTIONCHANGE, OBJID_CLIENT,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-accessible");
+    std::fs::create_dir_all(scratch.folder().join(r"sub\Taken")).unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+    let field = inline_field(window.hwnd);
+    let read = |description: bool| -> String {
+        let com = unsafe {
+            windows_sys::Win32::System::Com::CoInitializeEx(
+                std::ptr::null(),
+                windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
+            )
+        };
+        let mut object = std::ptr::null_mut();
+        let result = unsafe {
+            AccessibleObjectFromWindow(field, OBJID_CLIENT as u32, &IID_IACCESSIBLE, &mut object)
+        };
+        assert!(result >= 0 && !object.is_null(), "{result:#x}");
+        let vtable = unsafe { &**(object as *const *const AccessibleVtable) };
+        let get = if description {
+            vtable.get_acc_description
+        } else {
+            vtable.get_acc_name
+        };
+        let mut text = std::ptr::null();
+        unsafe { get(object, RawVariant::integer(0), &mut text) };
+        let value = if text.is_null() {
+            String::new()
+        } else {
+            let units = unsafe { std::slice::from_raw_parts(text, SysStringLen(text) as usize) };
+            let value = String::from_utf16_lossy(units);
+            unsafe { SysFreeString(text) };
+            value
+        };
+        unsafe { (vtable.release)(object) };
+        if com >= 0 {
+            unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+        }
+        value
+    };
+    assert_eq!(read(false), "New folder name, in sub");
+
+    take_raised();
+    type_into_field(window.hwnd, "taken");
+    assert!(
+        take_raised().contains(&(field as usize, EVENT_OBJECT_DESCRIPTIONCHANGE, 0)),
+        "the problem is announced"
+    );
+    assert_eq!(read(true), "taken already exists here.");
+}
+
+#[test]
+fn ctrl_a_selects_the_name_and_ctrl_backspace_deletes_a_word_in_the_field() {
+    // Break caught: Ctrl+A doing nothing in the field, or Ctrl+Backspace typing a box
+    // character instead of deleting the word before the caret (spec §5.1).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_BACK, VK_CONTROL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-keys");
+    scratch.note("top.md", "t");
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::inline_name::new_folder(window.hwnd, None);
+    type_into_field(window.hwnd, "my note.md");
+    let field = inline_field(window.hwnd);
+    unsafe { SendMessageW(field, windows_sys::Win32::UI::Controls::EM_SETSEL, 10, 10) };
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+
+    field_key(window.hwnd, VK_BACK);
+    unsafe { SendMessageW(field, WM_CHAR, 0x7f, 0) };
+    let after_backspace = field_text(window.hwnd);
+    field_key(window.hwnd, u16::from(b'A'));
+    unsafe { SendMessageW(field, WM_CHAR, 0x01, 0) };
+    let selection = field_selection(window.hwnd);
+    unsafe { SetKeyboardState(original.as_ptr()) };
+
+    assert_eq!(after_backspace, "my note.");
+    assert_eq!(selection, (0, 8));
+    assert_eq!(
+        field_text(window.hwnd),
+        "my note.",
+        "no control characters typed"
+    );
+}
+
+#[test]
+fn an_empty_folder_made_on_disk_appears_after_a_rescan_and_goes_with_it() {
+    // Break caught: a folder made in Explorer staying invisible until it holds a note, or a
+    // folder deleted in Explorer keeping its row (spec §3.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("empty-folder-rescan");
+    scratch.note("top.md", "t");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+
+    std::fs::create_dir(scratch.folder().join("Fresh")).unwrap();
+    rescan_and_wait(window.hwnd);
+    row_of(window.hwnd, &RowKind::Folder("Fresh".into()));
+
+    std::fs::remove_dir(scratch.folder().join("Fresh")).unwrap();
+    rescan_and_wait(window.hwnd);
+    assert!(
+        crate::library::tree::row_index(
+            &notebook_view(window.hwnd).rows,
+            &RowKind::Folder("Fresh".into())
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn the_palette_offers_new_note_and_new_folder_only_while_a_notebook_is_open() {
+    // Break caught: "Notebook: New note…" or "Notebook: New folder…" listed with no
+    // notebook, where they can only say "Open a notebook first." (inline naming spec §3.1).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("palette-new-note");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let listed = |command: CommandId| {
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let listed = app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .shown()
+            .iter()
+            .any(|entry| entry.command == command);
+        super::close_command_palette(window.hwnd, false);
+        listed
+    };
+    assert!(crate::window::library_host::folder(window.hwnd).is_none());
+    assert!(!listed(CommandId::NoteNew));
+    assert!(!listed(CommandId::NoteNewFolder));
+    scratch.install(window.hwnd);
+    assert!(listed(CommandId::NoteNew));
+    assert!(listed(CommandId::NoteNewFolder));
+}
+
+#[test]
+fn plus_new_note_here_and_the_palette_each_draft_a_note_in_the_right_folder() {
+    // Break caught: "+" or "New note here" opening an untitled tab instead, a draft in the
+    // wrong folder or at the wrong depth, a field not focused, or the palette ignoring the
+    // selected row's folder (inline naming spec §3.1).
+    use crate::window::inline_name::Purpose;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-note-starts");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\b.md", "b");
+    scratch.note("top.md", "t");
+    let (window, _editor) = notebook_window(&scratch);
+    let tabs = super::tab_count(window.hwnd);
+    select_row(window.hwnd, &RowKind::Note("top.md".into()));
+
+    crate::window::notebook_view::header_clicked(
+        window.hwnd,
+        crate::window::notebook_view::HeaderButton::NewNote,
+    );
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(Purpose::NewNote(std::path::PathBuf::new()))
+    );
+    assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+    assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+    assert_eq!(super::tab_count(window.hwnd), tabs, "no untitled tab");
+    field_key(window.hwnd, VK_ESCAPE);
+    assert_eq!(draft_row(window.hwnd), None);
+
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let sub = row_of(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteNew));
+    crate::window::notebook_view::open_context_menu(window.hwnd, sub, None);
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(Purpose::NewNote("sub".into()))
+    );
+    assert_eq!(draft_row(window.hwnd), Some((sub + 1, 1)), "sub expanded");
+    field_key(window.hwnd, VK_ESCAPE);
+
+    select_row(window.hwnd, &RowKind::Note(r"sub\b.md".into()));
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    let query = app_mut(window.hwnd)
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .query_hwnd();
+    let typed = crate::platform::wide_null("Notebook: New note");
+    unsafe { SetWindowTextW(query, typed.as_ptr()) };
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(Purpose::NewNote("sub".into())),
+        "the selected note's folder"
+    );
+    assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+    assert_eq!(super::tab_count(window.hwnd), tabs);
+}
+
+#[test]
+fn enter_on_a_new_note_creates_the_file_and_opens_it_with_focus_in_the_editor() {
+    // Break caught: the note left unsaved in an untitled tab, created with text or over a
+    // file, opened as the preview, not listed in the tree, or the focus left in the tree
+    // (spec §4.1, §5.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-note-enter");
+    scratch.note("top.md", "t");
+    let (window, editor) = notebook_window(&scratch);
+
+    crate::window::inline_name::new_note(window.hwnd, None);
+    type_into_field(window.hwnd, "todo");
+    field_key(window.hwnd, VK_RETURN);
+
+    let todo = scratch.folder().join("todo.md");
+    assert_eq!(std::fs::read(&todo).unwrap(), b"", "an empty file");
+    assert!(!inline_open(window.hwnd));
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(todo.as_path()));
+    assert!(!active.preview);
+    assert_eq!(unsafe { GetFocus() }, editor.hwnd());
+    row_of(window.hwnd, &RowKind::Note("todo.md".into()));
+
+    crate::window::inline_name::new_note(window.hwnd, Some(std::path::PathBuf::new()));
+    type_into_field(window.hwnd, "data.json");
+    field_key(window.hwnd, VK_RETURN);
+    assert!(
+        scratch.folder().join("data.json").exists(),
+        "a typed note extension is kept"
+    );
+    assert!(!scratch.folder().join("data.json.md").exists());
+}
+
+#[test]
+fn a_new_note_with_a_listed_name_shows_the_message_and_enter_keeps_the_field() {
+    // Break caught: a clash with a listed note missed until Enter, the message shown in
+    // another case than typed, or Enter going ahead (spec §4.4).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-note-taken");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::inline_name::new_note(window.hwnd, None);
+
+    type_into_field(window.hwnd, "A");
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("A.md already exists here.")
+    );
+    field_key(window.hwnd, VK_RETURN);
+    assert!(inline_open(window.hwnd));
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("a.md")).unwrap(),
+        "a"
+    );
+    type_into_field(window.hwnd, "b");
+    assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+}
+
+#[test]
+fn a_new_note_clashing_with_an_unlisted_file_or_a_vanished_folder_says_so_after_enter() {
+    // Break caught: a file written after the scan overwritten, a note created somewhere
+    // else when its folder was deleted in Explorer, or the field closing on the failure
+    // (spec §4.4, §5.2).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-note-disk");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note("top.md", "t");
+    let (window, _editor) = notebook_window(&scratch);
+    std::fs::write(scratch.folder().join("fresh.md"), "theirs").unwrap();
+
+    crate::window::inline_name::new_note(window.hwnd, None);
+    type_into_field(window.hwnd, "fresh");
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd),
+        None,
+        "not listed"
+    );
+    field_key(window.hwnd, VK_RETURN);
+    assert!(inline_open(window.hwnd));
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("fresh.md already exists. Try fresh 2.md.")
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("fresh.md")).unwrap(),
+        "theirs"
+    );
+    crate::window::inline_name::cancel(window.hwnd);
+
+    crate::window::inline_name::new_note(window.hwnd, Some("sub".into()));
+    std::fs::remove_dir(scratch.folder().join("sub")).unwrap();
+    type_into_field(window.hwnd, "x");
+    field_key(window.hwnd, VK_RETURN);
+    assert!(inline_open(window.hwnd));
+    let problem = crate::window::inline_name::problem(window.hwnd).unwrap();
+    assert!(
+        problem.starts_with("FastPad could not create x.md: "),
+        "{problem}"
+    );
+    assert!(!scratch.folder().join("x.md").exists());
+}
+
+#[test]
+fn a_rescan_that_lists_the_typed_name_shows_the_problem_without_a_keystroke() {
+    // Break caught: the live check run only on keystrokes, so a note that appeared on disk
+    // while the user typed its name is only caught by the disk call (spec §4.4, §5.4).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-note-rescan");
+    scratch.note("top.md", "t");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    crate::window::inline_name::new_note(window.hwnd, None);
+    type_into_field(window.hwnd, "idea");
+    assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+
+    scratch.note("idea.md", "made elsewhere");
+    rescan_and_wait(window.hwnd);
+
+    assert!(inline_open(window.hwnd));
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("idea.md already exists here.")
+    );
+}
+
+#[test]
+fn the_first_note_of_an_empty_notebook_gets_a_draft_row() {
+    // Break caught: "+" in a notebook with no notes doing nothing, because the empty state
+    // has no tree to put the draft row in (spec §3.1).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-new-note-empty");
+    let (window, _editor) = notebook_window(&scratch);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+
+    crate::window::notebook_view::header_clicked(
+        window.hwnd,
+        crate::window::notebook_view::HeaderButton::NewNote,
+    );
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+    assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+    field_key(window.hwnd, VK_ESCAPE);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+}
+
+#[test]
+fn a_draft_whose_folder_goes_in_a_notebook_left_empty_shows_the_empty_state() {
+    // Break caught: the tree forced on for a draft that the rebuild then ends (its folder
+    // gone, nothing else listed), leaving a blank tree without the empty state's New note
+    // button (spec §3.1, §5.4).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-draft-empty-gone");
+    std::fs::create_dir(scratch.folder().join("Fresh")).unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::inline_name::new_note(window.hwnd, Some("Fresh".into()));
+    assert!(inline_open(window.hwnd));
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+
+    // The library drops the folder (deleted in Explorer, say): nothing is left to list.
+    std::fs::remove_dir(scratch.folder().join("Fresh")).unwrap();
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        state.remove_folder(std::path::Path::new("Fresh"), 0)
+    });
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    assert!(!inline_open(window.hwnd));
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+}
+
+#[test]
+fn the_empty_notebooks_new_note_button_drafts_a_note_instead_of_opening_a_tab() {
+    // Break caught: the empty state's own "New note" button opening an untitled tab
+    // (`CommandId::New`) instead of drafting a note in the tree, which is the only way an
+    // empty notebook can name its own first note (inline naming spec §3.1).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-empty-state-button");
+    let (window, _editor) = notebook_window(&scratch);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    let tabs = super::tab_count(window.hwnd);
+
+    crate::window::notebook_view::state_button(window.hwnd);
+
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+    assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+    assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+    assert_eq!(super::tab_count(window.hwnd), tabs, "no untitled tab");
+}
+
+#[test]
+fn renaming_a_folder_with_an_open_note_rebinds_the_tab_and_keeps_the_notes_pin() {
+    // Break caught: a folder rename leaving its open tab on the old path (the next save
+    // re-creating the old folder), dropping the note's pin, or losing the row's selection.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    let old = open_note(&window, &scratch, r"sub\a.md", "a");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    select_row(window.hwnd, &RowKind::Folder("sub".into()));
+
+    assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::RenameFolder(
+            "sub".into()
+        ))
+    );
+    assert_eq!(field_text(window.hwnd), "sub");
+    type_into_field(window.hwnd, "Projects");
+    field_key(
+        window.hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+    );
+
+    let new = scratch.folder().join(r"Projects\a.md");
+    assert!(!inline_open(window.hwnd));
+    assert!(new.exists());
+    assert!(!old.exists());
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(new.as_path())
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Folder("Projects".into()))
+    );
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(state.is_pinned(&new));
+        assert!(!state.is_folder(std::path::Path::new("sub")));
+    });
+    crate::window::library_host::flush_now(window.hwnd);
+    let reloaded = crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
+    assert!(
+        reloaded.is_pinned(&new),
+        "the pin was written under the new path"
+    );
+}
+
+#[test]
+fn renaming_a_folder_moves_its_preview_and_dirty_tabs_without_saving_them() {
+    // Break caught: a rename that saves a dirty tab (touching the file's contents), turns the
+    // preview into a normal tab, or leaves either on the old path (spec §4.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-tabs");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let a = scratch.note(r"sub\a.md", "a");
+    let b = scratch.note(r"sub\b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    // Autosave would save `a` the moment `b` opens; the rename must leave it dirty.
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &a).unwrap();
+    editor.set_text("a, edited").unwrap();
+    super::open_note(window.hwnd, &b, super::OpenMode::Preview, false).unwrap();
+    let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+    let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "Moved");
+    field_key(
+        window.hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+    );
+
+    let moved = scratch.folder().join("Moved");
+    let tabs = &app_mut(window.hwnd).tabs;
+    assert_eq!(tabs.document(a_id).unwrap().path, Some(moved.join("a.md")));
+    assert!(tabs.document(a_id).unwrap().dirty);
+    assert_eq!(tabs.document(b_id).unwrap().path, Some(moved.join("b.md")));
+    assert_eq!(tabs.preview_id(), Some(b_id));
+    assert_eq!(
+        std::fs::read_to_string(moved.join("a.md")).unwrap(),
+        "a",
+        "nothing was saved"
+    );
+}
+
+#[test]
+fn a_case_only_folder_rename_renames_it_on_disk_and_in_tabs_and_expansion() {
+    // Break caught: "sub" → "Sub" refused as a clash with itself, a no-op on NTFS, or the tab
+    // and the expanded entry left in the old case.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-case");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    open_note(&window, &scratch, r"sub\a.md", "a");
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "Sub");
+    field_key(
+        window.hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+    );
+
+    let names: Vec<String> = std::fs::read_dir(scratch.folder())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"Sub".to_owned()), "{names:?}");
+    assert!(!inline_open(window.hwnd));
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path,
+        Some(scratch.folder().join(r"Sub\a.md"))
+    );
+    assert!(
+        crate::window::library_host::expanded(window.hwnd)
+            .contains(&std::path::PathBuf::from("Sub"))
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Folder("Sub".into()))
+    );
+}
+
+#[test]
+fn a_folder_rename_an_open_tab_cannot_follow_is_undone() {
+    // Break caught: the folder renamed on disk while a tab stays on the old path (its next
+    // save re-creating the old folder), or a half-done rename left behind (spec §4.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-undo");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let a = scratch.note(r"sub\a.md", "a");
+    let top = scratch.note("top.md", "t");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &top).unwrap();
+    // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+    let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+    app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+        Some(scratch.folder().join(r"Moved\a.md"));
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "Moved");
+    field_key(
+        window.hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+    );
+
+    assert!(inline_open(window.hwnd));
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("Another tab already has that file open.")
+    );
+    assert!(a.exists());
+    assert!(!scratch.folder().join("Moved").exists());
+    let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a);
+    assert!(a_id.is_some(), "a's tab is back on its old path");
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(state.is_folder(std::path::Path::new("sub")));
+        assert!(!state.is_folder(std::path::Path::new("Moved")));
+    });
+}
+
+#[test]
+fn a_folder_rename_onto_a_sibling_is_refused_and_the_same_name_changes_nothing() {
+    // Break caught: a rename onto an existing sibling (in another case) merging or failing
+    // oddly, Note: Rename on a focused folder row renaming the active tab instead, or an
+    // unchanged name showing a message (spec §4.3, §4.4).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-clash");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    std::fs::create_dir_all(scratch.folder().join("Other")).unwrap();
+    scratch.note(r"sub\a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    select_row(window.hwnd, &RowKind::Folder("sub".into()));
+    let (_, panel) = sidebar_windows(window.hwnd);
+    unsafe { SetFocus(panel) };
+    assert_eq!(unsafe { GetFocus() }, panel);
+
+    execute_command(window.hwnd, CommandId::NoteRename);
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::RenameFolder(
+            "sub".into()
+        ))
+    );
+    type_into_field(window.hwnd, "other");
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("other already exists here.")
+    );
+    field_key(window.hwnd, VK_RETURN);
+    assert!(inline_open(window.hwnd));
+    assert!(scratch.folder().join(r"sub\a.md").exists());
+
+    type_into_field(window.hwnd, "sub");
+    assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
+    field_key(window.hwnd, VK_RETURN);
+    assert!(!inline_open(window.hwnd));
+    assert!(scratch.folder().join(r"sub\a.md").exists());
+}
+
+#[test]
+fn tree_move_a_note_moves_into_a_folder_with_its_dirty_tab_and_pin() {
+    // Break caught: a drop that saves the dirty tab, leaves it on the old path, drops the pin,
+    // or leaves the target folder collapsed and the row unselected (tree drag spec §4).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-move-note");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let a = scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    super::open_path(window.hwnd, &a).unwrap();
+    editor.set_text("a, edited").unwrap();
+    crate::window::library_host::toggle_pin(window.hwnd, &a);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    // Autosave-off and Pinned notices from setup are not what this test is about.
+    app_mut(window.hwnd).notifications.dismiss_all();
+
+    crate::window::tree_move::drop_into(
+        window.hwnd,
+        &RowKind::Note("a.md".into()),
+        std::path::Path::new("work"),
+    );
+
+    let moved = scratch.folder().join(r"work\a.md");
+    assert!(moved.exists() && !a.exists());
+    assert_eq!(
+        std::fs::read_to_string(&moved).unwrap(),
+        "a",
+        "nothing was saved"
+    );
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(active.path.as_deref(), Some(moved.as_path()));
+    assert!(active.dirty);
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(state.is_pinned(&moved));
+    });
+    assert!(
+        crate::window::library_host::expanded(window.hwnd)
+            .contains(&std::path::PathBuf::from("work"))
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"work\a.md".into()))
+    );
+    assert!(
+        notices(window.hwnd).is_empty(),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn tree_move_a_folder_moves_to_the_root_with_its_tabs_and_expanded_folders() {
+    // Break caught: tabs under the moved folder left on old paths, or its expanded state and
+    // its own expanded subfolder lost (tree drag spec §4).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-move-folder");
+    std::fs::create_dir_all(scratch.folder().join(r"work\inner\deep")).unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    let c = open_note(&window, &scratch, r"work\inner\c.md", "c");
+    for folder in ["work", r"work\inner", r"work\inner\deep"] {
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new(folder), true);
+    }
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    crate::window::tree_move::drop_into(
+        window.hwnd,
+        &RowKind::Folder(r"work\inner".into()),
+        std::path::Path::new(""),
+    );
+
+    let moved = scratch.folder().join(r"inner\c.md");
+    assert!(moved.exists() && !c.exists());
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(moved.as_path())
+    );
+    let expanded = crate::window::library_host::expanded(window.hwnd);
+    assert!(
+        expanded.contains(&std::path::PathBuf::from("inner")),
+        "{expanded:?}"
+    );
+    assert!(
+        expanded.contains(&std::path::PathBuf::from(r"inner\deep")),
+        "{expanded:?}"
+    );
+    assert!(
+        !expanded.contains(&std::path::PathBuf::from(r"work\inner")),
+        "{expanded:?}"
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Folder("inner".into()))
+    );
+}
+
+#[test]
+fn tree_move_a_taken_name_is_refused_in_memory_and_on_disk() {
+    // Break caught: a drop onto a listed name in another letter case (a clash on NTFS), or
+    // onto a file the tree has not seen yet, overwriting or half-moving (tree drag spec §5).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-move-taken");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\A.md", "work A");
+    let a = scratch.note("a.md", "root a");
+    let z = scratch.note("z.md", "root z");
+    let (window, _editor) = notebook_window(&scratch);
+    // Made after the scan: only the disk knows it.
+    std::fs::write(scratch.folder().join(r"work\z.md"), "unseen").unwrap();
+
+    let drop = |name: &str, folder: &str| {
+        crate::window::tree_move::drop_into(
+            window.hwnd,
+            &RowKind::Note(name.into()),
+            std::path::Path::new(folder),
+        )
+    };
+    drop("a.md", "work");
+    drop("z.md", "work");
+    // work\A.md onto the root, where a.md is: the notice names the notebook.
+    drop(r"work\A.md", "");
+    let root_name = crate::window::library_host::notebook_name(&scratch.folder());
+
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "root a");
+    assert_eq!(std::fs::read_to_string(&z).unwrap(), "root z");
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join(r"work\z.md")).unwrap(),
+        "unseen"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join(r"work\A.md")).unwrap(),
+        "work A"
+    );
+    assert_eq!(
+        notices(window.hwnd),
+        vec![
+            "a.md already exists in work. Nothing was moved.".to_owned(),
+            "z.md already exists in work. Nothing was moved.".to_owned(),
+            format!("A.md already exists in {root_name}. Nothing was moved."),
+        ]
+    );
+}
+
+#[test]
+fn tree_move_a_vanished_or_locked_source_says_so_and_moves_nothing() {
+    // Break caught: a missing file reported as a generic failure (or as a clash), or a
+    // sharing violation swallowed (tree drag spec §5).
+    use std::os::windows::fs::OpenOptionsExt;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-move-gone");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let gone = scratch.note("gone.md", "g");
+    let locked = scratch.note("locked.md", "l");
+    let (window, _editor) = notebook_window(&scratch);
+    std::fs::remove_file(&gone).unwrap();
+    let _lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&locked)
+        .unwrap();
+
+    for name in ["gone.md", "locked.md"] {
+        crate::window::tree_move::drop_into(
+            window.hwnd,
+            &RowKind::Note(name.into()),
+            std::path::Path::new("work"),
+        );
+    }
+
+    assert!(!scratch.folder().join(r"work\gone.md").exists());
+    assert!(locked.exists() && !scratch.folder().join(r"work\locked.md").exists());
+    let notices = notices(window.hwnd);
+    assert_eq!(notices[0], "gone.md no longer exists.");
+    assert!(
+        notices[1].starts_with("Couldn't move locked.md: "),
+        "{notices:?}"
+    );
+    assert_eq!(notices.len(), 2, "{notices:?}");
+}
+
+#[test]
+fn tree_move_a_drop_into_a_folder_deleted_outside_fastpad_says_so_not_that_the_note_is_gone() {
+    // Break caught: ERROR_PATH_NOT_FOUND for the destination's vanished parent folder read as
+    // the source itself being missing, which said "a.md no longer exists" instead of naming
+    // the real problem and asking for a rescan (final review Important 2; tree drag spec §5).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-move-target-gone");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    // request_rescan only starts a load with a data dir to write the local state to.
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    std::fs::remove_dir(scratch.folder().join("work")).unwrap();
+
+    crate::window::tree_move::drop_into(
+        window.hwnd,
+        &RowKind::Note("a.md".into()),
+        std::path::Path::new("work"),
+    );
+
+    assert!(a.exists(), "the source never moved");
+    let notices = notices(window.hwnd);
+    assert!(
+        notices
+            .last()
+            .is_some_and(|notice| notice.starts_with("Couldn't move a.md: ")),
+        "{notices:?}"
+    );
+    assert!(
+        app_mut(window.hwnd).library.scanning,
+        "a rescan catches the vanished folder up"
+    );
+}
+
+#[test]
+fn tree_move_a_tab_that_cannot_follow_undoes_the_move_or_names_the_stuck_tab() {
+    // Break caught: a move that leaves a tab on a path that no longer exists without saying
+    // so, or keeps the move when it could be undone (tree drag spec §5).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-move-tab");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let a = scratch.note("a.md", "a");
+    let top = scratch.note("top.md", "t");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &top).unwrap();
+    // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+    let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+    app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+        Some(scratch.folder().join(r"work\a.md"));
+    let drop = || {
+        crate::window::tree_move::drop_into(
+            window.hwnd,
+            &RowKind::Note("a.md".into()),
+            std::path::Path::new("work"),
+        )
+    };
+
+    drop();
+    assert!(a.exists(), "moved back");
+    assert_eq!(
+        notices(window.hwnd),
+        vec!["Couldn't move a.md: another tab already has that file open.".to_owned()]
+    );
+
+    crate::window::library_host::fail_next_note_rename_back();
+    drop();
+    assert!(!a.exists() && scratch.folder().join(r"work\a.md").exists());
+    let expected = crate::window::library_host::rename_undo_failed_notice(
+        "a.md",
+        r"work\a.md",
+        std::slice::from_ref(&a),
+    );
+    assert_eq!(notices(window.hwnd).last(), Some(&expected));
+}
+
+fn mouse(panel: HWND, message: u32, buttons: usize, lparam: super::LPARAM) {
+    unsafe { SendMessageW(panel, message, buttons, lparam) };
+}
+
+/// Presses on `from` and moves past the drag distance, still holding the button.
+fn start_drag(hwnd: HWND, panel: HWND, from: &RowKind) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+    let lparam = row_lparam(hwnd, from);
+    mouse(panel, WM_LBUTTONDOWN, 1, lparam);
+    let (x, y) = ((lparam & 0xffff) as i32, (lparam >> 16) as i32);
+    mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x + 30, y));
+}
+
+fn drag_over(panel: HWND, lparam: super::LPARAM) {
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+        1,
+        lparam,
+    );
+}
+
+fn drop_at(panel: HWND, lparam: super::LPARAM) {
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+        0,
+        lparam,
+    );
+}
+
+/// A point in the list below its last row.
+fn below_rows(hwnd: HWND, panel: HWND) -> super::LPARAM {
+    let mut client = windows_sys::Win32::Foundation::RECT::default();
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(panel, &mut client) };
+    let last = notebook_view(hwnd).rows.len() - 1;
+    let bottom = notebook_view(hwnd).row_rect_at(last).unwrap().bottom;
+    assert!(
+        bottom + 40 < client.bottom - 40,
+        "the panel is tall enough to test with"
+    );
+    client_lparam(client.right / 2, bottom + 40)
+}
+
+/// Presses on Open Editors row `index` and moves past the drag distance.
+fn start_tab_drag(hwnd: HWND, panel: HWND, index: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+    let rect = notebook_view(hwnd).editor_rect_at(index).unwrap();
+    let (x, y) = ((rect.left + rect.right) / 3, (rect.top + rect.bottom) / 2);
+    mouse(panel, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+    mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x, y + 40));
+}
+
+#[test]
+fn open_editors_drag_onto_a_folder_copies_the_file_and_leaves_the_tab_on_it() {
+    // Break caught: the drop moving the file, the tab following the copy, or the copied row
+    // not selected (open editors spec §4.1, §4.5).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-drag");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let outside = scratch.root.join("draft.txt");
+    std::fs::write(&outside, "draft").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &outside).unwrap();
+    let panel = sidebar_windows(window.hwnd).1;
+    start_tab_drag(window.hwnd, panel, 0);
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    drag_over(panel, work);
+    drop_at(panel, work);
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+        "draft"
+    );
+    assert!(outside.exists());
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(outside.as_path())
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"work\draft.txt".into())),
+        "a .txt is a note type, listed and selected"
+    );
+}
+
+#[test]
+fn open_editors_drag_onto_its_own_folder_copies_nothing_and_asks_nothing() {
+    // Break caught (Review Focus 1).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-drag-self");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let b = scratch.note(r"work\b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &b).unwrap();
+    let panel = sidebar_windows(window.hwnd).1;
+    start_tab_drag(window.hwnd, panel, 0);
+    let row = row_lparam(window.hwnd, &RowKind::Note(r"work\b.md".into()));
+    drag_over(panel, row);
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        None
+    );
+    drop_at(panel, row);
+    assert!(crate::window::modal::take_last_confirm().is_none());
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "b");
+}
+
+#[test]
+fn open_editors_an_untitled_row_drags_but_no_folder_takes_it() {
+    // Break caught: an untitled row that cannot reach another group, or one the tree tries
+    // to copy with no file behind it (plan amendment 5).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-drag-untitled");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    start_tab_drag(window.hwnd, panel, 0);
+    assert!(
+        notebook_view(window.hwnd)
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.started)
+    );
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    drag_over(panel, work);
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        None
+    );
+    drop_at(panel, work);
+}
+
+/// The Open Editors entry index (headers counted, as `editor_rect_at` counts them) of
+/// document `id`'s first view.
+fn open_editors_row_of(hwnd: HWND, id: crate::document::DocumentId) -> usize {
+    (0..64)
+        .find(|&index| {
+            notebook_view(hwnd)
+                .editors
+                .row(index)
+                .is_some_and(|row| row.id == id)
+        })
+        .expect("an Open Editors row")
+}
+
+#[test]
+fn open_editors_a_row_dropped_on_another_groups_content_moves_there() {
+    // Break caught: row drags stopping at the sidebar's edge (split editors spec §6.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-drag-group");
+    let outside = scratch.root.join("draft.txt");
+    std::fs::write(&outside, "draft").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &outside).unwrap();
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::New);
+    // Close the split's view of `dragged`, so a move is visible.
+    super::focus_view(window.hwnd, second, dragged);
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert!(super::activate_group(window.hwnd, first));
+    let panel = sidebar_windows(window.hwnd).1;
+    let row = open_editors_row_of(window.hwnd, dragged);
+    start_tab_drag(window.hwnd, panel, row);
+    let target = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    let middle = super::with_group_id(window.hwnd, second, |state| state.content).unwrap();
+    let point = lparam_in(
+        panel,
+        target,
+        (middle.left + middle.right) / 2,
+        (middle.top + middle.bottom) / 2,
+    );
+    drag_over(panel, point);
+    assert!(app_mut(window.hwnd).drop_overlay.is_some());
+    drop_at(panel, point);
+    assert!(
+        app_mut(window.hwnd)
+            .tabs
+            .group(second)
+            .unwrap()
+            .contains(dragged)
+    );
+    assert!(
+        !app_mut(window.hwnd)
+            .tabs
+            .group(first)
+            .is_some_and(|group| group.contains(dragged))
+    );
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+}
+
+#[test]
+fn open_editors_a_row_drag_cancelled_over_a_group_leaves_no_overlay() {
+    // Break caught: Esc mid-drag leaving the tint over the editor.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-drag-cancel");
+    let (window, _editor) = notebook_window(&scratch);
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    let panel = sidebar_windows(window.hwnd).1;
+    // With two groups entry 0 is a header: press the first tab row.
+    let row = (0..64)
+        .find(|&index| notebook_view(window.hwnd).editors.row(index).is_some())
+        .unwrap();
+    start_tab_drag(window.hwnd, panel, row);
+    let target = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    let middle = super::with_group_id(window.hwnd, second, |state| state.content).unwrap();
+    drag_over(
+        panel,
+        lparam_in(
+            panel,
+            target,
+            middle.left + 40,
+            (middle.top + middle.bottom) / 2,
+        ),
+    );
+    assert!(crate::window::notebook_view::cancel_drag(window.hwnd));
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+}
+
+#[test]
+fn open_editors_drag_survives_its_tab_closing_mid_drag() {
+    // Break caught (Review Focus 5): a stale DocumentId panicking the drop, or the drop
+    // copying nothing though the pressed file is still on disk.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-drag-closed");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let outside = scratch.root.join("gone.md");
+    std::fs::write(&outside, "g").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &outside).unwrap();
+    let panel = sidebar_windows(window.hwnd).1;
+    start_tab_drag(window.hwnd, panel, 0);
+    execute_command(window.hwnd, CommandId::CloseTab);
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    drag_over(panel, work);
+    drop_at(panel, work);
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert!(scratch.folder().join(r"work\gone.md").exists());
+}
+
+fn drag_cursor_is(cursor: windows_sys::core::PCWSTR) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursor, LoadCursorW};
+    unsafe { GetCursor() == LoadCursorW(std::ptr::null_mut(), cursor) }
+}
+
+#[test]
+fn tree_drag_a_short_move_or_a_missed_release_stays_a_click() {
+    // Break caught: a click turned into a drag by a jitter, or a drag started after its
+    // release went to another window (tree drag spec §3.1).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-click");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let lparam = row_lparam(window.hwnd, &RowKind::Note("a.md".into()));
+    let (x, y) = ((lparam & 0xffff) as i32, (lparam >> 16) as i32);
+
+    mouse(panel, WM_LBUTTONDOWN, 1, lparam);
+    mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x + 1, y + 1));
+    assert!(unsafe { GetCapture() }.is_null());
+    drop_at(panel, client_lparam(x + 1, y + 1));
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(a.as_path()),
+        "the press still opened the note"
+    );
+
+    mouse(panel, WM_LBUTTONDOWN, 1, lparam);
+    // The release went elsewhere: the next move comes without the button.
+    mouse(
+        panel,
+        WM_MOUSEMOVE,
+        0,
+        row_lparam(window.hwnd, &RowKind::Folder("work".into())),
+    );
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    assert!(unsafe { GetCapture() }.is_null());
+    assert!(a.exists());
+}
+
+#[test]
+fn tree_drag_a_note_dropped_on_a_folder_moves_into_it_and_is_selected() {
+    // Break caught: the drag not capturing, the drop not moving, the timer or capture left
+    // behind, or the moved row not selected (tree drag spec §3.1, §3.4).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, KillTimer};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-note");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    assert_eq!(unsafe { GetCapture() }, panel);
+    assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    drag_over(panel, work);
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        Some("work".into())
+    );
+    assert!(drag_cursor_is(IDC_ARROW));
+    drop_at(panel, work);
+
+    let moved = scratch.folder().join(r"work\a.md");
+    assert!(moved.exists() && !a.exists());
+    assert!(unsafe { GetCapture() }.is_null());
+    assert_eq!(
+        unsafe { KillTimer(panel, crate::window::notebook_view::DRAG_TIMER) },
+        0
+    );
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"work\a.md".into()))
+    );
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(moved.as_path()),
+        "the preview the press opened followed"
+    );
+}
+
+#[test]
+fn tree_drag_a_folder_pressed_then_dragged_to_empty_space_moves_to_the_root() {
+    // Break caught: the press's folder toggle shifting the rows so the drag follows the
+    // wrong row, or empty space not meaning the root (tree drag spec §3.1, §3.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-folder");
+    std::fs::create_dir_all(scratch.folder().join(r"work\inner")).unwrap();
+    scratch.note(r"work\inner\c.md", "c");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("work"), true);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    // The press toggles `inner` open, adding c.md's row under it.
+    start_drag(window.hwnd, panel, &RowKind::Folder(r"work\inner".into()));
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().source,
+        DragSource::Row(RowKind::Folder(r"work\inner".into()))
+    );
+    let below = below_rows(window.hwnd, panel);
+    drag_over(panel, below);
+    drop_at(panel, below);
+
+    assert!(scratch.folder().join(r"inner\c.md").exists());
+    assert!(!scratch.folder().join(r"work\inner").exists());
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Folder("inner".into()))
+    );
+}
+
+#[test]
+fn tree_drag_refused_targets_and_a_release_outside_move_nothing() {
+    // Break caught: a folder dropped into its own subfolder, a note "moved" into its own
+    // folder, the refusal cursor missing, or a release over the editor moving anyway
+    // (tree drag spec §3.2).
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDC_NO;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-refused");
+    std::fs::create_dir_all(scratch.folder().join(r"work\inner")).unwrap();
+    scratch.note(r"work\inner\c.md", "c");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    for folder in ["work", r"work\inner"] {
+        crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new(folder), true);
+    }
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    // `work` collapses on the press; it is expanded again so `inner` is there to hover.
+    start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("work"), true);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let inner = row_lparam(window.hwnd, &RowKind::Folder(r"work\inner".into()));
+    drag_over(panel, inner);
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        None
+    );
+    assert!(drag_cursor_is(IDC_NO));
+    drop_at(panel, inner);
+    assert!(scratch.folder().join(r"work\inner\c.md").exists());
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    let below = below_rows(window.hwnd, panel);
+    drag_over(panel, below);
+    assert!(drag_cursor_is(IDC_NO), "the root is a.md's own folder");
+    drop_at(panel, below);
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    drag_over(panel, work);
+    drop_at(panel, client_lparam(-50, (work >> 16) as i32));
+    assert!(scratch.folder().join("a.md").exists());
+    assert!(!scratch.folder().join(r"work\a.md").exists());
+    assert!(
+        notices(window.hwnd).is_empty(),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn tree_drag_esc_a_right_press_and_a_lost_capture_cancel() {
+    // Break caught: Esc sending the focus to the editor mid-drag, a right press opening the
+    // menu or leaving the drag on, or a task switch leaving a drag that drops later
+    // (tree drag spec §3.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetCapture, GetFocus, ReleaseCapture, SetCapture, VK_ESCAPE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-cancel");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let work = || row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    drag_over(panel, work());
+    unsafe { SendMessageW(panel, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    assert!(unsafe { GetCapture() }.is_null());
+    assert_eq!(unsafe { GetFocus() }, panel, "the focus stays in the tree");
+    drop_at(panel, work());
+    assert!(a.exists());
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    drag_over(panel, work());
+    mouse(panel, WM_RBUTTONDOWN, 2, work());
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    // The fix for review round 2 item 1: the capture stays until the right press's own
+    // release reaches the panel (otherwise that release, sent while the pointer is over the
+    // editor, would fall through to DefWindowProc there and open its context menu).
+    assert_eq!(
+        unsafe { GetCapture() },
+        panel,
+        "the capture stays until the right press's own release"
+    );
+    mouse(panel, WM_RBUTTONUP, 0, work());
+    assert!(unsafe { GetCapture() }.is_null());
+    drop_at(panel, work());
+    assert!(a.exists());
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    drag_over(panel, work());
+    unsafe { SetCapture(window.hwnd) };
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    unsafe { ReleaseCapture() };
+    drop_at(panel, work());
+    assert!(a.exists());
+    assert!(!scratch.folder().join(r"work\a.md").exists());
+}
+
+#[test]
+fn tree_drag_a_right_press_cancel_frees_the_mouse_when_its_release_cannot_come() {
+    // Break caught: after a right press cancelled a drag, a view switch, the sidebar hiding
+    // or a left press while the right button was still down leaving the panel with the
+    // capture for good, so clicks anywhere in FastPad went to the sidebar (tree drag spec
+    // §10).
+    use crate::config::SidebarView;
+    use crate::window::side_panel::show_view;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-right-capture");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let note = RowKind::Note("a.md".into());
+    // Starts a drag of a.md and cancels it with a right press, still held.
+    let cancel_with_right_press = || {
+        start_drag(window.hwnd, panel, &note);
+        mouse(panel, WM_RBUTTONDOWN, 2, row_lparam(window.hwnd, &note));
+        assert!(notebook_view(window.hwnd).drag.is_none());
+        assert_eq!(unsafe { GetCapture() }, panel, "kept for the right release");
+    };
+
+    for (view, name) in [
+        (SidebarView::Search, "another view"),
+        (SidebarView::Hidden, "the sidebar hiding"),
+    ] {
+        cancel_with_right_press();
+        show_view(window.hwnd, view, false);
+        assert!(unsafe { GetCapture() }.is_null(), "{name} frees the mouse");
+        show_view(window.hwnd, SidebarView::Notebook, false);
+        assert!(!notebook_view(window.hwnd).eat_right_up, "{name}");
+    }
+
+    cancel_with_right_press();
+    let lparam = row_lparam(window.hwnd, &note);
+    mouse(panel, WM_LBUTTONDOWN, 3, lparam);
+    assert!(
+        unsafe { GetCapture() }.is_null(),
+        "a left press frees the mouse"
+    );
+    mouse(panel, WM_LBUTTONUP, 2, lparam);
+    // The wait is gone, so the right release would now open the tree's menu, as any other
+    // does: not sent, since the menu's loop would wait for input.
+    assert!(!notebook_view(window.hwnd).eat_right_up);
+    assert!(a.exists(), "nothing moved");
+}
+
+#[test]
+fn tree_drag_a_right_press_cancel_eats_only_its_own_release() {
+    // Break caught: a right press that cancelled a drag setting a flag that outlives its own
+    // release (the release went elsewhere, e.g. the pointer was over the editor), so the next
+    // ordinary right-click in the tree opens no menu (tree drag spec §3.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-right-cancel");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let work = || row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    drag_over(panel, work());
+    mouse(panel, WM_RBUTTONDOWN, 2, work());
+    assert!(
+        notebook_view(window.hwnd).eat_right_up,
+        "the cancel's own release should be eaten"
+    );
+    let result = unsafe { SendMessageW(panel, WM_RBUTTONUP, 0, work()) };
+    assert_eq!(result, 0, "its own release is eaten, so no menu opens");
+    assert!(!notebook_view(window.hwnd).eat_right_up);
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    drag_over(panel, work());
+    mouse(panel, WM_RBUTTONDOWN, 2, work());
+    assert!(notebook_view(window.hwnd).eat_right_up);
+    // The release never came here (it went elsewhere): a later, unrelated right press must
+    // not still be eating a release meant for it.
+    mouse(panel, WM_RBUTTONDOWN, 2, work());
+    assert!(
+        !notebook_view(window.hwnd).eat_right_up,
+        "a later ordinary right press clears the stale flag"
+    );
+    // The first press's release never came (simulated above): its capture is still held.
+    // Tidy up, since nothing else in this scenario will release it.
+    unsafe { ReleaseCapture() };
+}
+
+#[test]
+fn tree_drag_a_right_press_cancel_over_the_editor_still_gets_its_release() {
+    // Break caught: releasing the capture as soon as a right press cancels a drag lets its
+    // own WM_RBUTTONUP, sent while the pointer is over the editor, fall through to
+    // DefWindowProc there and open the editor's context menu instead of the panel eating its
+    // own release (tree drag spec §3.3, spec §10; final review Important 1).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-right-editor");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    drag_over(panel, work);
+    let mut client = RECT::default();
+    unsafe { GetClientRect(panel, &mut client) };
+    // Beyond the panel's own client width: over the editor. Capture still routes it here.
+    let beyond = client_lparam(client.right + 50, (work >> 16) as i32);
+    mouse(panel, WM_RBUTTONDOWN, 2, beyond);
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    assert_eq!(
+        unsafe { GetCapture() },
+        panel,
+        "the capture stays until the right press's own release reaches the panel"
+    );
+
+    let result = unsafe { SendMessageW(panel, WM_RBUTTONUP, 0, beyond) };
+    assert_eq!(
+        result, 0,
+        "eaten: DefWindowProc never turns it into a context menu"
+    );
+    assert!(unsafe { GetCapture() }.is_null());
+    assert!(!notebook_view(window.hwnd).eat_right_up);
+}
+
+#[test]
+fn tree_drag_the_timer_expands_a_resting_folder_and_scrolls_near_the_bottom() {
+    // Break caught: a hovered collapsed folder never opening, the list not scrolling at its
+    // edge, or no timer while dragging (tree drag spec §3.3).
+    use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-timer");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    for index in 0..80 {
+        scratch.note(&format!("n{index:02}.md"), "n");
+    }
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("work"), false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    start_drag(window.hwnd, panel, &RowKind::Note("n00.md".into()));
+    let start = std::time::Instant::now();
+    drag_over(
+        panel,
+        row_lparam(window.hwnd, &RowKind::Folder("work".into())),
+    );
+    crate::window::notebook_view::drag_tick(window.hwnd, start);
+    assert!(
+        !crate::window::library_host::expanded(window.hwnd)
+            .contains(&std::path::PathBuf::from("work"))
+    );
+    crate::window::notebook_view::drag_tick(
+        window.hwnd,
+        start + std::time::Duration::from_millis(800),
+    );
+    assert!(
+        crate::window::library_host::expanded(window.hwnd)
+            .contains(&std::path::PathBuf::from("work"))
+    );
+
+    let mut client = windows_sys::Win32::Foundation::RECT::default();
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(panel, &mut client) };
+    drag_over(panel, client_lparam(client.right / 2, client.bottom - 2));
+    let top = notebook_view(window.hwnd).list.top;
+    crate::window::notebook_view::drag_tick(window.hwnd, start);
+    assert!(notebook_view(window.hwnd).list.top > top, "scrolled down");
+    assert_ne!(
+        unsafe { KillTimer(panel, crate::window::notebook_view::DRAG_TIMER) },
+        0,
+        "the drag's timer runs"
+    );
+    crate::window::notebook_view::cancel_drag(window.hwnd);
+}
+
+#[test]
+fn tree_drag_a_rebuild_or_view_switch_mid_drag_cancels_or_retargets() {
+    // Break caught: a drag of a row a rescan removed staying on, a drop into a folder that
+    // vanished, or a drag surviving another view (tree drag spec §3.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-rebuild");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    std::fs::create_dir_all(scratch.folder().join("other")).unwrap();
+    let a = scratch.note("a.md", "a");
+    scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    start_drag(window.hwnd, panel, &RowKind::Note("b.md".into()));
+    drag_over(
+        panel,
+        row_lparam(window.hwnd, &RowKind::Folder("work".into())),
+    );
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        state.remove_folder_for_test(std::path::Path::new("work"));
+    });
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let drag = notebook_view(window.hwnd).drag.clone().unwrap();
+    assert_eq!(drag.target, None, "the target folder's row is gone");
+
+    crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&a));
+    crate::window::notebook_view::rebuild(window.hwnd);
+    assert!(
+        notebook_view(window.hwnd).drag.is_some(),
+        "b.md is still there"
+    );
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        state.remove_note(&scratch.folder().join("b.md"))
+    });
+    crate::window::notebook_view::rebuild(window.hwnd);
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    assert!(unsafe { GetCapture() }.is_null());
+
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        let _ = state.add_note(&a);
+    });
+    crate::window::notebook_view::rebuild(window.hwnd);
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    assert!(unsafe { GetCapture() }.is_null());
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    assert!(notebook_view(window.hwnd).drag.is_none());
+}
+
+#[test]
+fn tree_drag_a_press_during_a_refused_edit_ends_the_edit_before_the_drag() {
+    // Break caught: a taken name left open under a drag started by the same press, instead
+    // of the press committing the refused edit first — closing it with its notice, renaming
+    // nothing — and only then arming the drag of the row it actually landed on (spec §8, tree
+    // drag spec §3.1; final review Important 3, a controller-pinned ordering).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-refused-edit");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    std::fs::create_dir_all(scratch.folder().join("other")).unwrap();
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "other");
+    assert_eq!(
+        crate::window::inline_name::problem(window.hwnd).as_deref(),
+        Some("other already exists here.")
+    );
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+
+    assert!(!inline_open(window.hwnd), "the refused edit closed");
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|notice| notice == "other already exists here."),
+        "{:?}",
+        notices(window.hwnd)
+    );
+    assert!(scratch.folder().join("sub").is_dir(), "nothing was renamed");
+    assert!(scratch.folder().join("other").is_dir());
+    assert_eq!(
+        notebook_view(window.hwnd)
+            .drag
+            .as_ref()
+            .map(|drag| drag.source.clone()),
+        Some(DragSource::Row(RowKind::Note("a.md".into()))),
+        "the pressed row's drag armed only once the edit had closed"
+    );
+    assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);
+    assert_eq!(unsafe { GetCapture() }, panel);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(a.as_path()),
+        "the press still opened the note"
+    );
+
+    crate::window::notebook_view::cancel_drag(window.hwnd);
+}
+
+#[test]
+fn tree_drag_a_notebook_switch_mid_drag_cancels_even_when_the_row_still_resolves() {
+    // Break caught: a rebuild that only checks whether the dragged row's RowKind still has a
+    // row, so switching to a different notebook that happens to have its own "a.md" reads as
+    // "the row is still there" and the drag survives into the wrong notebook (final review
+    // Minor 5; tree drag spec §3.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    let _scintilla = load_native_scintilla();
+    let first = LibraryScratch::new("drag-switch-first");
+    let a = first.note("a.md", "a");
+    let (window, _editor) = notebook_window(&first);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    assert_eq!(unsafe { GetCapture() }, panel);
+
+    let second = LibraryScratch::new("drag-switch-second");
+    second.note("a.md", "a2");
+    let local = crate::library::local::local_file(&second.data(), &second.folder());
+    let state = crate::library::load(&second.folder(), &local, crate::library::now_unix()).unwrap();
+    crate::window::library_host::install_for_test(window.hwnd, state);
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    assert!(
+        notebook_view(window.hwnd).drag.is_none(),
+        "a different notebook's a.md is not the same row"
+    );
+    assert!(unsafe { GetCapture() }.is_null());
+    assert!(a.exists());
+}
+
+#[test]
+fn tree_drag_a_rebuild_mid_drag_retargets_the_band_from_the_still_pointer() {
+    // Break caught: rows shifting under a pointer that has not moved (a folder appearing
+    // elsewhere, a rescan) leaving the drag's target and cursor pointing at what used to be
+    // there, until the next mouse move (final review Minor 4; tree drag spec §3.2, §3.3).
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDC_ARROW;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-rebuild-retarget");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    drag_over(panel, work);
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        Some("work".into())
+    );
+
+    // A folder appears above "work", sorted before it: "work"'s row shifts down one, so the
+    // still pointer is now over the new folder's row instead.
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        state.add_folder(std::path::Path::new("AAA"));
+    });
+    crate::window::notebook_view::rebuild(window.hwnd);
+
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        Some("AAA".into()),
+        "the band followed the row that moved under the still pointer"
+    );
+    assert!(drag_cursor_is(IDC_ARROW));
+
+    crate::window::notebook_view::cancel_drag(window.hwnd);
+}
+
+#[test]
+fn tree_drag_a_wheel_scroll_mid_drag_retargets_the_band_from_the_still_pointer() {
+    // Break caught: a wheel scroll during a started drag moving the rows under the pointer
+    // without re-checking the target, so the band and cursor keep showing the row that used
+    // to be there (final review Minor 4; tree drag spec §3.2, §3.3).
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, IDC_NO, WM_MOUSEWHEEL};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-wheel-retarget");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note("a.md", "a");
+    for index in 0..80 {
+        scratch.note(&format!("n{index:02}.md"), "n");
+    }
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    // "a.md" is dragged: the root is its own folder, so it is refused there and accepted in
+    // "work", the only folder.
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    drag_over(panel, work);
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        Some("work".into())
+    );
+    assert!(drag_cursor_is(IDC_ARROW));
+
+    // A big scroll: "work" (the list's one folder, at the top) scrolls out of view, so the
+    // still pointer, at the same pixel it was over "work" at, now lands on a root note.
+    let down = ((-(120_i16 * 20)) as u16 as usize) << 16;
+    let top = notebook_view(window.hwnd).list.top;
+    mouse(panel, WM_MOUSEWHEEL, down, 0);
+    assert!(notebook_view(window.hwnd).list.top > top, "scrolled");
+
+    assert_eq!(
+        notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+        None,
+        "the still pointer is over a root note now: a.md's own folder"
+    );
+    assert!(drag_cursor_is(IDC_NO));
+
+    crate::window::notebook_view::cancel_drag(window.hwnd);
+}
+
+#[test]
+fn tree_drag_keys_are_ignored_while_a_drag_is_started() {
+    // Break caught: F2 opening a rename field, or a typed letter jumping the selection, on
+    // the row a started drag is carrying (final review Minor 6; tree drag spec §3.3). Esc
+    // still cancels it: side_panel routes that to cancel_drag before this is ever reached.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-keys-ignored");
+    scratch.note("a.md", "a");
+    scratch.note("zzz.md", "z");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("a.md".into()))
+    );
+
+    mouse(panel, WM_KEYDOWN, VK_F2 as usize, 0);
+    assert!(!inline_open(window.hwnd), "F2 opened no rename field");
+
+    mouse(panel, WM_CHAR, 'z' as usize, 0);
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("a.md".into())),
+        "a typed letter did not jump the selection"
+    );
+    assert!(notebook_view(window.hwnd).drag.as_ref().unwrap().started);
+
+    crate::window::notebook_view::cancel_drag(window.hwnd);
+}
+
+#[test]
+fn tree_drag_a_label_with_the_name_follows_the_pointer_until_the_drag_ends() {
+    // Break caught: a drag with nothing following the pointer, a label that takes the focus
+    // or clicks, one left on screen after a drop or a cancel, or one shown for a click
+    // (tree drag spec §3.2).
+    use crate::window::drag_label::{place, work_area};
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetFocus, ReleaseCapture, SetCapture, VK_ESCAPE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongW, GetWindowRect, GetWindowTextW, IsWindow, IsWindowVisible,
+        WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WS_EX_NOACTIVATE,
+        WS_EX_TRANSPARENT,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("drag-label");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let label = || {
+        notebook_view(window.hwnd)
+            .drag_label
+            .map(|label| label.hwnd())
+    };
+    let text = |label: HWND| {
+        let mut buffer = [0u16; 64];
+        let length = unsafe { GetWindowTextW(label, buffer.as_mut_ptr(), 64) };
+        String::from_utf16_lossy(&buffer[..length as usize])
+    };
+    let point = |lparam: super::LPARAM| ((lparam & 0xffff) as i32, (lparam >> 16) as i32);
+    // Where the label should be for the pointer at panel `lparam`.
+    let expected = |label: HWND, lparam: super::LPARAM| {
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(label, &mut rect) };
+        let (x, y) = point(lparam);
+        let mut pointer = POINT { x, y };
+        unsafe { ClientToScreen(panel, &mut pointer) };
+        let size = windows_sys::Win32::Foundation::SIZE {
+            cx: rect.right - rect.left,
+            cy: rect.bottom - rect.top,
+        };
+        let at = place(pointer, size, work_area(pointer), unsafe {
+            GetDpiForWindow(panel)
+        });
+        ((rect.left, rect.top), (at.x, at.y))
+    };
+    let a = row_lparam(window.hwnd, &RowKind::Note("a.md".into()));
+    let work = || row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+
+    let (x, y) = point(a);
+    mouse(panel, WM_LBUTTONDOWN, 1, a);
+    mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x + 1, y + 1));
+    assert!(label().is_none(), "a click shows no label");
+    drop_at(panel, client_lparam(x + 1, y + 1));
+
+    // The click may have moved the rows: start_drag presses where the row is now.
+    let (x, y) = point(row_lparam(window.hwnd, &RowKind::Note("a.md".into())));
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    let shown = label().expect("the drag shows a label");
+    assert!(unsafe { IsWindowVisible(shown) } != 0);
+    assert_eq!(text(shown), "a.md");
+    let style = unsafe { GetWindowLongW(shown, GWL_EXSTYLE) } as u32;
+    assert_eq!(
+        style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE),
+        WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        "it never takes a click or the focus"
+    );
+    assert_eq!(unsafe { GetFocus() }, panel);
+    let (at, want) = expected(shown, client_lparam(x + 30, y));
+    assert_eq!(at, want, "next to the pointer");
+    drag_over(panel, work());
+    let (at, want) = expected(shown, work());
+    assert_eq!(at, want, "it follows the pointer");
+    drop_at(panel, work());
+    assert!(label().is_none());
+    assert!(unsafe { IsWindow(shown) } == 0, "the drop destroys it");
+    assert!(scratch.folder().join(r"work\a.md").exists());
+
+    let gone = |shown: HWND| label().is_none() && unsafe { IsWindow(shown) } == 0;
+    start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+    let shown = label().unwrap();
+    assert_eq!(text(shown), "work");
+    unsafe { SendMessageW(panel, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    assert!(gone(shown), "Esc");
+
+    start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+    let shown = label().unwrap();
+    mouse(panel, WM_RBUTTONDOWN, 2, work());
+    assert!(gone(shown), "a right press");
+    mouse(panel, WM_RBUTTONUP, 0, work());
+
+    start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+    let shown = label().unwrap();
+    unsafe { SetCapture(window.hwnd) };
+    assert!(gone(shown), "a lost capture");
+    unsafe { ReleaseCapture() };
+
+    start_drag(window.hwnd, panel, &RowKind::Folder("work".into()));
+    let shown = label().unwrap();
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
+    assert!(gone(shown), "another view");
+}
+
+/// The centre of `rect` as a panel `lParam`.
+fn centre(rect: RECT) -> super::LPARAM {
+    client_lparam((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+}
+
+#[test]
+fn open_editors_lists_the_tabs_and_follows_opening_closing_and_saving() {
+    // Break caught: a tab opened or closed without its row following, a dirty tab without
+    // its dot, or the active tab's row not the selected one (open editors spec §3.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-follow");
+    let a = scratch.note("a.md", "a");
+    let (window, editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    let outside = scratch.root.join("outside.txt");
+    std::fs::write(&outside, "x").unwrap();
+    super::open_path(window.hwnd, &outside).unwrap();
+    let names = |hwnd| {
+        notebook_view(hwnd)
+            .editors
+            .rows
+            .iter()
+            .filter_map(crate::window::open_editors::EditorEntry::row)
+            .map(|row| (row.name.clone(), row.dirty, row.active))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(window.hwnd),
+        [
+            ("a.md".into(), false, false),
+            ("outside.txt".into(), false, true)
+        ]
+    );
+    editor.set_text("changed").unwrap();
+    assert!(names(window.hwnd)[1].1, "the dirty dot follows the edit");
+    crate::window::modal::answer_next_close_prompt(|_| CloseDecision::Discard);
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert_eq!(names(window.hwnd).len(), 1);
+}
+
+#[test]
+fn open_editors_click_switches_close_box_and_middle_click_close() {
+    // Break caught: a click that opens nothing, the close box closing the wrong tab, or a
+    // middle-click ignored in the panel (open editors spec §3.2).
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-click");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let c = scratch.note("c.md", "c");
+    let (window, _editor) = notebook_window(&scratch);
+    for path in [&a, &b, &c] {
+        super::open_path(window.hwnd, path).unwrap();
+    }
+    let panel = sidebar_windows(window.hwnd).1;
+    let row0 = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(row0));
+    mouse(panel, WM_LBUTTONUP, 0, centre(row0));
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(a.as_path())
+    );
+    assert_eq!(
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+        panel,
+        "the focus stays in the panel, as a click on a tree row leaves it"
+    );
+
+    let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+    let close = crate::window::open_editors::close_rect(row1, 96);
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(close));
+    mouse(panel, WM_LBUTTONUP, 0, centre(close));
+    assert_eq!(tab_paths(window.hwnd), [Some(a.clone()), Some(c.clone())]);
+
+    let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+    mouse(panel, WM_MBUTTONDOWN, 4, centre(row1));
+    mouse(panel, WM_MBUTTONUP, 0, centre(row1));
+    assert_eq!(tab_paths(window.hwnd), [Some(a)]);
+}
+
+#[test]
+fn open_editors_expanded_after_a_switch_while_collapsed_shows_every_row() {
+    // Break caught: a tab switch while the section was collapsed (a list 0 px high) scrolling
+    // the rows to the active one, so expanding showed one row and blank space below, with
+    // clicks landing on the wrong row.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-collapsed-switch");
+    let paths: Vec<_> = (0..6)
+        .map(|index| scratch.note(&format!("n{index}.md"), "x"))
+        .collect();
+    let (window, _editor) = notebook_window(&scratch);
+    for path in &paths {
+        super::open_path(window.hwnd, path).unwrap();
+    }
+    assert_eq!(notebook_view(window.hwnd).editors.rows.len(), 6);
+    let panel = sidebar_windows(window.hwnd).1;
+    let toggle = || {
+        let header = notebook_view(window.hwnd).editors_header_rect();
+        mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+        mouse(panel, WM_LBUTTONUP, 0, centre(header));
+    };
+    toggle();
+    assert!(!super::open_editors_expanded(window.hwnd));
+    let fifth = notebook_view(window.hwnd).editors.row(4).unwrap().id;
+    super::activate_document_by_id(window.hwnd, fifth);
+    assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(4));
+    toggle();
+    assert!(super::open_editors_expanded(window.hwnd));
+    assert_eq!(notebook_view(window.hwnd).editors.list.top, 0);
+    for index in 0..6 {
+        assert!(
+            notebook_view(window.hwnd).editor_rect_at(index).is_some(),
+            "row {index} is in view"
+        );
+    }
+    let row0 = notebook_view(window.hwnd).editor_rect_at(0).unwrap();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(row0));
+    mouse(panel, WM_LBUTTONUP, 0, centre(row0));
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(paths[0].as_path()),
+        "a click lands on the row drawn there"
+    );
+}
+
+#[test]
+fn open_editors_and_the_root_collapse_and_stay_so() {
+    // Break caught: the chevrons doing nothing, the tree still hit-tested while the root is
+    // collapsed, or either state lost (open editors spec §3.3).
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-collapse");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let header = notebook_view(window.hwnd).editors_header_rect();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(header));
+    mouse(panel, WM_LBUTTONUP, 0, centre(header));
+    assert!(!super::open_editors_expanded(window.hwnd));
+    let root = notebook_view(window.hwnd).root_rect();
+    let chevron = crate::window::notebook_layout::root_parts(root, 96).chevron;
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(chevron));
+    mouse(panel, WM_LBUTTONUP, 0, centre(chevron));
+    assert!(!crate::window::library_host::root_expanded(window.hwnd));
+    assert!(!notebook_view(window.hwnd).tree_shown());
+    let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
+    assert!(
+        std::fs::read_to_string(local)
+            .unwrap()
+            .contains("root=collapsed")
+    );
+}
+
+#[test]
+fn the_arrow_keys_cross_from_open_editors_into_the_tree_and_del_on_a_tab_row_deletes_nothing() {
+    // Break caught: the keyboard stuck in the tree, Enter on a tab row doing nothing, or Del
+    // on a tab row deleting the tree's selected note (open editors spec §3.5).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_DOWN, VK_HOME, VK_RETURN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-keys");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+    let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+    key(VK_HOME);
+    assert_eq!(
+        notebook_view(window.hwnd).cursor,
+        crate::window::panel_cursor::Cursor::EditorsHeader
+    );
+    key(VK_DOWN);
+    key(VK_DELETE);
+    assert!(a.exists() && b.exists(), "Del on a tab row deletes nothing");
+    key(VK_RETURN);
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(a.as_path())
+    );
+    for _ in 0..3 {
+        key(VK_DOWN);
+    }
+    assert_eq!(
+        notebook_view(window.hwnd).cursor,
+        crate::window::panel_cursor::Cursor::Tree
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("a.md".into()))
+    );
+}
+
+#[test]
+fn a_note_command_with_a_tab_row_selected_leaves_the_trees_selected_note_alone() {
+    // Break caught: Delete run while the keyboard selection is on an Open Editors row
+    // deleting the tree's selected note instead of the active tab's (open editors spec
+    // §3.5).
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-delete");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+    let panel = sidebar_windows(window.hwnd).1;
+    let row1 = notebook_view(window.hwnd).editor_rect_at(1).unwrap();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(row1));
+    mouse(panel, WM_LBUTTONUP, 0, centre(row1));
+    assert_eq!(
+        notebook_view(window.hwnd).cursor,
+        crate::window::panel_cursor::Cursor::Editor(1)
+    );
+    assert_eq!(
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+        panel
+    );
+    select_row(window.hwnd, &RowKind::Note("a.md".into()));
+    crate::window::modal::answer_next_confirm(|_| true);
+    execute_command(window.hwnd, CommandId::NoteDelete);
+    assert!(a.exists(), "the tree's selected note stays");
+    assert!(!b.exists(), "the active tab's note goes");
+}
+
+#[test]
+fn the_root_rows_new_note_button_still_makes_the_note_in_the_selected_folder() {
+    // Break caught: a click on the root row's New note moving the keyboard selection off the
+    // tree, so the note went to the notebook's root (open editors spec §3.3).
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-root-new-note");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    select_row(window.hwnd, &RowKind::Folder("sub".into()));
+    let panel = sidebar_windows(window.hwnd).1;
+    let root = notebook_view(window.hwnd).root_rect();
+    let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
+        .buttons
+        .into_iter()
+        .find(|(button, _)| *button == crate::window::notebook_view::HeaderButton::NewNote)
+        .unwrap();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(new_note));
+    mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::NewNote("sub".into()))
+    );
+}
+
+#[test]
+fn without_a_notebook_the_arrows_cross_between_open_editors_and_recent() {
+    // Break caught: the keyboard stuck in RECENT or in Open Editors while no notebook is
+    // open (open editors spec §3.5).
+    use crate::window::panel_cursor::Cursor;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_HOME, VK_UP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-recent-a");
+    let other = LibraryScratch::new("editors-recent-b");
+    let a = scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    crate::library::local::write_folders(
+        &crate::library::local::folders_file(&scratch.data()),
+        &crate::library::local::RecentFolders {
+            folders: vec![scratch.folder(), other.folder()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    super::open_path(window.hwnd, &a).unwrap();
+    execute_command(window.hwnd, CommandId::CloseNotebook);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
+    assert!(!notebook_view(window.hwnd).recent.is_empty());
+    let tabs = notebook_view(window.hwnd).editors.rows.len();
+    assert!(tabs >= 1);
+    let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+    key(VK_HOME);
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::EditorsHeader);
+    for _ in 0..tabs {
+        key(VK_DOWN);
+    }
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(tabs - 1));
+    key(VK_DOWN);
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+    assert_eq!(
+        notebook_view(window.hwnd).list.selected,
+        Some(0),
+        "RECENT's first row"
+    );
+    key(VK_UP);
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(tabs - 1));
+}
+
+#[test]
+fn page_keys_move_within_the_open_editors_rows() {
+    // Break caught: Page Up and Page Down dropped on an Open Editors row, or moving the
+    // active tab's row instead of the keyboard selection (open editors spec §3.5).
+    use crate::window::panel_cursor::Cursor;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_HOME, VK_NEXT, VK_PRIOR};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-page");
+    let paths: Vec<_> = (0..12)
+        .map(|index| scratch.note(&format!("n{index:02}.md"), "x"))
+        .collect();
+    let (window, _editor) = notebook_window(&scratch);
+    for path in &paths {
+        super::open_path(window.hwnd, path).unwrap();
+    }
+    let key = |vk: u16| crate::window::notebook_view::key_down(window.hwnd, vk);
+    key(VK_HOME);
+    key(VK_DOWN);
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(0));
+    key(VK_NEXT);
+    let Cursor::Editor(paged) = notebook_view(window.hwnd).cursor else {
+        panic!("{:?}", notebook_view(window.hwnd).cursor);
+    };
+    assert!(paged > 1 && paged < 12, "{paged}");
+    assert!(
+        notebook_view(window.hwnd).editor_rect_at(paged).is_some(),
+        "the paged-to row is in view"
+    );
+    assert_eq!(notebook_view(window.hwnd).editors.active_index(), Some(11));
+    assert_eq!(notebook_view(window.hwnd).editors.list.selected, Some(11));
+    key(VK_PRIOR);
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Editor(0));
+}
+
+#[test]
+fn screen_readers_see_the_sections_and_the_tab_rows() {
+    // Break caught: Open Editors rows invisible to screen readers, or headers without their
+    // expanded state (open editors spec §7).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-msaa");
+    let a = scratch.note("a.md", "a");
+    let (window, editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    editor.set_text("changed").unwrap();
+    let panel = sidebar_windows(window.hwnd).1;
+    let count = crate::window::side_panel::accessible_item_count(panel);
+    let items: Vec<_> = (0..count)
+        .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+        .collect();
+    // Break caught (spec §7): tab rows exposed unlike tree rows, or a flat outline where the
+    // tree's top rows sit at the level of the rows that hold them.
+    let outline = |name: &str| {
+        let item = items
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("{name} in {items:?}"));
+        assert_eq!(
+            item.role,
+            windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_OUTLINEITEM,
+            "{name}"
+        );
+        item.value.clone()
+    };
+    assert_eq!(outline("Open editors, 1"), "0");
+    assert_eq!(outline("a.md, open editor, modified"), "1");
+    let notebook = crate::window::library_host::notebook_name(&scratch.folder());
+    assert_eq!(outline(&notebook), "0");
+    assert_eq!(outline("a.md, Markdown"), "1", "a top-level tree row");
+}
+
+#[test]
+fn a_folder_rename_selects_the_whole_name_even_with_a_dot() {
+    // Break caught: "v1.2" opening with only "v1" selected, as a file name's stem would be,
+    // so typing keeps ".2" (spec §3.3).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-dot");
+    std::fs::create_dir_all(scratch.folder().join("v1.2")).unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("v1.2".into()));
+
+    assert_eq!(field_text(window.hwnd), "v1.2");
+    assert_eq!(field_selection(window.hwnd), (0, 4));
+}
+
+#[test]
+fn a_folder_renamed_while_a_rescan_runs_keeps_its_new_name_once_the_rescan_lands() {
+    // Break caught: a rescan that listed the folder before the rename bringing the old row
+    // back, with its note at a path that is gone, and hiding the new one (spec §3.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-rescan");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    scratch.install(window.hwnd);
+    crate::window::library_host::request_rescan(window.hwnd);
+    assert!(app_mut(window.hwnd).library.scanning);
+
+    crate::window::notebook_view::rebuild(window.hwnd);
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "Moved");
+    field_key(
+        window.hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+    );
+    pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning);
+
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(state.is_folder(std::path::Path::new("Moved")));
+        assert!(!state.is_folder(std::path::Path::new("sub")));
+        let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
+        assert_eq!(notes, [std::path::PathBuf::from(r"Moved\a.md")]);
+    });
+    row_of(window.hwnd, &RowKind::Folder("Moved".into()));
+    assert!(
+        crate::library::tree::row_index(
+            &notebook_view(window.hwnd).rows,
+            &RowKind::Folder("sub".into())
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn deleting_a_folder_recycles_it_closes_its_tabs_and_removes_its_rows() {
+    // Break caught: a folder delete that leaves its rows, its open tab on a file that is gone
+    // or its pinned note's record looking alive; one that deletes on Cancel; or a selection
+    // that jumps away from where the folder was (spec §4.3).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-delete");
+    std::fs::create_dir_all(scratch.folder().join(r"sub\inner")).unwrap();
+    std::fs::create_dir_all(scratch.folder().join("empty")).unwrap();
+    scratch.note(r"sub\inner\b.md", "b");
+    scratch.note("top.md", "t");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    let a = open_note(&window, &scratch, r"sub\a.md", "a");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let menu = |kind: &RowKind, answer: CommandId| {
+        crate::window::menus::answer_next_popup_menu(move |_| Some(answer));
+        let index = row_of(window.hwnd, kind);
+        crate::window::notebook_view::open_context_menu(window.hwnd, index, None);
+    };
+    crate::window::modal::take_last_confirm();
+
+    crate::window::answer_next_confirm(|_| false);
+    menu(&RowKind::Folder("empty".into()), CommandId::NoteDelete);
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move the folder \u{201c}empty\u{201d} to the Recycle Bin?")
+    );
+    assert!(
+        scratch.folder().join("empty").exists(),
+        "Cancel deletes nothing"
+    );
+
+    crate::window::answer_next_confirm(|_| true);
+    menu(&RowKind::Folder("sub".into()), CommandId::NoteDelete);
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move \u{201c}sub\u{201d} and its 2 notes to the Recycle Bin?")
+    );
+    assert!(!scratch.folder().join("sub").exists());
+    assert!(
+        tab_paths(window.hwnd)
+            .iter()
+            .all(|path| path.as_deref() != Some(a.as_path()))
+    );
+    let rows = &notebook_view(window.hwnd).rows;
+    for gone in ["sub", r"sub\inner"] {
+        assert!(
+            crate::library::tree::row_index(rows, &RowKind::Folder(gone.into())).is_none(),
+            "{gone}"
+        );
+    }
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("top.md".into()))
+    );
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        let record = state.record_for(&a).unwrap();
+        assert!(record.deleted);
+        assert!(state.local.missing_since(record.id).is_some());
+        let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
+        assert_eq!(notes, [std::path::PathBuf::from("top.md")]);
+    });
+}
+
+#[test]
+fn deleting_a_folder_that_holds_the_only_tab_and_the_draft_target_warns_and_cancels_the_draft() {
+    // Break caught: unsaved edits discarded without a word, the last tab left on a deleted
+    // file, or a draft still offering to create inside a folder that is gone (spec §5.4).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-delete-only-tab");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    let a = open_note(&window, &scratch, r"sub\a.md", "a");
+    execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
+    editor.set_text("unsaved").unwrap();
+    crate::window::notebook_view::rebuild(window.hwnd);
+    crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+    assert!(inline_open(window.hwnd));
+    select_row(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::modal::take_last_confirm();
+    crate::window::answer_next_confirm(|_| true);
+
+    assert!(crate::window::notebook_view::key_down(
+        window.hwnd,
+        VK_DELETE
+    ));
+
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some(
+            "Move \u{201c}sub\u{201d} and its 1 note to the Recycle Bin?\n1 open note has unsaved changes, which will be lost."
+        )
+    );
+    assert!(!a.exists());
+    assert_eq!(super::tab_count(window.hwnd), 0);
+    assert!(!inline_open(window.hwnd));
+    assert_eq!(draft_row(window.hwnd), None);
+}
+
+#[test]
+fn deleting_a_folder_with_autosave_on_closes_its_dirty_tabs_without_a_changed_on_disk_notice() {
+    // Break caught: closing a deleted folder's tabs one by one autosaving the dirty one being
+    // left, whose file is gone, so a false "changed on disk. Autosave is paused" notice shows.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-delete-autosave");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let a = scratch.note(r"sub\a.md", "a");
+    let b = scratch.note(r"sub\b.md", "b");
+    scratch.note("top.md", "t");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+    editor.set_text("b, unsaved").unwrap();
+    let active = app_mut(window.hwnd).tabs.active().unwrap();
+    assert!(active.dirty && active.path.as_deref() == Some(b.as_path()));
+    crate::window::answer_next_confirm(|_| true);
+
+    crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new("sub"));
+
+    assert!(!scratch.folder().join("sub").exists());
+    assert_eq!(super::tab_count(window.hwnd), 0);
+    assert!(
+        !notices(window.hwnd)
+            .iter()
+            .any(|notice| notice.contains("changed on disk")),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn folder_commands_on_an_empty_or_escaping_path_touch_no_disk() {
+    // Break caught: a folder delete or rename, or a new note or folder, handed the empty
+    // path (the notebook root) or a `..` path recycling, renaming or creating outside the
+    // folder the user picked, even when a commit is reached with such a path directly.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-bad-path");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    scratch.note(r"sub\a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    crate::window::modal::take_last_confirm();
+    let notes =
+        || crate::window::library_host::with_state(window.hwnd, |state| state.notes.len()).unwrap();
+
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(""));
+    crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(".."));
+    for bad in ["", ".."] {
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder(bad.into()));
+        assert!(!inline_open(window.hwnd), "{bad:?} has no row");
+    }
+    crate::window::inline_name::new_folder(window.hwnd, Some("..".into()));
+    assert!(!inline_open(window.hwnd), "no draft outside the notebook");
+    // The commits' own guards, reached with purposes no row gives.
+    use crate::window::inline_name::Purpose;
+    let listing = |folder: &std::path::Path| {
+        let mut names = std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let (around, inside) = (listing(&scratch.root), listing(&scratch.folder()));
+    for (purpose, text) in [
+        (Purpose::NewFolder("..".into()), "Outside"),
+        (Purpose::NewNote("..".into()), "Outside"),
+        (Purpose::RenameFolder("".into()), "Renamed"),
+        (Purpose::RenameFolder("..".into()), "Renamed"),
+        (Purpose::RenameFolder("sub".into()), ".."),
+    ] {
+        let shown = format!("{purpose:?} {text:?}");
+        crate::window::inline_name::commit_unchecked(window.hwnd, purpose, text);
+        assert!(!inline_open(window.hwnd), "{shown}");
+    }
+
+    assert_eq!(crate::window::modal::take_last_confirm(), None);
+    assert!(scratch.folder().join(r"sub\a.md").exists());
+    assert_eq!(
+        listing(&scratch.root),
+        around,
+        "nothing made beside the notebook"
+    );
+    assert_eq!(
+        listing(&scratch.folder()),
+        inside,
+        "nothing made or renamed in it"
+    );
+    assert_eq!(notes(), 1);
+}
+
+#[test]
+fn a_new_note_made_in_a_folder_saves_into_it_after_the_folder_is_renamed() {
+    // Break caught: an untitled tab made (Ctrl+N) with a folder of the notebook as its save
+    // folder keeping the folder's old path, so after a rename its first save silently lands
+    // in the notebook root instead.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-save-folder");
+    std::fs::create_dir_all(scratch.folder().join(r"sub\inner")).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    untitled_tab_saving_in(window.hwnd, scratch.folder().join("sub"));
+    let in_sub = app_mut(window.hwnd).tabs.active().unwrap().id;
+    untitled_tab_saving_in(window.hwnd, scratch.folder().join(r"SUB\inner"));
+    let in_inner = app_mut(window.hwnd).tabs.active().unwrap().id;
+    untitled_tab_saving_in(window.hwnd, scratch.folder());
+    let at_root = app_mut(window.hwnd).tabs.active().unwrap().id;
+
+    crate::window::notebook_view::rebuild(window.hwnd);
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "Moved");
+    field_key(
+        window.hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+    );
+
+    let moved = scratch.folder().join("Moved");
+    let save_folder = |id| {
+        app_mut(window.hwnd)
+            .tabs
+            .document(id)
+            .unwrap()
+            .save_folder
+            .clone()
+    };
+    assert_eq!(save_folder(in_sub), Some(moved.clone()));
+    assert_eq!(save_folder(in_inner), Some(moved.join("inner")));
+    assert_eq!(save_folder(at_root), Some(scratch.folder()));
+    assert!(super::activate_document_by_id(window.hwnd, in_sub));
+    editor.set_text("Idea").unwrap();
+    execute_command(window.hwnd, CommandId::Save);
+    crate::window::library_host::name_box_submit(window.hwnd);
+    assert!(moved.join("Idea.md").exists());
+}
+
+#[test]
+fn deleting_a_folder_selects_the_row_after_it_even_when_closing_its_tab_expands_another() {
+    // Break caught: the selection after a delete chosen by index, so when closing the
+    // folder's tab switches to a note in a collapsed folder above (expanding it), a row
+    // inside that folder is selected instead of the one that took the deleted folder's place.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-delete-selection");
+    std::fs::create_dir_all(scratch.folder().join("above")).unwrap();
+    std::fs::create_dir_all(scratch.folder().join("doomed")).unwrap();
+    let x = scratch.note(r"above\x.md", "x");
+    let y = scratch.note(r"doomed\y.md", "y");
+    scratch.note("top.md", "t");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &x).unwrap();
+    super::open_path(window.hwnd, &y).unwrap();
+    let path = std::path::Path::new;
+    crate::window::library_host::set_expanded(window.hwnd, path("above"), false);
+    crate::window::library_host::set_expanded(window.hwnd, path("doomed"), false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    select_row(window.hwnd, &RowKind::Folder("doomed".into()));
+    assert!(
+        crate::library::tree::row_index(
+            &notebook_view(window.hwnd).rows,
+            &RowKind::Note(r"above\x.md".into())
+        )
+        .is_none(),
+        "`above` starts collapsed"
+    );
+    crate::window::answer_next_confirm(|_| true);
+
+    crate::window::library_host::delete_folder(window.hwnd, path("doomed"));
+
+    assert!(!scratch.folder().join("doomed").exists());
+    assert!(
+        crate::library::tree::row_index(
+            &notebook_view(window.hwnd).rows,
+            &RowKind::Note(r"above\x.md".into())
+        )
+        .is_some(),
+        "switching to x's tab expanded `above`"
+    );
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("top.md".into()))
+    );
+}
+
+#[test]
+fn a_folder_rename_that_cannot_be_undone_stands_and_names_the_tab_left_behind() {
+    // Break caught: a failed undo swallowed, leaving the folder renamed on disk while the
+    // library still lists the old one and every tab points at a path that is gone.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("folder-rename-undo-fails");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let a = scratch.note(r"sub\a.md", "a");
+    let b = scratch.note(r"sub\b.md", "b");
+    let top = scratch.note("top.md", "t");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &a).unwrap();
+    super::open_path(window.hwnd, &b).unwrap();
+    super::open_path(window.hwnd, &top).unwrap();
+    let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a).unwrap();
+    let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
+    // Another tab already names the path `a` would move to, so `a`'s tab cannot follow.
+    let top_id = app_mut(window.hwnd).tabs.find_stored_path(&top).unwrap();
+    app_mut(window.hwnd).tabs.document_mut(top_id).unwrap().path =
+        Some(scratch.folder().join(r"Moved\a.md"));
+    untitled_tab_saving_in(window.hwnd, scratch.folder().join("sub"));
+    let untitled = app_mut(window.hwnd).tabs.active().unwrap().id;
+    crate::window::library_host::fail_next_folder_rename_back();
+
+    crate::window::notebook_view::rebuild(window.hwnd);
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    type_into_field(window.hwnd, "Moved");
+    field_key(
+        window.hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
+    );
+
+    let moved = scratch.folder().join("Moved");
+    assert!(moved.join("b.md").exists());
+    assert_eq!(
+        app_mut(window.hwnd)
+            .tabs
+            .document(untitled)
+            .unwrap()
+            .save_folder,
+        Some(moved.clone()),
+        "the rename stands, so the untitled tab's first save follows it"
+    );
+    assert!(!scratch.folder().join("sub").exists());
+    assert!(!inline_open(window.hwnd));
+    let tabs = &app_mut(window.hwnd).tabs;
+    assert_eq!(tabs.document(b_id).unwrap().path, Some(moved.join("b.md")));
+    assert_eq!(tabs.document(a_id).unwrap().path, Some(a.clone()));
+    crate::window::library_host::with_state(window.hwnd, |state| {
+        assert!(state.is_folder(std::path::Path::new("Moved")));
+        assert!(!state.is_folder(std::path::Path::new("sub")));
+    });
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Folder("Moved".into()))
+    );
+    let expected = "FastPad could not undo renaming \u{201c}sub\u{201d} to \u{201c}Moved\u{201d}. \u{201c}a.md\u{201d} is still open at its old path.";
+    assert!(
+        notices(window.hwnd).iter().any(|notice| notice == expected),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn palette_rename_with_a_folder_row_focused_edits_the_folder_row() {
+    // Break caught: the palette's Note: Rename renaming the active tab's note while the user
+    // had a folder row focused, or renaming anything before Enter (spec §9).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("palette-folder-rename");
+    std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
+    let active = scratch.note("active.md", "active");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    super::open_path(window.hwnd, &active).unwrap();
+    crate::window::notebook_view::rebuild(window.hwnd);
+    select_row(window.hwnd, &RowKind::Folder("sub".into()));
+    let (_, panel) = sidebar_windows(window.hwnd);
+    unsafe { SetFocus(panel) };
+    assert_eq!(unsafe { GetFocus() }, panel);
+
+    execute_command(window.hwnd, CommandId::CommandPalette);
+    let query = app_mut(window.hwnd)
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .query_hwnd();
+    let typed = crate::platform::wide_null("Note: Rename");
+    unsafe { SetWindowTextW(query, typed.as_ptr()) };
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::RenameFolder(
+            "sub".into()
+        ))
+    );
+    assert_eq!(field_text(window.hwnd), "sub");
+    assert!(
+        scratch.folder().join("sub").is_dir(),
+        "nothing renamed before Enter"
+    );
+    assert!(active.exists());
+}
+
+#[test]
+fn focus_moving_to_the_editor_commits_and_a_taken_name_closes_with_a_notice() {
+    // Break caught: a name lost when the user clicks into the editor, a click away that
+    // leaves the field hanging, or a taken name closed without saying why (spec §5.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-focus-editor");
+    let a = scratch.note("a.md", "a");
+    let (window, editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+
+    crate::window::inline_name::new_folder(window.hwnd, None);
+    type_into_field(window.hwnd, "Plans");
+    unsafe { SetFocus(editor.hwnd()) };
+    pump_posted_messages(window.hwnd);
+    assert!(!inline_open(window.hwnd));
+    assert!(scratch.folder().join("Plans").is_dir());
+
+    // At the root: with the new folder's row selected, None would draft inside it.
+    crate::window::inline_name::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
+    type_into_field(window.hwnd, "plans");
+    assert!(crate::window::inline_name::problem(window.hwnd).is_some());
+    unsafe { SetFocus(editor.hwnd()) };
+    pump_posted_messages(window.hwnd);
+    assert!(!inline_open(window.hwnd));
+    assert_eq!(draft_row(window.hwnd), None);
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|notice| notice == "plans already exists here."),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn losing_focus_to_another_app_keeps_the_field_and_reactivation_refocuses_it() {
+    // Break caught: Alt+Tab creating a half-typed note, or coming back to FastPad with the
+    // field open but the caret in the editor (spec §5.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETFOCUS;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-focus-app");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::inline_name::new_note(window.hwnd, None);
+    type_into_field(window.hwnd, "half");
+
+    // What deactivation does to the focused field: focus goes to no window of this thread.
+    unsafe { SetFocus(std::ptr::null_mut()) };
+    pump_posted_messages(window.hwnd);
+    assert!(inline_open(window.hwnd));
+    assert!(!scratch.folder().join("half.md").exists());
+
+    unsafe { SendMessageW(window.hwnd, WM_SETFOCUS, 0, 0) };
+    assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+    assert_eq!(field_text(window.hwnd), "half");
+}
+
+#[test]
+fn a_commit_on_focus_loss_waits_for_a_modal_prompt_to_end() {
+    // Break caught: a note created or renamed while a modal prompt that took the focus is
+    // still asking something (spec §5.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-focus-modal");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::inline_name::new_folder(window.hwnd, None);
+    type_into_field(window.hwnd, "Later");
+
+    let modal = crate::window::modal::ModalScope::enter(window.hwnd);
+    // The prompt takes the focus: here the frame does, a window of this thread.
+    unsafe { SetFocus(window.hwnd) };
+    pump_posted_messages(window.hwnd);
+    assert!(inline_open(window.hwnd));
+    assert!(!scratch.folder().join("Later").exists(), "held while modal");
+
+    // Leaving the outermost modal scope re-posts what it held.
+    drop(modal);
+    pump_posted_messages(window.hwnd);
+    assert!(!inline_open(window.hwnd));
+    assert!(scratch.folder().join("Later").is_dir());
+}
+
+#[test]
+fn a_click_on_a_row_below_a_draft_commits_first_and_acts_on_that_row() {
+    // Break caught: the click selecting whatever row slid under the pointer once the empty
+    // draft went, or the rename not committed before the click (spec §5.3).
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-click");
+    scratch.note("a.md", "a");
+    scratch.note("b.md", "b");
+    scratch.note("c.md", "c");
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    let click = |lparam| unsafe {
+        SendMessageW(panel, WM_LBUTTONDOWN, 0, lparam);
+        SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
+    };
+
+    crate::window::inline_name::new_note(window.hwnd, None);
+    assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
+    click(row_lparam(window.hwnd, &RowKind::Note("b.md".into())));
+    assert!(!inline_open(window.hwnd));
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("b.md".into()))
+    );
+    assert_eq!(
+        app_mut(window.hwnd).tabs.active().unwrap().path,
+        Some(scratch.folder().join("b.md"))
+    );
+
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("c.md".into()));
+    type_into_field(window.hwnd, "d");
+    click(row_lparam(window.hwnd, &RowKind::Note("a.md".into())));
+    assert!(scratch.folder().join("d.md").exists(), "committed first");
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("a.md".into()))
+    );
+}
+
+#[test]
+fn starting_an_edit_while_one_is_open_commits_the_open_one_first() {
+    // Break caught: a second edit dropping the first one's typing, or two fields at once
+    // (spec §3.4).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-one-edit");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    select_row(window.hwnd, &RowKind::Note("a.md".into()));
+    assert!(crate::window::notebook_view::key_down(window.hwnd, VK_F2));
+    type_into_field(window.hwnd, "a2");
+
+    crate::window::notebook_view::header_clicked(
+        window.hwnd,
+        crate::window::notebook_view::HeaderButton::NewFolder,
+    );
+
+    assert!(scratch.folder().join("a2.md").exists());
+    assert_eq!(
+        crate::window::inline_name::purpose(window.hwnd),
+        Some(crate::window::inline_name::Purpose::NewFolder(
+            std::path::PathBuf::new()
+        ))
+    );
+    assert_eq!(field_text(window.hwnd), "");
+}
+
+#[test]
+fn switching_the_sidebar_view_or_hiding_it_cancels_the_edit() {
+    // Break caught: a field left typing into a view nobody can see, or Ctrl+B committing a
+    // half-typed rename (spec §5.4).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-view-switch");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    for view in [
+        crate::config::SidebarView::Search,
+        crate::config::SidebarView::Hidden,
+    ] {
+        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+        type_into_field(window.hwnd, "zzz");
+        crate::window::side_panel::show_view(window.hwnd, view, false);
+        pump_posted_messages(window.hwnd);
+        assert!(!inline_open(window.hwnd), "{view:?}");
+        assert!(scratch.folder().join("a.md").exists(), "{view:?}");
+        crate::window::side_panel::show_view(
+            window.hwnd,
+            crate::config::SidebarView::Notebook,
+            false,
+        );
+    }
+}
+
+#[test]
+fn ctrl_z_and_ctrl_y_in_the_field_stay_with_the_field() {
+    // Break caught: Ctrl+Z in the name field undoing the note in the editor, or Ctrl+Y
+    // redoing it, because the accelerator table takes the key first (spec §5.1, §11).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-ctrl-z");
+    let a = scratch.note("a.md", "a");
+    let (window, editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+    editor.set_text("typed in the editor").unwrap();
+    editor.undo().unwrap();
+    assert!(editor.can_redo().unwrap(), "the editor has a step to redo");
+    let before = editor.text().unwrap();
+    let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+    crate::window::inline_name::new_note(window.hwnd, None);
+    let field = inline_field(window.hwnd);
+    let typed = crate::platform::wide_null("abc");
+    unsafe {
+        SendMessageW(
+            field,
+            windows_sys::Win32::UI::Controls::EM_REPLACESEL,
+            1,
+            typed.as_ptr() as isize,
+        )
+    };
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[VK_CONTROL as usize] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let ctrl = |key: u8| MSG {
+        hwnd: field,
+        message: WM_KEYDOWN,
+        wParam: usize::from(key),
+        ..Default::default()
+    };
+
+    let redo_taken = unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl(b'Y')) };
+    unsafe {
+        SendMessageW(field, WM_KEYDOWN, usize::from(b'Y'), 0);
+        SendMessageW(field, WM_CHAR, 0x19, 0);
+    }
+    let after_redo = (field_text(window.hwnd), editor.text().unwrap());
+    let undo_taken = unsafe { super::translate_accelerator(window.hwnd, &identity, &ctrl(b'Z')) };
+    unsafe {
+        SendMessageW(field, WM_KEYDOWN, usize::from(b'Z'), 0);
+        SendMessageW(field, WM_CHAR, 0x1a, 0);
+    }
+    unsafe { SetKeyboardState(original.as_ptr()) };
+
+    assert!(!redo_taken, "the field keeps Ctrl+Y");
+    assert_eq!(after_redo, ("abc".to_owned(), before.clone()));
+    assert!(!undo_taken, "the field keeps Ctrl+Z");
+    assert_eq!(field_text(window.hwnd), "");
+    assert_eq!(editor.text().unwrap(), before);
+    assert!(
+        editor.can_redo().unwrap(),
+        "nothing redid the editor's step"
+    );
+}
+
+#[test]
+fn pressing_the_scroll_thumb_keeps_the_edit_open_and_the_field_focused() {
+    // Break caught: grabbing the tree's scroll thumb mid-rename renaming the note to the
+    // half-typed name, or taking the focus from the field; scrolling keeps the edit (inline
+    // naming spec §5.4).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-thumb");
+    for index in 0..80 {
+        scratch.note(&format!("n{index:02}.md"), "n");
+    }
+    let (window, _editor) = notebook_window(&scratch);
+    let panel = sidebar_windows(window.hwnd).1;
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("n00.md".into()));
+    type_into_field(window.hwnd, "half");
+    let (x, y) = notebook_view(window.hwnd)
+        .thumb_point()
+        .expect("80 notes overflow the list");
+
+    unsafe {
+        SendMessageW(panel, WM_LBUTTONDOWN, 1, client_lparam(x, y));
+        SendMessageW(panel, WM_LBUTTONUP, 0, client_lparam(x, y));
+    }
+    pump_posted_messages(window.hwnd);
+
+    assert!(inline_open(window.hwnd));
+    assert_eq!(field_text(window.hwnd), "half");
+    assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
+    assert!(scratch.folder().join("n00.md").exists());
+    assert!(!scratch.folder().join("half.md").exists());
+}
+
+#[test]
+fn copy_host_copies_files_and_folders_indexes_notes_and_says_what_is_hidden() {
+    // Break caught: a copied note missing from the tree until a rescan, a copied folder not
+    // listed, a file that is neither a note nor an image copied silently, or the single
+    // copied row not selected (open editors spec §4.5, §4.6; image preview spec §9).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("copy-into");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let outside = scratch.root.join("outside");
+    std::fs::create_dir_all(outside.join(r"pics\deep")).unwrap();
+    std::fs::write(outside.join("draft.md"), "d").unwrap();
+    std::fs::write(outside.join(r"pics\deep\x.png"), [1u8]).unwrap();
+    std::fs::write(outside.join("archive.zip"), [1u8]).unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+
+    crate::window::copy_host::copy_into(
+        window.hwnd,
+        vec![outside.join("draft.md")],
+        std::path::Path::new("work"),
+        None,
+    );
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert!(scratch.folder().join(r"work\draft.md").exists());
+    assert!(outside.join("draft.md").exists(), "a copy, not a move");
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note(r"work\draft.md".into()))
+    );
+
+    crate::window::copy_host::copy_into(
+        window.hwnd,
+        vec![outside.join("pics"), outside.join("archive.zip")],
+        std::path::Path::new(""),
+        None,
+    );
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert!(scratch.folder().join(r"pics\deep\x.png").exists());
+    assert!(scratch.folder().join("archive.zip").exists());
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|notice| notice.contains("isn't shown") || notice.contains("aren't shown"))
+    );
+}
+
+#[test]
+fn copy_host_a_clash_asks_ok_replaces_and_cancel_skips() {
+    // Break caught: a clash replaced without asking, Cancel stopping the whole drop, or a
+    // replaced clean tab left showing the old text (open editors spec §4.4, §4.7).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("copy-clash");
+    let a = scratch.note("a.md", "old a");
+    scratch.note("b.md", "old b");
+    let outside = scratch.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("a.md"), "new a").unwrap();
+    std::fs::write(outside.join("b.md"), "new b").unwrap();
+    std::fs::write(outside.join("c.md"), "new c").unwrap();
+    let (window, editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &a).unwrap();
+
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::modal::answer_next_confirm(|_| false);
+    crate::window::copy_host::copy_into(
+        window.hwnd,
+        vec![
+            outside.join("a.md"),
+            outside.join("b.md"),
+            outside.join("c.md"),
+        ],
+        std::path::Path::new(""),
+        None,
+    );
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    let folder = crate::window::library_host::notebook_name(&scratch.folder());
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some(format!("b.md already exists in {folder}. Replace it?").as_str())
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("b.md")).unwrap(),
+        "old b"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("c.md")).unwrap(),
+        "new c"
+    );
+    assert_eq!(editor.text().unwrap(), "new a", "the clean tab reloaded");
+}
+
+#[test]
+fn copy_host_a_failed_recycle_skips_that_item_and_says_so() {
+    // Break caught (Review Focus 3): an item copied (or half-copied) after its Recycle Bin
+    // step failed, or the rest of the drop abandoned.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("copy-recycle-fails");
+    scratch.note("a.md", "old a");
+    let outside = scratch.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("a.md"), "new a").unwrap();
+    std::fs::write(outside.join("b.md"), "new b").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::copy_host::fail_next_recycle();
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::copy_host::copy_into(
+        window.hwnd,
+        vec![outside.join("a.md"), outside.join("b.md")],
+        std::path::Path::new(""),
+        None,
+    );
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("a.md")).unwrap(),
+        "old a"
+    );
+    assert!(scratch.folder().join("b.md").exists());
+    assert!(
+        notices(window.hwnd)
+            .contains(&"a.md was not copied: it could not be moved to the Recycle Bin.".to_owned())
+    );
+}
+
+#[test]
+fn copy_host_an_alias_of_the_source_is_refused_and_nothing_is_recycled() {
+    // Break caught: a `\\?\` or 8.3 spelling of the item itself, or of the folder holding it,
+    // passing the lexical plan as a clash, so answering OK recycled the very item being copied.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("copy-alias");
+    let note = scratch.note("a-long-note-name.md", "keep");
+    std::fs::create_dir_all(scratch.folder().join(r"work\work")).unwrap();
+    std::fs::write(scratch.folder().join(r"work\work\in.md"), "in").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    let verbatim = |path: &std::path::Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::copy_host::copy_into(
+        window.hwnd,
+        vec![
+            verbatim(&note),
+            verbatim(&scratch.folder().join(r"work\work")),
+        ],
+        std::path::Path::new(""),
+        None,
+    );
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "keep");
+    assert!(scratch.folder().join(r"work\work\in.md").exists());
+    let said = notices(window.hwnd);
+    assert!(said.contains(&"a-long-note-name.md was not copied: it is already there.".to_owned()));
+    assert!(
+        said.contains(&"work was not copied: it would replace the folder it is in.".to_owned())
+    );
+
+    let short = crate::platform::files::short_path_for_test(&note);
+    if short.file_name() == note.file_name() {
+        // The scratch volume makes no 8.3 names: the `\\?\` spelling above stands in.
+        return;
+    }
+    let short_name = crate::window::tree_copy::item_name(&short);
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::copy_host::copy_into(window.hwnd, vec![short], std::path::Path::new(""), None);
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "keep");
+    assert!(notices(window.hwnd).contains(&format!(
+        "{short_name} was not copied: it is already there."
+    )));
+}
+
+#[test]
+fn copy_host_a_junction_in_the_source_path_does_not_hide_the_folder_holding_it() {
+    // Break caught: the identity check walking only the folders of the source as spelled, so
+    // with a junction on the way the real folder holding it was not seen, and answering OK
+    // recycled that folder with the source inside it.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("copy-junction");
+    let inner = scratch.folder().join("work").join("x").join("work");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("in.md"), "in").unwrap();
+    let link = scratch.root.join("j");
+    crate::platform::files::junction_for_test(&link, &scratch.folder().join("work").join("x"));
+    let (window, _editor) = notebook_window(&scratch);
+
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::copy_host::copy_into(
+        window.hwnd,
+        vec![link.join("work")],
+        std::path::Path::new(""),
+        None,
+    );
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    let folder = crate::window::library_host::notebook_name(&scratch.folder());
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some(format!("work already exists in {folder}. Replace it?").as_str()),
+        "the plan saw a clash, not the refusal"
+    );
+    assert_eq!(std::fs::read_to_string(inner.join("in.md")).unwrap(), "in");
+    assert!(
+        notices(window.hwnd)
+            .contains(&"work was not copied: it would replace the folder it is in.".to_owned())
+    );
+}
+
+/// A drag from Explorer onto panel point `x`, `y`: DragEnter, DragOver, then Drop or
+/// DragLeave, as OLE runs them. The effects each answered.
+fn explorer_drop(panel: HWND, x: i32, y: i32, paths: &[&std::path::Path]) -> [u32; 3] {
+    let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(panel, &mut point) };
+    crate::editor::file_drop::test_support::drag_and_drop_at(
+        panel,
+        paths,
+        windows_sys::Win32::Foundation::POINTL {
+            x: point.x,
+            y: point.y,
+        },
+    )
+}
+
+#[test]
+fn panel_drop_onto_the_root_row_copies_and_onto_open_editors_opens() {
+    // Break caught: Explorer drops refused on the panel, dropped on the wrong folder, or
+    // Open Editors copying instead of opening (open editors spec §4.1, §4.3).
+    use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_NONE};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("panel-drop");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let outside = scratch.root.join("x.md");
+    std::fs::write(&outside, "x").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::side_panel::accept_file_drops(window.hwnd);
+    let panel = sidebar_windows(window.hwnd).1;
+    let root = notebook_view(window.hwnd).root_rect();
+    let effects = explorer_drop(
+        panel,
+        root.left + 40,
+        (root.top + root.bottom) / 2,
+        &[&outside],
+    );
+    assert_eq!(effects, [DROPEFFECT_COPY; 3]);
+    pump_until(window.hwnd, || scratch.folder().join("x.md").exists());
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+
+    let header = notebook_view(window.hwnd).editors_header_rect();
+    explorer_drop(panel, header.left + 40, header.top + 5, &[&outside]);
+    pump_until(window.hwnd, || {
+        tab_paths(window.hwnd).contains(&Some(outside.clone()))
+    });
+
+    let title = 10;
+    assert_eq!(
+        explorer_drop(panel, 40, title, &[&outside])[1],
+        DROPEFFECT_NONE,
+        "the title band takes nothing"
+    );
+}
+
+#[test]
+fn panel_drop_returns_before_asking_and_the_posted_drop_asks() {
+    // Break caught (Review Focus 4): the clash prompt shown inside Drop, which keeps
+    // Explorer's drag waiting on FastPad.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("panel-drop-post");
+    scratch.note("x.md", "old");
+    let outside = scratch.root.join("x.md");
+    std::fs::write(&outside, "new").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::side_panel::accept_file_drops(window.hwnd);
+    let panel = sidebar_windows(window.hwnd).1;
+    let root = notebook_view(window.hwnd).root_rect();
+    let _ = crate::window::modal::take_last_confirm();
+    explorer_drop(
+        panel,
+        root.left + 40,
+        (root.top + root.bottom) / 2,
+        &[&outside],
+    );
+    assert!(
+        crate::window::modal::take_last_confirm().is_none(),
+        "nothing asked during Drop"
+    );
+    crate::window::modal::answer_next_confirm(|_| true);
+    pump_until(window.hwnd, || {
+        crate::window::modal::take_last_confirm().is_some()
+    });
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join("x.md")).unwrap(),
+        "new"
+    );
+}
+
+#[test]
+fn open_editors_a_tab_and_an_explorer_file_copy_into_an_empty_notebook() {
+    // Break caught: a notebook with no notes refusing every copy, because the drag's hover
+    // only looked for a tree (open editors spec §4.1: the root row or empty space copies into
+    // the root).
+    use windows_sys::Win32::System::Ole::DROPEFFECT_COPY;
+    let _scintilla = load_native_scintilla();
+    // The root row of an empty notebook takes a tab.
+    {
+        let scratch = LibraryScratch::new("empty-copy");
+        let outside = scratch.root.join("tab.md");
+        std::fs::write(&outside, "t").unwrap();
+        let (window, _editor) = notebook_window(&scratch);
+        super::open_path(window.hwnd, &outside).unwrap();
+        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+        let panel = sidebar_windows(window.hwnd).1;
+
+        let tab = notebook_view(window.hwnd)
+            .editors
+            .rows
+            .iter()
+            .position(|entry| {
+                entry
+                    .row()
+                    .is_some_and(|row| row.path.as_deref() == Some(outside.as_path()))
+            })
+            .unwrap();
+        start_tab_drag(window.hwnd, panel, tab);
+        let root = notebook_view(window.hwnd).root_rect();
+        let on_root = client_lparam(root.left + 40, (root.top + root.bottom) / 2);
+        drag_over(panel, on_root);
+        assert_eq!(
+            notebook_view(window.hwnd).drag.as_ref().unwrap().target,
+            Some(PathBuf::new()),
+            "the root row takes the tab"
+        );
+        drop_at(panel, on_root);
+        crate::window::copy_host::wait_for_copies(window.hwnd);
+        assert!(scratch.folder().join("tab.md").exists());
+    }
+
+    // Another empty notebook, and the space under its root row.
+    let scratch = LibraryScratch::new("empty-copy-body");
+    let dropped = scratch.root.join("dropped.md");
+    std::fs::write(&dropped, "d").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    let panel = sidebar_windows(window.hwnd).1;
+    crate::window::side_panel::accept_file_drops(window.hwnd);
+    let root = notebook_view(window.hwnd).root_rect();
+    let effects = explorer_drop(panel, root.left + 40, root.bottom + 40, &[&dropped]);
+    assert_eq!(effects, [DROPEFFECT_COPY; 3]);
+    pump_until(window.hwnd, || scratch.folder().join("dropped.md").exists());
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+}
+
+#[test]
+fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows_the_field() {
+    // Break caught: New note, New folder or Rename opening their name field in a collapsed
+    // root, hidden, with the keyboard focus in it (open editors spec §3.3).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("inline-root-collapsed");
+    scratch.note("a.md", "a");
+    let (window, _editor) = notebook_window(&scratch);
+    let collapse = || {
+        crate::window::library_host::set_root_expanded(window.hwnd, false);
+        crate::window::notebook_view::rebuild(window.hwnd);
+        assert!(!notebook_view(window.hwnd).tree_shown());
+    };
+    collapse();
+    let panel = sidebar_windows(window.hwnd).1;
+    let root = notebook_view(window.hwnd).root_rect();
+    let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
+        .buttons
+        .into_iter()
+        .find(|(button, _)| *button == crate::window::notebook_view::HeaderButton::NewNote)
+        .unwrap();
+    mouse(panel, WM_LBUTTONDOWN, 1, centre(new_note));
+    mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
+    assert!(inline_open(window.hwnd));
+    assert!(crate::window::library_host::root_expanded(window.hwnd));
+    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(is_shown(inline_field(window.hwnd)), "the name field shows");
+    field_key(window.hwnd, VK_ESCAPE);
+
+    collapse();
+    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+    assert!(inline_open(window.hwnd));
+    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(
+        is_shown(inline_field(window.hwnd)),
+        "the rename field shows"
+    );
+    field_key(window.hwnd, VK_ESCAPE);
+
+    collapse();
+    crate::window::inline_name::rename_note_at(window.hwnd, &scratch.folder().join("a.md"));
+    assert!(inline_open(window.hwnd));
+    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(
+        is_shown(inline_field(window.hwnd)),
+        "the revealed row's field shows"
+    );
+}
+
+#[test]
+fn open_editors_a_collapsed_root_takes_the_keyboard_off_the_hidden_tree() {
+    // Break caught: with the root collapsed, the keyboard selection left on a tree row that
+    // isn't shown, type-ahead selecting hidden rows, and Del deleting one (open editors spec
+    // §3.3, §3.5).
+    use crate::window::panel_cursor::Cursor;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editors-root-keys");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    select_row(window.hwnd, &RowKind::Note("a.md".into()));
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+
+    crate::window::library_host::set_root_expanded(window.hwnd, false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Root);
+
+    // Even a selection left in the tree some other way acts on nothing hidden.
+    notebook_view(window.hwnd).cursor = Cursor::Tree;
+    let panel = sidebar_windows(window.hwnd).1;
+    unsafe { SendMessageW(panel, WM_CHAR, 'b' as usize, 0) };
+    assert_eq!(
+        selected_kind(window.hwnd),
+        Some(RowKind::Note("a.md".into())),
+        "type-ahead selects no hidden row"
+    );
+    let _ = crate::window::modal::take_last_confirm();
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::notebook_view::key_down(window.hwnd, VK_DELETE);
+    assert!(
+        crate::window::modal::take_last_confirm().is_none(),
+        "no prompt"
+    );
+    assert!(a.exists() && b.exists());
+}
+
+/// Opens `path` with no sharing, so a copy of it fails, until the handle is dropped.
+fn locked(path: &std::path::Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+fn copy_host_a_failure_part_way_through_a_folder_says_how_many_files_were_copied() {
+    // Break caught: a folder's failure without its count, or "1 files" (open editors spec
+    // §4.6, §8).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("copy-part-way");
+    let pack = scratch.root.join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    for name in ["a.md", "b.md", "c.md"] {
+        std::fs::write(pack.join(name), name).unwrap();
+    }
+    let (window, _editor) = notebook_window(&scratch);
+    let lock = locked(&pack.join("b.md"));
+    crate::window::copy_host::copy_into(
+        window.hwnd,
+        vec![pack.clone()],
+        std::path::Path::new(""),
+        None,
+    );
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    drop(lock);
+    assert!(scratch.folder().join(r"pack\a.md").exists());
+    assert!(
+        !scratch.folder().join(r"pack\c.md").exists(),
+        "the rest stops"
+    );
+    let said = notices(window.hwnd);
+    assert!(
+        said.iter().any(|notice| {
+            notice.starts_with("pack could not be copied: ")
+                && notice.ends_with(". 1 file was copied before the failure.")
+        }),
+        "{said:?}"
+    );
+}
+
+#[test]
+fn copy_host_a_dirty_tab_whose_copy_fails_gets_only_the_failure_notice() {
+    // Break caught: "Copied the saved version of…" shown for a copy that failed, next to its
+    // failure notice (open editors spec §4.6).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("copy-dirty-fails");
+    let outside = scratch.root.join("draft.md");
+    std::fs::write(&outside, "saved").unwrap();
+    let (window, editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &outside).unwrap();
+    editor.set_text("changed").unwrap();
+    let id = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let lock = locked(&outside);
+    crate::window::copy_host::copy_tab_into(window.hwnd, id, &outside, std::path::Path::new(""));
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    drop(lock);
+    let said = notices(window.hwnd);
+    assert!(
+        said.iter()
+            .any(|notice| notice.starts_with("draft.md could not be copied: ")),
+        "{said:?}"
+    );
+    assert!(
+        !said
+            .iter()
+            .any(|notice| notice.starts_with("Copied the saved")),
+        "{said:?}"
+    );
+
+    crate::window::copy_host::copy_tab_into(window.hwnd, id, &outside, std::path::Path::new(""));
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert!(
+        notices(window.hwnd).contains(&crate::window::tree_copy::dirty_notice("draft.md")),
+        "a copy that worked still says so"
+    );
+}
+
+#[test]
+fn panel_drop_while_a_modal_runs_is_refused_rather_than_lost() {
+    // Break caught: an Explorer drop answered COPY during a modal dialog, then dropped
+    // silently when its posted message arrived (open editors spec §4.3).
+    use windows_sys::Win32::System::Ole::DROPEFFECT_NONE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("panel-drop-modal");
+    scratch.note("a.md", "a");
+    let outside = scratch.root.join("x.md");
+    std::fs::write(&outside, "x").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    crate::window::side_panel::accept_file_drops(window.hwnd);
+    let panel = sidebar_windows(window.hwnd).1;
+    let root = notebook_view(window.hwnd).root_rect();
+    let header = notebook_view(window.hwnd).editors_header_rect();
+    let modal = crate::window::modal::ModalScope::enter(window.hwnd);
+    let effects = explorer_drop(
+        panel,
+        root.left + 40,
+        (root.top + root.bottom) / 2,
+        &[&outside],
+    );
+    assert_eq!(effects, [DROPEFFECT_NONE; 3]);
+    assert_eq!(
+        explorer_drop(panel, header.left + 40, header.top + 5, &[&outside]),
+        [DROPEFFECT_NONE; 3],
+        "nor does Open Editors open it"
+    );
+    assert!(notebook_view(window.hwnd).drag.is_none(), "no band left");
+    drop(modal);
+    pump_posted_messages(window.hwnd);
+    assert!(!scratch.folder().join("x.md").exists());
+    assert!(!tab_paths(window.hwnd).contains(&Some(outside.clone())));
+}
+
+#[test]
+fn the_drop_overlay_covers_its_rectangle_and_lets_the_pointer_through() {
+    // Break caught: an overlay that steals the drag's clicks, or lands off by the frame.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowRect, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let rect = RECT {
+        left: 100,
+        top: 120,
+        right: 300,
+        bottom: 220,
+    };
+    let overlay = crate::window::drop_overlay::DropOverlay::show(
+        window.hwnd,
+        rect,
+        0x00ff_0000,
+        crate::window::drop_overlay::TINT_ALPHA,
+    )
+    .expect("overlay");
+    let mut shown = RECT::default();
+    unsafe { GetWindowRect(overlay.hwnd(), &mut shown) };
+    assert_eq!(
+        (shown.left, shown.top, shown.right, shown.bottom),
+        (100, 120, 300, 220)
+    );
+    let style = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
+    assert_ne!(style & WS_EX_LAYERED, 0);
+    assert_ne!(style & WS_EX_TRANSPARENT, 0);
+    let moved = RECT {
+        left: 10,
+        top: 20,
+        right: 30,
+        bottom: 40,
+    };
+    overlay.place(moved, 0x0000_ff00, crate::window::drop_overlay::BAR_ALPHA);
+    assert_eq!(overlay.rect().right, 30);
+    let hwnd = overlay.hwnd();
+    overlay.destroy();
+    assert_eq!(unsafe { super::IsWindow(hwnd) }, 0);
+}
+
+#[test]
+fn a_tab_label_is_painted_without_the_sidebar() {
+    // Break caught: the tab drag reaching into the notebook view, which is gone when the
+    // sidebar is hidden.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let group = super::group_hwnd(window.hwnd).unwrap();
+    let image = crate::window::notebook_view::tab_label_image(
+        window.hwnd,
+        group,
+        crate::window::icon_sets::TreeItem::Note(crate::window::file_icons::NoteKind::Text),
+        "notes.txt",
+    )
+    .expect("label image");
+    assert!(image.size.cx > image.size.cy);
+}
+
+/// Group `from`'s window, and a press on its tab `index` followed by a move past the drag
+/// distance.
+fn start_strip_drag(hwnd: HWND, from: GroupId, index: usize) -> HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+    let window = super::with_group_id(hwnd, from, |state| state.hwnd).unwrap();
+    let tab = super::strip_layout_of(hwnd, from)
+        .unwrap()
+        .tab(index)
+        .unwrap()
+        .center();
+    unsafe {
+        SendMessageW(window, WM_LBUTTONDOWN, 1, client_lparam(tab.x, tab.y));
+        SendMessageW(window, WM_MOUSEMOVE, 1, client_lparam(tab.x + 30, tab.y));
+    }
+    window
+}
+
+/// Window `to`'s client point (`x`, `y`) in window `from`'s client coordinates, as an
+/// `lParam`: where the source group, which has the capture, sees the pointer.
+fn lparam_in(from: HWND, to: HWND, x: i32, y: i32) -> super::LPARAM {
+    let mut point = windows_sys::Win32::Foundation::POINT { x, y };
+    unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(to, from, &mut point, 1) };
+    client_lparam(point.x, point.y)
+}
+
+/// Moves the drag to window `to`'s client point and releases there; `buttons` carries
+/// `MK_CONTROL` for a copy.
+fn drop_strip_drag(from: HWND, to: HWND, x: i32, y: i32, buttons: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_MOUSEMOVE};
+    let point = lparam_in(from, to, x, y);
+    unsafe {
+        SendMessageW(from, WM_MOUSEMOVE, 1 | buttons, point);
+        SendMessageW(from, WM_LBUTTONUP, buttons, point);
+    }
+}
+
+fn strip_ids(hwnd: HWND, group: GroupId) -> Vec<crate::document::DocumentId> {
+    app_mut(hwnd).tabs.group(group).unwrap().document_ids()
+}
+
+#[test]
+fn a_tab_dragged_along_its_strip_moves_there_and_stays_active() {
+    // Break caught: a strip drag that does nothing, or reorders but leaves the editor on
+    // another tab.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let ids = strip_ids(window.hwnd, group);
+    let source = start_strip_drag(window.hwnd, group, 0);
+    assert!(
+        app_mut(window.hwnd)
+            .tab_drag
+            .as_ref()
+            .is_some_and(|drag| drag.started)
+    );
+    let layout = super::strip_layout_of(window.hwnd, group).unwrap();
+    let end = layout.tab(2).unwrap();
+    drop_strip_drag(source, source, end.right - 2, end.center().y, 0);
+    assert_eq!(strip_ids(window.hwnd, group), [ids[1], ids[2], ids[0]]);
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, ids[0]);
+    assert!(app_mut(window.hwnd).tab_drag.is_none());
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+}
+
+#[test]
+fn a_wobble_under_the_drag_distance_is_still_a_click() {
+    // Break caught (Review Focus 1): a slightly shaky click starting a drag, so the tab
+    // never activates.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let first = strip_ids(window.hwnd, group)[0];
+    let tab = super::strip_layout_of(window.hwnd, group)
+        .unwrap()
+        .tab(0)
+        .unwrap()
+        .center();
+    let source = super::with_group_id(window.hwnd, group, |state| state.hwnd).unwrap();
+    unsafe {
+        SendMessageW(source, WM_LBUTTONDOWN, 1, client_lparam(tab.x, tab.y));
+        SendMessageW(source, WM_MOUSEMOVE, 1, client_lparam(tab.x + 1, tab.y));
+        SendMessageW(source, WM_LBUTTONUP, 0, client_lparam(tab.x + 1, tab.y));
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().id, first);
+    assert!(app_mut(window.hwnd).tab_drag.is_none());
+}
+
+#[test]
+fn a_press_on_a_tabs_close_button_never_starts_a_drag() {
+    // Break caught: a jittery click on × dragging the tab instead of closing it.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let close = super::strip_layout_of(window.hwnd, group)
+        .unwrap()
+        .close_tab(0)
+        .unwrap()
+        .center();
+    let source = super::with_group_id(window.hwnd, group, |state| state.hwnd).unwrap();
+    unsafe {
+        SendMessageW(source, WM_LBUTTONDOWN, 1, client_lparam(close.x, close.y));
+        SendMessageW(
+            source,
+            WM_MOUSEMOVE,
+            1,
+            client_lparam(close.x - 40, close.y),
+        );
+    }
+    assert!(
+        app_mut(window.hwnd)
+            .tab_drag
+            .as_ref()
+            .is_none_or(|drag| !drag.started)
+    );
+}
+
+#[test]
+fn esc_cancels_a_tab_drag_and_takes_its_label_and_overlay() {
+    // Break caught: Esc typed into the editor while a tab drag hangs on the pointer.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let ids = strip_ids(window.hwnd, group);
+    start_strip_drag(window.hwnd, group, 0);
+    let escape = MSG {
+        hwnd: editor.hwnd(),
+        message: WM_KEYDOWN,
+        wParam: VK_ESCAPE as usize,
+        ..Default::default()
+    };
+    assert!(crate::window::tab_drag::keeps_key(window.hwnd, &escape));
+    assert!(app_mut(window.hwnd).tab_drag.is_none());
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+    assert_eq!(strip_ids(window.hwnd, group), ids);
+    assert_eq!(
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() },
+        std::ptr::null_mut()
+    );
+}
+
+#[test]
+fn a_lost_capture_cancels_a_tab_drag() {
+    // Break caught (Review Focus 2): Alt+Tab mid-drag leaving the label on screen and the
+    // next click dropping the tab somewhere.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    start_strip_drag(window.hwnd, group, 0);
+    unsafe { ReleaseCapture() };
+    assert!(app_mut(window.hwnd).tab_drag.is_none());
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+}
+
+#[test]
+fn a_right_press_cancels_a_tab_drag_and_its_release_opens_no_menu() {
+    // Break caught: the right release after a cancel falling through to the strip's menu.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let menu = std::rc::Rc::new(std::cell::Cell::new(false));
+    let shown = menu.clone();
+    crate::window::menus::answer_next_popup_menu(move |_| {
+        shown.set(true);
+        None
+    });
+    let source = start_strip_drag(window.hwnd, group, 0);
+    unsafe { SendMessageW(source, WM_RBUTTONDOWN, 2, client_lparam(20, 10)) };
+    assert!(
+        app_mut(window.hwnd)
+            .tab_drag
+            .as_ref()
+            .is_some_and(|drag| drag.eat_right_up)
+    );
+    unsafe { SendMessageW(source, WM_RBUTTONUP, 0, client_lparam(20, 10)) };
+    assert!(app_mut(window.hwnd).tab_drag.is_none());
+    assert!(!menu.get(), "the release opened a menu");
+}
+
+#[test]
+fn the_insertion_bar_shows_over_the_strip_under_the_pointer() {
+    // Break caught: no feedback until the drop, so the user cannot see where the tab lands.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let source = start_strip_drag(window.hwnd, group, 0);
+    let layout = super::strip_layout_of(window.hwnd, group).unwrap();
+    let x = layout.insertion_x(2);
+    unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, client_lparam(x + 1, 10)) };
+    let overlay = app_mut(window.hwnd).drop_overlay.expect("an insertion bar");
+    let mut origin = windows_sys::Win32::Foundation::POINT { x, y: 0 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(source, &mut origin) };
+    let rect = overlay.rect();
+    assert!(
+        (rect.left - origin.x).abs() <= 2,
+        "bar at {} vs insertion point {}",
+        rect.left,
+        origin.x
+    );
+    assert_eq!(rect.bottom - rect.top, layout.height);
+    crate::window::tab_drag::cancel(window.hwnd);
+}
+
+#[test]
+fn near_a_content_edge_the_half_the_new_group_takes_is_tinted() {
+    // Break caught: no zone highlight near the edges, a tint over the whole group for an edge
+    // (the user cannot tell a split from a move), the wrong half, or a tint where the drop
+    // does nothing.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let area = super::with_group_id(window.hwnd, group, |state| state.content).unwrap();
+    let area = RECT {
+        left: area.left,
+        top: area.top,
+        right: area.right,
+        bottom: area.bottom,
+    };
+    let screen = |source: HWND, rect: RECT| {
+        let mut corners = [
+            windows_sys::Win32::Foundation::POINT {
+                x: rect.left,
+                y: rect.top,
+            },
+            windows_sys::Win32::Foundation::POINT {
+                x: rect.right,
+                y: rect.bottom,
+            },
+        ];
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::MapWindowPoints(
+                source,
+                std::ptr::null_mut(),
+                corners.as_mut_ptr(),
+                2,
+            )
+        };
+        (corners[0].x, corners[0].y, corners[1].x, corners[1].y)
+    };
+    let tint = || {
+        app_mut(window.hwnd).drop_overlay.map(|overlay| {
+            let rect = overlay.rect();
+            (rect.left, rect.top, rect.right, rect.bottom)
+        })
+    };
+    let (width, height) = (area.right - area.left, area.bottom - area.top);
+    let source = start_strip_drag(window.hwnd, group, 0);
+
+    // The right edge: the right half.
+    let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+    unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+    assert_eq!(
+        tint(),
+        Some(screen(
+            source,
+            RECT {
+                left: area.right - width / 2,
+                ..area
+            }
+        ))
+    );
+    // The bottom edge: the bottom half; the zone follows the pointer.
+    let point = client_lparam((area.left + area.right) / 2, area.bottom - 5);
+    unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+    assert_eq!(
+        tint(),
+        Some(screen(
+            source,
+            RECT {
+                top: area.bottom - height / 2,
+                ..area
+            }
+        ))
+    );
+    crate::window::tab_drag::cancel(window.hwnd);
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+
+    // A lone tab over its own edge would do nothing: no tint.
+    execute_command(window.hwnd, CommandId::CloseTab);
+    let source = start_strip_drag(window.hwnd, group, 0);
+    let point = client_lparam(area.right - 5, (area.top + area.bottom) / 2);
+    unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+    assert!(tint().is_none());
+    crate::window::tab_drag::cancel(window.hwnd);
+}
+
+/// Two groups side by side, the second showing the first's document; the second active.
+fn two_groups(hwnd: HWND) -> (GroupId, GroupId) {
+    let first = app_mut(hwnd).tabs.active_group();
+    execute_command(hwnd, CommandId::SplitRight);
+    (first, app_mut(hwnd).tabs.active_group())
+}
+
+fn group_window(hwnd: HWND, id: GroupId) -> HWND {
+    super::with_group_id(hwnd, id, |state| state.hwnd).unwrap()
+}
+
+fn content(hwnd: HWND, id: GroupId) -> RECT {
+    let area = super::with_group_id(hwnd, id, |state| state.content).unwrap();
+    RECT {
+        left: area.left,
+        top: area.top,
+        right: area.right,
+        bottom: area.bottom,
+    }
+}
+
+#[test]
+fn a_tab_dropped_on_another_groups_strip_moves_there_at_that_point() {
+    // Break caught: a cross-group drop appending, keeping the source view, or leaving the
+    // focus in the source group.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = two_groups(window.hwnd);
+    execute_command(window.hwnd, CommandId::New);
+    let moving = app_mut(window.hwnd).tabs.active().unwrap().id;
+    assert!(super::activate_group(window.hwnd, first));
+    execute_command(window.hwnd, CommandId::New);
+    let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let index = strip_ids(window.hwnd, first)
+        .iter()
+        .position(|id| *id == dragged)
+        .unwrap();
+    let source = start_strip_drag(window.hwnd, first, index);
+    let target = group_window(window.hwnd, second);
+    let layout = super::strip_layout_of(window.hwnd, second).unwrap();
+    drop_strip_drag(source, target, layout.insertion_x(1) + 1, 10, 0);
+    assert_eq!(strip_ids(window.hwnd, second)[1], dragged);
+    assert!(strip_ids(window.hwnd, second).contains(&moving));
+    assert!(!strip_ids(window.hwnd, first).contains(&dragged));
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+    assert_eq!(
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+        super::group_editor(window.hwnd, second).unwrap().hwnd()
+    );
+}
+
+#[test]
+fn a_ctrl_drop_on_another_group_adds_a_view_and_keeps_the_source() {
+    // Break caught: Ctrl ignored, so a copy drag takes the tab away from where it was.
+    const MK_CONTROL: usize = 0x0008;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = two_groups(window.hwnd);
+    assert!(super::activate_group(window.hwnd, first));
+    execute_command(window.hwnd, CommandId::New);
+    let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let index = strip_ids(window.hwnd, first)
+        .iter()
+        .position(|id| *id == dragged)
+        .unwrap();
+    let source = start_strip_drag(window.hwnd, first, index);
+    let target = group_window(window.hwnd, second);
+    let middle = content(window.hwnd, second);
+    drop_strip_drag(
+        source,
+        target,
+        (middle.left + middle.right) / 2,
+        (middle.top + middle.bottom) / 2,
+        MK_CONTROL,
+    );
+    assert!(strip_ids(window.hwnd, first).contains(&dragged));
+    assert_eq!(strip_ids(window.hwnd, second).last(), Some(&dragged));
+    assert_eq!(app_mut(window.hwnd).tabs.views_of(dragged).len(), 2);
+}
+
+#[test]
+fn a_drop_where_the_document_is_already_open_activates_that_view_and_still_moves() {
+    // Break caught (spec §6.2): a second view of one document in one group, or the source
+    // view left behind by a move.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = two_groups(window.hwnd);
+    let shared = strip_ids(window.hwnd, second)[0];
+    execute_command(window.hwnd, CommandId::New);
+    assert!(super::activate_group(window.hwnd, first));
+    execute_command(window.hwnd, CommandId::New);
+    let source = start_strip_drag(window.hwnd, first, 0);
+    let target = group_window(window.hwnd, second);
+    let middle = content(window.hwnd, second);
+    drop_strip_drag(
+        source,
+        target,
+        (middle.left + middle.right) / 2,
+        (middle.top + middle.bottom) / 2,
+        0,
+    );
+    assert_eq!(
+        strip_ids(window.hwnd, second)
+            .iter()
+            .filter(|id| **id == shared)
+            .count(),
+        1
+    );
+    assert_eq!(
+        app_mut(window.hwnd)
+            .tabs
+            .group(second)
+            .unwrap()
+            .active_document(),
+        Some(shared)
+    );
+    assert!(!strip_ids(window.hwnd, first).contains(&shared));
+}
+
+#[test]
+fn dragging_a_groups_last_tab_to_another_group_closes_the_source_group() {
+    // Break caught (Review Focus 4): an empty group left behind after its last tab moved.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = two_groups(window.hwnd);
+    execute_command(window.hwnd, CommandId::New);
+    let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let index = strip_ids(window.hwnd, second)
+        .iter()
+        .position(|id| *id == dragged)
+        .unwrap();
+    let other = strip_ids(window.hwnd, second)[1 - index];
+    // Leave `dragged` alone in the second group.
+    super::focus_view(window.hwnd, second, other);
+    super::close_document_tab(window.hwnd, other);
+    let source = start_strip_drag(window.hwnd, second, 0);
+    let target = group_window(window.hwnd, first);
+    let middle = content(window.hwnd, first);
+    drop_strip_drag(
+        source,
+        target,
+        (middle.left + middle.right) / 2,
+        (middle.top + middle.bottom) / 2,
+        0,
+    );
+    assert_eq!(super::group_order(window.hwnd), [first]);
+    assert!(strip_ids(window.hwnd, first).contains(&dragged));
+}
+
+#[test]
+fn a_lone_tab_dropped_on_its_own_edge_or_middle_does_nothing() {
+    // Break caught (Review Focus 4): a one-tab group splitting itself and closing, which
+    // shuffles the layout for nothing.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let ids = strip_ids(window.hwnd, group);
+    let area = content(window.hwnd, group);
+    let own = group_window(window.hwnd, group);
+    let source = start_strip_drag(window.hwnd, group, 0);
+    drop_strip_drag(source, own, area.right - 5, (area.top + area.bottom) / 2, 0);
+    assert_eq!(super::group_order(window.hwnd), [group]);
+    let source = start_strip_drag(window.hwnd, group, 0);
+    drop_strip_drag(
+        source,
+        own,
+        (area.left + area.right) / 2,
+        (area.top + area.bottom) / 2,
+        0,
+    );
+    assert_eq!(strip_ids(window.hwnd, group), ids);
+}
+
+#[test]
+fn a_tab_dropped_on_an_edge_splits_that_way_and_moves_into_the_new_group() {
+    // Break caught: the split going the wrong way, or the view copied instead of moved.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let dragged = strip_ids(window.hwnd, group)[0];
+    let area = content(window.hwnd, group);
+    let own = group_window(window.hwnd, group);
+    let source = start_strip_drag(window.hwnd, group, 0);
+    drop_strip_drag(
+        source,
+        own,
+        (area.left + area.right) / 2,
+        area.bottom - 5,
+        0,
+    );
+    let order = super::group_order(window.hwnd);
+    assert_eq!(order.len(), 2);
+    let new = order[1];
+    assert_eq!(strip_ids(window.hwnd, new), [dragged]);
+    assert!(!strip_ids(window.hwnd, group).contains(&dragged));
+    let layout = super::tree_layout(window.hwnd).unwrap();
+    assert!(
+        layout.rect_of(new).unwrap().top > layout.rect_of(group).unwrap().top,
+        "below"
+    );
+}
+
+#[test]
+fn an_edge_drop_without_room_says_so_and_leaves_the_tab_where_it_was() {
+    // Break caught (Review Focus 5): the view removed from its group before the split was
+    // refused, losing the tab.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::New);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let ids = strip_ids(window.hwnd, group);
+    let own = group_window(window.hwnd, group);
+    let source = start_strip_drag(window.hwnd, group, 0);
+    // Shrink the window below two minimum-width groups mid-drag.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            window.hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            300,
+            400,
+            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+    }
+    super::layout_editor_and_find_bar(window.hwnd);
+    let area = content(window.hwnd, group);
+    drop_strip_drag(source, own, area.right - 3, (area.top + area.bottom) / 2, 0);
+    assert_eq!(super::group_order(window.hwnd), [group]);
+    assert_eq!(strip_ids(window.hwnd, group), ids);
+    assert!(
+        notices(window.hwnd)
+            .iter()
+            .any(|notice| notice.contains(super::NO_ROOM_TO_SPLIT))
+    );
+}
+
+#[test]
+fn a_tab_closed_mid_drag_drops_nothing() {
+    // Break caught (Review Focus 2): a stale id moving some other tab, or a panic.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = two_groups(window.hwnd);
+    assert!(super::activate_group(window.hwnd, first));
+    execute_command(window.hwnd, CommandId::New);
+    let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let index = strip_ids(window.hwnd, first)
+        .iter()
+        .position(|id| *id == dragged)
+        .unwrap();
+    let source = start_strip_drag(window.hwnd, first, index);
+    super::close_document_without_prompt(window.hwnd, dragged);
+    let before = strip_ids(window.hwnd, second);
+    let target = group_window(window.hwnd, second);
+    let middle = content(window.hwnd, second);
+    drop_strip_drag(
+        source,
+        target,
+        (middle.left + middle.right) / 2,
+        (middle.top + middle.bottom) / 2,
+        0,
+    );
+    assert_eq!(strip_ids(window.hwnd, second), before);
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+}
+
+#[test]
+fn a_dirty_document_moves_between_groups_without_a_prompt_and_stays_dirty() {
+    // Break caught: a move implemented as close plus open, asking to save.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let (first, second) = two_groups(window.hwnd);
+    assert!(super::activate_group(window.hwnd, first));
+    execute_command(window.hwnd, CommandId::New);
+    editor.set_text("unsaved").unwrap();
+    let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+    app_mut(window.hwnd).tabs.set_dirty(dragged, true);
+    assert!(app_mut(window.hwnd).tabs.document(dragged).unwrap().dirty);
+    let index = strip_ids(window.hwnd, first)
+        .iter()
+        .position(|id| *id == dragged)
+        .unwrap();
+    let source = start_strip_drag(window.hwnd, first, index);
+    let target = group_window(window.hwnd, second);
+    let middle = content(window.hwnd, second);
+    drop_strip_drag(
+        source,
+        target,
+        (middle.left + middle.right) / 2,
+        (middle.top + middle.bottom) / 2,
+        0,
+    );
+    assert!(crate::window::modal::take_last_confirm().is_none());
+    assert!(app_mut(window.hwnd).tabs.document(dragged).unwrap().dirty);
+    assert!(strip_ids(window.hwnd, second).contains(&dragged));
+}
+
+#[test]
+fn a_strip_tab_dropped_on_a_notebook_folder_copies_its_file() {
+    // Break caught: strip drags ignoring the tree the Open Editors rows already copy into
+    // (split editors spec §6.1).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("strip-drag-folder");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let outside = scratch.root.join("draft.txt");
+    std::fs::write(&outside, "draft").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &outside).unwrap();
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let index = strip_ids(window.hwnd, group)
+        .iter()
+        .position(|id| {
+            app_mut(window.hwnd)
+                .tabs
+                .document(*id)
+                .unwrap()
+                .path
+                .as_deref()
+                == Some(outside.as_path())
+        })
+        .unwrap();
+    let source = start_strip_drag(window.hwnd, group, index);
+    let panel = sidebar_windows(window.hwnd).1;
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    let (x, y) = (
+        (work & 0xffff) as i16 as i32,
+        ((work >> 16) & 0xffff) as i16 as i32,
+    );
+    drop_strip_drag(source, panel, x, y, 0);
+    crate::window::copy_host::wait_for_copies(window.hwnd);
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+        "draft"
+    );
+    assert!(
+        strip_ids(window.hwnd, group).iter().any(|id| {
+            app_mut(window.hwnd)
+                .tabs
+                .document(*id)
+                .unwrap()
+                .path
+                .as_deref()
+                == Some(outside.as_path())
+        }),
+        "the tab stays"
+    );
+    assert!(notebook_view(window.hwnd).drag.is_none());
+}
+
+#[test]
+fn files_dropped_on_a_second_groups_editor_open_in_that_group() {
+    // Break caught: only group 1's editor taking Explorer drops, so a drop on the right-hand
+    // editor opens on the left (split editors spec §6.2).
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editor-drop-group");
+    let note = scratch.note("dropped.md", "dropped");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    assert!(super::activate_group(window.hwnd, first));
+    crate::window::library_host::accept_editor_file_drops(window.hwnd);
+    let target = super::group_editor(window.hwnd, second).unwrap();
+    crate::editor::file_drop::test_support::drag_and_drop(target.hwnd(), &[note.as_path()]);
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(second)
+            .iter()
+            .any(|document| document.path.as_deref() == Some(note.as_path()))
+    });
+    assert_eq!(app_mut(window.hwnd).tabs.active_group(), second);
+}
+
+#[test]
+fn a_group_split_off_after_the_chrome_takes_explorer_drops() {
+    // Break caught: the wrapper installed once in BUILD_CHROME, so every later group's
+    // editor refuses files.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editor-drop-late");
+    let note = scratch.note("late.md", "late");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::library_host::accept_editor_file_drops(window.hwnd);
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    let target = super::group_editor(window.hwnd, second).unwrap();
+    let effects =
+        crate::editor::file_drop::test_support::drag_and_drop(target.hwnd(), &[note.as_path()]);
+    assert_eq!(
+        effects,
+        [windows_sys::Win32::System::Ole::DROPEFFECT_COPY; 3]
+    );
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(second)
+            .iter()
+            .any(|document| document.path.as_deref() == Some(note.as_path()))
+    });
+}
+
+#[test]
+fn files_dropped_on_a_groups_strip_open_in_that_group() {
+    // Break caught: WM_DROPFILES (a drop on a strip, a preview or an image) always opening
+    // in the active group.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("strip-drop");
+    let note = scratch.note("strip.md", "strip");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    assert!(super::activate_group(window.hwnd, first));
+    let strip = super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    let mut point = windows_sys::Win32::Foundation::POINT { x: 20, y: 10 };
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::MapWindowPoints(strip, window.hwnd, &mut point, 1)
+    };
+    let drop = crate::platform::win32::test_hdrop_at(&[note.as_path()], point);
+    unsafe { SendMessageW(window.hwnd, super::WM_DROPFILES, drop as usize, 0) };
+    assert!(
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(second)
+            .iter()
+            .any(|document| document.path.as_deref() == Some(note.as_path()))
+    );
+}
+
+#[test]
+fn a_left_release_after_a_right_press_cancel_drops_nothing_and_opens_no_menu() {
+    // Break caught: the right press hides the drag, but releasing the left button still
+    // drops the tab, and the right release then falls through to a context menu.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let (first, second) = two_groups(window.hwnd);
+    assert!(super::activate_group(window.hwnd, first));
+    execute_command(window.hwnd, CommandId::New);
+    let dragged = app_mut(window.hwnd).tabs.active().unwrap().id;
+    let index = strip_ids(window.hwnd, first)
+        .iter()
+        .position(|id| *id == dragged)
+        .unwrap();
+    let menu = std::rc::Rc::new(std::cell::Cell::new(false));
+    let shown = menu.clone();
+    crate::window::menus::answer_next_popup_menu(move |_| {
+        shown.set(true);
+        None
+    });
+    let source = start_strip_drag(window.hwnd, first, index);
+    let target = group_window(window.hwnd, second);
+    let middle = content(window.hwnd, second);
+    let point = lparam_in(
+        source,
+        target,
+        (middle.left + middle.right) / 2,
+        (middle.top + middle.bottom) / 2,
+    );
+    unsafe {
+        SendMessageW(source, WM_MOUSEMOVE, 1, point);
+        SendMessageW(source, WM_RBUTTONDOWN, 3, point);
+        SendMessageW(source, WM_LBUTTONUP, 2, point);
+        SendMessageW(source, WM_RBUTTONUP, 0, point);
+    }
+    assert!(strip_ids(window.hwnd, first).contains(&dragged));
+    assert!(!strip_ids(window.hwnd, second).contains(&dragged));
+    assert!(!menu.get(), "the right release opened a menu");
+    assert!(app_mut(window.hwnd).tab_drag.is_none());
+}
+
+#[test]
+fn a_right_press_cancel_over_a_notebook_folder_ends_the_trees_drag() {
+    // Break caught: the folder's band and the tree's drag timer left running after the tab
+    // drag was cancelled.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("strip-drag-right-cancel");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\b.md", "b");
+    let outside = scratch.root.join("draft.txt");
+    std::fs::write(&outside, "draft").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &outside).unwrap();
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let index = strip_ids(window.hwnd, group)
+        .iter()
+        .position(|id| {
+            app_mut(window.hwnd)
+                .tabs
+                .document(*id)
+                .unwrap()
+                .path
+                .as_deref()
+                == Some(outside.as_path())
+        })
+        .unwrap();
+    let source = start_strip_drag(window.hwnd, group, index);
+    let panel = sidebar_windows(window.hwnd).1;
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    let (x, y) = (
+        (work & 0xffff) as i16 as i32,
+        ((work >> 16) & 0xffff) as i16 as i32,
+    );
+    let point = lparam_in(source, panel, x, y);
+    unsafe { SendMessageW(source, WM_MOUSEMOVE, 1, point) };
+    assert!(notebook_view(window.hwnd).drag.is_some(), "over the folder");
+    unsafe { SendMessageW(source, WM_RBUTTONDOWN, 3, point) };
+    assert!(notebook_view(window.hwnd).drag.is_none());
+    unsafe { SendMessageW(source, WM_RBUTTONUP, 0, point) };
+}
+
+#[test]
+fn a_strip_tab_dropped_on_a_folder_asks_to_replace_with_the_drag_already_gone() {
+    // Break caught: the "Replace?" question opening under a frozen drag label with the group
+    // window still holding the mouse.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("strip-drag-replace");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note(r"work\draft.txt", "old");
+    let outside = scratch.root.join("draft.txt");
+    std::fs::write(&outside, "draft").unwrap();
+    let (window, _editor) = notebook_window(&scratch);
+    super::open_path(window.hwnd, &outside).unwrap();
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let index = strip_ids(window.hwnd, group)
+        .iter()
+        .position(|id| {
+            app_mut(window.hwnd)
+                .tabs
+                .document(*id)
+                .unwrap()
+                .path
+                .as_deref()
+                == Some(outside.as_path())
+        })
+        .unwrap();
+    let asked = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = asked.clone();
+    crate::window::modal::answer_next_confirm(move |_| {
+        let capture = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() };
+        seen.set(Some(capture.is_null()));
+        false
+    });
+    let source = start_strip_drag(window.hwnd, group, index);
+    let panel = sidebar_windows(window.hwnd).1;
+    let work = row_lparam(window.hwnd, &RowKind::Folder("work".into()));
+    let (x, y) = (
+        (work & 0xffff) as i16 as i32,
+        ((work >> 16) & 0xffff) as i16 as i32,
+    );
+    drop_strip_drag(source, panel, x, y, 0);
+    assert_eq!(
+        asked.get(),
+        Some(true),
+        "asked, with the capture already released"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.folder().join(r"work\draft.txt")).unwrap(),
+        "old"
+    );
+}
+
+#[test]
+fn about_shows_a_modal_window_over_the_disabled_main_window_until_escape() {
+    // Break caught: About doing nothing, leaving the main window usable behind the box (or
+    // disabled after it closes), or a modal scope that never ends, which holds back every
+    // deferred message for the rest of the session; or one with no native frame (no DWM
+    // shadow) or a visible one, as for Settings.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, HTCAPTION,
+        HTCLIENT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST, WS_CAPTION,
+    };
+    let window = ProductionWindow::new(make_app());
+    let owner = window.hwnd;
+    let shown = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = shown.clone();
+    crate::window::about::answer_next(move |dialog| {
+        let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
+        let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
+        let modal = crate::window::modal::modal_active(owner);
+        // A hidden native frame: WS_CAPTION earns the DWM shadow, WM_NCCALCSIZE leaves no
+        // visible frame, so the client is the whole window.
+        let style = unsafe { GetWindowLongW(dialog, GWL_STYLE) } as u32;
+        let (mut client, mut frame) = (RECT::default(), RECT::default());
+        unsafe {
+            GetClientRect(dialog, &mut client);
+            GetWindowRect(dialog, &mut frame);
+        }
+        let framed = style & WS_CAPTION == WS_CAPTION
+            && client.right - client.left == frame.right - frame.left
+            && client.bottom - client.top == frame.bottom - frame.top
+            && client.right > 0;
+        // The header still drags the box; its × and the body below do not.
+        let hit = |x: i32, y: i32| unsafe {
+            SendMessageW(
+                dialog,
+                WM_NCHITTEST,
+                0,
+                ((u32::from(y as u16) << 16) | u32::from(x as u16)) as LPARAM,
+            )
+        };
+        let framed = framed
+            && hit(frame.left + 30, frame.top + 10) == HTCAPTION as LRESULT
+            && hit(frame.right - 5, frame.top + 10) == HTCLIENT as LRESULT
+            && hit(frame.left + 5, frame.bottom - 5) == HTCLIENT as LRESULT;
+        seen.set(Some((dialog, owned, owner_disabled, modal, framed)));
+        unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    });
+
+    execute_command(owner, CommandId::About);
+
+    let (dialog, owned, owner_disabled, modal, framed) =
+        shown.get().expect("the About box was shown");
+    assert!(owned, "owned by the main window");
+    assert!(
+        framed,
+        "WS_CAPTION, a client rect the size of the window, and the header still a caption"
+    );
+    assert!(
+        owner_disabled,
+        "the main window is disabled while About is up"
+    );
+    assert!(modal, "About runs inside a modal scope");
+    assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
+    assert_ne!(
+        unsafe { IsWindowEnabled(owner) },
+        0,
+        "the main window is usable again"
+    );
+    assert!(!crate::window::modal::modal_active(owner));
+}
+
+#[test]
+fn about_opens_the_repository_link_from_the_keyboard_and_stays_open() {
+    // Break caught: a link that Tab can't reach or Enter doesn't follow, or following a link
+    // that also closes the box.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+    let window = ProductionWindow::new(make_app());
+    crate::window::about::take_opened_urls();
+    crate::window::about::answer_next(move |dialog| unsafe {
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+
+    execute_command(window.hwnd, CommandId::About);
+
+    assert_eq!(
+        crate::window::about::take_opened_urls(),
+        [crate::window::about::Link::Repository.url()]
+    );
+}
+
+#[test]
+fn settings_opens_an_owned_modal_dialog_that_escape_closes() {
+    // Break caught: a dialog that can hide behind the main window, leaves it disabled after
+    // closing, or never ends its modal scope; or one with no native frame (no DWM shadow)
+    // or a visible one.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_ESCAPE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, HTCAPTION,
+        HTCLIENT, HTRIGHT, PostMessageW, SendMessageW, WM_KEYDOWN, WM_NCHITTEST, WS_CAPTION,
+    };
+    let window = ProductionWindow::new(make_app());
+    let owner = window.hwnd;
+    let shown = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = shown.clone();
+    crate::window::settings_dialog::answer_next(move |dialog| {
+        let owned = unsafe { GetWindow(dialog, GW_OWNER) } == owner;
+        let owner_disabled = unsafe { IsWindowEnabled(owner) } == 0;
+        let modal = crate::window::modal::modal_active(owner)
+            && crate::window::settings_dialog::open_dialog(owner) == Some(dialog);
+        // A hidden native frame: WS_CAPTION earns the DWM shadow, WM_NCCALCSIZE leaves no
+        // visible frame, so the client is the whole window.
+        let style = unsafe { GetWindowLongW(dialog, GWL_STYLE) } as u32;
+        let (mut client, mut frame) = (RECT::default(), RECT::default());
+        unsafe {
+            GetClientRect(dialog, &mut client);
+            GetWindowRect(dialog, &mut frame);
+        }
+        let framed = style & WS_CAPTION == WS_CAPTION
+            && client.right - client.left == frame.right - frame.left
+            && client.bottom - client.top == frame.bottom - frame.top
+            && client.right > 0;
+        // The title row still drags the dialog; its × does not; the hidden frame's edges
+        // still size it.
+        let hit = |x: i32, y: i32| unsafe {
+            SendMessageW(
+                dialog,
+                WM_NCHITTEST,
+                0,
+                ((u32::from(y as u16) << 16) | u32::from(x as u16)) as LPARAM,
+            )
+        };
+        let framed = framed
+            && hit(frame.left + 30, frame.top + 10) == HTCAPTION as LRESULT
+            && hit(frame.right - 20, frame.top + 20) == HTCLIENT as LRESULT
+            && hit(frame.right - 1, (frame.top + frame.bottom) / 2) == HTRIGHT as LRESULT;
+        seen.set(Some((dialog, owned, owner_disabled, modal, framed)));
+        unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    });
+
+    super::show_settings(owner);
+
+    let (dialog, owned, owner_disabled, modal, framed) = shown.get().expect("Settings was shown");
+    assert!(owned && owner_disabled && modal);
+    assert!(
+        framed,
+        "WS_CAPTION, a client rect the size of the window, and the title row still a caption"
+    );
+    assert_eq!(unsafe { IsWindow(dialog) }, 0, "Escape closed it");
+    assert_eq!(crate::window::settings_dialog::open_dialog(owner), None);
+    assert_ne!(unsafe { IsWindowEnabled(owner) }, 0);
+    assert!(!crate::window::modal::modal_active(owner));
+}
+
+#[test]
+fn rebinding_save_rebuilds_the_accelerator_table_and_saves_one_line() {
+    // Break caught: a new key saved but the old table still dispatching, or Reset leaving a
+    // `key.file.save=` line that unbinds Save on the next start.
+    use crate::window::keymap::KeyStroke;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FVIRTKEY};
+    let scratch = RecoveryScratch::new("keymap-rebind");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let save_entries = |hwnd| {
+        app_mut(hwnd)
+            .accelerators
+            .as_ref()
+            .unwrap()
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.cmd == CommandId::Save as u16)
+            .map(|entry| (entry.fVirt, entry.key))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        save_entries(window.hwnd),
+        [(FVIRTKEY | FCONTROL, u16::from(b'S'))]
+    );
+
+    super::set_command_keys(
+        window.hwnd,
+        CommandId::Save,
+        vec![KeyStroke::parse("Ctrl+Alt+S").unwrap()],
+    );
+    assert_eq!(
+        save_entries(window.hwnd),
+        [(FVIRTKEY | FCONTROL | FALT, u16::from(b'S'))]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\nkey.file.save=Ctrl+Alt+S\r\n"
+    );
+    assert_eq!(
+        app_mut(window.hwnd)
+            .settings
+            .key_overrides
+            .get("file.save")
+            .map(String::as_str),
+        Some("Ctrl+Alt+S")
+    );
+
+    super::reset_command_keys(window.hwnd, CommandId::Save);
+    assert_eq!(
+        save_entries(window.hwnd),
+        [(FVIRTKEY | FCONTROL, u16::from(b'S'))]
+    );
+    assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+    assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
+
+    // Keys equal to the defaults are a reset too.
+    super::set_command_keys(window.hwnd, CommandId::Save, vec![]);
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\nkey.file.save=\r\n"
+    );
+    super::set_command_keys(
+        window.hwnd,
+        CommandId::Save,
+        vec![KeyStroke::parse("Ctrl+S").unwrap()],
+    );
+    assert_eq!(std::fs::read_to_string(&ini).unwrap(), "# kept\r\n");
+    super::save_settings_to(None);
+}
+
+#[test]
+fn resetting_a_command_removes_an_ignored_key_line() {
+    // Break caught: `key.file.save=Bogus` is ignored at load, so Reset saw an unchanged
+    // keymap, returned early and left the line (and its warning) forever.
+    let scratch = RecoveryScratch::new("keymap-stale");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(
+        &ini,
+        "# kept
+key.file.save=Bogus
+",
+    )
+    .unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let mut settings = crate::config::default_settings();
+    settings
+        .key_overrides
+        .insert("file.save".into(), "Bogus".into());
+    super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+    assert!(!app_mut(window.hwnd).keymap.is_user(CommandId::Save));
+
+    super::reset_command_keys(window.hwnd, CommandId::Save);
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept
+"
+    );
+    assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
+    super::save_settings_to(None);
+}
+
+#[test]
+fn loaded_key_overrides_rebuild_the_table_and_warn_about_bad_lines() {
+    // Break caught: `key.` lines read but never applied, or an unknown command dropped
+    // without telling the user.
+    let window = ProductionWindow::new(make_app());
+    let mut settings = crate::config::default_settings();
+    settings
+        .key_overrides
+        .insert("search.find".into(), "F9".into());
+    settings
+        .key_overrides
+        .insert("nope.command".into(), "F8".into());
+    super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+    let app = app_mut(window.hwnd);
+    assert!(app.keymap.is_user(CommandId::Find));
+    assert!(
+        app.accelerators
+            .as_ref()
+            .unwrap()
+            .entries()
+            .iter()
+            .any(|entry| {
+                entry.cmd == CommandId::Find as u16
+                    && entry.key == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9
+            })
+    );
+    assert!(
+        app.notifications
+            .pending()
+            .iter()
+            .any(|notification| notification.message.contains("key.nope.command"))
+    );
+}
+
+#[test]
+fn the_settings_dialog_changes_settings_from_the_keyboard() {
+    // Break caught: arrows or Space that change nothing, a typed font size lost when Tab
+    // leaves the field, or changes that aren't saved (settings dialog spec §3.3).
+    use crate::config::FileIconSet;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RIGHT, VK_SPACE, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("settings-dialog-keys");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+        let char = |c: char| PostMessageW(dialog, WM_CHAR, c as usize, 0);
+        key(VK_TAB); // File icons
+        key(VK_RIGHT); // Minimal
+        key(VK_TAB); // Font
+        key(VK_TAB); // Font size
+        char('1');
+        char('6');
+        key(VK_TAB); // commits 16; Tab width
+        key(VK_RIGHT); // 4 → 8
+        key(VK_TAB); // Indent with spaces
+        key(VK_SPACE);
+        key(VK_ESCAPE);
+    });
+
+    super::show_settings(window.hwnd);
+
+    let settings = app_mut(window.hwnd).settings.clone();
+    assert_eq!(settings.file_icons, FileIconSet::Minimal);
+    assert_eq!(settings.font_size, 16);
+    assert_eq!(settings.tab_width, 8);
+    assert!(settings.insert_spaces);
+    super::save_settings_to(None);
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\ntab_width=8\r\ninsert_spaces=true\r\n"
+    );
+}
+
+#[test]
+fn the_theme_dropdown_opens_with_enter_and_picks_with_the_keyboard() {
+    // Break caught: a dropdown that opens but ignores the arrows, or picks without applying.
+    use crate::config::ThemePreference;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+    let scratch = RecoveryScratch::new("settings-dialog-theme");
+    super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+    let window = ProductionWindow::new(make_app());
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+        key(VK_RETURN); // opens the Theme list on System
+        key(VK_DOWN); // Light
+        key(VK_RETURN); // picks it and closes the list
+        key(VK_ESCAPE); // closes the dialog
+    });
+
+    super::show_settings(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).settings.theme, ThemePreference::Light);
+    super::save_settings_to(None);
+}
+
+#[test]
+fn up_and_down_step_the_focused_theme_dropdown_without_opening_it() {
+    // Break caught: arrows that only work once the list is open, or a step that wraps past
+    // the first item (dropdown arrows brief).
+    use crate::config::ThemePreference;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_UP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+    let scratch = RecoveryScratch::new("settings-dialog-theme-arrows");
+    let ini = scratch.path().join("fastpad.ini");
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+        // The Theme row has the focus, on System, the first item.
+        key(VK_UP); // clamped: still System
+        key(VK_DOWN); // Light
+        key(VK_DOWN); // Dark
+        key(VK_UP); // Light
+        key(VK_ESCAPE);
+        // Break caught: were a step to open the list, the first Escape would close only the
+        // list and show_settings would never return; this one closes the dialog, so the
+        // assertions below fail instead.
+        key(VK_ESCAPE);
+    });
+
+    super::show_settings(window.hwnd);
+
+    assert_eq!(app_mut(window.hwnd).settings.theme, ThemePreference::Light);
+    super::save_settings_to(None);
+    assert_eq!(
+        std::fs::read_to_string(&ini).unwrap(),
+        "theme=light\n",
+        "each step rewrote the one theme line"
+    );
+}
+
+#[test]
+fn the_dialog_keeps_the_focus_after_a_change_that_moves_it() {
+    // Break caught: switching notes mode off from the dialog tears down the sidebar, the
+    // focus lands in the main window, and the dialog stops answering the keyboard (review
+    // focus 1). Posted test keys reach the dialog whatever the focus, so the dialog records
+    // the focus after each change and the test checks that record.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_SPACE, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("settings-dialog-focus");
+    super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::settings_dialog::take_focus_checks();
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
+        // Theme → … → Notes mode is the 11th row: ten Tabs.
+        for _ in 0..10 {
+            key(VK_TAB);
+        }
+        key(VK_SPACE); // notes mode off
+        key(VK_SPACE); // and on again
+        key(VK_ESCAPE);
+    });
+
+    super::show_settings(window.hwnd);
+
+    assert!(app_mut(window.hwnd).settings.notes_mode, "both toggles ran");
+    assert_eq!(
+        crate::window::settings_dialog::take_focus_checks(),
+        [true, true],
+        "the dialog had the keyboard after each change"
+    );
+    super::save_settings_to(None);
+}
+
+#[test]
+fn edit_fastpad_ini_closes_the_dialog_and_opens_the_file_in_a_tab() {
+    // Break caught: the link doing nothing when fastpad.ini doesn't exist yet, or opening it
+    // under the still-modal dialog (settings dialog spec §3.6).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("settings-dialog-edit-ini");
+    let ini = scratch.path().join("FastPad").join("fastpad.ini");
+    super::save_settings_to(Some(ini.clone()));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        // 12 enabled rows (no notebook, so autosave is skipped): 12 Tabs reach the link.
+        for _ in 0..12 {
+            PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+        }
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+    });
+
+    super::show_settings(window.hwnd);
+
+    assert!(ini.exists(), "created when missing");
+    assert!(
+        app_mut(window.hwnd).tabs.find_path(&ini).is_some(),
+        "opened in a tab"
+    );
+    // Break caught: a hand edit saved there looking ignored because FastPad reads the file
+    // only at startup, with nothing saying so (final review 5).
+    assert!(
+        app_mut(window.hwnd)
+            .notifications
+            .pending()
+            .iter()
+            .any(|notice| notice.message == super::EDIT_INI_NOTICE),
+        "the notice says when hand edits apply"
+    );
+    super::save_settings_to(None);
+}
+
+/// Point `(x, y)` packed as a mouse message's `lparam`.
+fn settings_click_at(x: i32, y: i32) -> LPARAM {
+    (x as u16 as usize | ((y as u16 as usize) << 16)) as LPARAM
+}
+
+/// The center of `row` in the open Settings dialog's client area, before any scrolling.
+fn settings_row_center(dialog: HWND, row: crate::window::settings_model::Row) -> (i32, i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow};
+    let owner = unsafe { GetWindow(dialog, GW_OWNER) };
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(owner) }.max(96);
+    let layout = crate::window::settings_dialog::Layout::calculate(dpi, i32::MAX, i32::MAX, 100);
+    let rect = layout.row_rect(row, 0);
+    ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+}
+
+#[test]
+fn the_second_click_of_a_double_click_on_a_dropdown_item_changes_nothing_else() {
+    // Break caught: double-clicking a theme in the list picks it on the first click, the
+    // list goes, and the second click lands on the Word wrap row underneath and toggles it
+    // (final review 3). A later click still toggles it: only one press is swallowed.
+    use crate::config::ThemePreference;
+    use crate::window::settings_model::Row;
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("settings-dialog-double-click");
+    super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    assert!(!app_mut(window.hwnd).settings.word_wrap);
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let (x, y) = settings_row_center(dialog, Row::WordWrap);
+        let mut screen = POINT { x, y };
+        ClientToScreen(dialog, &mut screen);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0); // the Theme list
+        // The list's first click picks Light at a point over the Word wrap row.
+        PostMessageW(
+            dialog,
+            crate::window::dropdown_list::WM_LIST_PICKED,
+            1,
+            settings_click_at(screen.x, screen.y),
+        );
+        for _ in 0..2 {
+            PostMessageW(dialog, WM_LBUTTONDOWN, 1, settings_click_at(x, y));
+            PostMessageW(dialog, WM_LBUTTONUP, 0, settings_click_at(x, y));
+        }
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+
+    super::show_settings(window.hwnd);
+
+    let settings = app_mut(window.hwnd).settings.clone();
+    assert_eq!(settings.theme, ThemePreference::Light, "the pick applied");
+    assert!(settings.word_wrap, "toggled once: by the later click only");
+    super::save_settings_to(None);
+}
+
+#[test]
+fn clicking_the_greyed_autosave_row_leaves_the_focus_where_it_was() {
+    // Break caught: a click on the Notebook autosave row, greyed with no notebook open,
+    // moving the focus onto a row the keyboard can't use (final review 6). Tab and Right
+    // after the click then change File icons, the row after Theme.
+    use crate::config::FileIconSet;
+    use crate::window::settings_model::Row;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RIGHT, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    };
+    let scratch = RecoveryScratch::new("settings-dialog-greyed-row");
+    super::save_settings_to(Some(scratch.path().join("fastpad.ini")));
+    let window = ProductionWindow::new(make_app());
+    crate::window::settings_dialog::answer_next(|dialog| unsafe {
+        let (x, y) = settings_row_center(dialog, Row::NotebookAutosave);
+        PostMessageW(dialog, WM_LBUTTONDOWN, 1, settings_click_at(x, y));
+        PostMessageW(dialog, WM_LBUTTONUP, 0, settings_click_at(x, y));
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RIGHT), 0);
+        PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
+    });
+
+    super::show_settings(window.hwnd);
+
+    assert_eq!(
+        app_mut(window.hwnd).settings.file_icons,
+        FileIconSet::Minimal
+    );
+    super::save_settings_to(None);
+}
