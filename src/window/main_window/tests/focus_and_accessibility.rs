@@ -431,9 +431,14 @@ fn the_find_bar_exposes_its_fields_toggles_and_close_button() {
             ROLE_SYSTEM_CHECKBUTTON,
             ROLE_SYSTEM_CHECKBUTTON,
             ROLE_SYSTEM_CHECKBUTTON,
+            ROLE_SYSTEM_PUSHBUTTON,
+            ROLE_SYSTEM_PUSHBUTTON,
             ROLE_SYSTEM_PUSHBUTTON
         ]
     );
+    assert_eq!(shown[4].name, "Previous match");
+    assert_eq!(shown[5].name, "Next match");
+    assert_eq!(shown[6].name, "Close");
     assert_eq!(shown[0].window, query);
     assert_eq!(shown[2].name, "Match whole word");
     let typed = crate::platform::wide_null("needle");
@@ -450,7 +455,7 @@ fn the_find_bar_exposes_its_fields_toggles_and_close_button() {
     assert!(app_mut(window.hwnd).find_bar().unwrap().options().case);
 
     execute_command(window.hwnd, CommandId::Replace);
-    assert_eq!((FIND_BAR_ACCESSIBLE.count)(panel), 6);
+    assert_eq!((FIND_BAR_ACCESSIBLE.count)(panel), 8);
     let typed = crate::platform::wide_null("pin");
     unsafe { SetWindowTextW(replace, typed.as_ptr()) };
     let shown = items();

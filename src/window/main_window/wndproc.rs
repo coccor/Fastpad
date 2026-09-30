@@ -114,6 +114,10 @@ pub(super) unsafe extern "system" fn main_window_proc(
             crate::window::library_host::autosave_active(hwnd);
             0
         }
+        WM_TIMER if wparam == FIND_COUNT_TIMER_ID => {
+            find_count_timer(hwnd);
+            0
+        }
         WM_TIMER if wparam == crate::window::text_search_host::TEXT_SEARCH_TIMER_ID => {
             crate::window::text_search_host::timer(hwnd);
             0
@@ -710,6 +714,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
             modification.position.max(0) as usize,
         );
         crate::window::library_host::schedule_autosave(hwnd);
+        schedule_find_count(hwnd);
         for shown in showing {
             crate::window::preview_host::record_edit(hwnd, shown, modification);
         }
