@@ -54,25 +54,43 @@ pub(super) fn sync_window_title(hwnd: HWND) {
     }
 }
 
-/// Group `id`'s tab titles, selected tab, strip scroll, whether it is empty, and its preview tab.
-pub(super) fn tab_snapshot(
-    hwnd: HWND,
-    id: GroupId,
-) -> (Vec<String>, usize, i32, bool, Option<usize>) {
+/// What a group's strip paints: its tab titles and icon kinds, selected tab and preview tab.
+pub(super) struct TabSnapshot {
+    pub(super) titles: Vec<String>,
+    /// Each tab's icon kind: its file's, or text for an untitled document.
+    pub(super) kinds: Vec<crate::window::file_icons::NoteKind>,
+    pub(super) active: usize,
+    pub(super) preview_tab: Option<usize>,
+}
+
+/// Group `id`'s strip contents.
+pub(super) fn tab_snapshot(hwnd: HWND, id: GroupId) -> TabSnapshot {
     unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let app = unsafe { app.as_ref() };
             let group = app.tabs.group(id)?;
             let documents = app.tabs.group_documents(id);
-            Some((
-                documents.iter().map(|document| document.title()).collect(),
-                group.active_index(),
-                group.scroll_offset(),
-                app.group(id).is_some() && group.is_empty(),
-                documents.iter().position(|document| document.preview),
-            ))
+            Some(TabSnapshot {
+                titles: documents.iter().map(|document| document.title()).collect(),
+                kinds: documents
+                    .iter()
+                    .map(|document| {
+                        document.path.as_deref().map_or(
+                            crate::window::file_icons::NoteKind::Text,
+                            crate::window::file_icons::note_kind,
+                        )
+                    })
+                    .collect(),
+                active: group.active_index(),
+                preview_tab: documents.iter().position(|document| document.preview),
+            })
         })
-        .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false, None))
+        .unwrap_or_else(|| TabSnapshot {
+            titles: vec!["Untitled".to_owned()],
+            kinds: vec![crate::window::file_icons::NoteKind::Text],
+            active: 0,
+            preview_tab: None,
+        })
 }
 
 pub(super) fn group_tab_count(hwnd: HWND, id: GroupId) -> usize {

@@ -1387,12 +1387,15 @@ fn button_hint(button: PreviewButton, cycle: Option<&str>) -> String {
     }
 }
 
+/// `button`'s tooltip and status-bar text. The cycle key comes from the keymap, so a rebound key
+/// shows here too.
+pub(crate) fn button_text(hwnd: HWND, button: PreviewButton) -> String {
+    let cycle = super::main_window::first_key_text(hwnd, CommandId::MarkdownPreviewCycle);
+    button_hint(button, cycle.as_deref())
+}
+
 pub(crate) fn button_hover(hwnd: HWND, button: Option<PreviewButton>) {
-    let hint = button.map(|button| {
-        // The cycle key comes from the keymap, so a rebound key shows here too.
-        let cycle = super::main_window::first_key_text(hwnd, CommandId::MarkdownPreviewCycle);
-        button_hint(button, cycle.as_deref())
-    });
+    let hint = button.map(|button| button_text(hwnd, button));
     let changed = with_host(hwnd, |host| {
         let changed = host.button_hint != hint;
         host.button_hint = hint;

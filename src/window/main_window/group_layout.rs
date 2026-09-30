@@ -605,8 +605,13 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
     if let Some(layout) = strip_layout_of(hwnd, id)
         && paint.rcPaint.top < layout.height
     {
-        let (titles, active, _, _, preview_tab) = tab_snapshot(hwnd, id);
-        let titles = titles.iter().map(String::as_str).collect::<Vec<_>>();
+        let snapshot = tab_snapshot(hwnd, id);
+        let titles = snapshot
+            .titles
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let (icon_set, light_theme) = current_icon_style(hwnd);
         let pointer = with_group_id(hwnd, id, |group| group.pointer).unwrap_or_default();
         let (is_active_group, group_count) = unsafe { app_ptr(hwnd) }
             .map(|app| {
@@ -621,8 +626,12 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
                 dpi,
                 &crate::window::group_strip::StripPaint {
                     titles: &titles,
-                    active,
-                    preview_tab,
+                    kinds: &snapshot.kinds,
+                    icons: current_file_icons(hwnd),
+                    icon_set,
+                    light_theme,
+                    active: snapshot.active,
+                    preview_tab: snapshot.preview_tab,
                     palette,
                     fonts,
                     pointer,
