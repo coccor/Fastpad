@@ -11,6 +11,7 @@ use crate::window::side_panel;
 use crate::window::text_search_host::{self, SearchBatch};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
 
 /// `EN_CHANGE` from the box. A query that can run restarts the debounce and nothing else. One
@@ -25,11 +26,13 @@ pub(crate) fn query_changed(hwnd: HWND) {
         text_search_host::schedule(hwnd);
         // "Type at least 2 characters." goes at once, not when the debounce ends.
         let panel = with_view(hwnd, |view| {
-            view.box_text.clone_from(&query);
-            (view.search == SearchState::TooShort).then(|| {
+            // The clear button appears with the first text.
+            let first = std::mem::replace(&mut view.box_text, query.clone()).is_empty();
+            let too_short = view.search == SearchState::TooShort;
+            if too_short {
                 view.search = SearchState::Idle;
-                view.panel
-            })
+            }
+            (first || too_short).then_some(view.panel)
         })
         .flatten();
         if let Some(panel) = panel {
@@ -55,6 +58,20 @@ pub(crate) fn query_changed(hwnd: HWND) {
     };
     invalidate(panel);
     announce_lines(hwnd, true);
+}
+
+/// The clear button: empties the box, which clears the query and the results (`query_changed`),
+/// and puts the caret back in it. Runs with nothing of the App borrowed: setting the text sends
+/// `EN_CHANGE` and focusing sends focus messages.
+pub(super) fn clear_search(hwnd: HWND) {
+    let Some(edit) = with_view(hwnd, |view| view.edit).flatten() else {
+        return;
+    };
+    let empty = wide_null("");
+    unsafe {
+        SetWindowTextW(edit, empty.as_ptr());
+        SetFocus(edit);
+    }
 }
 
 /// Part of `side_panel::refresh`. A new notebook cancels the search and clears the query and the

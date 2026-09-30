@@ -330,7 +330,8 @@ pub(crate) fn layout(hwnd: HWND) {
         SearchView::field_rect(client, dpi),
         text_font,
         inset_x,
-        option_toggles::reserved_width(dpi),
+        option_toggles::reserved_width(dpi)
+            + scale(option_toggles::SIZE_AT_96_DPI + CLEAR_GAP_AT_96_DPI, dpi),
     );
     let (replace, replace_open) = with_view(hwnd, |view| {
         view.list.row_height = scale(ROW_AT_96_DPI, dpi);

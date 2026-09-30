@@ -16,6 +16,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 /// A mask bitmap's key: the set, the icon, its pixel size and the COLORREF it is tinted with.
 type MaskKey = (MaskSet, MaskIcon, u32, u32);
 
+#[derive(Debug)]
 pub(crate) struct IconImages {
     bitmaps: HashMap<(MaterialIcon, u32), HBITMAP>,
     /// Tinted masks. A theme switch adds a colour's bitmaps; at most 9 icons × 2 sets × the
