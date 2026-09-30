@@ -65,13 +65,24 @@ unsafe extern "system" fn collect_family(
 /// name ignoring case. Empty names, duplicates and vertical (`@`) families are dropped.
 /// `current` is listed first when no family has its name, so the dropdown can still show it.
 pub fn dropdown_names(families: Vec<FontFamily>, current: &str) -> Vec<String> {
+    sorted_names(families, current, true)
+}
+
+/// The Preview font dropdown's names: every family sorted by name ignoring case, with the same
+/// filtering and `current` handling as `dropdown_names`. Reading fonts are mostly proportional, so
+/// fixed-pitch families get no priority.
+pub fn preview_dropdown_names(families: Vec<FontFamily>, current: &str) -> Vec<String> {
+    sorted_names(families, current, false)
+}
+
+fn sorted_names(families: Vec<FontFamily>, current: &str, fixed_pitch_first: bool) -> Vec<String> {
     let mut families = families
         .into_iter()
         .filter(|family| !family.name.is_empty() && !family.name.starts_with('@'))
         .collect::<Vec<_>>();
     families.sort_by(|a, b| {
-        b.fixed_pitch
-            .cmp(&a.fixed_pitch)
+        (fixed_pitch_first && b.fixed_pitch)
+            .cmp(&(fixed_pitch_first && a.fixed_pitch))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -115,6 +126,23 @@ mod tests {
             "Consolas",
         );
         assert_eq!(names, ["Cascadia Mono", "consolas", "Arial", "Segoe UI"]);
+    }
+
+    #[test]
+    fn the_preview_list_sorts_every_family_together() {
+        // Break caught: a monospace family jumping ahead of the serif and sans faces a reader
+        // picks a preview font from.
+        let names = preview_dropdown_names(
+            vec![
+                family("Segoe UI", false),
+                family("consolas", true),
+                family("Georgia", false),
+                family("@MS Gothic", true),
+                family("Georgia", false),
+            ],
+            "Newsreader",
+        );
+        assert_eq!(names, ["Newsreader", "consolas", "Georgia", "Segoe UI"]);
     }
 
     #[test]

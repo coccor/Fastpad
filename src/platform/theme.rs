@@ -62,19 +62,25 @@ pub enum Theme {
     CatppuccinFrappe,
     CatppuccinMacchiato,
     CatppuccinMocha,
+    /// Warm off-white reading and writing theme.
+    Paper,
+    /// Warm charcoal companion to `Paper`.
+    Lamp,
 }
 
 impl Theme {
     pub const COUNT: usize = Self::ALL.len();
 
     /// Every theme, in discriminant order (`Self::ALL[theme as usize] == theme`).
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Light,
         Self::Dark,
         Self::CatppuccinLatte,
         Self::CatppuccinFrappe,
         Self::CatppuccinMacchiato,
         Self::CatppuccinMocha,
+        Self::Paper,
+        Self::Lamp,
     ];
 
     /// `system_dark` is only consulted by preferences that follow the system.
@@ -88,11 +94,14 @@ impl Theme {
             ThemePreference::CatppuccinFrappe => Self::CatppuccinFrappe,
             ThemePreference::CatppuccinMacchiato => Self::CatppuccinMacchiato,
             ThemePreference::CatppuccinMocha => Self::CatppuccinMocha,
+            ThemePreference::PaperLamp if system_dark => Self::Lamp,
+            ThemePreference::PaperLamp | ThemePreference::Paper => Self::Paper,
+            ThemePreference::Lamp => Self::Lamp,
         }
     }
 
     pub const fn is_dark(self) -> bool {
-        !matches!(self, Self::Light | Self::CatppuccinLatte)
+        !matches!(self, Self::Light | Self::CatppuccinLatte | Self::Paper)
     }
 }
 
@@ -202,6 +211,23 @@ mod tests {
             light_system.effective_theme(ThemePreference::Catppuccin),
             Theme::CatppuccinLatte
         );
+        assert_eq!(
+            dark_system.effective_theme(ThemePreference::PaperLamp),
+            Theme::Lamp
+        );
+        assert_eq!(
+            light_system.effective_theme(ThemePreference::PaperLamp),
+            Theme::Paper
+        );
+        assert_eq!(
+            dark_system.effective_theme(ThemePreference::Paper),
+            Theme::Paper
+        );
+        assert_eq!(
+            light_system.effective_theme(ThemePreference::Lamp),
+            Theme::Lamp
+        );
+        assert!(!Theme::Paper.is_dark() && Theme::Lamp.is_dark());
         for (preference, theme) in [
             (ThemePreference::CatppuccinLatte, Theme::CatppuccinLatte),
             (ThemePreference::CatppuccinFrappe, Theme::CatppuccinFrappe),

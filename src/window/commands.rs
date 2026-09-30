@@ -131,6 +131,9 @@ pub enum CommandId {
     EditSettingsFile = 236,
     OpenKeyboardShortcuts = 237,
     ToggleAlwaysOnTop = 238,
+    ThemePaperLamp = 239,
+    ThemePaper = 240,
+    ThemeLamp = 241,
 }
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
@@ -206,6 +209,9 @@ impl CommandId {
                 | Self::ThemeCatppuccinFrappe
                 | Self::ThemeCatppuccinMacchiato
                 | Self::ThemeCatppuccinMocha
+                | Self::ThemePaperLamp
+                | Self::ThemePaper
+                | Self::ThemeLamp
                 | Self::FileIconsMaterial
                 | Self::FileIconsMinimal
                 | Self::FileIconsSolid
@@ -380,7 +386,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 128] = [
+        const COMMANDS: [CommandId; 131] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -509,6 +515,9 @@ impl TryFrom<u16> for CommandId {
             CommandId::EditSettingsFile,
             CommandId::OpenKeyboardShortcuts,
             CommandId::ToggleAlwaysOnTop,
+            CommandId::ThemePaperLamp,
+            CommandId::ThemePaper,
+            CommandId::ThemeLamp,
         ];
         COMMANDS
             .into_iter()

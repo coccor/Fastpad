@@ -200,6 +200,56 @@ const DARK_SYNTAX: SyntaxColors = SyntaxColors {
     error: rgb(244, 71, 71),
 };
 
+// Paper: teal for structure, clay for emphasis, quiet muted comments.
+const PAPER_SYNTAX: SyntaxColors = SyntaxColors {
+    background: rgb(248, 247, 243),
+    text: rgb(42, 41, 38),
+    comment: rgb(128, 126, 114),
+    keyword: rgb(47, 111, 106),
+    string: rgb(138, 79, 58),
+    number: rgb(150, 100, 40),
+    operator: rgb(90, 88, 80),
+    key: rgb(47, 111, 106),
+    tag: rgb(47, 111, 106),
+    attribute: rgb(120, 90, 60),
+    type_name: rgb(72, 95, 130),
+    function: rgb(100, 80, 130),
+    preprocessor: rgb(140, 90, 110),
+    variable: rgb(60, 80, 100),
+    escape: rgb(170, 90, 50),
+    heading: rgb(47, 111, 106),
+    emphasis: rgb(138, 79, 58),
+    link: rgb(47, 111, 106),
+    code: rgb(138, 79, 58),
+    code_background: rgb(236, 235, 227),
+    error: rgb(161, 55, 35),
+};
+
+// Lamp: desaturated sea-green and amber on warm charcoal.
+const LAMP_SYNTAX: SyntaxColors = SyntaxColors {
+    background: rgb(33, 31, 28),
+    text: rgb(217, 212, 199),
+    comment: rgb(124, 120, 108),
+    keyword: rgb(127, 181, 172),
+    string: rgb(214, 154, 107),
+    number: rgb(203, 180, 120),
+    operator: rgb(170, 165, 152),
+    key: rgb(127, 181, 172),
+    tag: rgb(127, 181, 172),
+    attribute: rgb(200, 170, 130),
+    type_name: rgb(140, 165, 205),
+    function: rgb(185, 160, 210),
+    preprocessor: rgb(205, 150, 170),
+    variable: rgb(170, 190, 205),
+    escape: rgb(225, 140, 95),
+    heading: rgb(127, 181, 172),
+    emphasis: rgb(214, 154, 107),
+    link: rgb(127, 181, 172),
+    code: rgb(214, 154, 107),
+    code_background: rgb(42, 40, 37),
+    error: rgb(232, 131, 113),
+};
+
 /// Catppuccin style guide roles.
 const fn catppuccin_syntax(flavor: &Flavor) -> SyntaxColors {
     SyntaxColors {
@@ -235,6 +285,8 @@ const SYNTAX_COLORS: [SyntaxColors; Theme::COUNT] = [
     catppuccin_syntax(&catppuccin::FRAPPE),
     catppuccin_syntax(&catppuccin::MACCHIATO),
     catppuccin_syntax(&catppuccin::MOCHA),
+    PAPER_SYNTAX,
+    LAMP_SYNTAX,
 ];
 
 #[cfg(test)]

@@ -37,6 +37,7 @@ pub(crate) enum Row {
     Theme,
     FileIcons,
     Font,
+    PreviewFont,
     FontSize,
     TabWidth,
     InsertSpaces,
@@ -50,10 +51,11 @@ pub(crate) enum Row {
 }
 
 impl Row {
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::Theme,
         Self::FileIcons,
         Self::Font,
+        Self::PreviewFont,
         Self::FontSize,
         Self::TabWidth,
         Self::InsertSpaces,
@@ -71,6 +73,7 @@ impl Row {
             Self::Theme => "Theme",
             Self::FileIcons => "File icons",
             Self::Font => "Font",
+            Self::PreviewFont => "Preview font",
             Self::FontSize => "Font size",
             Self::TabWidth => "Tab width",
             Self::InsertSpaces => "Indent with spaces",
@@ -96,7 +99,7 @@ impl Row {
 
     pub(crate) const fn control(self) -> Control {
         match self {
-            Self::Theme | Self::Font => Control::Dropdown,
+            Self::Theme | Self::Font | Self::PreviewFont => Control::Dropdown,
             Self::FileIcons | Self::TabWidth => Control::Segmented,
             Self::FontSize => Control::Stepper,
             _ => Control::Check,
@@ -150,15 +153,21 @@ impl Toggle {
 }
 
 /// The Theme dropdown's items, in order.
-pub(crate) const THEME_CHOICES: [(ThemePreference, &str); 8] = [
+pub(crate) const THEME_CHOICES: [(ThemePreference, &str); 11] = [
     (ThemePreference::System, "System"),
     (ThemePreference::Light, "Light"),
     (ThemePreference::Dark, "Dark"),
-    (ThemePreference::Catppuccin, "Catppuccin"),
+    (
+        ThemePreference::Catppuccin,
+        "Catppuccin Latte / Mocha (follows system)",
+    ),
     (ThemePreference::CatppuccinLatte, "Catppuccin Latte"),
     (ThemePreference::CatppuccinFrappe, "Catppuccin Frappé"),
     (ThemePreference::CatppuccinMacchiato, "Catppuccin Macchiato"),
     (ThemePreference::CatppuccinMocha, "Catppuccin Mocha"),
+    (ThemePreference::PaperLamp, "Paper / Lamp (follows system)"),
+    (ThemePreference::Paper, "Paper"),
+    (ThemePreference::Lamp, "Lamp"),
 ];
 
 pub(crate) const FILE_ICON_CHOICES: [(FileIconSet, &str); 3] = [
@@ -182,6 +191,7 @@ pub(crate) enum SettingsAction {
     SetTheme(ThemePreference),
     SetFileIcons(FileIconSet),
     SetFontFace(String),
+    SetPreviewFont(String),
     SetFontSize(u16),
     SetTabWidth(u8),
     Toggle(Toggle),
@@ -273,7 +283,8 @@ impl SettingsView {
         }
     }
 
-    /// A dropdown row's items and the selected one. `fonts` is the Font row's list.
+    /// A dropdown row's items and the selected one. `fonts` is the list of a font row: the code
+    /// fonts for Font, all fonts for Preview font.
     pub(crate) fn dropdown(&self, row: Row, fonts: &[String]) -> (Vec<String>, Option<usize>) {
         match row {
             Row::Theme => (
@@ -291,6 +302,12 @@ impl SettingsView {
                     .iter()
                     .position(|font| font.eq_ignore_ascii_case(&self.settings.font_face)),
             ),
+            Row::PreviewFont => (
+                fonts.to_vec(),
+                fonts
+                    .iter()
+                    .position(|font| font.eq_ignore_ascii_case(&self.settings.preview_font)),
+            ),
             _ => (Vec::new(), None),
         }
     }
@@ -303,6 +320,7 @@ impl SettingsView {
                 .find(|(theme, _)| *theme == self.settings.theme)
                 .map_or_else(String::new, |(_, label)| (*label).to_owned()),
             Row::Font => self.settings.font_face.clone(),
+            Row::PreviewFont => self.settings.preview_font.clone(),
             _ => String::new(),
         }
     }
@@ -317,6 +335,9 @@ pub(crate) fn dropdown_action(row: Row, index: usize, fonts: &[String]) -> Optio
         Row::Font => fonts
             .get(index)
             .map(|font| SettingsAction::SetFontFace(font.clone())),
+        Row::PreviewFont => fonts
+            .get(index)
+            .map(|font| SettingsAction::SetPreviewFont(font.clone())),
         _ => None,
     }
 }
@@ -650,8 +671,8 @@ mod tests {
         }
         let sections = Row::ALL.map(Row::section);
         assert_eq!(&sections[..2], [Section::Appearance; 2]);
-        assert_eq!(&sections[2..10], [Section::Editor; 8]);
-        assert_eq!(&sections[10..], [Section::NotesAndSession; 3]);
+        assert_eq!(&sections[2..11], [Section::Editor; 9]);
+        assert_eq!(&sections[11..], [Section::NotesAndSession; 3]);
         for (index, section) in Section::ALL.into_iter().enumerate() {
             assert_eq!(section as usize, index);
         }
@@ -1008,15 +1029,33 @@ mod tests {
             Some(SettingsAction::SetTheme(ThemePreference::Light))
         );
         assert_eq!(dropdown_step(Row::Theme, false, &view, &fonts), None);
-        view.settings.theme = ThemePreference::CatppuccinMocha;
+        view.settings.theme = ThemePreference::Lamp;
         assert_eq!(dropdown_step(Row::Theme, true, &view, &fonts), None);
         assert_eq!(
             dropdown_step(Row::Theme, false, &view, &fonts),
-            Some(SettingsAction::SetTheme(
-                ThemePreference::CatppuccinMacchiato
-            ))
+            Some(SettingsAction::SetTheme(ThemePreference::Paper))
         );
         assert_eq!(dropdown_step(Row::WordWrap, true, &view, &fonts), None);
+    }
+
+    #[test]
+    fn the_preview_font_row_reads_and_sets_the_preview_font_not_the_editor_font() {
+        // Break caught: the Preview font dropdown showing or changing the editor's font.
+        let mut view = view();
+        view.settings.preview_font = "georgia".to_owned();
+        let fonts = vec!["Cambria".to_owned(), "Georgia".to_owned()];
+        assert_eq!(Row::PreviewFont.control(), Control::Dropdown);
+        assert_eq!(Row::PreviewFont.section(), Section::Editor);
+        assert_eq!(
+            view.dropdown(Row::PreviewFont, &fonts),
+            (fonts.clone(), Some(1))
+        );
+        assert_eq!(view.dropdown_text(Row::PreviewFont), "georgia");
+        assert_eq!(
+            dropdown_action(Row::PreviewFont, 0, &fonts),
+            Some(SettingsAction::SetPreviewFont("Cambria".to_owned()))
+        );
+        assert_eq!(dropdown_action(Row::PreviewFont, 5, &fonts), None);
     }
 
     #[test]
@@ -1026,7 +1065,7 @@ mod tests {
         view.settings.font_face = "consolas".to_owned();
         let fonts = vec!["Cascadia Mono".to_owned(), "Consolas".to_owned()];
         let (themes, selected) = view.dropdown(Row::Theme, &fonts);
-        assert_eq!(themes.len(), 8);
+        assert_eq!(themes.len(), 11);
         assert_eq!(selected, Some(7));
         assert_eq!(view.dropdown_text(Row::Theme), "Catppuccin Mocha");
         assert_eq!(view.dropdown(Row::Font, &fonts), (fonts.clone(), Some(1)));

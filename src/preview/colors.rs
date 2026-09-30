@@ -110,6 +110,36 @@ const GITHUB_DARK: PreviewColors = PreviewColors {
     kbd_border: rgb(61, 68, 77),
 };
 
+const PAPER_PREVIEW: PreviewColors = PreviewColors {
+    background: rgb(248, 247, 243),
+    text: rgb(42, 41, 38),
+    muted: rgb(117, 115, 106),
+    heading: rgb(47, 111, 106),
+    link: rgb(47, 111, 106),
+    code_background: rgb(236, 235, 227),
+    border: rgb(217, 214, 203),
+    quote_bar: rgb(138, 79, 58),
+    table_stripe: rgb(241, 240, 234),
+    focus: rgb(47, 111, 106),
+    mark: rgb(240, 225, 170),
+    kbd_border: rgb(217, 214, 203),
+};
+
+const LAMP_PREVIEW: PreviewColors = PreviewColors {
+    background: rgb(33, 31, 28),
+    text: rgb(217, 212, 199),
+    muted: rgb(143, 139, 127),
+    heading: rgb(127, 181, 172),
+    link: rgb(127, 181, 172),
+    code_background: rgb(42, 40, 37),
+    border: rgb(62, 60, 55),
+    quote_bar: rgb(214, 154, 107),
+    table_stripe: rgb(38, 36, 33),
+    focus: rgb(127, 181, 172),
+    mark: rgb(72, 60, 30),
+    kbd_border: rgb(62, 60, 55),
+};
+
 const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
     PreviewColors {
         background: flavor.base,
@@ -162,6 +192,8 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
         Theme::CatppuccinFrappe => catppuccin_colors(&catppuccin::FRAPPE),
         Theme::CatppuccinMacchiato => catppuccin_colors(&catppuccin::MACCHIATO),
         Theme::CatppuccinMocha => catppuccin_colors(&catppuccin::MOCHA),
+        Theme::Paper => PAPER_PREVIEW,
+        Theme::Lamp => LAMP_PREVIEW,
     };
     PreviewColors {
         background: palette.editor_background,

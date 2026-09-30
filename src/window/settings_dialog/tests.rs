@@ -26,9 +26,9 @@ fn cards_stack_under_their_headings_with_gaps_and_everything_fits_at_96_dpi() {
         for row in Row::ALL.into_iter().filter(|row| row.section() == section) {
             let card = layout.rows[row as usize];
             assert_eq!(card.top, expected_top, "{row:?}");
-            assert_eq!(card.bottom - card.top, 36, "{row:?}");
+            assert_eq!(card.bottom - card.top, 34, "{row:?}");
             assert_eq!((card.left, card.right), (200, 840), "{row:?}");
-            expected_top = card.bottom + 3;
+            expected_top = card.bottom + 2;
         }
     }
     assert_eq!(layout.content_height, expected_top);
@@ -283,6 +283,7 @@ fn painted_dialog(canvas: Canvas, theme: crate::platform::theme::Theme) -> Dialo
         view: view(),
         model: DialogModel::new(Page::General),
         fonts: Vec::new(),
+        preview_fonts: Vec::new(),
         scroll: 0,
         title_font: std::ptr::null_mut(),
         heading_font: std::ptr::null_mut(),
@@ -412,7 +413,7 @@ fn a_narrow_work_area_caps_the_width_and_shrinks_the_dropdowns_not_their_labels(
     assert_eq!(layout.title_close.right, 450);
     assert_eq!(layout.close.right, 450 - 20);
     let view = view();
-    for row in [Row::Theme, Row::Font] {
+    for row in [Row::Theme, Row::Font, Row::PreviewFont] {
         let card = layout.row_rect(row, 0);
         assert_eq!((card.left, card.right), (170, 430));
         let control = layout.control_rect(row, card, 0);

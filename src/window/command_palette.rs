@@ -50,7 +50,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 106] = [
+pub(crate) const ENTRIES: [PaletteEntry; 109] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -162,7 +162,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 106] = [
     entry("Theme: Light", CommandId::ThemeLight),
     entry("Theme: Dark", CommandId::ThemeDark),
     entry(
-        "Theme: Catppuccin (follow system)",
+        "Theme: Catppuccin Latte / Mocha (follows system)",
         CommandId::ThemeCatppuccin,
     ),
     entry("Theme: Catppuccin Latte", CommandId::ThemeCatppuccinLatte),
@@ -172,6 +172,12 @@ pub(crate) const ENTRIES: [PaletteEntry; 106] = [
         CommandId::ThemeCatppuccinMacchiato,
     ),
     entry("Theme: Catppuccin Mocha", CommandId::ThemeCatppuccinMocha),
+    entry(
+        "Theme: Paper / Lamp (follows system)",
+        CommandId::ThemePaperLamp,
+    ),
+    entry("Theme: Paper", CommandId::ThemePaper),
+    entry("Theme: Lamp", CommandId::ThemeLamp),
     entry("File icons: Material", CommandId::FileIconsMaterial),
     entry("File icons: Minimal", CommandId::FileIconsMinimal),
     entry("File icons: Solid", CommandId::FileIconsSolid),

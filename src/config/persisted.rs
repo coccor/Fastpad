@@ -14,13 +14,17 @@ pub enum ThemePreference {
     CatppuccinFrappe,
     CatppuccinMacchiato,
     CatppuccinMocha,
+    /// Paper and Lamp that follow the system: Paper when light, Lamp when dark.
+    PaperLamp,
+    Paper,
+    Lamp,
 }
 
 impl ThemePreference {
     /// Whether resolving this preference needs the system light/dark state. Fixed themes never
     /// read it.
     pub const fn follows_system(self) -> bool {
-        matches!(self, Self::System | Self::Catppuccin)
+        matches!(self, Self::System | Self::Catppuccin | Self::PaperLamp)
     }
 }
 
@@ -86,6 +90,8 @@ impl FileIconSet {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub font_face: String,
+    /// The Markdown preview's body font.
+    pub preview_font: String,
     pub font_size: u16,
     pub tab_width: u8,
     pub word_wrap: bool,
@@ -129,6 +135,9 @@ impl Settings {
     pub fn apply_delta(&mut self, delta: &SettingsDelta) {
         if let Some(font_face) = &delta.font_face {
             self.font_face = font_face.clone();
+        }
+        if let Some(preview_font) = &delta.preview_font {
+            self.preview_font = preview_font.clone();
         }
         if let Some(font_size) = delta.font_size {
             self.font_size = font_size;
@@ -203,6 +212,7 @@ pub struct SettingWarning {
 #[derive(Default, Debug, PartialEq)]
 pub struct SettingsDelta {
     pub font_face: Option<String>,
+    pub preview_font: Option<String>,
     pub font_size: Option<u16>,
     pub tab_width: Option<u8>,
     pub word_wrap: Option<bool>,
@@ -226,7 +236,7 @@ pub struct SettingsDelta {
 
 /// Parses a hand-written, tolerant `.ini`-style settings source: one `key=value` pair per line: ASCII
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
-/// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
+/// lines are skipped, and exactly `font_face`, `preview_font`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `file_icons`, `open_editors_expanded`,
 /// `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
@@ -282,6 +292,13 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
                 warn(delta, line_number, key, value);
             } else {
                 delta.font_face = Some(value.to_owned());
+            }
+        }
+        "preview_font" => {
+            if value.is_empty() {
+                warn(delta, line_number, key, value);
+            } else {
+                delta.preview_font = Some(value.to_owned());
             }
         }
         "font_size" => match value.parse::<u16>() {
@@ -385,6 +402,9 @@ fn parse_theme(value: &str) -> Option<ThemePreference> {
         "catppuccin-frappe" => Some(ThemePreference::CatppuccinFrappe),
         "catppuccin-macchiato" => Some(ThemePreference::CatppuccinMacchiato),
         "catppuccin-mocha" => Some(ThemePreference::CatppuccinMocha),
+        "paper-lamp" => Some(ThemePreference::PaperLamp),
+        "paper" => Some(ThemePreference::Paper),
+        "lamp" => Some(ThemePreference::Lamp),
         _ => None,
     }
 }
@@ -455,6 +475,9 @@ impl ThemePreference {
             Self::CatppuccinFrappe => "catppuccin-frappe",
             Self::CatppuccinMacchiato => "catppuccin-macchiato",
             Self::CatppuccinMocha => "catppuccin-mocha",
+            Self::PaperLamp => "paper-lamp",
+            Self::Paper => "paper",
+            Self::Lamp => "lamp",
         }
     }
 }
@@ -724,6 +747,9 @@ mod tests {
             CatppuccinFrappe,
             CatppuccinMacchiato,
             CatppuccinMocha,
+            PaperLamp,
+            Paper,
+            Lamp,
         ] {
             assert_eq!(
                 parse(&format!("theme={}", theme.ini_value())).theme,
@@ -757,6 +783,12 @@ mod tests {
             parse("theme=catppuccin-mocha").theme,
             Some(ThemePreference::CatppuccinMocha)
         );
+        assert_eq!(
+            parse("theme=Paper-Lamp").theme,
+            Some(ThemePreference::PaperLamp)
+        );
+        assert_eq!(parse("theme=PAPER").theme, Some(ThemePreference::Paper));
+        assert_eq!(parse("theme=lamp").theme, Some(ThemePreference::Lamp));
         // Break caught: a typo'd flavor silently falling back to some theme instead of warning.
         assert_eq!(parse("theme=catppuccin-espresso").theme, None);
     }
@@ -771,6 +803,26 @@ mod tests {
             parse("recovery_interval_seconds=0").recovery_interval_seconds,
             None
         );
+    }
+
+    #[test]
+    fn preview_font_is_read_and_an_empty_one_is_rejected() {
+        // Break caught: a hand-edited preview_font ignored, or an empty one blanking the preview.
+        assert_eq!(
+            parse(
+                "preview_font = Georgia
+"
+            )
+            .preview_font
+            .as_deref(),
+            Some("Georgia")
+        );
+        let delta = parse(
+            "preview_font=
+",
+        );
+        assert_eq!(delta.preview_font, None);
+        assert_eq!(delta.warnings.len(), 1);
     }
 
     #[test]
