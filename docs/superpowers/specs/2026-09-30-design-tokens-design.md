@@ -21,7 +21,7 @@ FastPad's chrome is custom-painted, and its look lives in scattered places: a fl
 | Palette shape | Keep the flat `Copy` struct and the static per-theme arrays. Add roles as fields. No trait, no lookup by name. Resolving a palette stays an array index. |
 | New color roles | `accent`, `on_accent`, `stroke`, `disabled_foreground`, `warning_foreground`, `success_foreground`. Keyboard focus uses `accent`; it gets no role of its own. |
 | Migrating consumers | Only where the value is identical today. Everything else keeps reading its current field until the step that changes it. |
-| Metrics scope | Consolidate what is shared: the duplicated `scale` helper, the radii, and the row, header and bar heights that more than one file repeats. Per-surface values move when the step that changes them touches that surface, not in one sweep. |
+| Metrics scope | Consolidate `scale` (one function; a DPI of 0 counts as 96, which fixes the title bar copy's collapse to near-zero sizes), the control radius, the focus ring and gap, the sidebar panel header (38) and the sidebar row height (26). The field height 28, bar height 36 and command-palette row are repeated but diverge in later steps, so they stay per surface. |
 | Grid | Documented as 4px. Values that are off-grid today (22, 26, 30, 34, 38, 42, 46) keep their current value in step 1 and are normalised by later steps. |
 | Type ramp values in step 1 | The values in use today. Step 2 changes them (section 3.3). |
 | Font face | Still "Segoe UI" in step 1. The Segoe UI Variable choice with fallback arrives in step 2. |
@@ -46,9 +46,9 @@ FastPad's chrome is custom-painted, and its look lives in scattered places: a fl
 
 ### 3.2 Metrics (`design/metrics.rs`)
 
-- `scale(value, dpi)`: the one implementation of `(v * dpi + 48) / 96`. The identical copies in `window/titlebar.rs` and `window/panel.rs` are deleted.
-- Named constants at 96 DPI for values that more than one surface repeats: `CONTROL_RADIUS = 4`, `OVERLAY_RADIUS = 8`, `STROKE = 1`, `FOCUS_RING = 2`, `FOCUS_GAP = 1` (moved from `soft_paint.rs`), and the heights the audit found repeated across surfaces: list row 26 (notebook, favorites, command palette), panel header 38 (side panel, search, favorites), text field 28 (find bar, name box, command palette, search) and bar 36 (find bar, name box). The implementation plan confirms the exact list against the code.
-- A `GRID = 4` constant and a small `on_grid` helper used only by a test that lists every remaining off-grid value, so later steps can watch that list shrink.
+- `scale(value, dpi)`: the one implementation of `(v * dpi + 48) / 96`. The two copies (they differed for a DPI of 0) in `window/titlebar.rs` and `window/panel.rs` are deleted.
+- Named constants at 96 DPI: `CONTROL_RADIUS = 4`, `FOCUS_RING = 2`, `FOCUS_GAP = 1` (moved from `soft_paint.rs`), `PANEL_HEADER = 38` and `SIDEBAR_ROW = 26`.
+- A test-only `GRID = 4` constant and a small `on_grid` helper used only by a test that lists every remaining off-grid value, so later steps can watch that list shrink.
 
 ### 3.3 Type ramp (`design/type_ramp.rs`)
 
@@ -56,14 +56,16 @@ One table of text styles, each with a pixel height at 96 DPI and a weight, and o
 
 | Style | Step 1 (today) | Step 2 (target) |
 |---|---|---|
-| `Caption` | 12 regular | 12 regular |
 | `Body` | 12 regular (chrome) | 13 regular |
+| `BodyItalic` | 12 italic | 12 italic |
+| `BodyBold` | 12 bold | 12 bold |
 | `PanelHeader` | 11 semibold | 13 semibold |
 | `Heading` | 14 semibold | 14 semibold |
 | `Title` | 18 semibold | 18 semibold |
 | `DialogBody` | 13 regular | removed; dialogs use `Body` |
 
 - The four call-site groups that create fonts today (title strip and tabs, side panel, settings dialog, about dialog) switch to styles. Editor and Markdown preview fonts are user settings and stay out of the ramp.
+- `Caption` (12 regular) and `OVERLAY_RADIUS = 8` are added by the step that first uses them, because unused items fail `-D warnings`.
 - Reverting the 13px trial means changing the `Body` row back to 12.
 
 ### 3.4 Contrast tests (`design/contrast.rs`, `#[cfg(test)]`)
@@ -74,6 +76,7 @@ One table of text styles, each with a pixel height at 96 DPI and a weight, and o
   - non-text 3:1: `accent` on `editor_background` and on `strip_background`;
   - `line_number_foreground` on `editor_background` at 3:1, an allowance for secondary, non-essential text;
   - `stroke` is not tested, because it is a decorative separator.
+- Latte's `warning_foreground` and `success_foreground` are the flavor's yellow and green pulled two-thirds toward its text color, because the raw swatches fail 4.5:1 on Latte's base.
 - The tests do not cover high contrast, which uses system colors.
 
 ## 4. Non-goals
@@ -88,7 +91,7 @@ One table of text styles, each with a pixel height at 96 DPI and a weight, and o
 
 - **Startup latency.** Everything is `const` or `static`, with no allocation and no theme query before first paint. Font creation happens at the same points as today. `benchmarks/README.md` gates are re-run after the change.
 - **First-paint rule.** Paint never triggers a load (`chrome.rs`), so the ramp only wraps existing font creation. It adds none.
-- **The contrast test may find failures in today's themes.** Any current pair below its threshold is listed in the test's failure output before any color is touched. Each is then either fixed with a minimal value change, which is visible and gets called out, or recorded as a known exception with a reason. Step 1 does not silently retune a theme.
+- **The contrast test may find failures in today's themes.** Any current pair below its threshold is listed in the test's failure output before any color is touched. Step 1 records each such pair in a known-exceptions list and changes no color; step 4 fixes them. Step 1 does not silently retune a theme.
 - **Reach.** About 25 files use `*_AT_96_DPI` constants. Limiting migration to shared values keeps this step reviewable. The remaining constants move with the steps that change them.
 - **`Palette` derives `Copy` and `Eq`.** Adding fields is compatible. Tests that build a `Palette` by hand need the new fields.
 
