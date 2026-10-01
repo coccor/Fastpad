@@ -6,7 +6,8 @@
 use crate::library::quick_open::QuickMatch;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
-use crate::window::design::metrics::scale;
+use crate::window::design::metrics::{CONTROL_RADIUS, ROW_INSET_X, ROW_INSET_Y, scale};
+use crate::window::design::round::{Corners, fill_bordered, fill_rounded, radius_for};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
 use std::cell::Cell;
@@ -401,9 +402,54 @@ const ROW_HEIGHT_AT_96_DPI: i32 = 26;
 const VISIBLE_ROWS: usize = 12;
 const MARGIN_AT_96_DPI: i32 = 8;
 
+/// The field box: rounded, in the editor's colors with an accent border, over the strip card.
+fn paint_field(dc: HDC, field: RECT, colors: &Palette, dpi: u32) {
+    unsafe {
+        fill_bordered(
+            dc,
+            field,
+            radius_for(colors, CONTROL_RADIUS, dpi),
+            colors.editor_background,
+            colors.selection_background,
+            colors.strip_background,
+        );
+    }
+}
+
+/// A list row's background: the strip color, with the selected row's fill inset and rounded
+/// (the whole row, square, under a high-contrast palette).
+fn paint_row_background(dc: HDC, row: RECT, selected: bool, colors: &Palette, dpi: u32) {
+    unsafe {
+        fill(dc, row, colors.strip_background);
+        if !selected {
+            return;
+        }
+        if colors.high_contrast {
+            fill(dc, row, colors.hover_background);
+            return;
+        }
+        let fill_rect = RECT {
+            left: row.left + scale(ROW_INSET_X, dpi),
+            top: row.top + scale(ROW_INSET_Y, dpi),
+            right: row.right - scale(ROW_INSET_X, dpi),
+            bottom: row.bottom - scale(ROW_INSET_Y, dpi),
+        };
+        fill_rounded(
+            dc,
+            fill_rect,
+            radius_for(colors, CONTROL_RADIUS, dpi),
+            Corners::ALL,
+            colors.hover_background,
+            colors.strip_background,
+        );
+    }
+}
+
 /// Where the panel's parts sit, in panel client coordinates.
 #[derive(Clone, Copy)]
 struct PanelLayout {
+    /// The DPI this layout was scaled for, which painting scales its radii and insets by too.
+    dpi: u32,
     width: i32,
     height: i32,
     /// The painted field box, border included.
@@ -453,6 +499,7 @@ impl PanelLayout {
         // The list runs to the bottom border; the field alone keeps its padding below.
         let height = list.map_or(field.bottom + padding, |list| list.bottom + 1);
         Self {
+            dpi,
             width,
             height,
             field,
@@ -867,7 +914,7 @@ impl CommandPalette {
     }
 
     /// `WM_PAINT` for the panel: the strip-colored card with a hairline border, and the field box
-    /// in the editor's colors with an accent outline around the borderless `Edit`.
+    /// in the editor's colors with a rounded accent outline around the borderless `Edit`.
     pub(crate) fn paint_panel(&self, panel: HWND) {
         let mut paint = PAINTSTRUCT::default();
         let dc = unsafe { BeginPaint(panel, &mut paint) };
@@ -883,8 +930,7 @@ impl CommandPalette {
             unsafe {
                 fill(dc, client, colors.pressed_background);
                 fill(dc, inset(client, 1), colors.strip_background);
-                fill(dc, layout.field, colors.selection_background);
-                fill(dc, inset(layout.field, 1), colors.editor_background);
+                paint_field(dc, layout.field, &colors, layout.dpi);
             }
         }
         unsafe {
@@ -926,19 +972,12 @@ impl CommandPalette {
         };
         let selected = item.itemState & ODS_SELECTED != 0;
         let colors = self.colors;
-        let (background, foreground, muted) = if selected {
-            (
-                colors.hover_background,
-                colors.hover_foreground,
-                colors.hover_foreground,
-            )
+        let (foreground, muted) = if selected {
+            (colors.hover_foreground, colors.hover_foreground)
         } else {
-            (
-                colors.strip_background,
-                colors.editor_foreground,
-                colors.muted_foreground,
-            )
+            (colors.editor_foreground, colors.muted_foreground)
         };
+        let dpi = self.layout.map_or(0, |layout| layout.dpi);
         let dc = item.hDC;
         // Row text lines up with the query text above it; the list starts one pixel in.
         let padding = self.layout.map_or(8, |layout| layout.edit.left - 1);
@@ -948,7 +987,7 @@ impl CommandPalette {
             ..item.rcItem
         };
         unsafe {
-            fill(dc, item.rcItem, background);
+            paint_row_background(dc, item.rcItem, selected, &colors, dpi);
             SetBkMode(dc, TRANSPARENT as i32);
             let font = SendMessageW(self.list, WM_GETFONT, 0, 0);
             let previous = (font != 0).then(|| SelectObject(dc, font as _));
@@ -996,19 +1035,12 @@ impl CommandPalette {
         let notice = matches!(row, PickerRow::Notice(_));
         let selected = item.itemState & ODS_SELECTED != 0 && !notice;
         let colors = self.colors;
-        let (background, foreground, muted) = if selected {
-            (
-                colors.hover_background,
-                colors.hover_foreground,
-                colors.hover_foreground,
-            )
+        let (foreground, muted) = if selected {
+            (colors.hover_foreground, colors.hover_foreground)
         } else {
-            (
-                colors.strip_background,
-                colors.editor_foreground,
-                colors.muted_foreground,
-            )
+            (colors.editor_foreground, colors.muted_foreground)
         };
+        let dpi = self.layout.map_or(0, |layout| layout.dpi);
         let dc = item.hDC;
         let padding = self.layout.map_or(8, |layout| layout.edit.left - 1);
         let mut text = RECT {
@@ -1026,7 +1058,7 @@ impl CommandPalette {
             list_font
         };
         unsafe {
-            fill(dc, item.rcItem, background);
+            paint_row_background(dc, item.rcItem, selected, &colors, dpi);
             SetBkMode(dc, TRANSPARENT as i32);
         }
         let previous = unsafe { SelectObject(dc, font) };

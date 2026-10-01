@@ -141,10 +141,6 @@ pub(crate) unsafe fn fill_rounded(
 /// Fills `rect` as a box with a one-pixel `border`: the outer rounded shape in the border color,
 /// then the inner shape in `fill_color`, inset by one pixel with the radius reduced to match, so
 /// the border keeps an even width around the corners. `behind` is the flat color under the box.
-#[allow(
-    dead_code,
-    reason = "used by the palette and Search view in the next tasks"
-)]
 pub(crate) unsafe fn fill_bordered(
     dc: HDC,
     rect: RECT,
