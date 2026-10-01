@@ -1,4 +1,5 @@
 pub(crate) mod about;
+mod prompt;
 pub(crate) mod accessibility;
 pub(crate) mod activity_bar;
 pub(crate) mod command_palette;
