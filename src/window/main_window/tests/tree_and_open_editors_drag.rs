@@ -987,3 +987,68 @@ fn tree_drag_a_label_with_the_name_follows_the_pointer_until_the_drag_ends() {
     crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
     assert!(gone(shown), "another view");
 }
+
+#[test]
+fn tree_drag_a_note_dropped_on_a_groups_middle_opens_there_and_on_an_edge_splits() {
+    // Break caught: tree rows only dropping on folders, so dragging a note onto the editor
+    // does nothing; or an edge drop opening in the existing group instead of a new one.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("tree-drag-group");
+    let a = scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    assert!(super::super::activate_group(window.hwnd, first));
+    let panel = sidebar_windows(window.hwnd).1;
+    let holds = |group, path: &std::path::Path| {
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(group)
+            .iter()
+            .any(|document| document.path.as_deref() == Some(path))
+    };
+
+    start_drag(window.hwnd, panel, &RowKind::Note("a.md".into()));
+    let target = super::super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    let content = super::super::with_group_id(window.hwnd, second, |state| state.content).unwrap();
+    let middle = lparam_in(
+        panel,
+        target,
+        (content.left + content.right) / 2,
+        (content.top + content.bottom) / 2,
+    );
+    drag_over(panel, middle);
+    assert!(app_mut(window.hwnd).drop_overlay.is_some());
+    // Break caught: the overlay destroyed and remade on every move, so it never gets to paint.
+    let shown = app_mut(window.hwnd).drop_overlay.unwrap().hwnd();
+    drag_over(panel, middle);
+    assert_eq!(app_mut(window.hwnd).drop_overlay.unwrap().hwnd(), shown);
+    drop_at(panel, middle);
+    assert!(holds(second, &a), "opened in the group it was dropped on");
+    assert!(
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(second)
+            .iter()
+            .any(|document| document.path.as_deref() == Some(a.as_path()) && !document.preview),
+        "a drop opens a normal tab, not a preview"
+    );
+    assert!(!holds(first, &a));
+    assert!(app_mut(window.hwnd).drop_overlay.is_none());
+
+    let groups = app_mut(window.hwnd).tabs.group_ids().len();
+    start_drag(window.hwnd, panel, &RowKind::Note("b.md".into()));
+    let edge = lparam_in(
+        panel,
+        target,
+        content.right - 2,
+        (content.top + content.bottom) / 2,
+    );
+    drag_over(panel, edge);
+    drop_at(panel, edge);
+    assert_eq!(app_mut(window.hwnd).tabs.group_ids().len(), groups + 1);
+    let new = app_mut(window.hwnd).tabs.active_group();
+    assert!(holds(new, &b), "opened in the group split off the edge");
+}
