@@ -290,8 +290,8 @@ pub(crate) fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
 /// the row's index, rectangle and look. Last it paints the thin scroll thumb at the right edge.
 /// The fills are rounded and inset from the row's edges (`draw_row` still gets the whole row),
 /// except in high contrast, where they cover the whole row. `behind(index)` is the color under row
-/// `index` (the panel's fill, or a band the caller painted under it): the rounded corners blend toward it. Rows out of view
-/// are never touched, and nothing is drawn outside `area`.
+/// `index` (the panel's fill, or a band the caller painted under it): the rounded corners blend
+/// toward it. Rows out of view are never touched, and nothing is drawn outside `area`.
 #[allow(
     clippy::too_many_arguments,
     reason = "a paint entry point: the surface, the list, the look and the callback"
