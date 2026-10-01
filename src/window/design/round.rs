@@ -8,7 +8,9 @@ use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::{CLR_INVALID, GetPixel, HDC, SetPixelV};
 
 use crate::catppuccin::blend;
-use crate::window::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, scale};
+use crate::window::design::metrics::{
+    CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, SELECTION_BAR_HEIGHT, SELECTION_BAR_WIDTH, scale,
+};
 use crate::window::palette::Palette;
 use crate::window::panel::fill;
 
@@ -188,6 +190,47 @@ pub(crate) unsafe fn paint_focus_ring(dc: HDC, control: RECT, palette: &Palette,
             radius_for(palette, CONTROL_RADIUS, dpi),
             scale(FOCUS_RING, dpi),
             palette.accent,
+        );
+    }
+}
+
+/// The accent bar for a selected row inside `backplate`: flush with its left edge and vertically
+/// centered, `SELECTION_BAR_HEIGHT` tall but never closer than the corner radius to the top or
+/// bottom, so it stays clear of the backplate's rounded corners.
+pub(crate) fn selection_bar_rect(backplate: RECT, dpi: u32) -> RECT {
+    let room = backplate.bottom - backplate.top - 2 * scale(CONTROL_RADIUS, dpi);
+    let height = scale(SELECTION_BAR_HEIGHT, dpi).min(room).max(1);
+    let top = backplate.top + (backplate.bottom - backplate.top - height) / 2;
+    RECT {
+        left: backplate.left,
+        top,
+        right: backplate.left + scale(SELECTION_BAR_WIDTH, dpi),
+        bottom: top + height,
+    }
+}
+
+/// Paints the selected row's accent bar over its fill (`behind` is the fill's color, which the
+/// rounded ends blend toward). Nothing in high contrast, where the selection is already the
+/// highlight color and `accent` is that same color.
+pub(crate) unsafe fn paint_selection_bar(
+    dc: HDC,
+    backplate: RECT,
+    palette: &Palette,
+    behind: u32,
+    dpi: u32,
+) {
+    if palette.high_contrast {
+        return;
+    }
+    let rect = selection_bar_rect(backplate, dpi);
+    unsafe {
+        fill_rounded(
+            dc,
+            rect,
+            (rect.right - rect.left) / 2,
+            Corners::ALL,
+            palette.accent,
+            behind,
         );
     }
 }
@@ -389,6 +432,78 @@ mod tests {
             DeleteDC(dc);
             ReleaseDC(std::ptr::null_mut(), screen);
         }
+    }
+
+    #[test]
+    fn the_selection_bar_is_flush_left_centered_and_clamped() {
+        // Break caught: a bar that drifts off the row's left edge, off center, or into the
+        // backplate's rounded corners on a short row.
+        let tall = RECT {
+            left: 4,
+            top: 1,
+            right: 96,
+            bottom: 25,
+        };
+        let bar = selection_bar_rect(tall, 96);
+        assert_eq!((bar.left, bar.right), (4, 7));
+        assert_eq!((bar.top, bar.bottom), (5, 21));
+        let short = RECT {
+            left: 4,
+            top: 21,
+            right: 96,
+            bottom: 39,
+        };
+        let bar = selection_bar_rect(short, 96);
+        assert_eq!(bar.bottom - bar.top, 10);
+        assert_eq!(bar.top - short.top, short.bottom - bar.bottom);
+        let tiny = RECT {
+            left: 0,
+            top: 0,
+            right: 50,
+            bottom: 6,
+        };
+        assert_eq!(
+            selection_bar_rect(tiny, 96).bottom - selection_bar_rect(tiny, 96).top,
+            1
+        );
+        let big = RECT {
+            left: 8,
+            top: 2,
+            right: 190,
+            bottom: 50,
+        };
+        let bar = selection_bar_rect(big, 192);
+        assert_eq!((bar.right - bar.left, bar.bottom - bar.top), (6, 32));
+        assert_eq!(bar.left, 8);
+    }
+
+    #[test]
+    fn the_selection_bar_paints_accent_over_the_fill_and_nothing_in_high_contrast() {
+        // Break caught: a bar in the wrong color, bleeding past its rect, or drawn in high contrast
+        // where it would vanish into the highlight fill.
+        let backplate = RECT {
+            left: 4,
+            top: 1,
+            right: 96,
+            bottom: 39,
+        };
+        let mut palette = Palette::neutral();
+        palette.accent = 0x0000_00ff;
+        let bar = selection_bar_rect(backplate, 96);
+        with_canvas(
+            |dc| unsafe { paint_selection_bar(dc, backplate, &palette, BEHIND, 96) },
+            |pixel| {
+                assert_eq!(pixel(5, 20), palette.accent, "middle of the bar");
+                assert_eq!(pixel(7, 20), BEHIND, "just right of the bar");
+                assert_eq!(pixel(5, bar.top - 1), BEHIND, "just above the bar");
+                assert_ne!(pixel(bar.left, bar.top), palette.accent, "rounded corner");
+            },
+        );
+        palette.high_contrast = true;
+        with_canvas(
+            |dc| unsafe { paint_selection_bar(dc, backplate, &palette, BEHIND, 96) },
+            |pixel| assert_eq!(pixel(5, 20), BEHIND, "no bar in high contrast"),
+        );
     }
 
     #[test]

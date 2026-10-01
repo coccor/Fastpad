@@ -19,6 +19,9 @@ pub(crate) const ROW_INSET_Y: i32 = 1;
 /// The keyboard-focus ring's stroke, and its gap outside the control it rings.
 pub(crate) const FOCUS_RING: i32 = 2;
 pub(crate) const FOCUS_GAP: i32 = 1;
+/// The accent bar on a selected row: width and height at 96 DPI.
+pub(crate) const SELECTION_BAR_WIDTH: i32 = 3;
+pub(crate) const SELECTION_BAR_HEIGHT: i32 = 16;
 /// The height of a side panel's title row, shared by every sidebar view.
 pub(crate) const PANEL_HEADER: i32 = 38;
 /// The height of a row in the sidebar's lists (notebook tree, open editors, favorites).
@@ -86,7 +89,7 @@ mod tests {
 
     use super::{
         CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, GRID, ICON, PANEL_HEADER, ROW_INSET_X, ROW_INSET_Y,
-        SIDEBAR_ICON, SIDEBAR_ROW, TAB_RADIUS,
+        SELECTION_BAR_HEIGHT, SELECTION_BAR_WIDTH, SIDEBAR_ICON, SIDEBAR_ROW, TAB_RADIUS,
     };
 
     #[test]
@@ -98,6 +101,8 @@ mod tests {
         assert_eq!(ROW_INSET_Y, 1);
         assert_eq!(FOCUS_RING, 2); // was soft_paint::FOCUS_WIDTH_AT_96_DPI
         assert_eq!(FOCUS_GAP, 1); // was soft_paint::FOCUS_GAP_AT_96_DPI
+        assert_eq!(SELECTION_BAR_WIDTH, 3);
+        assert_eq!(SELECTION_BAR_HEIGHT, 16);
         assert_eq!(PANEL_HEADER, 38); // was side_panel::HEADER_HEIGHT_96
         assert_eq!(SIDEBAR_ROW, 26); // was notebook_layout::ROW_HEIGHT
         assert_eq!(ICON, 16); // the activity bar icon size
