@@ -69,10 +69,6 @@ fn arc_coverage(x: i32, y: i32, center: i32, radius: i32) -> u32 {
 /// How much of the corner-square pixel (`x`, `y`) lies in a ring of `width` pixels just inside
 /// an arc of `radius` pixels: the outer arc's coverage minus the inner arc's. (0, 0) is the
 /// outermost pixel. Requires `radius > 0` and `0 < width <= radius`.
-#[allow(
-    dead_code,
-    reason = "used by the activity bar and the notebook view in the next task"
-)]
 pub(crate) fn ring_coverage(x: i32, y: i32, radius: i32, width: i32) -> u32 {
     let outer = arc_coverage(x, y, radius, radius);
     let inner = if radius > width {
@@ -87,10 +83,6 @@ pub(crate) fn ring_coverage(x: i32, y: i32, radius: i32, width: i32) -> u32 {
 /// fills; each corner pixel is `color` blended over the pixel already there, so the ring sits
 /// correctly on any background. `radius` and `width` clamp to what the rect can hold, and an
 /// empty or inverted rect draws nothing.
-#[allow(
-    dead_code,
-    reason = "used by the activity bar and the notebook view in the next task"
-)]
 pub(crate) unsafe fn stroke_ring(dc: HDC, rect: RECT, radius: i32, width: i32, color: u32) {
     let w = rect.right - rect.left;
     let h = rect.bottom - rect.top;
@@ -192,10 +184,6 @@ pub(crate) unsafe fn stroke_ring(dc: HDC, rect: RECT, radius: i32, width: i32, c
 /// The keyboard focus ring around `control`: `FOCUS_RING` wide in the accent color, with its outer
 /// edge `FOCUS_GAP` inside the control's rect, rounded by `CONTROL_RADIUS` (square in high
 /// contrast), all scaled to `dpi`.
-#[allow(
-    dead_code,
-    reason = "used by the activity bar and the notebook view in the next task"
-)]
 pub(crate) unsafe fn paint_focus_ring(dc: HDC, control: RECT, palette: &Palette, dpi: u32) {
     let gap = scale(FOCUS_GAP, dpi);
     let rect = RECT {

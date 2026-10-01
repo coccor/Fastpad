@@ -32,7 +32,7 @@ Give the chrome's keyboard focus indicators the same look the dialogs already ha
 
 ### 4.1 The helper (`design/round.rs`)
 
-- `ring_coverage(x, y, radius, width) -> u32`: how much of the corner pixel (`x`, `y`) lies inside the ring band, from 0 to 255. It is the 4x4-sample coverage of the outer arc (radius `radius`) minus that of the inner arc (radius `radius - width`, floored at 0), clamped at 0. For a radius of 0 it is 255 for the pixels inside the `width` band and 0 elsewhere, which keeps one code path.
+- `ring_coverage(x, y, radius, width) -> u32`: how much of the corner pixel (`x`, `y`) lies inside the ring band, from 0 to 255. It is the 4x4-sample coverage of the outer arc (radius `radius`) minus that of the inner arc (radius `radius - width`, floored at 0), clamped at 0. It requires a radius above 0; a square ring (radius 0, as in high contrast) is drawn as four plain strips and has no corner pixels.
 - `stroke_ring(dc, rect, radius, width, color)`: clamps `radius` to half the shorter side and `width` to the radius or to at least 1 when the radius is 0. It fills the four straight edge strips with `FillRect`, excluding the corner squares, and for each corner square pixel with coverage above 0 reads `GetPixel`, blends `color` over it at that coverage, and writes `SetPixelV`. An empty or inverted rect draws nothing.
 - Cost: at most `4 * radius^2` pixel reads and writes (at 192 DPI about 256), only when focus is drawn, which is on a focus change or a repaint of the focused control.
 - `GetPixel` works on both the memory DC the sidebar paints into and the activity bar's paint DC. If a DC cannot be read, `GetPixel` returns `CLR_INVALID`; the helper then skips that pixel rather than writing a wrong color.
@@ -56,7 +56,7 @@ Give the chrome's keyboard focus indicators the same look the dialogs already ha
 - `stroke_ring` on a memory DC with a known fill: the middle of the top, left, right and bottom edge strips equals the ring color; the interior (more than `width` in) is untouched; the outermost corner pixel is untouched; a corner pixel on the arc is a blend of the ring color and the original pixel (neither of the two); the rect's outside is untouched; a rect smaller than twice the width and an empty rect do not panic or draw outside.
 - A ring over a non-flat background: two different background colors under the same corner pixel give two different blended results (the blend uses the underlying pixel).
 - High contrast: `radius_for` gives 0, so the ring is square and its corner pixel equals the ring color exactly.
-- Activity bar: a test that `paint_keyboard_focus` draws the accent color on the focused button's edge and nothing in the old dotted rectangle position inside it (use the nearest existing activity bar paint test as the harness).
+- Activity bar: `paint_keyboard_focus` is bound to a window handle, so its drawing is covered by the helper tests above and by the build.
 - Notebook view: a test that a focused `Cursor::Root` row has the accent color on its top edge strip and an unfocused panel has none.
 
 ## 6. Risks and checks

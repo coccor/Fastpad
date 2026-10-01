@@ -348,7 +348,7 @@ fn paint(main: HWND, bar: HWND) {
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
-        paint_keyboard_focus(bar, dc);
+        paint_keyboard_focus(bar, dc, &palette);
     });
 }
 
@@ -505,20 +505,19 @@ pub(crate) fn key_down(bar: HWND, key: u16) -> bool {
     true
 }
 
-/// Draws the keyboard focus rectangle. Call it last in the bar's `WM_PAINT`, before `EndPaint`.
-pub(crate) fn paint_keyboard_focus(bar: HWND, hdc: windows_sys::Win32::Graphics::Gdi::HDC) {
+/// Draws the keyboard focus ring. Call it last in the bar's `WM_PAINT`, before `EndPaint`.
+pub(crate) fn paint_keyboard_focus(
+    bar: HWND,
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    palette: &crate::window::palette::Palette,
+) {
     if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } != bar {
         return;
     }
     let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
     let (client, dpi) = bar_geometry(bar);
-    let rect = crate::window::panel::inset(
-        button_rects(client, dpi)[super::side_panel::bar_focus(main)],
-        crate::window::design::metrics::scale(3, dpi),
-    );
-    unsafe {
-        windows_sys::Win32::Graphics::Gdi::DrawFocusRect(hdc, &rect);
-    }
+    let rect = button_rects(client, dpi)[super::side_panel::bar_focus(main)];
+    unsafe { crate::window::design::round::paint_focus_ring(hdc, rect, palette, dpi) };
 }
 
 #[cfg(test)]

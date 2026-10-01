@@ -732,3 +732,57 @@ fn the_color_under_a_row_is_the_band_inside_the_highlight_and_the_panel_elsewher
         panel
     );
 }
+
+#[test]
+fn a_focused_root_row_draws_the_accent_focus_ring() {
+    use crate::window::icon_sets::images::TestTarget;
+    use crate::window::panel_cursor::Cursor;
+    let palette = Palette::neutral();
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 240,
+        bottom: 300,
+    };
+    let mut view = NotebookView::new(std::ptr::null_mut());
+    view.mode = Mode::Tree;
+    view.cursor = Cursor::Root;
+    let layout = view.layout(client, 96);
+    let probe = RECT {
+        left: layout.root.left + (layout.root.right - layout.root.left) / 2,
+        top: layout.root.top + 1,
+        right: layout.root.left + (layout.root.right - layout.root.left) / 2 + 1,
+        bottom: layout.root.top + 2,
+    };
+    let mut ring_pixel = |focused: bool| {
+        let target = TestTarget::new(240, 300);
+        unsafe { fill(target.dc, client, palette.panel_background()) };
+        let paint = ViewPaint {
+            hdc: target.dc,
+            client,
+            palette,
+            icons: FileIcons::neutral(),
+            icon_set: FileIconSet::Minimal,
+            light_theme: true,
+            background: palette.panel_background(),
+            fonts: UiFonts::default(),
+            dpi: 96,
+            focused,
+        };
+        view.paint_sections(&paint, layout);
+        target.area(probe)[0]
+    };
+    let accent = {
+        let target = TestTarget::new(1, 1);
+        let pixel = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        unsafe { fill(target.dc, pixel, palette.accent) };
+        target.pixel(0, 0)
+    };
+    assert_eq!(ring_pixel(true), accent);
+    assert_ne!(ring_pixel(false), accent);
+}

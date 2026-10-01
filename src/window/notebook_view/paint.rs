@@ -6,6 +6,7 @@ use super::*;
 use crate::config::FileIconSet;
 use crate::library::tree::{RowKind, TreeRow};
 use crate::window::design::metrics::{SIDEBAR_ROW, scale};
+use crate::window::design::round::paint_focus_ring;
 use crate::window::drag_label::LabelImage;
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::images::IconImages;
@@ -953,7 +954,7 @@ impl NotebookView {
                 Cursor::Root | Cursor::Editor(_) | Cursor::Tree => None,
             };
             if let Some(rect) = outlined {
-                paint_outline(dc, rect, palette.selection_background, dpi);
+                unsafe { paint_focus_ring(dc, rect, palette, dpi) };
             }
         }
     }
