@@ -12,7 +12,7 @@ use crate::window::row_list::{self, ListKey};
 use crate::window::side_panel::point_of;
 use crate::window::tooltip::Tooltip;
 use crate::window::tree_drag::DragSource;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
@@ -360,6 +360,11 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
             rebuild(hwnd);
         }
         Hit::Editor { index, close } => {
+            // The Pinned part's note opens as a click on its tree row does.
+            if let Some(path) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, &path, Activation::Click);
+                return;
+            }
             // A header row does nothing.
             let Some(row) = with_view(hwnd, |view| view.editors.row(index).cloned()).flatten()
             else {
@@ -427,9 +432,41 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
 
 /// `WM_LBUTTONDBLCLK`: a row's second press opens it as a normal tab, which also promotes its
 /// preview (spec §6.4). Anywhere else it is one more click.
+/// Opens the pinned note `relative` the way activating its tree row would.
+fn open_pinned(hwnd: HWND, relative: &Path, how: Activation) {
+    let Some(root) = crate::window::library_host::folder(hwnd) else {
+        return;
+    };
+    let path = root.join(relative);
+    let (mode, focus) = match how {
+        Activation::Click => (OpenMode::Preview, false),
+        Activation::Permanent => (OpenMode::Permanent, true),
+    };
+    if let Err(error) = crate::window::main_window::open_note(hwnd, &path, mode, focus) {
+        crate::window::main_window::report_open_failure(hwnd, &path, &error);
+    }
+}
+
+/// The pinned note at Open Editors entry `index`, if that entry is one.
+fn pinned_at(hwnd: HWND, index: usize) -> Option<PathBuf> {
+    with_view(hwnd, |view| {
+        view.editors
+            .rows
+            .get(index)?
+            .pinned()
+            .map(|row| row.path.clone())
+    })
+    .flatten()
+}
+
 pub(super) fn double_click(hwnd: HWND, x: i32, y: i32) {
     match with_view(hwnd, |view| view.hit_test(x, y)) {
         Some(Hit::Row { index, part }) => row_clicked(hwnd, index, part, true),
+        Some(Hit::Editor { index, .. }) if pinned_at(hwnd, index).is_some() => {
+            if let Some(path) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, &path, Activation::Permanent);
+            }
+        }
         Some(_) => left_down(hwnd, x, y),
         None => {}
     }
@@ -721,6 +758,11 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
 /// rows only.
 pub(super) fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
     match (cursor, key) {
+        (Cursor::Editor(index), VK_RETURN) if pinned_at(hwnd, index).is_some() => {
+            if let Some(path) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, &path, Activation::Permanent);
+            }
+        }
         (Cursor::Editor(index), VK_RETURN) => {
             let Some((group, id)) = with_view(hwnd, |view| {
                 view.editors.row(index).map(|row| (row.group, row.id))

@@ -1117,3 +1117,46 @@ fn pressing_the_scroll_thumb_keeps_the_edit_open_and_the_field_focused() {
     assert!(scratch.folder().join("n00.md").exists());
     assert!(!scratch.folder().join("half.md").exists());
 }
+
+#[test]
+fn a_pinned_note_gets_a_pinned_part_under_the_open_editors_and_unpinning_removes_it() {
+    // Break caught: a pin that only moves the note up its folder, with nothing listed under
+    // Open editors, or an unpinned note staying in the Pinned part.
+    use crate::window::open_editors::EditorEntry;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("pinned-part");
+    scratch.note("a.md", "a");
+    let b = scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    let pinned = |hwnd| {
+        notebook_view(hwnd)
+            .editors
+            .rows
+            .iter()
+            .filter_map(|entry| entry.pinned().map(|row| row.name.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert!(pinned(window.hwnd).is_empty());
+    assert!(
+        !notebook_view(window.hwnd)
+            .editors
+            .rows
+            .contains(&EditorEntry::PinnedHeader)
+    );
+
+    crate::window::library_host::toggle_pin(window.hwnd, &b);
+    assert_eq!(pinned(window.hwnd), ["b.md"]);
+    // After the tabs, header first.
+    let rows = &notebook_view(window.hwnd).editors.rows;
+    assert_eq!(rows[rows.len() - 2], EditorEntry::PinnedHeader);
+    assert!(matches!(rows[rows.len() - 1], EditorEntry::Pinned(_)));
+
+    crate::window::library_host::toggle_pin(window.hwnd, &b);
+    assert!(pinned(window.hwnd).is_empty());
+    assert!(
+        !notebook_view(window.hwnd)
+            .editors
+            .rows
+            .contains(&EditorEntry::PinnedHeader)
+    );
+}

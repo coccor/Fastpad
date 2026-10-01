@@ -160,17 +160,28 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         let index = index - header;
         if index < editors {
             let (rect, visible) = row_rect(layout.editors_list, &self.editors.list, index);
-            let row = match self.editors.rows.get(index)? {
+            let name = match self.editors.rows.get(index)? {
                 crate::window::open_editors::EditorEntry::Header(number) => {
                     return Some(crate::window::sidebar_accessibility::text_item(
                         &crate::window::open_editors::header_label(*number),
                         rect,
                     ));
                 }
-                crate::window::open_editors::EditorEntry::View(row) => row,
+                crate::window::open_editors::EditorEntry::PinnedHeader => {
+                    return Some(crate::window::sidebar_accessibility::text_item(
+                        crate::window::open_editors::PINNED_LABEL,
+                        rect,
+                    ));
+                }
+                crate::window::open_editors::EditorEntry::View(row) => {
+                    crate::window::open_editors::accessible_name(row)
+                }
+                crate::window::open_editors::EditorEntry::Pinned(row) => {
+                    crate::window::open_editors::pinned_accessible_name(row)
+                }
             };
             return Some(editor_item(
-                &crate::window::open_editors::accessible_name(row),
+                &name,
                 self.cursor == Cursor::Editor(index),
                 focused,
                 rect,
@@ -332,6 +343,12 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                 }
                 crate::window::open_editors::EditorEntry::View(row) => {
                     identity_of(&("editor", row.group.0, row.id.0))
+                }
+                crate::window::open_editors::EditorEntry::PinnedHeader => {
+                    identity_of(&"pinned-notes")
+                }
+                crate::window::open_editors::EditorEntry::Pinned(row) => {
+                    identity_of(&("pinned-note", &row.path))
                 }
             });
         }

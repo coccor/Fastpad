@@ -27,6 +27,8 @@ const CLOSE_BOX: i32 = 24;
 /// Segoe MDL2 Assets' Cancel, the tab strip's close glyph.
 const GLYPH_CLOSE: &str = "\u{E711}";
 const DIRTY_DOT: &str = "\u{25CF}";
+/// The Pinned part's header.
+pub(crate) const PINNED_LABEL: &str = "Pinned";
 const LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX;
 const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
 
@@ -52,28 +54,57 @@ pub(crate) fn unsaved_label(document: &Document) -> String {
         .unwrap_or_else(|| "Untitled".to_owned())
 }
 
-/// A row of the section: a group's header, or one of its tabs.
+/// A pinned note as the section's Pinned part shows it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedRow {
+    /// The note's path relative to the notebook.
+    pub path: PathBuf,
+    /// The file name with its extension.
+    pub name: String,
+}
+
+/// A row of the section: a group's header, one of its tabs, or the Pinned part after the tabs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EditorEntry {
     /// "Group N", numbered from 1 in layout order.
     Header(usize),
     View(EditorRow),
+    /// "Pinned", before the pinned notes. Only there with a pinned note.
+    PinnedHeader,
+    Pinned(PinnedRow),
+}
+
+/// What stays the same while a row only changes its look.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EntryKey {
+    Header(usize),
+    View(GroupId, DocumentId),
+    PinnedHeader,
+    Pinned(PathBuf),
 }
 
 impl EditorEntry {
     pub(crate) fn row(&self) -> Option<&EditorRow> {
         match self {
-            Self::Header(_) => None,
             Self::View(row) => Some(row),
+            Self::Header(_) | Self::PinnedHeader | Self::Pinned(_) => None,
         }
     }
 
-    /// What stays the same while the row only changes its look: the header's number, or the
-    /// view's group and document.
-    pub(crate) fn key(&self) -> (Option<usize>, Option<(GroupId, DocumentId)>) {
+    pub(crate) fn pinned(&self) -> Option<&PinnedRow> {
         match self {
-            Self::Header(number) => (Some(*number), None),
-            Self::View(row) => (None, Some((row.group, row.id))),
+            Self::Pinned(row) => Some(row),
+            _ => None,
+        }
+    }
+
+    /// The header's number, the view's group and document, or the pinned note's path.
+    pub(crate) fn key(&self) -> EntryKey {
+        match self {
+            Self::Header(number) => EntryKey::Header(*number),
+            Self::View(row) => EntryKey::View(row.group, row.id),
+            Self::PinnedHeader => EntryKey::PinnedHeader,
+            Self::Pinned(row) => EntryKey::Pinned(row.path.clone()),
         }
     }
 }
@@ -97,6 +128,28 @@ fn editor_row(
         dirty: document.dirty,
         active: Some((group, document.id)) == active,
     }
+}
+
+/// The Pinned part's rows for the notes in `pinned` (paths relative to the notebook), by name;
+/// empty without a pinned note.
+pub(crate) fn pinned_entries(mut pinned: Vec<PathBuf>) -> Vec<EditorEntry> {
+    if pinned.is_empty() {
+        return Vec::new();
+    }
+    let name = |path: &PathBuf| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    pinned.sort_by_key(|path| (name(path).to_lowercase(), path.clone()));
+    std::iter::once(EditorEntry::PinnedHeader)
+        .chain(pinned.into_iter().map(|path| {
+            EditorEntry::Pinned(PinnedRow {
+                name: name(&path),
+                path,
+            })
+        }))
+        .collect()
 }
 
 /// Every group's tabs in strip order, the groups in the order given (layout order). Headers only
@@ -134,6 +187,11 @@ pub(crate) fn snapshot(hwnd: HWND) -> Vec<EditorEntry> {
             entries(&groups, active)
         })
         .unwrap_or_default()
+        .into_iter()
+        .chain(pinned_entries(crate::window::library_host::pinned_notes(
+            hwnd,
+        )))
+        .collect()
 }
 
 /// What screen readers hear for a row (spec §7).
@@ -143,6 +201,11 @@ pub(crate) fn accessible_name(row: &EditorRow) -> String {
         name.push_str(", modified");
     }
     name
+}
+
+/// What screen readers hear for a pinned note's row.
+pub(crate) fn pinned_accessible_name(row: &PinnedRow) -> String {
+    format!("{}, pinned note", row.name)
 }
 
 /// A row's tooltip: the file's full path, or an untitled tab's label.
@@ -206,7 +269,10 @@ impl OpenEditors {
     }
 
     pub(crate) fn is_header(&self, index: usize) -> bool {
-        matches!(self.rows.get(index), Some(EditorEntry::Header(_)))
+        matches!(
+            self.rows.get(index),
+            Some(EditorEntry::Header(_) | EditorEntry::PinnedHeader)
+        )
     }
 
     /// How many tabs the section lists, headers left out.
@@ -225,6 +291,15 @@ pub(crate) fn header_label(number: usize) -> String {
 
 /// Paints a group's header row, in the section header's style: no icon and no close box.
 pub(crate) fn draw_header(dc: HDC, number: usize, rect: RECT, paint: &ViewPaint) {
+    draw_label(dc, &header_label(number), rect, paint);
+}
+
+/// Paints the Pinned part's header row, in the group header's style.
+pub(crate) fn draw_pinned_header(dc: HDC, rect: RECT, paint: &ViewPaint) {
+    draw_label(dc, PINNED_LABEL, rect, paint);
+}
+
+fn draw_label(dc: HDC, label: &str, rect: RECT, paint: &ViewPaint) {
     let text = RECT {
         left: (rect.left + scale(LEFT_PAD, paint.dpi)).min(rect.right),
         ..rect
@@ -232,13 +307,55 @@ pub(crate) fn draw_header(dc: HDC, number: usize, rect: RECT, paint: &ViewPaint)
     unsafe {
         draw_text(
             dc,
-            &header_label(number),
+            label,
             text,
             paint.fonts.bold,
             paint.palette.muted_foreground,
             LINE,
         )
     };
+}
+
+/// Paints a pinned note's row: its icon and name, with no close box.
+pub(crate) fn draw_pinned_row(
+    dc: HDC,
+    row: &PinnedRow,
+    rect: RECT,
+    look: RowLook,
+    paint: &ViewPaint,
+    images: &mut IconImages,
+) {
+    let (palette, dpi) = (&paint.palette, paint.dpi);
+    let foreground = row_foreground(look, palette);
+    let muted = if look.selected && look.focused {
+        foreground
+    } else {
+        palette.muted_foreground
+    };
+    let px = scale(GLYPH_BOX, dpi);
+    let icon = RECT {
+        left: (rect.left + scale(LEFT_PAD, dpi)).min(rect.right),
+        top: rect.top,
+        right: (rect.left + scale(LEFT_PAD, dpi) + px).min(rect.right),
+        bottom: rect.bottom,
+    };
+    draw_item_icon(
+        dc,
+        TreeItem::Note(note_kind(&row.path)),
+        icon,
+        px,
+        muted,
+        palette,
+        &paint.icons,
+        images,
+        paint.icon_set,
+        paint.light_theme,
+    );
+    let name = RECT {
+        left: (icon.right + scale(GAP, dpi)).min(rect.right),
+        ..rect
+    };
+    unsafe { draw_text(dc, &row.name, name, paint.fonts.text, foreground, LINE) };
 }
 
 /// Paints one row: the icon, the name, and at the right the dot of a dirty tab or, on hover or
@@ -356,6 +473,7 @@ mod tests {
                 EditorEntry::View(row) => {
                     format!("{}{}", row.name, if row.active { "*" } else { "" })
                 }
+                EditorEntry::PinnedHeader | EditorEntry::Pinned(_) => unreachable!(),
             })
             .collect();
         assert_eq!(shape, vec!["G1", "a", "G2", "a", "b*"]);
@@ -408,5 +526,34 @@ mod tests {
         assert!(!editors.set_rows(rows(2)));
         assert!(editors.set_rows(rows(1)));
         assert_eq!(editors.list.selected, Some(0));
+    }
+
+    #[test]
+    fn pinned_notes_follow_a_pinned_header_by_name_and_are_not_tabs() {
+        // Break caught: pinned notes listed in a hash or disk order, a header with nothing under
+        // it, or a pinned note counted as an open tab.
+        assert!(pinned_entries(Vec::new()).is_empty());
+        let rows = pinned_entries(vec![
+            PathBuf::from(r"notes\zeta.md"),
+            PathBuf::from("Alpha.md"),
+            PathBuf::from(r"b\beta.md"),
+        ]);
+        assert_eq!(rows[0], EditorEntry::PinnedHeader);
+        let names: Vec<_> = rows
+            .iter()
+            .filter_map(EditorEntry::pinned)
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(names, ["Alpha.md", "beta.md", "zeta.md"]);
+        assert!(rows.iter().all(|entry| entry.row().is_none()));
+        let mut editors = OpenEditors::new(20);
+        editors.set_rows(rows);
+        assert_eq!(editors.view_count(), 0);
+        assert!(editors.is_header(0));
+        assert!(!editors.is_header(1));
+        assert_eq!(
+            pinned_accessible_name(editors.rows[1].pinned().unwrap()),
+            "Alpha.md, pinned note"
+        );
     }
 }

@@ -493,7 +493,11 @@ fn pinning_a_note_that_is_not_first_raises_reorder_and_state_change() {
 
     let after = row_of(window.hwnd, &kind);
     assert!(after < before, "the pinned note moves up");
-    assert_eq!((source.count)(panel), count, "the same number of children");
+    assert_eq!(
+        (source.count)(panel),
+        count + 2,
+        "the Pinned header and the pinned note join the Open editors list"
+    );
     let id = (source.current)(panel).unwrap() as i32 + 1;
     let raised = take_raised()
         .into_iter()
