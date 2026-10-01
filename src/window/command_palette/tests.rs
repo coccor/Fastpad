@@ -486,7 +486,12 @@ mod painting {
     #[test]
     fn high_contrast_keeps_a_square_field_and_a_full_row_selection() {
         // Break caught: rounding or insetting under a high-contrast palette.
-        let colors = Palette::for_theme(Theme::ALL[0], true);
+        // In high contrast `accent` equals the highlight fill, so give it a distinct color here:
+        // otherwise a bar drawn by mistake would be invisible to the "no accent bar" check.
+        let colors = Palette {
+            accent: 0x0012_3456,
+            ..Palette::for_theme(Theme::ALL[0], true)
+        };
         with_canvas(
             &colors,
             |dc| {
