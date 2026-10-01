@@ -520,7 +520,6 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
 pub(crate) fn refresh_metrics(hwnd: HWND) {
     if let Some((_, panel)) = windows(hwnd) {
         crate::window::favorites_view::refresh_metrics(hwnd, panel);
-        unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
     }
 }
 

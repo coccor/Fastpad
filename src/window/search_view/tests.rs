@@ -758,3 +758,41 @@ mod painting {
         );
     }
 }
+
+#[test]
+fn the_search_header_lines_and_fields_fit_at_every_text_size() {
+    // Break caught: at a larger Windows text size the field overflowing its 38 px header, the
+    // replace field overlapping it, or the summary and status lines disagreeing with the list.
+    use crate::window::design::text_scale::{scale_text, set_factor_for_test};
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 320,
+        bottom: 900,
+    };
+    for factor in [100, 150, 225] {
+        set_factor_for_test(factor);
+        for dpi in [96, 144] {
+            let field = SearchView::field_rect(client, dpi);
+            let title = SearchView::title_rect(client, dpi);
+            let header = scale_text(super::HEADER_AT_96_DPI, dpi);
+            assert!(field.top >= title.bottom, "{factor}% {dpi}");
+            assert!(field.bottom <= title.bottom + header, "{factor}% {dpi}");
+            let mut view = SearchView::new(std::ptr::null_mut(), dpi);
+            view.replace_open = true;
+            let replace = SearchView::replace_field_rect(client, dpi);
+            let band_bottom = title.bottom + header + scale_text(REPLACE_ROW_AT_96_DPI, dpi);
+            assert!(replace.top >= field.bottom, "{factor}% {dpi}");
+            assert!(replace.bottom <= band_bottom, "{factor}% {dpi}");
+            assert_eq!(view.head_bottom(client, dpi), band_bottom);
+            let line = scale_text(super::LINE_AT_96_DPI, dpi);
+            let summary = view.summary_rect(client, dpi);
+            assert_eq!(summary.top, band_bottom);
+            assert_eq!(summary.bottom - summary.top, line);
+            assert_eq!(view.list_area(client, dpi).top, summary.bottom);
+            let status = SearchView::status_rect(client, dpi);
+            assert_eq!(status.bottom - status.top, line);
+        }
+    }
+    set_factor_for_test(100);
+}
