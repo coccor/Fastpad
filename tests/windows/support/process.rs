@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Threading::{
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClassNameW, GetDlgCtrlID, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, PostMessageW, WM_CLOSE, WM_COMMAND,
+    GetWindowThreadProcessId, IsWindow, PostMessageW, WM_CLOSE, WM_COMMAND, WM_KEYDOWN,
 };
 #[cfg(windows)]
 use windows_sys::core::BOOL;
@@ -516,6 +516,18 @@ unsafe extern "system" fn enum_main_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
 /// dialog is not the active window, which is routine on a CI desktop.
 #[cfg(windows)]
 fn dismiss_dialog(dialog: HWND) -> bool {
+    if is_fastpad_prompt(dialog) {
+        // FastPad's own themed prompt. The close prompt's "Don't save" quick key (`D`) discards,
+        // as "No" does in the standard dialog; a confirmation has no quick keys, so the Enter
+        // after it takes its primary button, as "OK" does. On the close prompt the `D` ends the
+        // prompt first, so the Enter finds no window. The keys go straight to the window, which
+        // needs no focus.
+        // The Enter's result is ignored: the `D` may already have ended the prompt.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let posted = unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(b'D'), 0) } != 0;
+        unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0) };
+        return posted;
+    }
     let mut search = ButtonSearch { hwnd: None };
     unsafe {
         EnumChildWindows(
@@ -558,8 +570,17 @@ unsafe extern "system" fn enum_no_or_ok_button(hwnd: HWND, lparam: LPARAM) -> BO
     1
 }
 
-/// Finds a top-level dialog (window class `"#32770"`) owned by `process_id`: a `MessageBoxW` such
-/// as FastPad's "Save changes?" close prompt, or a common dialog such as Save As.
+/// Whether `hwnd` is FastPad's own prompt window (the themed "Save changes?" and confirm popup).
+#[cfg(windows)]
+fn is_fastpad_prompt(hwnd: HWND) -> bool {
+    let mut class_name = [0_u16; 32];
+    let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+    length > 0 && String::from_utf16_lossy(&class_name[..length as usize]) == "FastPadPrompt"
+}
+
+/// Finds a top-level dialog owned by `process_id`: FastPad's own prompt (window class
+/// `"FastPadPrompt"`, the "Save changes?" close prompt), a standard dialog (`"#32770"`) such as a
+/// common dialog like Save As, or a `MessageBoxW`.
 #[cfg(windows)]
 fn find_dialog(process_id: u32) -> TestResult<Option<HWND>> {
     let mut search = DialogSearch {
@@ -596,7 +617,12 @@ unsafe extern "system" fn enum_dialog_for_process(hwnd: HWND, lparam: LPARAM) ->
     }
     let mut class_name = [0_u16; 32];
     let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
-    if length > 0 && String::from_utf16_lossy(&class_name[..length as usize]) == "#32770" {
+    if length > 0
+        && matches!(
+            String::from_utf16_lossy(&class_name[..length as usize]).as_str(),
+            "#32770" | "FastPadPrompt"
+        )
+    {
         search.hwnd = Some(hwnd);
         return 0;
     }

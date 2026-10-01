@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::Accessibility::{AccessibleObjectFromWindow, SELFLAG_
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, IDCANCEL, IDNO,
-    IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 use windows_sys::core::{BOOL, BSTR, GUID, HRESULT};
@@ -297,7 +297,36 @@ fn answer_next_dialog(process_id: u32, button: i32) -> TestResult<()> {
     Ok(())
 }
 
+/// Whether `dialog` is FastPad's own themed prompt rather than a standard dialog.
+fn is_prompt(dialog: HWND) -> bool {
+    let mut class = [0_u16; 32];
+    let length = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW(
+            dialog,
+            class.as_mut_ptr(),
+            class.len() as i32,
+        )
+    };
+    length > 0 && String::from_utf16_lossy(&class[..length as usize]) == "FastPadPrompt"
+}
+
+/// Whether the close-review dialog is up with its Cancel choice: the prompt always has it, a
+/// standard dialog once its button exists.
+fn has_cancel(dialog: HWND) -> bool {
+    is_prompt(dialog) || unsafe { !GetDlgItem(dialog, IDCANCEL).is_null() }
+}
+
 fn answer_dialog(dialog: HWND, button: i32) -> TestResult<()> {
+    if is_prompt(dialog) {
+        // The prompt's keys: Esc is Cancel, `D` is "Don't save" and `S` is "Save".
+        let key = match button {
+            IDCANCEL => 0x1B_u16, // VK_ESCAPE
+            IDNO => u16::from(b'D'),
+            _ => return Err(format!("the prompt has no key for button {button}").into()),
+        };
+        unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(key), 0) };
+        return Ok(());
+    }
     let control = unsafe { GetDlgItem(dialog, button) };
     if control.is_null() {
         return Err(format!("close-review dialog did not expose button {button}").into());
@@ -310,7 +339,7 @@ fn wait_for_dialog(process_id: u32, present: bool, timeout: Duration) -> TestRes
     let deadline = Instant::now() + timeout;
     loop {
         let dialog = find_dialog(process_id);
-        let ready = dialog.is_some_and(|dialog| unsafe { !GetDlgItem(dialog, IDCANCEL).is_null() });
+        let ready = dialog.is_some_and(has_cancel);
         if (present && ready) || (!present && dialog.is_none()) {
             return Ok(dialog.unwrap_or(std::ptr::null_mut()));
         }
@@ -328,9 +357,9 @@ fn wait_for_replacement_dialog(
 ) -> TestResult<HWND> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(dialog) = find_dialog(process_id).filter(|dialog| {
-            *dialog != previous && unsafe { !GetDlgItem(*dialog, IDCANCEL).is_null() }
-        }) {
+        if let Some(dialog) =
+            find_dialog(process_id).filter(|dialog| *dialog != previous && has_cancel(*dialog))
+        {
             return Ok(dialog);
         }
         if Instant::now() >= deadline {
@@ -360,8 +389,10 @@ fn find_dialog(process_id: u32) -> Option<HWND> {
                 class.len() as i32,
             )
         };
+        let class = &class[..length.max(0) as usize];
         if length > 0
-            && &class[..length as usize] == wide_null("#32770").strip_suffix(&[0]).unwrap()
+            && (class == wide_null("#32770").strip_suffix(&[0]).unwrap()
+                || class == wide_null("FastPadPrompt").strip_suffix(&[0]).unwrap())
         {
             search.found = Some(hwnd);
             return 0;
