@@ -563,3 +563,24 @@ fn dragging_the_sidebar_edge_resizes_it_and_saves_the_width_once_on_release() {
     assert_eq!(client_size(panel).0, scale(260));
     super::super::save_settings_to(None);
 }
+
+#[test]
+fn the_sidebar_fonts_are_rebuilt_when_only_the_text_size_changes() {
+    // Break caught: a text-size change leaving the old fonts in the cache, so the sidebar keeps
+    // its old text size until the DPI changes.
+    use crate::window::design::text_scale::set_factor_for_test;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    set_factor_for_test(100);
+    let sidebar = app_mut(window.hwnd)
+        .sidebar
+        .as_mut()
+        .expect("notes mode has a sidebar");
+    let first = sidebar.fonts(96).text;
+    assert_eq!(sidebar.fonts(96).text, first, "same key reuses the fonts");
+    set_factor_for_test(150);
+    let second = sidebar.fonts(96).text;
+    set_factor_for_test(100);
+    assert_ne!(second, first);
+}

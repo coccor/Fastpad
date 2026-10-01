@@ -56,21 +56,21 @@ pub(crate) const EDITOR_MIN_WIDTH_96: i32 = 320;
 /// The strip along the panel's right edge that resizes it.
 pub(crate) const GRIP_WIDTH_96: i32 = 4;
 
-/// The sidebar's fonts at one DPI. Painting copies them out; `Sidebar` owns and deletes them.
+/// The sidebar's fonts at one DPI and text-size factor. Painting copies them out; `Sidebar` owns and deletes them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UiFonts {
-    /// Row and body text: the text face, 13 px at 96 DPI.
+    /// Row and body text: the text face, 13 px at 96 DPI and 100% text size.
     pub(crate) text: HFONT,
-    /// The match in a Search result's snippet: Segoe UI bold, 13 px. Made on the first paint of a
+    /// The match in a Search result's snippet: text face, bold, 13 px. Made on the first paint of a
     /// snippet (`Sidebar::text_bold`), not with the others, so it adds nothing before first paint.
     pub(crate) text_bold: HFONT,
-    /// Header titles: Segoe UI semibold, 13 px.
+    /// Header titles: text face, semibold, 13 px.
     pub(crate) bold: HFONT,
-    /// Notices inside the list: Segoe UI italic, 13 px.
+    /// Notices inside the list: text face, italic, 13 px.
     pub(crate) italic: HFONT,
-    /// Row, caret and header-button icons: Segoe MDL2 Assets, `SIDEBAR_ICON` px.
+    /// Row, caret and header-button icons: the icon face, `SIDEBAR_ICON` px.
     pub(crate) glyph: HFONT,
-    /// The activity bar's icons: Segoe MDL2 Assets, `ICON` px.
+    /// The activity bar's icons: the icon face, `ICON` px.
     pub(crate) bar_glyph: HFONT,
 }
 
@@ -139,15 +139,16 @@ pub(crate) struct Sidebar {
     /// The live width (96-DPI pixels) while the panel edge is dragged. The setting changes once,
     /// when the drag ends.
     drag_width: Option<u16>,
-    /// The fonts and the DPI they were made for (`main_window::ui_fonts`).
-    fonts: Option<(u32, UiFonts)>,
+    /// The fonts and the (DPI, text-size factor) they were made for (`main_window::ui_fonts`).
+    fonts: Option<((u32, u32), UiFonts)>,
 }
 
 impl Sidebar {
-    /// The fonts for `dpi`, created on first use and again after a DPI change.
+    /// The fonts for `dpi`, created on first use and again after a DPI or text-size change.
     pub(crate) fn fonts(&mut self, dpi: u32) -> UiFonts {
-        if let Some((font_dpi, fonts)) = self.fonts
-            && font_dpi == dpi
+        let key = (dpi, crate::window::design::text_scale::factor());
+        if let Some((font_key, fonts)) = self.fonts
+            && font_key == key
         {
             return fonts;
         }
@@ -155,7 +156,7 @@ impl Sidebar {
             old.delete();
         }
         let fonts = UiFonts::create(dpi);
-        self.fonts = Some((dpi, fonts));
+        self.fonts = Some((key, fonts));
         fonts
     }
 
@@ -1370,6 +1371,35 @@ mod tests {
             );
             fonts.delete();
         }
+    }
+
+    #[test]
+    fn the_text_size_factor_scales_the_sidebar_text_but_not_its_icons() {
+        // Break caught: icons growing with the text-size setting, or the sidebar text ignoring it.
+        use crate::window::design::{
+            metrics::{ICON, SIDEBAR_ICON, scale},
+            text_scale::set_factor_for_test,
+        };
+        use windows_sys::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
+        let height = |font| {
+            let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                GetObjectW(
+                    font,
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    (&mut log as *mut LOGFONTW).cast(),
+                )
+            };
+            assert!(written > 0);
+            log.lfHeight
+        };
+        set_factor_for_test(225);
+        let fonts = UiFonts::create(96);
+        set_factor_for_test(100);
+        assert_eq!(height(fonts.text), -29);
+        assert_eq!(height(fonts.glyph), -scale(SIDEBAR_ICON, 96));
+        assert_eq!(height(fonts.bar_glyph), -scale(ICON, 96));
+        fonts.delete();
     }
 
     #[test]

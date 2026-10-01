@@ -2,7 +2,7 @@
 //! each, and the one function that turns a style into a GDI font. Icon fonts and the editor and
 //! preview fonts are not part of the ramp.
 
-use super::metrics::scale;
+use super::text_scale::scale_text;
 use crate::window::titlebar::create_ui_font;
 use windows_sys::Win32::Graphics::Gdi::{FW_BOLD, FW_NORMAL, FW_SEMIBOLD, HFONT};
 
@@ -62,7 +62,12 @@ pub(crate) fn face(style: TextStyle) -> &'static str {
 /// A GDI font for `style` at `dpi`. The caller owns it and deletes it.
 pub(crate) fn create(style: TextStyle, dpi: u32) -> HFONT {
     let spec = style.spec();
-    create_ui_font(scale(spec.px, dpi), face(style), spec.weight, spec.italic)
+    create_ui_font(
+        scale_text(spec.px, dpi),
+        face(style),
+        spec.weight,
+        spec.italic,
+    )
 }
 
 #[cfg(test)]
@@ -126,6 +131,33 @@ mod tests {
             assert!(written > 0, "dpi {dpi}");
             assert_eq!(log.lfHeight, -expected_height, "dpi {dpi}");
             unsafe { DeleteObject(font) };
+        }
+    }
+
+    #[test]
+    fn the_text_size_factor_scales_every_style_height() {
+        // Break caught: a style ignoring the Windows text-size setting, or rounding it down.
+        use crate::window::design::text_scale::set_factor_for_test;
+        let height = |style: TextStyle| {
+            let font = create(style, 96);
+            let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                GetObjectW(
+                    font,
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    (&mut log as *mut LOGFONTW).cast(),
+                )
+            };
+            assert!(written > 0);
+            unsafe { DeleteObject(font) };
+            log.lfHeight
+        };
+        for (factor, body, title) in [(100, -13, -18), (150, -20, -27), (225, -29, -41)] {
+            set_factor_for_test(factor);
+            let (got_body, got_title) = (height(TextStyle::Body), height(TextStyle::Title));
+            set_factor_for_test(100);
+            assert_eq!(got_body, body, "body at {factor}");
+            assert_eq!(got_title, title, "title at {factor}");
         }
     }
 }

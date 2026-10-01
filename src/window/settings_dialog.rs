@@ -312,7 +312,7 @@ fn create(
     let title_font = type_ramp::create(TextStyle::Title, dpi);
     let heading_font = type_ramp::create(TextStyle::Heading, dpi);
     let body_font = type_ramp::create(TextStyle::Body, dpi);
-    let link_font = create_underlined_font(scale(13, dpi));
+    let link_font = create_underlined_font(crate::window::design::text_scale::scale_text(13, dpi));
     let glyph_font = create_ui_font(scale(11, dpi), glyph_font_face(), FW_NORMAL as i32, false);
 
     let mut monitor = MONITORINFO {

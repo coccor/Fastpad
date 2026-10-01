@@ -21,7 +21,7 @@
 | Icon face | "Segoe Fluent Icons" on Windows 11, "Segoe MDL2 Assets" otherwise. Segoe Fluent Icons keeps MDL2's codepoints, so no glyph or layout code changes. |
 | Text size source | `HKCU\Software\Microsoft\Accessibility\TextScaleFactor`, a DWORD. Missing, unreadable or out of range means 100. The value is clamped to 100..=225. Read lazily with the font cache, never at startup. |
 | What the factor scales | Text style font heights, and the text-tied heights listed in 3.4. Icon fonts, the activity bar, the tab strip height and every other metric stay on DPI scaling only. |
-| When it refreshes | On `WM_SETTINGCHANGE` whose parameter is "TextScaleFactor" (a change to DPI keeps its own path). Open About and Settings dialogs keep their fonts until reopened. |
+| When it refreshes | On every `WM_SETTINGCHANGE`, by re-reading the value and acting only when it changed (the message's parameter string is not matched; a change to DPI keeps its own path). Open About and Settings dialogs keep their fonts until reopened. |
 | Not in this piece | The editor font and the Markdown preview (user settings), the dialogs following a text-size change while open, and any new setting. |
 
 ## 3. Design
@@ -57,7 +57,7 @@ At 100% every value is unchanged (the existing tests are the guard). The impleme
 
 ### 3.5 Refresh (`main_window/wndproc.rs`)
 
-- `WM_SETTINGCHANGE` already calls `refresh_theme`. It additionally checks whether the changed-setting parameter is the string "TextScaleFactor"; if so it calls `text_scale::refresh()`, and when that returns true it drops `title_fonts`, invalidates the sidebar font cache (the cache key becomes the DPI plus the factor), and calls the same relayout the DPI change calls (`layout_editor_and_find_bar`) followed by `InvalidateRect`.
+- `WM_SETTINGCHANGE` already calls `refresh_theme`. It additionally calls `text_scale::refresh()` on every such message (a cheap registry read; the parameter string is not matched, because it is not reliable across Windows versions), and when that returns true it drops `title_fonts`, invalidates the sidebar font cache (the cache key becomes the DPI plus the factor), and calls the same relayout the DPI change calls (`layout_editor_and_find_bar`) followed by `InvalidateRect`.
 - `ui_fonts` and `TitleFonts` compare `(dpi, factor)` instead of `dpi`.
 
 ## 4. Tests
@@ -68,7 +68,7 @@ At 100% every value is unchanged (the existing tests are the guard). The impleme
 - Font height tests (`type_ramp`, `side_panel`): the lfHeight of the body font at DPI 96 is 13, 20 and 29 at factors 100, 150 and 225, and the icon fonts do not change.
 - Row-height tests: Search rows, sidebar rows, panel header and the palette row at factors 100 and 225; the Search result row still holds two text lines at 96, 120, 144 and 192 DPI at factor 225.
 - The existing tests that pin 26, 38, 46, 19, 22 and the palette row are the 100% guard and must pass unchanged.
-- A test that `WM_SETTINGCHANGE`'s text-size branch is skipped for other parameters, where the existing wndproc tests allow it.
+- A test that `WM_SETTINGCHANGE` runs the shared refresh only when `text_scale::refresh()` reports a change (an unchanged value leaves the title fonts alone), where the existing wndproc tests allow it.
 
 ## 5. Risks and checks
 

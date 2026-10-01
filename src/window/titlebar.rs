@@ -334,10 +334,11 @@ impl Default for TitleFontHandles {
     }
 }
 
-/// Title-strip fonts for one DPI, deleted on drop (with the App at `WM_NCDESTROY`).
+/// Title-strip fonts for one DPI and text-size factor, deleted on drop (with the App at `WM_NCDESTROY`).
 #[derive(Debug)]
 pub(crate) struct TitleFonts {
     dpi: u32,
+    factor: u32,
     handles: TitleFontHandles,
 }
 
@@ -345,6 +346,7 @@ impl TitleFonts {
     pub(crate) fn create(dpi: u32) -> Self {
         Self {
             dpi,
+            factor: crate::window::design::text_scale::factor(),
             handles: TitleFontHandles {
                 text: type_ramp::create(TextStyle::Body, dpi),
                 italic: type_ramp::create(TextStyle::BodyItalic, dpi),
@@ -358,6 +360,11 @@ impl TitleFonts {
 
     pub(crate) fn dpi(&self) -> u32 {
         self.dpi
+    }
+
+    /// The text-size percentage these fonts were made for.
+    pub(crate) fn factor(&self) -> u32 {
+        self.factor
     }
 
     pub(crate) fn handles(&self) -> TitleFontHandles {

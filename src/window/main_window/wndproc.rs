@@ -416,9 +416,6 @@ pub(super) unsafe extern "system" fn main_window_proc(
         }
         WM_DPICHANGED => {
             let suggested = unsafe { &*(lparam as *const RECT) };
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                unsafe { app.as_mut() }.title_fonts = None;
-            }
             unsafe {
                 SetWindowPos(
                     hwnd,
@@ -429,27 +426,23 @@ pub(super) unsafe extern "system" fn main_window_proc(
                     suggested.bottom - suggested.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                InvalidateRect(hwnd, std::ptr::null(), 1);
             }
             let dpi = (wparam & 0xffff) as u32;
-            if let Some(editor) =
-                unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
-            {
-                let _ = editor.set_text_padding(dpi);
-                if let Some(app) = unsafe { app_ptr(hwnd) } {
-                    let _ =
-                        editor.set_code_folding(unsafe { app.as_ref() }.settings.code_folding, dpi);
-                }
-            }
             // Replaces (and drops, which destroys) any icon loaded for the old DPI. The bar's own
             // resize below repaints it, so no separate invalidate is needed here.
             ensure_logo_icon(hwnd, dpi);
             // The suggested rectangle may keep the size, and then no WM_SIZE re-lays out the
             // sidebar and bands for the new DPI.
-            layout_editor_and_find_bar(hwnd);
+            refresh_metrics(hwnd, dpi);
             0
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
+            // The text-size value is re-read on every setting change (the parameter string is
+            // not reliable across Windows versions); only a changed value costs a relayout.
+            if message == WM_SETTINGCHANGE && crate::window::design::text_scale::refresh() {
+                let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+                refresh_metrics(hwnd, dpi);
+            }
             refresh_theme(hwnd);
             unsafe {
                 InvalidateRect(hwnd, std::ptr::null(), 1);

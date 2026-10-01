@@ -38,10 +38,6 @@ fn read_registry() -> u32 {
 }
 
 /// The text-size percentage, 100 to 225. The first call reads the registry.
-#[allow(
-    dead_code,
-    reason = "used by the font and height sites in the next tasks"
-)]
 pub(crate) fn factor() -> u32 {
     match FACTOR.load(Ordering::Relaxed) {
         0 => {
@@ -54,10 +50,6 @@ pub(crate) fn factor() -> u32 {
 }
 
 /// Re-reads the setting and returns whether it changed.
-#[allow(
-    dead_code,
-    reason = "used by the font and height sites in the next tasks"
-)]
 pub(crate) fn refresh() -> bool {
     let before = factor();
     let after = read_registry();
@@ -67,10 +59,6 @@ pub(crate) fn refresh() -> bool {
 
 /// `value` (pixels at 96 DPI) scaled to `dpi`, then by the text-size factor, rounded half up.
 /// At 100 percent it equals `scale`.
-#[allow(
-    dead_code,
-    reason = "used by the font and height sites in the next tasks"
-)]
 pub(crate) fn scale_text(value: i32, dpi: u32) -> i32 {
     let scaled = i64::from(scale(value, dpi));
     ((scaled * i64::from(factor()) + 50) / 100) as i32

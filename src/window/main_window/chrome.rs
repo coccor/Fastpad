@@ -203,6 +203,27 @@ pub(super) fn apply_theme(hwnd: HWND) {
     crate::window::side_panel::refresh(hwnd);
 }
 
+/// Re-derives everything that depends on font heights or DPI: the title fonts, the editor's
+/// padding and folding margin, the layout, and a repaint. Shared by `WM_DPICHANGED` and a change
+/// of the Windows text-size setting.
+pub(super) fn refresh_metrics(hwnd: HWND, dpi: u32) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.title_fonts = None;
+    }
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+    if let Some(editor) =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
+    {
+        let _ = editor.set_text_padding(dpi);
+        if let Some(app) = unsafe { app_ptr(hwnd) } {
+            let _ = editor.set_code_folding(unsafe { app.as_ref() }.settings.code_folding, dpi);
+        }
+    }
+    layout_editor_and_find_bar(hwnd);
+}
+
 /// Copies what a title-strip paint needs out of App, creating the per-DPI fonts on first use.
 /// Before chrome is built the palette is the neutral compiled one (no theme queries).
 pub(crate) fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
@@ -210,11 +231,9 @@ pub(crate) fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerSta
     unsafe { app_ptr(hwnd) }
         .map(|mut app| {
             let app = unsafe { app.as_mut() };
-            if app
-                .title_fonts
-                .as_ref()
-                .is_none_or(|fonts| fonts.dpi() != dpi)
-            {
+            if app.title_fonts.as_ref().is_none_or(|fonts| {
+                fonts.dpi() != dpi || fonts.factor() != crate::window::design::text_scale::factor()
+            }) {
                 app.title_fonts = Some(crate::window::titlebar::TitleFonts::create(dpi));
             }
             (

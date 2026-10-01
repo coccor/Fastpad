@@ -391,7 +391,7 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
     // The title matches Settings' title.
     let title_font = type_ramp::create(TextStyle::Title, dpi);
     let body_font = type_ramp::create(TextStyle::Body, dpi);
-    let link_font = create_underlined_font(scale(13, dpi));
+    let link_font = create_underlined_font(crate::window::design::text_scale::scale_text(13, dpi));
     let glyph_font = create_ui_font(scale(11, dpi), glyph_font_face(), FW_NORMAL as i32, false);
     let link_widths = Link::ALL.map(|link| measure(dialog, link_font, link.label()));
     let layout = Layout::calculate(
