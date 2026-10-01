@@ -788,6 +788,19 @@ fn a_focused_root_row_draws_the_accent_focus_ring() {
 }
 
 #[test]
+fn the_selection_bar_clears_the_narrowest_row_content() {
+    // Break caught: the accent bar overlapping the first row content (the pin or indent) at some
+    // text size.
+    use crate::window::design::metrics::{ROW_INSET_X, SELECTION_BAR_WIDTH};
+    for dpi in [96, 120, 144, 192] {
+        assert!(
+            scale(ROW_INSET_X, dpi) + scale(SELECTION_BAR_WIDTH, dpi) <= scale(LEFT_PAD, dpi),
+            "dpi {dpi}"
+        );
+    }
+}
+
+#[test]
 fn the_no_notebook_state_and_drag_label_hold_their_text_at_every_text_size() {
     // Break caught: the message, button, RECENT label or drag label too short for the text at a
     // larger Windows text size, or the 100 % sizes drifting.

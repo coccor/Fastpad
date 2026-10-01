@@ -5,7 +5,7 @@
 //! Every `height` is the list area's height in pixels, and every `y` is relative to its top.
 
 use crate::window::design::metrics::{CONTROL_RADIUS, ROW_INSET_X, ROW_INSET_Y, scale};
-use crate::window::design::round::{Corners, fill_rounded, radius_for};
+use crate::window::design::round::{Corners, fill_rounded, paint_selection_bar, radius_for};
 use crate::window::palette::Palette;
 use crate::window::panel::fill;
 use windows_sys::Win32::Foundation::RECT;
@@ -354,6 +354,9 @@ pub(crate) fn paint(
                     background,
                     behind(index),
                 );
+                if focused {
+                    paint_selection_bar(hdc, backplate, palette, background, dpi);
+                }
             } else if look.hover {
                 fill_rounded(
                     hdc,
@@ -674,7 +677,9 @@ mod tests {
                 // The fill is inset 4px left and right and 1px top and bottom, with rounded corners.
                 assert_eq!(GetPixel(dc, 1, 20 + 13), palette.editor_background);
                 assert_eq!(GetPixel(dc, 3, 20 + 13), palette.editor_background);
-                assert_eq!(GetPixel(dc, 4, 20 + 13), selection);
+                // x 4..7 of the focused selection is the accent bar, so the fill's edge is probed
+                // just right of it.
+                assert_eq!(GetPixel(dc, 7, 20 + 13), selection);
                 assert_eq!(GetPixel(dc, 12, 20 + 13), selection);
                 assert_eq!(GetPixel(dc, 12, 20), palette.editor_background);
                 assert_eq!(GetPixel(dc, 4, 20 + 1), palette.editor_background);
@@ -749,6 +754,72 @@ mod tests {
             );
             assert_eq!(GetPixel(dc, 4, 20 + 1), band);
             assert_eq!(GetPixel(dc, 12, 20 + 10), palette.selection_background);
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn a_focused_selected_row_gets_the_accent_bar_and_no_other_row_does() {
+        // Break caught: a bar on hovered, unselected or unfocused rows, or none on the focused
+        // selection, or one drawn over the high-contrast highlight.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let accent = 0x00aa_ff00;
+        let mut palette = Palette {
+            selection_background: 0x0000_00ff,
+            inactive_selection_background: 0x0000_ff00,
+            hover_background: 0x00ff_0000,
+            editor_background: 0x0080_8080,
+            accent,
+            ..Palette::neutral()
+        };
+        let mut state = RowListState::new(20);
+        state.set_count(10);
+        state.selected = Some(1);
+        state.hover = Some(2);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            let previous = SelectObject(dc, bitmap);
+            let render = |palette: &Palette, focused: bool| {
+                crate::window::panel::fill(dc, area, palette.editor_background);
+                paint(
+                    dc,
+                    area,
+                    &state,
+                    palette,
+                    focused,
+                    &|_| palette.editor_background,
+                    96,
+                    &mut |_, _, _, _| {},
+                );
+            };
+            render(&palette, true);
+            assert_eq!(GetPixel(dc, 5, 30), accent);
+            assert_eq!(GetPixel(dc, 7, 30), palette.selection_background);
+            assert_eq!(GetPixel(dc, 5, 50), palette.hover_background);
+            for y in [5, 70, 90] {
+                assert_ne!(GetPixel(dc, 5, y), accent, "unselected row at y {y}");
+            }
+            render(&palette, false);
+            assert_eq!(GetPixel(dc, 5, 30), palette.inactive_selection_background);
+            assert_eq!(GetPixel(dc, 5, 50), palette.hover_background);
+            palette.high_contrast = true;
+            render(&palette, true);
+            assert_eq!(GetPixel(dc, 5, 30), palette.selection_background);
             SelectObject(dc, previous);
             DeleteObject(bitmap);
             DeleteDC(dc);

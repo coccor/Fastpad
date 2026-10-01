@@ -316,7 +316,7 @@ impl FavoritesView {
                         right: rect.left + scale(3, dpi),
                         ..rect
                     },
-                    palette.selection_background,
+                    palette.accent,
                 );
             }
             draw_text(
@@ -844,6 +844,62 @@ mod tests {
         assert_eq!(rows[2].hint, None);
         assert!(rows[2].open);
         assert!(!rows[3].open && !rows[0].open);
+    }
+
+    #[test]
+    fn the_open_notebooks_bar_is_the_accent_color() {
+        // Break caught: the open-notebook bar painted in the selection fill (invisible on a
+        // selected row) instead of the accent, or drawn on a notebook that isn't open.
+        use crate::config::FileIconSet;
+        use crate::window::icon_sets::images::TestTarget;
+        use crate::window::palette::{FileIcons, Palette};
+        use crate::window::side_panel::{UiFonts, ViewPaint};
+        let palette = Palette {
+            accent: 0x00aa_55ff,
+            ..Palette::neutral()
+        };
+        let favorites = [r"C:\a\Alpha", r"C:\b\Beta"].map(PathBuf::from);
+        let mut view = FavoritesView::new(96);
+        view.set_rows(
+            favorite_rows(&favorites, Some(Path::new(r"C:\a\Alpha"))),
+            96,
+            400,
+        );
+        view.list.selected = None;
+        let target = TestTarget::new(260, 400);
+        let paint = ViewPaint {
+            hdc: target.dc,
+            client: CLIENT,
+            palette,
+            icons: FileIcons::neutral(),
+            icon_set: FileIconSet::Minimal,
+            light_theme: true,
+            background: palette.panel_background(),
+            fonts: UiFonts::default(),
+            dpi: 96,
+            focused: true,
+        };
+        view.paint(&paint);
+        let area = view.list_area(CLIENT, 96);
+        let row = view.list.row_height;
+        let accent = {
+            let probe = TestTarget::new(1, 1);
+            unsafe {
+                crate::window::panel::fill(
+                    probe.dc,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: 1,
+                    },
+                    palette.accent,
+                );
+            }
+            probe.pixel(0, 0)
+        };
+        assert_eq!(target.pixel(1, area.top + row / 2), accent);
+        assert_ne!(target.pixel(1, area.top + row + row / 2), accent);
     }
 
     #[test]
