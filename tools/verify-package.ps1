@@ -71,6 +71,11 @@ public static class FastPadSmoke {
     public static void Close(IntPtr hwnd) { PostMessage(hwnd, 0x0010, IntPtr.Zero, IntPtr.Zero); }
 
     public static bool DismissDiscardPrompt(uint pid) {
+        // FastPad's own prompt: its "Don't save" quick key discards.
+        IntPtr prompt = FindTopLevel(pid, "FastPadPrompt");
+        if (prompt != IntPtr.Zero) {
+            return PostMessage(prompt, 0x0100, (IntPtr)0x44, IntPtr.Zero);
+        }
         IntPtr dialog = FindTopLevel(pid, "#32770");
         if (dialog == IntPtr.Zero) return false;
         IntPtr button = IntPtr.Zero;
