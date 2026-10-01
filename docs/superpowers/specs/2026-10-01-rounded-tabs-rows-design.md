@@ -37,7 +37,7 @@ Give the tab strip and the sidebar lists the softer Windows 11 shapes, without l
 
 - The fills at `group_strip.rs:375-380` (active, hover, idle) go through `fill_rounded` with the top corners rounded for the active and hovered tab. The idle tab keeps the plain strip background. `behind` is `strip_background`.
 - The active tab's `editor_background` fill stays flush at the bottom with the editor.
-- The 2px top accent bar (shown only with several groups) keeps its place and is clipped to the rounded outline by being drawn first and then covered at the corners.
+- The 2px top accent bar (shown only with several groups) is inset by the tab radius on each side, so it sits on the flat part of the top edge.
 - The close button's hover and pressed squares become 4px rounded.
 - Titlebar caption buttons stay square: they sit at the window edge.
 

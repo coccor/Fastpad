@@ -4,7 +4,8 @@
 //! pointer here.
 
 use crate::config::FileIconSet;
-use crate::window::design::metrics::scale;
+use crate::window::design::metrics::{CONTROL_RADIUS, TAB_RADIUS, scale};
+use crate::window::design::round::{Corners, fill_rounded, radius_for};
 use crate::window::file_icons::NoteKind;
 use crate::window::icon_sets::TreeItem;
 use crate::window::icon_sets::images::IconImages;
@@ -339,6 +340,15 @@ pub(crate) unsafe fn paint(dc: HDC, layout: &StripLayout, dpi: u32, input: &Stri
     }
 }
 
+fn native(rect: Rect) -> RECT {
+    RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
+}
+
 unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) {
     let palette = input.palette;
     let pointer = input.pointer;
@@ -381,11 +391,28 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
         };
         let close_hovered = pointer.hovered == Some(StripTarget::CloseTab(index));
         unsafe {
-            fill(dc, tab, background);
+            let tab_radius = radius_for(&palette, TAB_RADIUS, dpi);
+            fill_rounded(
+                dc,
+                native(tab),
+                tab_radius,
+                if selected || tab_hovered {
+                    Corners::TOP
+                } else {
+                    Corners::NONE
+                },
+                background,
+                palette.strip_background,
+            );
             if selected && let Some(accent) = input.accent {
                 fill(
                     dc,
-                    Rect::new(tab.left, tab.top, tab.right, tab.top + scale(2, dpi)),
+                    Rect::new(
+                        tab.left + tab_radius,
+                        tab.top,
+                        tab.right - tab_radius,
+                        tab.top + scale(2, dpi),
+                    ),
                     accent,
                 );
             }
@@ -433,14 +460,17 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
             );
             if close_hovered {
                 let pressed = pointer.is_pressed(StripTarget::CloseTab(index));
-                fill(
+                fill_rounded(
                     dc,
-                    close.centered_square(scale(24, dpi)),
+                    native(close.centered_square(scale(24, dpi))),
+                    radius_for(&palette, CONTROL_RADIUS, dpi),
+                    Corners::ALL,
                     if pressed {
                         palette.pressed_background
                     } else {
                         palette.hover_background
                     },
+                    background,
                 );
             }
             select_font(dc, input.fonts.glyph());
@@ -614,6 +644,62 @@ mod tests {
             Some(StripTarget::CloseTab(1))
         );
         assert_eq!(pressed.release(Some(StripTarget::CloseTab(2))).1, None);
+    }
+
+    #[test]
+    fn the_active_tab_rounds_its_top_corners_and_keeps_its_bottom_flush() {
+        // Break caught: a square active tab, or a rounded bottom that leaves a notch against the
+        // editor.
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let palette = crate::window::palette::Palette::neutral();
+        assert_ne!(palette.strip_background, palette.active_tab_background());
+        let layout = StripLayout::calculate(900, 96, 3, 0);
+        let titles = ["a", "b", "c"];
+        let input = super::StripPaint {
+            titles: &titles,
+            kinds: &[],
+            icons: crate::window::palette::FileIcons::neutral(),
+            icon_set: crate::config::FileIconSet::default(),
+            light_theme: true,
+            active: 0,
+            preview_tab: None,
+            palette,
+            fonts: crate::window::titlebar::TitleFontHandles::default(),
+            pointer: StripPointer::default(),
+            accent: None,
+        };
+        let tab = layout.tab(0).unwrap();
+        let (width, height) = (layout.bounds().right, layout.bounds().bottom);
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            let previous = SelectObject(dc, bitmap);
+            super::draw(dc, &layout, 96, &input);
+            let pixel = |x, y| GetPixel(dc, x, y);
+            assert_eq!(
+                pixel(tab.left, tab.top),
+                palette.strip_background,
+                "top-left"
+            );
+            assert_eq!(
+                pixel((tab.left + tab.right) / 2, (tab.top + tab.bottom) / 2),
+                palette.active_tab_background(),
+                "middle"
+            );
+            assert_eq!(
+                pixel(tab.left, tab.bottom - 1),
+                palette.active_tab_background(),
+                "bottom-left"
+            );
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
     }
 
     #[test]

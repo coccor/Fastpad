@@ -11,10 +11,6 @@ pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
 /// The corner radius of cards, controls and buttons.
 pub(crate) const CONTROL_RADIUS: i32 = 4;
 /// The corner radius of the rounded top of a tab.
-#[allow(
-    dead_code,
-    reason = "adopted by the tab strip and the sidebar in the next tasks"
-)]
 pub(crate) const TAB_RADIUS: i32 = 8;
 /// How far a sidebar row's hover and selection fill is inset from the panel's left and right edges.
 #[allow(
