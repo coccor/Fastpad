@@ -117,7 +117,7 @@ pub(super) fn context_menu(hwnd: HWND, at: POINT) {
         items.push(("Remove Keybinding\tDelete".to_owned(), REMOVE));
     }
     if user {
-        items.push(("Reset Keybinding".to_owned(), RESET));
+        items.push(("Reset keybinding".to_owned(), RESET));
     }
     items.push((String::new(), 0));
     items.push(("Copy Command ID\tCtrl+C".to_owned(), COPY_ID));

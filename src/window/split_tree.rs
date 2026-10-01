@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_split_on_a_new_axis_wraps_the_leaf_in_a_half_and_half_branch() {
-        // Break caught: Split Right turning the whole tree into a row, or the new group landing
+        // Break caught: Split right turning the whole tree into a row, or the new group landing
         // on the wrong side.
         let mut tree = SplitTree::new(A);
         assert!(tree.split(A, Direction::Right, B));

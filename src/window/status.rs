@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn an_image_status_lists_size_format_file_size_and_zoom() {
-        // Break caught: an image tab showing a caret position and "Plain Text UTF-8".
+        // Break caught: an image tab showing a caret position and "Plain text UTF-8".
         let image = crate::window::image_host::ImageStatus {
             size: Some((1920, 1080)),
             format: Some("PNG"),

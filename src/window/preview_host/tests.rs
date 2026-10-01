@@ -13,13 +13,13 @@ fn button_hints_name_the_keymaps_cycle_key() {
     // command, or naming a key when it has none.
     assert_eq!(
         button_hint(PreviewButton::Side, Some("F9")),
-        "Open Preview to the Side (F9 cycles preview modes)"
+        "Open preview to the side (F9 cycles preview modes)"
     );
     assert_eq!(
         button_hint(PreviewButton::Full, Some("Ctrl+Shift+V")),
-        "Open Preview (Ctrl+Shift+V cycles preview modes)"
+        "Open preview (Ctrl+Shift+V cycles preview modes)"
     );
-    assert_eq!(button_hint(PreviewButton::Full, None), "Open Preview");
+    assert_eq!(button_hint(PreviewButton::Full, None), "Open preview");
     let keymap = crate::window::keymap::Keymap::defaults();
     assert_eq!(
         keymap

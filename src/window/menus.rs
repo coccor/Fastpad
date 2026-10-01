@@ -383,8 +383,8 @@ pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) ->
     }
     entries.extend([
         MenuEntry::Separator,
-        MenuEntry::command("Split Right", CommandId::SplitRight),
-        MenuEntry::command("Split Down", CommandId::SplitDown),
+        MenuEntry::command("Split right", CommandId::SplitRight),
+        MenuEntry::command("Split down", CommandId::SplitDown),
         MenuEntry::command("Close group", CommandId::CloseGroup),
     ]);
     track_popup(hwnd, &entries, POINT { x, y })

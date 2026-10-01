@@ -33,9 +33,9 @@ const CLASS_NAME: &str = "FastPadPreviewButtons";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreviewButton {
-    /// "Open Preview to the Side".
+    /// "Open preview to the side".
     Side,
-    /// "Open Preview", which replaces the editor.
+    /// "Open preview", which replaces the editor.
     Full,
 }
 

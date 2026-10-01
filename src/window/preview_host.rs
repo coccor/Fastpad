@@ -1382,8 +1382,8 @@ pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
 /// modes, when there is one.
 fn button_hint(button: PreviewButton, cycle: Option<&str>) -> String {
     let action = match button {
-        PreviewButton::Side => "Open Preview to the Side",
-        PreviewButton::Full => "Open Preview",
+        PreviewButton::Side => "Open preview to the side",
+        PreviewButton::Full => "Open preview",
     };
     match cycle {
         Some(key) => format!("{action} ({key} cycles preview modes)"),
