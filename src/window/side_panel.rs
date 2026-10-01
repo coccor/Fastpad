@@ -1384,6 +1384,7 @@ mod tests {
 
     #[test]
     fn the_text_size_factor_scales_the_sidebar_text_but_not_its_icons() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
         // Break caught: icons growing with the text-size setting, or the sidebar text ignoring it.
         use crate::window::design::{
             metrics::{ICON, SIDEBAR_ICON, scale},

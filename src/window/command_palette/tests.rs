@@ -272,6 +272,7 @@ fn matches_are_case_insensitive_and_ranked_prefix_word_substring_then_scattered(
 
 #[test]
 fn the_palette_rows_follow_the_text_size() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
     // Break caught: palette rows that stay 26 px tall while the Windows text size grows.
     use crate::window::design::text_scale::{scale_text, set_factor_for_test};
     set_factor_for_test(225);

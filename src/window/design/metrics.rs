@@ -60,6 +60,7 @@ mod tests {
 
     #[test]
     fn sidebar_row_and_panel_header_follow_the_text_size_factor() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
         // Break caught: sidebar rows and headers that stay put while the text grows to 225 %.
         use super::{panel_header, sidebar_row};
         use crate::window::design::text_scale::set_factor_for_test;

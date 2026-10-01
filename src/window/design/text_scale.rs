@@ -16,6 +16,13 @@ pub(crate) fn parse_factor(raw: Option<u32>) -> u32 {
     raw.map_or(MIN, |value| value.clamp(MIN, MAX))
 }
 
+/// Tests never read the machine's setting: it would make them depend on it.
+#[cfg(test)]
+fn read_registry() -> u32 {
+    MIN
+}
+
+#[cfg(not(test))]
 fn read_registry() -> u32 {
     use std::ffi::c_void;
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -68,6 +75,32 @@ pub(crate) fn scale_text(value: i32, dpi: u32) -> i32 {
 #[cfg(test)]
 pub(crate) fn set_factor_for_test(percent: u32) {
     FACTOR.store(percent.clamp(MIN, MAX), Ordering::Relaxed);
+}
+
+/// Restores the factor to 100 when dropped, even when the test panics.
+#[cfg(test)]
+pub(crate) struct FactorGuard;
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl FactorGuard {
+    /// A guard that leaves the factor at 100; the test sets other values itself.
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    /// Sets the factor to `percent` and restores 100 when dropped.
+    pub(crate) fn set(percent: u32) -> Self {
+        set_factor_for_test(percent);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FactorGuard {
+    fn drop(&mut self) {
+        set_factor_for_test(MIN);
+    }
 }
 
 #[cfg(test)]

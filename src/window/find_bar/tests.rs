@@ -37,6 +37,7 @@ fn find_fields_center_their_text_and_replace_mode_splits_the_bar_without_overlap
 
 #[test]
 fn the_find_bar_and_its_fields_hold_the_body_text_at_every_text_size() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
     // Break caught: a find field that clips the larger Windows text size inside a 28 px box.
     use super::{FIELD_HEIGHT_AT_96_DPI, find_bar_height};
     use crate::window::design::text_scale::{scale_text, set_factor_for_test};

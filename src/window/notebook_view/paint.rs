@@ -7,6 +7,7 @@ use crate::config::FileIconSet;
 use crate::library::tree::{RowKind, TreeRow};
 use crate::window::design::metrics::{scale, sidebar_row};
 use crate::window::design::round::paint_focus_ring;
+use crate::window::design::text_scale::scale_text;
 use crate::window::drag_label::LabelImage;
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::images::IconImages;
@@ -258,7 +259,7 @@ pub(crate) fn tab_label_image(
 pub(super) fn drag_label_size(text: i32, dpi: u32) -> SIZE {
     SIZE {
         cx: 2 * scale(LABEL_PAD, dpi) + scale(GLYPH_BOX, dpi) + scale(GAP, dpi) + text,
-        cy: scale(LABEL_HEIGHT, dpi),
+        cy: scale_text(LABEL_HEIGHT, dpi),
     }
 }
 

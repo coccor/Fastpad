@@ -590,6 +590,7 @@ mod tests {
 
     #[test]
     fn the_name_box_follows_the_text_size() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
         // Break caught: a name box that clips its field at a larger Windows text size.
         use crate::window::design::text_scale::set_factor_for_test;
         set_factor_for_test(100);

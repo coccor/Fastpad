@@ -70,6 +70,26 @@ pub(crate) fn create(style: TextStyle, dpi: u32) -> HFONT {
     )
 }
 
+/// The text height (`tmHeight`) of `style` at `dpi` and the current text-size factor, for the
+/// tests that check a row or box holds its text.
+#[cfg(test)]
+pub(crate) fn text_height_for_test(style: TextStyle, dpi: u32) -> i32 {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetTextMetricsW, ReleaseDC, SelectObject, TEXTMETRICW,
+    };
+    unsafe {
+        let font = create(style, dpi);
+        let dc = GetDC(std::ptr::null_mut());
+        let previous = SelectObject(dc, font);
+        let mut metrics = TEXTMETRICW::default();
+        GetTextMetricsW(dc, &mut metrics);
+        SelectObject(dc, previous);
+        ReleaseDC(std::ptr::null_mut(), dc);
+        DeleteObject(font);
+        metrics.tmHeight
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TextStyle, create, face};
@@ -136,6 +156,7 @@ mod tests {
 
     #[test]
     fn the_text_size_factor_scales_every_style_height() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
         // Break caught: a style ignoring the Windows text-size setting, or rounding it down.
         use crate::window::design::text_scale::set_factor_for_test;
         let height = |style: TextStyle| {

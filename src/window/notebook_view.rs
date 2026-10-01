@@ -7,6 +7,7 @@ use crate::document::DocumentId;
 use crate::library::tree::{self, NoteTree, RowKind, TreeRow};
 use crate::window::design::metrics::scale;
 use crate::window::design::metrics::sidebar_row;
+use crate::window::design::text_scale::scale_text;
 use crate::window::drag_label::DragLabel;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::inline_name::InlineName;
@@ -231,26 +232,26 @@ pub(crate) fn state_layout(body: RECT, dpi: u32) -> StateLayout {
     let right = (body.right - pad).max(left);
     let message = RECT {
         left,
-        top: body.top + scale(8, dpi),
+        top: body.top + scale_text(8, dpi),
         right,
-        bottom: body.top + scale(48, dpi),
+        bottom: body.top + scale_text(48, dpi),
     };
     let button = RECT {
         left,
-        top: message.bottom + scale(4, dpi),
+        top: message.bottom + scale_text(4, dpi),
         right: (left + scale(140, dpi)).min(right),
-        bottom: message.bottom + scale(32, dpi),
+        bottom: message.bottom + scale_text(32, dpi),
     };
     let second = RECT {
-        top: button.bottom + scale(8, dpi),
-        bottom: button.bottom + scale(8, dpi) + (button.bottom - button.top),
+        top: button.bottom + scale_text(8, dpi),
+        bottom: button.bottom + scale_text(8, dpi) + (button.bottom - button.top),
         ..button
     };
     let label = RECT {
         left,
-        top: button.bottom + scale(16, dpi),
+        top: button.bottom + scale_text(16, dpi),
         right,
-        bottom: button.bottom + scale(36, dpi),
+        bottom: button.bottom + scale_text(36, dpi),
     };
     let list = RECT {
         left: body.left,

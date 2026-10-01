@@ -6,6 +6,7 @@
 
 use super::design::metrics::scale;
 use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
+use super::design::text_scale::scale_text;
 use super::design::type_ramp::{self, TextStyle};
 use super::dropdown_list::{
     DropdownList, ListKey, ListModel, ListOutcome, ListStyle, WM_LIST_PICKED,

@@ -140,6 +140,7 @@ mod tests {
 
     #[test]
     fn the_status_bar_height_follows_the_text_size() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
         // Break caught: a status bar that clips its text at a larger Windows text size.
         use super::status_height;
         use crate::window::design::text_scale::{scale_text, set_factor_for_test};

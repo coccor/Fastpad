@@ -786,3 +786,38 @@ fn a_focused_root_row_draws_the_accent_focus_ring() {
     assert_eq!(ring_pixel(true), accent);
     assert_ne!(ring_pixel(false), accent);
 }
+
+#[test]
+fn the_no_notebook_state_and_drag_label_hold_their_text_at_every_text_size() {
+    // Break caught: the message, button, RECENT label or drag label too short for the text at a
+    // larger Windows text size, or the 100 % sizes drifting.
+    use crate::window::design::text_scale::FactorGuard;
+    use crate::window::design::type_ramp::{TextStyle, text_height_for_test};
+    let body = RECT {
+        left: 0,
+        top: 38,
+        right: 260,
+        bottom: 900,
+    };
+    let height = |rect: RECT| rect.bottom - rect.top;
+    {
+        let _factor = FactorGuard::set(100);
+        let layout = state_layout(body, 96);
+        assert_eq!(height(layout.message), 40);
+        assert_eq!(height(layout.button), 28);
+        assert_eq!(height(layout.label), 20);
+        assert_eq!(super::paint::drag_label_size(0, 96).cy, 24);
+    }
+    let _factor = FactorGuard::set(225);
+    for dpi in [96, 144] {
+        let layout = state_layout(body, dpi);
+        let text = text_height_for_test(TextStyle::Body, dpi);
+        assert!(height(layout.message) >= 2 * text, "{dpi}");
+        assert!(height(layout.button) >= text, "{dpi}");
+        assert!(height(layout.second) >= text, "{dpi}");
+        assert!(height(layout.label) >= text, "{dpi}");
+        assert!(layout.message.bottom <= layout.button.top);
+        assert!(layout.button.bottom <= layout.second.top);
+        assert!(super::paint::drag_label_size(0, dpi).cy >= text, "{dpi}");
+    }
+}

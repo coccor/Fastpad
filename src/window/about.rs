@@ -8,6 +8,7 @@
 
 use super::design::metrics::scale;
 use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
+use super::design::text_scale::scale_text;
 use super::design::type_ramp::{self, TextStyle};
 use super::modal::ModalScope;
 use super::palette::Palette;
@@ -177,7 +178,7 @@ impl Layout {
             left: title_close_left,
             top: 0,
             right: width,
-            bottom: scale(TITLE_HEIGHT_AT_96_DPI, dpi),
+            bottom: scale_text(TITLE_HEIGHT_AT_96_DPI, dpi),
         };
         let icon = RECT {
             left: padding,
@@ -201,7 +202,7 @@ impl Layout {
             left: 0,
             top: 0,
             right: width,
-            bottom: icon.bottom.max(version.bottom) + padding,
+            bottom: (icon.bottom.max(version.bottom) + padding).max(title_close.bottom),
         };
 
         let description = line(padding, header.bottom + section_gap, body_height);
@@ -224,9 +225,9 @@ impl Layout {
             left: 0,
             top: footer_top,
             right: width,
-            bottom: footer_top + scale(FOOTER_HEIGHT_AT_96_DPI, dpi),
+            bottom: footer_top + scale_text(FOOTER_HEIGHT_AT_96_DPI, dpi),
         };
-        let button_height = scale(BUTTON_HEIGHT_AT_96_DPI, dpi);
+        let button_height = scale_text(BUTTON_HEIGHT_AT_96_DPI, dpi);
         let button_top = footer.top + (footer.bottom - footer.top - button_height) / 2;
         let ok = RECT {
             left: right - scale(BUTTON_WIDTH_AT_96_DPI, dpi),
@@ -894,6 +895,32 @@ mod tests {
             "https://github.com/coccor/FastPad/blob/main/LICENSES.md"
         );
         assert!(!DESCRIPTION.is_empty());
+    }
+
+    #[test]
+    fn the_about_heights_hold_their_text_at_every_text_size() {
+        // Break caught: the title row, footer or OK button too short for the text at a larger
+        // Windows text size, or the 100 % sizes drifting.
+        use crate::window::design::text_scale::FactorGuard;
+        use crate::window::design::type_ramp::text_height_for_test;
+        let height = |rect: RECT| rect.bottom - rect.top;
+        {
+            let _factor = FactorGuard::set(100);
+            let layout = Layout::calculate(96, 24, 17, [100, 100]);
+            assert_eq!(layout.title_close.bottom, 44);
+            assert_eq!(height(layout.footer), 56);
+            assert_eq!(height(layout.ok), 30);
+        }
+        let _factor = FactorGuard::set(225);
+        for dpi in [96, 144] {
+            let body = text_height_for_test(TextStyle::Body, dpi);
+            let title = text_height_for_test(TextStyle::Title, dpi);
+            let layout = Layout::calculate(dpi, title, body, [100, 100]);
+            assert!(layout.title_close.bottom >= body, "{dpi}");
+            assert!(layout.header.bottom >= layout.title_close.bottom, "{dpi}");
+            assert!(height(layout.ok) >= body, "{dpi}");
+            assert!(height(layout.footer) > height(layout.ok), "{dpi}");
+        }
     }
 
     #[test]

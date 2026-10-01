@@ -70,6 +70,7 @@ fn the_skipped_tooltip_has_one_line_per_reason_that_skipped_a_note() {
 
 #[test]
 fn a_result_row_holds_two_lines_of_the_sidebar_text_at_every_dpi() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
     // Break caught: the snippet line clipped at 150% or 200%, or at a larger Windows text size,
     // or the bold match taller than its slot.
     use crate::window::design::text_scale::{scale_text, set_factor_for_test};
@@ -761,6 +762,7 @@ mod painting {
 
 #[test]
 fn the_search_header_lines_and_fields_fit_at_every_text_size() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
     // Break caught: at a larger Windows text size the field overflowing its 38 px header, the
     // replace field overlapping it, or the summary and status lines disagreeing with the list.
     use crate::window::design::text_scale::{scale_text, set_factor_for_test};

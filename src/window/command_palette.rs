@@ -532,7 +532,8 @@ pub(crate) struct CommandPalette {
     list_brush: HBRUSH,
     /// The list's font when the bold one was made, and the bold one; null until a quick-open
     /// row is first drawn.
-    bold: Cell<(HFONT, HFONT)>,
+    /// The bold font, with the list font, DPI and text-size factor it was made for.
+    bold: Cell<(HFONT, (u32, u32), HFONT)>,
     /// How many times a mode switch marked the field for its hint to come or go, for
     /// in-process tests (their windows are never shown, so they have no update region).
     #[cfg(test)]
@@ -583,7 +584,7 @@ impl CommandPalette {
             layout: None,
             field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
             list_brush: unsafe { CreateSolidBrush(colors.strip_background) },
-            bold: Cell::new((std::ptr::null_mut(), std::ptr::null_mut())),
+            bold: Cell::new((std::ptr::null_mut(), (0, 0), std::ptr::null_mut())),
             #[cfg(test)]
             hint_repaints: 0,
         })
@@ -1111,11 +1112,16 @@ impl CommandPalette {
         }
     }
 
-    /// `base` in bold, made on first use and again when the list's font changes (a DPI change).
+    /// `base` in bold, made on first use and again when the list's font, the DPI or the text-size
+    /// factor changes (a recycled handle value alone does not prove the font is the same).
     /// A list with no font yet uses the default GUI font's metrics.
     fn bold_font(&self, base: HFONT) -> HFONT {
-        let (made_for, bold) = self.bold.get();
-        if made_for == base && !bold.is_null() {
+        let key = (
+            self.layout.as_ref().map_or(0, |layout| layout.dpi),
+            crate::window::design::text_scale::factor(),
+        );
+        let (made_for, made_at, bold) = self.bold.get();
+        if made_for == base && made_at == key && !bold.is_null() {
             return bold;
         }
         if !bold.is_null() {
@@ -1142,7 +1148,7 @@ impl CommandPalette {
             font.lfWeight = FW_BOLD as i32;
             unsafe { CreateFontIndirectW(&font) }
         };
-        self.bold.set((base, bold));
+        self.bold.set((base, key, bold));
         bold
     }
 
@@ -1215,7 +1221,7 @@ impl CommandPalette {
 
     #[cfg(test)]
     pub(crate) fn has_bold_font(&self) -> bool {
-        !self.bold.get().1.is_null()
+        !self.bold.get().2.is_null()
     }
 
     #[cfg(test)]
@@ -1320,7 +1326,7 @@ fn draw_runs(
 
 impl Drop for CommandPalette {
     fn drop(&mut self) {
-        let (_, bold) = self.bold.get();
+        let (_, _, bold) = self.bold.get();
         unsafe {
             DeleteObject(self.field_brush);
             DeleteObject(self.list_brush);

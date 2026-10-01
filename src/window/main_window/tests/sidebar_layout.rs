@@ -566,6 +566,7 @@ fn dragging_the_sidebar_edge_resizes_it_and_saves_the_width_once_on_release() {
 
 #[test]
 fn the_sidebar_fonts_are_rebuilt_when_only_the_text_size_changes() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
     // Break caught: a text-size change leaving the old fonts in the cache, so the sidebar keeps
     // its old text size until the DPI changes.
     use crate::window::design::text_scale::set_factor_for_test;
@@ -597,6 +598,7 @@ fn the_sidebar_fonts_are_rebuilt_when_only_the_text_size_changes() {
 
 #[test]
 fn a_text_size_change_refreshes_the_stored_sidebar_row_heights() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
     // Break caught: the Favorites rows keeping their old height after the text size changes, so
     // the larger text clips until the rows reload.
     use crate::window::design::text_scale::set_factor_for_test;
