@@ -397,6 +397,10 @@ fn a_background_dirty_tab_is_replaced_in_the_editor_not_on_disk() {
         )),
         "c is closed: the warning shows"
     );
+    assert_eq!(
+        crate::window::modal::take_last_confirm_action().as_deref(),
+        Some("Replace")
+    );
 
     assert_eq!(
         std::fs::read_to_string(&a).unwrap(),
@@ -464,6 +468,10 @@ fn replace_all_writes_the_closed_notes_updates_the_library_and_searches_again() 
         Some(format!(
             "Replace 3 matches in 2 notes with \"pin\"?{SAVED_LINE}"
         ))
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm_action().as_deref(),
+        Some("Replace")
     );
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "one pin, two pin\r\n");
     assert_eq!(std::fs::read_to_string(&b).unwrap(), "pin\n");

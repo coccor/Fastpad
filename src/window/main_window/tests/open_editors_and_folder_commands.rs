@@ -450,6 +450,10 @@ fn deleting_a_folder_recycles_it_closes_its_tabs_and_removes_its_rows() {
         crate::window::modal::take_last_confirm().as_deref(),
         Some("Move the folder \u{201c}empty\u{201d} to the Recycle Bin?")
     );
+    assert_eq!(
+        crate::window::modal::take_last_confirm_action().as_deref(),
+        Some("Delete")
+    );
     assert!(
         scratch.folder().join("empty").exists(),
         "Cancel deletes nothing"
@@ -460,6 +464,10 @@ fn deleting_a_folder_recycles_it_closes_its_tabs_and_removes_its_rows() {
     assert_eq!(
         crate::window::modal::take_last_confirm().as_deref(),
         Some("Move \u{201c}sub\u{201d} and its 2 notes to the Recycle Bin?")
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm_action().as_deref(),
+        Some("Delete")
     );
     assert!(!scratch.folder().join("sub").exists());
     assert!(

@@ -553,6 +553,10 @@ fn deleting_a_note_with_unsaved_edits_says_they_are_discarded() {
         crate::window::modal::take_last_confirm().as_deref(),
         Some("Move \u{201c}a.md\u{201d} to the Recycle Bin?")
     );
+    assert_eq!(
+        crate::window::modal::take_last_confirm_action().as_deref(),
+        Some("Delete")
+    );
     editor.set_text("unsaved").unwrap();
     crate::window::answer_next_confirm(|_| false);
     execute_command(window.hwnd, CommandId::NoteDelete);

@@ -1,7 +1,6 @@
 //! The themed prompt that replaces `MessageBoxW` for the close and confirm questions: an owned
 //! popup in the theme's colors with action-named buttons, running its own modal loop like
 //! `about.rs`. This file's first half is pure layout and key logic.
-#![allow(dead_code, reason = "used by modal.rs from Task 4")]
 
 use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, scale};
 use super::design::text_scale::scale_text;

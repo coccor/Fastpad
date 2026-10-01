@@ -81,11 +81,11 @@ pub(super) fn report(hwnd: HWND, result: Result<(), LibraryError>) {
 }
 
 /// Asks `question`; false also when the window went away meanwhile.
-pub(crate) fn confirmed(hwnd: HWND, question: &str) -> bool {
+pub(crate) fn confirmed(hwnd: HWND, question: &str, action: &str) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
-    crate::window::modal::confirm(hwnd, question) && identity.is_live_for(hwnd)
+    crate::window::modal::confirm(hwnd, question, action) && identity.is_live_for(hwnd)
 }
 
 /// Pins or unpins `path`. Only a note inside the open notebook can be pinned: version 2 of

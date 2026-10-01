@@ -674,7 +674,7 @@ fn the_debounce_waits_out_a_modal_loop_and_a_file_population() {
         crate::window::text_search_host::timer(hwnd);
         true
     });
-    assert!(crate::window::modal::confirm(window.hwnd, "Go on?"));
+    assert!(crate::window::modal::confirm(window.hwnd, "Go on?", "Go"));
     assert!(
         crate::window::text_search_host::cancel_flag(window.hwnd).is_none(),
         "nothing ran inside the modal loop"

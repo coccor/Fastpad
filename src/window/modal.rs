@@ -1,17 +1,14 @@
-//! Nested modal loops (common file dialogs, `MessageBoxW`) re-enter the window procedure. While one
+//! Nested modal loops (common file dialogs, the themed prompt) re-enter the window procedure. While one
 //! runs, deferred startup units, the IPC drain, and recovery snapshots are held back so they cannot
 //! change which document the modal operation ends up acting on.
 
-use super::main_window::{app_ptr, window_identity};
+use super::main_window::{app_ptr, current_palette, window_identity};
+use super::prompt;
 use crate::app::WindowIdentity;
 use crate::document::CloseDecision;
-use crate::platform::wide_null;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IDCANCEL, IDNO, IDOK, IDYES, MB_ICONWARNING, MB_OKCANCEL, MB_YESNOCANCEL, MessageBoxW,
-    PostMessageW,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 /// Raises `App::modal_depth` for its lifetime; leaving the outermost scope re-posts held messages.
 pub(super) struct ModalScope {
@@ -76,6 +73,20 @@ pub(super) fn hold_while_modal(hwnd: HWND, message: u32) -> bool {
     })
 }
 
+/// Message, button labels (primary first, Cancel last) and quick keys of the close prompt.
+fn close_spec(title: &str) -> (String, [&'static str; 3], [(u16, usize); 2]) {
+    (
+        format!("Save changes to {title}?"),
+        ["Save", "Don't save", "Cancel"],
+        [(u16::from(b'S'), 0), (u16::from(b'D'), 1)],
+    )
+}
+
+/// Button labels of a confirmation: the action, then Cancel.
+fn confirm_labels(action: &str) -> [String; 2] {
+    [action.to_owned(), "Cancel".to_owned()]
+}
+
 /// The only modal prompt FastPad shows outside startup-fatal errors.
 pub(super) fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
     let _modal = ModalScope::enter(hwnd);
@@ -83,19 +94,15 @@ pub(super) fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
     if let Some(answer) = CLOSE_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return answer(hwnd);
     }
-    let message = wide_null(&format!("Save changes to {title} before closing?"));
-    let caption = wide_null("FastPad");
-    match unsafe {
-        MessageBoxW(
-            hwnd,
-            message.as_ptr(),
-            caption.as_ptr(),
-            MB_YESNOCANCEL | MB_ICONWARNING,
-        )
-    } {
-        IDYES => CloseDecision::Save,
-        IDNO => CloseDecision::Discard,
-        IDCANCEL => CloseDecision::Cancel,
+    let (message, buttons, quick) = close_spec(title);
+    let spec = prompt::Spec {
+        message: &message,
+        buttons: &buttons,
+        quick_keys: &quick,
+    };
+    match prompt::show(hwnd, current_palette(hwnd), &spec) {
+        0 => CloseDecision::Save,
+        1 => CloseDecision::Discard,
         _ => CloseDecision::Cancel,
     }
 }
@@ -131,25 +138,27 @@ pub(crate) fn choose_folder(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
     crate::window::commands::choose_folder_path(hwnd)
 }
 
-/// OK/Cancel warning. Returns whether the user chose OK.
-pub(crate) fn confirm(hwnd: HWND, text: &str) -> bool {
+/// Themed two-button confirmation: `action` is the primary button, Cancel the other. Returns
+/// whether the user chose `action`.
+pub(crate) fn confirm(hwnd: HWND, text: &str, action: &str) -> bool {
     let _modal = ModalScope::enter(hwnd);
     #[cfg(test)]
-    LAST_CONFIRM.with(|last| *last.borrow_mut() = Some(text.to_owned()));
+    {
+        LAST_CONFIRM.with(|last| *last.borrow_mut() = Some(text.to_owned()));
+        LAST_CONFIRM_ACTION.with(|last| *last.borrow_mut() = Some(action.to_owned()));
+    }
     #[cfg(test)]
     if let Some(answer) = CONFIRM_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return answer(hwnd);
     }
-    let text = wide_null(text);
-    let caption = wide_null("FastPad");
-    unsafe {
-        MessageBoxW(
-            hwnd,
-            text.as_ptr(),
-            caption.as_ptr(),
-            MB_OKCANCEL | MB_ICONWARNING,
-        ) == IDOK
-    }
+    let [primary, cancel] = confirm_labels(action);
+    let buttons = [primary.as_str(), cancel.as_str()];
+    let spec = prompt::Spec {
+        message: text,
+        buttons: &buttons,
+        quick_keys: &[],
+    };
+    prompt::show(hwnd, current_palette(hwnd), &spec) == 0
 }
 
 #[cfg(test)]
@@ -168,6 +177,8 @@ thread_local! {
     static LAST_SAVE_REQUEST: std::cell::RefCell<Option<(String, Option<PathBuf>)>> =
         const { std::cell::RefCell::new(None) };
     static LAST_CONFIRM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static LAST_CONFIRM_ACTION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The question the last confirm asked.
@@ -180,6 +191,16 @@ pub(crate) fn take_last_confirm() -> Option<String> {
     LAST_CONFIRM.with(|last| last.borrow_mut().take())
 }
 
+/// The primary-button label the last confirm was shown with.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn take_last_confirm_action() -> Option<String> {
+    LAST_CONFIRM_ACTION.with(|last| last.borrow_mut().take())
+}
+
 /// The suggested name and starting folder the last Save As dialog was opened with.
 #[cfg(test)]
 #[allow(
@@ -190,7 +211,7 @@ pub(crate) fn take_last_save_request() -> Option<(String, Option<PathBuf>)> {
     LAST_SAVE_REQUEST.with(|last| last.borrow_mut().take())
 }
 
-/// Answers the next close prompt from inside its modal scope instead of showing `MessageBoxW`.
+/// Answers the next close prompt from inside its modal scope instead of showing the themed prompt.
 #[cfg(test)]
 pub(crate) fn answer_next_close_prompt(answer: impl FnOnce(HWND) -> CloseDecision + 'static) {
     CLOSE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
@@ -212,4 +233,23 @@ pub(crate) fn answer_next_folder_dialog(answer: impl FnOnce(HWND) -> Option<Path
 #[cfg(test)]
 pub(crate) fn answer_next_confirm(answer: impl FnOnce(HWND) -> bool + 'static) {
     CONFIRM_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_spec_offers_save_dont_save_cancel() {
+        let (message, buttons, quick) = close_spec("notes.txt");
+        assert_eq!(message, "Save changes to notes.txt?");
+        assert_eq!(buttons, ["Save", "Don't save", "Cancel"]);
+        assert_eq!(quick, [(u16::from(b'S'), 0), (u16::from(b'D'), 1)]);
+    }
+
+    #[test]
+    fn confirm_labels_name_the_action_then_cancel() {
+        assert_eq!(confirm_labels("Replace"), ["Replace", "Cancel"]);
+        assert_eq!(confirm_labels("Delete"), ["Delete", "Cancel"]);
+    }
 }

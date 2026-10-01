@@ -224,7 +224,11 @@ fn a_new_search_drops_a_replace_that_has_not_asked_yet() {
     assert!(!crate::window::text_search_host::replacing(window.hwnd));
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "needle other");
     // The queued answer was never used: take it, so no later test gets it.
-    assert!(!crate::window::modal::confirm(window.hwnd, "drain"));
+    assert!(!crate::window::modal::confirm(
+        window.hwnd,
+        "drain",
+        "Drain"
+    ));
     crate::window::modal::take_last_confirm();
 }
 
