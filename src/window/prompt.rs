@@ -546,6 +546,9 @@ unsafe extern "system" fn prompt_proc(
                     prompt.focus = next_focus(prompt.focus, prompt.labels.len(), !back);
                 }
                 invalidate(hwnd);
+            } else if (lparam >> 30) & 1 != 0 && key != VK_ESCAPE {
+                // An auto-repeat of a key held down when the prompt opened must not answer it:
+                // the primary can be Delete or Replace.
             } else {
                 let choice = state(hwnd).and_then(|prompt| {
                     key_choice(key, prompt.focus, prompt.labels.len(), &prompt.quick)
@@ -947,6 +950,29 @@ mod tests {
         let owner = Owner::new();
         answer_next(answer);
         show(owner.0, Palette::neutral(), spec)
+    }
+
+    #[test]
+    fn a_held_enter_does_not_answer_but_the_next_press_does() {
+        // Break caught: Enter held down while the prompt opens auto-repeating into it and
+        // choosing a destructive primary before anyone has read it.
+        assert_eq!(
+            answered(&DELETE, |dialog| unsafe {
+                // Bit 30 of lparam is the previous key state: set on an auto-repeat.
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 1 << 30);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_ESCAPE), 1 << 30);
+            }),
+            1,
+            "the repeat was ignored, so only the Esc repeat (always Cancel) answered"
+        );
+        assert_eq!(
+            answered(&DELETE, |dialog| unsafe {
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 1 << 30);
+                PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);
+            }),
+            0,
+            "a fresh press still answers"
+        );
     }
 
     #[test]
