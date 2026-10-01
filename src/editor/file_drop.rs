@@ -2,10 +2,14 @@
 //! target accepts only text, so a file dragged from Explorer onto the editor is refused and never
 //! becomes the parent's `WM_DROPFILES`. `accept_file_drops` wraps Scintilla's target: a drag that
 //! offers `CF_HDROP` is taken here and its paths go to a callback, and every other drag (text
-//! dragged within or into the editor) goes to Scintilla's own target unchanged.
+//! dragged within or into the editor) goes to Scintilla's own target unchanged. The callbacks also
+//! hear where a file drag hovers and when it leaves, for the drop overlay.
+//! `accept_file_drops_on` puts the same target, with no Scintilla behind it, on a window that has
+//! none: the editor group's, which OLE reaches over the strips and margins.
 //!
 //! Scintilla revokes whatever target is registered when its window is destroyed, which releases the
-//! wrapper, and the wrapper releases Scintilla's target and the callback.
+//! wrapper, and the wrapper releases Scintilla's target and the callbacks. A group window revokes
+//! its own (`revoke_file_drops`).
 
 use crate::platform::ole_drop::{
     DropTargetVtbl, Unknown, dropped_files, is_drop_target_iid, offers_files,
@@ -32,7 +36,11 @@ struct FileDropTarget {
     inner: Unknown,
     /// Whether the drag in progress offers files and so is ours rather than Scintilla's.
     files: Cell<bool>,
-    on_files: Box<dyn Fn(Vec<PathBuf>)>,
+    on_files: Box<dyn Fn(Vec<PathBuf>, POINTL)>,
+    /// A file drag is over the window at this screen point.
+    on_hover: Box<dyn Fn(POINTL)>,
+    /// A file drag left the window, or ended on it.
+    on_leave: Box<dyn Fn()>,
 }
 
 static FILE_DROP_VTBL: DropTargetVtbl = DropTargetVtbl {
@@ -47,35 +55,86 @@ static FILE_DROP_VTBL: DropTargetVtbl = DropTargetVtbl {
 
 /// Replaces the drop target Scintilla registered on `scintilla` with one that sends dropped files
 /// to `on_files` and everything else to Scintilla. Calling it again on the same window does nothing.
+#[cfg(test)]
 pub(crate) fn accept_file_drops(
     scintilla: HWND,
     on_files: impl Fn(Vec<PathBuf>) + 'static,
 ) -> Result<()> {
-    let inner = registered_target(scintilla);
-    if inner.is_null() {
-        return Err(FastPadError::Invariant(
-            "the editor window has no registered drop target",
-        ));
-    }
+    accept_file_drops_with(scintilla, move |paths, _| on_files(paths), |_| {}, || {})
+}
+
+/// `accept_file_drops`, also telling `on_hover` where a file drag is over the editor (a screen
+/// point), `on_leave` when it goes, and `on_files` where it dropped.
+pub(crate) fn accept_file_drops_with(
+    scintilla: HWND,
+    on_files: impl Fn(Vec<PathBuf>, POINTL) + 'static,
+    on_hover: impl Fn(POINTL) + 'static,
+    on_leave: impl Fn() + 'static,
+) -> Result<()> {
+    install(scintilla, true, on_files, on_hover, on_leave)
+}
+
+/// Registers a file drop target on `window`, which has none of its own (an editor group's window,
+/// which OLE reaches when the pointer is over it and not over the editor). Drags that offer no
+/// files are refused.
+pub(crate) fn accept_file_drops_on(
+    window: HWND,
+    on_files: impl Fn(Vec<PathBuf>, POINTL) + 'static,
+    on_hover: impl Fn(POINTL) + 'static,
+    on_leave: impl Fn() + 'static,
+) -> Result<()> {
+    crate::platform::ole_drop::ensure_ole();
+    install(window, false, on_files, on_hover, on_leave)
+}
+
+/// Registers the file drop target on `window`. With `wrap`, it wraps the target Scintilla
+/// registered there; without, the window must have none. Already ours: nothing to do.
+fn install(
+    window: HWND,
+    wrap: bool,
+    on_files: impl Fn(Vec<PathBuf>, POINTL) + 'static,
+    on_hover: impl Fn(POINTL) + 'static,
+    on_leave: impl Fn() + 'static,
+) -> Result<()> {
+    let inner = registered_target(window);
     if is_file_drop_target(inner) {
         return Ok(());
     }
-    unsafe { (vtbl(inner).add_ref)(inner) };
+    match (wrap, inner.is_null()) {
+        (true, true) => {
+            return Err(FastPadError::Invariant(
+                "the editor window has no registered drop target",
+            ));
+        }
+        (false, false) => {
+            return Err(FastPadError::Invariant(
+                "the window already has a drop target",
+            ));
+        }
+        (true, false) => unsafe {
+            (vtbl(inner).add_ref)(inner);
+        },
+        (false, true) => {}
+    }
     let target = Box::into_raw(Box::new(FileDropTarget {
         vtbl: &FILE_DROP_VTBL,
         refs: Cell::new(1),
         inner,
         files: Cell::new(false),
         on_files: Box::new(on_files),
+        on_hover: Box::new(on_hover),
+        on_leave: Box::new(on_leave),
     }))
     .cast::<c_void>();
     let result = unsafe {
-        RevokeDragDrop(scintilla);
-        RegisterDragDrop(scintilla, target)
+        if wrap {
+            RevokeDragDrop(window);
+        }
+        RegisterDragDrop(window, target)
     };
-    if result < 0 {
+    if result < 0 && wrap {
         // Put Scintilla's own target back so text drag-and-drop keeps working.
-        unsafe { RegisterDragDrop(scintilla, inner) };
+        unsafe { RegisterDragDrop(window, inner) };
     }
     // OLE holds its own reference when registration succeeded; this drops the creation reference.
     unsafe { release(target) };
@@ -95,12 +154,27 @@ pub(crate) fn is_file_drop_target(target: *mut c_void) -> bool {
     !target.is_null() && std::ptr::eq(vtbl(target), &FILE_DROP_VTBL)
 }
 
+/// Revokes the file drop target `accept_file_drops_on` registered on `window`, which releases
+/// it. Called as the window is destroyed; Scintilla revokes its own.
+pub(crate) fn revoke_file_drops(window: HWND) {
+    if is_file_drop_target(registered_target(window)) {
+        unsafe { RevokeDragDrop(window) };
+    }
+}
+
 fn vtbl<'a>(object: Unknown) -> &'a DropTargetVtbl {
     unsafe { &**(object as *const *const DropTargetVtbl) }
 }
 
 fn this<'a>(object: Unknown) -> &'a FileDropTarget {
     unsafe { &*(object as *const FileDropTarget) }
+}
+
+/// A drag with nothing this window takes.
+fn refuse(effect: *mut u32) {
+    if !effect.is_null() {
+        unsafe { *effect = DROPEFFECT_NONE };
+    }
 }
 
 /// Copy is the only effect a file drop offers, and only when the source allows it.
@@ -148,7 +222,9 @@ unsafe extern "system" fn release(object: Unknown) -> u32 {
     target.refs.set(refs);
     if refs == 0 {
         let target = unsafe { Box::from_raw(object.cast::<FileDropTarget>()) };
-        unsafe { (vtbl(target.inner).release)(target.inner) };
+        if !target.inner.is_null() {
+            unsafe { (vtbl(target.inner).release)(target.inner) };
+        }
     }
     refs
 }
@@ -164,6 +240,11 @@ unsafe extern "system" fn drag_enter(
     target.files.set(offers_files(data));
     if target.files.get() {
         copy_effect(effect);
+        (target.on_hover)(point);
+        return S_OK;
+    }
+    if target.inner.is_null() {
+        refuse(effect);
         return S_OK;
     }
     unsafe { (vtbl(target.inner).drag_enter)(target.inner, data, keys, point, effect) }
@@ -178,6 +259,11 @@ unsafe extern "system" fn drag_over(
     let target = this(object);
     if target.files.get() {
         copy_effect(effect);
+        (target.on_hover)(point);
+        return S_OK;
+    }
+    if target.inner.is_null() {
+        refuse(effect);
         return S_OK;
     }
     unsafe { (vtbl(target.inner).drag_over)(target.inner, keys, point, effect) }
@@ -186,6 +272,10 @@ unsafe extern "system" fn drag_over(
 unsafe extern "system" fn drag_leave(object: Unknown) -> HRESULT {
     let target = this(object);
     if target.files.replace(false) {
+        (target.on_leave)();
+        return S_OK;
+    }
+    if target.inner.is_null() {
         return S_OK;
     }
     unsafe { (vtbl(target.inner).drag_leave)(target.inner) }
@@ -200,12 +290,17 @@ unsafe extern "system" fn drop_on(
 ) -> HRESULT {
     let target = this(object);
     if !target.files.replace(false) {
+        if target.inner.is_null() {
+            refuse(effect);
+            return S_OK;
+        }
         return unsafe { (vtbl(target.inner).drop)(target.inner, data, keys, point, effect) };
     }
     copy_effect(effect);
+    (target.on_leave)();
     let paths = dropped_files(data);
     if !paths.is_empty() {
-        (target.on_files)(paths);
+        (target.on_files)(paths, point);
     }
     S_OK
 }
@@ -277,6 +372,33 @@ pub(crate) mod test_support {
         paths: &[&Path],
     ) -> [u32; 3] {
         drag_and_drop_at(hwnd, paths, POINTL { x: 1, y: 1 })
+    }
+
+    /// Runs DragEnter and DragOver at screen point `point` on the target registered on `hwnd`,
+    /// then `during`, then DragLeave: a drag that hovers and goes.
+    pub(crate) fn hover_at(
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        paths: &[&Path],
+        point: POINTL,
+        during: impl FnOnce(),
+    ) {
+        let target = super::registered_target(hwnd);
+        assert!(!target.is_null(), "no drop target is registered");
+        let mut data = FakeData {
+            vtbl: &FAKE_VTBL,
+            paths: paths.iter().map(|path| path.to_path_buf()).collect(),
+        };
+        let data = (&mut data as *mut FakeData).cast::<std::ffi::c_void>();
+        let target_vtbl = vtbl(target);
+        let mut effect = super::DROPEFFECT_COPY;
+        unsafe {
+            let _ = (target_vtbl.drag_enter)(target, data, 0, point, &mut effect);
+            let _ = (target_vtbl.drag_over)(target, 0, point, &mut effect);
+        }
+        during();
+        unsafe {
+            let _ = (target_vtbl.drag_leave)(target);
+        }
     }
 
     /// `drag_and_drop` with the pointer at screen point `point`. A refused DragOver ends in

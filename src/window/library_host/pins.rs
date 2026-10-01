@@ -119,3 +119,15 @@ pub(crate) fn toggle_pin(hwnd: HWND, path: &Path) {
     );
     crate::window::side_panel::refresh(hwnd);
 }
+
+/// The open notebook's pinned notes that are still listed, as paths relative to it; empty while
+/// no notebook state is loaded.
+pub(crate) fn pinned_notes(hwnd: HWND) -> Vec<PathBuf> {
+    with_state(hwnd, |state| {
+        library::pinned_paths(&state.library)
+            .into_iter()
+            .filter(|path| state.is_listed(path))
+            .collect()
+    })
+    .unwrap_or_default()
+}

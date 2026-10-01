@@ -362,29 +362,70 @@ pub(crate) fn accept_editor_file_drops(hwnd: HWND) {
     crate::window::side_panel::accept_file_drops(hwnd);
 }
 
-/// Wraps `editor`'s drop target so its files open in group window `group`.
-pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
-    let (target, group) = (hwnd as isize, group as usize);
-    // Text drag-and-drop still works without the wrapper; only file drops on the editor are lost.
-    let _ = crate::editor::file_drop::accept_file_drops(editor, move |paths| {
-        let payload = Box::into_raw(Box::new(paths));
-        if unsafe {
-            PostMessageW(
-                target as HWND,
-                crate::window::WM_FASTPAD_FILES_DROPPED,
-                group,
-                payload as isize,
-            )
-        } == 0
-        {
-            drop(unsafe { Box::from_raw(payload) });
-        }
-    });
+/// What an Explorer drop on an editor carries to the window: the files, and the edge of the group
+/// the drop was on, if it was on one (the drop splits there, as a tab's does).
+struct EditorDrop {
+    paths: Vec<PathBuf>,
+    split: Option<crate::window::split_tree::Direction>,
 }
 
-/// `WM_FASTPAD_FILES_DROPPED`: frees the posted paths and opens them in the group of window
-/// `wparam`, else the active one. A drop that lands while a modal dialog runs is ignored, as
-/// `WM_DROPFILES` is for a disabled window.
+/// Makes files dropped on `editor`, and on the rest of its group window `group` (the strips and
+/// margins, which OLE reaches instead of the editor), open in that group, with the drop overlay a
+/// tab drag shows: the whole group, or the half an edge would split off.
+pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
+    use crate::window::group_drop::{Action, decide_open};
+    use windows_sys::Win32::Foundation::{POINT, POINTL};
+    type Handlers = (
+        Box<dyn Fn(Vec<PathBuf>, POINTL)>,
+        Box<dyn Fn(POINTL)>,
+        Box<dyn Fn()>,
+    );
+    let (target, group_id) = (hwnd as isize, group as usize);
+    let handlers = move || -> Handlers {
+        let at = move |point: POINTL| {
+            let point = POINT {
+                x: point.x,
+                y: point.y,
+            };
+            let found = crate::window::tab_drag::target_at(target as HWND, point);
+            (found, found.map(decide_open))
+        };
+        (
+            Box::new(move |paths, point| {
+                let split = match at(point).1 {
+                    Some(Action::Split { direction, .. }) => Some(direction),
+                    _ => None,
+                };
+                let payload = Box::into_raw(Box::new(EditorDrop { paths, split }));
+                if unsafe {
+                    PostMessageW(
+                        target as HWND,
+                        crate::window::WM_FASTPAD_FILES_DROPPED,
+                        group_id,
+                        payload as isize,
+                    )
+                } == 0
+                {
+                    drop(unsafe { Box::from_raw(payload) });
+                }
+            }),
+            Box::new(move |point| {
+                let (found, action) = at(point);
+                crate::window::tab_drag::show_feedback(target as HWND, found, action);
+            }),
+            Box::new(move || crate::window::tab_drag::hide_feedback(target as HWND)),
+        )
+    };
+    // Text drag-and-drop still works without the wrappers; only file drops are lost.
+    let (files, hover, leave) = handlers();
+    let _ = crate::editor::file_drop::accept_file_drops_with(editor, files, hover, leave);
+    let (files, hover, leave) = handlers();
+    let _ = crate::editor::file_drop::accept_file_drops_on(group, files, hover, leave);
+}
+
+/// `WM_FASTPAD_FILES_DROPPED`: frees the posted drop and opens its files in the group of window
+/// `wparam`, else the active one, or in a group split off it. A drop that lands while a modal
+/// dialog runs is ignored, as `WM_DROPFILES` is for a disabled window.
 pub(crate) fn editor_files_dropped(
     hwnd: HWND,
     wparam: windows_sys::Win32::Foundation::WPARAM,
@@ -393,17 +434,24 @@ pub(crate) fn editor_files_dropped(
     if lparam == 0 {
         return;
     }
-    let paths = *unsafe { Box::from_raw(lparam as *mut Vec<PathBuf>) };
+    let EditorDrop { paths, split } = *unsafe { Box::from_raw(lparam as *mut EditorDrop) };
     if crate::window::modal::modal_active(hwnd) {
         return;
     }
     if let Some(group) = crate::window::main_window::group_id_of(hwnd, wparam as HWND) {
-        crate::window::main_window::activate_group(hwnd, group);
+        let target = match split {
+            Some(direction) => crate::window::main_window::split_group(hwnd, group, direction),
+            None => Some(group),
+        };
+        if let Some(target) = target {
+            crate::window::main_window::activate_group(hwnd, target);
+        }
     }
     files_dropped(hwnd, paths);
 }
 
-/// Dropped folders open as the library (the last one wins); dropped files open as tabs.
+/// Dropped folders open as the library (the last one wins); dropped files open as normal tabs,
+/// a preview of one becoming normal.
 pub(crate) fn files_dropped(hwnd: HWND, paths: Vec<PathBuf>) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
@@ -415,8 +463,11 @@ pub(crate) fn files_dropped(hwnd: HWND, paths: Vec<PathBuf>) {
         }
         if path.is_dir() {
             folder = Some(path);
-        } else if let Err(error) = crate::window::main_window::open_path(hwnd, &path) {
-            crate::window::main_window::report_open_failure(hwnd, &path, &error);
+        } else {
+            match crate::window::main_window::open_path(hwnd, &path) {
+                Ok(()) => promote_tab_for(hwnd, &path),
+                Err(error) => crate::window::main_window::report_open_failure(hwnd, &path, &error),
+            }
         }
     }
     if let Some(folder) = folder

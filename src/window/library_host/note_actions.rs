@@ -253,7 +253,7 @@ pub(super) fn save_before_move(hwnd: HWND, note: &Path) -> bool {
 }
 
 /// Makes the tab that has `path` open a normal tab if it is the preview.
-pub(super) fn promote_tab_for(hwnd: HWND, path: &Path) {
+pub(crate) fn promote_tab_for(hwnd: HWND, path: &Path) {
     let promoted = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let tabs = &mut unsafe { app.as_mut() }.tabs;
         tabs.find_stored_path(path)

@@ -903,6 +903,14 @@ impl NotebookView {
                         hover_close && look.hover,
                     );
                 }
+                Some(crate::window::open_editors::EditorEntry::PinnedHeader) => {
+                    crate::window::open_editors::draw_pinned_header(dc, rect, paint);
+                }
+                Some(crate::window::open_editors::EditorEntry::Pinned(row)) => {
+                    crate::window::open_editors::draw_pinned_row(
+                        dc, row, rect, look, paint, images,
+                    );
+                }
                 None => {}
             },
         );

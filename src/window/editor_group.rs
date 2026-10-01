@@ -12,7 +12,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, DefWindowProcW, IDC_ARROW, IDC_SIZEWE, LoadCursorW, OBJID_CLIENT, RegisterClassW,
     SendMessageW, SetCursor, WM_CAPTURECHANGED, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_GETOBJECT,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
     WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
@@ -153,6 +153,11 @@ unsafe extern "system" fn group_proc(
             0
         }
         WM_ERASEBKGND => 1,
+        // OLE holds the group's file drop target until it is revoked.
+        WM_DESTROY => {
+            crate::editor::file_drop::revoke_file_drops(hwnd);
+            0
+        }
         WM_PAINT => {
             super::main_window::paint_group(main, hwnd);
             0

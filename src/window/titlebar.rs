@@ -814,9 +814,8 @@ pub(crate) fn track_pointer_leave(hwnd: HWND, nonclient: bool) {
 }
 
 /// Best-effort dark frame and editor scrollbars; failures silently keep the light appearance.
-pub(crate) fn apply_frame_theme(hwnd: HWND, editor: HWND, dark: bool) {
+pub(crate) fn apply_frame_theme(hwnd: HWND, dark: bool) {
     let enabled = windows_sys::core::BOOL::from(dark);
-    let theme = crate::platform::wide_null("DarkMode_Explorer");
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -824,6 +823,14 @@ pub(crate) fn apply_frame_theme(hwnd: HWND, editor: HWND, dark: bool) {
             (&raw const enabled).cast(),
             std::mem::size_of::<windows_sys::core::BOOL>() as u32,
         );
+    }
+}
+
+/// Gives `editor`'s scrollbars the dark or the light system look. Every group's editor needs it:
+/// a new split group's editor starts light.
+pub(crate) fn apply_scrollbar_theme(editor: HWND, dark: bool) {
+    let theme = crate::platform::wide_null("DarkMode_Explorer");
+    unsafe {
         let _ = SetWindowTheme(
             editor,
             if dark {

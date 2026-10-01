@@ -135,6 +135,8 @@ pub(crate) fn rebuild(hwnd: HWND) {
     }
     // A started drag's band and cursor follow the rows that moved under its pointer.
     retarget_drag(hwnd, Instant::now());
+    // The Pinned part follows the library's pins.
+    editors_changed(hwnd);
     // The field follows its row, or goes with an edit the rebuild ended (inline naming spec §5.4).
     crate::window::inline_name::place(hwnd);
 }

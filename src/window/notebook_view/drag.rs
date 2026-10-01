@@ -184,6 +184,7 @@ pub(super) fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
     let over_group = !accepted
         && source.is_some_and(|source| {
             group_drop_at(hwnd, panel, &source, x, y, buttons & MK_CONTROL != 0).is_some()
+                || open_drop_at(hwnd, panel, &source, x, y).is_some()
         });
     if accepted {
         crate::window::tab_drag::hide_feedback(hwnd);
@@ -210,7 +211,11 @@ pub(super) fn group_drop_at(
     crate::window::group_drop::Action,
 )> {
     let DragSource::Tab { id, group, .. } = source else {
-        crate::window::tab_drag::hide_feedback(hwnd);
+        // A tree note's own overlay (`open_drop_at`) must survive this: destroying and remaking it on
+        // every move leaves it no time to paint.
+        if !matches!(source, DragSource::Row(RowKind::Note(_))) {
+            crate::window::tab_drag::hide_feedback(hwnd);
+        }
         return None;
     };
     let screen = screen_point(panel, x, y);
@@ -222,6 +227,69 @@ pub(super) fn group_drop_at(
         });
     crate::window::tab_drag::show_feedback(hwnd, target, found.map(|(_, action)| action));
     found
+}
+
+/// A started drag of a tree note, at panel point `x`, `y` off the panel: the group drop that
+/// would open it there, if any, and its feedback. `None` for any other drag or point, which also
+/// hides the overlay.
+pub(super) fn open_drop_at(
+    hwnd: HWND,
+    panel: HWND,
+    source: &DragSource,
+    x: i32,
+    y: i32,
+) -> Option<crate::window::group_drop::Action> {
+    let DragSource::Row(RowKind::Note(_)) = source else {
+        return None;
+    };
+    let target = crate::window::tab_drag::target_at(hwnd, screen_point(panel, x, y));
+    let action = target.map(crate::window::group_drop::decide_open);
+    crate::window::tab_drag::show_feedback(hwnd, target, action);
+    action
+}
+
+/// Opens the tree note `relative` in the group `action` names, splitting a new one for an edge.
+/// The press that began the drag already opened the note as a preview in the active group: that
+/// tab moves with the drop instead of leaving a second view behind.
+fn open_note_in_group(hwnd: HWND, relative: &Path, action: crate::window::group_drop::Action) {
+    use crate::window::group_drop::Action;
+    let Some(root) = crate::window::library_host::folder(hwnd) else {
+        return;
+    };
+    let path = root.join(relative);
+    let preview = unsafe { crate::window::main_window::app_ptr(hwnd) }.and_then(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        let document = tabs.active()?;
+        (document.preview && document.path.as_deref() == Some(path.as_path()))
+            .then(|| (tabs.active_group(), document.id))
+    });
+    let (group, index) = match action {
+        Action::Place { group, index, .. } => (Some(group), index),
+        Action::Split {
+            group, direction, ..
+        } => (
+            crate::window::main_window::split_group(hwnd, group, direction),
+            None,
+        ),
+        Action::Reorder { .. } => (None, None),
+    };
+    let Some(group) = group else {
+        return;
+    };
+    match preview {
+        Some((from, id)) if from != group => {
+            crate::window::main_window::place_view(hwnd, from, id, group, index, false);
+        }
+        _ => {
+            crate::window::main_window::activate_group(hwnd, group);
+            if let Err(error) = crate::window::main_window::open_path(hwnd, &path) {
+                crate::window::main_window::report_open_failure(hwnd, &path, &error);
+                return;
+            }
+        }
+    }
+    // A drop is a deliberate open: the tab stays.
+    crate::window::library_host::promote_tab_for(hwnd, &path);
 }
 
 pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
@@ -242,11 +310,19 @@ pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool 
         .is_none()
         .then(|| group_drop_at(hwnd, panel, &drag.source, x, y, buttons & MK_CONTROL != 0))
         .flatten();
+    let open_drop = drag
+        .target
+        .is_none()
+        .then(|| open_drop_at(hwnd, panel, &drag.source, x, y))
+        .flatten();
     end_drag_input(panel);
     end_drag_label(hwnd);
     crate::window::tab_drag::hide_feedback(hwnd);
     if let Some((from, action)) = group_drop {
         crate::window::tab_drag::apply(hwnd, from, action);
+    }
+    if let (Some(action), DragSource::Row(RowKind::Note(relative))) = (open_drop, &drag.source) {
+        open_note_in_group(hwnd, relative, action);
     }
     if let Some(folder) = drag.target {
         match &drag.source {

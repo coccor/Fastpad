@@ -135,7 +135,7 @@ pub fn normalize_folder(folder: &Path) -> PathBuf {
 }
 
 /// The notes a tree shows as pinned: pinned records that are not flagged deleted.
-fn pinned_paths(library: &Library) -> Vec<PathBuf> {
+pub(crate) fn pinned_paths(library: &Library) -> Vec<PathBuf> {
     library
         .notes
         .iter()

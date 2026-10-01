@@ -138,9 +138,38 @@ pub(crate) fn decide(source: Source, target: Target, copy: bool) -> Option<Actio
     }
 }
 
+/// What dropping a file that is not a tab (a sidebar tree note, files from Explorer) on `target`
+/// does: it opens in that group, or in a group split off towards an edge. `Place` and `Split`
+/// stand for "open here" and "open in a new group there"; the file is the caller's.
+pub(crate) fn decide_open(target: Target) -> Action {
+    match target {
+        Target::Strip { group, index } => Action::Place {
+            group,
+            index: Some(index),
+            copy: true,
+        },
+        Target::Content {
+            zone: Zone::Middle,
+            group,
+        } => Action::Place {
+            group,
+            index: None,
+            copy: true,
+        },
+        Target::Content {
+            zone: Zone::Edge(direction),
+            group,
+        } => Action::Split {
+            group,
+            direction,
+            copy: true,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Action, Source, Target, Zone, decide, reorder_destination, zone};
+    use super::{Action, Source, Target, Zone, decide, decide_open, reorder_destination, zone};
     use crate::document::DocumentId;
     use crate::window::split_tree::{Direction, GroupId};
     use crate::window::titlebar::{Point, Rect};
@@ -154,6 +183,43 @@ mod tests {
             index,
             group_len,
         }
+    }
+
+    #[test]
+    fn a_file_from_the_tree_opens_in_the_group_it_is_over_or_in_a_split_off_it() {
+        // Break caught: a tree row dropped on an editor edge opening in the group instead of
+        // splitting, or on a strip opening at the end instead of at the insertion point.
+        let group = GroupId(2);
+        assert_eq!(
+            decide_open(Target::Strip { group, index: 1 }),
+            Action::Place {
+                group,
+                index: Some(1),
+                copy: true
+            }
+        );
+        assert_eq!(
+            decide_open(Target::Content {
+                group,
+                zone: Zone::Middle
+            }),
+            Action::Place {
+                group,
+                index: None,
+                copy: true
+            }
+        );
+        assert_eq!(
+            decide_open(Target::Content {
+                group,
+                zone: Zone::Edge(Direction::Right)
+            }),
+            Action::Split {
+                group,
+                direction: Direction::Right,
+                copy: true
+            }
+        );
     }
 
     #[test]

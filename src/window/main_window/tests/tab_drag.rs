@@ -876,3 +876,141 @@ fn a_strip_tab_dropped_on_a_folder_asks_to_replace_with_the_drag_already_gone() 
         "old"
     );
 }
+
+#[test]
+fn files_dropped_on_a_groups_edge_open_in_a_group_split_off_it() {
+    // Break caught: an Explorer drop on an editor's edge opening in that group, though the
+    // overlay (and a tab dropped there) splits it.
+    use windows_sys::Win32::Foundation::{POINT, POINTL};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("editor-drop-edge");
+    let note = scratch.note("edge.md", "edge");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    crate::window::library_host::accept_editor_file_drops(window.hwnd);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    let groups = app_mut(window.hwnd).tabs.group_ids().len();
+    let editor = super::super::group_editor(window.hwnd, first).unwrap();
+    let mut client = windows_sys::Win32::Foundation::RECT::default();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(editor.hwnd(), &mut client)
+    };
+    let mut point = POINT {
+        x: client.right - 2,
+        y: client.bottom / 2,
+    };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(editor.hwnd(), &mut point) };
+    crate::editor::file_drop::test_support::drag_and_drop_at(
+        editor.hwnd(),
+        &[note.as_path()],
+        POINTL {
+            x: point.x,
+            y: point.y,
+        },
+    );
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).tabs.group_ids().len() == groups + 1
+    });
+    let new = app_mut(window.hwnd).tabs.active_group();
+    assert_ne!(new, first);
+    assert!(
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(new)
+            .iter()
+            .any(|document| document.path.as_deref() == Some(note.as_path()))
+    );
+}
+
+#[test]
+fn files_dropped_on_a_groups_strip_through_ole_open_there_as_normal_tabs() {
+    // Break caught: only the editor taking Explorer's OLE drag, so a drag over the group's strip
+    // or margins shows no overlay and opens through WM_DROPFILES; or a dropped file left as the
+    // preview tab.
+    use windows_sys::Win32::Foundation::{POINT, POINTL};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("group-ole-drop");
+    let note = scratch.note("strip-ole.md", "strip");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let first = app_mut(window.hwnd).tabs.active_group();
+    execute_command(window.hwnd, CommandId::SplitRight);
+    let second = app_mut(window.hwnd).tabs.active_group();
+    assert!(super::super::activate_group(window.hwnd, first));
+    crate::window::library_host::accept_editor_file_drops(window.hwnd);
+    let strip = super::super::with_group_id(window.hwnd, second, |state| state.hwnd).unwrap();
+    assert!(crate::editor::file_drop::is_file_drop_target(
+        crate::editor::file_drop::registered_target(strip)
+    ));
+    let mut point = POINT { x: 20, y: 10 };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(strip, &mut point) };
+    crate::editor::file_drop::test_support::drag_and_drop_at(
+        strip,
+        &[note.as_path()],
+        POINTL {
+            x: point.x,
+            y: point.y,
+        },
+    );
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(second)
+            .iter()
+            .any(|document| document.path.as_deref() == Some(note.as_path()))
+    });
+    assert!(
+        app_mut(window.hwnd)
+            .tabs
+            .group_documents(second)
+            .iter()
+            .all(|document| !document.preview)
+    );
+    assert!(
+        app_mut(window.hwnd).drop_overlay.is_none(),
+        "gone after the drop"
+    );
+}
+
+#[test]
+fn an_explorer_drag_over_a_group_shows_the_overlay_until_it_leaves() {
+    // Break caught: Explorer drags over an editor or a strip showing no overlay, though a tab
+    // dragged there shows one; or the overlay left behind after the drag goes.
+    use windows_sys::Win32::Foundation::{POINT, POINTL};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("group-ole-hover");
+    let note = scratch.note("hover.md", "hover");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    crate::window::library_host::accept_editor_file_drops(window.hwnd);
+    let editor = super::super::group_editor(window.hwnd, group)
+        .unwrap()
+        .hwnd();
+    let strip = super::super::with_group_id(window.hwnd, group, |state| state.hwnd).unwrap();
+    for (window_under, local) in [
+        (editor, POINT { x: 60, y: 60 }),
+        (strip, POINT { x: 20, y: 10 }),
+    ] {
+        let mut point = local;
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(window_under, &mut point) };
+        crate::editor::file_drop::test_support::hover_at(
+            window_under,
+            &[note.as_path()],
+            POINTL {
+                x: point.x,
+                y: point.y,
+            },
+            || {
+                assert!(
+                    app_mut(window.hwnd).drop_overlay.is_some(),
+                    "shown while hovering"
+                )
+            },
+        );
+        assert!(
+            app_mut(window.hwnd).drop_overlay.is_none(),
+            "gone when it leaves"
+        );
+    }
+}
