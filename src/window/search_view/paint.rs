@@ -396,7 +396,7 @@ impl SearchView {
                 let enabled = self.replace_all_enabled();
                 let hover = enabled && self.row_hover_button == Some(index);
                 if hover {
-                    paint_hover(hdc, button, &palette, paint.background, dpi);
+                    fill(hdc, button, palette.hover_background);
                 }
                 draw_text(
                     hdc,
