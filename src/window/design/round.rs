@@ -138,6 +138,40 @@ pub(crate) unsafe fn fill_rounded(
     }
 }
 
+/// Fills `rect` as a box with a one-pixel `border`: the outer rounded shape in the border color,
+/// then the inner shape in `fill_color`, inset by one pixel with the radius reduced to match, so
+/// the border keeps an even width around the corners. `behind` is the flat color under the box.
+#[allow(
+    dead_code,
+    reason = "used by the palette and Search view in the next tasks"
+)]
+pub(crate) unsafe fn fill_bordered(
+    dc: HDC,
+    rect: RECT,
+    radius: i32,
+    fill_color: u32,
+    border: u32,
+    behind: u32,
+) {
+    let inner = RECT {
+        left: rect.left + 1,
+        top: rect.top + 1,
+        right: rect.right - 1,
+        bottom: rect.bottom - 1,
+    };
+    unsafe {
+        fill_rounded(dc, rect, radius, Corners::ALL, border, behind);
+        fill_rounded(
+            dc,
+            inner,
+            (radius - 1).max(0),
+            Corners::ALL,
+            fill_color,
+            border,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +365,70 @@ mod tests {
         with_canvas(
             |dc| unsafe { fill_rounded(dc, rect, 0, Corners::ALL, FILL, BEHIND) },
             |pixel| assert_eq!(pixel(10, 10), FILL),
+        );
+    }
+
+    const BORDER: u32 = 0x0000_8040;
+
+    #[test]
+    fn a_bordered_box_has_a_rounded_outside_a_border_and_a_fill() {
+        // Break caught: a border that is not drawn, or one that stays square at the corner.
+        let rect = RECT {
+            left: 10,
+            top: 10,
+            right: 30,
+            bottom: 30,
+        };
+        with_canvas(
+            |dc| unsafe { fill_bordered(dc, rect, 6, FILL, BORDER, BEHIND) },
+            |pixel| {
+                assert_eq!(
+                    pixel(10, 10),
+                    BEHIND,
+                    "outer corner stays the surface color"
+                );
+                assert_eq!(pixel(20, 10), BORDER, "top border");
+                assert_eq!(pixel(10, 20), BORDER, "left border");
+                assert_eq!(pixel(29, 20), BORDER, "right border");
+                assert_eq!(pixel(20, 29), BORDER, "bottom border");
+                assert_eq!(pixel(20, 11), FILL, "just inside the top border");
+                assert_eq!(pixel(20, 20), FILL, "center");
+                assert_eq!(pixel(9, 20), BEHIND, "outside the rect");
+            },
+        );
+    }
+
+    #[test]
+    fn a_bordered_box_with_no_radius_is_two_square_fills() {
+        let rect = RECT {
+            left: 10,
+            top: 10,
+            right: 30,
+            bottom: 30,
+        };
+        with_canvas(
+            |dc| unsafe { fill_bordered(dc, rect, 0, FILL, BORDER, BEHIND) },
+            |pixel| {
+                assert_eq!(pixel(10, 10), BORDER, "corner is border");
+                assert_eq!(pixel(11, 11), FILL, "just inside the corner");
+            },
+        );
+    }
+
+    #[test]
+    fn a_bordered_box_too_small_for_a_fill_stays_inside_its_rect() {
+        let rect = RECT {
+            left: 10,
+            top: 10,
+            right: 12,
+            bottom: 12,
+        };
+        with_canvas(
+            |dc| unsafe { fill_bordered(dc, rect, 4, FILL, BORDER, BEHIND) },
+            |pixel| {
+                assert_eq!(pixel(9, 9), BEHIND);
+                assert_eq!(pixel(12, 12), BEHIND);
+            },
         );
     }
 }
