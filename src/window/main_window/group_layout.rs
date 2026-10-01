@@ -353,6 +353,7 @@ fn configure_editor(hwnd: HWND, editor: &Editor) {
     };
     apply_settings_to(editor, &settings, palette);
     apply_colors_to(editor, palette, settings.highlight_current_line);
+    crate::window::titlebar::apply_scrollbar_theme(editor.hwnd(), palette.dark_frame);
     if let Some(zoom) = zoom {
         let _ = editor.set_zoom(zoom);
     }

@@ -128,33 +128,31 @@ pub(crate) fn effective_theme(hwnd: HWND) -> crate::platform::theme::Theme {
 }
 
 pub(super) fn apply_theme(hwnd: HWND) {
-    let Some((editor, language, palette, frame_change)) =
-        (unsafe { app_ptr(hwnd) }).and_then(|mut app| {
-            let app = unsafe { app.as_mut() };
-            let editor = app.editor().cloned()?;
-            let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
-            let frame_change = app.dark_frame_applied != palette.dark_frame;
-            app.dark_frame_applied = palette.dark_frame;
-            for group in &mut app.groups {
-                if let Some(bar) = group.find_bar.as_mut() {
-                    bar.set_colors(palette);
-                }
+    let Some((language, palette, frame_change)) = (unsafe { app_ptr(hwnd) }).and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        app.editor()?;
+        let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
+        let frame_change = app.dark_frame_applied != palette.dark_frame;
+        app.dark_frame_applied = palette.dark_frame;
+        for group in &mut app.groups {
+            if let Some(bar) = group.find_bar.as_mut() {
+                bar.set_colors(palette);
             }
-            if let Some(name_box) = app.name_box.as_mut() {
-                name_box.set_colors(palette);
-            }
-            if let Some(command_palette) = app.command_palette.as_mut() {
-                command_palette.set_colors(palette);
-            }
-            let language = app
-                .tabs
-                .active()
-                .map_or(crate::document::Language::PlainText, |document| {
-                    document.language
-                });
-            Some((editor, language, palette, frame_change))
-        })
-    else {
+        }
+        if let Some(name_box) = app.name_box.as_mut() {
+            name_box.set_colors(palette);
+        }
+        if let Some(command_palette) = app.command_palette.as_mut() {
+            command_palette.set_colors(palette);
+        }
+        let language = app
+            .tabs
+            .active()
+            .map_or(crate::document::Language::PlainText, |document| {
+                document.language
+            });
+        Some((language, palette, frame_change))
+    }) else {
         return;
     };
     let highlight_current_line = unsafe { app_ptr(hwnd) }
@@ -179,7 +177,10 @@ pub(super) fn apply_theme(hwnd: HWND) {
         }
     }
     if frame_change {
-        crate::window::titlebar::apply_frame_theme(hwnd, editor.hwnd(), palette.dark_frame);
+        crate::window::titlebar::apply_frame_theme(hwnd, palette.dark_frame);
+        for editor in all_editors(hwnd) {
+            crate::window::titlebar::apply_scrollbar_theme(editor.hwnd(), palette.dark_frame);
+        }
     }
     if language != crate::document::Language::PlainText {
         apply_language(hwnd, language);
