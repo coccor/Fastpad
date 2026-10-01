@@ -21,7 +21,7 @@ Give the tab strip and the sidebar lists the softer Windows 11 shapes, without l
 | Row backplate | 4px radius (`CONTROL_RADIUS`), inset 4px from the left and right panel edges and 1px top and bottom. |
 | Close-button hover (tab) | A 4px-rounded square in place of the square fill. |
 | High contrast | Shapes stay square with system colors. No blending in high contrast. |
-| Not in this piece | Search results rows, field borders, the command palette, focus rings, hit-testing, row heights, text and icon positions, colors. |
+| Not in this piece | Field borders, the command palette, focus rings, hit-testing, row heights, text and icon positions, colors. |
 
 ## 3. Design
 
@@ -64,9 +64,14 @@ Give the tab strip and the sidebar lists the softer Windows 11 shapes, without l
 
 - **Corner blend on a non-flat surface.** The blend assumes `behind` is a flat color. The sidebar panel and the tab strip are flat, so it holds. If the active tab's neighbor tab overlaps its corner, the corner pixels would blend toward `strip_background`, which is the neighbor's color too, so it is correct.
 - **Selection over a hover.** A row that is both hovered and selected draws one fill, as now, so no double blend.
-- **DPI.** Radius and insets scale through `scale`. The paint test runs at 96, 144 and 192.
+- **DPI.** Radius and insets scale through `scale`. The paint tests run at 96 DPI; the scaling itself is covered by the `radius_for` and metrics tests.
 - **Startup.** Nothing new is loaded or allocated before the first frame. The benchmark gate in `benchmarks/README.md` is re-run as a confirmation.
 - **Verification:** Clippy, the targeted tests for the changed modules, the full suite once, then the build. Before the build, `fastpad.ini` is backed up.
+
+## Amendments after the build
+
+- The Search results rows, the Open editors rows and the Favorites rows all paint through the shared `row_list::paint`, so they are rounded and inset too. Search field borders stay square.
+- The high-contrast square-corner guarantee is tested for the rows; for tabs it follows from `radius_for` returning 0, which is tested.
 
 ## 6. Next pieces
 
