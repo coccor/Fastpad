@@ -19,25 +19,26 @@ use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
     DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, DeleteObject,
-    DrawTextW, FW_NORMAL, GetDC, HDC, HFONT, InvalidateRect, ReleaseDC, ScreenToClient,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_CALCRECT, DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_WORDBREAK, DeleteObject, DrawTextW, FW_NORMAL, GetDC, GetMonitorInfoW, HDC, HFONT,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, ReleaseDC,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
+    EnableWindow, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_OWNER, GWLP_USERDATA,
     GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect, HCURSOR, HTCAPTION, HTCLIENT,
-    IDC_ARROW, IsWindow, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW,
+    IDC_ARROW, IsIconic, IsWindow, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WNDCLASSW,
@@ -186,6 +187,38 @@ impl Layout {
     }
 }
 
+/// The tallest the message may be for the whole prompt to fit a work area `work_height` tall:
+/// what is left once the title band, the gaps and the footer are taken.
+pub(crate) fn message_cap(dpi: u32, title_height: i32, work_height: i32) -> i32 {
+    let chrome = Layout::calculate(dpi, 0, title_height, 0, &[]).height;
+    (work_height - chrome).max(0)
+}
+
+/// Where a `width` x `height` prompt goes: centered on the owner's `frame`, or on the monitor's
+/// `work` area when the owner is minimized (its frame is parked off-screen), then moved so the
+/// whole prompt is inside `work`. Without a work area it is just centered on the frame.
+pub(crate) fn placement(
+    frame: RECT,
+    work: Option<RECT>,
+    iconic: bool,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
+    let center_on = match work {
+        Some(work) if iconic => work,
+        _ => frame,
+    };
+    let left = center_on.left + (center_on.right - center_on.left - width) / 2;
+    let top = center_on.top + (center_on.bottom - center_on.top - height) / 2;
+    match work {
+        Some(work) => (
+            left.min(work.right - width).max(work.left),
+            top.min(work.bottom - height).max(work.top),
+        ),
+        None => (left, top),
+    }
+}
+
 /// The focus after Tab (`forward`) or Shift+Tab, wrapping.
 pub(crate) fn next_focus(current: usize, count: usize, forward: bool) -> usize {
     if count == 0 {
@@ -245,6 +278,10 @@ struct Prompt {
     tracking_leave: bool,
     /// Direct2D for the rounded shapes, loaded as the prompt opens.
     canvas: Canvas,
+    /// The message was cut to fit the work area, so its last line ends in an ellipsis.
+    capped: bool,
+    /// The owner was enabled when the prompt opened, so closing it enables the owner again.
+    owner_was_enabled: bool,
 }
 
 impl Drop for Prompt {
@@ -267,11 +304,16 @@ thread_local! {
 pub(crate) fn show(owner: HWND, colors: Palette, spec: &Spec) -> usize {
     let last = spec.buttons.len().saturating_sub(1);
     CHOICE.with(|choice| choice.set(None));
-    let Some(dialog) = create(owner, colors, spec) else {
+    // An owner already disabled (by an outer modal) stays disabled: only what this prompt
+    // disabled is enabled again.
+    let owner_was_enabled = unsafe { IsWindowEnabled(owner) } != 0;
+    let Some(dialog) = create(owner, colors, spec, owner_was_enabled) else {
         return last;
     };
     unsafe {
-        EnableWindow(owner, 0);
+        if owner_was_enabled {
+            EnableWindow(owner, 0);
+        }
         ShowWindow(dialog, SW_SHOW);
         SetFocus(dialog);
     }
@@ -298,13 +340,33 @@ pub(crate) fn show(owner: HWND, colors: Palette, spec: &Spec) -> usize {
         }
     }
     close(dialog);
-    unsafe { EnableWindow(owner, 1) };
+    if owner_was_enabled {
+        unsafe { EnableWindow(owner, 1) };
+    }
     CHOICE.with(Cell::take).unwrap_or(last)
 }
 
-fn create(owner: HWND, colors: Palette, spec: &Spec) -> Option<HWND> {
+/// The work area of the monitor nearest `owner` (for a minimized owner, the one it restores to).
+fn work_area(owner: HWND) -> Option<RECT> {
+    let mut monitor = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let found = unsafe {
+        GetMonitorInfoW(
+            MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        )
+    } != 0;
+    let work = monitor.rcWork;
+    (found && work.right > work.left && work.bottom > work.top).then_some(work)
+}
+
+fn create(owner: HWND, colors: Palette, spec: &Spec, owner_was_enabled: bool) -> Option<HWND> {
     let class = register_class()?;
-    let title = wide_null(TITLE);
+    // Not drawn (the title band draws `TITLE`), but read out as the prompt activates, so a
+    // screen reader announces the question.
+    let title = wide_null(&format!("{TITLE}: {}", spec.message));
     let dialog = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -337,19 +399,19 @@ fn create(owner: HWND, colors: Palette, spec: &Spec) -> Option<HWND> {
         .map(|label| measure(dialog, body_font, label))
         .collect();
     let width = dialog_width(dpi, &label_widths);
-    let message_height = measure_wrapped(
+    let title_height = text_height(dialog, title_font);
+    let work = work_area(owner);
+    let measured = measure_wrapped(
         dialog,
         body_font,
         spec.message,
         content_width(dpi, &label_widths),
     );
-    let layout = Layout::calculate(
-        dpi,
-        width,
-        text_height(dialog, title_font),
-        message_height,
-        &label_widths,
-    );
+    let cap = work.map_or(i32::MAX, |work| {
+        message_cap(dpi, title_height, work.bottom - work.top)
+    });
+    let capped = measured > cap;
+    let layout = Layout::calculate(dpi, width, title_height, measured.min(cap), &label_widths);
     let (width, height) = (layout.width, layout.height);
     let state = Box::new(Prompt {
         colors,
@@ -369,16 +431,19 @@ fn create(owner: HWND, colors: Palette, spec: &Spec) -> Option<HWND> {
         pressed: None,
         tracking_leave: false,
         canvas: Canvas::load(),
+        capped,
+        owner_was_enabled,
     });
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, Box::into_raw(state) as isize) };
 
-    // Centered over the owner, with rounded corners where Windows 11 draws them and the DWM
-    // shadow of the hidden frame (a 1-px frame margin keeps DWM drawing it though the client
-    // covers the whole window).
+    // Centered over the owner (or its monitor when minimized) inside the work area, with
+    // rounded corners where Windows 11 draws them (square in high contrast) and the DWM shadow
+    // of the hidden frame (a 1-px frame margin keeps DWM drawing it though the client covers
+    // the whole window).
     let mut frame = RECT::default();
     unsafe { GetWindowRect(owner, &mut frame) };
-    let left = frame.left + (frame.right - frame.left - width) / 2;
-    let top = frame.top + (frame.bottom - frame.top - height) / 2;
+    let iconic = unsafe { IsIconic(owner) } != 0;
+    let (left, top) = placement(frame, work, iconic, width, height);
     unsafe {
         SetWindowPos(
             dialog,
@@ -389,7 +454,11 @@ fn create(owner: HWND, colors: Palette, spec: &Spec) -> Option<HWND> {
             height,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
-        let corners = DWMWCP_ROUND;
+        let corners = if colors.high_contrast {
+            DWMWCP_DONOTROUND
+        } else {
+            DWMWCP_ROUND
+        };
         DwmSetWindowAttribute(
             dialog,
             DWMWA_WINDOW_CORNER_PREFERENCE as u32,
@@ -413,14 +482,17 @@ fn finish(dialog: HWND, index: usize) {
     close(dialog);
 }
 
-/// Re-enables the owner before the prompt goes, so Windows hands activation back to it rather
-/// than to some other application.
+/// Re-enables the owner (if the prompt disabled it) before the prompt goes, so Windows hands
+/// activation back to it rather than to some other application.
 fn close(dialog: HWND) {
     if unsafe { IsWindow(dialog) } == 0 {
         return;
     }
+    let reenable = state(dialog).is_some_and(|prompt| prompt.owner_was_enabled);
     unsafe {
-        EnableWindow(GetWindow(dialog, GW_OWNER), 1);
+        if reenable {
+            EnableWindow(GetWindow(dialog, GW_OWNER), 1);
+        }
         DestroyWindow(dialog);
     }
 }
@@ -471,13 +543,14 @@ fn measure(hwnd: HWND, font: HFONT, text: &str) -> i32 {
     rect.right - rect.left
 }
 
-/// The height of `text` in `font` wrapped to `width`.
+/// The height of `text` in `font` wrapped to `width`, breaking inside a word too long for a line
+/// (a spaceless file name) as `paint_into` draws it.
 fn measure_wrapped(hwnd: HWND, font: HFONT, text: &str, width: i32) -> i32 {
     let bounds = RECT {
         right: width,
         ..RECT::default()
     };
-    let rect = calc_rect(hwnd, font, text, bounds, DT_WORDBREAK);
+    let rect = calc_rect(hwnd, font, text, bounds, DT_WORDBREAK | DT_EDITCONTROL);
     rect.bottom - rect.top
 }
 
@@ -664,6 +737,8 @@ fn paint_into(dc: HDC, client: RECT, prompt: &Prompt) {
     // once Direct2D has let go of the DC, as About's icon does.
     let mut text = wide_null(&prompt.message);
     let mut rect = prompt.layout.message;
+    // The same breaking as `measure_wrapped`; a message cut to the work area ends in "...".
+    let cut = if prompt.capped { DT_END_ELLIPSIS } else { 0 };
     unsafe {
         let previous = SelectObject(dc, prompt.body_font as _);
         SetBkMode(dc, TRANSPARENT as i32);
@@ -673,7 +748,7 @@ fn paint_into(dc: HDC, client: RECT, prompt: &Prompt) {
             text.as_mut_ptr(),
             -1,
             &mut rect,
-            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
+            DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | cut,
         );
         SelectObject(dc, previous);
     }
@@ -1010,7 +1085,7 @@ mod tests {
     #[test]
     fn tab_then_enter_picks_the_second_button() {
         let spec = Spec {
-            message: "Save changes to notes.txt before closing?",
+            message: "Save changes to notes.txt?",
             buttons: &["Save", "Don't save", "Cancel"],
             quick_keys: &[],
         };
@@ -1026,7 +1101,7 @@ mod tests {
     #[test]
     fn a_quick_key_picks_its_button() {
         let spec = Spec {
-            message: "Save changes to notes.txt before closing?",
+            message: "Save changes to notes.txt?",
             buttons: &["Save", "Don't save", "Cancel"],
             quick_keys: &[(b'S' as u16, 0), (b'D' as u16, 1)],
         };
@@ -1034,19 +1109,152 @@ mod tests {
         assert_eq!(answered(&spec, |dialog| key(dialog, u16::from(b'D'))), 1);
     }
 
+    /// The layout `create` gives `message` over `owner`.
+    fn created_layout(owner: HWND, message: &str) -> Layout {
+        let spec = Spec { message, ..DELETE };
+        let dialog = create(owner, Palette::neutral(), &spec, true).expect("the prompt window");
+        let layout = state(dialog).map(|prompt| prompt.layout.clone()).unwrap();
+        unsafe { DestroyWindow(dialog) };
+        layout
+    }
+
     #[test]
     fn a_long_message_grows_the_window() {
         // Break caught: a message measured on one line, clipping a long question.
         let owner = Owner::new();
-        let height = |message: &str| {
-            let spec = Spec { message, ..DELETE };
-            let dialog = create(owner.0, Palette::neutral(), &spec).expect("the prompt window");
-            let height = state(dialog).map(|prompt| prompt.layout.height).unwrap();
-            unsafe { DestroyWindow(dialog) };
-            height
-        };
         let long = ["word"; 40].join(" ");
-        assert!(height(&long) > height("Delete it?"));
+        assert!(
+            created_layout(owner.0, &long).height > created_layout(owner.0, "Delete it?").height
+        );
+    }
+
+    #[test]
+    fn a_long_unbroken_word_wraps_onto_more_lines() {
+        // Break caught: a spaceless file name measured as one line and clipped at the right
+        // edge, hiding which file the Delete applies to.
+        let owner = Owner::new();
+        let line = |layout: &Layout| layout.message.bottom - layout.message.top;
+        let one = created_layout(owner.0, "Delete it?");
+        let word = created_layout(owner.0, &"x".repeat(300));
+        assert!(
+            line(&word) > line(&one),
+            "{} vs {}",
+            line(&word),
+            line(&one)
+        );
+    }
+
+    #[test]
+    fn a_capped_message_keeps_the_prompt_inside_the_work_area() {
+        // Break caught: a long message growing the prompt past the bottom of the screen.
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
+        for factor in [100, 225] {
+            crate::window::design::text_scale::set_factor_for_test(factor);
+            for dpi in [96, 144, 192] {
+                let title_height = 24 * factor as i32 / 100;
+                for work_height in [768, 1040, 2160] {
+                    let cap = message_cap(dpi, title_height, work_height);
+                    assert!(cap > 0, "{factor} {dpi} {work_height}");
+                    let labels = [60, 70];
+                    let layout = Layout::calculate(
+                        dpi,
+                        dialog_width(dpi, &labels),
+                        title_height,
+                        100_000.min(cap),
+                        &labels,
+                    );
+                    assert!(layout.height <= work_height, "{factor} {dpi} {work_height}");
+                    assert_eq!(layout.height, work_height, "the cap uses all the room");
+                }
+            }
+        }
+        assert_eq!(message_cap(96, 24, 10), 0, "never negative");
+    }
+
+    #[test]
+    fn the_prompt_is_placed_inside_the_work_area() {
+        // Break caught: a prompt over a minimized owner opening at -32000, off-screen; or one
+        // over an owner partly off-screen hanging off the edge.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let owner = RECT {
+            left: 100,
+            top: 100,
+            right: 900,
+            bottom: 700,
+        };
+        assert_eq!(placement(owner, Some(work), false, 400, 200), (300, 300));
+        let parked = RECT {
+            left: -32000,
+            top: -32000,
+            right: -31840,
+            bottom: -31972,
+        };
+        assert_eq!(
+            placement(parked, Some(work), true, 400, 200),
+            (760, 420),
+            "centered on the work area"
+        );
+        let hanging = RECT {
+            left: 1700,
+            top: 900,
+            right: 2500,
+            bottom: 1500,
+        };
+        assert_eq!(placement(hanging, Some(work), false, 400, 200), (1520, 840));
+        let left_of = RECT {
+            left: -700,
+            top: -500,
+            right: 100,
+            bottom: 100,
+        };
+        assert_eq!(placement(left_of, Some(work), false, 400, 200), (0, 0));
+        assert_eq!(placement(owner, None, false, 400, 200), (300, 300));
+    }
+
+    #[test]
+    fn the_window_text_carries_the_question() {
+        // Break caught: a screen reader announcing only "FastPad" as the prompt activates.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+        let text = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let seen = text.clone();
+        answered(&DELETE, move |dialog| {
+            let mut buffer = [0u16; 128];
+            let length = unsafe { GetWindowTextW(dialog, buffer.as_mut_ptr(), 128) };
+            *seen.borrow_mut() = String::from_utf16_lossy(&buffer[..length as usize]);
+            key(dialog, VK_ESCAPE);
+        });
+        assert_eq!(*text.borrow(), "FastPad: Delete it?");
+    }
+
+    #[test]
+    fn only_an_owner_the_prompt_disabled_is_enabled_again() {
+        // Break caught: a prompt opened under an outer modal enabling the owner as it closes,
+        // so the outer prompt's owner takes input again.
+        let owner = Owner::new();
+        answer_next(|dialog| key(dialog, VK_ESCAPE));
+        show(owner.0, Palette::neutral(), &DELETE);
+        assert_ne!(unsafe { IsWindowEnabled(owner.0) }, 0, "enabled again");
+
+        unsafe { EnableWindow(owner.0, 0) };
+        answer_next(|dialog| key(dialog, VK_RETURN));
+        show(owner.0, Palette::neutral(), &DELETE);
+        assert_eq!(
+            unsafe { IsWindowEnabled(owner.0) },
+            0,
+            "still disabled after Enter"
+        );
+        answer_next(|dialog| key(dialog, VK_ESCAPE));
+        show(owner.0, Palette::neutral(), &DELETE);
+        assert_eq!(
+            unsafe { IsWindowEnabled(owner.0) },
+            0,
+            "still disabled after Esc"
+        );
     }
 
     fn painted_prompt(canvas: Canvas, colors: Palette) -> Prompt {
@@ -1066,6 +1274,8 @@ mod tests {
             pressed: None,
             tracking_leave: false,
             canvas,
+            capped: false,
+            owner_was_enabled: true,
         }
     }
 

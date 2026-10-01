@@ -252,4 +252,123 @@ mod tests {
         assert_eq!(confirm_labels("Replace"), ["Replace", "Cancel"]);
         assert_eq!(confirm_labels("Delete"), ["Delete", "Cancel"]);
     }
+
+    // The tests below queue no CLOSE_ANSWERS or CONFIRM_ANSWERS, so the real themed prompt opens
+    // and `prompt::answer_next` posts its input.
+
+    use crate::platform::wide_null;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
+        WM_KEYDOWN, WM_QUIT, WS_OVERLAPPEDWINDOW,
+    };
+
+    /// A plain top-level window (not a main window) to own the prompt; the caller destroys it.
+    fn owner() -> HWND {
+        let class = wide_null("STATIC");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                100,
+                100,
+                800,
+                600,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null(), "the test owner window");
+        hwnd
+    }
+
+    fn key(dialog: HWND, key: u16) {
+        unsafe { PostMessageW(dialog, WM_KEYDOWN, usize::from(key), 0) };
+    }
+
+    /// The close prompt's decision when `answer` drives the real prompt.
+    fn close_decision(answer: impl FnOnce(HWND) + 'static) -> CloseDecision {
+        let hwnd = owner();
+        prompt::answer_next(answer);
+        let decision = prompt_close_decision(hwnd, "notes.txt");
+        if unsafe { IsWindow(hwnd) } != 0 {
+            unsafe { DestroyWindow(hwnd) };
+        }
+        decision
+    }
+
+    fn confirmed(answer: impl FnOnce(HWND) + 'static) -> bool {
+        let hwnd = owner();
+        prompt::answer_next(answer);
+        let confirmed = confirm(hwnd, "Delete it?", "Delete");
+        unsafe { DestroyWindow(hwnd) };
+        confirmed
+    }
+
+    #[test]
+    fn the_close_prompt_maps_its_buttons_to_decisions() {
+        // Break caught: the prompt's button indexes mapped to the wrong decision (Discard for
+        // the primary, or anything but Cancel for Esc).
+        assert_eq!(
+            close_decision(|dialog| key(dialog, VK_ESCAPE)),
+            CloseDecision::Cancel
+        );
+        assert_eq!(
+            close_decision(|dialog| key(dialog, u16::from(b'D'))),
+            CloseDecision::Discard
+        );
+        assert_eq!(
+            close_decision(|dialog| key(dialog, VK_RETURN)),
+            CloseDecision::Save
+        );
+    }
+
+    #[test]
+    fn confirm_is_true_only_for_the_action() {
+        // Break caught: Esc confirming a Delete or Replace, or Enter not confirming it.
+        assert!(!confirmed(|dialog| key(dialog, VK_ESCAPE)));
+        assert!(confirmed(|dialog| key(dialog, VK_RETURN)));
+    }
+
+    #[test]
+    fn a_destroyed_owner_cancels_the_close_prompt() {
+        // Break caught: a prompt torn down with its owner answering Save or Discard.
+        assert_eq!(
+            close_decision(|dialog| {
+                let owner = unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(
+                        dialog,
+                        windows_sys::Win32::UI::WindowsAndMessaging::GW_OWNER,
+                    )
+                };
+                unsafe { DestroyWindow(owner) };
+            }),
+            CloseDecision::Cancel
+        );
+    }
+
+    #[test]
+    fn a_quit_cancels_the_close_prompt_and_is_passed_on() {
+        // Break caught: WM_QUIT answering Save or Discard, or being swallowed by the prompt's
+        // loop instead of reaching the outer one.
+        let decision = close_decision(|_| unsafe { PostQuitMessage(0) });
+        // Drained before any assert, so a failure cannot leak WM_QUIT into other tests.
+        let mut message = MSG::default();
+        let quit = unsafe {
+            PeekMessageW(
+                &mut message,
+                std::ptr::null_mut(),
+                WM_QUIT,
+                WM_QUIT,
+                PM_REMOVE,
+            )
+        };
+        assert_eq!(decision, CloseDecision::Cancel);
+        assert_ne!(quit, 0, "WM_QUIT re-posted for the outer loop");
+        assert_eq!(message.message, WM_QUIT);
+    }
 }

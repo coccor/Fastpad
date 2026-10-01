@@ -94,11 +94,11 @@ impl Drop for AcceleratorTable {
 #[derive(Debug)]
 pub(crate) struct MenuBar(HMENU);
 
-/// View ▸ Editor Layout (split editors spec §7).
+/// View ▸ Editor layout (split editors spec §7).
 fn editor_layout() -> Vec<MenuEntry> {
     vec![
-        MenuEntry::command("Split &Right", CommandId::SplitRight),
-        MenuEntry::command("Split &Down", CommandId::SplitDown),
+        MenuEntry::command("Split &right", CommandId::SplitRight),
+        MenuEntry::command("Split &down", CommandId::SplitDown),
         MenuEntry::Separator,
         MenuEntry::command("Move to &next group", CommandId::MoveTabToNextGroup),
         MenuEntry::command("Move to &previous group", CommandId::MoveTabToPreviousGroup),
@@ -118,10 +118,10 @@ impl MenuBar {
                 &[
                     MenuEntry::command("&New", CommandId::New),
                     MenuEntry::command("&Open...", CommandId::Open),
-                    MenuEntry::command("Open &Notebook...", CommandId::OpenFolder),
+                    MenuEntry::command("Open &notebook...", CommandId::OpenFolder),
                     MenuEntry::command("&Go to note\u{2026}", CommandId::QuickOpen),
                     MenuEntry::command("&Save", CommandId::Save),
-                    MenuEntry::command("Save &As...", CommandId::SaveAs),
+                    MenuEntry::command("Save &as...", CommandId::SaveAs),
                     MenuEntry::command("&Close tab", CommandId::CloseTab),
                     MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
                     MenuEntry::command("Close &group", CommandId::CloseGroup),
@@ -181,7 +181,7 @@ impl MenuBar {
                     MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
                     MenuEntry::Separator,
                     MenuEntry::command("Side&bar", CommandId::ToggleSidebar),
-                    MenuEntry::Submenu("Editor &Layout", editor_layout()),
+                    MenuEntry::Submenu("Editor &layout", editor_layout()),
                     MenuEntry::Separator,
                     MenuEntry::command("&Always on top", CommandId::ToggleAlwaysOnTop),
                     MenuEntry::Separator,
@@ -362,8 +362,8 @@ pub(crate) fn show_tab_menu(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
         MenuEntry::command("&Close tab", CommandId::CloseTab),
         MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
         MenuEntry::Separator,
-        MenuEntry::command("Split &Right", CommandId::SplitRight),
-        MenuEntry::command("Split &Down", CommandId::SplitDown),
+        MenuEntry::command("Split &right", CommandId::SplitRight),
+        MenuEntry::command("Split &down", CommandId::SplitDown),
         MenuEntry::command("Move to &next group", CommandId::MoveTabToNextGroup),
     ];
     track_popup(hwnd, &entries, POINT { x, y })
