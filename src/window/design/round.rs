@@ -187,6 +187,12 @@ mod tests {
     }
 
     #[test]
+    fn a_tiny_radius_leaves_the_outer_pixel_partly_covered() {
+        // At radius 2 the outermost pixel straddles the arc: 6 of its 16 samples are inside.
+        assert_eq!(coverage(0, 0, 2), 96);
+    }
+
+    #[test]
     fn the_high_contrast_palette_gets_square_corners() {
         use crate::platform::theme::Theme;
         use crate::window::palette::Palette;
