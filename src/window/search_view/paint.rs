@@ -6,6 +6,7 @@ use crate::search::Snippet;
 use crate::window::design::metrics::CONTROL_RADIUS;
 use crate::window::design::metrics::scale;
 use crate::window::design::round::{Corners, fill_bordered, fill_rounded, radius_for};
+use crate::window::design::text_scale::scale_text;
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::TreeItem;
 use crate::window::notebook_view::draw_item_icon;
@@ -322,7 +323,7 @@ impl SearchView {
         let dpi = paint.dpi;
         let palette = paint.palette;
         let pad = scale(PADDING_AT_96_DPI, dpi);
-        let slot = scale(ROW_LINE_AT_96_DPI, dpi);
+        let slot = scale_text(ROW_LINE_AT_96_DPI, dpi);
         let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
         let first = RECT {
             top: rect.top + scale(ROW_INSET_AT_96_DPI, dpi),

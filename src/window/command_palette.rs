@@ -8,6 +8,7 @@ use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
 use crate::window::design::metrics::{CONTROL_RADIUS, ROW_INSET_X, ROW_INSET_Y, scale};
 use crate::window::design::round::{Corners, fill_bordered, fill_rounded, radius_for};
+use crate::window::design::text_scale::scale_text;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
 use std::cell::Cell;
@@ -473,7 +474,7 @@ impl std::fmt::Debug for PanelLayout {
 impl PanelLayout {
     fn calculate(width: i32, dpi: u32, text_height: i32, rows: usize) -> Self {
         let padding = scale(PADDING_AT_96_DPI, dpi);
-        let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+        let field_height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
         let inset = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
         let field = RECT {
             left: padding,
@@ -494,7 +495,7 @@ impl PanelLayout {
             left: 1,
             top: field.bottom + padding,
             right: (width - 1).max(1),
-            bottom: field.bottom + padding + rows * scale(ROW_HEIGHT_AT_96_DPI, dpi),
+            bottom: field.bottom + padding + rows * scale_text(ROW_HEIGHT_AT_96_DPI, dpi),
         });
         // The list runs to the bottom border; the field alone keeps its padding below.
         let height = list.map_or(field.bottom + padding, |list| list.bottom + 1);
@@ -790,7 +791,7 @@ impl CommandPalette {
                 self.list,
                 LB_SETITEMHEIGHT,
                 0,
-                scale(ROW_HEIGHT_AT_96_DPI, dpi) as LPARAM,
+                scale_text(ROW_HEIGHT_AT_96_DPI, dpi) as LPARAM,
             );
             // Dark scrollbar under the dark palettes, the system one otherwise.
             let dark_theme = wide_null("DarkMode_Explorer");

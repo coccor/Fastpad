@@ -334,7 +334,8 @@ impl Default for TitleFontHandles {
     }
 }
 
-/// Title-strip fonts for one DPI and text-size factor, deleted on drop (with the App at `WM_NCDESTROY`).
+/// Title-strip fonts for one DPI and text-size factor, deleted on drop (with the App at
+/// `WM_NCDESTROY`).
 #[derive(Debug)]
 pub(crate) struct TitleFonts {
     dpi: u32,

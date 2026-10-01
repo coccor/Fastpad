@@ -5,6 +5,7 @@
 
 use crate::platform::wide_null;
 use crate::window::design::metrics::scale;
+use crate::window::design::text_scale::scale_text;
 use crate::window::palette::Palette;
 use crate::window::panel::fill;
 use windows_sys::Win32::Foundation::{HWND, RECT};
@@ -31,8 +32,8 @@ pub(crate) struct MenuMode {
     pub open: bool,
 }
 
-pub(crate) const fn band_height(dpi: u32) -> i32 {
-    scale(BAND_HEIGHT_AT_96_DPI, dpi)
+pub(crate) fn band_height(dpi: u32) -> i32 {
+    scale_text(BAND_HEIGHT_AT_96_DPI, dpi)
 }
 
 /// Heading rectangles for label widths `widths`, laid out left to right from `left` in a band at
@@ -171,6 +172,18 @@ pub(crate) unsafe fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_band_follows_the_text_size() {
+        // Break caught: menu headings clipped in a 28 px band at a larger Windows text size.
+        use crate::window::design::text_scale::set_factor_for_test;
+        set_factor_for_test(100);
+        assert_eq!(band_height(96), 28);
+        set_factor_for_test(225);
+        let height = band_height(96);
+        set_factor_for_test(100);
+        assert_eq!(height, 63);
+    }
 
     #[test]
     fn headings_sit_side_by_side_inside_the_band() {

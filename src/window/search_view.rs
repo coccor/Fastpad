@@ -7,7 +7,7 @@
 
 use crate::library::text_search::{Progress, RunEnd, TextHit, hit_cmp};
 use crate::search::{MatchOptions, SearchOption};
-use crate::window::design::metrics::scale;
+use crate::window::design::text_scale::scale_text;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::palette::Palette;
 use crate::window::row_list::RowListState;
@@ -288,7 +288,7 @@ impl SearchView {
             replace_on_batch: false,
             restore: None,
             selected_by_batch: None,
-            list: RowListState::new(scale(ROW_AT_96_DPI, dpi)),
+            list: RowListState::new(scale_text(ROW_AT_96_DPI, dpi)),
             placeholder: placeholder(None),
             thumb_grab: None,
             order: 0,

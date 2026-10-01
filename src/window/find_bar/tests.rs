@@ -36,6 +36,38 @@ fn find_fields_center_their_text_and_replace_mode_splits_the_bar_without_overlap
 }
 
 #[test]
+fn the_find_bar_and_its_fields_hold_the_body_text_at_every_text_size() {
+    // Break caught: a find field that clips the larger Windows text size inside a 28 px box.
+    use super::{FIELD_HEIGHT_AT_96_DPI, find_bar_height};
+    use crate::window::design::text_scale::{scale_text, set_factor_for_test};
+    use crate::window::design::type_ramp::{TextStyle, create};
+    use windows_sys::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetTextMetricsW, ReleaseDC, SelectObject, TEXTMETRICW,
+    };
+    for factor in [100, 150, 225] {
+        set_factor_for_test(factor);
+        let (field, bar, tallest) = unsafe {
+            let font = create(TextStyle::Body, 96);
+            let dc = GetDC(std::ptr::null_mut());
+            let previous = SelectObject(dc, font);
+            let mut metrics = TEXTMETRICW::default();
+            GetTextMetricsW(dc, &mut metrics);
+            SelectObject(dc, previous);
+            ReleaseDC(std::ptr::null_mut(), dc);
+            DeleteObject(font);
+            (
+                scale_text(FIELD_HEIGHT_AT_96_DPI, 96),
+                find_bar_height(96),
+                metrics.tmHeight,
+            )
+        };
+        set_factor_for_test(100);
+        assert!(field >= tallest + 2, "{factor}%: {field} < {tallest} + 2");
+        assert!(bar > field, "{factor}%");
+    }
+}
+
+#[test]
 fn next_match_wraps_once_then_stops() {
     let mut state = SearchState::new("one", SearchDirection::Forward, 8);
     assert_eq!(state.next_range("one two one"), Some(8..11));

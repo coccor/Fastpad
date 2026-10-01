@@ -581,6 +581,31 @@ fn the_sidebar_fonts_are_rebuilt_when_only_the_text_size_changes() {
     assert_eq!(sidebar.fonts(96).text, first, "same key reuses the fonts");
     set_factor_for_test(150);
     let second = sidebar.fonts(96).text;
+    // The old font is gone, so its handle value may be reused: check the new font's size instead.
+    let mut logfont = windows_sys::Win32::Graphics::Gdi::LOGFONTW::default();
+    let copied = unsafe {
+        windows_sys::Win32::Graphics::Gdi::GetObjectW(
+            second,
+            std::mem::size_of::<windows_sys::Win32::Graphics::Gdi::LOGFONTW>() as i32,
+            std::ptr::addr_of_mut!(logfont).cast(),
+        )
+    };
     set_factor_for_test(100);
-    assert_ne!(second, first);
+    assert!(copied > 0);
+    assert_eq!(logfont.lfHeight, -20);
+}
+
+#[test]
+fn a_text_size_change_refreshes_the_stored_sidebar_row_heights() {
+    // Break caught: the Favorites rows keeping their old height after the text size changes, so
+    // the larger text clips until the rows reload.
+    use crate::window::design::text_scale::set_factor_for_test;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    set_factor_for_test(150);
+    super::super::refresh_metrics(window.hwnd, 96);
+    set_factor_for_test(100);
+    let sidebar = app_mut(window.hwnd).sidebar.as_ref().expect("a sidebar");
+    assert_eq!(sidebar.favorites.row_height_for_test(), 39);
 }

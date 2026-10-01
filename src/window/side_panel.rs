@@ -16,7 +16,7 @@ use super::tooltip::Tooltip;
 use crate::config::SidebarView;
 use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use crate::platform::wide_null;
-use crate::window::design::metrics::{ICON, PANEL_HEADER, SIDEBAR_ICON, scale};
+use crate::window::design::metrics::{ICON, SIDEBAR_ICON, panel_header, scale};
 use crate::window::design::type_ramp::{self, TextStyle};
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, fill};
@@ -56,7 +56,8 @@ pub(crate) const EDITOR_MIN_WIDTH_96: i32 = 320;
 /// The strip along the panel's right edge that resizes it.
 pub(crate) const GRIP_WIDTH_96: i32 = 4;
 
-/// The sidebar's fonts at one DPI and text-size factor. Painting copies them out; `Sidebar` owns and deletes them.
+/// The sidebar's fonts at one DPI and text-size factor. Painting copies them out; `Sidebar` owns
+/// and deletes them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UiFonts {
     /// Row and body text: the text face, 13 px at 96 DPI and 100% text size.
@@ -512,6 +513,15 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
     update_tools(hwnd);
     crate::window::search_view::layout(hwnd);
     crate::window::inline_name::place(hwnd);
+}
+
+/// Re-applies the stored row heights after a DPI or text-size change. The Notebook view sets its
+/// own on every paint and the Search view in `layout`; the Favorites view only when its rows load.
+pub(crate) fn refresh_metrics(hwnd: HWND) {
+    if let Some((_, panel)) = windows(hwnd) {
+        crate::window::favorites_view::refresh_metrics(hwnd, panel);
+        unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
+    }
 }
 
 /// `show_view` without its win events.
@@ -1108,7 +1118,7 @@ fn panel_hit_test(main: HWND, panel: HWND, wparam: WPARAM, lparam: LPARAM) -> LR
     unsafe { ScreenToClient(panel, &mut point) };
     let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
     let caption = point.y >= 0
-        && point.y < scale(PANEL_HEADER, dpi)
+        && point.y < panel_header(dpi)
         && !over_grip(panel, point.x)
         && PanelView::of(current_view(main))
             .is_some_and(|view| header_is_caption(main, view, panel, point.x, point.y));

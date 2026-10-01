@@ -271,6 +271,19 @@ fn matches_are_case_insensitive_and_ranked_prefix_word_substring_then_scattered(
 }
 
 #[test]
+fn the_palette_rows_follow_the_text_size() {
+    // Break caught: palette rows that stay 26 px tall while the Windows text size grows.
+    use crate::window::design::text_scale::{scale_text, set_factor_for_test};
+    set_factor_for_test(225);
+    let layout = PanelLayout::calculate(560, 96, 16, 3);
+    let expected = 3 * scale_text(26, 96);
+    set_factor_for_test(100);
+    let list = layout.list.unwrap();
+    assert_eq!(list.bottom - list.top, expected);
+    assert_eq!(expected, 3 * 59);
+}
+
+#[test]
 fn the_panel_centers_the_query_text_and_ends_with_the_list_on_its_bottom_border() {
     // Break caught: query text stuck to the top of its box, or a list that overhangs (or stops
     // short of) the panel's border.

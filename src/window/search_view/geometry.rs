@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::search::SearchOption;
-use crate::window::design::metrics::PANEL_HEADER;
+use crate::window::design::metrics::panel_header;
 use crate::window::design::metrics::scale;
+use crate::window::design::text_scale::scale_text;
 use crate::window::option_toggles;
 use crate::window::sidebar_accessibility;
 use windows_sys::Win32::Foundation::{POINT, RECT};
@@ -14,7 +15,7 @@ impl SearchView {
     /// view, so all of it is caption.
     pub(crate) fn title_rect(client: RECT, dpi: u32) -> RECT {
         RECT {
-            bottom: (client.top + scale(PANEL_HEADER, dpi)).min(client.bottom),
+            bottom: (client.top + panel_header(dpi)).min(client.bottom),
             ..client
         }
     }
@@ -27,7 +28,7 @@ impl SearchView {
     /// The painted search field, border included, right of the chevron.
     pub(crate) fn field_rect(client: RECT, dpi: u32) -> RECT {
         let margin = scale(FIELD_MARGIN_AT_96_DPI, dpi);
-        let height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+        let height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
         let top = Self::header_top(client, dpi) + (scale(HEADER_AT_96_DPI, dpi) - height) / 2;
         let left = client.left
             + scale(CHEVRON_LEFT_AT_96_DPI, dpi)
@@ -73,7 +74,7 @@ impl SearchView {
         let height = field.bottom - field.top;
         let top = Self::header_top(client, dpi)
             + scale(HEADER_AT_96_DPI, dpi)
-            + (scale(REPLACE_ROW_AT_96_DPI, dpi) - height) / 2;
+            + (scale_text(REPLACE_ROW_AT_96_DPI, dpi) - height) / 2;
         RECT {
             left: (field.right - scale(REPLACE_ALL_WIDTH_AT_96_DPI, dpi)).max(field.left),
             top,
@@ -111,7 +112,7 @@ impl SearchView {
     /// Where the header ends, and the replace row under it while the replace field is open.
     pub(super) fn head_bottom(&self, client: RECT, dpi: u32) -> i32 {
         let replace = if self.replace_open {
-            scale(REPLACE_ROW_AT_96_DPI, dpi)
+            scale_text(REPLACE_ROW_AT_96_DPI, dpi)
         } else {
             0
         };

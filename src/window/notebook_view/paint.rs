@@ -5,7 +5,7 @@
 use super::*;
 use crate::config::FileIconSet;
 use crate::library::tree::{RowKind, TreeRow};
-use crate::window::design::metrics::{SIDEBAR_ROW, scale};
+use crate::window::design::metrics::{scale, sidebar_row};
 use crate::window::design::round::paint_focus_ring;
 use crate::window::drag_label::LabelImage;
 use crate::window::file_icons::note_kind;
@@ -642,8 +642,8 @@ impl NotebookView {
             paint.focused,
         );
         let palette = &paint.palette;
-        self.list.row_height = scale(SIDEBAR_ROW, dpi);
-        self.editors.list.row_height = scale(SIDEBAR_ROW, dpi);
+        self.list.row_height = sidebar_row(dpi);
+        self.editors.list.row_height = sidebar_row(dpi);
         let sections = self.layout(area, dpi);
         // A panel sized after the rows came (startup) or resized: the scroll stays in range.
         let editors_height = height(sections.editors_list);

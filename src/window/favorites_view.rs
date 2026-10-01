@@ -6,7 +6,7 @@ use crate::library::model::same_path;
 use crate::library::tree::natural_cmp;
 use crate::library::{local, normalize_folder};
 use crate::window::commands::CommandId;
-use crate::window::design::metrics::{PANEL_HEADER, SIDEBAR_ROW, scale};
+use crate::window::design::metrics::{panel_header, scale, sidebar_row};
 use crate::window::library_host;
 use crate::window::menus::{self, MenuEntry};
 use crate::window::panel::fill;
@@ -121,7 +121,7 @@ pub(crate) struct FavoritesView {
 
 impl FavoritesView {
     pub(crate) fn new(dpi: u32) -> Self {
-        let mut list = RowListState::new(scale(SIDEBAR_ROW, dpi));
+        let mut list = RowListState::new(sidebar_row(dpi));
         list.set_count(1);
         Self {
             rows: Vec::new(),
@@ -130,6 +130,11 @@ impl FavoritesView {
             thumb_grab: None,
             order: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_height_for_test(&self) -> i32 {
+        self.list.row_height
     }
 
     /// Replaces the rows. The selection stays on the same notebook, or moves to the row that took
@@ -148,7 +153,7 @@ impl FavoritesView {
             self.order = self.order.wrapping_add(1);
         }
         self.rows = rows;
-        self.list.row_height = scale(SIDEBAR_ROW, dpi);
+        self.list.row_height = sidebar_row(dpi);
         self.list.set_count(self.rows.len() + 1);
         let index = kept
             .and_then(|folder| {
@@ -167,7 +172,7 @@ impl FavoritesView {
     /// The header's "Open notebook…" button.
     pub(crate) fn header_button(client: RECT, dpi: u32) -> RECT {
         let size = scale(HEADER_BUTTON_AT_96_DPI, dpi);
-        let header = scale(PANEL_HEADER, dpi);
+        let header = panel_header(dpi);
         let right = client.right - scale(GAP_AT_96_DPI, dpi);
         let top = client.top + (header - size) / 2;
         RECT {
@@ -180,9 +185,9 @@ impl FavoritesView {
 
     /// Where the rows are. With no favorites, the empty-state line sits above the footer row.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
-        let mut top = client.top + scale(PANEL_HEADER, dpi);
+        let mut top = client.top + panel_header(dpi);
         if self.rows.is_empty() {
-            top += scale(SIDEBAR_ROW, dpi);
+            top += sidebar_row(dpi);
         }
         RECT {
             top: top.min(client.bottom),
@@ -191,7 +196,7 @@ impl FavoritesView {
     }
 
     fn star_left(area: RECT, dpi: u32) -> i32 {
-        area.right - scale(SIDEBAR_ROW, dpi)
+        area.right - sidebar_row(dpi)
     }
 
     pub(crate) fn paint(&self, paint: &ViewPaint) {
@@ -201,7 +206,7 @@ impl FavoritesView {
         let pad = scale(PADDING_AT_96_DPI, dpi);
         let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
         let header = RECT {
-            bottom: client.top + scale(PANEL_HEADER, dpi),
+            bottom: client.top + panel_header(dpi),
             ..client
         };
         unsafe {
@@ -234,7 +239,7 @@ impl FavoritesView {
                     left: client.left + pad,
                     top: header.bottom,
                     right: client.right - pad,
-                    bottom: header.bottom + scale(SIDEBAR_ROW, dpi),
+                    bottom: header.bottom + sidebar_row(dpi),
                 };
                 draw_text(
                     paint.hdc,
@@ -524,6 +529,17 @@ pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
     with_view(hwnd, |view| {
         let area = view.list_area(client, dpi);
         view.set_rows(rows, dpi, height(area));
+    });
+    invalidate(panel);
+}
+
+/// Re-applies the row height after a DPI or text-size change; the rows themselves are unchanged.
+pub(crate) fn refresh_metrics(hwnd: HWND, panel: HWND) {
+    let (client, dpi) = geometry(panel);
+    with_view(hwnd, |view| {
+        let height = height(view.list_area(client, dpi));
+        view.list.row_height = sidebar_row(dpi);
+        view.list.scroll_lines(0, height);
     });
     invalidate(panel);
 }

@@ -70,46 +70,38 @@ fn the_skipped_tooltip_has_one_line_per_reason_that_skipped_a_note() {
 
 #[test]
 fn a_result_row_holds_two_lines_of_the_sidebar_text_at_every_dpi() {
-    // Break caught: the snippet line clipped at 150% or 200%, or the bold match taller than
-    // its slot.
-    use crate::window::titlebar::create_ui_font;
+    // Break caught: the snippet line clipped at 150% or 200%, or at a larger Windows text size,
+    // or the bold match taller than its slot.
+    use crate::window::design::text_scale::{scale_text, set_factor_for_test};
+    use crate::window::design::type_ramp::{TextStyle, create};
     use windows_sys::Win32::Graphics::Gdi::{
-        DeleteObject, FW_BOLD, FW_NORMAL, GetDC, GetTextMetricsW, ReleaseDC, SelectObject,
-        TEXTMETRICW,
+        DeleteObject, GetDC, GetTextMetricsW, ReleaseDC, SelectObject, TEXTMETRICW,
     };
-    for dpi in [96, 120, 144, 192] {
-        let mut tallest = 0;
-        for weight in [FW_NORMAL, FW_BOLD] {
-            let font = create_ui_font(
-                scale(
-                    crate::window::design::type_ramp::TextStyle::Body.spec().px,
-                    dpi,
-                ),
-                "Segoe UI",
-                weight as i32,
-                false,
-            );
-            unsafe {
-                let dc = GetDC(std::ptr::null_mut());
-                let previous = SelectObject(dc, font);
-                let mut metrics = TEXTMETRICW::default();
-                assert_ne!(GetTextMetricsW(dc, &mut metrics), 0);
-                tallest = tallest.max(metrics.tmHeight);
-                SelectObject(dc, previous);
-                ReleaseDC(std::ptr::null_mut(), dc);
-                DeleteObject(font);
+    for factor in [100, 150, 225] {
+        set_factor_for_test(factor);
+        for dpi in [96, 120, 144, 192] {
+            let mut tallest = 0;
+            for style in [TextStyle::Body, TextStyle::BodyBold] {
+                let font = create(style, dpi);
+                unsafe {
+                    let dc = GetDC(std::ptr::null_mut());
+                    let previous = SelectObject(dc, font);
+                    let mut metrics = TEXTMETRICW::default();
+                    assert_ne!(GetTextMetricsW(dc, &mut metrics), 0);
+                    tallest = tallest.max(metrics.tmHeight);
+                    SelectObject(dc, previous);
+                    ReleaseDC(std::ptr::null_mut(), dc);
+                    DeleteObject(font);
+                }
             }
+            let line = scale_text(ROW_LINE_AT_96_DPI, dpi);
+            let row = scale_text(ROW_AT_96_DPI, dpi);
+            let inset = scale(ROW_INSET_AT_96_DPI, dpi);
+            assert!(line >= tallest, "{factor}% at {dpi}: {line} < {tallest}");
+            assert!(row >= 2 * line + 2 * inset - 1, "{factor}% at {dpi}");
         }
-        assert!(
-            scale(ROW_LINE_AT_96_DPI, dpi) >= tallest,
-            "{dpi}: {tallest}"
-        );
-        assert!(
-            scale(ROW_AT_96_DPI, dpi)
-                >= 2 * scale(ROW_LINE_AT_96_DPI, dpi) + 2 * scale(ROW_INSET_AT_96_DPI, dpi) - 1,
-            "{dpi}"
-        );
     }
+    set_factor_for_test(100);
 }
 
 #[test]

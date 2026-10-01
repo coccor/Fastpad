@@ -221,6 +221,7 @@ pub(super) fn refresh_metrics(hwnd: HWND, dpi: u32) {
             let _ = editor.set_code_folding(unsafe { app.as_ref() }.settings.code_folding, dpi);
         }
     }
+    crate::window::side_panel::refresh_metrics(hwnd);
     layout_editor_and_find_bar(hwnd);
 }
 

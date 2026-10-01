@@ -23,6 +23,14 @@ pub(crate) const FOCUS_GAP: i32 = 1;
 pub(crate) const PANEL_HEADER: i32 = 38;
 /// The height of a row in the sidebar's lists (notebook tree, open editors, favorites).
 pub(crate) const SIDEBAR_ROW: i32 = 26;
+/// A sidebar row's height at `dpi`, following the Windows text-size setting.
+pub(crate) fn sidebar_row(dpi: u32) -> i32 {
+    crate::window::design::text_scale::scale_text(SIDEBAR_ROW, dpi)
+}
+/// A side panel's title row height at `dpi`, following the Windows text-size setting.
+pub(crate) fn panel_header(dpi: u32) -> i32 {
+    crate::window::design::text_scale::scale_text(PANEL_HEADER, dpi)
+}
 /// The size of the activity bar's icon glyphs.
 pub(crate) const ICON: i32 = 16;
 /// The size of the sidebar's icon glyphs: tree rows, carets, and the header buttons.
@@ -48,6 +56,23 @@ mod tests {
         assert_eq!(scale(26, 144), 39); // 39.0
         assert_eq!(scale(10, 192), 20);
         assert_eq!(scale(1, 144), 2); // 1.5 rounds up
+    }
+
+    #[test]
+    fn sidebar_row_and_panel_header_follow_the_text_size_factor() {
+        // Break caught: sidebar rows and headers that stay put while the text grows to 225 %.
+        use super::{panel_header, sidebar_row};
+        use crate::window::design::text_scale::set_factor_for_test;
+        set_factor_for_test(100);
+        for dpi in [96, 120, 144, 192] {
+            assert_eq!(sidebar_row(dpi), scale(SIDEBAR_ROW, dpi));
+            assert_eq!(panel_header(dpi), scale(PANEL_HEADER, dpi));
+        }
+        set_factor_for_test(225);
+        let (row, header) = (sidebar_row(96), panel_header(96));
+        set_factor_for_test(100);
+        assert_eq!(row, 59);
+        assert_eq!(header, 86);
     }
 
     #[test]
