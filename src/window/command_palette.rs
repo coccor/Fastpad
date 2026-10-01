@@ -7,7 +7,9 @@ use crate::library::quick_open::QuickMatch;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
 use crate::window::design::metrics::{CONTROL_RADIUS, ROW_INSET_X, ROW_INSET_Y, scale};
-use crate::window::design::round::{Corners, fill_bordered, fill_rounded, radius_for};
+use crate::window::design::round::{
+    Corners, fill_bordered, fill_rounded, paint_selection_bar, radius_for,
+};
 use crate::window::design::text_scale::scale_text;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
@@ -443,6 +445,7 @@ fn paint_row_background(dc: HDC, row: RECT, selected: bool, colors: &Palette, dp
             colors.hover_background,
             colors.strip_background,
         );
+        paint_selection_bar(dc, fill_rect, colors, colors.hover_background, dpi);
     }
 }
 

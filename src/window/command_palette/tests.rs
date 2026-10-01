@@ -462,7 +462,7 @@ mod painting {
             |dc| paint_row_background(dc, ROW, true, &colors, 96),
             |pixel| {
                 assert_eq!(pixel(1, 13), colors.strip_background, "left inset");
-                assert_eq!(pixel(4, 13), colors.hover_background, "fill edge");
+                assert_eq!(pixel(7, 13), colors.hover_background, "fill edge");
                 assert_eq!(pixel(50, 0), colors.strip_background, "top gap");
                 assert_eq!(pixel(4, 1), colors.strip_background, "rounded corner");
             },
@@ -496,6 +496,21 @@ mod painting {
             |pixel| {
                 assert_eq!(pixel(10, 10), colors.selection_background, "field corner");
                 assert_eq!(pixel(0, 0), colors.hover_background, "row corner");
+                assert_eq!(pixel(5, 13), colors.hover_background, "no accent bar");
+            },
+        );
+    }
+
+    #[test]
+    fn the_selected_row_has_an_accent_bar() {
+        // Break caught: a selected row with no accent bar, or a bar over the wrong pixels.
+        let colors = Palette::for_theme(Theme::ALL[0], false);
+        with_canvas(
+            &colors,
+            |dc| paint_row_background(dc, ROW, true, &colors, 96),
+            |pixel| {
+                assert_eq!(pixel(5, 13), colors.accent, "bar");
+                assert_eq!(pixel(7, 13), colors.hover_background, "past the bar");
             },
         );
     }

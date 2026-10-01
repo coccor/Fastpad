@@ -825,6 +825,7 @@ fn open_list(hwnd: HWND, row: Row) {
         ListStyle {
             row_height: dialog.layout.list_row_height(),
             radius: dialog.layout.radius(),
+            dpi: dialog.layout.dpi,
             font: dialog.body_font,
             colors: dialog.colors,
             canvas: dialog.canvas.clone(),
