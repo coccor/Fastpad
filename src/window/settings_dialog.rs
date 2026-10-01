@@ -4,21 +4,25 @@
 //! window disabled. All behaviour lives in `settings_model`; this module decodes input and
 //! paints.
 
+use super::design::metrics::scale;
+use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
+use super::design::text_scale::scale_text;
+use super::design::type_ramp::{self, TextStyle};
 use super::dropdown_list::{
     DropdownList, ListKey, ListModel, ListOutcome, ListStyle, WM_LIST_PICKED,
 };
 use super::keymap::KeyStroke;
 use super::modal::ModalScope;
 use super::palette::Palette;
-use super::panel::{inset, scale};
+use super::panel::inset;
 use super::settings_model::{
     Control, DialogModel, Effect, Focus, Key, Page, Row, Section, SettingsView, dropdown_action,
     dropdown_step, step_font_size,
 };
 use super::side_panel::paint_buffered;
 use super::soft_paint::{
-    Canvas, FOCUS_GAP_AT_96_DPI, FOCUS_WIDTH_AT_96_DPI, Frame, GLYPH_FONT, RADIUS_AT_96_DPI, Shape,
-    TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones, title_close,
+    Canvas, Frame, Shape, TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones,
+    glyph_font_face, title_close,
 };
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
@@ -33,9 +37,9 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DeleteObject, DrawTextW, FW_NORMAL, FW_SEMIBOLD, GetDC, GetMonitorInfoW, HBRUSH,
-    HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints,
-    MonitorFromWindow, ReleaseDC, ScreenToClient, SelectObject, SetBkColor, SetTextColor,
+    DT_SINGLELINE, DeleteObject, DrawTextW, FW_NORMAL, GetDC, GetMonitorInfoW, HBRUSH, HDC, HFONT,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow,
+    ReleaseDC, ScreenToClient, SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
@@ -306,11 +310,11 @@ fn create(
         return None;
     }
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
-    let title_font = create_ui_font(scale(18, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
-    let heading_font = create_ui_font(scale(14, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
-    let body_font = create_ui_font(scale(13, dpi), "Segoe UI", FW_NORMAL as i32, false);
-    let link_font = create_underlined_font(scale(13, dpi));
-    let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
+    let title_font = type_ramp::create(TextStyle::Title, dpi);
+    let heading_font = type_ramp::create(TextStyle::Heading, dpi);
+    let body_font = type_ramp::create(TextStyle::Body, dpi);
+    let link_font = create_underlined_font(crate::window::design::text_scale::scale_text(13, dpi));
+    let glyph_font = create_ui_font(scale(11, dpi), glyph_font_face(), FW_NORMAL as i32, false);
 
     let mut monitor = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -569,7 +573,7 @@ fn create_underlined_font(pixel_height: i32) -> HFONT {
         CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
         OUT_DEFAULT_PRECIS,
     };
-    let face = wide_null("Segoe UI");
+    let face = wide_null(crate::window::design::faces::current().text);
     unsafe {
         CreateFontW(
             -pixel_height,
@@ -821,6 +825,7 @@ fn open_list(hwnd: HWND, row: Row) {
         ListStyle {
             row_height: dialog.layout.list_row_height(),
             radius: dialog.layout.radius(),
+            dpi: dialog.layout.dpi,
             font: dialog.body_font,
             colors: dialog.colors,
             canvas: dialog.canvas.clone(),

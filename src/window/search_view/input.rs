@@ -2,9 +2,9 @@
 //! the panel's message handler.
 
 use super::*;
+use crate::window::design::metrics::scale;
 use crate::window::main_window::OpenMode;
 use crate::window::option_toggles;
-use crate::window::panel::scale;
 use crate::window::row_list::{self, ListKey};
 use crate::window::text_search_host;
 use crate::window::tooltip::Tooltip;

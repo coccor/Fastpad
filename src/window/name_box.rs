@@ -4,9 +4,11 @@
 
 use crate::document::DocumentId;
 use crate::platform::{last_error, wide_null};
+use crate::window::design::metrics::scale;
+use crate::window::design::text_scale::scale_text;
 use crate::window::palette::Palette;
 use crate::window::panel::{
-    create_child, create_child_with_id, create_panel, fill, inset, scale, text_height,
+    create_child, create_child_with_id, create_panel, fill, inset, text_height,
 };
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, SIZE, WPARAM};
@@ -39,8 +41,8 @@ const FIELD_TEXT_INSET_AT_96_DPI: i32 = 8;
 const BUTTON_WIDTH_AT_96_DPI: i32 = 72;
 
 /// Height of the box, reserved above the editor whenever it's visible.
-pub(crate) const fn name_box_height(dpi: u32) -> i32 {
-    scale(BOX_HEIGHT_AT_96_DPI, dpi)
+pub(crate) fn name_box_height(dpi: u32) -> i32 {
+    scale_text(BOX_HEIGHT_AT_96_DPI, dpi)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,7 +79,7 @@ fn box_layout(
     show_browse: bool,
 ) -> BoxLayout {
     let padding = scale(PADDING_AT_96_DPI, dpi);
-    let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+    let field_height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
     let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
     let button_width = scale(BUTTON_WIDTH_AT_96_DPI, dpi);
     let top = (name_box_height(dpi) - 1 - field_height) / 2;
@@ -585,6 +587,19 @@ fn set_control_text(hwnd: HWND, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::{box_layout, name_box_height};
+
+    #[test]
+    fn the_name_box_follows_the_text_size() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
+        // Break caught: a name box that clips its field at a larger Windows text size.
+        use crate::window::design::text_scale::set_factor_for_test;
+        set_factor_for_test(100);
+        assert_eq!(name_box_height(96), 36);
+        set_factor_for_test(225);
+        let height = name_box_height(96);
+        set_factor_for_test(100);
+        assert_eq!(height, 81);
+    }
 
     #[test]
     fn the_field_note_and_buttons_sit_side_by_side_inside_the_box() {

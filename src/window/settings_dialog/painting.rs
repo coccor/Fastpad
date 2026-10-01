@@ -196,8 +196,8 @@ pub(super) fn compose<'a>(
 
     // The focus ring: a rounded accent stroke just outside the focused control, or on the
     // edge of a toggle's card, all of which is its hit area.
-    let width = scale(FOCUS_WIDTH_AT_96_DPI, dpi);
-    let outside = width + scale(FOCUS_GAP_AT_96_DPI, dpi);
+    let width = scale(FOCUS_RING, dpi);
+    let outside = width + scale(FOCUS_GAP, dpi);
     let ring = match dialog.model.focus {
         Focus::Nav => Some((
             inset(layout.nav_items[dialog.model.page as usize], -outside),

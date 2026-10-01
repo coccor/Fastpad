@@ -2,9 +2,11 @@
 //! on, and how it paints (keyboard shortcuts spec §6.2–§6.5). Behaviour lives in
 //! `shortcuts_model`; `settings_dialog` routes input here.
 
+use super::design::metrics::scale;
+use super::design::text_scale::scale_text;
 use super::keymap::KeyStroke;
 use super::palette::Palette;
-use super::panel::{inset, scale};
+use super::panel::inset;
 use super::shortcuts_model::ShortcutsModel;
 use super::soft_paint::{Frame, Shape, Tones};
 use crate::platform::wide_null;
@@ -74,7 +76,7 @@ impl PageLayout {
     /// The page inside the dialog's `body` at `dpi`.
     pub(crate) fn calculate(body: RECT, dpi: u32) -> Self {
         let padding = scale(PADDING_AT_96_DPI, dpi);
-        let field = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+        let field = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
         let gap = scale(GAP_AT_96_DPI, dpi);
         let (left, right) = (body.left + padding, body.right - padding);
         let top = body.top + scale(SEARCH_TOP_AT_96_DPI, dpi);
@@ -95,7 +97,7 @@ impl PageLayout {
             left,
             top: header_top,
             right,
-            bottom: header_top + scale(HEADER_HEIGHT_AT_96_DPI, dpi),
+            bottom: header_top + scale_text(HEADER_HEIGHT_AT_96_DPI, dpi),
         };
         let table = RECT {
             left,
@@ -107,7 +109,7 @@ impl PageLayout {
         let command_end = left + width * 55 / 100;
         let keys_end = left + width * 85 / 100;
         let record_width = scale(RECORD_WIDTH_AT_96_DPI, dpi).min(width);
-        let record_height = scale(RECORD_HEIGHT_AT_96_DPI, dpi).min(table.bottom - header.top);
+        let record_height = scale_text(RECORD_HEIGHT_AT_96_DPI, dpi).min(table.bottom - header.top);
         let box_left = (left + right - record_width) / 2;
         let box_top = (header.top + table.bottom - record_height) / 2;
         Self {
@@ -126,7 +128,7 @@ impl PageLayout {
                 right: box_left + record_width,
                 bottom: box_top + record_height,
             },
-            row_height: scale(ROW_HEIGHT_AT_96_DPI, dpi),
+            row_height: scale_text(ROW_HEIGHT_AT_96_DPI, dpi),
             dpi,
         }
     }
@@ -245,7 +247,7 @@ fn keycaps(
         .collect::<Vec<_>>();
     let total = widths.iter().sum::<i32>() + (widths.len() as i32 - 1) * (plus + 2 * gap);
     let mut x = left.unwrap_or((line.left + line.right - total) / 2);
-    let height = scale(KEYCAP_HEIGHT_AT_96_DPI, dpi);
+    let height = scale_text(KEYCAP_HEIGHT_AT_96_DPI, dpi);
     let top = (line.top + line.bottom - height) / 2;
     for (index, (part, width)) in parts.into_iter().zip(widths).enumerate() {
         if index > 0 {
@@ -604,6 +606,31 @@ mod tests {
 
     fn center(rect: RECT) -> (i32, i32) {
         ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+    }
+
+    #[test]
+    fn the_shortcuts_heights_hold_their_text_at_every_text_size() {
+        // Break caught: the search field, header, rows or keycaps too short for the text at a
+        // larger Windows text size, or the 100 % sizes drifting.
+        use crate::window::design::text_scale::FactorGuard;
+        use crate::window::design::type_ramp::{TextStyle, text_height_for_test};
+        {
+            let _factor = FactorGuard::set(100);
+            let layout = PageLayout::calculate(body(), 96);
+            assert_eq!(layout.search.bottom - layout.search.top, 30);
+            assert_eq!(layout.header.bottom - layout.header.top, 28);
+            assert_eq!(layout.row_height, 28);
+            assert_eq!(scale_text(KEYCAP_HEIGHT_AT_96_DPI, 96), 20);
+        }
+        let _factor = FactorGuard::set(225);
+        for dpi in [96, 144] {
+            let layout = PageLayout::calculate(body(), dpi);
+            let text = text_height_for_test(TextStyle::Body, dpi);
+            assert!(layout.search.bottom - layout.search.top >= text, "{dpi}");
+            assert!(layout.header.bottom - layout.header.top >= text, "{dpi}");
+            assert!(layout.row_height >= text, "{dpi}");
+            assert!(scale_text(KEYCAP_HEIGHT_AT_96_DPI, dpi) >= text, "{dpi}");
+        }
     }
 
     #[test]

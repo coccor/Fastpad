@@ -462,3 +462,32 @@ fn a_short_work_area_caps_the_height_and_scrolls_the_focused_row_into_view() {
     let tiny = Layout::calculate(96, 4000, 100, 100);
     assert!(tiny.height > 100, "at least a few rows always show");
 }
+
+#[test]
+fn the_settings_heights_hold_their_text_at_every_text_size() {
+    // Break caught: nav items, headings, cards, the title row or the OK button too short for
+    // the text at a larger Windows text size, or the 100 % sizes drifting.
+    use crate::window::design::text_scale::FactorGuard;
+    use crate::window::design::type_ramp::text_height_for_test;
+    let height = |rect: RECT| rect.bottom - rect.top;
+    {
+        let _factor = FactorGuard::set(100);
+        let layout = Layout::sized(96, 860, 700, 80);
+        assert_eq!(layout.title.bottom, 44);
+        assert_eq!(height(layout.nav_items[0]), 32);
+        assert_eq!(height(layout.headings[0]), 30);
+        assert_eq!(height(layout.rows[0]), 34);
+        assert_eq!(height(layout.close), 30);
+    }
+    let _factor = FactorGuard::set(225);
+    for dpi in [96, 144] {
+        let layout = Layout::sized(dpi, 1400, 1400, 80);
+        let body = text_height_for_test(TextStyle::Body, dpi);
+        assert!(layout.title.bottom >= text_height_for_test(TextStyle::Title, dpi));
+        assert!(height(layout.nav_items[0]) >= body, "{dpi}");
+        assert!(height(layout.headings[0]) >= text_height_for_test(TextStyle::Heading, dpi));
+        assert!(height(layout.rows[0]) >= body, "{dpi}");
+        assert!(height(layout.close) >= body, "{dpi}");
+        assert!(layout.content_height > 0);
+    }
+}

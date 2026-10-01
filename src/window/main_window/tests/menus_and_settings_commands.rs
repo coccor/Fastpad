@@ -738,5 +738,9 @@ fn folder_and_confirm_seams_answer_inside_their_modal_scope() {
         assert!(crate::window::modal::modal_active(hwnd));
         false
     });
-    assert!(!crate::window::modal::confirm(window.hwnd, "Delete?"));
+    assert!(!crate::window::modal::confirm(
+        window.hwnd,
+        "Delete?",
+        "Delete"
+    ));
 }

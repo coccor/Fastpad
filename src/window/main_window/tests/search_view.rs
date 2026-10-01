@@ -674,7 +674,7 @@ fn the_debounce_waits_out_a_modal_loop_and_a_file_population() {
         crate::window::text_search_host::timer(hwnd);
         true
     });
-    assert!(crate::window::modal::confirm(window.hwnd, "Go on?"));
+    assert!(crate::window::modal::confirm(window.hwnd, "Go on?", "Go"));
     assert!(
         crate::window::text_search_host::cancel_flag(window.hwnd).is_none(),
         "nothing ran inside the modal loop"
@@ -760,7 +760,7 @@ fn the_toggles_change_by_click_and_by_alt_keys_in_the_box_and_the_results() {
             .search
             .list
             .row_height,
-        crate::window::panel::scale(42, dpi),
+        crate::window::design::metrics::scale(46, dpi),
         "two-line rows"
     );
     let options = || crate::window::search_view::options(window.hwnd);

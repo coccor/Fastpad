@@ -203,7 +203,7 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
     let tabs = tabs_under(hwnd, &absolute);
     let dirty = tabs.iter().filter(|(_, _, dirty)| *dirty).count();
     let name = relative.file_name().unwrap_or_default().to_string_lossy();
-    if !confirmed(hwnd, &delete_folder_question(&name, notes, dirty)) {
+    if !confirmed(hwnd, &delete_folder_question(&name, notes, dirty), "Delete") {
         return;
     }
     // The row that takes the folder's place, remembered by what it shows: closing the tabs

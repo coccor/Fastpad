@@ -197,7 +197,7 @@ fn the_sidebar_takes_the_left_edge_and_everything_else_starts_right_of_it() {
     };
     assert_eq!(
         super::super::menu_headings(window.hwnd)[0].left,
-        left + crate::window::panel::scale(4, dpi)
+        left + crate::window::design::metrics::scale(4, dpi)
     );
     unsafe {
         SendMessageW(
@@ -238,11 +238,12 @@ fn the_sidebar_top_strip_and_panel_header_are_caption() {
     assert_eq!(hit(bar, button_x, button_y), HTCLIENT as LRESULT);
 
     let header_y = layout.resize_border + 2;
-    let header = crate::window::panel::scale(crate::window::side_panel::HEADER_HEIGHT_96, dpi);
+    let header =
+        crate::window::design::metrics::scale(crate::window::design::metrics::PANEL_HEADER, dpi);
     assert!(header_y < header);
-    // The Notebook view's title band holds only its caption, "NOTEBOOK": all of it is a
+    // The Notebook view's title band holds only its caption, "Notebook": all of it is a
     // drag area, the old title point included.
-    let panel_x = crate::window::panel::scale(4, dpi);
+    let panel_x = crate::window::design::metrics::scale(4, dpi);
     assert_eq!(
         hit(panel, client_size(panel).0 / 2, header_y),
         HTTRANSPARENT as LRESULT,
@@ -481,7 +482,7 @@ fn a_narrow_window_squeezes_the_panel_without_saving_it() {
     let editor = install_test_editor(&window);
     let (_, panel) = sidebar_windows(window.hwnd);
     let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
-    let scale = |value| crate::window::panel::scale(value, dpi);
+    let scale = |value| crate::window::design::metrics::scale(value, dpi);
 
     set_client_width(window.hwnd, scale(44 + 320 + 200));
     let (width, _) = client_size(window.hwnd);
@@ -531,7 +532,7 @@ fn dragging_the_sidebar_edge_resizes_it_and_saves_the_width_once_on_release() {
     let _editor = install_test_editor(&window);
     let (_, panel) = sidebar_windows(window.hwnd);
     let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
-    let scale = |value| crate::window::panel::scale(value, dpi);
+    let scale = |value| crate::window::design::metrics::scale(value, dpi);
     set_client_width(window.hwnd, scale(1400));
     let saved = || std::fs::read_to_string(&ini).unwrap();
     let send = |message, x: i32| unsafe {
@@ -561,4 +562,52 @@ fn dragging_the_sidebar_edge_resizes_it_and_saves_the_width_once_on_release() {
     assert_eq!(saved(), "# kept\r\nsidebar_width=260\r\n");
     assert_eq!(client_size(panel).0, scale(260));
     super::super::save_settings_to(None);
+}
+
+#[test]
+fn the_sidebar_fonts_are_rebuilt_when_only_the_text_size_changes() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
+    // Break caught: a text-size change leaving the old fonts in the cache, so the sidebar keeps
+    // its old text size until the DPI changes.
+    use crate::window::design::text_scale::set_factor_for_test;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    set_factor_for_test(100);
+    let sidebar = app_mut(window.hwnd)
+        .sidebar
+        .as_mut()
+        .expect("notes mode has a sidebar");
+    let first = sidebar.fonts(96).text;
+    assert_eq!(sidebar.fonts(96).text, first, "same key reuses the fonts");
+    set_factor_for_test(150);
+    let second = sidebar.fonts(96).text;
+    // The old font is gone, so its handle value may be reused: check the new font's size instead.
+    let mut logfont = windows_sys::Win32::Graphics::Gdi::LOGFONTW::default();
+    let copied = unsafe {
+        windows_sys::Win32::Graphics::Gdi::GetObjectW(
+            second,
+            std::mem::size_of::<windows_sys::Win32::Graphics::Gdi::LOGFONTW>() as i32,
+            std::ptr::addr_of_mut!(logfont).cast(),
+        )
+    };
+    set_factor_for_test(100);
+    assert!(copied > 0);
+    assert_eq!(logfont.lfHeight, -20);
+}
+
+#[test]
+fn a_text_size_change_refreshes_the_stored_sidebar_row_heights() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
+    // Break caught: the Favorites rows keeping their old height after the text size changes, so
+    // the larger text clips until the rows reload.
+    use crate::window::design::text_scale::set_factor_for_test;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    set_factor_for_test(150);
+    super::super::refresh_metrics(window.hwnd, 96);
+    set_factor_for_test(100);
+    let sidebar = app_mut(window.hwnd).sidebar.as_ref().expect("a sidebar");
+    assert_eq!(sidebar.favorites.row_height_for_test(), 39);
 }

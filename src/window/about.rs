@@ -6,13 +6,17 @@
 //! It shares the Settings dialog's look: a hidden native frame for the DWM shadow, a header band
 //! that drags it with a × in its corner, and soft controls drawn through `soft_paint`.
 
+use super::design::metrics::scale;
+use super::design::metrics::{CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING};
+use super::design::text_scale::scale_text;
+use super::design::type_ramp::{self, TextStyle};
 use super::modal::ModalScope;
 use super::palette::Palette;
-use super::panel::{inset, scale, text_height};
+use super::panel::{inset, text_height};
 use super::side_panel::paint_buffered;
 use super::soft_paint::{
-    Canvas, FOCUS_GAP_AT_96_DPI, FOCUS_WIDTH_AT_96_DPI, Frame, GLYPH_FONT, RADIUS_AT_96_DPI, Shape,
-    TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones, title_close,
+    Canvas, Frame, Shape, TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones,
+    glyph_font_face, title_close,
 };
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
@@ -25,8 +29,7 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DeleteObject, DrawTextW,
-    FW_NORMAL, FW_SEMIBOLD, GetDC, HDC, HFONT, InvalidateRect, ReleaseDC, ScreenToClient,
-    SelectObject,
+    FW_NORMAL, GetDC, HDC, HFONT, InvalidateRect, ReleaseDC, ScreenToClient, SelectObject,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::MARGINS;
@@ -175,7 +178,7 @@ impl Layout {
             left: title_close_left,
             top: 0,
             right: width,
-            bottom: scale(TITLE_HEIGHT_AT_96_DPI, dpi),
+            bottom: scale_text(TITLE_HEIGHT_AT_96_DPI, dpi),
         };
         let icon = RECT {
             left: padding,
@@ -199,7 +202,7 @@ impl Layout {
             left: 0,
             top: 0,
             right: width,
-            bottom: icon.bottom.max(version.bottom) + padding,
+            bottom: (icon.bottom.max(version.bottom) + padding).max(title_close.bottom),
         };
 
         let description = line(padding, header.bottom + section_gap, body_height);
@@ -222,9 +225,9 @@ impl Layout {
             left: 0,
             top: footer_top,
             right: width,
-            bottom: footer_top + scale(FOOTER_HEIGHT_AT_96_DPI, dpi),
+            bottom: footer_top + scale_text(FOOTER_HEIGHT_AT_96_DPI, dpi),
         };
-        let button_height = scale(BUTTON_HEIGHT_AT_96_DPI, dpi);
+        let button_height = scale_text(BUTTON_HEIGHT_AT_96_DPI, dpi);
         let button_top = footer.top + (footer.bottom - footer.top - button_height) / 2;
         let ok = RECT {
             left: right - scale(BUTTON_WIDTH_AT_96_DPI, dpi),
@@ -273,7 +276,7 @@ impl Layout {
 
     /// The corner radius of the button and the focus ring, as in Settings.
     fn radius(&self) -> i32 {
-        scale(RADIUS_AT_96_DPI, self.dpi)
+        scale(CONTROL_RADIUS, self.dpi)
     }
 
     fn rect_of(&self, target: Target) -> RECT {
@@ -387,10 +390,10 @@ fn create(owner: HWND, colors: Palette, link_color: u32) -> Option<HWND> {
     }
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
     // The title matches Settings' title.
-    let title_font = create_ui_font(scale(18, dpi), "Segoe UI", FW_SEMIBOLD as i32, false);
-    let body_font = create_ui_font(scale(13, dpi), "Segoe UI", FW_NORMAL as i32, false);
-    let link_font = create_underlined_font(scale(13, dpi));
-    let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
+    let title_font = type_ramp::create(TextStyle::Title, dpi);
+    let body_font = type_ramp::create(TextStyle::Body, dpi);
+    let link_font = create_underlined_font(crate::window::design::text_scale::scale_text(13, dpi));
+    let glyph_font = create_ui_font(scale(11, dpi), glyph_font_face(), FW_NORMAL as i32, false);
     let link_widths = Link::ALL.map(|link| measure(dialog, link_font, link.label()));
     let layout = Layout::calculate(
         dpi,
@@ -496,7 +499,7 @@ fn create_underlined_font(pixel_height: i32) -> HFONT {
         CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
         OUT_DEFAULT_PRECIS,
     };
-    let face = wide_null("Segoe UI");
+    let face = wide_null(crate::window::design::faces::current().text);
     unsafe {
         CreateFontW(
             -pixel_height,
@@ -842,8 +845,8 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, about: &'a About) {
     );
 
     // The focus ring: a rounded accent stroke just outside the focused link or button.
-    let width = scale(FOCUS_WIDTH_AT_96_DPI, layout.dpi);
-    let outside = width + scale(FOCUS_GAP_AT_96_DPI, layout.dpi);
+    let width = scale(FOCUS_RING, layout.dpi);
+    let outside = width + scale(FOCUS_GAP, layout.dpi);
     frame.shape(Shape::Ring {
         rect: inset(layout.rect_of(about.focus), -outside),
         radius: radius + outside,
@@ -892,6 +895,32 @@ mod tests {
             "https://github.com/coccor/FastPad/blob/main/LICENSES.md"
         );
         assert!(!DESCRIPTION.is_empty());
+    }
+
+    #[test]
+    fn the_about_heights_hold_their_text_at_every_text_size() {
+        // Break caught: the title row, footer or OK button too short for the text at a larger
+        // Windows text size, or the 100 % sizes drifting.
+        use crate::window::design::text_scale::FactorGuard;
+        use crate::window::design::type_ramp::text_height_for_test;
+        let height = |rect: RECT| rect.bottom - rect.top;
+        {
+            let _factor = FactorGuard::set(100);
+            let layout = Layout::calculate(96, 24, 17, [100, 100]);
+            assert_eq!(layout.title_close.bottom, 44);
+            assert_eq!(height(layout.footer), 56);
+            assert_eq!(height(layout.ok), 30);
+        }
+        let _factor = FactorGuard::set(225);
+        for dpi in [96, 144] {
+            let body = text_height_for_test(TextStyle::Body, dpi);
+            let title = text_height_for_test(TextStyle::Title, dpi);
+            let layout = Layout::calculate(dpi, title, body, [100, 100]);
+            assert!(layout.title_close.bottom >= body, "{dpi}");
+            assert!(layout.header.bottom >= layout.title_close.bottom, "{dpi}");
+            assert!(height(layout.ok) >= body, "{dpi}");
+            assert!(height(layout.footer) > height(layout.ok), "{dpi}");
+        }
     }
 
     #[test]

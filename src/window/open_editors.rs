@@ -4,12 +4,12 @@
 //! editors spec §7). Built from the tab list in memory: no disk.
 
 use crate::document::{Document, DocumentId};
+use crate::window::design::metrics::scale;
 use crate::window::file_icons::{NoteKind, note_kind};
 use crate::window::icon_sets::TreeItem;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::main_window::app_ptr;
 use crate::window::notebook_view::draw_item_icon;
-use crate::window::panel::scale;
 use crate::window::row_list::{RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{ViewPaint, draw_text};
 use crate::window::split_tree::GroupId;

@@ -6,9 +6,10 @@ use crate::library::model::same_path;
 use crate::library::tree::natural_cmp;
 use crate::library::{local, normalize_folder};
 use crate::window::commands::CommandId;
+use crate::window::design::metrics::{panel_header, scale, sidebar_row};
 use crate::window::library_host;
 use crate::window::menus::{self, MenuEntry};
-use crate::window::panel::{fill, scale};
+use crate::window::panel::fill;
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{ViewPaint, draw_text, point_of};
 use std::path::{Path, PathBuf};
@@ -28,8 +29,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
 };
 
-const HEADER_AT_96_DPI: i32 = 38;
-const ROW_AT_96_DPI: i32 = 26;
 const PADDING_AT_96_DPI: i32 = 12;
 const GLYPH_AT_96_DPI: i32 = 20;
 const GAP_AT_96_DPI: i32 = 6;
@@ -39,7 +38,7 @@ const FOLDER_GLYPH: &str = "\u{E8B7}";
 const FILLED_STAR_GLYPH: &str = "\u{E735}";
 const OPEN_GLYPH: &str = "\u{E838}";
 
-pub(crate) const HEADER_TEXT: &str = "FAVORITES";
+pub(crate) const HEADER_TEXT: &str = "Favorites";
 pub(crate) const EMPTY_TEXT: &str = "Star a notebook to keep it here.";
 pub(crate) const OPEN_NOTEBOOK: &str = "Open notebook\u{2026}";
 
@@ -122,7 +121,7 @@ pub(crate) struct FavoritesView {
 
 impl FavoritesView {
     pub(crate) fn new(dpi: u32) -> Self {
-        let mut list = RowListState::new(scale(ROW_AT_96_DPI, dpi));
+        let mut list = RowListState::new(sidebar_row(dpi));
         list.set_count(1);
         Self {
             rows: Vec::new(),
@@ -131,6 +130,11 @@ impl FavoritesView {
             thumb_grab: None,
             order: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_height_for_test(&self) -> i32 {
+        self.list.row_height
     }
 
     /// Replaces the rows. The selection stays on the same notebook, or moves to the row that took
@@ -149,7 +153,7 @@ impl FavoritesView {
             self.order = self.order.wrapping_add(1);
         }
         self.rows = rows;
-        self.list.row_height = scale(ROW_AT_96_DPI, dpi);
+        self.list.row_height = sidebar_row(dpi);
         self.list.set_count(self.rows.len() + 1);
         let index = kept
             .and_then(|folder| {
@@ -168,7 +172,7 @@ impl FavoritesView {
     /// The header's "Open notebook…" button.
     pub(crate) fn header_button(client: RECT, dpi: u32) -> RECT {
         let size = scale(HEADER_BUTTON_AT_96_DPI, dpi);
-        let header = scale(HEADER_AT_96_DPI, dpi);
+        let header = panel_header(dpi);
         let right = client.right - scale(GAP_AT_96_DPI, dpi);
         let top = client.top + (header - size) / 2;
         RECT {
@@ -181,9 +185,9 @@ impl FavoritesView {
 
     /// Where the rows are. With no favorites, the empty-state line sits above the footer row.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
-        let mut top = client.top + scale(HEADER_AT_96_DPI, dpi);
+        let mut top = client.top + panel_header(dpi);
         if self.rows.is_empty() {
-            top += scale(ROW_AT_96_DPI, dpi);
+            top += sidebar_row(dpi);
         }
         RECT {
             top: top.min(client.bottom),
@@ -192,7 +196,7 @@ impl FavoritesView {
     }
 
     fn star_left(area: RECT, dpi: u32) -> i32 {
-        area.right - scale(ROW_AT_96_DPI, dpi)
+        area.right - sidebar_row(dpi)
     }
 
     pub(crate) fn paint(&self, paint: &ViewPaint) {
@@ -202,7 +206,7 @@ impl FavoritesView {
         let pad = scale(PADDING_AT_96_DPI, dpi);
         let line = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
         let header = RECT {
-            bottom: client.top + scale(HEADER_AT_96_DPI, dpi),
+            bottom: client.top + panel_header(dpi),
             ..client
         };
         unsafe {
@@ -235,7 +239,7 @@ impl FavoritesView {
                     left: client.left + pad,
                     top: header.bottom,
                     right: client.right - pad,
-                    bottom: header.bottom + scale(ROW_AT_96_DPI, dpi),
+                    bottom: header.bottom + sidebar_row(dpi),
                 };
                 draw_text(
                     paint.hdc,
@@ -254,6 +258,9 @@ impl FavoritesView {
             &self.list,
             &palette,
             paint.focused,
+            paint.focused,
+            &|_| paint.background,
+            dpi,
             &mut |hdc, index, rect, look| self.draw_row(hdc, index, rect, look, paint),
         );
     }
@@ -302,15 +309,16 @@ impl FavoritesView {
                 );
                 return;
             };
-            // The open notebook gets an accent bar, so it isn't marked by color alone.
-            if row.open {
+            // The open notebook gets an accent bar, so it isn't marked by color alone. The focused
+            // selection has its own bar, so this one steps aside rather than sit next to it.
+            if row.open && !(look.selected && look.focused) {
                 fill(
                     hdc,
                     RECT {
                         right: rect.left + scale(3, dpi),
                         ..rect
                     },
-                    palette.selection_background,
+                    palette.accent,
                 );
             }
             draw_text(
@@ -523,6 +531,17 @@ pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
     with_view(hwnd, |view| {
         let area = view.list_area(client, dpi);
         view.set_rows(rows, dpi, height(area));
+    });
+    invalidate(panel);
+}
+
+/// Re-applies the row height after a DPI or text-size change; the rows themselves are unchanged.
+pub(crate) fn refresh_metrics(hwnd: HWND, panel: HWND) {
+    let (client, dpi) = geometry(panel);
+    with_view(hwnd, |view| {
+        let height = height(view.list_area(client, dpi));
+        view.list.row_height = sidebar_row(dpi);
+        view.list.scroll_lines(0, height);
     });
     invalidate(panel);
 }
@@ -827,6 +846,75 @@ mod tests {
         assert_eq!(rows[2].hint, None);
         assert!(rows[2].open);
         assert!(!rows[3].open && !rows[0].open);
+    }
+
+    #[test]
+    fn the_open_notebooks_bar_is_the_accent_color() {
+        // Break caught: the open-notebook bar painted in the selection fill (invisible on a
+        // selected row) instead of the accent, drawn on a notebook that isn't open, or drawn beside
+        // the selection bar of the focused selected row.
+        use crate::config::FileIconSet;
+        use crate::window::icon_sets::images::TestTarget;
+        use crate::window::palette::{FileIcons, Palette};
+        use crate::window::side_panel::{UiFonts, ViewPaint};
+        let palette = Palette {
+            accent: 0x00aa_55ff,
+            ..Palette::neutral()
+        };
+        let favorites = [r"C:\a\Alpha", r"C:\b\Beta"].map(PathBuf::from);
+        let mut view = FavoritesView::new(96);
+        view.set_rows(
+            favorite_rows(&favorites, Some(Path::new(r"C:\a\Alpha"))),
+            96,
+            400,
+        );
+        view.list.selected = None;
+        let render = |view: &mut FavoritesView, focused: bool| {
+            let target = TestTarget::new(260, 400);
+            let paint = ViewPaint {
+                hdc: target.dc,
+                client: CLIENT,
+                palette,
+                icons: FileIcons::neutral(),
+                icon_set: FileIconSet::Minimal,
+                light_theme: true,
+                background: palette.panel_background(),
+                fonts: UiFonts::default(),
+                dpi: 96,
+                focused,
+            };
+            view.paint(&paint);
+            target
+        };
+        let target = render(&mut view, true);
+        let area = view.list_area(CLIENT, 96);
+        let row = view.list.row_height;
+        let accent = {
+            let probe = TestTarget::new(1, 1);
+            unsafe {
+                crate::window::panel::fill(
+                    probe.dc,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: 1,
+                    },
+                    palette.accent,
+                );
+            }
+            probe.pixel(0, 0)
+        };
+        assert_eq!(target.pixel(1, area.top + row / 2), accent);
+        assert_ne!(target.pixel(1, area.top + row + row / 2), accent);
+        // The focused selected open row has the selection bar instead, not both side by side.
+        view.list.selected = Some(0);
+        let target = render(&mut view, true);
+        assert_ne!(target.pixel(1, area.top + row / 2), accent);
+        assert_eq!(target.pixel(5, area.top + row / 2), accent);
+        // Unfocused, the selection has no bar of its own, so the open bar stays.
+        let target = render(&mut view, false);
+        assert_eq!(target.pixel(1, area.top + row / 2), accent);
     }
 
     #[test]

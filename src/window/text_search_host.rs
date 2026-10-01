@@ -801,7 +801,7 @@ fn confirm_and_apply(hwnd: HWND, counted: ReplaceCounted) {
     };
     // Asked with nothing of the App borrowed: the question is a nested modal loop.
     if let Some(question) = question
-        && !super::modal::confirm(hwnd, &question)
+        && !super::modal::confirm(hwnd, &question, "Replace")
     {
         if with_host(hwnd, |host| host.replace_generation) == Some(generation) {
             finish_replace(hwnd);

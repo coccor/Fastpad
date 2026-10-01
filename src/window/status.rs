@@ -9,10 +9,11 @@ use crate::file::encoding::Encoding;
 use crate::platform::theme::SystemTheme;
 use crate::window::notification::NotificationCenter;
 
-const STATUS_HEIGHT_AT_96_DPI: i64 = 22;
+const STATUS_HEIGHT_AT_96_DPI: i32 = 22;
 
+/// The bar's height at `dpi`, following the Windows text-size setting.
 pub fn status_height(dpi: u32) -> i32 {
-    ((STATUS_HEIGHT_AT_96_DPI * i64::from(dpi.max(96)) + 48) / 96) as i32
+    crate::window::design::text_scale::scale_text(STATUS_HEIGHT_AT_96_DPI, dpi.max(96))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,8 +139,26 @@ mod tests {
     use crate::window::notification::NotificationCenter;
 
     #[test]
+    fn the_status_bar_height_follows_the_text_size() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
+        // Break caught: a status bar that clips its text at a larger Windows text size.
+        use super::status_height;
+        use crate::window::design::text_scale::{scale_text, set_factor_for_test};
+        set_factor_for_test(100);
+        assert_eq!((status_height(96), status_height(144)), (22, 33));
+        assert_eq!(status_height(0), 22);
+        set_factor_for_test(225);
+        let (at_96, at_192) = (status_height(96), status_height(192));
+        let expected = scale_text(22, 96);
+        set_factor_for_test(100);
+        assert_eq!(at_96, expected);
+        assert_eq!(at_96, 50); // 49.5 rounds up
+        assert_eq!(at_192, 99);
+    }
+
+    #[test]
     fn an_image_status_lists_size_format_file_size_and_zoom() {
-        // Break caught: an image tab showing a caret position and "Plain Text UTF-8".
+        // Break caught: an image tab showing a caret position and "Plain text UTF-8".
         let image = crate::window::image_host::ImageStatus {
             size: Some((1920, 1080)),
             format: Some("PNG"),

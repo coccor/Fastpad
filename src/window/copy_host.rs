@@ -245,7 +245,7 @@ pub(crate) fn copy_into(
             Outcome::Refused(refusal) => notices.push(tree_copy::refused_notice(&name, refusal)),
             Outcome::Clash => {
                 let question = tree_copy::replace_question(&name, &folder_label);
-                if !library_host::confirmed(hwnd, &question) {
+                if !library_host::confirmed(hwnd, &question, "Replace") {
                     continue;
                 }
                 if let Some(notice) = kept_by_identity(&source, &destination, &name) {

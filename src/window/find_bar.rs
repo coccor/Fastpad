@@ -282,9 +282,11 @@ pub(crate) use count::{MatchCount, count_matches};
 // --- Window integration: native child controls hosting Find/Replace ---
 
 use crate::platform::{last_error, wide_null};
+use crate::window::design::metrics::scale;
+use crate::window::design::text_scale::scale_text;
 use crate::window::option_toggles;
 use crate::window::palette::Palette;
-use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
 use crate::window::side_panel::draw_text;
 use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSource};
 use crate::window::tooltip::Tooltip;
@@ -327,8 +329,8 @@ const PREVIOUS_TIP: &str = "Previous match (Shift+Enter)";
 const NEXT_TIP: &str = "Next match (Enter)";
 
 /// Height of the bar, reserved above the editor whenever it's visible.
-pub(crate) const fn find_bar_height(dpi: u32) -> i32 {
-    scale(BAR_HEIGHT_AT_96_DPI, dpi)
+pub(crate) fn find_bar_height(dpi: u32) -> i32 {
+    scale_text(BAR_HEIGHT_AT_96_DPI, dpi)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,7 +391,7 @@ struct BarLayout {
 
 fn bar_layout(width: i32, dpi: u32, text_height: i32, mode: FindBarMode) -> BarLayout {
     let padding = scale(PADDING_AT_96_DPI, dpi);
-    let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+    let field_height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
     let top = (find_bar_height(dpi) - 1 - field_height) / 2;
     let button = |left: i32| RECT {
         left: left.max(0),
@@ -429,7 +431,7 @@ fn field_layouts(
     top: i32,
 ) -> (FieldLayout, Option<FieldLayout>) {
     let padding = scale(PADDING_AT_96_DPI, dpi);
-    let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+    let field_height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
     let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
     let text_height = text_height.clamp(1, (field_height - 2).max(1));
     let toggles = option_toggles::reserved_width(dpi);
@@ -1063,6 +1065,7 @@ impl FindBar {
                     self.hovered_toggle.get(),
                     &colors,
                     text_font,
+                    dpi,
                 );
             }
             if !text_font.is_null()

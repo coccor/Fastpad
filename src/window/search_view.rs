@@ -7,9 +7,9 @@
 
 use crate::library::text_search::{Progress, RunEnd, TextHit, hit_cmp};
 use crate::search::{MatchOptions, SearchOption};
+use crate::window::design::text_scale::scale_text;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::palette::Palette;
-use crate::window::panel::scale;
 use crate::window::row_list::RowListState;
 use crate::window::side_panel::point_of;
 use crate::window::text_search_host::SearchBatch;
@@ -48,10 +48,10 @@ pub(crate) const REPLACING: &str = "Replacing\u{2026}";
 const HEADER_AT_96_DPI: i32 = 38;
 /// The summary line, the notice and the status line.
 const LINE_AT_96_DPI: i32 = 22;
-/// A result: two line slots with a little room above and below. The 12 px Segoe UI line is 16 px
-/// tall at 96 DPI; the old one-line row was 26 px.
-const ROW_AT_96_DPI: i32 = 42;
-const ROW_LINE_AT_96_DPI: i32 = 18;
+/// A result: two line slots with a little room above and below. The 13 px Segoe UI line is 17 px
+/// tall at 96 DPI and 28 px at 144 DPI; the old one-line row was 26 px.
+const ROW_AT_96_DPI: i32 = 46;
+const ROW_LINE_AT_96_DPI: i32 = 19;
 const ROW_INSET_AT_96_DPI: i32 = 3;
 const PADDING_AT_96_DPI: i32 = 12;
 const FIELD_MARGIN_AT_96_DPI: i32 = 8;
@@ -88,7 +88,7 @@ const CLEAR_TOOL: usize = 7;
 /// The clear button's gap to the toggles, and Segoe MDL2 Assets' Cancel glyph.
 const CLEAR_GAP_AT_96_DPI: i32 = 2;
 const CLEAR_GLYPH: &str = "\u{E711}";
-const TITLE: &str = "SEARCH";
+const TITLE: &str = "Search";
 /// The title's left inset, as the Notebook view's.
 const TITLE_INSET_AT_96_DPI: i32 = 12;
 /// A result's file icon, as the tree's.
@@ -288,7 +288,7 @@ impl SearchView {
             replace_on_batch: false,
             restore: None,
             selected_by_batch: None,
-            list: RowListState::new(scale(ROW_AT_96_DPI, dpi)),
+            list: RowListState::new(scale_text(ROW_AT_96_DPI, dpi)),
             placeholder: placeholder(None),
             thumb_grab: None,
             order: 0,

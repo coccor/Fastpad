@@ -110,17 +110,17 @@ pub(super) fn context_menu(hwnd: HWND, at: POINT) {
         return;
     };
     let mut items = vec![
-        ("Change Keybinding\tEnter".to_owned(), CHANGE),
-        ("Add Keybinding\tCtrl+Enter".to_owned(), ADD),
+        ("Change keybinding\tEnter".to_owned(), CHANGE),
+        ("Add keybinding\tCtrl+Enter".to_owned(), ADD),
     ];
     if has_key {
-        items.push(("Remove Keybinding\tDelete".to_owned(), REMOVE));
+        items.push(("Remove keybinding\tDelete".to_owned(), REMOVE));
     }
     if user {
-        items.push(("Reset Keybinding".to_owned(), RESET));
+        items.push(("Reset keybinding".to_owned(), RESET));
     }
     items.push((String::new(), 0));
-    items.push(("Copy Command ID\tCtrl+C".to_owned(), COPY_ID));
+    items.push(("Copy command ID\tCtrl+C".to_owned(), COPY_ID));
     let choice = crate::window::menus::track_choice(owner(hwnd), hwnd, &items, at);
     let effect = state(hwnd).map(|dialog| {
         let model = &mut dialog.shortcuts;

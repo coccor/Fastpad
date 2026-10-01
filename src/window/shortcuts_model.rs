@@ -19,7 +19,7 @@ const EXTRA_TITLES: [(CommandId, &str); 22] = [
     (CommandId::SelectTab8, "View: Select tab 8"),
     (CommandId::SelectTab9, "View: Select tab 9"),
     (CommandId::CommandPalette, "View: Show command palette"),
-    (CommandId::MarkdownPreviewCycle, "Markdown Preview: Cycle"),
+    (CommandId::MarkdownPreviewCycle, "Markdown preview: Cycle"),
     (CommandId::FocusNextPane, "View: Focus next pane"),
     (CommandId::FocusPreviousPane, "View: Focus previous pane"),
     (CommandId::FocusGroup1, "View: Focus editor group 1"),

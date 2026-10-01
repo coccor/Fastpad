@@ -3,9 +3,10 @@
 //! z-order, shown only while the active tab can preview.
 
 use crate::platform::wide_null;
+use crate::window::design::metrics::scale;
 use crate::window::titlebar::{
     GLYPH_PREVIEW_FULL, GLYPH_PREVIEW_SIDE, Point, Rect, create_ui_font, draw_text, fill,
-    restore_font, scale, select_font,
+    restore_font, select_font,
 };
 use crate::window::tooltip::Tooltip;
 use windows_sys::Win32::Foundation::{
@@ -32,9 +33,9 @@ const CLASS_NAME: &str = "FastPadPreviewButtons";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreviewButton {
-    /// "Open Preview to the Side".
+    /// "Open preview to the side".
     Side,
-    /// "Open Preview", which replaces the editor.
+    /// "Open preview", which replaces the editor.
     Full,
 }
 
@@ -350,7 +351,12 @@ fn paint(main: HWND, buttons: HWND) {
         SetBkMode(dc, TRANSPARENT as i32);
     }
     // Larger than the title bar's caption glyphs: these are the buttons' whole content.
-    let font = create_ui_font(scale(17, dpi), "Segoe MDL2 Assets", FW_NORMAL as i32, false);
+    let font = create_ui_font(
+        scale(17, dpi),
+        crate::window::design::faces::current().icons,
+        FW_NORMAL as i32,
+        false,
+    );
     let previous = unsafe { select_font(dc, font) };
     for (button, glyph, active) in [
         (

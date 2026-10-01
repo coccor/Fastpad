@@ -3,8 +3,10 @@
 //! bar share their geometry, painting, hit-testing, Alt keys and wording.
 
 use crate::search::{MatchOptions, SearchOption};
+use crate::window::design::metrics::{CONTROL_RADIUS, scale};
+use crate::window::design::round::{Corners, fill_rounded, radius_for};
 use crate::window::palette::Palette;
-use crate::window::panel::{fill, scale};
+use crate::window::panel::fill;
 use crate::window::side_panel::draw_text;
 use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -59,7 +61,7 @@ fn glyph(option: SearchOption) -> &'static str {
 
 /// Paints the toggles into `rects` (`toggle_rects`) in `font`. An option that is on is filled
 /// with the color FastPad outlines focused fields with (`selection_background`). The hovered one
-/// that is off is shaded. "ab" is underlined, as in VS Code.
+/// that is off is shaded. Both fills have rounded corners. "ab" is underlined, as in VS Code.
 pub(crate) fn paint(
     hdc: HDC,
     rects: &[RECT; 3],
@@ -67,15 +69,28 @@ pub(crate) fn paint(
     hover: Option<SearchOption>,
     palette: &Palette,
     font: HFONT,
+    dpi: u32,
 ) {
+    let radius = radius_for(palette, CONTROL_RADIUS, dpi);
+    let rounded = |rect: RECT, color: u32| unsafe {
+        // The toggles sit inside the field, so the field's fill is what shows behind a corner.
+        fill_rounded(
+            hdc,
+            rect,
+            radius,
+            Corners::ALL,
+            color,
+            palette.editor_background,
+        );
+    };
     for (option, rect) in SearchOption::ALL.into_iter().zip(rects) {
         let color = if options.get(option) {
-            unsafe { fill(hdc, *rect, palette.selection_background) };
+            rounded(*rect, palette.selection_background);
             palette
                 .selection_foreground
                 .unwrap_or(palette.editor_foreground)
         } else if hover == Some(option) {
-            unsafe { fill(hdc, *rect, palette.hover_background) };
+            rounded(*rect, palette.hover_background);
             palette.hover_foreground
         } else {
             palette.muted_foreground
@@ -349,7 +364,7 @@ mod tests {
             hover_background: 0x0000_ff00,
             ..Palette::neutral()
         };
-        let background = 0x0080_8080;
+        let background = palette.editor_background;
         let rects = toggle_rects(FIELD, 96);
         unsafe {
             let screen = GetDC(std::ptr::null_mut());
@@ -374,11 +389,15 @@ mod tests {
                 Some(SearchOption::WholeWord),
                 &palette,
                 std::ptr::null_mut(),
+                96,
             );
-            let corner = |rect: RECT| GetPixel(dc, rect.left + 1, rect.top + 1);
-            assert_eq!(corner(rects[0]), palette.selection_background, "on");
-            assert_eq!(corner(rects[1]), palette.hover_background, "hovered");
-            assert_eq!(corner(rects[2]), background, "off");
+            let middle = |rect: RECT| GetPixel(dc, rect.left + 3, rect.top + 3);
+            assert_eq!(middle(rects[0]), palette.selection_background, "on");
+            assert_eq!(middle(rects[1]), palette.hover_background, "hovered");
+            assert_eq!(middle(rects[2]), background, "off");
+            let outer = |rect: RECT| GetPixel(dc, rect.left, rect.top);
+            assert_eq!(outer(rects[0]), background, "on: rounded");
+            assert_eq!(outer(rects[1]), background, "hover: rounded");
             SelectObject(dc, previous);
             DeleteObject(bitmap);
             DeleteDC(dc);

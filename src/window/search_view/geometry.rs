@@ -3,18 +3,19 @@
 
 use super::*;
 use crate::search::SearchOption;
+use crate::window::design::metrics::panel_header;
+use crate::window::design::metrics::scale;
+use crate::window::design::text_scale::scale_text;
 use crate::window::option_toggles;
-use crate::window::panel::scale;
-use crate::window::side_panel::HEADER_HEIGHT_96;
 use crate::window::sidebar_accessibility;
 use windows_sys::Win32::Foundation::{POINT, RECT};
 
 impl SearchView {
-    /// The title band along the top ("SEARCH"): the window's title strip, as in the Notebook
+    /// The title band along the top ("Search"): the window's title strip, as in the Notebook
     /// view, so all of it is caption.
     pub(crate) fn title_rect(client: RECT, dpi: u32) -> RECT {
         RECT {
-            bottom: (client.top + scale(HEADER_HEIGHT_96, dpi)).min(client.bottom),
+            bottom: (client.top + panel_header(dpi)).min(client.bottom),
             ..client
         }
     }
@@ -27,8 +28,8 @@ impl SearchView {
     /// The painted search field, border included, right of the chevron.
     pub(crate) fn field_rect(client: RECT, dpi: u32) -> RECT {
         let margin = scale(FIELD_MARGIN_AT_96_DPI, dpi);
-        let height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
-        let top = Self::header_top(client, dpi) + (scale(HEADER_AT_96_DPI, dpi) - height) / 2;
+        let height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
+        let top = Self::header_top(client, dpi) + (scale_text(HEADER_AT_96_DPI, dpi) - height) / 2;
         let left = client.left
             + scale(CHEVRON_LEFT_AT_96_DPI, dpi)
             + scale(CHEVRON_WIDTH_AT_96_DPI, dpi)
@@ -72,8 +73,8 @@ impl SearchView {
         let field = Self::field_rect(client, dpi);
         let height = field.bottom - field.top;
         let top = Self::header_top(client, dpi)
-            + scale(HEADER_AT_96_DPI, dpi)
-            + (scale(REPLACE_ROW_AT_96_DPI, dpi) - height) / 2;
+            + scale_text(HEADER_AT_96_DPI, dpi)
+            + (scale_text(REPLACE_ROW_AT_96_DPI, dpi) - height) / 2;
         RECT {
             left: (field.right - scale(REPLACE_ALL_WIDTH_AT_96_DPI, dpi)).max(field.left),
             top,
@@ -111,19 +112,21 @@ impl SearchView {
     /// Where the header ends, and the replace row under it while the replace field is open.
     pub(super) fn head_bottom(&self, client: RECT, dpi: u32) -> i32 {
         let replace = if self.replace_open {
-            scale(REPLACE_ROW_AT_96_DPI, dpi)
+            scale_text(REPLACE_ROW_AT_96_DPI, dpi)
         } else {
             0
         };
-        (Self::header_top(client, dpi) + scale(HEADER_AT_96_DPI, dpi) + replace).min(client.bottom)
+        (Self::header_top(client, dpi) + scale_text(HEADER_AT_96_DPI, dpi) + replace)
+            .min(client.bottom)
     }
 
     /// Where the results are: under the header, the replace row while it shows, and the summary
     /// line, above the status line when it shows.
     pub(crate) fn list_area(&self, client: RECT, dpi: u32) -> RECT {
-        let top = (self.head_bottom(client, dpi) + scale(LINE_AT_96_DPI, dpi)).min(client.bottom);
+        let top =
+            (self.head_bottom(client, dpi) + scale_text(LINE_AT_96_DPI, dpi)).min(client.bottom);
         let bottom = if self.status_line().is_some() {
-            (client.bottom - scale(LINE_AT_96_DPI, dpi)).max(top)
+            (client.bottom - scale_text(LINE_AT_96_DPI, dpi)).max(top)
         } else {
             client.bottom
         };
@@ -142,7 +145,7 @@ impl SearchView {
             left: client.left + pad,
             top,
             right: client.right - pad,
-            bottom: (top + scale(LINE_AT_96_DPI, dpi)).min(client.bottom),
+            bottom: (top + scale_text(LINE_AT_96_DPI, dpi)).min(client.bottom),
         }
     }
 
@@ -202,7 +205,7 @@ impl SearchView {
         let pad = scale(PADDING_AT_96_DPI, dpi);
         RECT {
             left: client.left + pad,
-            top: (client.bottom - scale(LINE_AT_96_DPI, dpi)).max(client.top),
+            top: (client.bottom - scale_text(LINE_AT_96_DPI, dpi)).max(client.top),
             right: client.right - pad,
             bottom: client.bottom,
         }

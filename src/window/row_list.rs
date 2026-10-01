@@ -4,6 +4,8 @@
 //!
 //! Every `height` is the list area's height in pixels, and every `y` is relative to its top.
 
+use crate::window::design::metrics::{CONTROL_RADIUS, ROW_INSET_X, ROW_INSET_Y, scale};
+use crate::window::design::round::{Corners, fill_rounded, paint_selection_bar, radius_for};
 use crate::window::palette::Palette;
 use crate::window::panel::fill;
 use windows_sys::Win32::Foundation::RECT;
@@ -285,14 +287,25 @@ pub(crate) fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
 
 /// Paints the rows in view into `area` of `hdc`. For each row it paints the selection (the
 /// unfocused color when `focused` is false) or the hover background, then calls `draw_row` with
-/// the row's index, rectangle and look. Last it paints the thin scroll thumb at the right edge.
-/// Rows out of view are never touched, and nothing is drawn outside `area`.
+/// the row's index, rectangle and look. `bar` says whether the focused selection also gets the
+/// accent bar: it marks where the keyboard is, which is not always the selected row. Last it paints the thin scroll thumb at the right edge.
+/// The fills are rounded and inset from the row's edges (`draw_row` still gets the whole row),
+/// except in high contrast, where they cover the whole row. `behind(index)` is the color under row
+/// `index` (the panel's fill, or a band the caller painted under it): the rounded corners blend
+/// toward it. Rows out of view are never touched, and nothing is drawn outside `area`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a paint entry point: the surface, the list, the look and the callback"
+)]
 pub(crate) fn paint(
     hdc: HDC,
     area: RECT,
     state: &RowListState,
     palette: &Palette,
     focused: bool,
+    bar: bool,
+    behind: &dyn Fn(usize) -> u32,
+    dpi: u32,
     draw_row: &mut dyn FnMut(HDC, usize, RECT, RowLook),
 ) {
     let height = area.bottom - area.top;
@@ -302,6 +315,9 @@ pub(crate) fn paint(
     unsafe {
         let saved = SaveDC(hdc);
         IntersectClipRect(hdc, area.left, area.top, area.right, area.bottom);
+        let radius = radius_for(palette, CONTROL_RADIUS, dpi);
+        let inset_x = scale(ROW_INSET_X, dpi);
+        let inset_y = scale(ROW_INSET_Y, dpi);
         for offset in 0..state.visible_rows(height) {
             let index = state.top + offset;
             let top = area.top + offset as i32 * state.row_height;
@@ -316,15 +332,42 @@ pub(crate) fn paint(
                 hover: state.hover == Some(index),
                 focused,
             };
+            let backplate = if palette.high_contrast {
+                rect
+            } else {
+                RECT {
+                    left: rect.left + inset_x,
+                    top: rect.top + inset_y,
+                    right: rect.right - inset_x,
+                    bottom: rect.bottom - inset_y,
+                }
+            };
             if look.selected {
                 let background = if focused {
                     palette.selection_background
                 } else {
                     palette.inactive_selection_background
                 };
-                fill(hdc, rect, background);
+                fill_rounded(
+                    hdc,
+                    backplate,
+                    radius,
+                    Corners::ALL,
+                    background,
+                    behind(index),
+                );
+                if bar {
+                    paint_selection_bar(hdc, backplate, palette, background, dpi);
+                }
             } else if look.hover {
-                fill(hdc, rect, palette.hover_background);
+                fill_rounded(
+                    hdc,
+                    backplate,
+                    radius,
+                    Corners::ALL,
+                    palette.hover_background,
+                    behind(index),
+                );
             }
             draw_row(hdc, index, rect, look);
         }
@@ -613,6 +656,9 @@ mod tests {
                     &state,
                     &palette,
                     focused,
+                    focused,
+                    &|_| palette.editor_background,
+                    96,
                     &mut |_, index, rect, look| {
                         drawn.push((index, rect.top, look));
                     },
@@ -631,6 +677,15 @@ mod tests {
                     palette.inactive_selection_background
                 };
                 assert_eq!(GetPixel(dc, 10, 20 + 5), selection);
+                // The fill is inset 4px left and right and 1px top and bottom, with rounded corners.
+                assert_eq!(GetPixel(dc, 1, 20 + 13), palette.editor_background);
+                assert_eq!(GetPixel(dc, 3, 20 + 13), palette.editor_background);
+                // x 4..7 of the focused selection is the accent bar, so the fill's edge is probed
+                // just right of it.
+                assert_eq!(GetPixel(dc, 7, 20 + 13), selection);
+                assert_eq!(GetPixel(dc, 12, 20 + 13), selection);
+                assert_eq!(GetPixel(dc, 12, 20), palette.editor_background);
+                assert_eq!(GetPixel(dc, 4, 20 + 1), palette.editor_background);
                 assert_eq!(GetPixel(dc, 10, 40 + 5), palette.hover_background);
                 assert_eq!(GetPixel(dc, 10, 5), palette.editor_background);
                 let (thumb_top, _) = state.thumb(height).unwrap();
@@ -639,6 +694,254 @@ mod tests {
                     palette.line_number_foreground
                 );
             }
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn rounded_corners_blend_toward_the_color_under_their_own_row() {
+        // Break caught: corners that blend toward the panel inside a drop band, leaving specks.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let palette = Palette {
+            selection_background: 0x0000_00ff,
+            editor_background: 0x0080_8080,
+            ..Palette::neutral()
+        };
+        let band = 0x00ff_00ff;
+        let mut state = RowListState::new(20);
+        state.set_count(10);
+        state.selected = Some(1);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            let previous = SelectObject(dc, bitmap);
+            crate::window::panel::fill(dc, area, palette.editor_background);
+            crate::window::panel::fill(
+                dc,
+                RECT {
+                    top: 20,
+                    bottom: 40,
+                    ..area
+                },
+                band,
+            );
+            paint(
+                dc,
+                area,
+                &state,
+                &palette,
+                true,
+                true,
+                &|index| {
+                    if index == 1 {
+                        band
+                    } else {
+                        palette.editor_background
+                    }
+                },
+                96,
+                &mut |_, _, _, _| {},
+            );
+            assert_eq!(GetPixel(dc, 4, 20 + 1), band);
+            assert_eq!(GetPixel(dc, 12, 20 + 10), palette.selection_background);
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn a_focused_selected_row_gets_the_accent_bar_and_no_other_row_does() {
+        // Break caught: a bar on hovered, unselected or unfocused rows, or none on the focused
+        // selection, or one drawn over the high-contrast highlight.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let accent = 0x00aa_ff00;
+        let mut palette = Palette {
+            selection_background: 0x0000_00ff,
+            inactive_selection_background: 0x0000_ff00,
+            hover_background: 0x00ff_0000,
+            editor_background: 0x0080_8080,
+            accent,
+            ..Palette::neutral()
+        };
+        let mut state = RowListState::new(20);
+        state.set_count(10);
+        state.selected = Some(1);
+        state.hover = Some(2);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            let previous = SelectObject(dc, bitmap);
+            let render = |palette: &Palette, focused: bool| {
+                crate::window::panel::fill(dc, area, palette.editor_background);
+                paint(
+                    dc,
+                    area,
+                    &state,
+                    palette,
+                    focused,
+                    focused,
+                    &|_| palette.editor_background,
+                    96,
+                    &mut |_, _, _, _| {},
+                );
+            };
+            render(&palette, true);
+            assert_eq!(GetPixel(dc, 5, 30), accent);
+            assert_eq!(GetPixel(dc, 7, 30), palette.selection_background);
+            assert_eq!(GetPixel(dc, 5, 50), palette.hover_background);
+            for y in [5, 70, 90] {
+                assert_ne!(GetPixel(dc, 5, y), accent, "unselected row at y {y}");
+            }
+            render(&palette, false);
+            assert_eq!(GetPixel(dc, 5, 30), palette.inactive_selection_background);
+            assert_eq!(GetPixel(dc, 5, 50), palette.hover_background);
+            palette.high_contrast = true;
+            render(&palette, true);
+            assert_eq!(GetPixel(dc, 5, 30), palette.selection_background);
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn the_bar_flag_alone_decides_the_accent_bar_and_leaves_the_fill_alone() {
+        // Break caught: the bar tied to the focused look, so a list that is focused but whose
+        // keyboard is elsewhere shows a second bar, or a bar flag that changes the fill.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let accent = 0x00aa_ff00;
+        let palette = Palette {
+            selection_background: 0x0000_00ff,
+            editor_background: 0x0080_8080,
+            accent,
+            ..Palette::neutral()
+        };
+        let mut state = RowListState::new(20);
+        state.set_count(10);
+        state.selected = Some(1);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            let previous = SelectObject(dc, bitmap);
+            for bar in [false, true] {
+                crate::window::panel::fill(dc, area, palette.editor_background);
+                let mut looks = Vec::new();
+                paint(
+                    dc,
+                    area,
+                    &state,
+                    &palette,
+                    true,
+                    bar,
+                    &|_| palette.editor_background,
+                    96,
+                    &mut |_, index, _, look| looks.push((index, look.focused)),
+                );
+                assert!(
+                    looks.iter().all(|(_, focused)| *focused),
+                    "the look stays focused"
+                );
+                // The selected row's fill is the focused color either way.
+                assert_eq!(GetPixel(dc, 12, 30), palette.selection_background);
+                assert_eq!(GetPixel(dc, 8, 30), palette.selection_background);
+                assert_eq!(
+                    GetPixel(dc, 5, 30) == accent,
+                    bar,
+                    "the bar shows exactly when bar is set"
+                );
+                if !bar {
+                    assert_eq!(GetPixel(dc, 5, 30), palette.selection_background);
+                }
+            }
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn high_contrast_selection_fills_the_whole_row() {
+        // Break caught: rounding or insetting the system-color selection in high contrast, which
+        // leaves its corners and edges showing the background.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let palette = Palette {
+            selection_background: 0x0000_00ff,
+            editor_background: 0x0080_8080,
+            high_contrast: true,
+            ..Palette::neutral()
+        };
+        let mut state = RowListState::new(20);
+        state.set_count(10);
+        state.selected = Some(1);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            let previous = SelectObject(dc, bitmap);
+            crate::window::panel::fill(dc, area, palette.editor_background);
+            paint(
+                dc,
+                area,
+                &state,
+                &palette,
+                true,
+                true,
+                &|_| palette.editor_background,
+                96,
+                &mut |_, _, _, _| {},
+            );
+            assert_eq!(GetPixel(dc, 4, 20 + 1), palette.selection_background);
+            assert_eq!(GetPixel(dc, 1, 20), palette.selection_background);
             SelectObject(dc, previous);
             DeleteObject(bitmap);
             DeleteDC(dc);

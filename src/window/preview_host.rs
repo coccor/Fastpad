@@ -21,9 +21,9 @@ use crate::preview::{
 };
 use crate::window::WM_FASTPAD_PREVIEW_PARSED;
 use crate::window::commands::CommandId;
+use crate::window::design::metrics::scale;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
-use crate::window::panel::scale;
 use crate::window::preview_buttons::PreviewButton;
 use crate::window::split_tree::GroupId;
 use std::borrow::Cow;
@@ -542,7 +542,11 @@ fn appearance(hwnd: HWND) -> (PreviewColors, PreviewFonts, bool) {
         .unwrap_or_else(|| {
             (
                 preview_colors(theme, false),
-                PreviewFonts::from_settings("Segoe UI", "Consolas", 11),
+                PreviewFonts::from_settings(
+                    crate::window::design::faces::current().text,
+                    "Consolas",
+                    11,
+                ),
                 false,
             )
         })
@@ -1378,8 +1382,8 @@ pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
 /// modes, when there is one.
 fn button_hint(button: PreviewButton, cycle: Option<&str>) -> String {
     let action = match button {
-        PreviewButton::Side => "Open Preview to the Side",
-        PreviewButton::Full => "Open Preview",
+        PreviewButton::Side => "Open preview to the side",
+        PreviewButton::Full => "Open preview",
     };
     match cycle {
         Some(key) => format!("{action} ({key} cycles preview modes)"),

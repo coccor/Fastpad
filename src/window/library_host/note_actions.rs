@@ -300,7 +300,7 @@ pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
     } else {
         format!("Move \u{201c}{name}\u{201d} to the Recycle Bin?")
     };
-    if !confirmed(hwnd, &question) {
+    if !confirmed(hwnd, &question, "Delete") {
         return;
     }
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {

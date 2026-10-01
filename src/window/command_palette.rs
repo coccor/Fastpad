@@ -6,8 +6,13 @@
 use crate::library::quick_open::QuickMatch;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
+use crate::window::design::metrics::{CONTROL_RADIUS, ROW_INSET_X, ROW_INSET_Y, scale};
+use crate::window::design::round::{
+    Corners, fill_bordered, fill_rounded, paint_selection_bar, radius_for,
+};
+use crate::window::design::text_scale::scale_text;
 use crate::window::palette::Palette;
-use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -104,7 +109,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 112] = [
     ),
     entry("JSON: Format document", CommandId::FormatJson),
     entry("JSON: Validate document", CommandId::ValidateJson),
-    entry("Language: Plain Text", CommandId::LanguagePlainText),
+    entry("Language: Plain text", CommandId::LanguagePlainText),
     entry("Language: Bash", CommandId::LanguageBash),
     entry("Language: Batch", CommandId::LanguageBatch),
     entry("Language: C", CommandId::LanguageC),
@@ -128,23 +133,23 @@ pub(crate) const ENTRIES: [PaletteEntry; 112] = [
     entry("Language: XML", CommandId::LanguageXml),
     entry("Language: YAML", CommandId::LanguageYaml),
     entry(
-        "Markdown Preview: Side by Side",
+        "Markdown preview: Side by side",
         CommandId::MarkdownPreviewSide,
     ),
-    entry("Markdown Preview: Full", CommandId::MarkdownPreviewFull),
-    entry("Close Markdown Preview", CommandId::MarkdownPreviewClose),
+    entry("Markdown preview: Full", CommandId::MarkdownPreviewFull),
+    entry("Close Markdown preview", CommandId::MarkdownPreviewClose),
     entry("View: Next tab", CommandId::NextTab),
     entry("View: Previous tab", CommandId::PreviousTab),
     entry("View: Toggle sidebar", CommandId::ToggleSidebar),
-    entry("View: Split Editor Right", CommandId::SplitRight),
-    entry("View: Split Editor Down", CommandId::SplitDown),
-    entry("View: Close Editor Group", CommandId::CloseGroup),
+    entry("View: Split editor right", CommandId::SplitRight),
+    entry("View: Split editor down", CommandId::SplitDown),
+    entry("View: Close editor group", CommandId::CloseGroup),
     entry(
-        "View: Move Editor into Next Group",
+        "View: Move editor into next group",
         CommandId::MoveTabToNextGroup,
     ),
     entry(
-        "View: Move Editor into Previous Group",
+        "View: Move editor into previous group",
         CommandId::MoveTabToPreviousGroup,
     ),
     entry("View: Show notebook", CommandId::ShowNotebookView),
@@ -203,7 +208,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 112] = [
     entry("File: Exit", CommandId::Exit),
     entry("Preferences: Open Settings", CommandId::OpenSettings),
     entry(
-        "Preferences: Open Keyboard Shortcuts",
+        "Preferences: Open keyboard shortcuts",
         CommandId::OpenKeyboardShortcuts,
     ),
     entry("Preferences: Edit fastpad.ini", CommandId::EditSettingsFile),
@@ -400,9 +405,55 @@ const ROW_HEIGHT_AT_96_DPI: i32 = 26;
 const VISIBLE_ROWS: usize = 12;
 const MARGIN_AT_96_DPI: i32 = 8;
 
+/// The field box: rounded, in the editor's colors with an accent border, over the strip card.
+fn paint_field(dc: HDC, field: RECT, colors: &Palette, dpi: u32) {
+    unsafe {
+        fill_bordered(
+            dc,
+            field,
+            radius_for(colors, CONTROL_RADIUS, dpi),
+            colors.editor_background,
+            colors.selection_background,
+            colors.strip_background,
+        );
+    }
+}
+
+/// A list row's background: the strip color, with the selected row's fill inset and rounded
+/// (the whole row, square, under a high-contrast palette).
+fn paint_row_background(dc: HDC, row: RECT, selected: bool, colors: &Palette, dpi: u32) {
+    unsafe {
+        fill(dc, row, colors.strip_background);
+        if !selected {
+            return;
+        }
+        if colors.high_contrast {
+            fill(dc, row, colors.hover_background);
+            return;
+        }
+        let fill_rect = RECT {
+            left: row.left + scale(ROW_INSET_X, dpi),
+            top: row.top + scale(ROW_INSET_Y, dpi),
+            right: row.right - scale(ROW_INSET_X, dpi),
+            bottom: row.bottom - scale(ROW_INSET_Y, dpi),
+        };
+        fill_rounded(
+            dc,
+            fill_rect,
+            radius_for(colors, CONTROL_RADIUS, dpi),
+            Corners::ALL,
+            colors.hover_background,
+            colors.strip_background,
+        );
+        paint_selection_bar(dc, fill_rect, colors, colors.hover_background, dpi);
+    }
+}
+
 /// Where the panel's parts sit, in panel client coordinates.
 #[derive(Clone, Copy)]
 struct PanelLayout {
+    /// The DPI this layout was scaled for, which painting scales its radii and insets by too.
+    dpi: u32,
     width: i32,
     height: i32,
     /// The painted field box, border included.
@@ -426,7 +477,7 @@ impl std::fmt::Debug for PanelLayout {
 impl PanelLayout {
     fn calculate(width: i32, dpi: u32, text_height: i32, rows: usize) -> Self {
         let padding = scale(PADDING_AT_96_DPI, dpi);
-        let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+        let field_height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
         let inset = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
         let field = RECT {
             left: padding,
@@ -447,11 +498,12 @@ impl PanelLayout {
             left: 1,
             top: field.bottom + padding,
             right: (width - 1).max(1),
-            bottom: field.bottom + padding + rows * scale(ROW_HEIGHT_AT_96_DPI, dpi),
+            bottom: field.bottom + padding + rows * scale_text(ROW_HEIGHT_AT_96_DPI, dpi),
         });
         // The list runs to the bottom border; the field alone keeps its padding below.
         let height = list.map_or(field.bottom + padding, |list| list.bottom + 1);
         Self {
+            dpi,
             width,
             height,
             field,
@@ -483,7 +535,8 @@ pub(crate) struct CommandPalette {
     list_brush: HBRUSH,
     /// The list's font when the bold one was made, and the bold one; null until a quick-open
     /// row is first drawn.
-    bold: Cell<(HFONT, HFONT)>,
+    /// The bold font, with the list font, DPI and text-size factor it was made for.
+    bold: Cell<(HFONT, (u32, u32), HFONT)>,
     /// How many times a mode switch marked the field for its hint to come or go, for
     /// in-process tests (their windows are never shown, so they have no update region).
     #[cfg(test)]
@@ -534,7 +587,7 @@ impl CommandPalette {
             layout: None,
             field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
             list_brush: unsafe { CreateSolidBrush(colors.strip_background) },
-            bold: Cell::new((std::ptr::null_mut(), std::ptr::null_mut())),
+            bold: Cell::new((std::ptr::null_mut(), (0, 0), std::ptr::null_mut())),
             #[cfg(test)]
             hint_repaints: 0,
         })
@@ -742,7 +795,7 @@ impl CommandPalette {
                 self.list,
                 LB_SETITEMHEIGHT,
                 0,
-                scale(ROW_HEIGHT_AT_96_DPI, dpi) as LPARAM,
+                scale_text(ROW_HEIGHT_AT_96_DPI, dpi) as LPARAM,
             );
             // Dark scrollbar under the dark palettes, the system one otherwise.
             let dark_theme = wide_null("DarkMode_Explorer");
@@ -866,7 +919,7 @@ impl CommandPalette {
     }
 
     /// `WM_PAINT` for the panel: the strip-colored card with a hairline border, and the field box
-    /// in the editor's colors with an accent outline around the borderless `Edit`.
+    /// in the editor's colors with a rounded accent outline around the borderless `Edit`.
     pub(crate) fn paint_panel(&self, panel: HWND) {
         let mut paint = PAINTSTRUCT::default();
         let dc = unsafe { BeginPaint(panel, &mut paint) };
@@ -882,8 +935,7 @@ impl CommandPalette {
             unsafe {
                 fill(dc, client, colors.pressed_background);
                 fill(dc, inset(client, 1), colors.strip_background);
-                fill(dc, layout.field, colors.selection_background);
-                fill(dc, inset(layout.field, 1), colors.editor_background);
+                paint_field(dc, layout.field, &colors, layout.dpi);
             }
         }
         unsafe {
@@ -925,19 +977,12 @@ impl CommandPalette {
         };
         let selected = item.itemState & ODS_SELECTED != 0;
         let colors = self.colors;
-        let (background, foreground, muted) = if selected {
-            (
-                colors.hover_background,
-                colors.hover_foreground,
-                colors.hover_foreground,
-            )
+        let (foreground, muted) = if selected {
+            (colors.hover_foreground, colors.hover_foreground)
         } else {
-            (
-                colors.strip_background,
-                colors.editor_foreground,
-                colors.muted_foreground,
-            )
+            (colors.editor_foreground, colors.muted_foreground)
         };
+        let dpi = self.layout.map_or(0, |layout| layout.dpi);
         let dc = item.hDC;
         // Row text lines up with the query text above it; the list starts one pixel in.
         let padding = self.layout.map_or(8, |layout| layout.edit.left - 1);
@@ -947,7 +992,7 @@ impl CommandPalette {
             ..item.rcItem
         };
         unsafe {
-            fill(dc, item.rcItem, background);
+            paint_row_background(dc, item.rcItem, selected, &colors, dpi);
             SetBkMode(dc, TRANSPARENT as i32);
             let font = SendMessageW(self.list, WM_GETFONT, 0, 0);
             let previous = (font != 0).then(|| SelectObject(dc, font as _));
@@ -995,19 +1040,12 @@ impl CommandPalette {
         let notice = matches!(row, PickerRow::Notice(_));
         let selected = item.itemState & ODS_SELECTED != 0 && !notice;
         let colors = self.colors;
-        let (background, foreground, muted) = if selected {
-            (
-                colors.hover_background,
-                colors.hover_foreground,
-                colors.hover_foreground,
-            )
+        let (foreground, muted) = if selected {
+            (colors.hover_foreground, colors.hover_foreground)
         } else {
-            (
-                colors.strip_background,
-                colors.editor_foreground,
-                colors.muted_foreground,
-            )
+            (colors.editor_foreground, colors.muted_foreground)
         };
+        let dpi = self.layout.map_or(0, |layout| layout.dpi);
         let dc = item.hDC;
         let padding = self.layout.map_or(8, |layout| layout.edit.left - 1);
         let mut text = RECT {
@@ -1025,7 +1063,7 @@ impl CommandPalette {
             list_font
         };
         unsafe {
-            fill(dc, item.rcItem, background);
+            paint_row_background(dc, item.rcItem, selected, &colors, dpi);
             SetBkMode(dc, TRANSPARENT as i32);
         }
         let previous = unsafe { SelectObject(dc, font) };
@@ -1077,11 +1115,16 @@ impl CommandPalette {
         }
     }
 
-    /// `base` in bold, made on first use and again when the list's font changes (a DPI change).
+    /// `base` in bold, made on first use and again when the list's font, the DPI or the text-size
+    /// factor changes (a recycled handle value alone does not prove the font is the same).
     /// A list with no font yet uses the default GUI font's metrics.
     fn bold_font(&self, base: HFONT) -> HFONT {
-        let (made_for, bold) = self.bold.get();
-        if made_for == base && !bold.is_null() {
+        let key = (
+            self.layout.as_ref().map_or(0, |layout| layout.dpi),
+            crate::window::design::text_scale::factor(),
+        );
+        let (made_for, made_at, bold) = self.bold.get();
+        if made_for == base && made_at == key && !bold.is_null() {
             return bold;
         }
         if !bold.is_null() {
@@ -1108,7 +1151,7 @@ impl CommandPalette {
             font.lfWeight = FW_BOLD as i32;
             unsafe { CreateFontIndirectW(&font) }
         };
-        self.bold.set((base, bold));
+        self.bold.set((base, key, bold));
         bold
     }
 
@@ -1181,7 +1224,7 @@ impl CommandPalette {
 
     #[cfg(test)]
     pub(crate) fn has_bold_font(&self) -> bool {
-        !self.bold.get().1.is_null()
+        !self.bold.get().2.is_null()
     }
 
     #[cfg(test)]
@@ -1286,7 +1329,7 @@ fn draw_runs(
 
 impl Drop for CommandPalette {
     fn drop(&mut self) {
-        let (_, bold) = self.bold.get();
+        let (_, _, bold) = self.bold.get();
         unsafe {
             DeleteObject(self.field_brush);
             DeleteObject(self.list_brush);

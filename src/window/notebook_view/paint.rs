@@ -5,14 +5,17 @@
 use super::*;
 use crate::config::FileIconSet;
 use crate::library::tree::{RowKind, TreeRow};
+use crate::window::design::metrics::{scale, sidebar_row};
+use crate::window::design::round::paint_focus_ring;
+use crate::window::design::text_scale::scale_text;
 use crate::window::drag_label::LabelImage;
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::icon_sets::{TreeIcon, TreeItem, minimal, tree_icon};
 use crate::window::inline_name::FieldLayout;
-use crate::window::notebook_layout::{self, PanelLayout, ROW_HEIGHT};
+use crate::window::notebook_layout::{self, PanelLayout};
 use crate::window::palette::{FileIcons, Palette};
-use crate::window::panel::{fill, inset, scale};
+use crate::window::panel::{fill, inset};
 use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::{self, RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{UiFonts, ViewPaint, draw_text};
@@ -256,7 +259,7 @@ pub(crate) fn tab_label_image(
 pub(super) fn drag_label_size(text: i32, dpi: u32) -> SIZE {
     SIZE {
         cx: 2 * scale(LABEL_PAD, dpi) + scale(GLYPH_BOX, dpi) + scale(GAP, dpi) + text,
-        cy: scale(LABEL_HEIGHT, dpi),
+        cy: scale_text(LABEL_HEIGHT, dpi),
     }
 }
 
@@ -364,6 +367,26 @@ pub(super) fn paint_band(dc: HDC, band: RECT, palette: &Palette, dpi: u32, befor
     }
 }
 
+/// The color under row `index` when it paints: the drop band's fill for a row inside the
+/// highlighted range (the band is not filled in high contrast), the panel's otherwise.
+pub(super) fn under_row(
+    highlight: Option<tree_drag::Highlight>,
+    index: usize,
+    palette: &Palette,
+    panel: u32,
+) -> u32 {
+    let inside = match highlight {
+        None => false,
+        Some(tree_drag::Highlight::Root) => true,
+        Some(tree_drag::Highlight::Rows { start, end }) => (start..end).contains(&index),
+    };
+    if inside && !palette.high_contrast {
+        palette.inactive_selection_background
+    } else {
+        panel
+    }
+}
+
 /// A 1 px (scaled) outline just inside `rect`.
 pub(super) fn paint_outline(dc: HDC, rect: RECT, color: u32, dpi: u32) {
     let t = scale(1, dpi).max(1);
@@ -455,6 +478,20 @@ impl NotebookView {
             );
         }
     }
+}
+
+/// Which lists show the accent bar on their selected row: (the tree, the Open editors list). The
+/// bar marks where the keyboard is, so the panel must be focused and the cursor must be in that
+/// list. In Open editors the selected row is the active tab, so the cursor has to be on it.
+pub(super) fn keyboard_bars(
+    focused: bool,
+    cursor: Cursor,
+    editors_selected: Option<usize>,
+) -> (bool, bool) {
+    (
+        focused && cursor == Cursor::Tree,
+        focused && matches!(cursor, Cursor::Editor(index) if Some(index) == editors_selected),
+    )
 }
 
 impl NotebookView {
@@ -620,8 +657,9 @@ impl NotebookView {
             paint.focused,
         );
         let palette = &paint.palette;
-        self.list.row_height = scale(ROW_HEIGHT, dpi);
-        self.editors.list.row_height = scale(ROW_HEIGHT, dpi);
+        self.list.row_height = sidebar_row(dpi);
+        self.editors.list.row_height = sidebar_row(dpi);
+        let tree_bar = keyboard_bars(focused, self.cursor, self.editors.list.selected).0;
         let sections = self.layout(area, dpi);
         // A panel sized after the rows came (startup) or resized: the scroll stays in range.
         let editors_height = height(sections.editors_list);
@@ -685,6 +723,9 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
+                    tree_bar,
+                    &|_| paint.background,
+                    dpi,
                     &mut |dc, index, rect, look| {
                         draw_recent_row(dc, names.get(index), rect, look, palette, fonts, dpi);
                     },
@@ -743,10 +784,10 @@ impl NotebookView {
                 let icons = &paint.icons;
                 let drag = self.drag.as_ref().filter(|drag| drag.started);
                 let dragged = drag.map(|drag| drag.source.clone());
-                let band = drag
+                let highlight = drag
                     .and_then(|drag| drag.target.as_deref())
-                    .and_then(|folder| tree_drag::highlight(rows, folder))
-                    .and_then(|highlight| band_rect(list, &self.list, highlight));
+                    .and_then(|folder| tree_drag::highlight(rows, folder));
+                let band = highlight.and_then(|highlight| band_rect(list, &self.list, highlight));
                 if let Some(band) = band {
                     paint_band(dc, band, palette, dpi, true);
                 }
@@ -762,6 +803,9 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
+                    tree_bar,
+                    &|index| under_row(highlight, index, palette, paint.background),
+                    dpi,
                     &mut |dc, index, rect, look| {
                         let editing =
                             edited.and_then(|(edited, icon)| (edited == index).then_some(icon));
@@ -802,7 +846,7 @@ impl NotebookView {
             left: layout.title.left + scale(12, dpi),
             ..layout.title
         };
-        bold("NOTEBOOK", title, palette.muted_foreground);
+        bold("Notebook", title, palette.muted_foreground);
         // Open Editors header: chevron, label and count.
         let chevron = notebook_layout::section_chevron(layout.editors_header, dpi);
         let glyph = if self.editors_expanded {
@@ -826,11 +870,12 @@ impl NotebookView {
         };
         let count = self.editors.view_count();
         bold(
-            &format!("OPEN EDITORS  {count}"),
+            &format!("Open editors  {count}"),
             label,
             palette.muted_foreground,
         );
         // The rows.
+        let editors_bar = keyboard_bars(paint.focused, self.cursor, self.editors.list.selected).1;
         let editors = &self.editors;
         let images = &mut self.images;
         let hover_close = editors.hover_close;
@@ -840,6 +885,9 @@ impl NotebookView {
             &editors.list,
             palette,
             paint.focused,
+            editors_bar,
+            &|_| paint.background,
+            dpi,
             &mut |dc, index, rect, look| match editors.rows.get(index) {
                 Some(crate::window::open_editors::EditorEntry::Header(number)) => {
                     crate::window::open_editors::draw_header(dc, *number, rect, paint);
@@ -862,7 +910,7 @@ impl NotebookView {
         let parts = notebook_layout::root_parts(layout.root, dpi);
         if self.mode == Mode::NoNotebook {
             bold(
-                "NO NOTEBOOK",
+                "No notebook",
                 RECT {
                     left: parts.chevron.right,
                     ..layout.root
@@ -885,11 +933,7 @@ impl NotebookView {
                     CENTERED,
                 )
             };
-            bold(
-                &self.name.to_uppercase(),
-                parts.name,
-                palette.muted_foreground,
-            );
+            bold(&self.name, parts.name, palette.muted_foreground);
             for (button, rect) in parts.shown() {
                 let hot = self.hover == Some(Hit::Header(button));
                 if hot {
@@ -930,7 +974,7 @@ impl NotebookView {
                 Cursor::Root | Cursor::Editor(_) | Cursor::Tree => None,
             };
             if let Some(rect) = outlined {
-                paint_outline(dc, rect, palette.selection_background, dpi);
+                unsafe { paint_focus_ring(dc, rect, palette, dpi) };
             }
         }
     }

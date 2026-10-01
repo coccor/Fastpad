@@ -34,15 +34,14 @@ use windows_sys::Win32::Graphics::Gdi::{
     IntersectClipRect, RestoreDC, SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 
-/// The corner radius of cards, controls and buttons.
-pub(crate) const RADIUS_AT_96_DPI: i32 = 4;
-/// The focus ring's stroke, and its gap outside the control it rings.
-pub(crate) const FOCUS_WIDTH_AT_96_DPI: i32 = 2;
-pub(crate) const FOCUS_GAP_AT_96_DPI: i32 = 1;
 /// A dialog's title row, and its ×, as wide as the main window's caption close button.
 pub(crate) const TITLE_HEIGHT_AT_96_DPI: i32 = 44;
 pub(crate) const TITLE_CLOSE_WIDTH_AT_96_DPI: i32 = 46;
-pub(crate) const GLYPH_FONT: &str = "Segoe MDL2 Assets";
+
+/// The icon face for glyph fonts.
+pub(crate) fn glyph_font_face() -> &'static str {
+    crate::window::design::faces::current().icons
+}
 
 /// The fills of the soft controls, from the theme's palette. Hover and press shift a fill
 /// toward the text colour: darker in light themes, lighter in dark ones. High contrast may

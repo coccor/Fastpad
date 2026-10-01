@@ -1,3 +1,5 @@
+use super::design::metrics::scale;
+use super::design::type_ramp::{self, TextStyle};
 use crate::window::palette::Palette;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
@@ -204,11 +206,6 @@ pub struct TitleBarLayout {
     pub resize_border: i32,
 }
 
-pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
-    let dpi = if dpi == 0 { 1 } else { dpi };
-    ((value as i64 * dpi as i64 + 48) / 96) as i32
-}
-
 impl TitleBarLayout {
     pub fn calculate(client: Size, dpi: u32) -> Self {
         Self::calculate_with_offset(client, dpi, 0)
@@ -337,10 +334,12 @@ impl Default for TitleFontHandles {
     }
 }
 
-/// Title-strip fonts for one DPI, deleted on drop (with the App at `WM_NCDESTROY`).
+/// Title-strip fonts for one DPI and text-size factor, deleted on drop (with the App at
+/// `WM_NCDESTROY`).
 #[derive(Debug)]
 pub(crate) struct TitleFonts {
     dpi: u32,
+    factor: u32,
     handles: TitleFontHandles,
 }
 
@@ -348,16 +347,25 @@ impl TitleFonts {
     pub(crate) fn create(dpi: u32) -> Self {
         Self {
             dpi,
+            factor: crate::window::design::text_scale::factor(),
             handles: TitleFontHandles {
-                text: create_font(scale(12, dpi), "Segoe UI"),
-                italic: create_ui_font(scale(12, dpi), "Segoe UI", FW_NORMAL as i32, true),
-                glyph: create_font(scale(10, dpi), "Segoe MDL2 Assets"),
+                text: type_ramp::create(TextStyle::Body, dpi),
+                italic: type_ramp::create(TextStyle::BodyItalic, dpi),
+                glyph: create_font(
+                    scale(10, dpi),
+                    crate::window::design::faces::current().icons,
+                ),
             },
         }
     }
 
     pub(crate) fn dpi(&self) -> u32 {
         self.dpi
+    }
+
+    /// The text-size percentage these fonts were made for.
+    pub(crate) fn factor(&self) -> u32 {
+        self.factor
     }
 
     pub(crate) fn handles(&self) -> TitleFontHandles {

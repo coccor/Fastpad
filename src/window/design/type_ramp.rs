@@ -1,0 +1,184 @@
+//! The text styles FastPad's chrome uses: a pixel height at 96 DPI, a weight and an italic flag
+//! each, and the one function that turns a style into a GDI font. Icon fonts and the editor and
+//! preview fonts are not part of the ramp.
+
+use super::text_scale::scale_text;
+use crate::window::titlebar::create_ui_font;
+use windows_sys::Win32::Graphics::Gdi::{FW_BOLD, FW_NORMAL, FW_SEMIBOLD, HFONT};
+
+/// A named text style. Fonts for icons, the editor and the Markdown preview are not styles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextStyle {
+    /// Title strip, tabs, sidebar row text and the Settings and About dialogs' text.
+    Body,
+    /// The preview tab's label and notices inside sidebar lists.
+    BodyItalic,
+    /// The match in a Search result's snippet.
+    BodyBold,
+    /// Sidebar header titles.
+    PanelHeader,
+    /// A dialog's section headings.
+    Heading,
+    /// A dialog's title.
+    Title,
+}
+
+/// A style's pixel height at 96 DPI, GDI weight and italic flag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Spec {
+    pub(crate) px: i32,
+    pub(crate) weight: i32,
+    pub(crate) italic: bool,
+}
+
+impl TextStyle {
+    pub(crate) const fn spec(self) -> Spec {
+        let (px, weight, italic) = match self {
+            Self::Body => (13, FW_NORMAL, false),
+            Self::BodyItalic => (13, FW_NORMAL, true),
+            Self::BodyBold => (13, FW_BOLD, false),
+            Self::PanelHeader => (13, FW_SEMIBOLD, false),
+            Self::Heading => (14, FW_SEMIBOLD, false),
+            Self::Title => (18, FW_SEMIBOLD, false),
+        };
+        Spec {
+            px,
+            weight: weight as i32,
+            italic,
+        }
+    }
+}
+
+/// The face for `style`: the display face for `Title`, the text face for the rest.
+pub(crate) fn face(style: TextStyle) -> &'static str {
+    let faces = super::faces::current();
+    if style == TextStyle::Title {
+        faces.display
+    } else {
+        faces.text
+    }
+}
+
+/// A GDI font for `style` at `dpi`. The caller owns it and deletes it.
+pub(crate) fn create(style: TextStyle, dpi: u32) -> HFONT {
+    let spec = style.spec();
+    create_ui_font(
+        scale_text(spec.px, dpi),
+        face(style),
+        spec.weight,
+        spec.italic,
+    )
+}
+
+/// The text height (`tmHeight`) of `style` at `dpi` and the current text-size factor, for the
+/// tests that check a row or box holds its text.
+#[cfg(test)]
+pub(crate) fn text_height_for_test(style: TextStyle, dpi: u32) -> i32 {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetTextMetricsW, ReleaseDC, SelectObject, TEXTMETRICW,
+    };
+    unsafe {
+        let font = create(style, dpi);
+        let dc = GetDC(std::ptr::null_mut());
+        let previous = SelectObject(dc, font);
+        let mut metrics = TEXTMETRICW::default();
+        GetTextMetricsW(dc, &mut metrics);
+        SelectObject(dc, previous);
+        ReleaseDC(std::ptr::null_mut(), dc);
+        DeleteObject(font);
+        metrics.tmHeight
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextStyle, create, face};
+    use windows_sys::Win32::Graphics::Gdi::{
+        DeleteObject, FW_BOLD, FW_NORMAL, FW_SEMIBOLD, GetObjectW, LOGFONTW,
+    };
+
+    #[test]
+    fn the_title_uses_the_display_face_and_every_other_style_the_text_face() {
+        // Break caught: Title losing the display face, or a style bypassing the chosen faces.
+        let faces = crate::window::design::faces::current();
+        assert_eq!(face(TextStyle::Title), faces.display);
+        for style in [
+            TextStyle::Body,
+            TextStyle::BodyItalic,
+            TextStyle::BodyBold,
+            TextStyle::PanelHeader,
+            TextStyle::Heading,
+        ] {
+            assert_eq!(face(style), faces.text, "{style:?}");
+        }
+    }
+
+    #[test]
+    fn every_style_has_the_size_and_weight_the_spec_gives_it() {
+        // Break caught: a size or weight drifting from the spec. The four body-text styles are the
+        // 13px trial; reverting it means setting Body, BodyItalic and BodyBold back to 12 and
+        // PanelHeader back to 11 (semibold) in `spec` above.
+        let spec = |style: TextStyle| {
+            let s = style.spec();
+            (s.px, s.weight, s.italic)
+        };
+        assert_eq!(spec(TextStyle::Body), (13, FW_NORMAL as i32, false)); // strip, tabs, sidebar, dialogs
+        assert_eq!(spec(TextStyle::BodyItalic), (13, FW_NORMAL as i32, true)); // preview tab, notices
+        assert_eq!(spec(TextStyle::BodyBold), (13, FW_BOLD as i32, false)); // search match
+        assert_eq!(
+            spec(TextStyle::PanelHeader),
+            (13, FW_SEMIBOLD as i32, false)
+        );
+        assert_eq!(spec(TextStyle::Heading), (14, FW_SEMIBOLD as i32, false));
+        assert_eq!(spec(TextStyle::Title), (18, FW_SEMIBOLD as i32, false));
+    }
+
+    #[test]
+    fn fonts_are_created_at_unusual_dpis_and_scale_with_them() {
+        // Break caught: a DPI of 0 (bad handle) or a scaled monitor producing a null font, or a
+        // font whose height ignores the DPI.
+        for (dpi, expected_height) in [(0_u32, 13), (96, 13), (144, 20), (192, 26)] {
+            let font = create(TextStyle::Body, dpi);
+            assert!(!font.is_null(), "dpi {dpi}");
+            let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                GetObjectW(
+                    font,
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    (&mut log as *mut LOGFONTW).cast(),
+                )
+            };
+            assert!(written > 0, "dpi {dpi}");
+            assert_eq!(log.lfHeight, -expected_height, "dpi {dpi}");
+            unsafe { DeleteObject(font) };
+        }
+    }
+
+    #[test]
+    fn the_text_size_factor_scales_every_style_height() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
+        // Break caught: a style ignoring the Windows text-size setting, or rounding it down.
+        use crate::window::design::text_scale::set_factor_for_test;
+        let height = |style: TextStyle| {
+            let font = create(style, 96);
+            let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                GetObjectW(
+                    font,
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    (&mut log as *mut LOGFONTW).cast(),
+                )
+            };
+            assert!(written > 0);
+            unsafe { DeleteObject(font) };
+            log.lfHeight
+        };
+        for (factor, body, title) in [(100, -13, -18), (150, -20, -27), (225, -29, -41)] {
+            set_factor_for_test(factor);
+            let (got_body, got_title) = (height(TextStyle::Body), height(TextStyle::Title));
+            set_factor_for_test(100);
+            assert_eq!(got_body, body, "body at {factor}");
+            assert_eq!(got_title, title, "title at {factor}");
+        }
+    }
+}

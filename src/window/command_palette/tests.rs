@@ -271,6 +271,20 @@ fn matches_are_case_insensitive_and_ranked_prefix_word_substring_then_scattered(
 }
 
 #[test]
+fn the_palette_rows_follow_the_text_size() {
+    let _factor = crate::window::design::text_scale::FactorGuard::new();
+    // Break caught: palette rows that stay 26 px tall while the Windows text size grows.
+    use crate::window::design::text_scale::{scale_text, set_factor_for_test};
+    set_factor_for_test(225);
+    let layout = PanelLayout::calculate(560, 96, 16, 3);
+    let expected = 3 * scale_text(26, 96);
+    set_factor_for_test(100);
+    let list = layout.list.unwrap();
+    assert_eq!(list.bottom - list.top, expected);
+    assert_eq!(expected, 3 * 59);
+}
+
+#[test]
 fn the_panel_centers_the_query_text_and_ends_with_the_list_on_its_bottom_border() {
     // Break caught: query text stuck to the top of its box, or a list that overhangs (or stops
     // short of) the panel's border.
@@ -372,4 +386,137 @@ fn markdown_preview_cycles_with_ctrl_shift_v_and_lists_three_palette_entries() {
     assert!(
         filter_entries("markdown preview", |command| !command.is_markdown_preview()).is_empty()
     );
+}
+
+mod painting {
+    use super::super::{paint_field, paint_row_background};
+    use crate::platform::theme::Theme;
+    use crate::window::palette::Palette;
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel, HDC,
+        ReleaseDC, SelectObject,
+    };
+
+    /// Fills a 200x80 memory bitmap with `colors.strip_background`, runs `draw`, then `read`.
+    fn with_canvas(
+        colors: &Palette,
+        draw: impl FnOnce(HDC),
+        read: impl FnOnce(&dyn Fn(i32, i32) -> u32),
+    ) {
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 200, 80);
+            let previous = SelectObject(dc, bitmap);
+            let all = RECT {
+                left: 0,
+                top: 0,
+                right: 200,
+                bottom: 80,
+            };
+            crate::window::panel::fill(dc, all, colors.strip_background);
+            draw(dc);
+            read(&|x, y| GetPixel(dc, x, y));
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    const FIELD: RECT = RECT {
+        left: 10,
+        top: 10,
+        right: 110,
+        bottom: 40,
+    };
+    const ROW: RECT = RECT {
+        left: 0,
+        top: 0,
+        right: 100,
+        bottom: 26,
+    };
+
+    #[test]
+    fn the_field_is_a_rounded_box_with_an_accent_border() {
+        // Break caught: a square field, or a rounded one that lost its border.
+        let colors = Palette::for_theme(Theme::ALL[0], false);
+        with_canvas(
+            &colors,
+            |dc| paint_field(dc, FIELD, &colors, 96),
+            |pixel| {
+                assert_eq!(pixel(10, 10), colors.strip_background, "corner");
+                assert_eq!(pixel(60, 10), colors.selection_background, "border");
+                assert_eq!(pixel(60, 11), colors.editor_background, "inside");
+            },
+        );
+    }
+
+    #[test]
+    fn the_selected_row_is_an_inset_rounded_fill() {
+        // Break caught: a full-bleed selection, or a fill with square corners.
+        let colors = Palette::for_theme(Theme::ALL[0], false);
+        with_canvas(
+            &colors,
+            |dc| paint_row_background(dc, ROW, true, &colors, 96),
+            |pixel| {
+                assert_eq!(pixel(1, 13), colors.strip_background, "left inset");
+                assert_eq!(pixel(7, 13), colors.hover_background, "fill edge");
+                assert_eq!(pixel(50, 0), colors.strip_background, "top gap");
+                assert_eq!(pixel(4, 1), colors.strip_background, "rounded corner");
+            },
+        );
+    }
+
+    #[test]
+    fn an_unselected_row_stays_the_strip_color() {
+        let colors = Palette::for_theme(Theme::ALL[0], false);
+        with_canvas(
+            &colors,
+            |dc| paint_row_background(dc, ROW, false, &colors, 96),
+            |pixel| {
+                for (x, y) in [(0, 0), (4, 1), (50, 13), (99, 25)] {
+                    assert_eq!(pixel(x, y), colors.strip_background, "({x}, {y})");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn high_contrast_keeps_a_square_field_and_a_full_row_selection() {
+        // Break caught: rounding or insetting under a high-contrast palette.
+        // In high contrast `accent` equals the highlight fill, so give it a distinct color here:
+        // otherwise a bar drawn by mistake would be invisible to the "no accent bar" check.
+        let colors = Palette {
+            accent: 0x0012_3456,
+            ..Palette::for_theme(Theme::ALL[0], true)
+        };
+        with_canvas(
+            &colors,
+            |dc| {
+                paint_field(dc, FIELD, &colors, 96);
+                paint_row_background(dc, ROW, true, &colors, 96);
+            },
+            |pixel| {
+                assert_eq!(pixel(10, 10), colors.selection_background, "field corner");
+                assert_eq!(pixel(0, 0), colors.hover_background, "row corner");
+                assert_eq!(pixel(5, 13), colors.hover_background, "no accent bar");
+            },
+        );
+    }
+
+    #[test]
+    fn the_selected_row_has_an_accent_bar() {
+        // Break caught: a selected row with no accent bar, or a bar over the wrong pixels.
+        let colors = Palette::for_theme(Theme::ALL[0], false);
+        with_canvas(
+            &colors,
+            |dc| paint_row_background(dc, ROW, true, &colors, 96),
+            |pixel| {
+                assert_eq!(pixel(5, 13), colors.accent, "bar");
+                assert_eq!(pixel(7, 13), colors.hover_background, "past the bar");
+            },
+        );
+    }
 }

@@ -81,6 +81,10 @@ fn copy_host_a_clash_asks_ok_replaces_and_cancel_skips() {
         crate::window::modal::take_last_confirm().as_deref(),
         Some(format!("b.md already exists in {folder}. Replace it?").as_str())
     );
+    assert_eq!(
+        crate::window::modal::take_last_confirm_action().as_deref(),
+        Some("Replace")
+    );
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
     assert_eq!(
         std::fs::read_to_string(scratch.folder().join("b.md")).unwrap(),

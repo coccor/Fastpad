@@ -2,6 +2,8 @@
 //! activation, so the keyboard stays with the dialog, which forwards keys here (settings dialog
 //! spec §3.5). `ListModel` is the pure part: selection, scrolling and type-ahead.
 
+use super::design::metrics::{SELECTION_BAR_WIDTH, scale};
+use super::design::round::selection_bar_rect;
 use super::palette::Palette;
 use super::side_panel::paint_buffered;
 use super::soft_paint::{Canvas, Frame, Shape};
@@ -186,6 +188,8 @@ pub(crate) struct ListStyle {
     pub(crate) row_height: i32,
     /// The corner radius of the item highlight.
     pub(crate) radius: i32,
+    /// The dialog's DPI, which the selection bar scales by.
+    pub(crate) dpi: u32,
     /// Borrowed from the dialog, which outlives the list.
     pub(crate) font: HFONT,
     pub(crate) colors: Palette,
@@ -200,6 +204,7 @@ struct ListState {
     font: HFONT,
     row_height: i32,
     radius: i32,
+    dpi: u32,
     hot: Option<usize>,
     canvas: Canvas,
 }
@@ -216,6 +221,7 @@ impl DropdownList {
         let ListStyle {
             row_height,
             radius,
+            dpi,
             font,
             colors,
             canvas,
@@ -264,6 +270,7 @@ impl DropdownList {
             font,
             row_height,
             radius,
+            dpi,
             hot: None,
             canvas,
         });
@@ -474,6 +481,13 @@ fn compose<'a>(frame: &mut Frame<'a>, client: RECT, list: &'a ListState) {
                 rect: highlight,
                 radius: list.radius,
                 color,
+            });
+        }
+        if index == list.model.selected && !colors.high_contrast {
+            frame.shape(Shape::Round {
+                rect: selection_bar_rect(highlight, list.dpi),
+                radius: scale(SELECTION_BAR_WIDTH, list.dpi) / 2,
+                color: colors.accent,
             });
         }
         frame.text(

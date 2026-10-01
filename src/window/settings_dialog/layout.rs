@@ -31,7 +31,7 @@ impl Layout {
         let width = scale(WIDTH_AT_96_DPI, dpi);
         // Only the content's height is read off this one.
         let probe = Self::sized(dpi, width, 0, link_width);
-        let chrome = probe.title.bottom + scale(FOOTER_HEIGHT_AT_96_DPI, dpi);
+        let chrome = probe.title.bottom + scale_text(FOOTER_HEIGHT_AT_96_DPI, dpi);
         let natural = chrome + probe.content_height;
         let smallest = chrome + probe.row_pitch() * MIN_VISIBLE_ROWS;
         Self::sized(
@@ -53,11 +53,11 @@ impl Layout {
     /// The layout `width` by `height`, as the dialog opens or as the user sized it.
     pub(crate) fn sized(dpi: u32, width: i32, height: i32, link_width: i32) -> Self {
         let padding = scale(PADDING_AT_96_DPI, dpi);
-        let title_height = scale(TITLE_HEIGHT_AT_96_DPI, dpi);
-        let heading_height = scale(HEADING_HEIGHT_AT_96_DPI, dpi);
-        let card_height = scale(CARD_HEIGHT_AT_96_DPI, dpi);
+        let title_height = scale_text(TITLE_HEIGHT_AT_96_DPI, dpi);
+        let heading_height = scale_text(HEADING_HEIGHT_AT_96_DPI, dpi);
+        let card_height = scale_text(CARD_HEIGHT_AT_96_DPI, dpi);
         let row_pitch = card_height + scale(CARD_GAP_AT_96_DPI, dpi);
-        let footer_height = scale(FOOTER_HEIGHT_AT_96_DPI, dpi);
+        let footer_height = scale_text(FOOTER_HEIGHT_AT_96_DPI, dpi);
 
         // The × fills the title row's top-right corner, full height, like a caption button.
         let title_close_left = width - scale(TITLE_CLOSE_WIDTH_AT_96_DPI, dpi);
@@ -107,7 +107,7 @@ impl Layout {
             right: nav_width,
             bottom: body.bottom,
         };
-        let item_height = scale(NAV_ITEM_HEIGHT_AT_96_DPI, dpi);
+        let item_height = scale_text(NAV_ITEM_HEIGHT_AT_96_DPI, dpi);
         let nav_inset = scale(NAV_INSET_AT_96_DPI, dpi);
         let nav_items = std::array::from_fn(|index| {
             let top = nav.top + nav_inset + index as i32 * item_height;
@@ -118,7 +118,7 @@ impl Layout {
                 bottom: top + item_height,
             }
         });
-        let button_height = scale(BUTTON_HEIGHT_AT_96_DPI, dpi);
+        let button_height = scale_text(BUTTON_HEIGHT_AT_96_DPI, dpi);
         let button_top = body.bottom + (footer_height - button_height) / 2;
         let close = RECT {
             left: width - padding - scale(BUTTON_WIDTH_AT_96_DPI, dpi),
@@ -155,17 +155,17 @@ impl Layout {
     }
 
     pub(crate) fn list_row_height(&self) -> i32 {
-        scale(CONTROL_HEIGHT_AT_96_DPI, self.dpi)
+        scale_text(CONTROL_HEIGHT_AT_96_DPI, self.dpi)
     }
 
     /// The corner radius of cards and controls.
     pub(crate) fn radius(&self) -> i32 {
-        scale(RADIUS_AT_96_DPI, self.dpi)
+        scale(CONTROL_RADIUS, self.dpi)
     }
 
     /// A card and the gap under it, as `calculate` stacks them; a wheel notch scrolls three.
     pub(super) fn row_pitch(&self) -> i32 {
-        scale(CARD_HEIGHT_AT_96_DPI, self.dpi) + scale(CARD_GAP_AT_96_DPI, self.dpi)
+        scale_text(CARD_HEIGHT_AT_96_DPI, self.dpi) + scale(CARD_GAP_AT_96_DPI, self.dpi)
     }
 
     fn place(&self, rect: RECT, scroll: i32) -> RECT {
@@ -198,7 +198,7 @@ impl Layout {
                     - scale(LABEL_MIN_WIDTH_AT_96_DPI, dpi);
                 (
                     scale(DROPDOWN_WIDTH_AT_96_DPI, dpi).min(room).max(0),
-                    scale(CONTROL_HEIGHT_AT_96_DPI, dpi),
+                    scale_text(CONTROL_HEIGHT_AT_96_DPI, dpi),
                 )
             }
             Control::Segmented => {
@@ -209,12 +209,12 @@ impl Layout {
                 };
                 (
                     segments as i32 * scale(each, dpi),
-                    scale(CONTROL_HEIGHT_AT_96_DPI, dpi),
+                    scale_text(CONTROL_HEIGHT_AT_96_DPI, dpi),
                 )
             }
             Control::Stepper => (
                 scale(STEP_BUTTON_AT_96_DPI, dpi) * 2 + scale(STEP_VALUE_AT_96_DPI, dpi),
-                scale(CONTROL_HEIGHT_AT_96_DPI, dpi),
+                scale_text(CONTROL_HEIGHT_AT_96_DPI, dpi),
             ),
             Control::Check => (
                 scale(TOGGLE_WIDTH_AT_96_DPI, dpi),

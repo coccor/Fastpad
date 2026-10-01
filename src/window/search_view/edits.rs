@@ -6,9 +6,11 @@ use super::*;
 use crate::config::SidebarView;
 use crate::platform::{last_error, wide_null};
 use crate::search::escape;
+use crate::window::design::metrics::scale;
+use crate::window::design::text_scale::scale_text;
 use crate::window::main_window::OpenMode;
 use crate::window::option_toggles;
-use crate::window::panel::{create_child, fill, scale, text_height};
+use crate::window::panel::{create_child, fill, text_height};
 use crate::window::side_panel::{self, draw_text};
 use crate::window::text_search_host;
 use std::path::PathBuf;
@@ -334,7 +336,7 @@ pub(crate) fn layout(hwnd: HWND) {
             + scale(option_toggles::SIZE_AT_96_DPI + CLEAR_GAP_AT_96_DPI, dpi),
     );
     let (replace, replace_open) = with_view(hwnd, |view| {
-        view.list.row_height = scale(ROW_AT_96_DPI, dpi);
+        view.list.row_height = scale_text(ROW_AT_96_DPI, dpi);
         (view.replace_edit, view.replace_open)
     })
     .unwrap_or((None, false));

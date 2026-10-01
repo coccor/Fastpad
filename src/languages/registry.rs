@@ -60,11 +60,11 @@ const SQL_PROPERTIES: &[(&str, &str)] = &[("fold.comment", "1")];
 // Tag folding is off by default in the hypertext and XML lexers.
 const MARKUP_PROPERTIES: &[(&str, &str)] = &[("fold.html", "1"), ("fold.hypertext.comment", "1")];
 
-/// Plain Text first, then alphabetical by name: this is the menu and palette order.
+/// Plain text first, then alphabetical by name: this is the menu and palette order.
 pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
     LanguageSpec {
         language: Language::PlainText,
-        name: "Plain Text",
+        name: "Plain text",
         extensions: &[],
         file_names: &[],
         lexer: None,

@@ -16,8 +16,10 @@ use super::tooltip::Tooltip;
 use crate::config::SidebarView;
 use crate::config::defaults::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use crate::platform::wide_null;
+use crate::window::design::metrics::{ICON, SIDEBAR_ICON, panel_header, scale};
+use crate::window::design::type_ramp::{self, TextStyle};
 use crate::window::palette::Palette;
-use crate::window::panel::{create_child, fill, scale};
+use crate::window::panel::{create_child, fill};
 use crate::window::sidebar_accessibility::{
     self, AccessibleItem, AccessibleMark, AccessibleSource, AccessibleView,
 };
@@ -27,9 +29,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DRAW_TEXT_FORMAT, DT_CALCRECT,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FW_SEMIBOLD, HDC, HFONT,
-    InvalidateRect, PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, HDC, HFONT, InvalidateRect,
+    PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -49,28 +50,28 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_VISIBLE,
 };
 
-/// Sizes at 96 DPI, scaled with `panel::scale`.
+/// Sizes at 96 DPI, scaled with `design::metrics::scale`.
 pub(crate) const ACTIVITY_WIDTH_96: i32 = 44;
 pub(crate) const EDITOR_MIN_WIDTH_96: i32 = 320;
-pub(crate) const HEADER_HEIGHT_96: i32 = 38;
 /// The strip along the panel's right edge that resizes it.
 pub(crate) const GRIP_WIDTH_96: i32 = 4;
 
-/// The sidebar's fonts at one DPI. Painting copies them out; `Sidebar` owns and deletes them.
+/// The sidebar's fonts at one DPI and text-size factor. Painting copies them out; `Sidebar` owns
+/// and deletes them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UiFonts {
-    /// Row and body text: Segoe UI, 12 px at 96 DPI.
+    /// Row and body text: the text face, 13 px at 96 DPI and 100% text size.
     pub(crate) text: HFONT,
-    /// The match in a Search result's snippet: Segoe UI bold, 12 px. Made on the first paint of a
+    /// The match in a Search result's snippet: text face, bold, 13 px. Made on the first paint of a
     /// snippet (`Sidebar::text_bold`), not with the others, so it adds nothing before first paint.
     pub(crate) text_bold: HFONT,
-    /// Header titles in small capitals: Segoe UI semibold, 11 px.
+    /// Header titles: text face, semibold, 13 px.
     pub(crate) bold: HFONT,
-    /// Notices inside the list: Segoe UI italic, 12 px.
+    /// Notices inside the list: text face, italic, 13 px.
     pub(crate) italic: HFONT,
-    /// Row and header-button icons: Segoe MDL2 Assets, 12 px.
+    /// Row, caret and header-button icons: the icon face, `SIDEBAR_ICON` px.
     pub(crate) glyph: HFONT,
-    /// The activity bar's icons: Segoe MDL2 Assets, 16 px.
+    /// The activity bar's icons: the icon face, `ICON` px.
     pub(crate) bar_glyph: HFONT,
 }
 
@@ -90,13 +91,14 @@ impl Default for UiFonts {
 impl UiFonts {
     fn create(dpi: u32) -> Self {
         let normal = FW_NORMAL as i32;
+        let icons = crate::window::design::faces::current().icons;
         Self {
-            text: create_ui_font(scale(12, dpi), "Segoe UI", normal, false),
+            text: type_ramp::create(TextStyle::Body, dpi),
             text_bold: std::ptr::null_mut(),
-            bold: create_ui_font(scale(11, dpi), "Segoe UI", FW_SEMIBOLD as i32, false),
-            italic: create_ui_font(scale(12, dpi), "Segoe UI", normal, true),
-            glyph: create_ui_font(scale(12, dpi), "Segoe MDL2 Assets", normal, false),
-            bar_glyph: create_ui_font(scale(16, dpi), "Segoe MDL2 Assets", normal, false),
+            bold: type_ramp::create(TextStyle::PanelHeader, dpi),
+            italic: type_ramp::create(TextStyle::BodyItalic, dpi),
+            glyph: create_ui_font(scale(SIDEBAR_ICON, dpi), icons, normal, false),
+            bar_glyph: create_ui_font(scale(ICON, dpi), icons, normal, false),
         }
     }
 
@@ -138,15 +140,16 @@ pub(crate) struct Sidebar {
     /// The live width (96-DPI pixels) while the panel edge is dragged. The setting changes once,
     /// when the drag ends.
     drag_width: Option<u16>,
-    /// The fonts and the DPI they were made for (`main_window::ui_fonts`).
-    fonts: Option<(u32, UiFonts)>,
+    /// The fonts and the (DPI, text-size factor) they were made for (`main_window::ui_fonts`).
+    fonts: Option<((u32, u32), UiFonts)>,
 }
 
 impl Sidebar {
-    /// The fonts for `dpi`, created on first use and again after a DPI change.
+    /// The fonts for `dpi`, created on first use and again after a DPI or text-size change.
     pub(crate) fn fonts(&mut self, dpi: u32) -> UiFonts {
-        if let Some((font_dpi, fonts)) = self.fonts
-            && font_dpi == dpi
+        let key = (dpi, crate::window::design::text_scale::factor());
+        if let Some((font_key, fonts)) = self.fonts
+            && font_key == key
         {
             return fonts;
         }
@@ -154,7 +157,7 @@ impl Sidebar {
             old.delete();
         }
         let fonts = UiFonts::create(dpi);
-        self.fonts = Some((dpi, fonts));
+        self.fonts = Some((key, fonts));
         fonts
     }
 
@@ -165,7 +168,7 @@ impl Sidebar {
         if !font.is_null() {
             return font;
         }
-        let font = create_ui_font(scale(12, dpi), "Segoe UI", FW_BOLD as i32, false);
+        let font = type_ramp::create(TextStyle::BodyBold, dpi);
         if let Some((_, fonts)) = self.fonts.as_mut() {
             fonts.text_bold = font;
         }
@@ -510,6 +513,14 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
     update_tools(hwnd);
     crate::window::search_view::layout(hwnd);
     crate::window::inline_name::place(hwnd);
+}
+
+/// Re-applies the stored row heights after a DPI or text-size change. The Notebook view sets its
+/// own on every paint and the Search view in `layout`; the Favorites view only when its rows load.
+pub(crate) fn refresh_metrics(hwnd: HWND) {
+    if let Some((_, panel)) = windows(hwnd) {
+        crate::window::favorites_view::refresh_metrics(hwnd, panel);
+    }
 }
 
 /// `show_view` without its win events.
@@ -1106,7 +1117,7 @@ fn panel_hit_test(main: HWND, panel: HWND, wparam: WPARAM, lparam: LPARAM) -> LR
     unsafe { ScreenToClient(panel, &mut point) };
     let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
     let caption = point.y >= 0
-        && point.y < scale(HEADER_HEIGHT_96, dpi)
+        && point.y < panel_header(dpi)
         && !over_grip(panel, point.x)
         && PanelView::of(current_view(main))
             .is_some_and(|view| header_is_caption(main, view, panel, point.x, point.y));
@@ -1276,7 +1287,7 @@ fn save_width(main: HWND, width: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PanelView, drag_width_96, sidebar_widths};
+    use super::{PanelView, UiFonts, drag_width_96, sidebar_widths};
     use crate::config::SidebarView;
     use crate::window::palette::Palette;
 
@@ -1327,5 +1338,101 @@ mod tests {
             Some(PanelView::Favorites)
         );
         assert_eq!(PanelView::of(SidebarView::Hidden), None);
+    }
+
+    #[test]
+    fn the_sidebar_and_activity_bar_glyph_fonts_are_icon_sized_at_every_dpi() {
+        // Break caught: a glyph font built at the wrong size or scaled differently from the
+        // metrics, or the sidebar text not following the body style.
+        use crate::window::design::{
+            metrics::{ICON, SIDEBAR_ICON, scale},
+            type_ramp,
+        };
+        use windows_sys::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
+        let height = |font| {
+            let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                GetObjectW(
+                    font,
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    (&mut log as *mut LOGFONTW).cast(),
+                )
+            };
+            assert!(written > 0);
+            log.lfHeight
+        };
+        for dpi in [96, 120, 144, 192] {
+            let fonts = UiFonts::create(dpi);
+            assert_eq!(
+                height(fonts.glyph),
+                -scale(SIDEBAR_ICON, dpi),
+                "glyph at {dpi}"
+            );
+            assert_eq!(
+                height(fonts.bar_glyph),
+                -scale(ICON, dpi),
+                "bar glyph at {dpi}"
+            );
+            assert_eq!(
+                height(fonts.text),
+                -scale(type_ramp::TextStyle::Body.spec().px, dpi),
+                "text at {dpi}"
+            );
+            fonts.delete();
+        }
+    }
+
+    #[test]
+    fn the_text_size_factor_scales_the_sidebar_text_but_not_its_icons() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
+        // Break caught: icons growing with the text-size setting, or the sidebar text ignoring it.
+        use crate::window::design::{
+            metrics::{ICON, SIDEBAR_ICON, scale},
+            text_scale::set_factor_for_test,
+        };
+        use windows_sys::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
+        let height = |font| {
+            let mut log: LOGFONTW = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                GetObjectW(
+                    font,
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    (&mut log as *mut LOGFONTW).cast(),
+                )
+            };
+            assert!(written > 0);
+            log.lfHeight
+        };
+        set_factor_for_test(225);
+        let fonts = UiFonts::create(96);
+        set_factor_for_test(100);
+        assert_eq!(height(fonts.text), -29);
+        assert_eq!(height(fonts.glyph), -scale(SIDEBAR_ICON, 96));
+        assert_eq!(height(fonts.bar_glyph), -scale(ICON, 96));
+        fonts.delete();
+    }
+
+    #[test]
+    fn the_glyph_fonts_use_the_chosen_icon_face() {
+        // Break caught: a glyph font bypassing the chosen icon face.
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetTextFaceW, SelectObject,
+        };
+        let fonts = UiFonts::create(96);
+        let expected = crate::window::design::faces::current().icons;
+        unsafe {
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            assert!(!dc.is_null());
+            for font in [fonts.glyph, fonts.bar_glyph] {
+                let old = SelectObject(dc, font);
+                let mut buffer = [0_u16; 64];
+                let len = GetTextFaceW(dc, buffer.len() as i32, buffer.as_mut_ptr());
+                SelectObject(dc, old);
+                let name = String::from_utf16_lossy(&buffer[..(len.max(1) as usize - 1)]);
+                assert_eq!(name, expected);
+            }
+            DeleteDC(dc);
+        }
+        fonts.delete();
     }
 }

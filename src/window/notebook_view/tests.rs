@@ -157,10 +157,15 @@ fn a_tree_row_draws_the_chosen_sets_icon_and_minimal_in_high_contrast() {
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL, FW_SEMIBOLD};
     let normal = FW_NORMAL as i32;
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", normal, false),
-        bold: create_ui_font(11, "Segoe UI", FW_SEMIBOLD as i32, false),
-        italic: create_ui_font(12, "Segoe UI", normal, true),
-        glyph: create_ui_font(12, "Segoe MDL2 Assets", normal, false),
+        text: create_ui_font(13, "Segoe UI", normal, false),
+        bold: create_ui_font(13, "Segoe UI", FW_SEMIBOLD as i32, false),
+        italic: create_ui_font(13, "Segoe UI", normal, true),
+        glyph: create_ui_font(
+            crate::window::design::metrics::SIDEBAR_ICON,
+            "Segoe MDL2 Assets",
+            normal,
+            false,
+        ),
         ..UiFonts::default()
     };
     let rect = RECT {
@@ -267,10 +272,15 @@ fn a_clipped_icon_box_draws_part_of_the_icon_not_a_shrunken_one() {
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL, FW_SEMIBOLD};
     let normal = FW_NORMAL as i32;
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", normal, false),
-        bold: create_ui_font(11, "Segoe UI", FW_SEMIBOLD as i32, false),
-        italic: create_ui_font(12, "Segoe UI", normal, true),
-        glyph: create_ui_font(12, "Segoe MDL2 Assets", normal, false),
+        text: create_ui_font(13, "Segoe UI", normal, false),
+        bold: create_ui_font(13, "Segoe UI", FW_SEMIBOLD as i32, false),
+        italic: create_ui_font(13, "Segoe UI", normal, true),
+        glyph: create_ui_font(
+            crate::window::design::metrics::SIDEBAR_ICON,
+            "Segoe MDL2 Assets",
+            normal,
+            false,
+        ),
         ..UiFonts::default()
     };
     // At depth 0 and 96 DPI: chevron sits at [8, 24), leaving only 6 px for the icon box
@@ -456,7 +466,7 @@ fn the_dragged_row_draws_its_name_dimmed() {
     use crate::window::titlebar::create_ui_font;
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL};
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", FW_NORMAL as i32, false),
+        text: create_ui_font(13, "Segoe UI", FW_NORMAL as i32, false),
         ..UiFonts::default()
     };
     let rect = RECT {
@@ -510,7 +520,7 @@ fn the_drag_label_has_a_border_a_fill_an_icon_and_its_name() {
     use crate::window::titlebar::create_ui_font;
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, FW_NORMAL};
     let fonts = UiFonts {
-        text: create_ui_font(12, "Segoe UI", FW_NORMAL as i32, false),
+        text: create_ui_font(13, "Segoe UI", FW_NORMAL as i32, false),
         ..UiFonts::default()
     };
     let size = drag_label_size(80, 96);
@@ -691,4 +701,246 @@ fn collapse_all_keeps_the_selected_row_when_it_is_still_listed() {
     let hidden = RowKind::Note(r"a\b\two.md".into());
     let index = tree::row_index(&before, &hidden);
     assert!(follow(&after, Some(&hidden), index).is_some_and(|row| row < after.len()));
+}
+
+#[test]
+fn the_color_under_a_row_is_the_band_inside_the_highlight_and_the_panel_elsewhere() {
+    // Break caught: rounded row corners blending toward the panel inside the drop band.
+    use crate::window::tree_drag::Highlight;
+    let palette = Palette {
+        inactive_selection_background: 0x00aa_bbcc,
+        ..Palette::neutral()
+    };
+    let panel = 0x0011_2233;
+    let rows = Some(Highlight::Rows { start: 2, end: 4 });
+    let under = |highlight, index| paint::under_row(highlight, index, &palette, panel);
+    assert_eq!(under(rows, 1), panel);
+    assert_eq!(under(rows, 2), palette.inactive_selection_background);
+    assert_eq!(under(rows, 3), palette.inactive_selection_background);
+    assert_eq!(under(rows, 4), panel);
+    assert_eq!(under(None, 2), panel);
+    assert_eq!(
+        under(Some(Highlight::Root), 9),
+        palette.inactive_selection_background
+    );
+    let contrast = Palette {
+        high_contrast: true,
+        ..palette
+    };
+    assert_eq!(
+        paint::under_row(Some(Highlight::Root), 0, &contrast, panel),
+        panel
+    );
+}
+
+#[test]
+fn a_focused_root_row_draws_the_accent_focus_ring() {
+    use crate::window::icon_sets::images::TestTarget;
+    use crate::window::panel_cursor::Cursor;
+    let palette = Palette::neutral();
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 240,
+        bottom: 300,
+    };
+    let mut view = NotebookView::new(std::ptr::null_mut());
+    view.mode = Mode::Tree;
+    view.cursor = Cursor::Root;
+    let layout = view.layout(client, 96);
+    let probe = RECT {
+        left: layout.root.left + (layout.root.right - layout.root.left) / 2,
+        top: layout.root.top + 1,
+        right: layout.root.left + (layout.root.right - layout.root.left) / 2 + 1,
+        bottom: layout.root.top + 2,
+    };
+    let mut ring_pixel = |focused: bool| {
+        let target = TestTarget::new(240, 300);
+        unsafe { fill(target.dc, client, palette.panel_background()) };
+        let paint = ViewPaint {
+            hdc: target.dc,
+            client,
+            palette,
+            icons: FileIcons::neutral(),
+            icon_set: FileIconSet::Minimal,
+            light_theme: true,
+            background: palette.panel_background(),
+            fonts: UiFonts::default(),
+            dpi: 96,
+            focused,
+        };
+        view.paint_sections(&paint, layout);
+        target.area(probe)[0]
+    };
+    let accent = {
+        let target = TestTarget::new(1, 1);
+        let pixel = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        unsafe { fill(target.dc, pixel, palette.accent) };
+        target.pixel(0, 0)
+    };
+    assert_eq!(ring_pixel(true), accent);
+    assert_ne!(ring_pixel(false), accent);
+}
+
+#[test]
+fn the_selection_bar_is_only_where_the_keyboard_is() {
+    // Break caught: the tree and the active Open editors row both showing the bar at once, so
+    // neither marks the keyboard.
+    use crate::window::icon_sets::images::TestTarget;
+    use crate::window::panel_cursor::Cursor;
+    let palette = Palette {
+        accent: 0x00aa_ff00,
+        ..Palette::neutral()
+    };
+    let accent = {
+        let target = TestTarget::new(1, 1);
+        let pixel = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        unsafe { fill(target.dc, pixel, palette.accent) };
+        target.pixel(0, 0)
+    };
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 240,
+        bottom: 400,
+    };
+    let mut view = NotebookView::new(std::ptr::null_mut());
+    view.mode = Mode::Tree;
+    view.root_expanded = true;
+    view.editors_expanded = true;
+    view.list.set_count(3);
+    view.list.selected = Some(0);
+    let tab = |id: u64, active: bool| {
+        crate::window::open_editors::EditorEntry::View(crate::window::open_editors::EditorRow {
+            id: crate::document::DocumentId(id),
+            group: crate::window::split_tree::GroupId(1),
+            name: format!("tab{id}"),
+            path: None,
+            dirty: false,
+            active,
+        })
+    };
+    view.editors
+        .set_rows(vec![tab(1, false), tab(2, true), tab(3, false)]);
+    assert_eq!(view.editors.list.selected, Some(1));
+    // Where the two selected rows' bars would be (x 5 is inside the 4..7 bar), at mid-height.
+    let mut bars = |cursor: Cursor| {
+        view.cursor = cursor;
+        let target = TestTarget::new(240, 400);
+        unsafe { fill(target.dc, client, palette.panel_background()) };
+        let paint = ViewPaint {
+            hdc: target.dc,
+            client,
+            palette,
+            icons: FileIcons::neutral(),
+            icon_set: FileIconSet::Minimal,
+            light_theme: true,
+            background: palette.panel_background(),
+            fonts: UiFonts::default(),
+            dpi: 96,
+            focused: true,
+        };
+        view.paint(&paint);
+        let layout = view.layout(client, 96);
+        let tree = view.list_rect(client);
+        let tree_row = tree.top + view.list.row_top(0).unwrap() + view.list.row_height / 2;
+        let editor_row = view.editors_row_rect(layout.editors_list, 1).unwrap();
+        let editor_row = (editor_row.top + editor_row.bottom) / 2;
+        let at = |y: i32| {
+            target.area(RECT {
+                left: 5,
+                top: y,
+                right: 6,
+                bottom: y + 1,
+            })[0]
+                == accent
+        };
+        (at(tree_row), at(editor_row))
+    };
+    assert_eq!(bars(Cursor::Tree), (true, false));
+    assert_eq!(bars(Cursor::Editor(1)), (false, true));
+    assert_eq!(bars(Cursor::Editor(2)), (false, false));
+    assert_eq!(bars(Cursor::Root), (false, false));
+}
+
+#[test]
+fn the_bar_decision_needs_focus_and_the_cursor_on_the_list() {
+    use super::paint::keyboard_bars;
+    use crate::window::panel_cursor::Cursor;
+    assert_eq!(keyboard_bars(true, Cursor::Tree, Some(1)), (true, false));
+    assert_eq!(
+        keyboard_bars(true, Cursor::Editor(1), Some(1)),
+        (false, true)
+    );
+    assert_eq!(
+        keyboard_bars(true, Cursor::Editor(2), Some(1)),
+        (false, false)
+    );
+    assert_eq!(
+        keyboard_bars(true, Cursor::EditorsHeader, Some(1)),
+        (false, false)
+    );
+    assert_eq!(keyboard_bars(false, Cursor::Tree, Some(1)), (false, false));
+    assert_eq!(
+        keyboard_bars(false, Cursor::Editor(1), Some(1)),
+        (false, false)
+    );
+}
+
+#[test]
+fn the_selection_bar_clears_the_narrowest_row_content() {
+    // Break caught: the accent bar overlapping the first row content (the pin or indent) at some
+    // text size.
+    use crate::window::design::metrics::{ROW_INSET_X, SELECTION_BAR_WIDTH};
+    for dpi in [96, 120, 144, 192] {
+        assert!(
+            scale(ROW_INSET_X, dpi) + scale(SELECTION_BAR_WIDTH, dpi) <= scale(LEFT_PAD, dpi),
+            "dpi {dpi}"
+        );
+    }
+}
+
+#[test]
+fn the_no_notebook_state_and_drag_label_hold_their_text_at_every_text_size() {
+    // Break caught: the message, button, RECENT label or drag label too short for the text at a
+    // larger Windows text size, or the 100 % sizes drifting.
+    use crate::window::design::text_scale::FactorGuard;
+    use crate::window::design::type_ramp::{TextStyle, text_height_for_test};
+    let body = RECT {
+        left: 0,
+        top: 38,
+        right: 260,
+        bottom: 900,
+    };
+    let height = |rect: RECT| rect.bottom - rect.top;
+    {
+        let _factor = FactorGuard::set(100);
+        let layout = state_layout(body, 96);
+        assert_eq!(height(layout.message), 40);
+        assert_eq!(height(layout.button), 28);
+        assert_eq!(height(layout.label), 20);
+        assert_eq!(super::paint::drag_label_size(0, 96).cy, 24);
+    }
+    let _factor = FactorGuard::set(225);
+    for dpi in [96, 144] {
+        let layout = state_layout(body, dpi);
+        let text = text_height_for_test(TextStyle::Body, dpi);
+        assert!(height(layout.message) >= 2 * text, "{dpi}");
+        assert!(height(layout.button) >= text, "{dpi}");
+        assert!(height(layout.second) >= text, "{dpi}");
+        assert!(height(layout.label) >= text, "{dpi}");
+        assert!(layout.message.bottom <= layout.button.top);
+        assert!(layout.button.bottom <= layout.second.top);
+        assert!(super::paint::drag_label_size(0, dpi).cy >= text, "{dpi}");
+    }
 }

@@ -1,7 +1,8 @@
 //! The layout of the editor groups (split editors spec §4.3): rows and columns whose leaves are
 //! groups. Pure: it computes rectangles and never touches a window.
 
-use super::titlebar::{Point, Rect, scale};
+use super::design::metrics::scale;
+use super::titlebar::{Point, Rect};
 use crate::session::{SessionAxis, SessionLayout};
 
 /// The sash between two groups, and the smallest a group may get, at 96 DPI (spec §4.3).
@@ -472,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_split_on_a_new_axis_wraps_the_leaf_in_a_half_and_half_branch() {
-        // Break caught: Split Right turning the whole tree into a row, or the new group landing
+        // Break caught: Split right turning the whole tree into a row, or the new group landing
         // on the wrong side.
         let mut tree = SplitTree::new(A);
         assert!(tree.split(A, Direction::Right, B));

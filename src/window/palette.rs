@@ -8,8 +8,8 @@ use crate::catppuccin::{self, Flavor};
 use crate::languages::rgb;
 use crate::platform::theme::{SystemTheme, Theme};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, GetSysColor,
+    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
 };
 
 /// Every color is a Windows `COLORREF` (`0x00BBGGRR`).
@@ -37,6 +37,17 @@ pub struct Palette {
     pub strip_foreground: u32,
     /// Error text on `editor_background` or the panel, such as a regex error in the Search view.
     pub error_foreground: u32,
+    /// Interactive emphasis: the focus ring, the selection pill and a primary button's fill.
+    pub accent: u32,
+    /// Text and glyphs drawn on `accent`.
+    pub on_accent: u32,
+    /// 1px separators and control borders.
+    pub stroke: u32,
+    /// Disabled text and glyphs. Exempt from contrast rules, as disabled controls are.
+    pub disabled_foreground: u32,
+    /// Warning and success text on `editor_background`.
+    pub warning_foreground: u32,
+    pub success_foreground: u32,
     /// Whether the frame and editor scrollbars should request the dark system styling.
     pub dark_frame: bool,
     /// The system's high-contrast colors: only system color pairs may be drawn, never a blend.
@@ -65,6 +76,12 @@ const LIGHT: Palette = Palette {
     line_number_foreground: rgb(110, 118, 129),
     strip_foreground: rgb(32, 32, 32),
     error_foreground: rgb(0xA1, 0x26, 0x0D),
+    accent: rgb(0, 95, 184),
+    on_accent: WHITE,
+    stroke: rgb(204, 204, 204),
+    disabled_foreground: rgb(160, 160, 160),
+    warning_foreground: rgb(157, 93, 0),
+    success_foreground: rgb(15, 123, 15),
     dark_frame: false,
     high_contrast: false,
 };
@@ -87,6 +104,12 @@ const DARK: Palette = Palette {
     line_number_foreground: rgb(133, 133, 133),
     strip_foreground: rgb(212, 212, 212),
     error_foreground: rgb(0xF4, 0x87, 0x71),
+    accent: rgb(96, 205, 255),
+    on_accent: rgb(0, 0, 0),
+    stroke: rgb(72, 72, 76),
+    disabled_foreground: rgb(110, 110, 110),
+    warning_foreground: rgb(252, 225, 0),
+    success_foreground: rgb(108, 203, 95),
     dark_frame: true,
     high_contrast: false,
 };
@@ -111,6 +134,12 @@ const PAPER: Palette = Palette {
     line_number_foreground: rgb(140, 138, 127),
     strip_foreground: rgb(42, 41, 38),
     error_foreground: rgb(161, 55, 35),
+    accent: rgb(0, 110, 100),
+    on_accent: WHITE,
+    stroke: rgb(207, 205, 194),
+    disabled_foreground: rgb(160, 158, 148),
+    warning_foreground: rgb(150, 90, 0),
+    success_foreground: rgb(30, 120, 50),
     dark_frame: false,
     high_contrast: false,
 };
@@ -134,6 +163,12 @@ const LAMP: Palette = Palette {
     line_number_foreground: rgb(110, 107, 98),
     strip_foreground: rgb(217, 212, 199),
     error_foreground: rgb(232, 131, 113),
+    accent: rgb(110, 190, 170),
+    on_accent: rgb(20, 24, 22),
+    stroke: rgb(62, 60, 55),
+    disabled_foreground: rgb(95, 92, 84),
+    warning_foreground: rgb(225, 185, 90),
+    success_foreground: rgb(140, 200, 120),
     dark_frame: true,
     high_contrast: false,
 };
@@ -159,6 +194,22 @@ const fn catppuccin(flavor: &Flavor, dark: bool) -> Palette {
         line_number_foreground: flavor.overlay1,
         strip_foreground: flavor.text,
         error_foreground: flavor.red,
+        accent: flavor.blue,
+        on_accent: if dark { flavor.crust } else { WHITE },
+        stroke: flavor.surface1,
+        disabled_foreground: flavor.overlay1,
+        // Latte's yellow and green are too pale on its light base for text, so the light flavor
+        // pulls them two-thirds of the way to its text color.
+        warning_foreground: if dark {
+            flavor.yellow
+        } else {
+            catppuccin::blend(flavor.text, flavor.yellow, 170)
+        },
+        success_foreground: if dark {
+            flavor.green
+        } else {
+            catppuccin::blend(flavor.text, flavor.green, 170)
+        },
         dark_frame: dark,
         high_contrast: false,
     }
@@ -326,6 +377,12 @@ impl Palette {
             line_number_foreground: text,
             strip_foreground: color(COLOR_BTNTEXT),
             error_foreground: text,
+            accent: highlight,
+            on_accent: highlight_text,
+            stroke: text,
+            disabled_foreground: color(COLOR_GRAYTEXT),
+            warning_foreground: text,
+            success_foreground: text,
             dark_frame: false,
             high_contrast: true,
         }
@@ -351,6 +408,7 @@ mod tests {
     ];
     use crate::languages::{rgb, syntax_colors};
     use crate::platform::theme::Theme;
+    use crate::window::design::contrast::ratio;
     use windows_sys::Win32::Graphics::Gdi::{
         COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
     };
@@ -487,24 +545,6 @@ mod tests {
         );
     }
 
-    /// WCAG relative luminance of a `COLORREF`.
-    fn luminance(color: u32) -> f64 {
-        let channel = |shift: u32| {
-            let value = f64::from((color >> shift) & 0xFF) / 255.0;
-            if value <= 0.040_45 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(16)
-    }
-
-    fn contrast(a: u32, b: u32) -> f64 {
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
-
     #[test]
     fn file_icon_colours_come_from_the_themes_flavour_and_high_contrast_mutes_them() {
         // Break caught: the Light theme drawing Mocha's pastel icons on white, a Catppuccin theme
@@ -574,10 +614,151 @@ mod tests {
                     palette.hover_background,
                     palette.panel_background(),
                 ] {
-                    let ratio = contrast(color, background);
+                    let ratio = ratio(color, background);
                     assert!(
                         ratio >= 1.5,
                         "{theme:?}: {color:06x} on {background:06x} is {ratio:.2}:1"
+                    );
+                }
+            }
+        }
+    }
+
+    struct Pair {
+        name: &'static str,
+        foreground: u32,
+        background: u32,
+        minimum: f64,
+    }
+
+    /// The text and UI pairs every themed palette must keep legible: 4.5:1 for text, 3:1 for
+    /// secondary text and interactive shapes.
+    fn contrast_pairs(p: &Palette) -> Vec<Pair> {
+        let pair = |name, foreground, background, minimum| Pair {
+            name,
+            foreground,
+            background,
+            minimum,
+        };
+        vec![
+            pair("editor text", p.editor_foreground, p.editor_background, 4.5),
+            pair("strip text", p.strip_foreground, p.strip_background, 4.5),
+            pair(
+                "muted text on strip",
+                p.muted_foreground,
+                p.strip_background,
+                4.5,
+            ),
+            pair(
+                "muted text on editor",
+                p.muted_foreground,
+                p.editor_background,
+                4.5,
+            ),
+            pair("error text", p.error_foreground, p.editor_background, 4.5),
+            pair(
+                "line numbers",
+                p.line_number_foreground,
+                p.editor_background,
+                3.0,
+            ),
+            pair("on accent", p.on_accent, p.accent, 4.5),
+            pair(
+                "warning text",
+                p.warning_foreground,
+                p.editor_background,
+                4.5,
+            ),
+            pair(
+                "success text",
+                p.success_foreground,
+                p.editor_background,
+                4.5,
+            ),
+            pair("accent on editor", p.accent, p.editor_background, 3.0),
+            pair("accent on strip", p.accent, p.strip_background, 3.0),
+        ]
+    }
+
+    #[test]
+    fn stroke_is_the_border_color_borders_use_today() {
+        // Break caught: moving borders onto `stroke` changing a border's color, which would break
+        // "no visible change".
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
+            assert_eq!(palette.stroke, palette.pressed_background, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn the_new_roles_are_distinct_from_the_surfaces_they_sit_on() {
+        // Break caught: an accent or status color that equals the background.
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
+            for color in [
+                palette.accent,
+                palette.warning_foreground,
+                palette.success_foreground,
+                palette.disabled_foreground,
+            ] {
+                assert_ne!(color, palette.editor_background, "{theme:?}");
+            }
+            assert_ne!(palette.accent, palette.on_accent, "{theme:?}");
+            assert_ne!(
+                palette.disabled_foreground, palette.muted_foreground,
+                "{theme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_contrast_maps_the_new_roles_to_system_colors_and_never_blends() {
+        // Break caught: a blended or hard-coded color in high contrast, where only system
+        // color pairs are allowed.
+        use windows_sys::Win32::Graphics::Gdi::COLOR_GRAYTEXT;
+        // High contrast ignores the theme, so any theme works here.
+        let palette = Palette::for_theme(Theme::CatppuccinMocha, true);
+        unsafe {
+            assert_eq!(palette.accent, GetSysColor(COLOR_HIGHLIGHT));
+            assert_eq!(palette.on_accent, GetSysColor(COLOR_HIGHLIGHTTEXT));
+            assert_eq!(palette.stroke, GetSysColor(COLOR_WINDOWTEXT));
+            assert_eq!(palette.disabled_foreground, GetSysColor(COLOR_GRAYTEXT));
+            assert_eq!(palette.warning_foreground, GetSysColor(COLOR_WINDOWTEXT));
+            assert_eq!(palette.success_foreground, GetSysColor(COLOR_WINDOWTEXT));
+        }
+    }
+
+    /// Pairs that fall short today, each recorded with the measured ratio and left as they are so
+    /// step 1 changes no color. A later step fixes the color and removes the entry. The test
+    /// below fails if an entry starts passing, so this list cannot go stale.
+    const KNOWN_SHORT: &[(Theme, &str)] = &[
+        (Theme::CatppuccinLatte, "muted text on strip"), // 4.06:1, needs 4.5:1
+        (Theme::CatppuccinLatte, "muted text on editor"), // 4.37:1, needs 4.5:1
+        (Theme::CatppuccinLatte, "line numbers"),        // 2.83:1, needs 3:1
+        (Theme::Paper, "muted text on strip"),           // 3.98:1, needs 4.5:1
+        (Theme::Paper, "muted text on editor"),          // 4.44:1, needs 4.5:1
+    ];
+
+    #[test]
+    fn every_theme_keeps_its_text_and_shapes_legible() {
+        // Break caught: a palette edit that leaves text or a control nearly invisible on its
+        // background, in any of the eight themes.
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
+            for pair in contrast_pairs(&palette) {
+                let measured = ratio(pair.foreground, pair.background);
+                let known = KNOWN_SHORT.contains(&(theme, pair.name));
+                if measured >= pair.minimum {
+                    assert!(
+                        !known,
+                        "{theme:?} {}: now {measured:.2}:1, so remove it from KNOWN_SHORT",
+                        pair.name
+                    );
+                } else {
+                    assert!(
+                        known,
+                        "{theme:?} {}: {measured:.2}:1 is below {}:1",
+                        pair.name, pair.minimum
                     );
                 }
             }

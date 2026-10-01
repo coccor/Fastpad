@@ -1,0 +1,130 @@
+//! Sizes shared by more than one surface, in pixels at 96 DPI, and the one `scale` that turns
+//! them into device pixels.
+
+/// `value` (pixels at 96 DPI) scaled to `dpi`, rounded half up. A DPI of 0, which Windows returns
+/// for a bad handle, counts as 96.
+pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    ((value as i64 * dpi as i64 + 48) / 96) as i32
+}
+
+/// The corner radius of cards, controls and buttons.
+pub(crate) const CONTROL_RADIUS: i32 = 4;
+/// The corner radius of the rounded top of a tab.
+pub(crate) const TAB_RADIUS: i32 = 8;
+/// How far a sidebar row's hover and selection fill is inset from the panel's left and right edges.
+pub(crate) const ROW_INSET_X: i32 = 4;
+/// How far that fill is inset from the row's top and bottom, which leaves a gap between rows.
+pub(crate) const ROW_INSET_Y: i32 = 1;
+/// The keyboard-focus ring's stroke, and its gap outside the control it rings.
+pub(crate) const FOCUS_RING: i32 = 2;
+pub(crate) const FOCUS_GAP: i32 = 1;
+/// The accent bar on a selected row: width and height at 96 DPI.
+pub(crate) const SELECTION_BAR_WIDTH: i32 = 3;
+pub(crate) const SELECTION_BAR_HEIGHT: i32 = 16;
+/// The height of a side panel's title row, shared by every sidebar view.
+pub(crate) const PANEL_HEADER: i32 = 38;
+/// The height of a row in the sidebar's lists (notebook tree, open editors, favorites).
+pub(crate) const SIDEBAR_ROW: i32 = 26;
+/// A sidebar row's height at `dpi`, following the Windows text-size setting.
+pub(crate) fn sidebar_row(dpi: u32) -> i32 {
+    crate::window::design::text_scale::scale_text(SIDEBAR_ROW, dpi)
+}
+/// A side panel's title row height at `dpi`, following the Windows text-size setting.
+pub(crate) fn panel_header(dpi: u32) -> i32 {
+    crate::window::design::text_scale::scale_text(PANEL_HEADER, dpi)
+}
+/// The size of the activity bar's icon glyphs.
+pub(crate) const ICON: i32 = 16;
+/// The size of the sidebar's icon glyphs: tree rows, carets, and the header buttons.
+pub(crate) const SIDEBAR_ICON: i32 = 12;
+/// The layout grid. Only tests use it, to track the sizes not yet on it.
+#[cfg(test)]
+pub(crate) const GRID: i32 = 4;
+
+#[cfg(test)]
+mod tests {
+    use super::scale;
+
+    #[test]
+    fn scale_is_the_identity_at_96_dpi() {
+        assert_eq!(scale(26, 96), 26);
+        assert_eq!(scale(0, 96), 0);
+    }
+
+    #[test]
+    fn scale_rounds_half_up_at_common_dpis() {
+        // Break caught: a layout that drifts by a pixel per row at 125 % and 150 %.
+        assert_eq!(scale(12, 120), 15); // 14.5 + 0.5 = 15
+        assert_eq!(scale(26, 144), 39); // 39.0
+        assert_eq!(scale(10, 192), 20);
+        assert_eq!(scale(1, 144), 2); // 1.5 rounds up
+    }
+
+    #[test]
+    fn sidebar_row_and_panel_header_follow_the_text_size_factor() {
+        let _factor = crate::window::design::text_scale::FactorGuard::new();
+        // Break caught: sidebar rows and headers that stay put while the text grows to 225 %.
+        use super::{panel_header, sidebar_row};
+        use crate::window::design::text_scale::set_factor_for_test;
+        set_factor_for_test(100);
+        for dpi in [96, 120, 144, 192] {
+            assert_eq!(sidebar_row(dpi), scale(SIDEBAR_ROW, dpi));
+            assert_eq!(panel_header(dpi), scale(PANEL_HEADER, dpi));
+        }
+        set_factor_for_test(225);
+        let (row, header) = (sidebar_row(96), panel_header(96));
+        set_factor_for_test(100);
+        assert_eq!(row, 59);
+        assert_eq!(header, 86);
+    }
+
+    #[test]
+    fn a_dpi_of_zero_falls_back_to_96_instead_of_collapsing_the_layout() {
+        // Break caught: `GetDpiForWindow` returns 0 for a bad handle; the old titlebar copy treated
+        // that as a DPI of 1 and scaled every size to about zero.
+        assert_eq!(scale(26, 0), 26);
+        assert_eq!(scale(44, 0), 44);
+    }
+
+    use super::{
+        CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, GRID, ICON, PANEL_HEADER, ROW_INSET_X, ROW_INSET_Y,
+        SELECTION_BAR_HEIGHT, SELECTION_BAR_WIDTH, SIDEBAR_ICON, SIDEBAR_ROW, TAB_RADIUS,
+    };
+
+    #[test]
+    fn shared_metrics_keep_the_values_the_old_constants_had() {
+        // Break caught: a "no visible change" refactor that shifts a control by a pixel.
+        assert_eq!(CONTROL_RADIUS, 4); // was soft_paint::RADIUS_AT_96_DPI
+        assert_eq!(TAB_RADIUS, 8);
+        assert_eq!(ROW_INSET_X, 4);
+        assert_eq!(ROW_INSET_Y, 1);
+        assert_eq!(FOCUS_RING, 2); // was soft_paint::FOCUS_WIDTH_AT_96_DPI
+        assert_eq!(FOCUS_GAP, 1); // was soft_paint::FOCUS_GAP_AT_96_DPI
+        assert_eq!(SELECTION_BAR_WIDTH, 3);
+        assert_eq!(SELECTION_BAR_HEIGHT, 16);
+        assert_eq!(PANEL_HEADER, 38); // was side_panel::HEADER_HEIGHT_96
+        assert_eq!(SIDEBAR_ROW, 26); // was notebook_layout::ROW_HEIGHT
+        assert_eq!(ICON, 16); // the activity bar icon size
+        assert_eq!(SIDEBAR_ICON, 12); // the sidebar icon size
+    }
+
+    #[test]
+    fn the_layout_sizes_still_off_the_4px_grid_are_the_known_ones() {
+        // Later steps move these onto the grid; when one moves, this list shrinks. Hairline strokes
+        // (the focus ring and gap) are exempt from the grid.
+        let sizes = [
+            ("CONTROL_RADIUS", CONTROL_RADIUS),
+            ("ICON", ICON),
+            ("SIDEBAR_ICON", SIDEBAR_ICON),
+            ("PANEL_HEADER", PANEL_HEADER),
+            ("SIDEBAR_ROW", SIDEBAR_ROW),
+        ];
+        let off_grid: Vec<&str> = sizes
+            .iter()
+            .filter(|(_, value)| value % GRID != 0)
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(off_grid, ["PANEL_HEADER", "SIDEBAR_ROW"]);
+    }
+}

@@ -165,7 +165,7 @@ fn corrupt_settings_are_reported_on_the_bottom_bar_that_chrome_reserves() {
     assert_eq!(super::super::current_status_text(window.hwnd), None);
     let bar = super::super::current_status_bar(window.hwnd).unwrap();
     assert_eq!(bar.left, "Ln 1, Col 1");
-    assert_eq!(bar.right, "Plain Text    UTF-8");
+    assert_eq!(bar.right, "Plain text    UTF-8");
     let mut dismissed = RECT::default();
     unsafe {
         GetClientRect(editor_hwnd, &mut dismissed);

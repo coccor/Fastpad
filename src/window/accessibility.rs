@@ -67,8 +67,8 @@ pub(crate) enum ProviderKind {
 const MINIMIZE: &str = "Minimize";
 const MAXIMIZE: &str = "Maximize";
 const CLOSE: &str = "Close";
-const PREVIEW_SIDE: &str = "Open Preview to the Side";
-const PREVIEW_FULL: &str = "Open Preview";
+const PREVIEW_SIDE: &str = "Open preview to the side";
+const PREVIEW_FULL: &str = "Open preview";
 
 pub(crate) fn accessible_children(
     kind: ProviderKind,
@@ -1058,7 +1058,7 @@ mod tests {
             .iter()
             .filter_map(AccessibleChild::button_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["Open Preview to the Side", "Open Preview"]);
+        assert_eq!(names, vec!["Open preview to the side", "Open preview"]);
         let without = accessible_children(ProviderKind::GroupStrip, &["a"], false);
         assert_eq!(without.len(), 1);
     }

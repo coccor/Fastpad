@@ -18,7 +18,7 @@ impl Section {
         match self {
             Self::Appearance => "Appearance",
             Self::Editor => "Editor",
-            Self::NotesAndSession => "Notes and Session",
+            Self::NotesAndSession => "Notes and session",
         }
     }
 }
@@ -403,7 +403,7 @@ impl Page {
     pub(crate) const fn title(self) -> &'static str {
         match self {
             Self::General => "General",
-            Self::Shortcuts => "Keyboard Shortcuts",
+            Self::Shortcuts => "Keyboard shortcuts",
         }
     }
 
