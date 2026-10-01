@@ -3,6 +3,7 @@
 
 pub(crate) mod metrics;
 pub(crate) mod round;
+pub(crate) mod text_scale;
 
 #[cfg(test)]
 pub(crate) mod contrast;
