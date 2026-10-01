@@ -1,5 +1,4 @@
 pub(crate) mod about;
-mod prompt;
 pub(crate) mod accessibility;
 pub(crate) mod activity_bar;
 pub(crate) mod command_palette;
@@ -38,6 +37,7 @@ pub(crate) mod panel_cursor;
 pub(crate) mod panel_drop;
 pub(crate) mod preview_buttons;
 pub(crate) mod preview_host;
+mod prompt;
 pub(crate) mod row_list;
 pub(crate) mod search_view;
 pub(crate) mod settings_dialog;

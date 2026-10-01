@@ -173,7 +173,7 @@ pub(crate) fn key_choice(
 ) -> Option<usize> {
     match key {
         VK_ESCAPE => count.checked_sub(1),
-        VK_RETURN | VK_SPACE => Some(focus.min(count.saturating_sub(1))),
+        VK_RETURN | VK_SPACE => (count > 0).then(|| focus.min(count - 1)),
         _ => quick
             .iter()
             .find(|(letter, index)| *letter == key && *index < count)
