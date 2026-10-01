@@ -258,6 +258,7 @@ impl FavoritesView {
             &self.list,
             &palette,
             paint.focused,
+            paint.focused,
             &|_| paint.background,
             dpi,
             &mut |hdc, index, rect, look| self.draw_row(hdc, index, rect, look, paint),
@@ -308,8 +309,9 @@ impl FavoritesView {
                 );
                 return;
             };
-            // The open notebook gets an accent bar, so it isn't marked by color alone.
-            if row.open {
+            // The open notebook gets an accent bar, so it isn't marked by color alone. The focused
+            // selection has its own bar, so this one steps aside rather than sit next to it.
+            if row.open && !(look.selected && look.focused) {
                 fill(
                     hdc,
                     RECT {
@@ -849,7 +851,8 @@ mod tests {
     #[test]
     fn the_open_notebooks_bar_is_the_accent_color() {
         // Break caught: the open-notebook bar painted in the selection fill (invisible on a
-        // selected row) instead of the accent, or drawn on a notebook that isn't open.
+        // selected row) instead of the accent, drawn on a notebook that isn't open, or drawn beside
+        // the selection bar of the focused selected row.
         use crate::config::FileIconSet;
         use crate::window::icon_sets::images::TestTarget;
         use crate::window::palette::{FileIcons, Palette};
@@ -866,20 +869,24 @@ mod tests {
             400,
         );
         view.list.selected = None;
-        let target = TestTarget::new(260, 400);
-        let paint = ViewPaint {
-            hdc: target.dc,
-            client: CLIENT,
-            palette,
-            icons: FileIcons::neutral(),
-            icon_set: FileIconSet::Minimal,
-            light_theme: true,
-            background: palette.panel_background(),
-            fonts: UiFonts::default(),
-            dpi: 96,
-            focused: true,
+        let render = |view: &mut FavoritesView, focused: bool| {
+            let target = TestTarget::new(260, 400);
+            let paint = ViewPaint {
+                hdc: target.dc,
+                client: CLIENT,
+                palette,
+                icons: FileIcons::neutral(),
+                icon_set: FileIconSet::Minimal,
+                light_theme: true,
+                background: palette.panel_background(),
+                fonts: UiFonts::default(),
+                dpi: 96,
+                focused,
+            };
+            view.paint(&paint);
+            target
         };
-        view.paint(&paint);
+        let target = render(&mut view, true);
         let area = view.list_area(CLIENT, 96);
         let row = view.list.row_height;
         let accent = {
@@ -900,6 +907,14 @@ mod tests {
         };
         assert_eq!(target.pixel(1, area.top + row / 2), accent);
         assert_ne!(target.pixel(1, area.top + row + row / 2), accent);
+        // The focused selected open row has the selection bar instead, not both side by side.
+        view.list.selected = Some(0);
+        let target = render(&mut view, true);
+        assert_ne!(target.pixel(1, area.top + row / 2), accent);
+        assert_eq!(target.pixel(5, area.top + row / 2), accent);
+        // Unfocused, the selection has no bar of its own, so the open bar stays.
+        let target = render(&mut view, false);
+        assert_eq!(target.pixel(1, area.top + row / 2), accent);
     }
 
     #[test]

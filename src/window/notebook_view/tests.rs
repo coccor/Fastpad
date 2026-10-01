@@ -788,6 +788,116 @@ fn a_focused_root_row_draws_the_accent_focus_ring() {
 }
 
 #[test]
+fn the_selection_bar_is_only_where_the_keyboard_is() {
+    // Break caught: the tree and the active Open editors row both showing the bar at once, so
+    // neither marks the keyboard.
+    use crate::window::icon_sets::images::TestTarget;
+    use crate::window::panel_cursor::Cursor;
+    let palette = Palette {
+        accent: 0x00aa_ff00,
+        ..Palette::neutral()
+    };
+    let accent = {
+        let target = TestTarget::new(1, 1);
+        let pixel = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        unsafe { fill(target.dc, pixel, palette.accent) };
+        target.pixel(0, 0)
+    };
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 240,
+        bottom: 400,
+    };
+    let mut view = NotebookView::new(std::ptr::null_mut());
+    view.mode = Mode::Tree;
+    view.root_expanded = true;
+    view.editors_expanded = true;
+    view.list.set_count(3);
+    view.list.selected = Some(0);
+    let tab = |id: u64, active: bool| {
+        crate::window::open_editors::EditorEntry::View(crate::window::open_editors::EditorRow {
+            id: crate::document::DocumentId(id),
+            group: crate::window::split_tree::GroupId(1),
+            name: format!("tab{id}"),
+            path: None,
+            dirty: false,
+            active,
+        })
+    };
+    view.editors
+        .set_rows(vec![tab(1, false), tab(2, true), tab(3, false)]);
+    assert_eq!(view.editors.list.selected, Some(1));
+    // Where the two selected rows' bars would be (x 5 is inside the 4..7 bar), at mid-height.
+    let mut bars = |cursor: Cursor| {
+        view.cursor = cursor;
+        let target = TestTarget::new(240, 400);
+        unsafe { fill(target.dc, client, palette.panel_background()) };
+        let paint = ViewPaint {
+            hdc: target.dc,
+            client,
+            palette,
+            icons: FileIcons::neutral(),
+            icon_set: FileIconSet::Minimal,
+            light_theme: true,
+            background: palette.panel_background(),
+            fonts: UiFonts::default(),
+            dpi: 96,
+            focused: true,
+        };
+        view.paint(&paint);
+        let layout = view.layout(client, 96);
+        let tree = view.list_rect(client);
+        let tree_row = tree.top + view.list.row_top(0).unwrap() + view.list.row_height / 2;
+        let editor_row = view.editors_row_rect(layout.editors_list, 1).unwrap();
+        let editor_row = (editor_row.top + editor_row.bottom) / 2;
+        let at = |y: i32| {
+            target.area(RECT {
+                left: 5,
+                top: y,
+                right: 6,
+                bottom: y + 1,
+            })[0]
+                == accent
+        };
+        (at(tree_row), at(editor_row))
+    };
+    assert_eq!(bars(Cursor::Tree), (true, false));
+    assert_eq!(bars(Cursor::Editor(1)), (false, true));
+    assert_eq!(bars(Cursor::Editor(2)), (false, false));
+    assert_eq!(bars(Cursor::Root), (false, false));
+}
+
+#[test]
+fn the_bar_decision_needs_focus_and_the_cursor_on_the_list() {
+    use super::paint::keyboard_bars;
+    use crate::window::panel_cursor::Cursor;
+    assert_eq!(keyboard_bars(true, Cursor::Tree, Some(1)), (true, false));
+    assert_eq!(
+        keyboard_bars(true, Cursor::Editor(1), Some(1)),
+        (false, true)
+    );
+    assert_eq!(
+        keyboard_bars(true, Cursor::Editor(2), Some(1)),
+        (false, false)
+    );
+    assert_eq!(
+        keyboard_bars(true, Cursor::EditorsHeader, Some(1)),
+        (false, false)
+    );
+    assert_eq!(keyboard_bars(false, Cursor::Tree, Some(1)), (false, false));
+    assert_eq!(
+        keyboard_bars(false, Cursor::Editor(1), Some(1)),
+        (false, false)
+    );
+}
+
+#[test]
 fn the_selection_bar_clears_the_narrowest_row_content() {
     // Break caught: the accent bar overlapping the first row content (the pin or indent) at some
     // text size.

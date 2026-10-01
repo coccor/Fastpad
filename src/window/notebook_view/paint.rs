@@ -480,6 +480,20 @@ impl NotebookView {
     }
 }
 
+/// Which lists show the accent bar on their selected row: (the tree, the Open editors list). The
+/// bar marks where the keyboard is, so the panel must be focused and the cursor must be in that
+/// list. In Open editors the selected row is the active tab, so the cursor has to be on it.
+pub(super) fn keyboard_bars(
+    focused: bool,
+    cursor: Cursor,
+    editors_selected: Option<usize>,
+) -> (bool, bool) {
+    (
+        focused && cursor == Cursor::Tree,
+        focused && matches!(cursor, Cursor::Editor(index) if Some(index) == editors_selected),
+    )
+}
+
 impl NotebookView {
     /// The started drag's label painted with `paint`, and the dragged row's or tab's name (tree
     /// drag spec §3.2). `None` without a started drag, for dropped files, or if GDI can't make
@@ -645,6 +659,7 @@ impl NotebookView {
         let palette = &paint.palette;
         self.list.row_height = sidebar_row(dpi);
         self.editors.list.row_height = sidebar_row(dpi);
+        let tree_bar = keyboard_bars(focused, self.cursor, self.editors.list.selected).0;
         let sections = self.layout(area, dpi);
         // A panel sized after the rows came (startup) or resized: the scroll stays in range.
         let editors_height = height(sections.editors_list);
@@ -708,6 +723,7 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
+                    tree_bar,
                     &|_| paint.background,
                     dpi,
                     &mut |dc, index, rect, look| {
@@ -787,6 +803,7 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
+                    tree_bar,
                     &|index| under_row(highlight, index, palette, paint.background),
                     dpi,
                     &mut |dc, index, rect, look| {
@@ -858,6 +875,7 @@ impl NotebookView {
             palette.muted_foreground,
         );
         // The rows.
+        let editors_bar = keyboard_bars(paint.focused, self.cursor, self.editors.list.selected).1;
         let editors = &self.editors;
         let images = &mut self.images;
         let hover_close = editors.hover_close;
@@ -867,6 +885,7 @@ impl NotebookView {
             &editors.list,
             palette,
             paint.focused,
+            editors_bar,
             &|_| paint.background,
             dpi,
             &mut |dc, index, rect, look| match editors.rows.get(index) {

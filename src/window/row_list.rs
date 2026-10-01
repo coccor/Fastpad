@@ -287,7 +287,8 @@ pub(crate) fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
 
 /// Paints the rows in view into `area` of `hdc`. For each row it paints the selection (the
 /// unfocused color when `focused` is false) or the hover background, then calls `draw_row` with
-/// the row's index, rectangle and look. Last it paints the thin scroll thumb at the right edge.
+/// the row's index, rectangle and look. `bar` says whether the focused selection also gets the
+/// accent bar: it marks where the keyboard is, which is not always the selected row. Last it paints the thin scroll thumb at the right edge.
 /// The fills are rounded and inset from the row's edges (`draw_row` still gets the whole row),
 /// except in high contrast, where they cover the whole row. `behind(index)` is the color under row
 /// `index` (the panel's fill, or a band the caller painted under it): the rounded corners blend
@@ -302,6 +303,7 @@ pub(crate) fn paint(
     state: &RowListState,
     palette: &Palette,
     focused: bool,
+    bar: bool,
     behind: &dyn Fn(usize) -> u32,
     dpi: u32,
     draw_row: &mut dyn FnMut(HDC, usize, RECT, RowLook),
@@ -354,7 +356,7 @@ pub(crate) fn paint(
                     background,
                     behind(index),
                 );
-                if focused {
+                if bar {
                     paint_selection_bar(hdc, backplate, palette, background, dpi);
                 }
             } else if look.hover {
@@ -654,6 +656,7 @@ mod tests {
                     &state,
                     &palette,
                     focused,
+                    focused,
                     &|_| palette.editor_background,
                     96,
                     &mut |_, index, rect, look| {
@@ -742,6 +745,7 @@ mod tests {
                 &state,
                 &palette,
                 true,
+                true,
                 &|index| {
                     if index == 1 {
                         band
@@ -802,6 +806,7 @@ mod tests {
                     &state,
                     palette,
                     focused,
+                    focused,
                     &|_| palette.editor_background,
                     96,
                     &mut |_, _, _, _| {},
@@ -820,6 +825,73 @@ mod tests {
             palette.high_contrast = true;
             render(&palette, true);
             assert_eq!(GetPixel(dc, 5, 30), palette.selection_background);
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn the_bar_flag_alone_decides_the_accent_bar_and_leaves_the_fill_alone() {
+        // Break caught: the bar tied to the focused look, so a list that is focused but whose
+        // keyboard is elsewhere shows a second bar, or a bar flag that changes the fill.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let accent = 0x00aa_ff00;
+        let palette = Palette {
+            selection_background: 0x0000_00ff,
+            editor_background: 0x0080_8080,
+            accent,
+            ..Palette::neutral()
+        };
+        let mut state = RowListState::new(20);
+        state.set_count(10);
+        state.selected = Some(1);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            let previous = SelectObject(dc, bitmap);
+            for bar in [false, true] {
+                crate::window::panel::fill(dc, area, palette.editor_background);
+                let mut looks = Vec::new();
+                paint(
+                    dc,
+                    area,
+                    &state,
+                    &palette,
+                    true,
+                    bar,
+                    &|_| palette.editor_background,
+                    96,
+                    &mut |_, index, _, look| looks.push((index, look.focused)),
+                );
+                assert!(
+                    looks.iter().all(|(_, focused)| *focused),
+                    "the look stays focused"
+                );
+                // The selected row's fill is the focused color either way.
+                assert_eq!(GetPixel(dc, 12, 30), palette.selection_background);
+                assert_eq!(GetPixel(dc, 8, 30), palette.selection_background);
+                assert_eq!(
+                    GetPixel(dc, 5, 30) == accent,
+                    bar,
+                    "the bar shows exactly when bar is set"
+                );
+                if !bar {
+                    assert_eq!(GetPixel(dc, 5, 30), palette.selection_background);
+                }
+            }
             SelectObject(dc, previous);
             DeleteObject(bitmap);
             DeleteDC(dc);
@@ -862,6 +934,7 @@ mod tests {
                 area,
                 &state,
                 &palette,
+                true,
                 true,
                 &|_| palette.editor_background,
                 96,

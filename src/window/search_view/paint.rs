@@ -300,6 +300,7 @@ impl SearchView {
             &self.list,
             &palette,
             paint.focused,
+            paint.focused,
             &|_| paint.background,
             dpi,
             &mut |hdc, index, rect, look| self.draw_row(hdc, index, rect, look, paint),
