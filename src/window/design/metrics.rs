@@ -10,6 +10,24 @@ pub(crate) const fn scale(value: i32, dpi: u32) -> i32 {
 
 /// The corner radius of cards, controls and buttons.
 pub(crate) const CONTROL_RADIUS: i32 = 4;
+/// The corner radius of the rounded top of a tab.
+#[allow(
+    dead_code,
+    reason = "adopted by the tab strip and the sidebar in the next tasks"
+)]
+pub(crate) const TAB_RADIUS: i32 = 8;
+/// How far a sidebar row's hover and selection fill is inset from the panel's left and right edges.
+#[allow(
+    dead_code,
+    reason = "adopted by the tab strip and the sidebar in the next tasks"
+)]
+pub(crate) const ROW_INSET_X: i32 = 4;
+/// How far that fill is inset from the row's top and bottom, which leaves a gap between rows.
+#[allow(
+    dead_code,
+    reason = "adopted by the tab strip and the sidebar in the next tasks"
+)]
+pub(crate) const ROW_INSET_Y: i32 = 1;
 /// The keyboard-focus ring's stroke, and its gap outside the control it rings.
 pub(crate) const FOCUS_RING: i32 = 2;
 pub(crate) const FOCUS_GAP: i32 = 1;
@@ -53,13 +71,17 @@ mod tests {
     }
 
     use super::{
-        CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, GRID, ICON, PANEL_HEADER, SIDEBAR_ICON, SIDEBAR_ROW,
+        CONTROL_RADIUS, FOCUS_GAP, FOCUS_RING, GRID, ICON, PANEL_HEADER, ROW_INSET_X, ROW_INSET_Y,
+        SIDEBAR_ICON, SIDEBAR_ROW, TAB_RADIUS,
     };
 
     #[test]
     fn shared_metrics_keep_the_values_the_old_constants_had() {
         // Break caught: a "no visible change" refactor that shifts a control by a pixel.
         assert_eq!(CONTROL_RADIUS, 4); // was soft_paint::RADIUS_AT_96_DPI
+        assert_eq!(TAB_RADIUS, 8);
+        assert_eq!(ROW_INSET_X, 4);
+        assert_eq!(ROW_INSET_Y, 1);
         assert_eq!(FOCUS_RING, 2); // was soft_paint::FOCUS_WIDTH_AT_96_DPI
         assert_eq!(FOCUS_GAP, 1); // was soft_paint::FOCUS_GAP_AT_96_DPI
         assert_eq!(PANEL_HEADER, 38); // was side_panel::HEADER_HEIGHT_96
