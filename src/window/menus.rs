@@ -100,10 +100,10 @@ fn editor_layout() -> Vec<MenuEntry> {
         MenuEntry::command("Split &Right", CommandId::SplitRight),
         MenuEntry::command("Split &Down", CommandId::SplitDown),
         MenuEntry::Separator,
-        MenuEntry::command("Move to &Next Group", CommandId::MoveTabToNextGroup),
-        MenuEntry::command("Move to &Previous Group", CommandId::MoveTabToPreviousGroup),
+        MenuEntry::command("Move to &next group", CommandId::MoveTabToNextGroup),
+        MenuEntry::command("Move to &previous group", CommandId::MoveTabToPreviousGroup),
         MenuEntry::Separator,
-        MenuEntry::command("&Close Group", CommandId::CloseGroup),
+        MenuEntry::command("&Close group", CommandId::CloseGroup),
     ]
 }
 
@@ -364,7 +364,7 @@ pub(crate) fn show_tab_menu(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
         MenuEntry::Separator,
         MenuEntry::command("Split &Right", CommandId::SplitRight),
         MenuEntry::command("Split &Down", CommandId::SplitDown),
-        MenuEntry::command("Move to &Next Group", CommandId::MoveTabToNextGroup),
+        MenuEntry::command("Move to &next group", CommandId::MoveTabToNextGroup),
     ];
     track_popup(hwnd, &entries, POINT { x, y })
 }
