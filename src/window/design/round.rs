@@ -137,21 +137,8 @@ pub(crate) unsafe fn stroke_ring(dc: HDC, rect: RECT, radius: i32, width: i32, c
         rect.bottom - radius,
     );
     if radius == 0 {
-        // A square ring: the corner squares are the `width` x `width` blocks.
-        strip(rect.left, rect.top, rect.left + width, rect.top + width);
-        strip(rect.right - width, rect.top, rect.right, rect.top + width);
-        strip(
-            rect.left,
-            rect.bottom - width,
-            rect.left + width,
-            rect.bottom,
-        );
-        strip(
-            rect.right - width,
-            rect.bottom - width,
-            rect.right,
-            rect.bottom,
-        );
+        // A square ring: the straight strips above already span the full width and height, so they
+        // cover the corners and there are no corner pixels to blend.
         return;
     }
     for (flip_x, flip_y) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -716,6 +703,32 @@ mod tests {
         with_canvas(
             |dc| unsafe { stroke_ring(dc, inverted, 4, 2, FILL) },
             |pixel| assert_eq!(pixel(20, 20), BEHIND),
+        );
+    }
+
+    #[test]
+    fn the_focus_ring_is_square_in_high_contrast() {
+        // Break caught: the high-contrast palette still getting a rounded, blended corner.
+        use crate::platform::theme::Theme;
+        use crate::window::palette::Palette;
+        let mut palette = Palette::for_theme(Theme::ALL[0], true);
+        palette.accent = FILL;
+        let control = RECT {
+            left: 10,
+            top: 10,
+            right: 30,
+            bottom: 30,
+        };
+        with_canvas(
+            |dc| unsafe { paint_focus_ring(dc, control, &palette, 96) },
+            |pixel| {
+                assert_eq!(
+                    pixel(11, 11),
+                    FILL,
+                    "corner of the ring is the exact accent color"
+                );
+                assert_eq!(pixel(10, 10), BEHIND, "the gap outside it is untouched");
+            },
         );
     }
 
