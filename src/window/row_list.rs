@@ -666,6 +666,8 @@ mod tests {
                 assert_eq!(GetPixel(dc, 10, 20 + 5), selection);
                 // The fill is inset 4px left and right and 1px top and bottom, with rounded corners.
                 assert_eq!(GetPixel(dc, 1, 20 + 13), palette.editor_background);
+                assert_eq!(GetPixel(dc, 3, 20 + 13), palette.editor_background);
+                assert_eq!(GetPixel(dc, 4, 20 + 13), selection);
                 assert_eq!(GetPixel(dc, 12, 20 + 13), selection);
                 assert_eq!(GetPixel(dc, 12, 20), palette.editor_background);
                 assert_eq!(GetPixel(dc, 4, 20 + 1), palette.editor_background);
