@@ -365,6 +365,26 @@ pub(super) fn paint_band(dc: HDC, band: RECT, palette: &Palette, dpi: u32, befor
     }
 }
 
+/// The color under row `index` when it paints: the drop band's fill for a row inside the
+/// highlighted range (the band is not filled in high contrast), the panel's otherwise.
+pub(super) fn under_row(
+    highlight: Option<tree_drag::Highlight>,
+    index: usize,
+    palette: &Palette,
+    panel: u32,
+) -> u32 {
+    let inside = match highlight {
+        None => false,
+        Some(tree_drag::Highlight::Root) => true,
+        Some(tree_drag::Highlight::Rows { start, end }) => (start..end).contains(&index),
+    };
+    if inside && !palette.high_contrast {
+        palette.inactive_selection_background
+    } else {
+        panel
+    }
+}
+
 /// A 1 px (scaled) outline just inside `rect`.
 pub(super) fn paint_outline(dc: HDC, rect: RECT, color: u32, dpi: u32) {
     let t = scale(1, dpi).max(1);
@@ -686,7 +706,7 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
-                    paint.background,
+                    &|_| paint.background,
                     dpi,
                     &mut |dc, index, rect, look| {
                         draw_recent_row(dc, names.get(index), rect, look, palette, fonts, dpi);
@@ -746,10 +766,10 @@ impl NotebookView {
                 let icons = &paint.icons;
                 let drag = self.drag.as_ref().filter(|drag| drag.started);
                 let dragged = drag.map(|drag| drag.source.clone());
-                let band = drag
+                let highlight = drag
                     .and_then(|drag| drag.target.as_deref())
-                    .and_then(|folder| tree_drag::highlight(rows, folder))
-                    .and_then(|highlight| band_rect(list, &self.list, highlight));
+                    .and_then(|folder| tree_drag::highlight(rows, folder));
+                let band = highlight.and_then(|highlight| band_rect(list, &self.list, highlight));
                 if let Some(band) = band {
                     paint_band(dc, band, palette, dpi, true);
                 }
@@ -765,7 +785,7 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
-                    paint.background,
+                    &|index| under_row(highlight, index, palette, paint.background),
                     dpi,
                     &mut |dc, index, rect, look| {
                         let editing =
@@ -845,7 +865,7 @@ impl NotebookView {
             &editors.list,
             palette,
             paint.focused,
-            paint.background,
+            &|_| paint.background,
             dpi,
             &mut |dc, index, rect, look| match editors.rows.get(index) {
                 Some(crate::window::open_editors::EditorEntry::Header(number)) => {

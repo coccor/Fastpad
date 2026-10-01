@@ -702,3 +702,33 @@ fn collapse_all_keeps_the_selected_row_when_it_is_still_listed() {
     let index = tree::row_index(&before, &hidden);
     assert!(follow(&after, Some(&hidden), index).is_some_and(|row| row < after.len()));
 }
+
+#[test]
+fn the_color_under_a_row_is_the_band_inside_the_highlight_and_the_panel_elsewhere() {
+    // Break caught: rounded row corners blending toward the panel inside the drop band.
+    use crate::window::tree_drag::Highlight;
+    let palette = Palette {
+        inactive_selection_background: 0x00aa_bbcc,
+        ..Palette::neutral()
+    };
+    let panel = 0x0011_2233;
+    let rows = Some(Highlight::Rows { start: 2, end: 4 });
+    let under = |highlight, index| paint::under_row(highlight, index, &palette, panel);
+    assert_eq!(under(rows, 1), panel);
+    assert_eq!(under(rows, 2), palette.inactive_selection_background);
+    assert_eq!(under(rows, 3), palette.inactive_selection_background);
+    assert_eq!(under(rows, 4), panel);
+    assert_eq!(under(None, 2), panel);
+    assert_eq!(
+        under(Some(Highlight::Root), 9),
+        palette.inactive_selection_background
+    );
+    let contrast = Palette {
+        high_contrast: true,
+        ..palette
+    };
+    assert_eq!(
+        paint::under_row(Some(Highlight::Root), 0, &contrast, panel),
+        panel
+    );
+}

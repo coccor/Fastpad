@@ -289,8 +289,8 @@ pub(crate) fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
 /// unfocused color when `focused` is false) or the hover background, then calls `draw_row` with
 /// the row's index, rectangle and look. Last it paints the thin scroll thumb at the right edge.
 /// The fills are rounded and inset from the row's edges (`draw_row` still gets the whole row),
-/// except in high contrast, where they cover the whole row. `behind` is the color the caller
-/// filled `area` with just before this call: the rounded corners blend toward it. Rows out of view
+/// except in high contrast, where they cover the whole row. `behind(index)` is the color under row
+/// `index` (the panel's fill, or a band the caller painted under it): the rounded corners blend toward it. Rows out of view
 /// are never touched, and nothing is drawn outside `area`.
 #[allow(
     clippy::too_many_arguments,
@@ -302,7 +302,7 @@ pub(crate) fn paint(
     state: &RowListState,
     palette: &Palette,
     focused: bool,
-    behind: u32,
+    behind: &dyn Fn(usize) -> u32,
     dpi: u32,
     draw_row: &mut dyn FnMut(HDC, usize, RECT, RowLook),
 ) {
@@ -346,7 +346,14 @@ pub(crate) fn paint(
                 } else {
                     palette.inactive_selection_background
                 };
-                fill_rounded(hdc, backplate, radius, Corners::ALL, background, behind);
+                fill_rounded(
+                    hdc,
+                    backplate,
+                    radius,
+                    Corners::ALL,
+                    background,
+                    behind(index),
+                );
             } else if look.hover {
                 fill_rounded(
                     hdc,
@@ -354,7 +361,7 @@ pub(crate) fn paint(
                     radius,
                     Corners::ALL,
                     palette.hover_background,
-                    behind,
+                    behind(index),
                 );
             }
             draw_row(hdc, index, rect, look);
@@ -644,7 +651,7 @@ mod tests {
                     &state,
                     &palette,
                     focused,
-                    palette.editor_background,
+                    &|_| palette.editor_background,
                     96,
                     &mut |_, index, rect, look| {
                         drawn.push((index, rect.top, look));
@@ -679,6 +686,69 @@ mod tests {
                     palette.line_number_foreground
                 );
             }
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn rounded_corners_blend_toward_the_color_under_their_own_row() {
+        // Break caught: corners that blend toward the panel inside a drop band, leaving specks.
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        let palette = Palette {
+            selection_background: 0x0000_00ff,
+            editor_background: 0x0080_8080,
+            ..Palette::neutral()
+        };
+        let band = 0x00ff_00ff;
+        let mut state = RowListState::new(20);
+        state.set_count(10);
+        state.selected = Some(1);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            let previous = SelectObject(dc, bitmap);
+            crate::window::panel::fill(dc, area, palette.editor_background);
+            crate::window::panel::fill(
+                dc,
+                RECT {
+                    top: 20,
+                    bottom: 40,
+                    ..area
+                },
+                band,
+            );
+            paint(
+                dc,
+                area,
+                &state,
+                &palette,
+                true,
+                &|index| {
+                    if index == 1 {
+                        band
+                    } else {
+                        palette.editor_background
+                    }
+                },
+                96,
+                &mut |_, _, _, _| {},
+            );
+            assert_eq!(GetPixel(dc, 4, 20 + 1), band);
+            assert_eq!(GetPixel(dc, 12, 20 + 10), palette.selection_background);
             SelectObject(dc, previous);
             DeleteObject(bitmap);
             DeleteDC(dc);
@@ -722,7 +792,7 @@ mod tests {
                 &state,
                 &palette,
                 true,
-                palette.editor_background,
+                &|_| palette.editor_background,
                 96,
                 &mut |_, _, _, _| {},
             );
