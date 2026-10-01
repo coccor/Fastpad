@@ -3,13 +3,15 @@
 
 use super::*;
 use crate::search::Snippet;
+use crate::window::design::metrics::CONTROL_RADIUS;
 use crate::window::design::metrics::scale;
+use crate::window::design::round::{Corners, fill_bordered, fill_rounded, radius_for};
 use crate::window::file_icons::note_kind;
 use crate::window::icon_sets::TreeItem;
 use crate::window::notebook_view::draw_item_icon;
 use crate::window::option_toggles;
 use crate::window::palette::Palette;
-use crate::window::panel::{fill, inset};
+use crate::window::panel::fill;
 use crate::window::row_list::{self, RowLook, row_foreground};
 use crate::window::side_panel::{UiFonts, ViewPaint, draw_text};
 use windows_sys::Win32::Foundation::{HWND, RECT};
@@ -146,6 +148,35 @@ pub(super) unsafe fn draw_snippet(
     }
 }
 
+/// A text field's box: `palette.editor_background` inside a one-pixel `selection_background`
+/// border, with rounded corners over `behind`.
+pub(super) unsafe fn paint_field(hdc: HDC, field: RECT, palette: &Palette, behind: u32, dpi: u32) {
+    unsafe {
+        fill_bordered(
+            hdc,
+            field,
+            radius_for(palette, CONTROL_RADIUS, dpi),
+            palette.editor_background,
+            palette.selection_background,
+            behind,
+        );
+    }
+}
+
+/// A hovered button's rounded shading over `behind`.
+pub(super) unsafe fn paint_hover(hdc: HDC, rect: RECT, palette: &Palette, behind: u32, dpi: u32) {
+    unsafe {
+        fill_rounded(
+            hdc,
+            rect,
+            radius_for(palette, CONTROL_RADIUS, dpi),
+            Corners::ALL,
+            palette.hover_background,
+            behind,
+        );
+    }
+}
+
 impl SearchView {
     pub(crate) fn paint(&self, paint: &ViewPaint) {
         let dpi = paint.dpi;
@@ -169,8 +200,7 @@ impl SearchView {
             );
             if self.edit.is_some() {
                 let field = Self::field_rect(client, dpi);
-                fill(paint.hdc, field, palette.selection_background);
-                fill(paint.hdc, inset(field, 1), palette.editor_background);
+                paint_field(paint.hdc, field, &palette, paint.background, dpi);
                 option_toggles::paint(
                     paint.hdc,
                     &option_toggles::toggle_rects(field, dpi),
@@ -178,11 +208,12 @@ impl SearchView {
                     self.toggle_hover,
                     &palette,
                     paint.fonts.text,
+                    dpi,
                 );
                 let chevron = Self::chevron_rect(client, dpi);
                 let hover = self.header_hover == Some(HeaderButton::Chevron);
                 if hover {
-                    fill(paint.hdc, chevron, palette.hover_background);
+                    paint_hover(paint.hdc, chevron, &palette, paint.background, dpi);
                 }
                 draw_text(
                     paint.hdc,
@@ -200,7 +231,7 @@ impl SearchView {
                     let clear = Self::clear_rect(client, dpi);
                     let hover = self.header_hover == Some(HeaderButton::Clear);
                     if hover {
-                        fill(paint.hdc, clear, palette.hover_background);
+                        paint_hover(paint.hdc, clear, &palette, paint.background, dpi);
                     }
                     draw_text(
                         paint.hdc,
@@ -213,13 +244,12 @@ impl SearchView {
                 }
                 if self.replace_open {
                     let replace = Self::replace_field_rect(client, dpi);
-                    fill(paint.hdc, replace, palette.selection_background);
-                    fill(paint.hdc, inset(replace, 1), palette.editor_background);
+                    paint_field(paint.hdc, replace, &palette, paint.background, dpi);
                     let all = Self::replace_all_rect(client, dpi);
                     let enabled = self.replace_all_enabled();
                     let hover = enabled && self.header_hover == Some(HeaderButton::ReplaceAll);
                     if hover {
-                        fill(paint.hdc, all, palette.hover_background);
+                        paint_hover(paint.hdc, all, &palette, paint.background, dpi);
                     }
                     draw_text(
                         paint.hdc,
@@ -366,7 +396,7 @@ impl SearchView {
                 let enabled = self.replace_all_enabled();
                 let hover = enabled && self.row_hover_button == Some(index);
                 if hover {
-                    fill(hdc, button, palette.hover_background);
+                    paint_hover(hdc, button, &palette, paint.background, dpi);
                 }
                 draw_text(
                     hdc,

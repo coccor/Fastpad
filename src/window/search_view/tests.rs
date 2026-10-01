@@ -672,3 +672,97 @@ fn the_clear_button_shows_and_hits_only_while_the_box_has_text() {
     );
     assert_eq!(tool(&view).as_deref(), Some("Clear search"));
 }
+
+mod painting {
+    use super::super::paint::{paint_field, paint_hover};
+    use crate::platform::theme::Theme;
+    use crate::window::palette::Palette;
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel, HDC,
+        ReleaseDC, SelectObject,
+    };
+
+    const BACKGROUND: u32 = 0x0080_8080;
+    const BOX: RECT = RECT {
+        left: 10,
+        top: 10,
+        right: 110,
+        bottom: 40,
+    };
+
+    /// Fills a 200x80 memory bitmap with `BACKGROUND`, runs `draw`, then `read`.
+    fn with_canvas(draw: impl FnOnce(HDC), read: impl FnOnce(&dyn Fn(i32, i32) -> u32)) {
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 200, 80);
+            let previous = SelectObject(dc, bitmap);
+            let all = RECT {
+                left: 0,
+                top: 0,
+                right: 200,
+                bottom: 80,
+            };
+            crate::window::panel::fill(dc, all, BACKGROUND);
+            draw(dc);
+            read(&|x, y| GetPixel(dc, x, y));
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+
+    #[test]
+    fn a_field_is_a_rounded_box_with_an_accent_border() {
+        // Break caught: a square field, or a rounded one that lost its border.
+        let colors = Palette::for_theme(Theme::ALL[0], false);
+        with_canvas(
+            |dc| unsafe { paint_field(dc, BOX, &colors, BACKGROUND, 96) },
+            |pixel| {
+                assert_eq!(pixel(10, 10), BACKGROUND, "corner");
+                assert_eq!(pixel(60, 10), colors.selection_background, "border");
+                assert_eq!(pixel(60, 11), colors.editor_background, "inside");
+            },
+        );
+    }
+
+    #[test]
+    fn a_hover_fill_is_rounded() {
+        // Break caught: a hovered button shaded with square corners.
+        let colors = Palette::for_theme(Theme::ALL[0], false);
+        with_canvas(
+            |dc| unsafe { paint_hover(dc, BOX, &colors, BACKGROUND, 96) },
+            |pixel| {
+                assert_eq!(pixel(10, 10), BACKGROUND, "corner");
+                assert_eq!(pixel(60, 25), colors.hover_background, "middle");
+            },
+        );
+    }
+
+    #[test]
+    fn high_contrast_keeps_square_fields_and_hover_fills() {
+        let colors = Palette::for_theme(Theme::ALL[0], true);
+        with_canvas(
+            |dc| unsafe {
+                paint_field(dc, BOX, &colors, BACKGROUND, 96);
+                paint_hover(
+                    dc,
+                    RECT {
+                        left: 120,
+                        right: 180,
+                        ..BOX
+                    },
+                    &colors,
+                    BACKGROUND,
+                    96,
+                );
+            },
+            |pixel| {
+                assert_eq!(pixel(10, 10), colors.selection_background, "field corner");
+                assert_eq!(pixel(120, 10), colors.hover_background, "hover corner");
+            },
+        );
+    }
+}

@@ -1064,6 +1064,7 @@ impl FindBar {
                     self.hovered_toggle.get(),
                     &colors,
                     text_font,
+                    dpi,
                 );
             }
             if !text_font.is_null()
