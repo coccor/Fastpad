@@ -1,5 +1,5 @@
-//! Rounded fills drawn with GDI alone, so the tab strip and the sidebar need no Direct2D (which
-//! the app loads only when a dialog opens). The body is plain `FillRect`; only the corner pixels
+//! Rounded fills drawn with GDI alone, so the tab strip, the sidebar, the command palette and the
+//! find bar's toggles need no Direct2D (which the app loads only when a dialog opens). The body is plain `FillRect`; only the corner pixels
 //! are computed, each one a blend of the shape color and the known color behind it.
 
 use windows_sys::Win32::Foundation::RECT;
