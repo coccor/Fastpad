@@ -686,6 +686,8 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
+                    paint.background,
+                    dpi,
                     &mut |dc, index, rect, look| {
                         draw_recent_row(dc, names.get(index), rect, look, palette, fonts, dpi);
                     },
@@ -763,6 +765,8 @@ impl NotebookView {
                     &self.list,
                     palette,
                     focused,
+                    paint.background,
+                    dpi,
                     &mut |dc, index, rect, look| {
                         let editing =
                             edited.and_then(|(edited, icon)| (edited == index).then_some(icon));
@@ -841,6 +845,8 @@ impl NotebookView {
             &editors.list,
             palette,
             paint.focused,
+            paint.background,
+            dpi,
             &mut |dc, index, rect, look| match editors.rows.get(index) {
                 Some(crate::window::open_editors::EditorEntry::Header(number)) => {
                     crate::window::open_editors::draw_header(dc, *number, rect, paint);

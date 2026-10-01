@@ -253,6 +253,8 @@ impl FavoritesView {
             &self.list,
             &palette,
             paint.focused,
+            paint.background,
+            dpi,
             &mut |hdc, index, rect, look| self.draw_row(hdc, index, rect, look, paint),
         );
     }

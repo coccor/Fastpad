@@ -13,16 +13,8 @@ pub(crate) const CONTROL_RADIUS: i32 = 4;
 /// The corner radius of the rounded top of a tab.
 pub(crate) const TAB_RADIUS: i32 = 8;
 /// How far a sidebar row's hover and selection fill is inset from the panel's left and right edges.
-#[allow(
-    dead_code,
-    reason = "adopted by the tab strip and the sidebar in the next tasks"
-)]
 pub(crate) const ROW_INSET_X: i32 = 4;
 /// How far that fill is inset from the row's top and bottom, which leaves a gap between rows.
-#[allow(
-    dead_code,
-    reason = "adopted by the tab strip and the sidebar in the next tasks"
-)]
 pub(crate) const ROW_INSET_Y: i32 = 1;
 /// The keyboard-focus ring's stroke, and its gap outside the control it rings.
 pub(crate) const FOCUS_RING: i32 = 2;
