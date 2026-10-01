@@ -59,7 +59,7 @@ pub(crate) const GRIP_WIDTH_96: i32 = 4;
 /// The sidebar's fonts at one DPI. Painting copies them out; `Sidebar` owns and deletes them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UiFonts {
-    /// Row and body text: Segoe UI, 13 px at 96 DPI.
+    /// Row and body text: the text face, 13 px at 96 DPI.
     pub(crate) text: HFONT,
     /// The match in a Search result's snippet: Segoe UI bold, 13 px. Made on the first paint of a
     /// snippet (`Sidebar::text_bold`), not with the others, so it adds nothing before first paint.
@@ -90,13 +90,14 @@ impl Default for UiFonts {
 impl UiFonts {
     fn create(dpi: u32) -> Self {
         let normal = FW_NORMAL as i32;
+        let icons = crate::window::design::faces::current().icons;
         Self {
             text: type_ramp::create(TextStyle::Body, dpi),
             text_bold: std::ptr::null_mut(),
             bold: type_ramp::create(TextStyle::PanelHeader, dpi),
             italic: type_ramp::create(TextStyle::BodyItalic, dpi),
-            glyph: create_ui_font(scale(SIDEBAR_ICON, dpi), "Segoe MDL2 Assets", normal, false),
-            bar_glyph: create_ui_font(scale(ICON, dpi), "Segoe MDL2 Assets", normal, false),
+            glyph: create_ui_font(scale(SIDEBAR_ICON, dpi), icons, normal, false),
+            bar_glyph: create_ui_font(scale(ICON, dpi), icons, normal, false),
         }
     }
 
@@ -1369,5 +1370,29 @@ mod tests {
             );
             fonts.delete();
         }
+    }
+
+    #[test]
+    fn the_glyph_fonts_use_the_chosen_icon_face() {
+        // Break caught: a glyph font bypassing the chosen icon face.
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetTextFaceW, SelectObject,
+        };
+        let fonts = UiFonts::create(96);
+        let expected = crate::window::design::faces::current().icons;
+        unsafe {
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            assert!(!dc.is_null());
+            for font in [fonts.glyph, fonts.bar_glyph] {
+                let old = SelectObject(dc, font);
+                let mut buffer = [0_u16; 64];
+                let len = GetTextFaceW(dc, buffer.len() as i32, buffer.as_mut_ptr());
+                SelectObject(dc, old);
+                let name = String::from_utf16_lossy(&buffer[..(len.max(1) as usize - 1)]);
+                assert_eq!(name, expected);
+            }
+            DeleteDC(dc);
+        }
+        fonts.delete();
     }
 }

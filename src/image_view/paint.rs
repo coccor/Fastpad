@@ -51,7 +51,7 @@ fn text_format(
     let format = state
         .graphics
         .text_format(
-            "Segoe UI",
+            crate::window::design::faces::current().text,
             TEXT_SIZE * dpi_scale(state.hwnd),
             weight,
             DWRITE_FONT_STYLE_NORMAL,

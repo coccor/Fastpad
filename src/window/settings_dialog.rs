@@ -20,8 +20,8 @@ use super::settings_model::{
 };
 use super::side_panel::paint_buffered;
 use super::soft_paint::{
-    Canvas, Frame, GLYPH_FONT, Shape, TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones,
-    title_close,
+    Canvas, Frame, Shape, TITLE_CLOSE_WIDTH_AT_96_DPI, TITLE_HEIGHT_AT_96_DPI, Tones,
+    glyph_font_face, title_close,
 };
 use super::titlebar::create_ui_font;
 use crate::platform::wide_null;
@@ -313,7 +313,7 @@ fn create(
     let heading_font = type_ramp::create(TextStyle::Heading, dpi);
     let body_font = type_ramp::create(TextStyle::Body, dpi);
     let link_font = create_underlined_font(scale(13, dpi));
-    let glyph_font = create_ui_font(scale(11, dpi), GLYPH_FONT, FW_NORMAL as i32, false);
+    let glyph_font = create_ui_font(scale(11, dpi), glyph_font_face(), FW_NORMAL as i32, false);
 
     let mut monitor = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -572,7 +572,7 @@ fn create_underlined_font(pixel_height: i32) -> HFONT {
         CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
         OUT_DEFAULT_PRECIS,
     };
-    let face = wide_null("Segoe UI");
+    let face = wide_null(crate::window::design::faces::current().text);
     unsafe {
         CreateFontW(
             -pixel_height,

@@ -6,9 +6,6 @@ use super::metrics::scale;
 use crate::window::titlebar::create_ui_font;
 use windows_sys::Win32::Graphics::Gdi::{FW_BOLD, FW_NORMAL, FW_SEMIBOLD, HFONT};
 
-/// The chrome's text face. Segoe UI Variable with a fallback replaces it in a later step.
-pub(crate) const UI_FACE: &str = "Segoe UI";
-
 /// A named text style. Fonts for icons, the editor and the Markdown preview are not styles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TextStyle {
@@ -52,18 +49,44 @@ impl TextStyle {
     }
 }
 
+/// The face for `style`: the display face for `Title`, the text face for the rest.
+pub(crate) fn face(style: TextStyle) -> &'static str {
+    let faces = super::faces::current();
+    if style == TextStyle::Title {
+        faces.display
+    } else {
+        faces.text
+    }
+}
+
 /// A GDI font for `style` at `dpi`. The caller owns it and deletes it.
 pub(crate) fn create(style: TextStyle, dpi: u32) -> HFONT {
     let spec = style.spec();
-    create_ui_font(scale(spec.px, dpi), UI_FACE, spec.weight, spec.italic)
+    create_ui_font(scale(spec.px, dpi), face(style), spec.weight, spec.italic)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TextStyle, create};
+    use super::{TextStyle, create, face};
     use windows_sys::Win32::Graphics::Gdi::{
         DeleteObject, FW_BOLD, FW_NORMAL, FW_SEMIBOLD, GetObjectW, LOGFONTW,
     };
+
+    #[test]
+    fn the_title_uses_the_display_face_and_every_other_style_the_text_face() {
+        // Break caught: Title losing the display face, or a style bypassing the chosen faces.
+        let faces = crate::window::design::faces::current();
+        assert_eq!(face(TextStyle::Title), faces.display);
+        for style in [
+            TextStyle::Body,
+            TextStyle::BodyItalic,
+            TextStyle::BodyBold,
+            TextStyle::PanelHeader,
+            TextStyle::Heading,
+        ] {
+            assert_eq!(face(style), faces.text, "{style:?}");
+        }
+    }
 
     #[test]
     fn every_style_has_the_size_and_weight_the_spec_gives_it() {

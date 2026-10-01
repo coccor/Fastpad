@@ -542,7 +542,11 @@ fn appearance(hwnd: HWND) -> (PreviewColors, PreviewFonts, bool) {
         .unwrap_or_else(|| {
             (
                 preview_colors(theme, false),
-                PreviewFonts::from_settings("Segoe UI", "Consolas", 11),
+                PreviewFonts::from_settings(
+                    crate::window::design::faces::current().text,
+                    "Consolas",
+                    11,
+                ),
                 false,
             )
         })

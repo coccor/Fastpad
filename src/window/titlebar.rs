@@ -348,7 +348,10 @@ impl TitleFonts {
             handles: TitleFontHandles {
                 text: type_ramp::create(TextStyle::Body, dpi),
                 italic: type_ramp::create(TextStyle::BodyItalic, dpi),
-                glyph: create_font(scale(10, dpi), "Segoe MDL2 Assets"),
+                glyph: create_font(
+                    scale(10, dpi),
+                    crate::window::design::faces::current().icons,
+                ),
             },
         }
     }

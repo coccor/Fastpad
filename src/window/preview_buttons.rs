@@ -351,7 +351,12 @@ fn paint(main: HWND, buttons: HWND) {
         SetBkMode(dc, TRANSPARENT as i32);
     }
     // Larger than the title bar's caption glyphs: these are the buttons' whole content.
-    let font = create_ui_font(scale(17, dpi), "Segoe MDL2 Assets", FW_NORMAL as i32, false);
+    let font = create_ui_font(
+        scale(17, dpi),
+        crate::window::design::faces::current().icons,
+        FW_NORMAL as i32,
+        false,
+    );
     let previous = unsafe { select_font(dc, font) };
     for (button, glyph, active) in [
         (

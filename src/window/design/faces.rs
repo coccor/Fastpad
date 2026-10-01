@@ -38,7 +38,6 @@ pub(crate) fn choose(build: Option<u32>, probe: impl Fn(&str) -> bool) -> Faces 
 }
 
 /// The set for this process, computed on first use.
-#[allow(dead_code, reason = "used by the font sites in the next tasks")]
 pub(crate) fn current() -> Faces {
     static CURRENT: OnceLock<Faces> = OnceLock::new();
     *CURRENT.get_or_init(|| choose(os_build(), face_is_mapped))
