@@ -385,3 +385,91 @@ fn replacing_in_a_background_tab_leaves_the_active_view_alone() {
     );
     assert!(app_mut(window.hwnd).tabs.document(second).unwrap().dirty);
 }
+
+#[test]
+fn the_primary_window_saves_where_it_closed_and_reopens_there() {
+    // Break caught: FastPad opening at the default spot after being closed elsewhere, reopening
+    // a maximized window restored, or a `--new-window` window overwriting the primary's spot.
+    use crate::config::WindowPlacement;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOW, SW_SHOWMAXIMIZED};
+    let _scintilla = load_native_scintilla();
+    let scratch = RecoveryScratch::new("window-placement");
+    let ini = scratch.path().join("fastpad.ini");
+    std::fs::write(&ini, "# kept\r\n").unwrap();
+    super::super::save_settings_to(Some(ini.clone()));
+    let placed = WindowPlacement {
+        x: 120,
+        y: 90,
+        width: 900,
+        height: 600,
+        maximized: false,
+    };
+    let close_at = |placement: WindowPlacement, primary: bool| {
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        if primary {
+            app_mut(window.hwnd).instance_mutex = Some(unnamed_mutex());
+        }
+        let show = super::super::restore_placement(window.hwnd, Some(placement));
+        let expected = if placement.maximized {
+            SW_SHOWMAXIMIZED
+        } else {
+            SW_SHOW
+        };
+        assert_eq!(show, expected);
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(window.hwnd, show);
+            SendMessageW(window.hwnd, WM_CLOSE, 0, 0);
+        }
+        assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+        std::fs::read_to_string(&ini).unwrap()
+    };
+
+    assert_eq!(
+        close_at(placed, true),
+        "# kept\r\nwindow_placement=120,90,900x600\r\n"
+    );
+    let maximized = WindowPlacement {
+        maximized: true,
+        ..placed
+    };
+    assert_eq!(
+        close_at(maximized, true),
+        "# kept\r\nwindow_placement=120,90,900x600,maximized\r\n",
+        "maximized keeps the restored frame under it"
+    );
+    let elsewhere = WindowPlacement { x: 200, ..placed };
+    assert_eq!(
+        close_at(elsewhere, false),
+        "# kept\r\nwindow_placement=120,90,900x600,maximized\r\n",
+        "a window that is not the primary saves nothing"
+    );
+    super::super::save_settings_to(None);
+}
+
+#[test]
+fn a_placement_on_no_monitor_leaves_the_window_where_it_was_created() {
+    // Break caught: FastPad reopening off screen after the monitor it closed on was unplugged.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, SW_SHOW};
+    let window = ProductionWindow::new(make_app());
+    let frame = || {
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(window.hwnd, &mut rect) };
+        (rect.left, rect.top, rect.right, rect.bottom)
+    };
+    let before = frame();
+    let gone = crate::config::WindowPlacement {
+        x: -60_000,
+        y: -60_000,
+        width: 900,
+        height: 600,
+        maximized: true,
+    };
+
+    assert_eq!(
+        super::super::restore_placement(window.hwnd, Some(gone)),
+        SW_SHOW
+    );
+    assert_eq!(super::super::restore_placement(window.hwnd, None), SW_SHOW);
+    assert_eq!(frame(), before);
+}

@@ -242,6 +242,7 @@ line in a notification and applies the rest.
 | `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
 | `settings_size` | `<width>x<height>` (pixels at 100% scaling), saved when you resize Settings | none: its natural size |
+| `window_placement` | `<x>,<y>,<width>x<height>`, then `,maximized` if it was; saved when the main window closes | none: opens at the default spot |
 | `file_icons` | `material`, `minimal` or `solid` | `material` |
 
 Hand edits keep your comments and other lines; the palette and Settings rewrite only the lines they change.

@@ -67,6 +67,7 @@ pub fn default_settings() -> Settings {
         code_folding: DEFAULT_CODE_FOLDING,
         always_on_top: DEFAULT_ALWAYS_ON_TOP,
         settings_size: None,
+        window_placement: None,
         key_overrides: std::collections::BTreeMap::new(),
     }
 }

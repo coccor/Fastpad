@@ -8,7 +8,7 @@ use crate::platform::{OwnedModule, last_error, wide_null};
 use crate::window::{
     INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
     clear_input_priority, initialize_editor_with, input_priority_requested,
-    input_queue_status_mask, maybe_post_deferred_start,
+    input_queue_status_mask, maybe_post_deferred_start, restore_placement,
 };
 use crate::{FastPadError, Result};
 #[cfg(test)]
@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
-    PM_REMOVE, PeekMessageW, QS_ALLINPUT, SW_SHOW, ShowWindow, TranslateMessage, WM_PAINT, WM_QUIT,
+    PM_REMOVE, PeekMessageW, QS_ALLINPUT, ShowWindow, TranslateMessage, WM_PAINT, WM_QUIT,
 };
 
 pub fn run(options: LaunchOptions) -> Result<i32> {
@@ -57,6 +57,10 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
     // The sidebar's first frame uses the saved view and width, so fastpad.ini is read before the
     // window exists. Its warnings are reported by WM_FASTPAD_LOAD_SETTINGS, once chrome is up.
     let (settings, warnings) = crate::config::load();
+    // Only the primary window reopens where it closed, as only it saves that.
+    let placement = settings
+        .window_placement
+        .filter(|_| app.instance_mutex.is_some());
     app.settings = settings;
     app.preloaded_settings_warnings = Some(warnings);
     let identity = app.window_identity();
@@ -68,6 +72,8 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
         ));
     }
     let teardown = ParentWindowGuard::new(hwnd, identity.clone());
+    // Before the editor exists, so the move lays out an empty frame.
+    let show = restore_placement(hwnd, placement);
 
     let editor_hwnd = unsafe {
         initialize_editor_with(hwnd, &identity, |parent| {
@@ -91,7 +97,7 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
     }
 
     unsafe {
-        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, show);
     }
     if !identity.is_live_for(hwnd) {
         return Err(FastPadError::Invariant(
