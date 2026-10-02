@@ -74,6 +74,12 @@ pub(crate) use main_window::{
 #[cfg(test)]
 #[allow(
     unused_imports,
+    reason = "consumed by the source-linked image_preview integration target"
+)]
+pub(crate) use main_window::{activate_group, place_view, split_group};
+#[cfg(test)]
+#[allow(
+    unused_imports,
     reason = "consumed by the source-linked save_file integration target"
 )]
 pub(crate) use main_window::{save_path_as, with_test_input_queue_status};

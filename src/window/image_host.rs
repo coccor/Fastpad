@@ -50,10 +50,23 @@ fn view(hwnd: HWND) -> Option<ImageView> {
     with_host(hwnd, |host| host.view).flatten()
 }
 
-/// The active tab's path, disk stamp and file name, when it is an image tab.
-fn active_image(hwnd: HWND) -> Option<(std::path::PathBuf, Option<crate::library::DiskStamp>)> {
+fn group_view(hwnd: HWND, id: GroupId) -> Option<ImageView> {
+    with_group_host(hwnd, id, |host| host.view).flatten()
+}
+
+type ImageFile = (std::path::PathBuf, Option<crate::library::DiskStamp>);
+
+/// The active tab's path and disk stamp, when it is an image tab.
+fn active_image(hwnd: HWND) -> Option<ImageFile> {
     let app = unsafe { host_window::app_ptr(hwnd) }?;
-    let document = unsafe { app.as_ref() }.tabs.active()?;
+    group_image(hwnd, unsafe { app.as_ref() }.tabs.active_group())
+}
+
+/// Group `id`'s active tab's path and disk stamp, when it is an image tab.
+fn group_image(hwnd: HWND, id: GroupId) -> Option<ImageFile> {
+    let app = unsafe { host_window::app_ptr(hwnd) }?;
+    let tabs = &unsafe { app.as_ref() }.tabs;
+    let document = tabs.document(tabs.group(id)?.active_document()?)?;
     document
         .is_image()
         .then(|| (document.path.clone(), document.disk_stamp))
@@ -70,40 +83,48 @@ pub(crate) fn shown_view_hwnd(hwnd: HWND) -> Option<HWND> {
         .flatten()
 }
 
-fn ensure_view(hwnd: HWND) -> Option<ImageView> {
-    if let Some(view) = view(hwnd) {
+fn ensure_view(hwnd: HWND, id: GroupId) -> Option<ImageView> {
+    if let Some(view) = group_view(hwnd, id) {
         return Some(view);
     }
-    if with_host(hwnd, |host| host.unavailable).unwrap_or(true) {
+    if with_group_host(hwnd, id, |host| host.unavailable).unwrap_or(true) {
         return None;
     }
+    let parent = host_window::with_group_id(hwnd, id, |group| group.hwnd)?;
     let created = crate::window::preview_host::shared_graphics(hwnd).and_then(|graphics| {
         let (colors, high_contrast) = crate::window::preview_host::image_colors(hwnd);
-        ImageView::create(
-            host_window::content_parent(hwnd),
-            graphics,
-            colors,
-            high_contrast,
-        )
+        ImageView::create(parent, graphics, colors, high_contrast)
     });
     match created {
         Ok(view) => {
-            with_host(hwnd, |host| host.view = Some(view));
+            with_group_host(hwnd, id, |host| host.view = Some(view));
             Some(view)
         }
         Err(error) => {
-            with_host(hwnd, |host| host.unavailable = true);
+            with_group_host(hwnd, id, |host| host.unavailable = true);
             host_window::push_notice(hwnd, format!("FastPad could not display images: {error}"));
             None
         }
     }
 }
 
-/// Follows tab changes: shows the view for an image tab and moves the keyboard focus onto it,
-/// or hides it and frees its render target for a text tab (or no tab).
+/// Follows tab changes in the active group: shows the view for an image tab and moves the
+/// keyboard focus onto it, or hides it and frees its render target for a text tab (or no tab).
 pub(crate) fn sync(hwnd: HWND) {
-    let Some((path, stamp)) = active_image(hwnd) else {
-        if let Some(view) = view(hwnd) {
+    if let Some(app) = unsafe { host_window::app_ptr(hwnd) } {
+        let id = unsafe { app.as_ref() }.tabs.active_group();
+        sync_group(hwnd, id);
+    }
+}
+
+/// `sync` for group `id`, which need not be the active one: a group left showing an image tab
+/// shows it rather than whatever its hidden editor last drew. Only the active group takes the
+/// focus.
+pub(crate) fn sync_group(hwnd: HWND, id: GroupId) {
+    let active = unsafe { host_window::app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.tabs.active_group() == id);
+    let Some((path, stamp)) = group_image(hwnd, id) else {
+        if let Some(view) = group_view(hwnd, id) {
             let had_focus = unsafe { GetFocus() } == view.hwnd();
             unsafe { ShowWindow(view.hwnd(), SW_HIDE) };
             view.release();
@@ -117,7 +138,7 @@ pub(crate) fn sync(hwnd: HWND) {
         }
         return;
     };
-    let Some(view) = ensure_view(hwnd) else {
+    let Some(view) = ensure_view(hwnd, id) else {
         return;
     };
     let name = path
@@ -127,6 +148,9 @@ pub(crate) fn sync(hwnd: HWND) {
     view.show_file(&path, stamp, &name);
     host_window::layout_editor_and_find_bar(hwnd);
     unsafe { ShowWindow(view.hwnd(), SW_SHOWNA) };
+    if !active {
+        return;
+    }
     // The content area's focus follows it onto the image, whether it was on the editor or on a
     // Markdown or SVG preview that this tab hides.
     let focus = unsafe { GetFocus() };

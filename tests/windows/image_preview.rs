@@ -181,6 +181,11 @@ impl TestMain {
             .expect("image view")
     }
 
+    fn image_view_of(&self, id: window::split_tree::GroupId) -> image_view::ImageView {
+        self.with_app(|app| app.group(id).unwrap().image.view)
+            .expect("image view")
+    }
+
     fn wait_ready(&self) -> image_view::ImageStats {
         let view = self.image_view();
         pump_until("image decoded", Duration::from_secs(5), || {
@@ -360,6 +365,108 @@ fn switching_between_image_and_text_tabs_keeps_each_tab_intact() {
     assert!(visible(view.hwnd()));
     assert_eq!(view.stats().decodes, decodes);
     assert!(!main.with_app(|app| app.tabs.active().unwrap().dirty));
+}
+
+/// A focusable child of the main window outside every editor group, standing in for the tree.
+fn outside_child(parent: HWND) -> HWND {
+    let class: Vec<u16> = "STATIC ".encode_utf16().collect();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+            0,
+            class.as_ptr(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::WS_CHILD,
+            0,
+            0,
+            1,
+            1,
+            parent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    }
+}
+
+#[test]
+fn a_group_left_showing_an_image_shows_its_image_view_not_text() {
+    // Break caught: a file dragged from the tree to a new split left the image's group showing
+    // that file's text, because only the active group's image view was ever shown or hidden.
+    use window::split_tree::Direction;
+    use window::{place_view, split_group};
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("split");
+    let image = dir.join("a.png");
+    std::fs::write(&image, preview::images::PNG_2X2).unwrap();
+    let text = dir.join("b.txt");
+    std::fs::write(&text, "some text").unwrap();
+    main.open(&image).unwrap();
+    let view = main.image_view();
+    main.wait_ready();
+    // The tree press opens the file in the image's group; the drop moves it to a new split.
+    main.open(&text).unwrap();
+    assert!(!visible(view.hwnd()));
+    let (first, text_id) =
+        main.with_app(|app| (app.tabs.active_group(), app.tabs.active().unwrap().id));
+    // The drag starts in the tree, so the focus is outside the groups.
+    let tree = outside_child(main.hwnd);
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(tree) };
+    let second = split_group(main.hwnd, first, Direction::Right).expect("split");
+    assert!(place_view(main.hwnd, first, text_id, second, None, false));
+    pump_pending();
+
+    assert_eq!(main.with_app(|app| app.tabs.active_group()), second);
+    assert!(visible(view.hwnd()), "the image's group shows the image");
+    assert!(!visible(main.editor), "the image's group hides its editor");
+
+    // And back: moving the image out leaves the first group showing text, not a stale image.
+    let image_id = main.with_app(|app| app.tabs.find_path(&image)).unwrap();
+    let other = dir.join("c.txt");
+    std::fs::write(&other, "first group text").unwrap();
+    window::activate_group(main.hwnd, first);
+    main.open(&other).unwrap();
+    main.open(&image).unwrap();
+    assert!(visible(view.hwnd()));
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(tree) };
+    assert!(place_view(main.hwnd, first, image_id, second, None, false));
+    pump_pending();
+    assert_eq!(main.with_app(|app| app.tabs.active_group()), second);
+    assert!(visible(main.editor), "the first group shows its text tab");
+    assert!(
+        !visible(view.hwnd()),
+        "the first group's image view is hidden"
+    );
+}
+
+#[test]
+fn moving_the_focused_tab_to_a_split_leaves_the_split_active() {
+    // Break caught: hiding the source group's focused editor handed the focus to that group's
+    // window, which made the source group active again, so the new split was not.
+    use window::split_tree::Direction;
+    use window::{place_view, split_group};
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("split-focus");
+    let image = dir.join("a.png");
+    std::fs::write(&image, preview::images::PNG_2X2).unwrap();
+    let text = dir.join("b.txt");
+    std::fs::write(&text, "some text").unwrap();
+    main.open(&image).unwrap();
+    main.open(&text).unwrap();
+    pump_pending();
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(main.editor) };
+    let (first, text_id) =
+        main.with_app(|app| (app.tabs.active_group(), app.tabs.active().unwrap().id));
+    let second = split_group(main.hwnd, first, Direction::Right).expect("split");
+    assert!(place_view(main.hwnd, first, text_id, second, None, false));
+    pump_pending();
+
+    assert_eq!(main.with_app(|app| app.tabs.active_group()), second);
+    let focus = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+    let second_editor = main.with_app(|app| app.group(second).unwrap().editor.hwnd());
+    assert_eq!(focus, second_editor, "the moved tab has the focus");
+    assert!(visible(main.image_view_of(first).hwnd()));
 }
 
 #[test]
