@@ -360,7 +360,13 @@ pub(crate) fn show_group_view(hwnd: HWND, id: GroupId) -> bool {
         style_group_view(hwnd, id);
     }
     if !active {
+        // Hiding the focused editor would hand the focus to this group's window, which makes
+        // this group active again: the focus goes to the active group's content first.
+        if !text && unsafe { GetFocus() } == editor.hwnd() {
+            focus_group_content(hwnd);
+        }
         unsafe { ShowWindow(editor.hwnd(), if text { SW_SHOWNA } else { SW_HIDE }) };
+        crate::window::image_host::sync_group(hwnd, id);
         crate::window::preview_host::in_group(id, || {
             crate::window::preview_host::sync_visibility(hwnd);
         });
