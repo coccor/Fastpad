@@ -1,12 +1,12 @@
 {
-  "version": "0.3.0",
-  "description": "A startup-latency-first text editor for Windows",
+  "version": "0.4.0",
+  "description": "Ultra fast note taking app.",
   "homepage": "https://github.com/coccor/FastPad",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/coccor/FastPad/releases/download/v0.3.0/FastPad-0.3.0-windows-x64.zip",
-      "hash": "bf8549bedf6766774c2830a323e47c3d88d39474ca69ab8a8360b5340aa73178"
+      "url": "https://github.com/coccor/FastPad/releases/download/v0.4.0/FastPad-0.4.0-windows-x64.zip",
+      "hash": "310b516c21cfb7b4579effa6be941acbb0c584ecee87678f080f3c6b48b457d4"
     }
   },
   "bin": "FastPad.exe",
