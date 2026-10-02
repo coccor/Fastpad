@@ -125,6 +125,9 @@ pub struct Settings {
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
     /// `None` opens it at its natural size. Saved when a resize drag ends.
     pub settings_size: Option<(u16, u16)>,
+    /// Where the primary window reopens: its frame when last closed. `None` opens it at the
+    /// default spot. Saved when the window closes.
+    pub window_placement: Option<WindowPlacement>,
     /// `key.<command-id>=` lines, id to value, as written: the keymap validates them when
     /// settings load (keyboard shortcuts spec §4).
     pub key_overrides: std::collections::BTreeMap<String, String>,
@@ -173,6 +176,9 @@ impl Settings {
         }
         if let Some(size) = delta.settings_size {
             self.settings_size = Some(size);
+        }
+        if let Some(placement) = delta.window_placement {
+            self.window_placement = Some(placement);
         }
         if let Some(file_icons) = delta.file_icons {
             self.file_icons = file_icons;
@@ -229,6 +235,7 @@ pub struct SettingsDelta {
     pub sidebar_view: Option<SidebarView>,
     pub sidebar_width: Option<u16>,
     pub settings_size: Option<(u16, u16)>,
+    pub window_placement: Option<WindowPlacement>,
     pub file_icons: Option<FileIconSet>,
     pub open_editors_expanded: Option<bool>,
     pub insert_spaces: Option<bool>,
@@ -244,12 +251,12 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `preview_font`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
-/// `sidebar_view`, `sidebar_width`, `settings_size`, `file_icons`, `open_editors_expanded`,
-/// `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
+/// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
+/// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
-/// `file_icons` is
+/// `window_placement` is as `WindowPlacement::token` writes it; `file_icons` is
 /// `material` or `minimal` (any case). `key.<command-id>` lines are collected as text into `key_overrides` for the keymap to validate. Every line is handled independently: a line with an
 /// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
 /// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
@@ -273,6 +280,50 @@ pub fn parse(source: &str) -> SettingsDelta {
         apply_line(&mut delta, line_number, trim_ascii(key), trim_ascii(value));
     }
     delta
+}
+
+/// The main window's restored frame, in the workspace pixels `GetWindowPlacement` reports, and
+/// whether it was maximized over that frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+impl WindowPlacement {
+    /// `<x>,<y>,<width>x<height>`, then `,maximized` when it was.
+    pub fn token(&self) -> String {
+        let maximized = if self.maximized { ",maximized" } else { "" };
+        format!(
+            "{},{},{}x{}{maximized}",
+            self.x, self.y, self.width, self.height
+        )
+    }
+
+    /// What `token` writes; the size must be above zero.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut parts = value.split(',').map(trim_ascii);
+        let x = parts.next()?.parse().ok()?;
+        let y = parts.next()?.parse().ok()?;
+        let (width, height) = parts.next()?.split_once(['x', 'X'])?;
+        let width = trim_ascii(width).parse::<i32>().ok()?;
+        let height = trim_ascii(height).parse::<i32>().ok()?;
+        let maximized = match parts.next() {
+            None => false,
+            Some(flag) if flag.eq_ignore_ascii_case("maximized") => true,
+            Some(_) => return None,
+        };
+        (width > 0 && height > 0 && parts.next().is_none()).then_some(Self {
+            x,
+            y,
+            width,
+            height,
+            maximized,
+        })
+    }
 }
 
 /// `<width>x<height>`, both above zero, as `settings_size` writes it.
@@ -350,6 +401,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "settings_size" => match parse_size(value) {
             Some(size) => delta.settings_size = Some(size),
+            None => warn(delta, line_number, key, value),
+        },
+        "window_placement" => match WindowPlacement::parse(value) {
+            Some(placement) => delta.window_placement = Some(placement),
             None => warn(delta, line_number, key, value),
         },
         "file_icons" => match FileIconSet::parse(value) {
@@ -974,6 +1029,61 @@ mod tests {
         assert_eq!(settings.settings_size, None);
         settings.apply_delta(&parse("settings_size=900x700"));
         assert_eq!(settings.settings_size, Some((900, 700)));
+    }
+
+    #[test]
+    fn window_placement_reads_back_what_it_writes_and_warns_about_anything_else() {
+        // Break caught: FastPad forgetting where it was closed, reopening maximized windows
+        // restored, or a hand-edited placement of nonsense opening it with no size.
+        let normal = WindowPlacement {
+            x: -1700,
+            y: 40,
+            width: 1280,
+            height: 720,
+            maximized: false,
+        };
+        let maximized = WindowPlacement {
+            maximized: true,
+            ..normal
+        };
+        assert_eq!(normal.token(), "-1700,40,1280x720");
+        assert_eq!(maximized.token(), "-1700,40,1280x720,maximized");
+        for placement in [normal, maximized] {
+            let delta = parse(&format!("window_placement={}", placement.token()));
+            assert_eq!(delta.window_placement, Some(placement));
+            assert!(delta.warnings.is_empty());
+        }
+        assert_eq!(
+            parse("window_placement = -1700, 40, 1280 X 720, Maximized").window_placement,
+            Some(maximized)
+        );
+        for bad in [
+            "",
+            "10,20",
+            "10,20,0x720",
+            "10,20,1280x-5",
+            "10,20,1280",
+            "a,20,1280x720",
+            "10,20,1280x720,minimized",
+            "10,20,1280x720,maximized,extra",
+        ] {
+            let delta = parse(&format!("window_placement={bad}"));
+            assert_eq!(delta.window_placement, None, "{bad}");
+            assert_eq!(delta.warnings.len(), 1, "{bad}");
+        }
+        let mut settings = default_settings();
+        assert_eq!(settings.window_placement, None);
+        settings.apply_delta(&parse("window_placement=10,20,800x600"));
+        assert_eq!(
+            settings.window_placement,
+            Some(WindowPlacement {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+                maximized: false
+            })
+        );
     }
 
     #[test]

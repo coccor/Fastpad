@@ -203,8 +203,8 @@ pub(crate) fn change_setting(
     let theme_changed = unsafe { app_ptr(hwnd) }
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
     // The sidebar's view, width and icon set change only the sidebar, which their callers redo,
-    // and the Settings dialog's size only that dialog; the editor and the Markdown preview are
-    // not restyled for them.
+    // the Settings dialog's size only that dialog, and the window's placement only the next
+    // start; the editor and the Markdown preview are not restyled for them.
     let sidebar_only = matches!(
         key,
         "sidebar_view"
@@ -212,6 +212,7 @@ pub(crate) fn change_setting(
             | "file_icons"
             | "open_editors_expanded"
             | "settings_size"
+            | "window_placement"
             | "always_on_top"
     );
     if theme_changed {

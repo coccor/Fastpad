@@ -61,6 +61,8 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 remove_session_snapshots(hwnd, &discarded);
             }
             crate::window::library_host::flush_before_close(hwnd);
+            // Before `shutdown_ipc`, which gives up the instance mutex that marks the primary.
+            save_placement(hwnd);
             shutdown_ipc(hwnd);
             clear_documents_for_shutdown(hwnd);
             unsafe {

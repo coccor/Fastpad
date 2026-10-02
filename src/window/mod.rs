@@ -68,8 +68,8 @@ pub(crate) use main_window::post_content_focus;
 pub(crate) use main_window::{
     INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
     clear_input_priority, initialize_editor_with, input_priority_requested,
-    input_queue_status_mask, ipc_wait_handle, maybe_post_deferred_start, open_path, service_ipc,
-    translate_accelerator,
+    input_queue_status_mask, ipc_wait_handle, maybe_post_deferred_start, open_path,
+    restore_placement, service_ipc, translate_accelerator,
 };
 #[cfg(test)]
 #[allow(
