@@ -2,7 +2,6 @@
 //! their keys, on a real Scintilla.
 
 use super::*;
-#[allow(unused_imports)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
 };
@@ -460,4 +459,62 @@ fn editing_keys_stay_with_controls_outside_the_editor() {
     });
     assert!(!elsewhere, "Ctrl+D outside the editor was translated");
     assert_eq!(f.editor.selections().unwrap(), vec![0..0]);
+}
+
+use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSKEYUP};
+
+/// Client coordinates of `position` in the editor, packed as a mouse `LPARAM`.
+fn point_of(editor: &crate::editor::Editor, position: usize) -> isize {
+    use crate::editor::scintilla_constants::{SCI_POINTXFROMPOSITION, SCI_POINTYFROMPOSITION};
+    let x = unsafe { SendMessageW(editor.hwnd(), SCI_POINTXFROMPOSITION, 0, position as isize) };
+    let y =
+        unsafe { SendMessageW(editor.hwnd(), SCI_POINTYFROMPOSITION, 0, position as isize) } + 2;
+    (x & 0xFFFF) | ((y & 0xFFFF) << 16)
+}
+
+#[test]
+fn alt_click_adds_a_caret_and_keeps_the_others() {
+    let f = fixture("one\ntwo\nthree");
+    f.editor.set_selection(0..0).unwrap();
+    let at = point_of(&f.editor, 6); // "tw|o"
+    with_keys_down(&[VK_MENU], || unsafe {
+        SendMessageW(f.editor.hwnd(), WM_LBUTTONDOWN, 0x0001, at);
+        SendMessageW(f.editor.hwnd(), WM_LBUTTONUP, 0, at);
+    });
+    let mut carets = f.editor.carets().unwrap();
+    carets.sort_unstable();
+    assert_eq!(carets, vec![0, 6]);
+}
+
+#[test]
+fn a_mouse_press_cancels_the_pending_alt_tap() {
+    let f = fixture("one");
+    let alt = |message| MSG {
+        hwnd: f.editor.hwnd(),
+        message,
+        wParam: usize::from(VK_MENU),
+        ..Default::default()
+    };
+    translate(&f, alt(WM_SYSKEYDOWN));
+    translate(
+        &f,
+        MSG {
+            hwnd: f.editor.hwnd(),
+            message: WM_LBUTTONDOWN,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !translate(&f, alt(WM_SYSKEYUP)),
+        "releasing Alt after a click opened the menu"
+    );
+    translate(&f, alt(WM_SYSKEYDOWN));
+    assert!(
+        translate(&f, alt(WM_SYSKEYUP)),
+        "a bare Alt tap still opens the menu"
+    );
+    discard_posted(
+        f.window.hwnd,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+    );
 }

@@ -33,6 +33,11 @@ use crate::editor::scintilla_constants::{
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
+#[cfg(windows)]
+use crate::editor::scintilla_constants::{
+    SCI_ADDSELECTION, SCI_GETMAINSELECTION, SCI_GETSELECTIONNANCHOR, SCI_GETSELECTIONNCARET,
+    SCI_GETSELECTIONS, SCI_POSITIONFROMPOINT, SCI_SETMAINSELECTION, SCI_SETSELECTION,
+};
 use crate::editor::scintilla_constants::{
     SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCHARACTERPOINTER, SCI_GETCODEPAGE,
     SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETFIRSTVISIBLELINE, SCI_GETLINE, SCI_GETRANGEPOINTER,
@@ -45,7 +50,7 @@ use crate::editor::scintilla_constants::{
     STYLE_LINENUMBER, STYLE_MAX,
 };
 use crate::{FastPadError, Result};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::ops::Range;
 use std::rc::Rc;
@@ -59,13 +64,14 @@ use std::mem::transmute;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
 #[cfg(windows)]
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetClientRect, HWND_MESSAGE, SendMessageW, WM_CHAR,
-    WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
+    WM_DPICHANGED_AFTERPARENT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCDESTROY, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
 };
 
 mod document_text;
@@ -153,8 +159,20 @@ struct EditorEndpoint {
     /// The word Add next occurrence last selected at an empty caret: while the selection is still
     /// exactly that word, matches stay whole words.
     occurrence_word: Cell<Option<(usize, usize)>>,
+    /// The selections and point an Alt+Click started from (editing shortcuts spec §5).
+    alt_click: RefCell<Option<AltClick>>,
     #[cfg(test)]
     release_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// An Alt+Click in progress: where the button went down, and the selections (caret, anchor) and
+/// main selection from before Scintilla's own handling.
+#[derive(Debug)]
+struct AltClick {
+    x: i32,
+    y: i32,
+    selections: Vec<(isize, isize)>,
+    main: usize,
 }
 
 /// Whether margin 0 shows line numbers, and how many digits its current width was measured for
@@ -347,6 +365,7 @@ impl EditorDocument {
                 line_numbers: Cell::new(LineNumberMargin::default()),
                 occurrence_whole_word: Cell::new(false),
                 occurrence_word: Cell::new(None),
+                alt_click: RefCell::new(None),
                 release_counter: Some(releases),
             }),
         }
@@ -382,6 +401,7 @@ impl EditorEndpoint {
             line_numbers: Cell::new(LineNumberMargin::default()),
             occurrence_whole_word: Cell::new(false),
             occurrence_word: Cell::new(None),
+            alt_click: RefCell::new(None),
             #[cfg(test)]
             release_counter: None,
         }
@@ -408,6 +428,70 @@ impl EditorEndpoint {
         self.send_direct_checked(SCI_SETMARGINWIDTHN, 0, width)?;
         margin.digits = digits;
         self.line_numbers.set(margin);
+        Ok(())
+    }
+
+    /// Every selection as (caret, anchor), and which one is main.
+    #[cfg(windows)]
+    fn selection_snapshot(&self) -> Result<(Vec<(isize, isize)>, usize)> {
+        let count = self.send_direct_checked(SCI_GETSELECTIONS, 0, 0)?.max(1) as usize;
+        let selections = (0..count)
+            .map(|n| {
+                Ok((
+                    self.send_direct_checked(SCI_GETSELECTIONNCARET, n, 0)?,
+                    self.send_direct_checked(SCI_GETSELECTIONNANCHOR, n, 0)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let main = self.send_direct_checked(SCI_GETMAINSELECTION, 0, 0)?.max(0) as usize;
+        Ok((selections, main))
+    }
+
+    /// A button press with Alt (and no Shift or Ctrl) may become Alt+Click: remember where it
+    /// started from (editing shortcuts spec §5).
+    #[cfg(windows)]
+    fn begin_alt_click(&self, lparam: LPARAM) {
+        let alt_only = unsafe { GetKeyState(VK_MENU as i32) } < 0
+            && unsafe { GetKeyState(VK_SHIFT as i32) } >= 0
+            && unsafe { GetKeyState(VK_CONTROL as i32) } >= 0;
+        let click = alt_only
+            .then(|| self.selection_snapshot().ok())
+            .flatten()
+            .map(|(selections, main)| {
+                let (x, y) = mouse_point(lparam);
+                AltClick {
+                    x,
+                    y,
+                    selections,
+                    main,
+                }
+            });
+        *self.alt_click.borrow_mut() = click;
+    }
+
+    /// After Scintilla's own button-up: a release near the press restores the earlier
+    /// selections and adds a caret at the click, as the main selection. A drag stays
+    /// Scintilla's rectangular selection.
+    #[cfg(windows)]
+    fn finish_alt_click(&self, click: AltClick, lparam: LPARAM) -> Result<()> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXDRAG, SM_CYDRAG};
+        let (x, y) = mouse_point(lparam);
+        let moved = (x - click.x).abs() > unsafe { GetSystemMetrics(SM_CXDRAG) }
+            || (y - click.y).abs() > unsafe { GetSystemMetrics(SM_CYDRAG) };
+        if moved {
+            return Ok(());
+        }
+        for (n, (caret, anchor)) in click.selections.iter().enumerate() {
+            let message = if n == 0 {
+                SCI_SETSELECTION
+            } else {
+                SCI_ADDSELECTION
+            };
+            self.send_direct_checked(message, *caret as usize, *anchor)?;
+        }
+        self.send_direct_checked(SCI_SETMAINSELECTION, click.main, 0)?;
+        let position = self.send_direct_checked(SCI_POSITIONFROMPOINT, x as usize, y as isize)?;
+        self.send_direct_checked(SCI_ADDSELECTION, position.max(0) as usize, position)?;
         Ok(())
     }
 
@@ -607,6 +691,14 @@ fn parent_client_rect(parent: HWND) -> Result<RECT> {
     if ok == 0 { Err(last_error()) } else { Ok(rect) }
 }
 
+/// A mouse message's client point: signed 16-bit x and y.
+#[cfg(windows)]
+fn mouse_point(lparam: LPARAM) -> (i32, i32) {
+    let x = i32::from((lparam & 0xFFFF) as u16 as i16);
+    let y = i32::from(((lparam >> 16) & 0xFFFF) as u16 as i16);
+    (x, y)
+}
+
 #[cfg(windows)]
 unsafe extern "system" fn editor_endpoint_subclass_proc(
     hwnd: HWND,
@@ -622,6 +714,17 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
         if crate::editor::input_filter::should_ignore_char(wparam as u16, ctrl_down) {
             return 0;
         }
+    }
+    if message == WM_LBUTTONDOWN {
+        endpoint.begin_alt_click(lparam);
+    }
+    if message == WM_LBUTTONUP {
+        let click = endpoint.alt_click.borrow_mut().take();
+        let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        if let Some(click) = click {
+            let _ = endpoint.finish_alt_click(click, lparam);
+        }
+        return result;
     }
     if message == WM_DPICHANGED_AFTERPARENT {
         // Scintilla adopts the new DPI inside its own handler; measure digits only after that.

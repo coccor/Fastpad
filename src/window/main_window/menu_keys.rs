@@ -377,7 +377,11 @@ fn menu_activation_message(
     if message.message == WM_SYSKEYUP && message.wParam == VK_MENU as usize {
         return app.take_menu_alt_pending();
     }
-    if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+    // Alt+Click (a caret in the editor) is Alt with other input, not a bare tap.
+    if matches!(
+        message.message,
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+    ) {
         app.set_menu_alt_pending(false);
     }
     false
