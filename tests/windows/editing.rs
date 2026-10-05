@@ -67,7 +67,12 @@ fn line_commands_route_through_the_shared_command_model() {
     let editor = main.editor;
     type_text(editor, "two");
     unsafe {
-        SendMessageW(main.hwnd, WM_COMMAND, CommandId::InsertLineAbove as usize, 0);
+        SendMessageW(
+            main.hwnd,
+            WM_COMMAND,
+            CommandId::InsertLineAbove as usize,
+            0,
+        );
     }
     type_text(editor, "one");
     wait_text(editor, "one\r\ntwo");
