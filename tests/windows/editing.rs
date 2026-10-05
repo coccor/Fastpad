@@ -59,6 +59,31 @@ fn cut_and_paste_route_through_the_shared_command_model() {
 }
 
 #[test]
+fn line_commands_route_through_the_shared_command_model() {
+    // Break caught: the editing-shortcut commands not reaching the editor from WM_COMMAND (menu
+    // and accelerator path) in the real binary's window.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let editor = main.editor;
+    type_text(editor, "two");
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::InsertLineAbove as usize, 0);
+    }
+    type_text(editor, "one");
+    wait_text(editor, "one\r\ntwo");
+
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::MoveLinesDown as usize, 0);
+    }
+    wait_text(editor, "two\r\none");
+
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::DeleteLines as usize, 0);
+    }
+    wait_text(editor, "two");
+}
+
+#[test]
 fn ctrl_f_opens_find_bar_prefills_from_selection_and_escape_returns_focus_to_editor() {
     // Break caught: the bar not appearing, not prefilling from a single-line selection, or Escape
     // leaving focus stranded in the (now hidden) query field instead of the editor.
