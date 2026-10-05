@@ -90,7 +90,7 @@ fn go_to_note_is_listed_once_with_ctrl_p() {
         shortcut_text(CommandId::QuickOpen).as_deref(),
         Some("Ctrl+P")
     );
-    assert_eq!(ENTRIES.len(), 112);
+    assert_eq!(ENTRIES.len(), 128);
 }
 
 #[test]

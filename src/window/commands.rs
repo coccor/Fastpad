@@ -137,10 +137,63 @@ pub enum CommandId {
     ToggleCodeFolding = 242,
     FoldAll = 243,
     UnfoldAll = 244,
+    MoveLinesUp = 245,
+    MoveLinesDown = 246,
+    CopyLinesUp = 247,
+    CopyLinesDown = 248,
+    DeleteLines = 249,
+    InsertLineBelow = 250,
+    InsertLineAbove = 251,
+    IndentLines = 252,
+    OutdentLines = 253,
+    ExpandLineSelection = 254,
+    ToggleLineComment = 255,
+    ToggleBlockComment = 256,
+    AddNextOccurrence = 257,
+    SelectAllOccurrences = 258,
+    AddCursorAbove = 259,
+    AddCursorBelow = 260,
 }
 
+/// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
+/// while an editor has the focus.
+pub const EDITING_COMMANDS: [CommandId; 16] = [
+    CommandId::MoveLinesUp,
+    CommandId::MoveLinesDown,
+    CommandId::CopyLinesUp,
+    CommandId::CopyLinesDown,
+    CommandId::DeleteLines,
+    CommandId::InsertLineBelow,
+    CommandId::InsertLineAbove,
+    CommandId::IndentLines,
+    CommandId::OutdentLines,
+    CommandId::ExpandLineSelection,
+    CommandId::ToggleLineComment,
+    CommandId::ToggleBlockComment,
+    CommandId::AddNextOccurrence,
+    CommandId::SelectAllOccurrences,
+    CommandId::AddCursorAbove,
+    CommandId::AddCursorBelow,
+];
+
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 40] = [
+pub const TEXT_COMMANDS: [CommandId; 56] = [
+    CommandId::MoveLinesUp,
+    CommandId::MoveLinesDown,
+    CommandId::CopyLinesUp,
+    CommandId::CopyLinesDown,
+    CommandId::DeleteLines,
+    CommandId::InsertLineBelow,
+    CommandId::InsertLineAbove,
+    CommandId::IndentLines,
+    CommandId::OutdentLines,
+    CommandId::ExpandLineSelection,
+    CommandId::ToggleLineComment,
+    CommandId::ToggleBlockComment,
+    CommandId::AddNextOccurrence,
+    CommandId::SelectAllOccurrences,
+    CommandId::AddCursorAbove,
+    CommandId::AddCursorBelow,
     CommandId::FoldAll,
     CommandId::UnfoldAll,
     CommandId::Save,
@@ -187,6 +240,12 @@ impl CommandId {
     /// Commands that need the active tab's text, and so do nothing on an image tab.
     pub fn needs_text(self) -> bool {
         TEXT_COMMANDS.contains(&self)
+    }
+
+    /// Editing-shortcut commands, whose keys stay with other controls when no editor has the
+    /// focus (editing shortcuts spec §6).
+    pub fn is_editing(self) -> bool {
+        EDITING_COMMANDS.contains(&self)
     }
 
     /// Commands that act on the active document, and so do nothing while no tab is open.
@@ -392,7 +451,23 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 134] = [
+        const COMMANDS: [CommandId; 150] = [
+            CommandId::MoveLinesUp,
+            CommandId::MoveLinesDown,
+            CommandId::CopyLinesUp,
+            CommandId::CopyLinesDown,
+            CommandId::DeleteLines,
+            CommandId::InsertLineBelow,
+            CommandId::InsertLineAbove,
+            CommandId::IndentLines,
+            CommandId::OutdentLines,
+            CommandId::ExpandLineSelection,
+            CommandId::ToggleLineComment,
+            CommandId::ToggleBlockComment,
+            CommandId::AddNextOccurrence,
+            CommandId::SelectAllOccurrences,
+            CommandId::AddCursorAbove,
+            CommandId::AddCursorBelow,
             CommandId::New,
             CommandId::Open,
             CommandId::Save,

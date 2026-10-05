@@ -350,3 +350,52 @@ fn select_all_occurrences_from_a_caret_selects_every_whole_word_match() {
     found.sort_by_key(|range| range.start);
     assert_eq!(found, vec![0..2, 7..9]);
 }
+
+#[test]
+fn editing_commands_have_their_spec_keys() {
+    use crate::window::keymap::KeyStroke;
+    let keymap = crate::window::keymap::Keymap::defaults();
+    for (text, command) in [
+        ("Alt+Up", CommandId::MoveLinesUp),
+        ("Alt+Down", CommandId::MoveLinesDown),
+        ("Shift+Alt+Up", CommandId::CopyLinesUp),
+        ("Shift+Alt+Down", CommandId::CopyLinesDown),
+        ("Ctrl+Shift+K", CommandId::DeleteLines),
+        ("Ctrl+Enter", CommandId::InsertLineBelow),
+        ("Ctrl+Shift+Enter", CommandId::InsertLineAbove),
+        ("Ctrl+]", CommandId::IndentLines),
+        ("Ctrl+[", CommandId::OutdentLines),
+        ("Ctrl+L", CommandId::ExpandLineSelection),
+        ("Ctrl+/", CommandId::ToggleLineComment),
+        ("Shift+Alt+A", CommandId::ToggleBlockComment),
+        ("Ctrl+D", CommandId::AddNextOccurrence),
+        ("Ctrl+Shift+L", CommandId::SelectAllOccurrences),
+        ("Ctrl+Alt+Up", CommandId::AddCursorAbove),
+        ("Ctrl+Alt+Down", CommandId::AddCursorBelow),
+    ] {
+        assert_eq!(
+            keymap.command_for(KeyStroke::parse(text).unwrap()),
+            Some(command),
+            "{text}"
+        );
+        assert!(command.is_editing() && command.needs_text(), "{command:?}");
+    }
+}
+
+#[test]
+fn toggle_line_comment_uses_the_active_tabs_language() {
+    let f = fixture("a");
+    app_mut(f.window.hwnd).tabs.active_mut().unwrap().language = Language::Python;
+    execute_command(f.window.hwnd, CommandId::ToggleLineComment);
+    assert_eq!(f.editor.text().unwrap(), "# a");
+}
+
+#[test]
+fn line_commands_run_on_the_active_editor() {
+    let f = fixture("a\r\nb");
+    f.editor.set_selection(0..0).unwrap();
+    execute_command(f.window.hwnd, CommandId::MoveLinesDown);
+    assert_eq!(f.editor.text().unwrap(), "b\r\na");
+    execute_command(f.window.hwnd, CommandId::DeleteLines);
+    assert_eq!(f.editor.text().unwrap(), "b");
+}

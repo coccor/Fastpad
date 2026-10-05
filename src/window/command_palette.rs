@@ -55,7 +55,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 112] = [
+pub(crate) const ENTRIES: [PaletteEntry; 128] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -93,6 +93,25 @@ pub(crate) const ENTRIES: [PaletteEntry; 112] = [
     entry("Edit: Cut", CommandId::Cut),
     entry("Edit: Copy", CommandId::Copy),
     entry("Edit: Paste", CommandId::Paste),
+    entry("Edit: Move line up", CommandId::MoveLinesUp),
+    entry("Edit: Move line down", CommandId::MoveLinesDown),
+    entry("Edit: Copy line up", CommandId::CopyLinesUp),
+    entry("Edit: Copy line down", CommandId::CopyLinesDown),
+    entry("Edit: Delete line", CommandId::DeleteLines),
+    entry("Edit: Insert line below", CommandId::InsertLineBelow),
+    entry("Edit: Insert line above", CommandId::InsertLineAbove),
+    entry("Edit: Indent line", CommandId::IndentLines),
+    entry("Edit: Outdent line", CommandId::OutdentLines),
+    entry("Edit: Select line", CommandId::ExpandLineSelection),
+    entry("Edit: Toggle line comment", CommandId::ToggleLineComment),
+    entry("Edit: Toggle block comment", CommandId::ToggleBlockComment),
+    entry("Edit: Add next occurrence", CommandId::AddNextOccurrence),
+    entry(
+        "Edit: Select all occurrences",
+        CommandId::SelectAllOccurrences,
+    ),
+    entry("Edit: Add cursor above", CommandId::AddCursorAbove),
+    entry("Edit: Add cursor below", CommandId::AddCursorBelow),
     entry("Search: Find", CommandId::Find),
     entry("Search: Find next", CommandId::FindNext),
     entry("Search: Find previous", CommandId::FindPrevious),
