@@ -234,6 +234,9 @@ pub(crate) unsafe fn translate_accelerator(
     if start_tab_for_typing(hwnd, message) {
         return true;
     }
+    if editing_key_off_editor(hwnd, message) {
+        return false;
+    }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .accelerators
@@ -287,6 +290,37 @@ fn start_tab_for_typing(
     focus_content(hwnd);
     unsafe { SendMessageW(editor.hwnd(), WM_CHAR, message.wParam, message.lParam) };
     true
+}
+
+/// A key bound to an editing-shortcut command while the focus is not in an editor: it stays
+/// with the focused control, as VS Code's `editorTextFocus` (editing shortcuts spec §6).
+fn editing_key_off_editor(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    if !matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        return false;
+    }
+    let down = |key: u16| unsafe { GetKeyState(i32::from(key)) } < 0;
+    let Some(stroke) = crate::window::keymap::KeyStroke::from_key(
+        message.wParam as u16,
+        down(VK_CONTROL),
+        down(VK_SHIFT),
+        down(VK_MENU),
+    ) else {
+        return false;
+    };
+    let editing = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.keymap.command_for(stroke))
+        .is_some_and(CommandId::is_editing);
+    editing && !is_group_editor(hwnd, message.hwnd)
+}
+
+/// Whether `window` is one of the editor groups' editors.
+fn is_group_editor(hwnd: HWND, window: HWND) -> bool {
+    group_of_child(hwnd, window)
+        .and_then(|id| group_editor(hwnd, id))
+        .is_some_and(|editor| editor.hwnd() == window)
 }
 
 /// Ctrl+W (without Alt) aimed at one of the command palette's controls.

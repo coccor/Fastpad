@@ -399,3 +399,65 @@ fn line_commands_run_on_the_active_editor() {
     execute_command(f.window.hwnd, CommandId::DeleteLines);
     assert_eq!(f.editor.text().unwrap(), "b");
 }
+
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_OEM_2};
+use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_SYSKEYDOWN};
+
+fn translate(f: &Fixture, message: MSG) -> bool {
+    let identity = unsafe { super::super::window_identity(f.window.hwnd).unwrap() };
+    unsafe { super::super::translate_accelerator(f.window.hwnd, &identity, &message) }
+}
+
+#[test]
+fn alt_down_and_ctrl_slash_in_the_editor_run_their_commands() {
+    let f = fixture("one\r\ntwo");
+    f.editor.set_selection(0..0).unwrap();
+    app_mut(f.window.hwnd).tabs.active_mut().unwrap().language = Language::Rust;
+    let moved = with_keys_down(&[VK_MENU], || {
+        translate(
+            &f,
+            MSG {
+                hwnd: f.editor.hwnd(),
+                message: WM_SYSKEYDOWN,
+                wParam: usize::from(VK_DOWN),
+                lParam: 1 << 29,
+                ..Default::default()
+            },
+        )
+    });
+    assert!(moved, "Alt+Down was not translated");
+    assert_eq!(f.editor.text().unwrap(), "two\r\none");
+    let commented = with_keys_down(&[VK_CONTROL], || {
+        translate(
+            &f,
+            MSG {
+                hwnd: f.editor.hwnd(),
+                message: WM_KEYDOWN,
+                wParam: usize::from(VK_OEM_2),
+                ..Default::default()
+            },
+        )
+    });
+    assert!(commented, "Ctrl+/ was not translated");
+    assert_eq!(f.editor.text().unwrap(), "two\r\n// one");
+}
+
+#[test]
+fn editing_keys_stay_with_controls_outside_the_editor() {
+    // Break caught: Ctrl+D typed in the find field or the tree adding a selection in the
+    // document (VS Code scopes these keys to editorTextFocus).
+    let f = fixture("one");
+    let elsewhere = with_keys_down(&[VK_CONTROL], || {
+        translate(
+            &f,
+            MSG {
+                hwnd: f.window.hwnd,
+                message: WM_KEYDOWN,
+                wParam: usize::from(b'D'),
+                ..Default::default()
+            },
+        )
+    });
+    assert!(!elsewhere, "Ctrl+D outside the editor was translated");
+    assert_eq!(f.editor.selections().unwrap(), vec![0..0]);
+}
