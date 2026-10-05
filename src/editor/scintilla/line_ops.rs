@@ -12,6 +12,10 @@ use crate::editor::scintilla_constants::{
     SCK_LEFT, SCK_RIGHT, SCK_UP, SCMOD_ALT, SCMOD_CTRL, SCMOD_SHIFT,
 };
 use crate::editor::scintilla_constants::{
+    SCFIND_MATCHCASE, SCFIND_WHOLEWORD, SCI_MULTIPLESELECTADDEACH, SCI_MULTIPLESELECTADDNEXT,
+    SCI_SETSEARCHFLAGS, SCI_TARGETWHOLEDOCUMENT,
+};
+use crate::editor::scintilla_constants::{
     SCI_FINDCOLUMN, SCI_GETANCHOR, SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETINDENT,
     SCI_GETLINEINDENTATION, SCI_GETLINEINDENTPOSITION, SCI_GETTABWIDTH, SCI_MOVESELECTEDLINESDOWN,
     SCI_MOVESELECTEDLINESUP, SCI_SETLINEINDENTATION, SCI_SETSEL,
@@ -279,6 +283,83 @@ impl Editor {
             Some(offset) => self.set_selection(start + offset..start + offset),
             None => self.set_selection(start..start + toggle.replacement.len()),
         }
+    }
+
+    /// Ctrl+D: the word at an empty caret, then the next match as a new selection (spec §3).
+    pub fn add_next_occurrence(&self) -> Result<()> {
+        self.add_occurrences(SCI_MULTIPLESELECTADDNEXT)
+    }
+
+    /// Ctrl+Shift+L: a selection on every match (spec §3).
+    pub fn select_all_occurrences(&self) -> Result<()> {
+        self.add_occurrences(SCI_MULTIPLESELECTADDEACH)
+    }
+
+    /// Case-sensitive; whole-word only when the run started from an empty caret, as VS Code.
+    /// At an empty caret Scintilla only selects the word, so Select all occurrences then goes
+    /// on to add every match.
+    fn add_occurrences(&self, message: u32) -> Result<()> {
+        let endpoint = &self.endpoint;
+        if self.send(SCI_GETSELECTIONS, 0, 0)? <= 1 {
+            let selection = self.selection()?;
+            if selection.is_empty() {
+                self.send(message, 0, 0)?;
+                let word = self.selection()?;
+                endpoint.occurrence_word.set(Some((word.start, word.end)));
+                endpoint.occurrence_whole_word.set(true);
+                if message == SCI_MULTIPLESELECTADDNEXT || word.is_empty() {
+                    return Ok(());
+                }
+            } else {
+                let started_at_caret =
+                    endpoint.occurrence_word.get() == Some((selection.start, selection.end));
+                endpoint.occurrence_whole_word.set(started_at_caret);
+            }
+        }
+        let whole_word = if endpoint.occurrence_whole_word.get() {
+            SCFIND_WHOLEWORD
+        } else {
+            0
+        };
+        self.send(
+            SCI_SETSEARCHFLAGS,
+            (SCFIND_MATCHCASE | whole_word) as usize,
+            0,
+        )?;
+        self.send(SCI_TARGETWHOLEDOCUMENT, 0, 0)?;
+        self.send(message, 0, 0).map(drop)
+    }
+
+    /// A caret on the line above the topmost caret (or below the bottommost), in the same
+    /// visual column, clamped to that line's end (spec §3).
+    pub fn add_cursor(&self, above: bool) -> Result<()> {
+        let carets = self
+            .carets()?
+            .into_iter()
+            .map(|caret| Ok((self.line_from_position(caret)?, caret)))
+            .collect::<Result<Vec<_>>>()?;
+        let edge = if above {
+            carets.iter().min()
+        } else {
+            carets.iter().max()
+        };
+        let Some(&(line, caret)) = edge else {
+            return Ok(());
+        };
+        let target = if above {
+            match line.checked_sub(1) {
+                Some(target) => target,
+                None => return Ok(()),
+            }
+        } else if line + 1 < self.line_count()? {
+            line + 1
+        } else {
+            return Ok(());
+        };
+        let column = self.send(SCI_GETCOLUMN, caret, 0)?;
+        let position = self.send(SCI_FINDCOLUMN, target, column)?;
+        self.send(SCI_ADDSELECTION, position.max(0) as usize, position)
+            .map(drop)
     }
 
     #[cfg(test)]

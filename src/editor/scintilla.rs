@@ -147,6 +147,12 @@ struct EditorEndpoint {
     destroyed: AtomicBool,
     destroy_window_on_drop: bool,
     line_numbers: Cell<LineNumberMargin>,
+    /// Whether Add next occurrence matches whole words: set when it starts from an empty caret
+    /// (editing shortcuts spec §3).
+    occurrence_whole_word: Cell<bool>,
+    /// The word Add next occurrence last selected at an empty caret: while the selection is still
+    /// exactly that word, matches stay whole words.
+    occurrence_word: Cell<Option<(usize, usize)>>,
     #[cfg(test)]
     release_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -339,6 +345,8 @@ impl EditorDocument {
                 destroyed: AtomicBool::new(false),
                 destroy_window_on_drop: false,
                 line_numbers: Cell::new(LineNumberMargin::default()),
+                occurrence_whole_word: Cell::new(false),
+                occurrence_word: Cell::new(None),
                 release_counter: Some(releases),
             }),
         }
@@ -372,6 +380,8 @@ impl EditorEndpoint {
             destroyed: AtomicBool::new(false),
             destroy_window_on_drop,
             line_numbers: Cell::new(LineNumberMargin::default()),
+            occurrence_whole_word: Cell::new(false),
+            occurrence_word: Cell::new(None),
             #[cfg(test)]
             release_counter: None,
         }

@@ -284,3 +284,69 @@ fn comment_toggles_do_nothing_without_markers() {
     assert_eq!(f.editor.text().unwrap(), "a");
     assert!(!f.editor.can_undo().unwrap());
 }
+
+#[test]
+fn add_next_occurrence_selects_the_word_then_adds_matches() {
+    let f = fixture("foo bar foo");
+    f.editor.set_selection(1..1).unwrap();
+    f.editor.add_next_occurrence().unwrap();
+    assert_eq!(f.editor.selections().unwrap(), vec![0..3]);
+    f.editor.add_next_occurrence().unwrap();
+    assert_eq!(f.editor.selections().unwrap(), vec![0..3, 8..11]);
+}
+
+#[test]
+fn add_next_occurrence_from_a_caret_matches_whole_words_only() {
+    let f = fixture("foo food foo");
+    f.editor.set_selection(0..0).unwrap();
+    f.editor.add_next_occurrence().unwrap(); // the word: 0..3
+    f.editor.add_next_occurrence().unwrap(); // skips "food"
+    assert_eq!(f.editor.selections().unwrap(), vec![0..3, 9..12]);
+}
+
+#[test]
+fn add_next_occurrence_from_a_selection_matches_substrings_but_not_case() {
+    let f = fixture("foo food Foo");
+    f.editor.set_selection(0..3).unwrap();
+    f.editor.add_next_occurrence().unwrap();
+    f.editor.add_next_occurrence().unwrap();
+    // Scintilla makes the newest selection main and may reorder; compare as a set.
+    let mut found = f.editor.selections().unwrap();
+    found.sort_by_key(|range| range.start);
+    assert_eq!(found, vec![0..3, 4..7]);
+}
+
+#[test]
+fn select_all_occurrences_selects_every_match() {
+    let f = fixture("ab x ab y ab");
+    f.editor.set_selection(0..2).unwrap();
+    f.editor.select_all_occurrences().unwrap();
+    let mut found = f.editor.selections().unwrap();
+    found.sort_by_key(|range| range.start);
+    assert_eq!(found, vec![0..2, 5..7, 10..12]);
+}
+
+#[test]
+fn add_cursor_above_and_below_keep_the_column_and_clamp() {
+    let f = fixture("abcd\nab\nabcd");
+    f.editor.set_selection(7..7).unwrap(); // line 1, column 2 (end of "ab")
+    f.editor.add_cursor(true).unwrap();
+    f.editor.add_cursor(false).unwrap();
+    let mut carets = f.editor.carets().unwrap();
+    carets.sort_unstable();
+    assert_eq!(carets, vec![2, 7, 10]);
+    f.editor.add_cursor(true).unwrap(); // topmost is line 0: nothing above
+    assert_eq!(f.editor.carets().unwrap().len(), 3);
+}
+
+#[test]
+fn select_all_occurrences_from_a_caret_selects_every_whole_word_match() {
+    // Break caught: Scintilla only selecting the word at an empty caret, so Ctrl+Shift+L needed
+    // a second press (VS Code selects every match at once).
+    let f = fixture("ab abc ab");
+    f.editor.set_selection(0..0).unwrap();
+    f.editor.select_all_occurrences().unwrap();
+    let mut found = f.editor.selections().unwrap();
+    found.sort_by_key(|range| range.start);
+    assert_eq!(found, vec![0..2, 7..9]);
+}
