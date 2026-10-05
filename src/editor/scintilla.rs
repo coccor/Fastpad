@@ -36,7 +36,7 @@ use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, S
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{
     SCI_ADDSELECTION, SCI_GETMAINSELECTION, SCI_GETSELECTIONNANCHOR, SCI_GETSELECTIONNCARET,
-    SCI_GETSELECTIONS, SCI_POSITIONFROMPOINT, SCI_SETMAINSELECTION, SCI_SETSELECTION,
+    SCI_GETSELECTIONS, SCI_POSITIONFROMPOINT, SCI_SETMAINSELECTION,
 };
 use crate::editor::scintilla_constants::{
     SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCHARACTERPOINTER, SCI_GETCODEPAGE,
@@ -481,13 +481,14 @@ impl EditorEndpoint {
         if moved {
             return Ok(());
         }
+        // The Alt press put Scintilla in rectangular mode; SCI_SETSEL clears it back to stream,
+        // or typing would rebuild the carets as a column. Its arguments are anchor, caret.
         for (n, (caret, anchor)) in click.selections.iter().enumerate() {
-            let message = if n == 0 {
-                SCI_SETSELECTION
+            if n == 0 {
+                self.send_direct_checked(SCI_SETSEL, *anchor as usize, *caret)?;
             } else {
-                SCI_ADDSELECTION
-            };
-            self.send_direct_checked(message, *caret as usize, *anchor)?;
+                self.send_direct_checked(SCI_ADDSELECTION, *caret as usize, *anchor)?;
+            }
         }
         self.send_direct_checked(SCI_SETMAINSELECTION, click.main, 0)?;
         let position = self.send_direct_checked(SCI_POSITIONFROMPOINT, x as usize, y as isize)?;

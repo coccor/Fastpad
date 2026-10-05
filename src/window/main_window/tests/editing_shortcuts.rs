@@ -484,6 +484,25 @@ fn alt_click_adds_a_caret_and_keeps_the_others() {
     let mut carets = f.editor.carets().unwrap();
     carets.sort_unstable();
     assert_eq!(carets, vec![0, 6]);
+    // Break caught: Scintilla left in rectangular mode by the Alt press, so the first keystroke
+    // rebuilt the carets as a column between the two (review finding).
+    for _ in 0..2 {
+        unsafe {
+            SendMessageW(
+                f.editor.hwnd(),
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR,
+                usize::from(b'x'),
+                0,
+            )
+        };
+    }
+    assert_eq!(
+        f.editor.text().unwrap(),
+        "xxone
+twxxo
+three"
+    );
+    assert_eq!(f.editor.carets().unwrap().len(), 2);
 }
 
 #[test]
