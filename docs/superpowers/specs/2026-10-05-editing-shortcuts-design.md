@@ -52,7 +52,7 @@ Existing commands that change behaviour, keeping their keys:
 - **Copy / Cut** (`Ctrl+C` / `Ctrl+X`): `SCI_COPYALLOWLINE` / `SCI_CUTALLOWLINE`. With an empty selection they copy or cut the whole line, and Scintilla marks the clipboard as a line copy so **Paste** inserts it above the caret's line, as VS Code does. With a selection, unchanged.
 - **Paste** with several carets and a multi-line clipboard: each caret gets the whole clipboard (`SC_MULTIPASTE_EACH`). VS Code's split-one-line-per-caret is out of scope.
 
-Line operations with several selections: move and copy lines act on the main selection only (Scintilla's built-ins do). Delete lines, indent, outdent and both comment toggles act on every line any selection touches.
+Line operations with several selections: move lines, copy lines, insert line, select line and toggle block comment act on the main selection only (move uses Scintilla's built-in, which does). Delete lines, indent, outdent and toggle line comment act on every line any selection touches.
 
 No conflicts with today's defaults: none of the keys above is in `DEFAULT_BINDINGS`. `Ctrl+Alt+Left/Right` (move tab to group) stay; accelerators match exact modifiers, so `Ctrl+Alt+Up/Down` and `Ctrl+Shift+Alt+arrows` don't collide with them.
 
@@ -102,8 +102,9 @@ Set once per editor view, next to today's view setup:
 
 - **Cleared** (`SCI_CLEARCMDKEY`), because FastPad now owns these keys and an unhandled stroke must not fall through to Scintilla's different action: `Ctrl+D` (selection duplicate), `Ctrl+L` (line cut), `Ctrl+Shift+L` (line delete), `Ctrl+T` (line transpose; FastPad's New already wins, but clear it so rebinding New doesn't expose it), `Ctrl+Shift+T` (line copy), `Ctrl+[` / `Ctrl+]` (paragraph up/down). `Ctrl+U` / `Ctrl+Shift+U` (lower / upper case) stay Scintilla's: nothing here uses them.
 - **Moved** (`SCI_ASSIGNCMDKEY`): column (rectangular) selection by keyboard goes from `Shift+Alt+arrows` to `Ctrl+Shift+Alt+arrows`, VS Code's keys. `Shift+Alt+Left/Right` are cleared (VS Code's smart select is out of scope).
-- **Mouse:** `Alt+drag` stays Scintilla's rectangular selection. `Alt+Click` (press and release without moving) adds a caret, VS Code's gesture: the editor's subclass catches `WM_LBUTTONDOWN` with Alt and no Shift/Ctrl, and on `WM_LBUTTONUP` at the same point calls `SCI_ADDSELECTION` at `SCI_POSITIONFROMPOINT`; a drag passes through to Scintilla untouched. Scintilla's own `Ctrl+Click` add-caret stays as a bonus.
-- **Escape** with several selections drops back to the main one (Scintilla's `SCI_CANCEL` does this). FastPad's own Escape handling (closing the find bar, the palette) runs only when there is a single selection. To verify during implementation; if the find bar's Escape intercepts first, it checks `SCI_GETSELECTIONS > 1` and cancels the extra carets instead.
+- **Mouse:** `Alt+drag` stays Scintilla's rectangular selection. `Alt+Click` (press and release without moving past `SM_CXDRAG` / `SM_CYDRAG`) adds a caret, VS Code's gesture. Both messages still reach Scintilla, so a drag works as before. On `WM_LBUTTONDOWN` with Alt and no Shift/Ctrl, the editor's subclass snapshots the selections (caret and anchor of each) and the point; on `WM_LBUTTONUP` near that point it restores the snapshot and adds a caret at `SCI_POSITIONFROMPOINT`, as the main selection. Scintilla's own `Ctrl+Click` add-caret stays as a bonus.
+- **Alt and the menu band:** a mouse button press clears the pending bare-Alt tap, so releasing Alt after `Alt+Click` does not open the menu band.
+- **Escape** in the editor with several selections drops back to the main one: Scintilla's `SCI_CANCEL` does this, and FastPad's Escape handling lives in the find bar's and palette's own fields, never the editor's.
 
 ## 6. Wiring
 
@@ -116,6 +117,7 @@ Set once per editor view, next to today's view setup:
   - **Toggle line comment**, **Toggle block comment**.
   - **Selection ▸** Add next occurrence, Select all occurrences, Add cursor above, Add cursor below.
 - Dispatch: the command handler forwards each to the active text view's `line_ops` method, as Undo is forwarded today.
+- **Editor focus only:** a key bound to one of the sixteen commands is translated only when the keyboard focus is in an editor, as VS Code's `editorTextFocus`. Elsewhere (the find bar's fields, the palette, the Notebook tree) the key reaches the focused control untouched, so `Ctrl+Enter` or `Alt+Up` there does what that control does. The palette and the menu still run the commands on the active editor.
 - `windows` crate features: none new expected. If one is, update `tools/audit-dependencies.ps1`.
 
 ## 7. Testing
