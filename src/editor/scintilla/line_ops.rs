@@ -20,6 +20,7 @@ use crate::editor::scintilla_constants::{
     SCI_GETLINEINDENTATION, SCI_GETLINEINDENTPOSITION, SCI_GETTABWIDTH, SCI_MOVESELECTEDLINESDOWN,
     SCI_MOVESELECTEDLINESUP, SCI_SETLINEINDENTATION, SCI_SETSEL,
 };
+use crate::editor::scintilla_constants::{SCK_DELETE, SCK_INSERT};
 use std::ops::RangeInclusive;
 
 /// A Scintilla key definition: the key in the low word, `SCMOD_*` modifiers in the high word.
@@ -62,6 +63,15 @@ const RECTANGLE_KEYS: [(usize, u32); 4] = [
     ),
 ];
 
+/// Copy and Cut keys: with an empty selection they take the whole line, as the menu's Copy and
+/// Cut do. FastPad binds no accelerator to them, so Scintilla's keymap is what runs (spec §3).
+const CLIPBOARD_KEYS: [(usize, u32); 4] = [
+    (key_definition(b'C' as u32, SCMOD_CTRL), SCI_COPYALLOWLINE),
+    (key_definition(SCK_INSERT, SCMOD_CTRL), SCI_COPYALLOWLINE),
+    (key_definition(b'X' as u32, SCMOD_CTRL), SCI_CUTALLOWLINE),
+    (key_definition(SCK_DELETE, SCMOD_SHIFT), SCI_CUTALLOWLINE),
+];
+
 /// Sorted, merged runs of lines from `spans` (each `first..=last`).
 fn merge_runs(mut spans: Vec<RangeInclusive<usize>>) -> Vec<RangeInclusive<usize>> {
     spans.sort_by_key(|span| *span.start());
@@ -91,7 +101,7 @@ impl Editor {
         for key in CLEARED_KEYS {
             self.send(SCI_CLEARCMDKEY, key, 0)?;
         }
-        for (key, command) in RECTANGLE_KEYS {
+        for (key, command) in RECTANGLE_KEYS.into_iter().chain(CLIPBOARD_KEYS) {
             self.send(SCI_ASSIGNCMDKEY, key, command as isize)?;
         }
         Ok(())

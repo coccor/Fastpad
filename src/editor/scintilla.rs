@@ -64,13 +64,15 @@ use std::mem::transmute;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
 #[cfg(windows)]
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
+};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetClientRect, HWND_MESSAGE, SendMessageW, WM_CHAR,
-    WM_DPICHANGED_AFTERPARENT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCDESTROY, WS_CHILD,
+    WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCDESTROY, WS_CHILD,
     WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -431,6 +433,14 @@ impl EditorEndpoint {
         Ok(())
     }
 
+    /// Leaves an empty selection at the caret.
+    #[cfg(windows)]
+    fn collapse_selection(&self) -> Result<()> {
+        let caret = self.send_direct_checked(SCI_GETCURRENTPOS, 0, 0)?;
+        self.send_direct_checked(SCI_SETSEL, caret.max(0) as usize, caret)?;
+        Ok(())
+    }
+
     /// Every selection as (caret, anchor), and which one is main.
     #[cfg(windows)]
     fn selection_snapshot(&self) -> Result<(Vec<(isize, isize)>, usize)> {
@@ -715,6 +725,18 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
         if crate::editor::input_filter::should_ignore_char(wparam as u16, ctrl_down) {
             return 0;
         }
+    }
+    if message == WM_KEYDOWN && wparam == usize::from(VK_ESCAPE) {
+        // Scintilla's Cancel drops extra carets; with one selection it keeps it, where VS Code
+        // clears it (editing shortcuts spec §5).
+        let single = endpoint
+            .send_direct_checked(SCI_GETSELECTIONS, 0, 0)
+            .is_ok_and(|count| count <= 1);
+        let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        if single {
+            let _ = endpoint.collapse_selection();
+        }
+        return result;
     }
     if message == WM_LBUTTONDOWN {
         endpoint.begin_alt_click(lparam);

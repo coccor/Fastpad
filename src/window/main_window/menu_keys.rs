@@ -220,6 +220,9 @@ pub(crate) unsafe fn translate_accelerator(
     if crate::window::tab_drag::keeps_key(hwnd, message) {
         return true;
     }
+    if alt_release_after_click(hwnd, message) {
+        return true;
+    }
     if menu_activation_message(hwnd, message)
         && unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0) } != 0
     {
@@ -372,6 +375,7 @@ fn menu_activation_message(
     }
     if message.message == WM_SYSKEYDOWN && message.wParam == VK_MENU as usize {
         app.set_menu_alt_pending(no_control_or_shift);
+        app.set_menu_alt_clicked(false);
         return false;
     }
     if message.message == WM_SYSKEYUP && message.wParam == VK_MENU as usize {
@@ -380,9 +384,28 @@ fn menu_activation_message(
     // Alt+Click (a caret in the editor) is Alt with other input, not a bare tap.
     if matches!(
         message.message,
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+    ) && unsafe { GetKeyState(VK_MENU as i32) } < 0
+    {
+        app.set_menu_alt_clicked(true);
+    }
+    if matches!(
+        message.message,
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
     ) {
         app.set_menu_alt_pending(false);
     }
     false
+}
+
+/// The release of an Alt held for a click. Windows counts a click as no input, so passed on it
+/// would open the menu band; consumed, it does nothing (editing shortcuts spec §5).
+fn alt_release_after_click(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    message.message == WM_SYSKEYUP
+        && message.wParam == VK_MENU as usize
+        && unsafe { app_ptr(hwnd) }
+            .is_some_and(|mut app| unsafe { app.as_mut() }.take_menu_alt_clicked())
 }

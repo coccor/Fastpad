@@ -515,17 +515,35 @@ fn a_mouse_press_cancels_the_pending_alt_tap() {
         ..Default::default()
     };
     translate(&f, alt(WM_SYSKEYDOWN));
-    translate(
-        &f,
-        MSG {
-            hwnd: f.editor.hwnd(),
-            message: WM_LBUTTONDOWN,
-            ..Default::default()
-        },
-    );
+    with_keys_down(&[VK_MENU], || {
+        translate(
+            &f,
+            MSG {
+                hwnd: f.editor.hwnd(),
+                message: WM_LBUTTONDOWN,
+                ..Default::default()
+            },
+        )
+    });
+    // Passing the release on lets Windows send SC_KEYMENU itself (a click is not a key to
+    // Windows), so FastPad must consume it, and post nothing of its own.
     assert!(
-        !translate(&f, alt(WM_SYSKEYUP)),
-        "releasing Alt after a click opened the menu"
+        translate(&f, alt(WM_SYSKEYUP)),
+        "releasing Alt after a click reached Windows, which opens the menu"
+    );
+    let mut posted = MSG::default();
+    let menu_posted = unsafe {
+        PeekMessageW(
+            &mut posted,
+            f.window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+            PM_REMOVE,
+        )
+    } != 0;
+    assert!(
+        !menu_posted,
+        "releasing Alt after a click posted SC_KEYMENU"
     );
     translate(&f, alt(WM_SYSKEYDOWN));
     assert!(
@@ -536,4 +554,33 @@ fn a_mouse_press_cancels_the_pending_alt_tap() {
         f.window.hwnd,
         windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
     );
+}
+
+#[test]
+fn ctrl_c_and_ctrl_x_in_the_editor_take_the_whole_line() {
+    // Break caught: Ctrl+C / Ctrl+X have no FastPad accelerator, so they reach Scintilla's own
+    // keymap, which copied nothing with an empty selection (only the menu's Copy took the line).
+    let f = fixture("one\r\ntwo\r\nthree");
+    f.editor.set_selection(6..6).unwrap();
+    with_keys_down(&[VK_CONTROL], || unsafe {
+        SendMessageW(f.editor.hwnd(), WM_KEYDOWN, usize::from(b'C'), 0)
+    });
+    f.editor.set_selection(1..1).unwrap();
+    f.editor.paste().unwrap();
+    assert_eq!(f.editor.text().unwrap(), "two\r\none\r\ntwo\r\nthree");
+    f.editor.set_selection(1..1).unwrap();
+    with_keys_down(&[VK_CONTROL], || unsafe {
+        SendMessageW(f.editor.hwnd(), WM_KEYDOWN, usize::from(b'X'), 0)
+    });
+    assert_eq!(f.editor.text().unwrap(), "one\r\ntwo\r\nthree");
+}
+
+#[test]
+fn escape_in_the_editor_clears_a_single_selection() {
+    // Break caught: Scintilla's Cancel only drops extra carets, so Escape left a selection in
+    // place (VS Code's Escape cancels it, keeping the caret where it was).
+    let f = fixture("one two");
+    f.editor.set_selection(0..3).unwrap();
+    unsafe { SendMessageW(f.editor.hwnd(), WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    assert_eq!(f.editor.selection().unwrap(), 3..3);
 }
