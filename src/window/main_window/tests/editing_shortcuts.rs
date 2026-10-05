@@ -584,3 +584,48 @@ fn escape_in_the_editor_clears_a_single_selection() {
     unsafe { SendMessageW(f.editor.hwnd(), WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
     assert_eq!(f.editor.selection().unwrap(), 3..3);
 }
+
+#[test]
+fn holding_alt_through_a_click_still_keeps_the_menu_closed() {
+    // Break caught: Windows auto-repeats WM_SYSKEYDOWN for a held Alt; each repeat after the
+    // click re-armed the bare-Alt tap and cleared the click, so the release opened the menu.
+    let f = fixture("one");
+    let alt = |message, repeat: bool| MSG {
+        hwnd: f.editor.hwnd(),
+        message,
+        wParam: usize::from(VK_MENU),
+        lParam: if repeat { 1 << 30 } else { 0 },
+        ..Default::default()
+    };
+    translate(&f, alt(WM_SYSKEYDOWN, false));
+    with_keys_down(&[VK_MENU], || {
+        translate(
+            &f,
+            MSG {
+                hwnd: f.editor.hwnd(),
+                message: WM_LBUTTONDOWN,
+                ..Default::default()
+            },
+        );
+        translate(&f, alt(WM_SYSKEYDOWN, true));
+        translate(&f, alt(WM_SYSKEYDOWN, true));
+    });
+    assert!(
+        translate(&f, alt(WM_SYSKEYUP, false)),
+        "releasing a held Alt after a click reached Windows"
+    );
+    let mut posted = MSG::default();
+    let menu_posted = unsafe {
+        PeekMessageW(
+            &mut posted,
+            f.window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+            PM_REMOVE,
+        )
+    } != 0;
+    assert!(
+        !menu_posted,
+        "releasing a held Alt after a click posted SC_KEYMENU"
+    );
+}

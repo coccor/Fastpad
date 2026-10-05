@@ -374,6 +374,11 @@ fn menu_activation_message(
         return true;
     }
     if message.message == WM_SYSKEYDOWN && message.wParam == VK_MENU as usize {
+        // A held Alt auto-repeats (bit 30: the key was already down). Only the first press
+        // starts a tap; a repeat after Alt+Click must not re-arm the menu.
+        if message.lParam & (1 << 30) != 0 {
+            return false;
+        }
         app.set_menu_alt_pending(no_control_or_shift);
         app.set_menu_alt_clicked(false);
         return false;
