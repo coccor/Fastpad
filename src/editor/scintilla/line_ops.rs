@@ -10,6 +10,11 @@ use crate::editor::scintilla_constants::{
     SCI_SETADDITIONALSELECTIONTYPING, SCI_SETMULTIPASTE, SCI_SETMULTIPLESELECTION, SCK_DOWN,
     SCK_LEFT, SCK_RIGHT, SCK_UP, SCMOD_ALT, SCMOD_CTRL, SCMOD_SHIFT,
 };
+use crate::editor::scintilla_constants::{
+    SCI_FINDCOLUMN, SCI_GETANCHOR, SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_GETINDENT,
+    SCI_GETLINEINDENTATION, SCI_GETLINEINDENTPOSITION, SCI_GETTABWIDTH, SCI_MOVESELECTEDLINESDOWN,
+    SCI_MOVESELECTEDLINESUP, SCI_SETLINEINDENTATION, SCI_SETSEL,
+};
 use std::ops::RangeInclusive;
 
 /// A Scintilla key definition: the key in the low word, `SCMOD_*` modifiers in the high word.
@@ -105,6 +110,137 @@ impl Editor {
         (0..count)
             .map(|n| Ok(self.send(SCI_GETSELECTIONNCARET, n, 0)?.max(0) as usize))
             .collect()
+    }
+
+    /// The touched lines of the main selection swap with the line above or below (spec §3).
+    pub fn move_lines(&self, up: bool) -> Result<()> {
+        let message = if up {
+            SCI_MOVESELECTEDLINESUP
+        } else {
+            SCI_MOVESELECTEDLINESDOWN
+        };
+        self.begin_undo_action();
+        let result = self.send(message, 0, 0);
+        self.end_undo_action();
+        result.map(drop)
+    }
+
+    /// Duplicates the main selection's touched lines; the selection ends on the lower copy when
+    /// copying down, the upper one when copying up (spec §3).
+    pub fn copy_lines(&self, down: bool) -> Result<()> {
+        let anchor = self.send(SCI_GETANCHOR, 0, 0)?.max(0) as usize;
+        let caret = self.send(SCI_GETCURRENTPOS, 0, 0)?.max(0) as usize;
+        let lines = self.touched_lines(anchor.min(caret)..anchor.max(caret))?;
+        let start = self.line_start(*lines.start())?;
+        let end = self.line_end(*lines.end())?;
+        let text = String::from_utf8_lossy(self.range_bytes(start..end)?).into_owned();
+        let eol = self.line_ending(*lines.end())?;
+        let (at, inserted) = if down {
+            (end, format!("{eol}{text}"))
+        } else {
+            (start, format!("{text}{eol}"))
+        };
+        self.begin_undo_action();
+        let result = self.replace_target(at..at, &inserted);
+        self.end_undo_action();
+        result?;
+        let shift = if down { inserted.len() } else { 0 };
+        self.send(SCI_SETSEL, anchor + shift, (caret + shift) as isize)
+            .map(drop)
+    }
+
+    /// Deletes every line any selection touches, line ends included; one caret stays, on the
+    /// line that took the main caret's line's place, in the same column (spec §3).
+    pub fn delete_lines(&self) -> Result<()> {
+        let caret = self.send(SCI_GETCURRENTPOS, 0, 0)?.max(0) as usize;
+        let caret_line = self.line_from_position(caret)?;
+        let column = self.send(SCI_GETCOLUMN, caret, 0)?;
+        let runs = self.touched_runs()?;
+        self.begin_undo_action();
+        let result = runs.iter().rev().try_for_each(|run| {
+            let range = if run.end() + 1 < self.line_count()? {
+                self.line_start(*run.start())?..self.line_start(run.end() + 1)?
+            } else if *run.start() > 0 {
+                self.line_end(run.start() - 1)?..self.length()?
+            } else {
+                0..self.length()?
+            };
+            self.replace_target(range, "").map(drop)
+        });
+        self.end_undo_action();
+        result?;
+        let removed_above: usize = runs
+            .iter()
+            .filter(|run| *run.end() < caret_line)
+            .map(|run| run.end() - run.start() + 1)
+            .sum();
+        let base = runs
+            .iter()
+            .find(|run| run.contains(&caret_line))
+            .map_or(caret_line, |run| *run.start());
+        let line = (base - removed_above).min(self.line_count()?.saturating_sub(1));
+        let position = self.send(SCI_FINDCOLUMN, line, column)?.max(0) as usize;
+        self.send(SCI_SETSEL, position, position as isize).map(drop)
+    }
+
+    /// A new line below or above the main caret's line, with that line's indentation; the caret
+    /// moves to it (spec §3).
+    pub fn insert_line(&self, below: bool) -> Result<()> {
+        let caret = self.send(SCI_GETCURRENTPOS, 0, 0)?.max(0) as usize;
+        let line = self.line_from_position(caret)?;
+        let indentation = self.send(SCI_GETLINEINDENTATION, line, 0)?;
+        let eol = self.line_ending(line)?;
+        let (at, new_line) = if below {
+            (self.line_end(line)?, line + 1)
+        } else {
+            (self.line_start(line)?, line)
+        };
+        self.begin_undo_action();
+        let result = self
+            .replace_target(at..at, &eol)
+            .and_then(|_| self.send(SCI_SETLINEINDENTATION, new_line, indentation));
+        self.end_undo_action();
+        result?;
+        let position = self.send(SCI_GETLINEINDENTPOSITION, new_line, 0)?.max(0) as usize;
+        self.send(SCI_SETSEL, position, position as isize).map(drop)
+    }
+
+    /// Indents (or outdents) every touched line to the next (or previous) indent stop, whatever
+    /// the selection. Indenting skips empty lines (spec §3).
+    pub fn indent_lines(&self, outdent: bool) -> Result<()> {
+        let width = match self.send(SCI_GETINDENT, 0, 0)? {
+            0 => self.send(SCI_GETTABWIDTH, 0, 0)?,
+            width => width,
+        }
+        .max(1);
+        let runs = self.touched_runs()?;
+        self.begin_undo_action();
+        let result = runs.iter().flat_map(Clone::clone).try_for_each(|line| {
+            let current = self.send(SCI_GETLINEINDENTATION, line, 0)?;
+            let next = if outdent {
+                if current == 0 {
+                    return Ok(());
+                }
+                (current - 1) / width * width
+            } else {
+                if self.line_end(line)? == self.line_start(line)? {
+                    return Ok(());
+                }
+                (current / width + 1) * width
+            };
+            self.send(SCI_SETLINEINDENTATION, line, next).map(drop)
+        });
+        self.end_undo_action();
+        result
+    }
+
+    /// Selects the main selection's lines whole, line end included; again, one more line
+    /// (spec §3).
+    pub fn expand_line_selection(&self) -> Result<()> {
+        let selection = self.selection()?;
+        let start = self.line_start(self.line_from_position(selection.start)?)?;
+        let end = self.line_start(self.line_from_position(selection.end)? + 1)?;
+        self.send(SCI_SETSEL, start, end as isize).map(drop)
     }
 
     #[cfg(test)]

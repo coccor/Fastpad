@@ -130,3 +130,106 @@ fn scintillas_own_line_keys_are_cleared() {
     }
     assert_eq!(f.editor.text().unwrap(), "one\r\ntwo");
 }
+
+#[test]
+fn move_lines_moves_the_touched_lines_in_one_undo_step() {
+    // Scintilla ends a line moved to the end with the document's EOL mode (CRLF here).
+    let f = fixture("a\r\nb\r\nc");
+    f.editor.set_selection(3..4).unwrap(); // "b"
+    f.editor.move_lines(true).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "b\r\na\r\nc");
+    f.editor.move_lines(false).unwrap();
+    f.editor.move_lines(false).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "a\r\nc\r\nb");
+    f.editor.undo().unwrap();
+    f.editor.undo().unwrap();
+    assert_one_undo_restores(&f.editor, "a\r\nb\r\nc");
+}
+
+#[test]
+fn copy_lines_up_keeps_the_selection_on_the_upper_copy() {
+    let f = fixture("a\nbc\nd");
+    f.editor.set_selection(3..4).unwrap(); // "c"
+    f.editor.copy_lines(false).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "a\nbc\nbc\nd");
+    assert_eq!(f.editor.selection().unwrap(), 3..4);
+    assert_one_undo_restores(&f.editor, "a\nbc\nd");
+}
+
+#[test]
+fn copy_lines_down_moves_the_selection_to_the_lower_copy() {
+    let f = fixture("a\nbc\nd");
+    f.editor.set_selection(3..4).unwrap();
+    f.editor.copy_lines(true).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "a\nbc\nbc\nd");
+    assert_eq!(f.editor.selection().unwrap(), 6..7);
+}
+
+#[test]
+fn copy_lines_down_on_the_last_line_adds_a_line_end() {
+    let f = fixture("a\r\nb");
+    f.editor.set_selection(4..4).unwrap();
+    f.editor.copy_lines(true).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "a\r\nb\r\nb");
+}
+
+#[test]
+fn delete_lines_removes_every_touched_line_and_keeps_the_column() {
+    let f = fixture("aa\nbb\ncc\ndd\nee");
+    f.editor.set_selection(4..4).unwrap(); // line 1, column 1
+    f.editor.add_selection_for_test(10); // line 3
+    f.editor.delete_lines().unwrap();
+    assert_eq!(f.editor.text().unwrap(), "aa\ncc\nee");
+    // The added caret is the main one: its line 3 ("dd") becomes line 2 ("ee"), column 1.
+    assert_eq!(f.editor.carets().unwrap(), vec![7]);
+    assert_one_undo_restores(&f.editor, "aa\nbb\ncc\ndd\nee");
+}
+
+#[test]
+fn delete_lines_on_the_last_line_removes_the_preceding_line_end() {
+    let f = fixture("a\nb");
+    f.editor.set_selection(2..2).unwrap();
+    f.editor.delete_lines().unwrap();
+    assert_eq!(f.editor.text().unwrap(), "a");
+    drop(f);
+    let only = fixture("solo");
+    only.editor.delete_lines().unwrap();
+    assert_eq!(only.editor.text().unwrap(), "");
+}
+
+#[test]
+fn insert_line_below_and_above_keep_the_indentation() {
+    let f = fixture("  a\nb");
+    f.editor.set_selection(1..1).unwrap();
+    f.editor.insert_line(true).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "  a\n  \nb");
+    assert_eq!(f.editor.selection().unwrap(), 6..6);
+    f.editor.set_selection(2..2).unwrap();
+    f.editor.insert_line(false).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "  \n  a\n  \nb");
+    assert_eq!(f.editor.selection().unwrap(), 2..2);
+}
+
+#[test]
+fn indent_and_outdent_move_lines_by_one_level_whatever_the_selection() {
+    let f = fixture("a\n\n   b");
+    f.editor.set_selection(0..6).unwrap(); // touches all three lines
+    f.editor.indent_lines(false).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "    a\n\n    b"); // blank line left alone; 3 → 4
+    assert_one_undo_restores(&f.editor, "a\n\n   b");
+    f.editor.set_selection(0..6).unwrap(); // Undo moved the selection
+    f.editor.indent_lines(true).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "a\n\nb"); // 3 → 0, 0 stays 0
+}
+
+#[test]
+fn select_line_selects_the_line_then_extends_it() {
+    let f = fixture("ab\ncd\nef");
+    f.editor.set_selection(4..4).unwrap();
+    f.editor.expand_line_selection().unwrap();
+    assert_eq!(f.editor.selection().unwrap(), 3..6);
+    f.editor.expand_line_selection().unwrap();
+    assert_eq!(f.editor.selection().unwrap(), 3..8);
+    f.editor.expand_line_selection().unwrap();
+    assert_eq!(f.editor.selection().unwrap(), 3..8);
+}
