@@ -233,3 +233,54 @@ fn select_line_selects_the_line_then_extends_it() {
     f.editor.expand_line_selection().unwrap();
     assert_eq!(f.editor.selection().unwrap(), 3..8);
 }
+
+const RUST: crate::editor::comment::CommentSyntax =
+    crate::document::Language::Rust.comment_syntax();
+
+#[test]
+fn toggle_line_comment_comments_every_selections_lines_in_one_step() {
+    let f = fixture("fn a() {}\n    x\ny\nz");
+    f.editor.set_selection(0..0).unwrap();
+    f.editor.add_selection_for_test(18); // "z"
+    f.editor.toggle_line_comment(RUST).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "// fn a() {}\n    x\ny\n// z");
+    assert_one_undo_restores(&f.editor, "fn a() {}\n    x\ny\nz");
+}
+
+#[test]
+fn toggle_line_comment_round_trips_and_the_caret_follows_its_text() {
+    let f = fixture("    foo\nbar");
+    f.editor.set_selection(7..7).unwrap(); // end of "    foo"
+    f.editor.toggle_line_comment(RUST).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "    // foo\nbar");
+    assert_eq!(f.editor.selection().unwrap(), 10..10);
+    f.editor.toggle_line_comment(RUST).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "    foo\nbar");
+}
+
+#[test]
+fn toggle_block_comment_wraps_and_unwraps_the_main_selection() {
+    let f = fixture("let a = b + c;");
+    f.editor.set_selection(8..13).unwrap();
+    f.editor.toggle_block_comment(RUST).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "let a = /* b + c */;");
+    assert_eq!(f.editor.selection().unwrap(), 8..19);
+    f.editor.toggle_block_comment(RUST).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "let a = b + c;");
+    drop(f);
+    let empty = fixture("x");
+    empty.editor.set_selection(1..1).unwrap();
+    empty.editor.toggle_block_comment(RUST).unwrap();
+    assert_eq!(empty.editor.text().unwrap(), "x/*  */");
+    assert_eq!(empty.editor.selection().unwrap(), 4..4);
+}
+
+#[test]
+fn comment_toggles_do_nothing_without_markers() {
+    let none = crate::document::Language::PlainText.comment_syntax();
+    let f = fixture("a");
+    f.editor.toggle_line_comment(none).unwrap();
+    f.editor.toggle_block_comment(none).unwrap();
+    assert_eq!(f.editor.text().unwrap(), "a");
+    assert!(!f.editor.can_undo().unwrap());
+}

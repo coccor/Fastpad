@@ -2,6 +2,7 @@
 //! multiple carets, plus the one-time setup that turns VS Code's editing model on.
 
 use super::*;
+use crate::editor::comment::{self, CommentSyntax};
 use crate::editor::scintilla_constants::{
     SC_EOL_CR, SC_EOL_LF, SC_MULTIPASTE_EACH, SCI_ADDSELECTION, SCI_ASSIGNCMDKEY,
     SCI_CHARLEFTRECTEXTEND, SCI_CHARRIGHTRECTEXTEND, SCI_CLEARCMDKEY, SCI_GETEOLMODE,
@@ -241,6 +242,43 @@ impl Editor {
         let start = self.line_start(self.line_from_position(selection.start)?)?;
         let end = self.line_start(self.line_from_position(selection.end)? + 1)?;
         self.send(SCI_SETSEL, start, end as isize).map(drop)
+    }
+
+    /// Toggles line comments on every touched line, one run at a time; the selections follow
+    /// their text (spec §4.2).
+    pub fn toggle_line_comment(&self, syntax: CommentSyntax) -> Result<()> {
+        let mut edits = Vec::new();
+        for run in self.touched_runs()? {
+            let texts = run
+                .clone()
+                .map(|line| self.line_text(line))
+                .collect::<Result<Vec<_>>>()?;
+            let lines: Vec<&str> = texts.iter().map(String::as_str).collect();
+            for edit in comment::toggle_line(&lines, syntax) {
+                let at = self.line_start(run.start() + edit.line)? + edit.column;
+                edits.push((at..at + edit.remove, edit.insert));
+            }
+        }
+        self.replace_ranges_with(&edits).map(drop)
+    }
+
+    /// Wraps or unwraps the main selection in the block pair; the result is selected, or the
+    /// caret goes between the markers of an empty pair (spec §4.3).
+    pub fn toggle_block_comment(&self, syntax: CommentSyntax) -> Result<()> {
+        let selection = self.selection()?;
+        let selected = String::from_utf8_lossy(self.range_bytes(selection.clone())?).into_owned();
+        let Some(toggle) = comment::toggle_block(&selected, syntax) else {
+            return Ok(());
+        };
+        self.begin_undo_action();
+        let result = self.replace_target(selection.clone(), &toggle.replacement);
+        self.end_undo_action();
+        result?;
+        let start = selection.start;
+        match toggle.caret {
+            Some(offset) => self.set_selection(start + offset..start + offset),
+            None => self.set_selection(start..start + toggle.replacement.len()),
+        }
     }
 
     #[cfg(test)]
