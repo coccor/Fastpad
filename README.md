@@ -94,6 +94,10 @@ typing. Both panes scroll together.
   local files open in a new FastPad tab.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
+- Writing helpers in Markdown files: `Ctrl+B`, `Ctrl+I`, ``Ctrl+` `` and `Ctrl+K` make the selection
+  bold, italic, code or a link. Enter continues a list (Enter on an empty item ends it), Tab and
+  Shift+Tab nest list items and move between table cells, and a table lines up when you leave it.
+  Each is a single undo step.
 
 ### Notes and notebooks
 
@@ -207,7 +211,7 @@ before closing again.
 | Find | `Ctrl+F` | | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Alt+1` … `Alt+9` |
-| Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` |
+| Open notebook | `Ctrl+Shift+O` | | Toggle sidebar | `Ctrl+B` (Bold in Markdown files) |
 | Show notebook | `Ctrl+Shift+E` | | Search notes | `Ctrl+Shift+F` |
 | Move note to notebook | `Ctrl+Shift+M` | | Sidebar / editor groups focus | `F6` / `Shift+F6` |
 | Find next / previous | `F3` / `Shift+F3` | | Match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` |
@@ -221,6 +225,7 @@ before closing again.
 | Indent / outdent line | `Ctrl+]` / `Ctrl+[` | | Toggle line / block comment | `Ctrl+/` / `Shift+Alt+A` |
 | Add next occurrence | `Ctrl+D` | | Select all occurrences | `Ctrl+Shift+L` |
 | Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
+| Bold / italic (Markdown files) | `Ctrl+B` / `Ctrl+I` | | Code / link (Markdown files) | ``Ctrl+` `` / `Ctrl+K` |
 
 ## Make it yours
 
