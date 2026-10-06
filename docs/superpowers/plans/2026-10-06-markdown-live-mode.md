@@ -1,5 +1,7 @@
 # Markdown Live Mode Implementation Plan
 
+> **Note:** Live mode was dropped on 2026-10-06 (Scintilla cannot keep the edited block rendered); only the writing helpers (§8) and scoped bindings (§9) shipped.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a Live Markdown mode that shows rendered Markdown inside the Scintilla editor, with markup revealed on the lines being edited. Also add Markdown writing helpers and key bindings that apply only in Markdown files.

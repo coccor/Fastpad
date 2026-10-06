@@ -1,5 +1,7 @@
 # FastPad Markdown Live Mode Design
 
+> **Note:** Live mode was dropped on 2026-10-06 (Scintilla cannot keep the edited block rendered); only the writing helpers (§8) and scoped bindings (§9) shipped.
+
 Status: Approved design (pending written-spec review)  
 Date: 6 October 2026  
 Builds on: `2026-09-16-markdown-preview-design.md`, `2026-09-17-preview-html-rendering-design.md`, `2026-09-28-syntax-highlighting-design.md`
