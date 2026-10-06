@@ -33,12 +33,34 @@ const EXTRA_TITLES: [(CommandId, &str); 22] = [
     (CommandId::FocusLastGroup, "View: Focus last editor group"),
 ];
 
-/// What the page calls `command`: its palette label, or its name from `EXTRA_TITLES`.
+/// Names for the Markdown-scoped commands: their keys work only in Markdown files, so the page
+/// says so (live mode spec §9).
+const MARKDOWN_SCOPED_TITLES: [(CommandId, &str); 4] = [
+    (CommandId::MarkdownBold, "Markdown: Bold (Markdown files)"),
+    (
+        CommandId::MarkdownItalic,
+        "Markdown: Italic (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownCode,
+        "Markdown: Inline code (Markdown files)",
+    ),
+    (CommandId::MarkdownLink, "Markdown: Link (Markdown files)"),
+];
+
+/// What the page calls `command`: its Markdown-scoped name, its palette label, or its name from
+/// `EXTRA_TITLES`.
 pub(crate) fn title(command: CommandId) -> Option<&'static str> {
-    crate::window::command_palette::ENTRIES
+    MARKDOWN_SCOPED_TITLES
         .iter()
-        .find(|entry| entry.command == command)
-        .map(|entry| entry.label)
+        .find(|(candidate, _)| *candidate == command)
+        .map(|(_, title)| *title)
+        .or_else(|| {
+            crate::window::command_palette::ENTRIES
+                .iter()
+                .find(|entry| entry.command == command)
+                .map(|entry| entry.label)
+        })
         .or_else(|| {
             EXTRA_TITLES
                 .iter()
@@ -449,6 +471,21 @@ mod tests {
             );
         }
         assert_eq!(title(CommandId::SelectTab3), Some("View: Select tab 3"));
+    }
+
+    #[test]
+    fn markdown_scoped_titles_say_where_their_keys_work() {
+        // Break caught: Ctrl+B listed twice on the page with nothing telling the two rows apart.
+        for (command, _) in crate::window::keymap::COMMAND_IDS {
+            let scoped = command.scope() == crate::window::commands::Scope::Markdown;
+            let suffixed =
+                title(*command).is_some_and(|title| title.ends_with(" (Markdown files)"));
+            assert_eq!(scoped, suffixed, "{command:?}");
+        }
+        assert_eq!(
+            title(CommandId::MarkdownBold),
+            Some("Markdown: Bold (Markdown files)")
+        );
     }
 
     #[test]

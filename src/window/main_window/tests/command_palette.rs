@@ -23,13 +23,14 @@ fn the_command_palette_filters_as_typed_and_runs_the_selection_on_enter() {
     execute_command(window.hwnd, CommandId::CommandPalette);
     assert!(palette(window.hwnd).is_visible());
     assert!(panel_visible(window.hwnd));
-    // Markdown preview commands are listed only while the active tab is Markdown, and New
-    // note and New folder only while a notebook is open (this window has none).
+    // Markdown preview and Markdown editing commands are listed only while the active tab is
+    // Markdown, and New note and New folder only while a notebook is open (this window has none).
     assert_eq!(
         palette(window.hwnd).shown().len(),
         crate::window::command_palette::ENTRIES
             .iter()
             .filter(|entry| !entry.command.is_markdown_preview())
+            .filter(|entry| !entry.command.is_markdown_edit())
             .filter(|entry| !matches!(entry.command, CommandId::NoteNew | CommandId::NoteNewFolder))
             .count()
     );

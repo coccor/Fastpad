@@ -525,6 +525,8 @@ pub(super) fn refilter_command_palette(hwnd: HWND) {
         let has_tabs = tab_count(hwnd) > 0;
         let markdown = crate::window::preview_host::buttons_visible(hwnd);
         let image = crate::window::image_host::active_is_image(hwnd);
+        // Not `buttons_visible`, which also holds for SVG.
+        let markdown_document = active_language(hwnd) == crate::document::Language::Markdown;
         let sidebar = notes_mode_enabled(hwnd);
         // New note and New folder need a notebook, open or loading, to put the item in (inline
         // naming spec §3.1).
@@ -534,6 +536,7 @@ pub(super) fn refilter_command_palette(hwnd: HWND) {
             (has_tabs || !command.needs_document())
                 && (!image || !command.needs_text())
                 && (markdown || !command.is_markdown_preview())
+                && (markdown_document || !command.is_markdown_edit())
                 && (sidebar || !command.is_sidebar())
                 && (notebook || !matches!(command, CommandId::NoteNew | CommandId::NoteNewFolder))
                 // Close Group with one empty group would do nothing.

@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::platform::{last_error, wide_null};
-use crate::window::commands::CommandId;
+use crate::window::commands::{CommandId, Scope};
 use crate::window::menu_band::{self, MENU_TITLES};
 use crate::window::modal::ModalScope;
 use std::cell::RefCell;
@@ -22,12 +22,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 pub(crate) struct AcceleratorTable(HACCEL);
 
 impl AcceleratorTable {
-    /// The table for `keymap`'s bindings, in its precedence order: `TranslateAcceleratorW`
+    /// The table for `keymap`'s global bindings, in its precedence order: `TranslateAcceleratorW`
     /// takes the first entry that matches, so a user binding shadows a default on its key.
+    /// Markdown-scoped keys are dispatched before the table (live mode spec §9).
     pub(crate) fn create(keymap: &crate::window::keymap::Keymap) -> Result<Self> {
         let accelerators = keymap
             .bindings()
             .iter()
+            .filter(|binding| binding.command.scope() == Scope::Global)
             .map(|binding| ACCEL {
                 fVirt: FVIRTKEY | binding.stroke.accel_flags(),
                 key: binding.stroke.vk,
@@ -224,6 +226,7 @@ impl MenuBar {
                     ),
                     MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
                     MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
+                    MenuEntry::command("&Live Markdown", CommandId::MarkdownToggleLive),
                     MenuEntry::Separator,
                     MenuEntry::command("Command &palette...", CommandId::CommandPalette),
                 ],
@@ -266,6 +269,17 @@ pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
         CommandId::MarkdownPreviewClose,
     ] {
         unsafe { EnableMenuItem(menu, command as u32, state) };
+    }
+}
+
+/// Grays Live Markdown off Markdown tabs and checks it while the active document is Live.
+pub(crate) fn set_markdown_live(menu: HMENU, enabled: bool, checked: bool) {
+    let command = CommandId::MarkdownToggleLive as u32;
+    let enable = if enabled { MF_ENABLED } else { MF_GRAYED };
+    let check = if checked { MF_CHECKED } else { MF_UNCHECKED };
+    unsafe {
+        EnableMenuItem(menu, command, MF_BYCOMMAND | enable);
+        CheckMenuItem(menu, command, MF_BYCOMMAND | check);
     }
 }
 
@@ -753,7 +767,7 @@ pub(crate) fn answer_next_popup_menu(answer: impl FnOnce(HWND) -> Option<Command
 
 #[cfg(test)]
 mod tests {
-    use crate::window::commands::CommandId;
+    use crate::window::commands::{CommandId, Scope};
 
     fn label(
         menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
@@ -829,10 +843,12 @@ mod tests {
         command: CommandId,
     }
 
+    /// The default bindings the accelerator table holds: the global ones.
     fn accelerator_specs() -> Vec<Spec> {
         crate::window::keymap::Keymap::defaults()
             .bindings()
             .iter()
+            .filter(|binding| binding.command.scope() == Scope::Global)
             .map(|binding| Spec {
                 modifiers: binding.stroke.accel_flags(),
                 key: binding.stroke.vk,
@@ -862,7 +878,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 82);
+        assert_eq!(specs.len(), 83);
     }
 
     #[test]
@@ -871,7 +887,7 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         let table = super::AcceleratorTable::create(&crate::window::keymap::Keymap::defaults())
             .expect("accelerator table");
-        assert_eq!(table.entries().len(), 82);
+        assert_eq!(table.entries().len(), 83);
     }
 
     #[test]
@@ -890,14 +906,18 @@ mod tests {
 
     #[test]
     fn every_shortcut_chord_maps_to_exactly_one_command() {
-        let specs = accelerator_specs();
-        for (index, spec) in specs.iter().enumerate() {
+        // A Markdown-scoped key may match a global one (live mode spec §9), never one of its own
+        // scope.
+        let keymap = crate::window::keymap::Keymap::defaults();
+        let bindings = keymap.bindings();
+        for (index, binding) in bindings.iter().enumerate() {
             assert!(
-                specs[index + 1..]
-                    .iter()
-                    .all(|other| (other.modifiers, other.key) != (spec.modifiers, spec.key)),
+                bindings[index + 1..].iter().all(|other| {
+                    (other.command.scope(), other.stroke)
+                        != (binding.command.scope(), binding.stroke)
+                }),
                 "duplicate chord for {:?}",
-                spec.command
+                binding.command
             );
         }
     }

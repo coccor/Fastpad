@@ -2,7 +2,7 @@
 //! user's overrides resolved into the bindings every surface reads (keyboard shortcuts spec §3).
 //! Pure: no window handles.
 
-use crate::window::commands::CommandId;
+use crate::window::commands::{CommandId, Scope};
 use std::collections::BTreeMap;
 use std::fmt;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -342,6 +342,11 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::AddCursorAbove, "edit.addCursorAbove"),
     (CommandId::AddCursorBelow, "edit.addCursorBelow"),
     (CommandId::About, "help.about"),
+    (CommandId::MarkdownToggleLive, "markdown.toggleLive"),
+    (CommandId::MarkdownBold, "markdown.bold"),
+    (CommandId::MarkdownItalic, "markdown.italic"),
+    (CommandId::MarkdownCode, "markdown.code"),
+    (CommandId::MarkdownLink, "markdown.link"),
 ];
 
 pub(crate) fn command_id(command: CommandId) -> Option<&'static str> {
@@ -376,7 +381,7 @@ const fn ch(byte: u8) -> u16 {
 }
 
 /// FastPad's shortcuts before any override, in precedence order (spec §3.3).
-pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 82] = [
+pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 87] = [
     (key(C, ch(b'N')), CommandId::New),
     (key(C, ch(b'T')), CommandId::New),
     (key(C, ch(b'O')), CommandId::Open),
@@ -463,6 +468,12 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 82] = [
     (key(C | S, ch(b'L')), CommandId::SelectAllOccurrences),
     (key(C | A, VK_UP), CommandId::AddCursorAbove),
     (key(C | A, VK_DOWN), CommandId::AddCursorBelow),
+    (key(C | A, ch(b'V')), CommandId::MarkdownToggleLive),
+    // Markdown-scoped (live mode spec §9): these never shadow a global binding.
+    (key(C, ch(b'B')), CommandId::MarkdownBold),
+    (key(C, ch(b'I')), CommandId::MarkdownItalic),
+    (key(C, VK_OEM_3), CommandId::MarkdownCode),
+    (key(C, ch(b'K')), CommandId::MarkdownLink),
 ];
 
 pub(crate) fn default_keys(command: CommandId) -> Vec<KeyStroke> {
@@ -663,21 +674,29 @@ impl Keymap {
             .any(|(overridden, _)| *overridden == command)
     }
 
-    /// The command `stroke` runs: the first binding in precedence order. The accelerator table
-    /// resolves keys in the app; `first_text` and the tests follow the same rule with this.
+    /// The global command `stroke` runs: the first global binding in precedence order. The
+    /// accelerator table resolves keys in the app; `first_text` and the tests follow the same
+    /// rule with this.
     pub(crate) fn command_for(&self, stroke: KeyStroke) -> Option<CommandId> {
+        self.command_for_in(stroke, Scope::Global)
+    }
+
+    /// The command `stroke` runs among the bindings of `scope` (live mode spec §9).
+    pub(crate) fn command_for_in(&self, stroke: KeyStroke, scope: Scope) -> Option<CommandId> {
         self.bindings
             .iter()
-            .find(|binding| binding.stroke == stroke)
+            .find(|binding| binding.stroke == stroke && binding.command.scope() == scope)
             .map(|binding| binding.command)
     }
 
-    /// The commands other than `except` bound to `stroke`, each once, in precedence order.
+    /// The commands other than `except` bound to `stroke` in `except`'s scope, each once, in
+    /// precedence order. A Markdown key that matches a global one is not a conflict.
     pub(crate) fn conflicts(&self, stroke: KeyStroke, except: CommandId) -> Vec<CommandId> {
         let mut commands = Vec::new();
         for binding in &self.bindings {
             if binding.stroke == stroke
                 && binding.command != except
+                && binding.command.scope() == except.scope()
                 && !commands.contains(&binding.command)
             {
                 commands.push(binding.command);
@@ -693,7 +712,7 @@ impl Keymap {
             .iter()
             .filter(|binding| binding.command == command)
             .map(|binding| binding.stroke)
-            .find(|stroke| self.command_for(*stroke) == Some(command))
+            .find(|stroke| self.command_for_in(*stroke, command.scope()) == Some(command))
             .map(|stroke| stroke.text())
     }
 
@@ -1056,5 +1075,54 @@ mod tests {
         assert!(bindable(stroke("F10")).is_err(), "menu");
         assert!(bindable(stroke("Shift+F10")).is_err(), "context menu");
         assert_eq!(bindable(stroke("Ctrl+F10")), Ok(()));
+    }
+
+    #[test]
+    fn markdown_bindings_do_not_shadow_global_ones() {
+        // Break caught: Ctrl+B bolding in a .txt file, or Toggle Sidebar losing its key text.
+        let keymap = Keymap::defaults();
+        let ctrl_b = KeyStroke::parse("Ctrl+B").unwrap();
+        assert_eq!(keymap.command_for(ctrl_b), Some(CommandId::ToggleSidebar));
+        assert_eq!(
+            keymap.command_for_in(ctrl_b, Scope::Markdown),
+            Some(CommandId::MarkdownBold)
+        );
+        assert_eq!(
+            keymap.first_text(CommandId::ToggleSidebar).as_deref(),
+            Some("Ctrl+B")
+        );
+        assert_eq!(
+            keymap.first_text(CommandId::MarkdownBold).as_deref(),
+            Some("Ctrl+B")
+        );
+        assert!(keymap.conflicts(ctrl_b, CommandId::MarkdownBold).is_empty());
+        assert!(
+            keymap
+                .conflicts(ctrl_b, CommandId::ToggleSidebar)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn live_markdown_toggles_with_ctrl_alt_v() {
+        let keymap = Keymap::defaults();
+        let stroke = KeyStroke::parse("Ctrl+Alt+V").unwrap();
+        assert_eq!(
+            keymap.command_for(stroke),
+            Some(CommandId::MarkdownToggleLive)
+        );
+    }
+
+    #[test]
+    fn a_user_rebinding_keeps_the_commands_scope() {
+        let entries = BTreeMap::from([("markdown.bold".to_owned(), "Ctrl+Shift+B".to_owned())]);
+        let (keymap, warnings) = Keymap::from_ini(&entries);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let stroke = KeyStroke::parse("Ctrl+Shift+B").unwrap();
+        assert_eq!(keymap.command_for(stroke), None);
+        assert_eq!(
+            keymap.command_for_in(stroke, Scope::Markdown),
+            Some(CommandId::MarkdownBold)
+        );
     }
 }
