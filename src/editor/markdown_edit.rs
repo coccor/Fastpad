@@ -465,7 +465,7 @@ fn nesting(text: &str, line: Range<usize>) -> Option<Nesting> {
             after_blank = true;
             continue;
         }
-        let indent = columns(&content[..content.len() - content.trim_start_matches([' ', '\t']).len()]);
+        let indent = leading(content).1;
         let keep = containing(&open, indent);
         let base = keep.checked_sub(1).map_or(0, |parent| open[parent].content);
         match list_prefix(content) {
@@ -473,7 +473,7 @@ fn nesting(text: &str, line: Range<usize>) -> Option<Nesting> {
                 open.truncate(keep);
                 open.push(Item::of(&prefix));
             }
-            _ if indent == 0 && (is_thematic_break(content) || content.starts_with(['#', '>', '`', '~'])) => {
+            _ if indent == 0 && breaks_lists(content) => {
                 open.clear();
             }
             // A paragraph after a blank line closes the items that do not contain it; without
@@ -496,7 +496,8 @@ fn nesting(text: &str, line: Range<usize>) -> Option<Nesting> {
 /// Shift+Tab moves the item to its parent's indent, or a top-level item to the margin; a marker
 /// indented too deep to be an item comes back to the shallowest item position there. An
 /// ordered item that ends up starting a new list is renumbered to 1: only `1.` may start a list
-/// right under paragraph text.
+/// right under paragraph text. The item's children move with it; after a Shift+Tab its later
+/// siblings become its children.
 pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditPlan> {
     let line = line_bounds(text, caret);
     let prefix = list_prefix(&text[line.clone()])?;
@@ -532,10 +533,109 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
     } else {
         line.start + new_indent
     };
-    Some(EditPlan {
-        edits: vec![TextEdit { range: line.start..line.start + replaced, text: new_prefix }],
-        selections: vec![after..after],
-    })
+    // The item's block (lines indented to its content, blank lines inside it) moves with it, by
+    // the change of its content column, so its children keep their place under it.
+    let renumber_shrink = (replaced - prefix.indent_len) - (new_prefix.len() - new_indent);
+    let new_content = prefix.content - prefix.indent + new_indent - renumber_shrink;
+    let mut edits = vec![TextEdit { range: line.start..line.start + replaced, text: new_prefix }];
+    let block_end = shift_lines(text, line.end, prefix.content, new_content, &mut edits);
+    if outdent && !nesting.too_deep {
+        match nesting.parent {
+            // The rest of the parent's block (the item's later siblings) becomes the item's
+            // children: lined up with its content instead of the parent's.
+            Some(parent) => {
+                let mut rest = block_end;
+                // The first of them starts a new child list unless it continues the item's own
+                // last child list; an ordered one is then renumbered to 1.
+                let mut last_child: Option<Item> = None;
+                for below in text[line.end..block_end].split('\n').skip(1) {
+                    let Some(child) = list_prefix(below.trim_end_matches('\r')) else { continue };
+                    let child = Item::of(&child);
+                    if last_child.is_none_or(|last| child.indent < last.content) {
+                        last_child = Some(child);
+                    }
+                }
+                let first = next_line(text, block_end, |content| !content.trim().is_empty());
+                if let Some(first) = first
+                    && let Some(sibling) = list_prefix(&text[first.clone()])
+                    && sibling.indent >= parent.content
+                    && sibling.number.is_some_and(|(value, _)| value != 1)
+                    && last_child.is_none_or(|last| last.kind != Item::of(&sibling).kind)
+                {
+                    let digits = text[first.start + sibling.indent_len..].bytes().take_while(u8::is_ascii_digit).count();
+                    let indent = sibling.indent - parent.content + new_content;
+                    edits.push(TextEdit {
+                        range: first.start..first.start + sibling.indent_len + digits,
+                        text: format!("{}1", " ".repeat(indent)),
+                    });
+                    let content = sibling.content - sibling.indent + indent - (digits - 1);
+                    rest = shift_lines(text, first.end, sibling.content, content, &mut edits);
+                }
+                shift_lines(text, rest, parent.content, new_content, &mut edits);
+            }
+            // At the top level the depth does not change; refuse when the next sibling would
+            // end up inside the item.
+            None => {
+                let next = next_line(text, block_end, |content| !content.trim().is_empty());
+                if next.is_some_and(|next| list_prefix(&text[next]).is_some_and(|item| item.indent >= new_content)) {
+                    return Some(EditPlan { edits: Vec::new(), selections: vec![caret..caret] });
+                }
+            }
+        }
+    }
+    Some(EditPlan { edits, selections: vec![after..after] })
+}
+
+/// The first line after the line ending at `line_end` that satisfies `wanted`.
+fn next_line(text: &str, mut line_end: usize, wanted: impl Fn(&str) -> bool) -> Option<Range<usize>> {
+    while let Some(newline) = text[line_end..].find('\n') {
+        let below = line_bounds(text, line_end + newline + 1);
+        if wanted(&text[below.clone()]) {
+            return Some(below);
+        }
+        line_end = below.end;
+    }
+    None
+}
+
+/// Re-indents the lines after the line ending at `line_end` that are indented to `column` or
+/// deeper (blank lines between them included) so that `column` lands on `new_column`, keeping
+/// their indents relative to each other. Stops before the first non-blank line indented less;
+/// returns the end of the last line it took.
+fn shift_lines(text: &str, mut line_end: usize, column: usize, new_column: usize, edits: &mut Vec<TextEdit>) -> usize {
+    let mut taken = line_end;
+    while let Some(newline) = text[line_end..].find('\n') {
+        let below = line_bounds(text, line_end + newline + 1);
+        line_end = below.end;
+        let content = &text[below.clone()];
+        if content.trim().is_empty() {
+            continue;
+        }
+        let (lead_len, lead) = leading(content);
+        if lead < column {
+            break;
+        }
+        taken = below.end;
+        let pad = " ".repeat(lead - column + new_column);
+        if content[..lead_len] != pad {
+            edits.push(TextEdit { range: below.start..below.start + lead_len, text: pad });
+        }
+    }
+    taken
+}
+
+/// A line's leading whitespace: its length in bytes and its width in visual columns.
+fn leading(line: &str) -> (usize, usize) {
+    let len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    (len, columns(&line[..len]))
+}
+
+/// A column-0 line that ends every open list: an ATX heading, a block quote, a code fence or a
+/// thematic break.
+fn breaks_lists(line: &str) -> bool {
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    let heading = (1..=6).contains(&hashes) && matches!(line.as_bytes().get(hashes), None | Some(b' ' | b'\t'));
+    heading || line.starts_with('>') || line.starts_with("```") || line.starts_with("~~~") || is_thematic_break(line)
 }
 
 fn is_delimiter_row(line: &str) -> bool {
@@ -1108,18 +1208,65 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_item_takes_its_children_along() {
+        let text = "- a\n- b\n  - c";
+        assert_eq!(nest(text, 7, false), Some(("- a\n  - b\n    - c".into(), 9)));
+        let text = "- a\n\t- b\n\t\t- c";
+        assert_eq!(nest(text, 8, true), Some(("- a\n- b\n    - c".into(), 7)));
+        let text = "- a\r\n- b\r\n\r\n  more\r\n  - c\r\n- d";
+        assert_eq!(
+            nest(text, 8, false),
+            Some(("- a\r\n  - b\r\n\r\n    more\r\n    - c\r\n- d".into(), 10)),
+            "blank lines inside the block, CRLF; the next sibling stays"
+        );
+        assert_eq!(nest("1. a\n10. b\n    - c", 9, true), None, "top level, nothing to un-nest");
+        assert_eq!(nest("- a\n  - b\n  - c", 9, true), Some(("- a\n- b\n  - c".into(), 7)), "c becomes b's child");
+        assert_eq!(
+            nest("- a\n   1. b\n   2. c", 11, true),
+            Some(("- a\n1. b\n    1. c".into(), 8)),
+            "c starts b's child list, keeping its extra space"
+        );
+        assert_eq!(nest("  - a\n- b", 5, true), Some(("- a\n- b".into(), 3)));
+        assert_eq!(nest("  - a\n  - b", 5, true), Some(("  - a\n  - b".into(), 5)), "b would end up inside a");
+        let text = "1. a\n\n   10. b\n       - c";
+        assert_eq!(
+            nest(text, 14, true),
+            Some(("1. a\n\n10. b\n    - c".into(), 11)),
+            "the children follow the content column"
+        );
+        let text = "- a\n\n  10. b\n      - c";
+        assert_eq!(
+            nest(text, 12, true),
+            Some(("- a\n\n1. b\n   - c".into(), 9)),
+            "renumbered to 1: the children follow the narrower marker"
+        );
+    }
+
+    #[test]
+    fn only_real_headings_quotes_and_fences_end_a_list() {
+        assert_eq!(nest("- a\n#tag\n- b", 12, false), Some(("- a\n#tag\n  - b".into(), 14)));
+        let consumed = |text: &str| indent_list_item(text, text.len(), false).unwrap().edits.is_empty();
+        assert!(consumed("- a\n# Title\n- b"));
+        assert!(consumed("- a\n> quote\n- b"));
+        assert!(consumed("- a\n```\n- b"));
+    }
+
+    #[test]
     fn tab_and_shift_tab_change_the_parsed_depth_by_one() {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = |bound: usize| {
             state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
             usize::try_from(state >> 33).unwrap() % bound
         };
+        let label = |index: usize| char::from(b'a' + u8::try_from(index).unwrap()).to_string();
         for _ in 0..1500 {
             // A list's indent is its parent's content column (0 at the top) plus 0-1 spaces,
             // written with spaces or with tabs; ordered items count up from 1 within their list.
+            // Some items are preceded by a blank line.
             let mut lines: Vec<String> = Vec::new();
+            let mut item_lines = Vec::new();
             let mut open: Vec<(usize, &str, usize)> = Vec::new(); // (content column, marker, number)
-            for index in 0..2 + next(5) {
+            for index in 0..2 + next(7) {
                 let depth = if index == 0 { 1 } else { 1 + next((open.len() + 1).min(3)) };
                 let base = if depth == 1 { 0 } else { open[depth - 2].0 };
                 let marker = ["-", "*", "1."][next(3)];
@@ -1133,33 +1280,53 @@ mod tests {
                 };
                 let marker_text = if marker == "1." { format!("{number}.") } else { marker.to_string() };
                 open.push((column + marker_text.len() + 1, marker, number));
-                lines.push(format!("{lead}{marker_text} {}", char::from(b'a' + u8::try_from(index).unwrap())));
+                if index > 0 && next(6) == 0 {
+                    lines.push(String::new());
+                }
+                item_lines.push(lines.len());
+                lines.push(format!("{lead}{marker_text} {}", label(index)));
             }
             let text = lines.join("\n");
             let before = item_depths(&text);
-            for index in 0..lines.len() {
-                let label = char::from(b'a' + u8::try_from(index).unwrap()).to_string();
-                let (depth, first) = before[&label];
-                assert!(depth >= 1, "{text:?}: {label} should be an item");
-                let caret = lines[..=index].iter().map(|line| line.len() + 1).sum::<usize>() - 1;
+            let depths: Vec<usize> = (0..item_lines.len()).map(|index| before[&label(index)].0).collect();
+            // After an edit to item `index` whose own depth went to `moved`: its descendants keep
+            // their depth relative to it, every other item keeps its depth.
+            let check = |out: &str, index: usize, moved: usize, what: &str| {
+                let after = item_depths(out);
+                let after: Vec<usize> = (0..depths.len()).map(|other| after.get(&label(other)).map_or(0, |depth| depth.0)).collect();
+                assert_eq!(after[index], moved, "{what} on {}: {text:?} -> {out:?}", label(index));
+                let block_end =
+                    (index + 1..depths.len()).find(|other| depths[*other] <= depths[index]).unwrap_or(depths.len());
+                for other in 0..depths.len() {
+                    let expected = if other == index {
+                        moved
+                    } else if (index + 1..block_end).contains(&other) {
+                        depths[other] + moved - depths[index]
+                    } else {
+                        depths[other]
+                    };
+                    assert_eq!(after[other], expected, "{what} on {}, item {}: {text:?} -> {out:?}", label(index), label(other));
+                }
+            };
+            for (index, line) in item_lines.iter().enumerate() {
+                let (depth, first) = before[&label(index)];
+                assert!(depth >= 1, "{text:?}: {} should be an item", label(index));
+                let caret = lines[..=*line].iter().map(|line| line.len() + 1).sum::<usize>() - 1;
 
                 let plan = indent_list_item(&text, caret, false).unwrap();
                 assert_well_formed(&text, &plan, &text);
-                let out = plan.apply_to(&text);
                 if plan.edits.is_empty() {
-                    assert!(first, "Tab on {label} in {text:?} was a no-op but it has a previous sibling");
+                    assert!(first, "Tab on {} in {text:?} was a no-op but it has a previous sibling", label(index));
                     assert_eq!(plan.selections, vec![caret..caret]);
                 } else {
-                    assert_eq!(item_depths(&out)[&label].0, depth + 1, "Tab on {label}: {text:?} -> {out:?}");
+                    check(&plan.apply_to(&text), index, depth + 1, "Tab");
                 }
 
                 match indent_list_item(&text, caret, true) {
-                    None => assert_eq!(depth, 1, "Shift+Tab on {label} in {text:?} did nothing"),
+                    None => assert_eq!(depth, 1, "Shift+Tab on {} in {text:?} did nothing", label(index)),
                     Some(plan) => {
                         assert_well_formed(&text, &plan, &text);
-                        let out = plan.apply_to(&text);
-                        let after = item_depths(&out)[&label].0;
-                        assert_eq!(after, (depth - 1).max(1), "Shift+Tab on {label}: {text:?} -> {out:?}");
+                        check(&plan.apply_to(&text), index, (depth - 1).max(1), "Shift+Tab");
                     }
                 }
             }
