@@ -220,6 +220,9 @@ pub(crate) unsafe fn translate_accelerator(
     if crate::window::tab_drag::keeps_key(hwnd, message) {
         return true;
     }
+    if alt_release_after_click(hwnd, message) {
+        return true;
+    }
     if menu_activation_message(hwnd, message)
         && unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0) } != 0
     {
@@ -233,6 +236,9 @@ pub(crate) unsafe fn translate_accelerator(
     }
     if start_tab_for_typing(hwnd, message) {
         return true;
+    }
+    if editing_key_off_editor(hwnd, message) {
+        return false;
     }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
@@ -289,6 +295,37 @@ fn start_tab_for_typing(
     true
 }
 
+/// A key bound to an editing-shortcut command while the focus is not in an editor: it stays
+/// with the focused control, as VS Code's `editorTextFocus` (editing shortcuts spec §6).
+fn editing_key_off_editor(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    if !matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        return false;
+    }
+    let down = |key: u16| unsafe { GetKeyState(i32::from(key)) } < 0;
+    let Some(stroke) = crate::window::keymap::KeyStroke::from_key(
+        message.wParam as u16,
+        down(VK_CONTROL),
+        down(VK_SHIFT),
+        down(VK_MENU),
+    ) else {
+        return false;
+    };
+    let editing = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.keymap.command_for(stroke))
+        .is_some_and(CommandId::is_editing);
+    editing && !is_group_editor(hwnd, message.hwnd)
+}
+
+/// Whether `window` is one of the editor groups' editors.
+fn is_group_editor(hwnd: HWND, window: HWND) -> bool {
+    group_of_child(hwnd, window)
+        .and_then(|id| group_editor(hwnd, id))
+        .is_some_and(|editor| editor.hwnd() == window)
+}
+
 /// Ctrl+W (without Alt) aimed at one of the command palette's controls.
 fn palette_keeps_key(
     hwnd: HWND,
@@ -337,14 +374,43 @@ fn menu_activation_message(
         return true;
     }
     if message.message == WM_SYSKEYDOWN && message.wParam == VK_MENU as usize {
+        // A held Alt auto-repeats (bit 30: the key was already down). Only the first press
+        // starts a tap; a repeat after Alt+Click must not re-arm the menu.
+        if message.lParam & (1 << 30) != 0 {
+            return false;
+        }
         app.set_menu_alt_pending(no_control_or_shift);
+        app.set_menu_alt_clicked(false);
         return false;
     }
     if message.message == WM_SYSKEYUP && message.wParam == VK_MENU as usize {
         return app.take_menu_alt_pending();
     }
-    if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+    // Alt+Click (a caret in the editor) is Alt with other input, not a bare tap.
+    if matches!(
+        message.message,
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+    ) && unsafe { GetKeyState(VK_MENU as i32) } < 0
+    {
+        app.set_menu_alt_clicked(true);
+    }
+    if matches!(
+        message.message,
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+    ) {
         app.set_menu_alt_pending(false);
     }
     false
+}
+
+/// The release of an Alt held for a click. Windows counts a click as no input, so passed on it
+/// would open the menu band; consumed, it does nothing (editing shortcuts spec §5).
+fn alt_release_after_click(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    message.message == WM_SYSKEYUP
+        && message.wParam == VK_MENU as usize
+        && unsafe { app_ptr(hwnd) }
+            .is_some_and(|mut app| unsafe { app.as_mut() }.take_menu_alt_clicked())
 }

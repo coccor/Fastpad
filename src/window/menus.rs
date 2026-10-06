@@ -146,6 +146,39 @@ impl MenuBar {
                     MenuEntry::command("&Copy", CommandId::Copy),
                     MenuEntry::command("&Paste", CommandId::Paste),
                     MenuEntry::Separator,
+                    MenuEntry::Submenu(
+                        "&Line",
+                        vec![
+                            MenuEntry::command("Move line &up", CommandId::MoveLinesUp),
+                            MenuEntry::command("Move line &down", CommandId::MoveLinesDown),
+                            MenuEntry::command("&Copy line up", CommandId::CopyLinesUp),
+                            MenuEntry::command("Copy line do&wn", CommandId::CopyLinesDown),
+                            MenuEntry::command("D&elete line", CommandId::DeleteLines),
+                            MenuEntry::command("Insert line &below", CommandId::InsertLineBelow),
+                            MenuEntry::command("Insert line &above", CommandId::InsertLineAbove),
+                            MenuEntry::command("&Indent line", CommandId::IndentLines),
+                            MenuEntry::command("&Outdent line", CommandId::OutdentLines),
+                            MenuEntry::command("&Select line", CommandId::ExpandLineSelection),
+                        ],
+                    ),
+                    MenuEntry::Submenu(
+                        "&Selection",
+                        vec![
+                            MenuEntry::command(
+                                "Add &next occurrence",
+                                CommandId::AddNextOccurrence,
+                            ),
+                            MenuEntry::command(
+                                "Select &all occurrences",
+                                CommandId::SelectAllOccurrences,
+                            ),
+                            MenuEntry::command("Add cursor &above", CommandId::AddCursorAbove),
+                            MenuEntry::command("Add cursor &below", CommandId::AddCursorBelow),
+                        ],
+                    ),
+                    MenuEntry::command("Toggle line co&mment", CommandId::ToggleLineComment),
+                    MenuEntry::command("Toggle bloc&k comment", CommandId::ToggleBlockComment),
+                    MenuEntry::Separator,
                     MenuEntry::command("&Format JSON", CommandId::FormatJson),
                 ],
                 keymap,
@@ -829,7 +862,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 66);
+        assert_eq!(specs.len(), 82);
     }
 
     #[test]
@@ -838,7 +871,7 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         let table = super::AcceleratorTable::create(&crate::window::keymap::Keymap::defaults())
             .expect("accelerator table");
-        assert_eq!(table.entries().len(), 66);
+        assert_eq!(table.entries().len(), 82);
     }
 
     #[test]
@@ -917,7 +950,12 @@ mod tests {
         assert_eq!(bound(FCONTROL, VK_OEM_PLUS), Some(CommandId::ZoomIn));
         assert_eq!(bound(FCONTROL, VK_OEM_MINUS), Some(CommandId::ZoomOut));
         assert_eq!(bound(FCONTROL, u16::from(b'0')), Some(CommandId::ZoomReset));
-        assert_eq!(bound(FCONTROL, u16::from(b'L')), None);
+        // Ctrl+L is Select line now (editing shortcuts spec §3); the removed text direction
+        // commands left Ctrl+R free.
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'L')),
+            Some(CommandId::ExpandLineSelection)
+        );
         assert_eq!(bound(FCONTROL, u16::from(b'R')), None);
         assert_eq!(
             bound(FCONTROL | FSHIFT, u16::from(b'P')),

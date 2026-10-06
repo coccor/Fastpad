@@ -192,9 +192,11 @@ impl Editor {
         ))
     }
 
+    /// Cuts the selection, or the caret's whole line when the selection is empty (editing
+    /// shortcuts spec §3).
     #[cfg(windows)]
     pub fn cut(&self) -> Result<()> {
-        self.endpoint.send_direct_checked(SCI_CUT, 0, 0)?;
+        self.endpoint.send_direct_checked(SCI_CUTALLOWLINE, 0, 0)?;
         Ok(())
     }
 
@@ -205,9 +207,11 @@ impl Editor {
         ))
     }
 
+    /// Copies the selection, or the caret's whole line when the selection is empty (editing
+    /// shortcuts spec §3).
     #[cfg(windows)]
     pub fn copy(&self) -> Result<()> {
-        self.endpoint.send_direct_checked(SCI_COPY, 0, 0)?;
+        self.endpoint.send_direct_checked(SCI_COPYALLOWLINE, 0, 0)?;
         Ok(())
     }
 

@@ -146,6 +146,60 @@ pub(super) fn execute_command_with_note(
         CommandId::Paste => with_editor(hwnd, |editor| {
             let _ = editor.paste();
         }),
+        CommandId::MoveLinesUp => with_editor(hwnd, |editor| {
+            let _ = editor.move_lines(true);
+        }),
+        CommandId::MoveLinesDown => with_editor(hwnd, |editor| {
+            let _ = editor.move_lines(false);
+        }),
+        CommandId::CopyLinesUp => with_editor(hwnd, |editor| {
+            let _ = editor.copy_lines(false);
+        }),
+        CommandId::CopyLinesDown => with_editor(hwnd, |editor| {
+            let _ = editor.copy_lines(true);
+        }),
+        CommandId::DeleteLines => with_editor(hwnd, |editor| {
+            let _ = editor.delete_lines();
+        }),
+        CommandId::InsertLineBelow => with_editor(hwnd, |editor| {
+            let _ = editor.insert_line(true);
+        }),
+        CommandId::InsertLineAbove => with_editor(hwnd, |editor| {
+            let _ = editor.insert_line(false);
+        }),
+        CommandId::IndentLines => with_editor(hwnd, |editor| {
+            let _ = editor.indent_lines(false);
+        }),
+        CommandId::OutdentLines => with_editor(hwnd, |editor| {
+            let _ = editor.indent_lines(true);
+        }),
+        CommandId::ExpandLineSelection => with_editor(hwnd, |editor| {
+            let _ = editor.expand_line_selection();
+        }),
+        CommandId::ToggleLineComment => {
+            let syntax = active_language(hwnd).comment_syntax();
+            with_editor(hwnd, |editor| {
+                let _ = editor.toggle_line_comment(syntax);
+            });
+        }
+        CommandId::ToggleBlockComment => {
+            let syntax = active_language(hwnd).comment_syntax();
+            with_editor(hwnd, |editor| {
+                let _ = editor.toggle_block_comment(syntax);
+            });
+        }
+        CommandId::AddNextOccurrence => with_editor(hwnd, |editor| {
+            let _ = editor.add_next_occurrence();
+        }),
+        CommandId::SelectAllOccurrences => with_editor(hwnd, |editor| {
+            let _ = editor.select_all_occurrences();
+        }),
+        CommandId::AddCursorAbove => with_editor(hwnd, |editor| {
+            let _ = editor.add_cursor(true);
+        }),
+        CommandId::AddCursorBelow => with_editor(hwnd, |editor| {
+            let _ = editor.add_cursor(false);
+        }),
         CommandId::Find => open_find_bar(hwnd, find_bar::FindBarMode::Find),
         CommandId::FindNext => find_again(hwnd, false),
         CommandId::FindPrevious => find_again(hwnd, true),

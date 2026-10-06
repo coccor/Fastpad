@@ -325,6 +325,22 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
         "preferences.openKeyboardShortcuts",
     ),
     (CommandId::EditSettingsFile, "preferences.editSettingsFile"),
+    (CommandId::MoveLinesUp, "edit.moveLinesUp"),
+    (CommandId::MoveLinesDown, "edit.moveLinesDown"),
+    (CommandId::CopyLinesUp, "edit.copyLinesUp"),
+    (CommandId::CopyLinesDown, "edit.copyLinesDown"),
+    (CommandId::DeleteLines, "edit.deleteLines"),
+    (CommandId::InsertLineBelow, "edit.insertLineBelow"),
+    (CommandId::InsertLineAbove, "edit.insertLineAbove"),
+    (CommandId::IndentLines, "edit.indentLines"),
+    (CommandId::OutdentLines, "edit.outdentLines"),
+    (CommandId::ExpandLineSelection, "edit.expandLineSelection"),
+    (CommandId::ToggleLineComment, "edit.toggleLineComment"),
+    (CommandId::ToggleBlockComment, "edit.toggleBlockComment"),
+    (CommandId::AddNextOccurrence, "edit.addNextOccurrence"),
+    (CommandId::SelectAllOccurrences, "edit.selectAllOccurrences"),
+    (CommandId::AddCursorAbove, "edit.addCursorAbove"),
+    (CommandId::AddCursorBelow, "edit.addCursorBelow"),
     (CommandId::About, "help.about"),
 ];
 
@@ -360,7 +376,7 @@ const fn ch(byte: u8) -> u16 {
 }
 
 /// FastPad's shortcuts before any override, in precedence order (spec §3.3).
-pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 66] = [
+pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 82] = [
     (key(C, ch(b'N')), CommandId::New),
     (key(C, ch(b'T')), CommandId::New),
     (key(C, ch(b'O')), CommandId::Open),
@@ -430,6 +446,23 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 66] = [
     // The backslash key on a US layout (split editors spec §6).
     (key(C, VK_OEM_5), CommandId::SplitRight),
     (key(C | S, VK_OEM_5), CommandId::SplitDown),
+    // VS Code's editing keys (editing shortcuts spec §3).
+    (key(A, VK_UP), CommandId::MoveLinesUp),
+    (key(A, VK_DOWN), CommandId::MoveLinesDown),
+    (key(S | A, VK_UP), CommandId::CopyLinesUp),
+    (key(S | A, VK_DOWN), CommandId::CopyLinesDown),
+    (key(C | S, ch(b'K')), CommandId::DeleteLines),
+    (key(C, VK_RETURN), CommandId::InsertLineBelow),
+    (key(C | S, VK_RETURN), CommandId::InsertLineAbove),
+    (key(C, VK_OEM_6), CommandId::IndentLines),
+    (key(C, VK_OEM_4), CommandId::OutdentLines),
+    (key(C, ch(b'L')), CommandId::ExpandLineSelection),
+    (key(C, VK_OEM_2), CommandId::ToggleLineComment),
+    (key(S | A, ch(b'A')), CommandId::ToggleBlockComment),
+    (key(C, ch(b'D')), CommandId::AddNextOccurrence),
+    (key(C | S, ch(b'L')), CommandId::SelectAllOccurrences),
+    (key(C | A, VK_UP), CommandId::AddCursorAbove),
+    (key(C | A, VK_DOWN), CommandId::AddCursorBelow),
 ];
 
 pub(crate) fn default_keys(command: CommandId) -> Vec<KeyStroke> {

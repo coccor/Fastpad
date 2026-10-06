@@ -95,6 +95,9 @@ pub struct App {
     deferred_start_pending: bool,
     prioritize_input: bool,
     menu_alt_pending: bool,
+    /// Alt is held for a click (Alt+Click adds a caret): its release must not reach Windows,
+    /// which would open the menu (editing shortcuts spec §5).
+    menu_alt_clicked: bool,
     pub(crate) recovery_root: Option<std::path::PathBuf>,
     pub(crate) recovery_owner: Option<crate::platform::OwnedHandle>,
     /// `session.ini` for a primary window, resolved on first use; tests pre-seed it.
@@ -175,6 +178,7 @@ impl App {
             deferred_start_pending: false,
             prioritize_input: false,
             menu_alt_pending: false,
+            menu_alt_clicked: false,
             recovery_root: None,
             recovery_owner: None,
             session_path: None,
@@ -228,6 +232,14 @@ impl App {
 
     pub(crate) fn take_menu_alt_pending(&mut self) -> bool {
         std::mem::take(&mut self.menu_alt_pending)
+    }
+
+    pub(crate) fn set_menu_alt_clicked(&mut self, clicked: bool) {
+        self.menu_alt_clicked = clicked;
+    }
+
+    pub(crate) fn take_menu_alt_clicked(&mut self) -> bool {
+        std::mem::take(&mut self.menu_alt_clicked)
     }
 
     pub fn execute(&mut self, command: CommandId) {

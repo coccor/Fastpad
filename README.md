@@ -215,7 +215,12 @@ before closing again.
 | Replace in the selected result | `Ctrl+Shift+1` | | Go to note | `Ctrl+P` |
 | Close tab | `Ctrl+W` or middle-click | | Split editor right / down | `Ctrl+\` / `Ctrl+Shift+\` |
 | Focus editor group 1–8 / last | `Ctrl+1` … `Ctrl+8` / `Ctrl+9` | | Move tab to next / previous group | `Ctrl+Alt+Right` / `Ctrl+Alt+Left` |
-| Settings | `Ctrl+,` | | | |
+| Settings | `Ctrl+,` | | Select line | `Ctrl+L` |
+| Move line up / down | `Alt+Up` / `Alt+Down` | | Copy line up / down | `Shift+Alt+Up` / `Shift+Alt+Down` |
+| Delete line | `Ctrl+Shift+K` | | Insert line below / above | `Ctrl+Enter` / `Ctrl+Shift+Enter` |
+| Indent / outdent line | `Ctrl+]` / `Ctrl+[` | | Toggle line / block comment | `Ctrl+/` / `Shift+Alt+A` |
+| Add next occurrence | `Ctrl+D` | | Select all occurrences | `Ctrl+Shift+L` |
+| Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
 
 ## Make it yours
 
