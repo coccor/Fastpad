@@ -55,11 +55,18 @@ fn word_at(text: &str, at: usize) -> Option<Range<usize>> {
 
 /// Length of the run of `byte` ending at `end` (backwards) or starting at `start` (forwards).
 fn run_before(text: &str, end: usize, byte: u8) -> usize {
-    text.as_bytes()[..end].iter().rev().take_while(|b| **b == byte).count()
+    text.as_bytes()[..end]
+        .iter()
+        .rev()
+        .take_while(|b| **b == byte)
+        .count()
 }
 
 fn run_after(text: &str, start: usize, byte: u8) -> usize {
-    text.as_bytes()[start..].iter().take_while(|b| **b == byte).count()
+    text.as_bytes()[start..]
+        .iter()
+        .take_while(|b| **b == byte)
+        .count()
 }
 
 /// A marker run of `run` characters can drop a `width`-character marker: exactly that marker,
@@ -105,9 +112,18 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
         })
         .collect();
     items.sort_by_key(|(index, selection, target)| {
-        (target.start, target.end, selection.start, selection.end, *index)
+        (
+            target.start,
+            target.end,
+            selection.start,
+            selection.end,
+            *index,
+        )
     });
-    let mut plan = EditPlan { edits: Vec::new(), selections: vec![0..0; selections.len()] };
+    let mut plan = EditPlan {
+        edits: Vec::new(),
+        selections: vec![0..0; selections.len()],
+    };
     let mut delta: isize = 0;
     // Targets already planned, and the selections that clashed with them.
     let mut handled: Vec<Range<usize>> = Vec::new();
@@ -130,8 +146,14 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
         } else {
             Kind::Wrap
         };
-        let insert = |at: usize, text: String| TextEdit { range: at..at, text };
-        let remove = |range: Range<usize>| TextEdit { range, text: String::new() };
+        let insert = |at: usize, text: String| TextEdit {
+            range: at..at,
+            text,
+        };
+        let remove = |range: Range<usize>| TextEdit {
+            range,
+            text: String::new(),
+        };
         let edits = match kind {
             Kind::Pair => vec![insert(target.start, marker.repeat(2))],
             Kind::Inside => vec![
@@ -143,14 +165,21 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
                 remove(target.end..target.end + width),
             ],
             Kind::Wrap => {
-                vec![insert(target.start, marker.to_owned()), insert(target.end, marker.to_owned())]
+                vec![
+                    insert(target.start, marker.to_owned()),
+                    insert(target.end, marker.to_owned()),
+                ]
             }
         };
         // Selections on one word, or on words that share a marker run, share one toggle.
         let clashes = handled
             .iter()
             .any(|done| *done == target || (target.start < done.end && done.start < target.end))
-            || edits.iter().any(|new| plan.edits.iter().any(|old| edits_clash(&new.range, &old.range)));
+            || edits.iter().any(|new| {
+                plan.edits
+                    .iter()
+                    .any(|old| edits_clash(&new.range, &old.range))
+            });
         if clashes {
             dropped.push((index, selection));
             continue;
@@ -193,7 +222,8 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
         plan.selections[index] = result;
         handled.push(target);
     }
-    plan.edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    plan.edits
+        .sort_by_key(|edit| (edit.range.start, edit.range.end));
     // A dropped selection keeps its own place, moved by the edits that were planned.
     for (index, selection) in dropped {
         let start = map_position(&plan.edits, selection.start);
@@ -207,8 +237,11 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
 fn map_position(edits: &[TextEdit], position: usize) -> usize {
     let mut mapped = position as isize;
     for edit in edits {
-        let before =
-            if edit.range.is_empty() { edit.range.start < position } else { edit.range.end <= position };
+        let before = if edit.range.is_empty() {
+            edit.range.start < position
+        } else {
+            edit.range.end <= position
+        };
         if before {
             mapped += edit.text.len() as isize - edit.range.len() as isize;
         } else if edit.range.start < position {
@@ -227,37 +260,62 @@ fn spans_clash(a: &Range<usize>, b: &Range<usize>) -> bool {
 }
 
 pub fn insert_link(_text: &str, selections: &[Range<usize>]) -> EditPlan {
-    let mut order: Vec<(usize, Range<usize>)> =
-        selections.iter().enumerate().map(|(index, selection)| (index, normalized(selection))).collect();
+    let mut order: Vec<(usize, Range<usize>)> = selections
+        .iter()
+        .enumerate()
+        .map(|(index, selection)| (index, normalized(selection)))
+        .collect();
     order.sort_by_key(|(index, selection)| (selection.start, selection.end, *index));
-    let mut plan = EditPlan { edits: Vec::new(), selections: vec![0..0; selections.len()] };
+    let mut plan = EditPlan {
+        edits: Vec::new(),
+        selections: vec![0..0; selections.len()],
+    };
     let mut delta: isize = 0;
     let mut handled: Vec<(Range<usize>, Range<usize>)> = Vec::new();
     for (index, selection) in order {
-        if let Some((_, result)) = handled.iter().find(|(done, _)| spans_clash(done, &selection)) {
+        if let Some((_, result)) = handled
+            .iter()
+            .find(|(done, _)| spans_clash(done, &selection))
+        {
             plan.selections[index] = result.clone();
             continue;
         }
         let at = if selection.is_empty() {
-            plan.edits.push(TextEdit { range: selection.clone(), text: "[]()".into() });
+            plan.edits.push(TextEdit {
+                range: selection.clone(),
+                text: "[]()".into(),
+            });
             shift(selection.start, delta) + 1
         } else {
-            plan.edits.push(TextEdit { range: selection.start..selection.start, text: "[".into() });
-            plan.edits.push(TextEdit { range: selection.end..selection.end, text: "]()".into() });
+            plan.edits.push(TextEdit {
+                range: selection.start..selection.start,
+                text: "[".into(),
+            });
+            plan.edits.push(TextEdit {
+                range: selection.end..selection.end,
+                text: "]()".into(),
+            });
             shift(selection.end, delta) + 3
         };
         delta += 4;
         plan.selections[index] = at..at;
         handled.push((selection, at..at));
     }
-    plan.edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    plan.edits
+        .sort_by_key(|edit| (edit.range.start, edit.range.end));
     plan
 }
 
 pub(crate) fn line_bounds(text: &str, at: usize) -> Range<usize> {
     let start = text[..at].rfind('\n').map_or(0, |newline| newline + 1);
-    let end = text[at..].find('\n').map_or(text.len(), |newline| at + newline);
-    let end = if end > start && text.as_bytes()[end - 1] == b'\r' { end - 1 } else { end };
+    let end = text[at..]
+        .find('\n')
+        .map_or(text.len(), |newline| at + newline);
+    let end = if end > start && text.as_bytes()[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    };
     start..end
 }
 
@@ -280,7 +338,13 @@ pub(crate) fn line_ending(text: &str, line_end: usize, fallback: &'static str) -
 
 /// The visual width of leading whitespace: a tab advances to the next multiple of 4.
 fn columns(whitespace: &str) -> usize {
-    whitespace.bytes().fold(0, |column, byte| if byte == 9 { column + 4 - column % 4 } else { column + 1 })
+    whitespace.bytes().fold(0, |column, byte| {
+        if byte == 9 {
+            column + 4 - column % 4
+        } else {
+            column + 1
+        }
+    })
 }
 
 struct ListPrefix {
@@ -301,7 +365,9 @@ struct ListPrefix {
 /// Three or more of the same `-`, `*` or `_`, spaces and tabs between them allowed.
 fn is_thematic_break(line: &str) -> bool {
     let mut marks = line.bytes().filter(|b| !matches!(b, b' ' | b'\t'));
-    let Some(first @ (b'-' | b'*' | b'_')) = marks.next() else { return false };
+    let Some(first @ (b'-' | b'*' | b'_')) = marks.next() else {
+        return false;
+    };
     let mut count = 1;
     for mark in marks {
         if mark != first {
@@ -326,7 +392,10 @@ fn list_prefix(line: &str) -> Option<ListPrefix> {
             (Some(marker), None)
         }
         digit if digit.is_ascii_digit() => {
-            let digits = bytes[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let digits = bytes[at..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
             if digits > 9 {
                 return None;
             }
@@ -347,17 +416,32 @@ fn list_prefix(line: &str) -> Option<ListPrefix> {
         None => {}
         Some(_) => return None,
     }
-    let spaces = bytes[marker_end..].iter().take_while(|b| **b == b' ').count();
-    let gap = if (1..=4).contains(&spaces) && marker_end + spaces < line.len() { spaces } else { 1 };
+    let spaces = bytes[marker_end..]
+        .iter()
+        .take_while(|b| **b == b' ')
+        .count();
+    let gap = if (1..=4).contains(&spaces) && marker_end + spaces < line.len() {
+        spaces
+    } else {
+        1
+    };
     let content = indent + (marker_end - indent_len) + gap;
     let rest = &line[at..];
-    let task = ["[ ]", "[x]", "[X]"].iter().any(|box_| {
-        rest.starts_with(box_) && (rest.len() == 3 || rest.as_bytes()[3] == b' ')
-    });
+    let task = ["[ ]", "[x]", "[X]"]
+        .iter()
+        .any(|box_| rest.starts_with(box_) && (rest.len() == 3 || rest.as_bytes()[3] == b' '));
     if task {
         at = (at + 4).min(line.len());
     }
-    Some(ListPrefix { indent, indent_len, bullet, number, task, len: at, content })
+    Some(ListPrefix {
+        indent,
+        indent_len,
+        bullet,
+        number,
+        task,
+        len: at,
+        content,
+    })
 }
 
 /// `fallback` is the line ending for a document with none yet (the editor's EOL mode).
@@ -378,7 +462,10 @@ pub fn enter_in_list(text: &str, caret: usize, fallback: &'static str) -> Option
     }
     if text[prefix_end.min(line.end)..line.end].trim().is_empty() {
         return Some(EditPlan {
-            edits: vec![TextEdit { range: line.clone(), text: String::new() }],
+            edits: vec![TextEdit {
+                range: line.clone(),
+                text: String::new(),
+            }],
             selections: vec![line.start..line.start],
         });
     }
@@ -396,7 +483,10 @@ pub fn enter_in_list(text: &str, caret: usize, fallback: &'static str) -> Option
     );
     let after = caret + inserted.len();
     Some(EditPlan {
-        edits: vec![TextEdit { range: caret..caret, text: inserted }],
+        edits: vec![TextEdit {
+            range: caret..caret,
+            text: inserted,
+        }],
         selections: vec![after..after],
     })
 }
@@ -412,8 +502,15 @@ struct Item {
 
 impl Item {
     fn of(prefix: &ListPrefix) -> Self {
-        let kind = prefix.bullet.or(prefix.number.map(|(_, delimiter)| delimiter)).unwrap_or(0);
-        Self { indent: prefix.indent, content: prefix.content, kind }
+        let kind = prefix
+            .bullet
+            .or(prefix.number.map(|(_, delimiter)| delimiter))
+            .unwrap_or(0);
+        Self {
+            indent: prefix.indent,
+            content: prefix.content,
+            kind,
+        }
     }
 }
 
@@ -433,7 +530,9 @@ struct Nesting {
 
 /// How many items of `open` (outermost first) contain a line indented to `indent`.
 fn containing(open: &[Item], indent: usize) -> usize {
-    open.iter().rposition(|item| item.content <= indent).map_or(0, |at| at + 1)
+    open.iter()
+        .rposition(|item| item.content <= indent)
+        .map_or(0, |at| at + 1)
 }
 
 fn nesting(text: &str, line: Range<usize>) -> Option<Nesting> {
@@ -448,7 +547,8 @@ fn nesting(text: &str, line: Range<usize>) -> Option<Nesting> {
             start = above.start;
             break;
         }
-        let after_blank = above.start == 0 || text[line_bounds(text, above.start - 1)].trim().is_empty();
+        let after_blank =
+            above.start == 0 || text[line_bounds(text, above.start - 1)].trim().is_empty();
         if unindented && after_blank {
             break;
         }
@@ -459,7 +559,9 @@ fn nesting(text: &str, line: Range<usize>) -> Option<Nesting> {
     let mut at = start;
     while at < line.start {
         let current = line_bounds(text, at);
-        at = text[current.end..].find('\n').map_or(text.len(), |newline| current.end + newline + 1);
+        at = text[current.end..]
+            .find('\n')
+            .map_or(text.len(), |newline| current.end + newline + 1);
         let content = &text[current];
         if content.trim().is_empty() {
             after_blank = true;
@@ -487,8 +589,17 @@ fn nesting(text: &str, line: Range<usize>) -> Option<Nesting> {
     let keep = containing(&open, own.indent);
     let parent = keep.checked_sub(1).map(|parent| open[parent]);
     let too_deep = own.indent >= parent.map_or(0, |parent| parent.content) + 4;
-    let previous = open.get(keep).copied().filter(|previous| previous.kind == own.kind);
-    Some(Nesting { own, too_deep, parent, previous, nephew: open.get(keep + 1).copied() })
+    let previous = open
+        .get(keep)
+        .copied()
+        .filter(|previous| previous.kind == own.kind);
+    Some(Nesting {
+        own,
+        too_deep,
+        parent,
+        previous,
+        nephew: open.get(keep + 1).copied(),
+    })
 }
 
 /// Tab nests the item under its previous sibling (indent = the sibling's content column); on a
@@ -506,7 +617,10 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
         if !outdent {
             return None;
         }
-        (nesting.parent.map_or(0, |parent| parent.content), nesting.previous.is_none())
+        (
+            nesting.parent.map_or(0, |parent| parent.content),
+            nesting.previous.is_none(),
+        )
     } else if outdent {
         if prefix.indent == 0 {
             return None;
@@ -517,15 +631,26 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
         }
     } else {
         let Some(previous) = nesting.previous else {
-            return Some(EditPlan { edits: Vec::new(), selections: vec![caret..caret] });
+            return Some(EditPlan {
+                edits: Vec::new(),
+                selections: vec![caret..caret],
+            });
         };
-        (previous.content, nesting.nephew.is_none_or(|nephew| nephew.kind != nesting.own.kind))
+        (
+            previous.content,
+            nesting
+                .nephew
+                .is_none_or(|nephew| nephew.kind != nesting.own.kind),
+        )
     };
     // The leading whitespace is replaced by spaces, so a tab never ends up after spaces.
     let mut replaced = prefix.indent_len;
     let mut new_prefix = " ".repeat(new_indent);
     if starts_a_list && prefix.number.is_some_and(|(value, _)| value != 1) {
-        replaced += text[line.start + replaced..].bytes().take_while(u8::is_ascii_digit).count();
+        replaced += text[line.start + replaced..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
         new_prefix.push('1');
     }
     let after = if caret >= line.start + replaced {
@@ -537,7 +662,10 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
     // the change of its content column, so its children keep their place under it.
     let renumber_shrink = (replaced - prefix.indent_len) - (new_prefix.len() - new_indent);
     let new_content = prefix.content - prefix.indent + new_indent - renumber_shrink;
-    let mut edits = vec![TextEdit { range: line.start..line.start + replaced, text: new_prefix }];
+    let mut edits = vec![TextEdit {
+        range: line.start..line.start + replaced,
+        text: new_prefix,
+    }];
     let block_end = shift_lines(text, line.end, prefix.content, new_content, &mut edits);
     if outdent && !nesting.too_deep {
         match nesting.parent {
@@ -549,7 +677,9 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
                 // last child list; an ordered one is then renumbered to 1.
                 let mut last_child: Option<Item> = None;
                 for below in text[line.end..block_end].split('\n').skip(1) {
-                    let Some(child) = list_prefix(below.trim_end_matches('\r')) else { continue };
+                    let Some(child) = list_prefix(below.trim_end_matches('\r')) else {
+                        continue;
+                    };
                     let child = Item::of(&child);
                     if last_child.is_none_or(|last| child.indent < last.content) {
                         last_child = Some(child);
@@ -562,7 +692,10 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
                     && sibling.number.is_some_and(|(value, _)| value != 1)
                     && last_child.is_none_or(|last| last.kind != Item::of(&sibling).kind)
                 {
-                    let digits = text[first.start + sibling.indent_len..].bytes().take_while(u8::is_ascii_digit).count();
+                    let digits = text[first.start + sibling.indent_len..]
+                        .bytes()
+                        .take_while(u8::is_ascii_digit)
+                        .count();
                     let indent = sibling.indent - parent.content + new_content;
                     edits.push(TextEdit {
                         range: first.start..first.start + sibling.indent_len + digits,
@@ -577,17 +710,29 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
             // end up inside the item.
             None => {
                 let next = next_line(text, block_end, |content| !content.trim().is_empty());
-                if next.is_some_and(|next| list_prefix(&text[next]).is_some_and(|item| item.indent >= new_content)) {
-                    return Some(EditPlan { edits: Vec::new(), selections: vec![caret..caret] });
+                if next.is_some_and(|next| {
+                    list_prefix(&text[next]).is_some_and(|item| item.indent >= new_content)
+                }) {
+                    return Some(EditPlan {
+                        edits: Vec::new(),
+                        selections: vec![caret..caret],
+                    });
                 }
             }
         }
     }
-    Some(EditPlan { edits, selections: vec![after..after] })
+    Some(EditPlan {
+        edits,
+        selections: vec![after..after],
+    })
 }
 
 /// The first line after the line ending at `line_end` that satisfies `wanted`.
-fn next_line(text: &str, mut line_end: usize, wanted: impl Fn(&str) -> bool) -> Option<Range<usize>> {
+fn next_line(
+    text: &str,
+    mut line_end: usize,
+    wanted: impl Fn(&str) -> bool,
+) -> Option<Range<usize>> {
     while let Some(newline) = text[line_end..].find('\n') {
         let below = line_bounds(text, line_end + newline + 1);
         if wanted(&text[below.clone()]) {
@@ -602,7 +747,13 @@ fn next_line(text: &str, mut line_end: usize, wanted: impl Fn(&str) -> bool) -> 
 /// deeper (blank lines between them included) so that `column` lands on `new_column`, keeping
 /// their indents relative to each other. Stops before the first non-blank line indented less;
 /// returns the end of the last line it took.
-fn shift_lines(text: &str, mut line_end: usize, column: usize, new_column: usize, edits: &mut Vec<TextEdit>) -> usize {
+fn shift_lines(
+    text: &str,
+    mut line_end: usize,
+    column: usize,
+    new_column: usize,
+    edits: &mut Vec<TextEdit>,
+) -> usize {
     let mut taken = line_end;
     while let Some(newline) = text[line_end..].find('\n') {
         let below = line_bounds(text, line_end + newline + 1);
@@ -618,7 +769,10 @@ fn shift_lines(text: &str, mut line_end: usize, column: usize, new_column: usize
         taken = below.end;
         let pad = " ".repeat(lead - column + new_column);
         if content[..lead_len] != pad {
-            edits.push(TextEdit { range: below.start..below.start + lead_len, text: pad });
+            edits.push(TextEdit {
+                range: below.start..below.start + lead_len,
+                text: pad,
+            });
         }
     }
     taken
@@ -634,8 +788,13 @@ fn leading(line: &str) -> (usize, usize) {
 /// thematic break.
 fn breaks_lists(line: &str) -> bool {
     let hashes = line.bytes().take_while(|b| *b == b'#').count();
-    let heading = (1..=6).contains(&hashes) && matches!(line.as_bytes().get(hashes), None | Some(b' ' | b'\t'));
-    heading || line.starts_with('>') || line.starts_with("```") || line.starts_with("~~~") || is_thematic_break(line)
+    let heading = (1..=6).contains(&hashes)
+        && matches!(line.as_bytes().get(hashes), None | Some(b' ' | b'\t'));
+    heading
+        || line.starts_with('>')
+        || line.starts_with("```")
+        || line.starts_with("~~~")
+        || is_thematic_break(line)
 }
 
 fn is_delimiter_row(line: &str) -> bool {
@@ -669,7 +828,11 @@ fn split_cells(line: &str) -> Vec<(Range<usize>, &str)> {
         }
     }
     let last = *pipes.last().expect("non-empty");
-    bounds.push(if last + 1 == trimmed_end { last } else { trimmed_end });
+    bounds.push(if last + 1 == trimmed_end {
+        last
+    } else {
+        trimmed_end
+    });
     bounds
         .chunks(2)
         .filter(|pair| pair.len() == 2 && pair[0] <= pair[1])
@@ -701,8 +864,12 @@ pub fn table_at(text: &str, at: usize) -> Option<Range<usize>> {
     }
     let mut last = here;
     loop {
-        let next_start = text[last.end..].find('\n').map(|newline| last.end + newline + 1);
-        let Some(next_start) = next_start.filter(|start| *start < text.len()) else { break };
+        let next_start = text[last.end..]
+            .find('\n')
+            .map(|newline| last.end + newline + 1);
+        let Some(next_start) = next_start.filter(|start| *start < text.len()) else {
+            break;
+        };
         let next = line_bounds(text, next_start);
         if !is_row(&next) {
             break;
@@ -724,15 +891,26 @@ enum Align {
 /// The table re-padded into aligned columns; `None` when it already is.
 pub fn format_table(table: &str) -> Option<String> {
     let ending = if table.contains("\r\n") { "\r\n" } else { "\n" };
-    let lines: Vec<&str> = table.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect();
+    let lines: Vec<&str> = table
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
     let rows: Vec<Vec<String>> = lines
         .iter()
-        .map(|line| split_cells(line).into_iter().map(|(_, cell)| cell.trim().to_owned()).collect())
+        .map(|line| {
+            split_cells(line)
+                .into_iter()
+                .map(|(_, cell)| cell.trim().to_owned())
+                .collect()
+        })
         .collect();
     let columns = rows.iter().map(Vec::len).max()?;
     let aligns: Vec<Align> = (0..columns)
         .map(|column| {
-            let cell = rows.get(1).and_then(|row| row.get(column)).map_or("", String::as_str);
+            let cell = rows
+                .get(1)
+                .and_then(|row| row.get(column))
+                .map_or("", String::as_str);
             match (cell.starts_with(':'), cell.ends_with(':') && cell.len() > 1) {
                 (true, true) => Align::Center,
                 (true, false) => Align::Left,
@@ -780,7 +958,11 @@ pub fn format_table(table: &str) -> Option<String> {
         })
         .collect();
     let indent = &lines[0][..lines[0].len() - lines[0].trim_start().len()];
-    let out = rendered.iter().map(|row| format!("{indent}{row}")).collect::<Vec<_>>().join(ending);
+    let out = rendered
+        .iter()
+        .map(|row| format!("{indent}{row}"))
+        .collect::<Vec<_>>()
+        .join(ending);
     (out != table).then_some(out)
 }
 
@@ -801,7 +983,11 @@ pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
             let lead = raw.len() - raw.trim_start().len();
             let content_start = line.start + segment.start + lead;
             let content = content_start..content_start + raw.trim().len();
-            cells.push((line.start, line.start + segment.start..line.start + segment.end, content));
+            cells.push((
+                line.start,
+                line.start + segment.start..line.start + segment.end,
+                content,
+            ));
         }
     }
     let current = cells
@@ -809,12 +995,21 @@ pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
         .position(|(_, segment, _)| segment.start <= caret && caret <= segment.end)
         .or_else(|| {
             // Before the first pipe is the first cell, after the last pipe the last one.
-            let on_line = |(line, _, _): &(usize, Range<usize>, Range<usize>)| Some(*line) == caret_line;
+            let on_line =
+                |(line, _, _): &(usize, Range<usize>, Range<usize>)| Some(*line) == caret_line;
             let first = cells.iter().position(on_line)?;
             let last = cells.iter().rposition(on_line)?;
-            Some(if caret < cells[first].1.start { first } else { last })
+            Some(if caret < cells[first].1.start {
+                first
+            } else {
+                last
+            })
         })?;
-    let target = if back { current.checked_sub(1)? } else { current + 1 };
+    let target = if back {
+        current.checked_sub(1)?
+    } else {
+        current + 1
+    };
     cells.get(target).map(|(_, _, content)| content.clone())
 }
 
@@ -829,23 +1024,38 @@ mod tests {
 
     #[test]
     fn wraps_a_selection_and_keeps_it_selected() {
-        assert_eq!(run("a b c", &[2..3], "**"), ("a **b** c".into(), vec![4..5]));
+        assert_eq!(
+            run("a b c", &[2..3], "**"),
+            ("a **b** c".into(), vec![4..5])
+        );
     }
 
     #[test]
     fn unwraps_when_the_markers_are_inside_the_selection() {
-        assert_eq!(run("a **b** c", &[2..7], "**"), ("a b c".into(), vec![2..3]));
+        assert_eq!(
+            run("a **b** c", &[2..7], "**"),
+            ("a b c".into(), vec![2..3])
+        );
     }
 
     #[test]
     fn unwraps_when_the_markers_surround_the_selection() {
-        assert_eq!(run("a **b** c", &[4..5], "**"), ("a b c".into(), vec![2..3]));
+        assert_eq!(
+            run("a **b** c", &[4..5], "**"),
+            ("a b c".into(), vec![2..3])
+        );
     }
 
     #[test]
     fn an_empty_selection_toggles_the_word_under_the_caret() {
-        assert_eq!(run("hello world", &[2..2], "**"), ("**hello** world".into(), vec![4..4]));
-        assert_eq!(run("**hello** world", &[4..4], "**"), ("hello world".into(), vec![2..2]));
+        assert_eq!(
+            run("hello world", &[2..2], "**"),
+            ("**hello** world".into(), vec![4..4])
+        );
+        assert_eq!(
+            run("**hello** world", &[4..4], "**"),
+            ("hello world".into(), vec![2..2])
+        );
     }
 
     #[test]
@@ -865,7 +1075,10 @@ mod tests {
 
     #[test]
     fn every_caret_of_a_multi_cursor_is_toggled() {
-        assert_eq!(run("a b", &[0..0, 2..2], "**"), ("**a** **b**".into(), vec![2..2, 8..8]));
+        assert_eq!(
+            run("a b", &[0..0, 2..2], "**"),
+            ("**a** **b**".into(), vec![2..2, 8..8])
+        );
     }
 
     #[test]
@@ -876,7 +1089,10 @@ mod tests {
     #[test]
     fn a_reversed_selection_is_handled() {
         let reversed = Range { start: 3, end: 2 };
-        assert_eq!(run("a b c", &[reversed], "**"), ("a **b** c".into(), vec![4..5]));
+        assert_eq!(
+            run("a b c", &[reversed], "**"),
+            ("a **b** c".into(), vec![4..5])
+        );
     }
 
     #[test]
@@ -934,13 +1150,20 @@ mod tests {
     fn continuation_uses_the_documents_line_ending() {
         assert_eq!(enter("- a\r\nb", 3), Some(("- a\r\n- \r\nb".into(), 7)));
         let plan = enter_in_list("- a", 3, "\r\n").unwrap();
-        assert_eq!(plan.apply_to("- a"), "- a\r\n- ", "a one-line document uses the fallback");
+        assert_eq!(
+            plan.apply_to("- a"),
+            "- a\r\n- ",
+            "a one-line document uses the fallback"
+        );
     }
 
     #[test]
     fn tab_nests_under_the_previous_sibling_and_shift_tab_un_nests() {
         assert_eq!(nest("- a\n- b", 7, false), Some(("- a\n  - b".into(), 9)));
-        assert_eq!(nest("1. a\n2. b", 9, false), Some(("1. a\n   1. b".into(), 12)));
+        assert_eq!(
+            nest("1. a\n2. b", 9, false),
+            Some(("1. a\n   1. b".into(), 12))
+        );
         assert_eq!(nest("  - a", 5, true), Some(("- a".into(), 3)));
         assert_eq!(nest("- a", 3, true), None);
         assert_eq!(nest("text", 2, false), None);
@@ -966,7 +1189,10 @@ mod tests {
 
     #[test]
     fn an_aligned_table_is_left_alone() {
-        assert_eq!(format_table("| a   | bb  |\n| --- | --- |\n| ccc | d   |"), None);
+        assert_eq!(
+            format_table("| a   | bb  |\n| --- | --- |\n| ccc | d   |"),
+            None
+        );
     }
 
     #[test]
@@ -1019,7 +1245,10 @@ mod tests {
         assert_eq!(next_cell(separated, at(separated, "e"), true), None);
         let with_text = "| a | b |\n| - | - |\n| c | d |\ntext\n| e | f |\n| - | - |\n| g | h |";
         assert_eq!(next_cell(with_text, at(with_text, "d"), false), None);
-        assert_eq!(table_at(with_text, at(with_text, "d")), Some(0..with_text.find("\ntext").unwrap()));
+        assert_eq!(
+            table_at(with_text, at(with_text, "d")),
+            Some(0..with_text.find("\ntext").unwrap())
+        );
     }
 
     #[test]
@@ -1028,20 +1257,36 @@ mod tests {
         let at = |s: &str| text.find(s).unwrap();
         assert_eq!(next_cell(text, at("b"), false), Some(at("c")..at("c") + 1));
         assert_eq!(next_cell(text, at("d"), false), None);
-        assert_eq!(table_at(text, at("c")), Some(0..text.find("\r\nafter").unwrap()));
+        assert_eq!(
+            table_at(text, at("c")),
+            Some(0..text.find("\r\nafter").unwrap())
+        );
     }
 
     #[test]
     fn carets_in_one_word_toggle_it_once() {
-        assert_eq!(run("**hello**", &[3..3, 5..5], "**"), ("hello".into(), vec![1..1, 3..3]));
-        assert_eq!(run("hello", &[1..1, 3..3], "**"), ("**hello**".into(), vec![3..3, 5..5]));
-        assert_eq!(run("ab cd", &[0..4, 2..5], "**").0, "**ab c**d", "the overlapping selection is dropped, not toggled again");
+        assert_eq!(
+            run("**hello**", &[3..3, 5..5], "**"),
+            ("hello".into(), vec![1..1, 3..3])
+        );
+        assert_eq!(
+            run("hello", &[1..1, 3..3], "**"),
+            ("**hello**".into(), vec![3..3, 5..5])
+        );
+        assert_eq!(
+            run("ab cd", &[0..4, 2..5], "**").0,
+            "**ab c**d",
+            "the overlapping selection is dropped, not toggled again"
+        );
     }
 
     #[test]
     fn a_multi_byte_word_is_toggled_whole() {
         assert_eq!(run("é b", &[0..0], "**"), ("**é** b".into(), vec![2..2]));
-        assert_eq!(run("héllo", &[3..3], "**"), ("**héllo**".into(), vec![5..5]));
+        assert_eq!(
+            run("héllo", &[3..3], "**"),
+            ("**héllo**".into(), vec![5..5])
+        );
     }
 
     #[test]
@@ -1064,11 +1309,29 @@ mod tests {
 
     #[test]
     fn nesting_follows_the_parent_items_content_column() {
-        assert_eq!(nest("1. a\n1. b", 9, false), Some(("1. a\n   1. b".into(), 12)));
-        assert_eq!(nest("1. a\n   2. b", 12, true), Some(("1. a\n2. b".into(), 9)), "same list as the parent");
-        assert_eq!(nest("- a\n\n  2. b", 11, true), Some(("- a\n\n1. b".into(), 9)), "a new list starts at 1");
-        assert_eq!(nest("-   a\n- b", 9, false), Some(("-   a\n    - b".into(), 13)), "content after 3 spaces");
-        assert_eq!(nest("- a\n  - b\n  - c", 15, false), Some(("- a\n  - b\n    - c".into(), 17)));
+        assert_eq!(
+            nest("1. a\n1. b", 9, false),
+            Some(("1. a\n   1. b".into(), 12))
+        );
+        assert_eq!(
+            nest("1. a\n   2. b", 12, true),
+            Some(("1. a\n2. b".into(), 9)),
+            "same list as the parent"
+        );
+        assert_eq!(
+            nest("- a\n\n  2. b", 11, true),
+            Some(("- a\n\n1. b".into(), 9)),
+            "a new list starts at 1"
+        );
+        assert_eq!(
+            nest("-   a\n- b", 9, false),
+            Some(("-   a\n    - b".into(), 13)),
+            "content after 3 spaces"
+        );
+        assert_eq!(
+            nest("- a\n  - b\n  - c", 15, false),
+            Some(("- a\n  - b\n    - c".into(), 17))
+        );
         assert_eq!(nest("\t- a", 4, true), Some(("- a".into(), 3)));
     }
 
@@ -1093,15 +1356,29 @@ mod tests {
     fn assert_well_formed(text: &str, plan: &EditPlan, context: &str) {
         let mut at = 0;
         for edit in &plan.edits {
-            assert!(edit.range.start >= at, "{context}: edits overlap or are unsorted: {plan:?}");
-            assert!(edit.range.start <= edit.range.end && edit.range.end <= text.len(), "{context}");
-            assert!(text.is_char_boundary(edit.range.start) && text.is_char_boundary(edit.range.end));
+            assert!(
+                edit.range.start >= at,
+                "{context}: edits overlap or are unsorted: {plan:?}"
+            );
+            assert!(
+                edit.range.start <= edit.range.end && edit.range.end <= text.len(),
+                "{context}"
+            );
+            assert!(
+                text.is_char_boundary(edit.range.start) && text.is_char_boundary(edit.range.end)
+            );
             at = edit.range.end;
         }
         let out = plan.apply_to(text);
         for selection in &plan.selections {
-            assert!(selection.start <= selection.end && selection.end <= out.len(), "{context}: {plan:?}");
-            assert!(out.is_char_boundary(selection.start) && out.is_char_boundary(selection.end), "{context}");
+            assert!(
+                selection.start <= selection.end && selection.end <= out.len(),
+                "{context}: {plan:?}"
+            );
+            assert!(
+                out.is_char_boundary(selection.start) && out.is_char_boundary(selection.end),
+                "{context}"
+            );
         }
     }
 
@@ -1152,32 +1429,69 @@ mod tests {
         assert!(consumed("- a", 3));
         assert!(consumed("1. a", 4));
         assert!(consumed("- a\n  - b", 9), "first item of a sublist");
-        assert!(consumed("1. a\n- b", 8), "a different marker starts a new list");
-        assert!(consumed("- a\n\nText\n\n- b", 14), "a paragraph after a blank line ends the list");
+        assert!(
+            consumed("1. a\n- b", 8),
+            "a different marker starts a new list"
+        );
+        assert!(
+            consumed("- a\n\nText\n\n- b", 14),
+            "a paragraph after a blank line ends the list"
+        );
     }
 
     #[test]
     fn tab_on_a_nested_item_stays_a_list_item() {
         let text = "- a\n\t- b\n\t\t- c";
-        assert_eq!(nest(text, text.len(), false), Some((text.into(), text.len())), "c is b's first child");
+        assert_eq!(
+            nest(text, text.len(), false),
+            Some((text.into(), text.len())),
+            "c is b's first child"
+        );
         let text = "- a\n\t- b\n\t\t\t- c";
-        assert_eq!(nest(text, text.len(), false), None, "c is 4+ columns past b's content: text, not an item");
-        assert_eq!(nest(text, text.len(), true), Some(("- a\n\t- b\n      - c".into(), text.len() + 3)));
+        assert_eq!(
+            nest(text, text.len(), false),
+            None,
+            "c is 4+ columns past b's content: text, not an item"
+        );
+        assert_eq!(
+            nest(text, text.len(), true),
+            Some(("- a\n\t- b\n      - c".into(), text.len() + 3))
+        );
         assert_eq!(nest("\t- a", 4, false), None, "an indented code block");
         let text = "- a\n\t- b\n\t- c";
-        assert_eq!(nest(text, text.len(), false), Some(("- a\n\t- b\n      - c".into(), text.len() + 5)));
-        assert_eq!(nest("- a\n\t- b", 8, false), Some(("- a\n\t- b".into(), 8)), "b is the first child");
+        assert_eq!(
+            nest(text, text.len(), false),
+            Some(("- a\n\t- b\n      - c".into(), text.len() + 5))
+        );
+        assert_eq!(
+            nest("- a\n\t- b", 8, false),
+            Some(("- a\n\t- b".into(), 8)),
+            "b is the first child"
+        );
         let text = "- a\n  - b\n  - c";
-        assert_eq!(nest(text, text.len(), false), Some(("- a\n  - b\n    - c".into(), text.len() + 2)));
+        assert_eq!(
+            nest(text, text.len(), false),
+            Some(("- a\n  - b\n    - c".into(), text.len() + 2))
+        );
         let nested = "- a\n  - b\n    - c";
-        assert_eq!(nest(nested, nested.len(), false), Some((nested.into(), nested.len())), "no sibling left");
+        assert_eq!(
+            nest(nested, nested.len(), false),
+            Some((nested.into(), nested.len())),
+            "no sibling left"
+        );
     }
 
     #[test]
     fn a_tab_indented_item_un_nests_to_a_space_indented_parent() {
         let text = "  - a\n\t- b";
-        assert_eq!(nest(text, text.len(), true), Some(("  - a\n  - b".into(), text.len() + 1)));
-        assert_eq!(nest("- a\nlazy\n  - b", 14, true), Some(("- a\nlazy\n- b".into(), 12)));
+        assert_eq!(
+            nest(text, text.len(), true),
+            Some(("  - a\n  - b".into(), text.len() + 1))
+        );
+        assert_eq!(
+            nest("- a\nlazy\n  - b", 14, true),
+            Some(("- a\nlazy\n- b".into(), 12))
+        );
     }
 
     /// Each label's list nesting depth (0 when the label does not start a list item) and
@@ -1198,7 +1512,10 @@ mod tests {
                     first = false;
                 }
                 Event::Text(label) => {
-                    depths.insert(label.to_string(), if fresh { (depth, first) } else { (0, false) });
+                    depths.insert(
+                        label.to_string(),
+                        if fresh { (depth, first) } else { (0, false) },
+                    );
                     fresh = false;
                 }
                 _ => {}
@@ -1210,7 +1527,10 @@ mod tests {
     #[test]
     fn a_moved_item_takes_its_children_along() {
         let text = "- a\n- b\n  - c";
-        assert_eq!(nest(text, 7, false), Some(("- a\n  - b\n    - c".into(), 9)));
+        assert_eq!(
+            nest(text, 7, false),
+            Some(("- a\n  - b\n    - c".into(), 9))
+        );
         let text = "- a\n\t- b\n\t\t- c";
         assert_eq!(nest(text, 8, true), Some(("- a\n- b\n    - c".into(), 7)));
         let text = "- a\r\n- b\r\n\r\n  more\r\n  - c\r\n- d";
@@ -1219,15 +1539,27 @@ mod tests {
             Some(("- a\r\n  - b\r\n\r\n    more\r\n    - c\r\n- d".into(), 10)),
             "blank lines inside the block, CRLF; the next sibling stays"
         );
-        assert_eq!(nest("1. a\n10. b\n    - c", 9, true), None, "top level, nothing to un-nest");
-        assert_eq!(nest("- a\n  - b\n  - c", 9, true), Some(("- a\n- b\n  - c".into(), 7)), "c becomes b's child");
+        assert_eq!(
+            nest("1. a\n10. b\n    - c", 9, true),
+            None,
+            "top level, nothing to un-nest"
+        );
+        assert_eq!(
+            nest("- a\n  - b\n  - c", 9, true),
+            Some(("- a\n- b\n  - c".into(), 7)),
+            "c becomes b's child"
+        );
         assert_eq!(
             nest("- a\n   1. b\n   2. c", 11, true),
             Some(("- a\n1. b\n    1. c".into(), 8)),
             "c starts b's child list, keeping its extra space"
         );
         assert_eq!(nest("  - a\n- b", 5, true), Some(("- a\n- b".into(), 3)));
-        assert_eq!(nest("  - a\n  - b", 5, true), Some(("  - a\n  - b".into(), 5)), "b would end up inside a");
+        assert_eq!(
+            nest("  - a\n  - b", 5, true),
+            Some(("  - a\n  - b".into(), 5)),
+            "b would end up inside a"
+        );
         let text = "1. a\n\n   10. b\n       - c";
         assert_eq!(
             nest(text, 14, true),
@@ -1244,8 +1576,16 @@ mod tests {
 
     #[test]
     fn only_real_headings_quotes_and_fences_end_a_list() {
-        assert_eq!(nest("- a\n#tag\n- b", 12, false), Some(("- a\n#tag\n  - b".into(), 14)));
-        let consumed = |text: &str| indent_list_item(text, text.len(), false).unwrap().edits.is_empty();
+        assert_eq!(
+            nest("- a\n#tag\n- b", 12, false),
+            Some(("- a\n#tag\n  - b".into(), 14))
+        );
+        let consumed = |text: &str| {
+            indent_list_item(text, text.len(), false)
+                .unwrap()
+                .edits
+                .is_empty()
+        };
         assert!(consumed("- a\n# Title\n- b"));
         assert!(consumed("- a\n> quote\n- b"));
         assert!(consumed("- a\n```\n- b"));
@@ -1255,7 +1595,9 @@ mod tests {
     fn tab_and_shift_tab_change_the_parsed_depth_by_one() {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = |bound: usize| {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             usize::try_from(state >> 33).unwrap() % bound
         };
         let label = |index: usize| char::from(b'a' + u8::try_from(index).unwrap()).to_string();
@@ -1267,10 +1609,18 @@ mod tests {
             let mut item_lines = Vec::new();
             let mut open: Vec<(usize, &str, usize)> = Vec::new(); // (content column, marker, number)
             for index in 0..2 + next(7) {
-                let depth = if index == 0 { 1 } else { 1 + next((open.len() + 1).min(3)) };
+                let depth = if index == 0 {
+                    1
+                } else {
+                    1 + next((open.len() + 1).min(3))
+                };
                 let base = if depth == 1 { 0 } else { open[depth - 2].0 };
                 let marker = ["-", "*", "1."][next(3)];
-                let number = if open.len() >= depth && open[depth - 1].1 == marker { open[depth - 1].2 + 1 } else { 1 };
+                let number = if open.len() >= depth && open[depth - 1].1 == marker {
+                    open[depth - 1].2 + 1
+                } else {
+                    1
+                };
                 open.truncate(depth - 1);
                 let column = base + next(2);
                 let lead = if next(2) == 0 {
@@ -1278,7 +1628,11 @@ mod tests {
                 } else {
                     format!("{}{}", "\t".repeat(column / 4), " ".repeat(column % 4))
                 };
-                let marker_text = if marker == "1." { format!("{number}.") } else { marker.to_string() };
+                let marker_text = if marker == "1." {
+                    format!("{number}.")
+                } else {
+                    marker.to_string()
+                };
                 open.push((column + marker_text.len() + 1, marker, number));
                 if index > 0 && next(6) == 0 {
                     lines.push(String::new());
@@ -1288,15 +1642,25 @@ mod tests {
             }
             let text = lines.join("\n");
             let before = item_depths(&text);
-            let depths: Vec<usize> = (0..item_lines.len()).map(|index| before[&label(index)].0).collect();
+            let depths: Vec<usize> = (0..item_lines.len())
+                .map(|index| before[&label(index)].0)
+                .collect();
             // After an edit to item `index` whose own depth went to `moved`: its descendants keep
             // their depth relative to it, every other item keeps its depth.
             let check = |out: &str, index: usize, moved: usize, what: &str| {
                 let after = item_depths(out);
-                let after: Vec<usize> = (0..depths.len()).map(|other| after.get(&label(other)).map_or(0, |depth| depth.0)).collect();
-                assert_eq!(after[index], moved, "{what} on {}: {text:?} -> {out:?}", label(index));
-                let block_end =
-                    (index + 1..depths.len()).find(|other| depths[*other] <= depths[index]).unwrap_or(depths.len());
+                let after: Vec<usize> = (0..depths.len())
+                    .map(|other| after.get(&label(other)).map_or(0, |depth| depth.0))
+                    .collect();
+                assert_eq!(
+                    after[index],
+                    moved,
+                    "{what} on {}: {text:?} -> {out:?}",
+                    label(index)
+                );
+                let block_end = (index + 1..depths.len())
+                    .find(|other| depths[*other] <= depths[index])
+                    .unwrap_or(depths.len());
                 for other in 0..depths.len() {
                     let expected = if other == index {
                         moved
@@ -1305,28 +1669,52 @@ mod tests {
                     } else {
                         depths[other]
                     };
-                    assert_eq!(after[other], expected, "{what} on {}, item {}: {text:?} -> {out:?}", label(index), label(other));
+                    assert_eq!(
+                        after[other],
+                        expected,
+                        "{what} on {}, item {}: {text:?} -> {out:?}",
+                        label(index),
+                        label(other)
+                    );
                 }
             };
             for (index, line) in item_lines.iter().enumerate() {
                 let (depth, first) = before[&label(index)];
                 assert!(depth >= 1, "{text:?}: {} should be an item", label(index));
-                let caret = lines[..=*line].iter().map(|line| line.len() + 1).sum::<usize>() - 1;
+                let caret = lines[..=*line]
+                    .iter()
+                    .map(|line| line.len() + 1)
+                    .sum::<usize>()
+                    - 1;
 
                 let plan = indent_list_item(&text, caret, false).unwrap();
                 assert_well_formed(&text, &plan, &text);
                 if plan.edits.is_empty() {
-                    assert!(first, "Tab on {} in {text:?} was a no-op but it has a previous sibling", label(index));
+                    assert!(
+                        first,
+                        "Tab on {} in {text:?} was a no-op but it has a previous sibling",
+                        label(index)
+                    );
                     assert_eq!(plan.selections, vec![caret..caret]);
                 } else {
                     check(&plan.apply_to(&text), index, depth + 1, "Tab");
                 }
 
                 match indent_list_item(&text, caret, true) {
-                    None => assert_eq!(depth, 1, "Shift+Tab on {} in {text:?} did nothing", label(index)),
+                    None => assert_eq!(
+                        depth,
+                        1,
+                        "Shift+Tab on {} in {text:?} did nothing",
+                        label(index)
+                    ),
                     Some(plan) => {
                         assert_well_formed(&text, &plan, &text);
-                        check(&plan.apply_to(&text), index, (depth - 1).max(1), "Shift+Tab");
+                        check(
+                            &plan.apply_to(&text),
+                            index,
+                            (depth - 1).max(1),
+                            "Shift+Tab",
+                        );
                     }
                 }
             }
@@ -1338,12 +1726,18 @@ mod tests {
         let pieces = ["a", "b", " ", "*", "`", "é", "_", "**"];
         let mut state = 0x2545_f491_4f6c_dd1d_u64;
         let mut next = |bound: usize| {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             usize::try_from(state >> 33).unwrap() % bound
         };
         for _ in 0..3000 {
-            let text: String = (0..1 + next(8)).map(|_| pieces[next(pieces.len())]).collect();
-            let boundaries: Vec<usize> = (0..=text.len()).filter(|at| text.is_char_boundary(*at)).collect();
+            let text: String = (0..1 + next(8))
+                .map(|_| pieces[next(pieces.len())])
+                .collect();
+            let boundaries: Vec<usize> = (0..=text.len())
+                .filter(|at| text.is_char_boundary(*at))
+                .collect();
             let selections: Vec<Range<usize>> = (0..1 + next(3))
                 .map(|_| boundaries[next(boundaries.len())]..boundaries[next(boundaries.len())])
                 .collect();

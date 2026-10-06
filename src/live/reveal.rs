@@ -10,7 +10,10 @@ pub fn revealed_lines(
 ) -> BTreeSet<usize> {
     let mut lines = BTreeSet::new();
     for selection in selections {
-        let (start, end) = (selection.start.min(selection.end), selection.start.max(selection.end));
+        let (start, end) = (
+            selection.start.min(selection.end),
+            selection.start.max(selection.end),
+        );
         let first = line_of(start);
         let last = if end > start && line_of(end) > first && line_of(end - 1) < line_of(end) {
             line_of(end) - 1
@@ -53,7 +56,10 @@ mod tests {
 
     #[test]
     fn multiple_carets_reveal_each_line() {
-        assert_eq!(revealed_lines(&[0..0, 7..7], line_of), BTreeSet::from([0, 2]));
+        assert_eq!(
+            revealed_lines(&[0..0, 7..7], line_of),
+            BTreeSet::from([0, 2])
+        );
     }
 
     #[test]

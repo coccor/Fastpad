@@ -41,7 +41,9 @@ pub fn style_runs(
             .get(span_index)
             .filter(|(span, _)| span.start <= start)
             .map_or(SpanKind::Text, |(_, kind)| *kind);
-        let is_revealed = revealed.iter().any(|line| line.start <= start && start < line.end);
+        let is_revealed = revealed
+            .iter()
+            .any(|line| line.start <= start && start < line.end);
         push(end - start, style_for(kind, is_revealed));
     }
     runs
@@ -57,7 +59,11 @@ mod tests {
     #[test]
     fn gaps_are_text_and_runs_cover_the_range() {
         // "a **b** c": Hide 2..4, Bold 4..5, Hide 5..7.
-        let spans = [(2..4, SpanKind::Hide), (4..5, SpanKind::Bold), (5..7, SpanKind::Hide)];
+        let spans = [
+            (2..4, SpanKind::Hide),
+            (4..5, SpanKind::Bold),
+            (5..7, SpanKind::Hide),
+        ];
         assert_eq!(
             style_runs(&spans, 0..9, &[]),
             vec![(2, TEXT), (2, HIDDEN), (1, BOLD), (2, HIDDEN), (2, TEXT)]

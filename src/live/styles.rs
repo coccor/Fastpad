@@ -82,28 +82,70 @@ pub(crate) fn style_table(c: &SyntaxColors) -> Vec<StyleDef> {
     };
     vec![
         plain(TEXT, c.text),
-        StyleDef { visible: false, ..plain(HIDDEN, c.text) },
+        StyleDef {
+            visible: false,
+            ..plain(HIDDEN, c.text)
+        },
         plain(BLANK, c.background),
-        StyleDef { bold: true, ..plain(BOLD, c.emphasis) },
-        StyleDef { italic: true, ..plain(ITALIC, c.emphasis) },
-        StyleDef { bold: true, italic: true, ..plain(BOLD_ITALIC, c.emphasis) },
-        StyleDef { background: c.code_background, mono: true, ..plain(INLINE_CODE, c.code) },
+        StyleDef {
+            bold: true,
+            ..plain(BOLD, c.emphasis)
+        },
+        StyleDef {
+            italic: true,
+            ..plain(ITALIC, c.emphasis)
+        },
+        StyleDef {
+            bold: true,
+            italic: true,
+            ..plain(BOLD_ITALIC, c.emphasis)
+        },
+        StyleDef {
+            background: c.code_background,
+            mono: true,
+            ..plain(INLINE_CODE, c.code)
+        },
         StyleDef {
             background: c.code_background,
             mono: true,
             eol_filled: true,
             ..plain(CODE_BLOCK, c.code)
         },
-        StyleDef { underline: true, ..plain(LINK, c.link) },
-        StyleDef { bold: true, ..plain(HEADING_SMALL, c.heading) },
-        StyleDef { italic: true, ..plain(QUOTE, c.comment) },
+        StyleDef {
+            underline: true,
+            ..plain(LINK, c.link)
+        },
+        StyleDef {
+            bold: true,
+            ..plain(HEADING_SMALL, c.heading)
+        },
+        StyleDef {
+            italic: true,
+            ..plain(QUOTE, c.comment)
+        },
         plain(DIM, c.comment),
         plain(MARKER, c.operator),
-        StyleDef { mono: true, ..plain(TABLE, c.text) },
-        StyleDef { mono: true, bold: true, ..plain(TABLE_HEADER, c.text) },
-        StyleDef { bold: true, ..plain(SOURCE_HEADING, c.heading) },
-        StyleDef { mono: true, ..plain(TABLE_BLANK, c.background) },
-        StyleDef { mono: true, ..plain(CODE_MARKER, c.operator) },
+        StyleDef {
+            mono: true,
+            ..plain(TABLE, c.text)
+        },
+        StyleDef {
+            mono: true,
+            bold: true,
+            ..plain(TABLE_HEADER, c.text)
+        },
+        StyleDef {
+            bold: true,
+            ..plain(SOURCE_HEADING, c.heading)
+        },
+        StyleDef {
+            mono: true,
+            ..plain(TABLE_BLANK, c.background)
+        },
+        StyleDef {
+            mono: true,
+            ..plain(CODE_MARKER, c.operator)
+        },
         plain(ANNOTATION, c.background),
     ]
 }
