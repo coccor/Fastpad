@@ -1,12 +1,14 @@
-//! Markdown writing helpers (live mode spec §8). Pure text → edit plans; the window layer
-//! applies a plan as one undo step. Edits use pre-edit byte offsets; selections are post-edit.
+//! Markdown writing helpers (2026-10-06 Markdown design spec §8). Pure text → edit plans; the
+//! window layer applies a plan as one undo step. Edits use pre-edit byte offsets; selections
+//! are post-edit.
 
 // A plan's selections are ranges; a one-caret plan is legitimately a one-element Vec of them.
 #![allow(clippy::single_range_in_vec_init)]
 
 use std::ops::Range;
 
-use crate::live::spans::pipe_positions;
+/// The helpers stay off in documents larger than this, so Enter and Tab never wait on a scan.
+pub const MARKDOWN_HELPER_MAX_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextEdit {
@@ -840,8 +842,52 @@ fn split_cells(line: &str) -> Vec<(Range<usize>, &str)> {
         .collect()
 }
 
-fn table_lines(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
-    crate::live::spans::line_ranges(text, range)
+/// Byte offsets of the column separators in one table line: unescaped pipes outside code spans.
+fn pipe_positions(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut pipes = Vec::new();
+    let mut index = 0;
+    let mut code_run: Option<usize> = None;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if code_run.is_none() => index += 2,
+            b'`' => {
+                let run = bytes[index..].iter().take_while(|b| **b == b'`').count();
+                code_run = match code_run {
+                    None => Some(run),
+                    Some(open) if open == run => None,
+                    other => other,
+                };
+                index += run;
+            }
+            b'|' if code_run.is_none() => {
+                pipes.push(index);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    pipes
+}
+
+/// The lines overlapping `range`, each without its line ending.
+fn line_ranges(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = line_bounds(text, range.start).start;
+    while start <= text.len() && (start < range.end || lines.is_empty()) {
+        let end = text[start..].find('\n').map_or(text.len(), |at| start + at);
+        let content_end = if end > start && text.as_bytes()[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        lines.push(start..content_end);
+        if end >= text.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    lines
 }
 
 /// The table containing `at`: whole lines, no final line ending.
@@ -876,7 +922,7 @@ pub fn table_at(text: &str, at: usize) -> Option<Range<usize>> {
         }
         last = next;
     }
-    let lines = table_lines(text, first.start..last.end);
+    let lines = line_ranges(text, first.start..last.end);
     (lines.len() >= 2 && is_delimiter_row(&text[lines[1].clone()])).then_some(first.start..last.end)
 }
 
@@ -972,7 +1018,7 @@ pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
     // (line start, segment, trimmed content) of every cell outside the delimiter row.
     let mut cells: Vec<(usize, Range<usize>, Range<usize>)> = Vec::new();
     let mut caret_line = None;
-    for (index, line) in table_lines(text, table).into_iter().enumerate() {
+    for (index, line) in line_ranges(text, table).into_iter().enumerate() {
         if line.start <= caret && caret <= line.end {
             caret_line = Some(line.start);
         }
@@ -1019,8 +1065,8 @@ pub fn is_list_item(line: &str) -> bool {
     list_prefix(line).is_some()
 }
 
-/// The byte after the closing line of YAML front matter (looked for in the first 64 KiB, as
-/// Live does), or `None`: an unclosed `---` is a thematic break.
+/// The byte after the closing line of YAML front matter (looked for in the first 64 KiB), or
+/// `None`: an unclosed `---` is a thematic break.
 fn front_matter_end(text: &str) -> Option<usize> {
     let head = &text[..text.floor_char_boundary(64 * 1024)];
     let mut lines = head.split_inclusive('\n');
@@ -1169,6 +1215,22 @@ pub fn in_literal_block_cached(text: &str, at: usize, cache: &mut FenceCache) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escaped_and_code_pipes_are_cell_text() {
+        assert_eq!(pipe_positions(r"|a\|b|"), vec![0, 5]);
+        assert_eq!(pipe_positions("|`a|b`|"), vec![0, 6]);
+    }
+
+    #[test]
+    fn line_ranges_returns_only_the_ranges_own_lines() {
+        let text = "ab\ncd\nef\n";
+        assert_eq!(line_ranges(text, 0..3), vec![0..2]);
+        assert_eq!(line_ranges(text, 0..6), vec![0..2, 3..5]);
+        assert_eq!(line_ranges(text, 3..8), vec![3..5, 6..8]);
+        assert_eq!(line_ranges(text, 4..4), vec![3..5]);
+        assert_eq!(line_ranges("a\r\nb", 0..4), vec![0..1, 3..4]);
+    }
 
     fn run(text: &str, selections: &[Range<usize>], marker: &str) -> (String, Vec<Range<usize>>) {
         let plan = toggle_marker(text, selections, marker);
@@ -1971,7 +2033,7 @@ mod tests {
 
     #[test]
     fn a_same_length_change_is_answered_fresh_after_the_cache_is_dropped() {
-        // ``` → ~~~ keeps the length, so only the window layer's reset (`live_host::forget`,
+        // ``` → ~~~ keeps the length, so only the window layer's reset (`markdown_host::forget`,
         // which drops the document's cache) can tell; after it the answer is a fresh scan's.
         let text = "```\n~~~\n```\n- x\n";
         let mut cache = FenceCache::default();

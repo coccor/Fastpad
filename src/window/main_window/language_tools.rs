@@ -66,9 +66,8 @@ pub(super) fn apply_language(hwnd: HWND, language: crate::document::Language) {
     }
 }
 
-/// The active tab's language; plain text while no tab is open.
-/// Sets the active document's language. A changed language drops Live's state for it: edits
-/// made under another language never reached it.
+/// Sets the active document's language. A changed language drops the Markdown helpers' state
+/// for it: edits made under another language never reached them.
 fn set_active_language(hwnd: HWND, language: crate::document::Language) {
     let changed = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let tabs = &mut unsafe { app.as_mut() }.tabs;
@@ -76,10 +75,11 @@ fn set_active_language(hwnd: HWND, language: crate::document::Language) {
         tabs.set_active_language(language).then_some(id)
     });
     if let Some(id) = changed {
-        crate::window::live_host::forget(hwnd, id);
+        crate::window::markdown_host::forget(hwnd, id);
     }
 }
 
+/// The active tab's language; plain text while no tab is open.
 pub(crate) fn active_language(hwnd: HWND) -> crate::document::Language {
     unsafe { app_ptr(hwnd) }
         .and_then(|app| {

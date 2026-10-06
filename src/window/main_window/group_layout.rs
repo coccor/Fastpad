@@ -360,10 +360,10 @@ fn configure_editor(hwnd: HWND, editor: &Editor) {
     install_group_hooks(hwnd, editor);
 }
 
-/// The Markdown Enter and Tab helpers (live mode spec §8), on every group's editor.
+/// The Markdown Enter and Tab helpers (Markdown design spec §8), on every group's editor.
 pub(super) fn install_group_hooks(hwnd: HWND, editor: &Editor) {
     editor.set_hooks(Some(std::rc::Rc::new(
-        crate::window::live_host::GroupHooks::new(hwnd, editor.hwnd()),
+        crate::window::markdown_host::GroupHooks::new(hwnd, editor.hwnd()),
     )));
 }
 

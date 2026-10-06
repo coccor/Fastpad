@@ -115,7 +115,7 @@ pub(crate) fn replace_in_document(
             // that failed after it), so it is marked edited whatever the result.
             if touched.get() && identity.is_live_for(hwnd) {
                 // The document host's notifications reach no window.
-                crate::window::live_host::forget(hwnd, id);
+                crate::window::markdown_host::forget(hwnd, id);
                 let changed = unsafe { app_ptr(hwnd) }
                     .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.note_background_edit(id));
                 if changed {
@@ -203,8 +203,9 @@ pub(crate) fn reload_clean_document(
     if !identity.is_live_for(hwnd) {
         return false;
     }
-    // Population suppressed (or never raised) SCN_MODIFIED, so Live's state is stale.
-    crate::window::live_host::forget(hwnd, id);
+    // Population suppressed (or never raised) SCN_MODIFIED, so the Markdown helpers' state is
+    // stale.
+    crate::window::markdown_host::forget(hwnd, id);
     if populated.is_err() {
         return false;
     }

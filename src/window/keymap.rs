@@ -342,7 +342,6 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::AddCursorAbove, "edit.addCursorAbove"),
     (CommandId::AddCursorBelow, "edit.addCursorBelow"),
     (CommandId::About, "help.about"),
-    (CommandId::MarkdownToggleLive, "markdown.toggleLive"),
     (CommandId::MarkdownBold, "markdown.bold"),
     (CommandId::MarkdownItalic, "markdown.italic"),
     (CommandId::MarkdownCode, "markdown.code"),
@@ -381,7 +380,7 @@ const fn ch(byte: u8) -> u16 {
 }
 
 /// FastPad's shortcuts before any override, in precedence order (spec §3.3).
-pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 87] = [
+pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 86] = [
     (key(C, ch(b'N')), CommandId::New),
     (key(C, ch(b'T')), CommandId::New),
     (key(C, ch(b'O')), CommandId::Open),
@@ -468,8 +467,7 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 87] = [
     (key(C | S, ch(b'L')), CommandId::SelectAllOccurrences),
     (key(C | A, VK_UP), CommandId::AddCursorAbove),
     (key(C | A, VK_DOWN), CommandId::AddCursorBelow),
-    (key(C | A, ch(b'V')), CommandId::MarkdownToggleLive),
-    // Markdown-scoped (live mode spec §9): these never shadow a global binding.
+    // Markdown-scoped (Markdown design spec §9): these never shadow a global binding.
     (key(C, ch(b'B')), CommandId::MarkdownBold),
     (key(C, ch(b'I')), CommandId::MarkdownItalic),
     (key(C, VK_OEM_3), CommandId::MarkdownCode),
@@ -681,7 +679,7 @@ impl Keymap {
         self.command_for_in(stroke, Scope::Global)
     }
 
-    /// The command `stroke` runs among the bindings of `scope` (live mode spec §9).
+    /// The command `stroke` runs among the bindings of `scope` (Markdown design spec §9).
     pub(crate) fn command_for_in(&self, stroke: KeyStroke, scope: Scope) -> Option<CommandId> {
         self.bindings
             .iter()
@@ -1100,16 +1098,6 @@ mod tests {
             keymap
                 .conflicts(ctrl_b, CommandId::ToggleSidebar)
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn live_markdown_toggles_with_ctrl_alt_v() {
-        let keymap = Keymap::defaults();
-        let stroke = KeyStroke::parse("Ctrl+Alt+V").unwrap();
-        assert_eq!(
-            keymap.command_for(stroke),
-            Some(CommandId::MarkdownToggleLive)
         );
     }
 

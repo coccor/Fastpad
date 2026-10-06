@@ -386,7 +386,7 @@ impl Editor {
     }
 
     /// Where `line`'s text ends, before its line end.
-    pub(crate) fn line_end(&self, line: usize) -> Result<usize> {
+    fn line_end(&self, line: usize) -> Result<usize> {
         Ok(self.send(SCI_GETLINEENDPOSITION, line, 0)?.max(0) as usize)
     }
 

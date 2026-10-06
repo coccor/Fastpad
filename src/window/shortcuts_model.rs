@@ -34,7 +34,7 @@ const EXTRA_TITLES: [(CommandId, &str); 22] = [
 ];
 
 /// Names for the Markdown-scoped commands: their keys work only in Markdown files, so the page
-/// says so (live mode spec §9).
+/// says so (Markdown design spec §9).
 const MARKDOWN_SCOPED_TITLES: [(CommandId, &str); 4] = [
     (CommandId::MarkdownBold, "Markdown: Bold (Markdown files)"),
     (

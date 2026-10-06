@@ -1,4 +1,5 @@
-//! Markdown-scoped keys (live mode spec §9), through the real accelerator path.
+//! Markdown-scoped keys (Markdown design spec §9) and the writing helpers, through the real
+//! accelerator and key paths.
 
 use super::*;
 use crate::document::Language;
@@ -48,14 +49,7 @@ fn ctrl_b_is_bold_in_markdown_and_toggle_sidebar_elsewhere() {
 fn markdown_keys_off_the_editor_fall_through_to_global() {
     let f = fixture("hello", Language::Markdown);
     let key = translate_key_with(f.window.hwnd, f.window.hwnd, b'B', true, false, false);
-    assert_ne!(key, Some(CommandId::MarkdownBold));
-}
-
-#[test]
-fn ctrl_alt_v_toggles_live_markdown() {
-    let f = fixture("hello", Language::Markdown);
-    let key = translate_key_with(f.window.hwnd, f.editor.hwnd(), b'V', true, false, true);
-    assert_eq!(key, Some(CommandId::MarkdownToggleLive));
+    assert_eq!(key, Some(CommandId::ToggleSidebar));
 }
 
 /// One Undo restores `original`.
@@ -397,6 +391,23 @@ fn closing_a_tab_with_a_dirty_table_leaves_the_others_alone() {
 }
 
 #[test]
+fn closing_a_document_drops_its_helper_state() {
+    // Break caught: every closed Markdown document's dirty table and fence states kept for the
+    // life of the window.
+    let f = fixture(TABLE, Language::Markdown);
+    type_in_table(&f.editor);
+    let id = app_mut(f.window.hwnd).tabs.active().unwrap().id;
+    assert!(crate::window::markdown_host::has_state(f.window.hwnd, id));
+    execute_command(f.window.hwnd, CommandId::New);
+    drain_messages();
+    crate::window::modal::answer_next_close_prompt(|_| CloseDecision::Discard);
+    super::super::close_tab_at(f.window.hwnd, 0);
+    drain_messages();
+    assert_eq!(super::super::tab_count(f.window.hwnd), 1);
+    assert!(!crate::window::markdown_host::has_state(f.window.hwnd, id));
+}
+
+#[test]
 fn enter_list_continuation_is_one_undo_step() {
     let f = fixture("- a\r\n- b", Language::Markdown);
     f.editor.set_selection(3..3).unwrap();
@@ -406,9 +417,9 @@ fn enter_list_continuation_is_one_undo_step() {
 }
 
 #[test]
-fn a_language_change_drops_the_documents_live_state() {
+fn a_language_change_drops_the_documents_helper_state() {
     // Break caught: a dirty table (or fence states) surviving edits made while the document was
-    // not Markdown, which never reached Live.
+    // not Markdown, which the helpers never saw.
     let f = fixture(TABLE, Language::Markdown);
     let edited = type_in_table(&f.editor);
     super::super::apply_language(f.window.hwnd, Language::PlainText);

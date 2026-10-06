@@ -1187,40 +1187,6 @@ unsafe extern "C" fn test_direct(
 }
 
 #[test]
-fn container_styling_runs_land_on_the_right_bytes() {
-    let editor = test_editor();
-    editor.set_text("ab**cd**").unwrap();
-    editor.set_lexer(0).unwrap();
-    editor
-        .apply_styling(0, &[(2, 0), (2, 1), (2, 3), (2, 1)])
-        .unwrap();
-    let styles: Vec<u8> = (0..8).map(|at| editor.style_at(at).unwrap()).collect();
-    assert_eq!(styles, [0, 0, 1, 1, 3, 3, 1, 1]);
-    assert_eq!(editor.end_styled().unwrap(), 8);
-}
-
-#[test]
-fn annotation_lines_reserve_and_clear() {
-    let editor = test_editor();
-    editor.set_text("# Title\nbody\n").unwrap();
-    editor.show_annotations(true).unwrap();
-    editor.set_annotation_lines(0, 2, 40).unwrap();
-    assert_eq!(editor.annotation_lines(0).unwrap(), 2);
-    editor.set_annotation_lines(0, 0, 40).unwrap();
-    assert_eq!(editor.annotation_lines(0).unwrap(), 0);
-}
-
-#[test]
-fn geometry_round_trips_a_position() {
-    let editor = test_editor();
-    editor.set_text("hello\nworld\n").unwrap();
-    let start = editor.line_start(1).unwrap();
-    let (x, y) = editor.point_of(start).unwrap();
-    assert_eq!(editor.position_at(x + 1, y + 1).unwrap(), start);
-    assert!(editor.text_height().unwrap() > 0);
-}
-
-#[test]
 fn a_hook_that_takes_enter_also_swallows_its_char() {
     use crate::editor::EditorHooks;
     use std::cell::Cell;

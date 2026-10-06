@@ -24,7 +24,7 @@ pub(crate) struct AcceleratorTable(HACCEL);
 impl AcceleratorTable {
     /// The table for `keymap`'s global bindings, in its precedence order: `TranslateAcceleratorW`
     /// takes the first entry that matches, so a user binding shadows a default on its key.
-    /// Markdown-scoped keys are dispatched before the table (live mode spec §9).
+    /// Markdown-scoped keys are dispatched before the table (Markdown design spec §9).
     pub(crate) fn create(keymap: &crate::window::keymap::Keymap) -> Result<Self> {
         let accelerators = keymap
             .bindings()
@@ -226,7 +226,6 @@ impl MenuBar {
                     ),
                     MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
                     MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
-                    MenuEntry::command("&Live Markdown", CommandId::MarkdownToggleLive),
                     MenuEntry::Separator,
                     MenuEntry::command("Command &palette...", CommandId::CommandPalette),
                 ],
@@ -269,17 +268,6 @@ pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
         CommandId::MarkdownPreviewClose,
     ] {
         unsafe { EnableMenuItem(menu, command as u32, state) };
-    }
-}
-
-/// Grays Live Markdown off Markdown tabs and checks it while the active document is Live.
-pub(crate) fn set_markdown_live(menu: HMENU, enabled: bool, checked: bool) {
-    let command = CommandId::MarkdownToggleLive as u32;
-    let enable = if enabled { MF_ENABLED } else { MF_GRAYED };
-    let check = if checked { MF_CHECKED } else { MF_UNCHECKED };
-    unsafe {
-        EnableMenuItem(menu, command, MF_BYCOMMAND | enable);
-        CheckMenuItem(menu, command, MF_BYCOMMAND | check);
     }
 }
 
@@ -878,7 +866,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 83);
+        assert_eq!(specs.len(), 82);
     }
 
     #[test]
@@ -887,7 +875,7 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         let table = super::AcceleratorTable::create(&crate::window::keymap::Keymap::defaults())
             .expect("accelerator table");
-        assert_eq!(table.entries().len(), 83);
+        assert_eq!(table.entries().len(), 82);
     }
 
     #[test]
@@ -906,7 +894,7 @@ mod tests {
 
     #[test]
     fn every_shortcut_chord_maps_to_exactly_one_command() {
-        // A Markdown-scoped key may match a global one (live mode spec §9), never one of its own
+        // A Markdown-scoped key may match a global one (Markdown design spec §9), never one of its own
         // scope.
         let keymap = crate::window::keymap::Keymap::defaults();
         let bindings = keymap.bindings();

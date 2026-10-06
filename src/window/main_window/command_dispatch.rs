@@ -445,7 +445,7 @@ pub(super) fn execute_command_with_note(
         CommandId::MarkdownBold
         | CommandId::MarkdownItalic
         | CommandId::MarkdownCode
-        | CommandId::MarkdownLink => crate::window::live_host::format(hwnd, command),
+        | CommandId::MarkdownLink => crate::window::markdown_host::format(hwnd, command),
         CommandId::ToggleSidebar => crate::window::side_panel::toggle(hwnd),
         CommandId::FocusNextPane => cycle_focus(hwnd, false),
         CommandId::FocusPreviousPane => cycle_focus(hwnd, true),

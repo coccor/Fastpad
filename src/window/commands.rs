@@ -153,12 +153,11 @@ pub enum CommandId {
     SelectAllOccurrences = 258,
     AddCursorAbove = 259,
     AddCursorBelow = 260,
-    // Live Markdown and the Markdown writing helpers (live mode spec §4, §8).
-    MarkdownToggleLive = 261,
-    MarkdownBold = 262,
-    MarkdownItalic = 263,
-    MarkdownCode = 264,
-    MarkdownLink = 265,
+    // The Markdown writing helpers (Markdown design spec §8).
+    MarkdownBold = 261,
+    MarkdownItalic = 262,
+    MarkdownCode = 263,
+    MarkdownLink = 264,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -183,7 +182,7 @@ pub const EDITING_COMMANDS: [CommandId; 16] = [
 ];
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 61] = [
+pub const TEXT_COMMANDS: [CommandId; 60] = [
     CommandId::MoveLinesUp,
     CommandId::MoveLinesDown,
     CommandId::CopyLinesUp,
@@ -240,14 +239,13 @@ pub const TEXT_COMMANDS: [CommandId; 61] = [
     CommandId::LanguageYaml,
     CommandId::NoteReloadFromDisk,
     CommandId::NoteKeepMine,
-    CommandId::MarkdownToggleLive,
     CommandId::MarkdownBold,
     CommandId::MarkdownItalic,
     CommandId::MarkdownCode,
     CommandId::MarkdownLink,
 ];
 
-/// Where a command's key bindings apply (live mode spec §9): Markdown bindings are tried first,
+/// Where a command's key bindings apply (Markdown design spec §9): Markdown bindings are tried first,
 /// and only while a Markdown tab's editor has focus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Scope {
@@ -256,7 +254,7 @@ pub enum Scope {
 }
 
 impl CommandId {
-    /// Where this command's key bindings apply (live mode spec §9).
+    /// Where this command's key bindings apply (Markdown design spec §9).
     pub const fn scope(self) -> Scope {
         match self {
             Self::MarkdownBold | Self::MarkdownItalic | Self::MarkdownCode | Self::MarkdownLink => {
@@ -266,16 +264,9 @@ impl CommandId {
         }
     }
 
-    /// Commands offered only for Markdown tabs (palette, View menu).
+    /// Commands offered only for Markdown tabs (palette).
     pub const fn is_markdown_edit(self) -> bool {
-        matches!(
-            self,
-            Self::MarkdownToggleLive
-                | Self::MarkdownBold
-                | Self::MarkdownItalic
-                | Self::MarkdownCode
-                | Self::MarkdownLink
-        )
+        matches!(self.scope(), Scope::Markdown)
     }
 
     /// Commands that need the active tab's text, and so do nothing on an image tab.
@@ -492,7 +483,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 155] = [
+        const COMMANDS: [CommandId; 154] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -643,7 +634,6 @@ impl TryFrom<u16> for CommandId {
             CommandId::ToggleCodeFolding,
             CommandId::FoldAll,
             CommandId::UnfoldAll,
-            CommandId::MarkdownToggleLive,
             CommandId::MarkdownBold,
             CommandId::MarkdownItalic,
             CommandId::MarkdownCode,
@@ -966,17 +956,17 @@ mod tests {
     #[test]
     fn markdown_edit_commands_have_stable_values() {
         for (value, command) in [
-            (261, CommandId::MarkdownToggleLive),
-            (262, CommandId::MarkdownBold),
-            (263, CommandId::MarkdownItalic),
-            (264, CommandId::MarkdownCode),
-            (265, CommandId::MarkdownLink),
+            (261, CommandId::MarkdownBold),
+            (262, CommandId::MarkdownItalic),
+            (263, CommandId::MarkdownCode),
+            (264, CommandId::MarkdownLink),
         ] {
             assert_eq!(CommandId::try_from(value), Ok(command));
             assert!(command.is_markdown_edit());
+            assert_eq!(command.scope(), Scope::Markdown);
         }
-        assert_eq!(CommandId::MarkdownBold.scope(), Scope::Markdown);
-        assert_eq!(CommandId::MarkdownToggleLive.scope(), Scope::Global);
+        assert!(CommandId::try_from(265).is_err());
+        assert!(!CommandId::ToggleSidebar.is_markdown_edit());
         assert_eq!(CommandId::ToggleSidebar.scope(), Scope::Global);
     }
 }

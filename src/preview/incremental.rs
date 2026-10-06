@@ -102,17 +102,7 @@ impl SourceText for str {
     }
 
     fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
-        // Block ranges are char boundaries; a range that is not one (a fixed-size window) is
-        // clamped inward instead of panicking.
-        let mut end = range.end.min(str::len(self));
-        while !self.is_char_boundary(end) {
-            end -= 1;
-        }
-        let mut start = range.start.min(end);
-        while !self.is_char_boundary(start) {
-            start += 1;
-        }
-        Cow::Borrowed(&self[start..end])
+        Cow::Borrowed(&self[range])
     }
 
     fn line_of(&self, byte: usize) -> usize {
@@ -158,16 +148,6 @@ impl PreviewDocument {
         self.refdefs = refdefs;
         self.revision += 1;
         Update::Full
-    }
-
-    /// The destination of the reference definition `label` names, as a broken-link callback
-    /// resolves it (live mode spec §7: Live parses one block at a time).
-    pub fn refdef_dest(&self, label: &str) -> Option<&str> {
-        let key = crate::preview::model::normalize_label(label);
-        self.refdefs
-            .iter()
-            .find(|definition| definition.key == key)
-            .map(|definition| definition.dest.as_str())
     }
 
     pub fn apply(&mut self, source: &(impl SourceText + ?Sized), edits: &[Edit]) -> Update {

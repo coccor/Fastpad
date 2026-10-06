@@ -522,8 +522,8 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 return handle_ipc_requests(hwnd);
             }
             match message {
-                crate::window::WM_FASTPAD_LIVE_DEFERRED => {
-                    crate::window::live_host::run_deferred(hwnd);
+                crate::window::WM_FASTPAD_MARKDOWN_DEFERRED => {
+                    crate::window::markdown_host::run_deferred(hwnd);
                     return 0;
                 }
                 crate::window::WM_FASTPAD_CONTENT_FOCUSED => {
@@ -683,7 +683,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0
             && document.is_some_and(|document| is_markdown(hwnd, document))
         {
-            crate::window::live_host::selection_changed(hwnd, group);
+            crate::window::markdown_host::selection_changed(hwnd, group);
         }
         return;
     }
@@ -736,7 +736,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
             crate::window::preview_host::record_edit(hwnd, shown, modification);
         }
         if is_markdown(hwnd, document) {
-            crate::window::live_host::text_changed(hwnd, &editor, document, modification);
+            crate::window::markdown_host::text_changed(hwnd, &editor, document, modification);
         }
         return;
     }

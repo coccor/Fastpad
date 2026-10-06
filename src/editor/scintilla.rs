@@ -62,9 +62,7 @@ use crate::platform::{last_error, wide_null};
 #[cfg(windows)]
 use std::mem::transmute;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT, WPARAM};
-#[cfg(windows)]
-use windows_sys::Win32::Graphics::Gdi::{GetUpdateRect, ScreenToClient};
+use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB,
@@ -73,15 +71,15 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, GetCursorPos, HTCLIENT, HWND_MESSAGE,
-    SendMessageW, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, GetClientRect, HWND_MESSAGE, SendMessageW, WM_CHAR,
+    WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCDESTROY, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE,
 };
 
 mod document_text;
 mod editing;
 mod line_ops;
-mod live_ops;
+mod markdown_ops;
 mod styling;
 
 pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
@@ -89,9 +87,6 @@ pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
 const ENDPOINT_DESTROYED: &str = "Scintilla editor endpoint is no longer alive";
 #[cfg(windows)]
 const EDITOR_ENDPOINT_SUBCLASS_ID: usize = 0x4650_4544;
-/// `wParam` bit of a mouse message: Ctrl is down. Its windows-sys feature is not enabled.
-#[cfg(windows)]
-const MK_CONTROL: usize = 0x0008;
 
 /// Where the caret sits, as `Editor::caret_status` reports it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -169,7 +164,7 @@ struct EditorEndpoint {
     occurrence_word: Cell<Option<(usize, usize)>>,
     /// The selections and point an Alt+Click started from (editing shortcuts spec §5).
     alt_click: RefCell<Option<AltClick>>,
-    /// Where the window layer plugs into paint, mouse, cursor and key handling.
+    /// Where the window layer plugs into key handling (the Markdown helpers' Enter and Tab).
     hooks: RefCell<Option<Rc<dyn crate::editor::EditorHooks>>>,
     /// The `WM_CHAR` a consumed `WM_KEYDOWN` will produce, dropped when it arrives.
     swallow_char: Cell<Option<u16>>,
@@ -319,14 +314,6 @@ impl Editor {
 
     pub fn set_hooks(&self, hooks: Option<Rc<dyn crate::editor::EditorHooks>>) {
         *self.endpoint.hooks.borrow_mut() = hooks;
-    }
-
-    /// Repaints the whole editor, so hook-painted decorations are redrawn.
-    pub fn invalidate(&self) {
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Graphics::Gdi::InvalidateRect(self.hwnd(), std::ptr::null(), 0);
-        }
     }
 
     #[cfg(test)]
@@ -746,7 +733,6 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
     ref_data: usize,
 ) -> isize {
     let endpoint = unsafe { &*(ref_data as *const EditorEndpoint) };
-    let hooks = endpoint.hooks.borrow().clone();
     if message == WM_CHAR
         && let Some(expected) = endpoint.swallow_char.take()
         && expected == wparam as u16
@@ -757,9 +743,13 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
         // A consumed key whose WM_CHAR never came must not eat a later key's character.
         endpoint.swallow_char.set(None);
     }
-    if message == WM_KEYDOWN
-        && let Some(hooks) = &hooks
-    {
+    // Cloned out first, so no borrow is held while the hook calls back into the editor.
+    let hooks = if message == WM_KEYDOWN {
+        endpoint.hooks.borrow().clone()
+    } else {
+        None
+    };
+    if let Some(hooks) = hooks {
         let down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
         let vk = wparam as u16;
         if hooks.key_down(vk, down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU)) {
@@ -772,44 +762,6 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
             endpoint.swallow_char.set(produced);
             return 0;
         }
-    }
-    if message == WM_LBUTTONDOWN
-        && let Some(hooks) = &hooks
-    {
-        let (x, y) = mouse_point(lparam);
-        if hooks.mouse_down(x, y, wparam & MK_CONTROL != 0) {
-            return 0;
-        }
-    }
-    if message == WM_SETCURSOR
-        && (lparam & 0xFFFF) as u32 == HTCLIENT
-        && let Some(hooks) = &hooks
-    {
-        let mut point = POINT { x: 0, y: 0 };
-        unsafe {
-            GetCursorPos(&mut point);
-            ScreenToClient(hwnd, &mut point);
-        }
-        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
-        if hooks.set_cursor(point.x, point.y, ctrl) {
-            return 1;
-        }
-    }
-    if message == WM_PAINT
-        && let Some(hooks) = &hooks
-    {
-        let mut update = RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        let has_update = unsafe { GetUpdateRect(hwnd, &mut update, 0) } != 0;
-        let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-        if has_update {
-            hooks.after_paint(hwnd, update);
-        }
-        return result;
     }
     if message == WM_CHAR {
         let ctrl_down = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;

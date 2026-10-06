@@ -1,13 +1,14 @@
-//! Live Markdown and the Markdown writing helpers in the window layer (live mode spec §4, §8).
+//! The Markdown writing helpers in the window layer (Markdown design spec §8): the format
+//! commands, Enter and Tab in Markdown documents, and tables formatted when the caret leaves them.
 
 use crate::document::{DocumentId, Language};
 use crate::editor::markdown_edit::{
-    EditPlan, FenceCache, enter_in_list, format_table, in_literal_block_cached, indent_list_item,
-    insert_link, is_list_item, next_cell, table_at, toggle_marker,
+    EditPlan, FenceCache, MARKDOWN_HELPER_MAX_BYTES, enter_in_list, format_table,
+    in_literal_block_cached, indent_list_item, insert_link, is_list_item, next_cell, table_at,
+    toggle_marker,
 };
 use crate::editor::scintilla_constants::{SC_MOD_DELETETEXT, SC_PERFORMED_REDO, SC_PERFORMED_UNDO};
 use crate::editor::{Editor, EditorHooks, ScintillaNotification};
-use crate::live::LIVE_MAX_BYTES;
 use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use crate::window::split_tree::GroupId;
@@ -16,12 +17,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_RETURN, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-/// Whether the active document is shown in Live Markdown.
-pub(crate) fn is_live(_hwnd: HWND) -> bool {
-    false
-}
-
-/// The format commands (live mode spec §8.1): toggle a marker around each selection, or insert
+/// The format commands (spec §8.1): toggle a marker around each selection, or insert
 /// a link, as one undo step.
 pub(crate) fn format(hwnd: HWND, command: CommandId) {
     if host_window::active_language(hwnd) != Language::Markdown {
@@ -43,18 +39,18 @@ pub(crate) fn format(hwnd: HWND, command: CommandId) {
     });
 }
 
-/// Per-document Live Markdown state, and the groups waiting for deferred work.
+/// The helpers' per-document state, and the groups waiting for deferred work.
 #[derive(Default)]
-pub(crate) struct LiveRegistry {
-    docs: HashMap<DocumentId, DocState>,
+pub(crate) struct MarkdownRegistry {
+    docs: HashMap<DocumentId, HelperState>,
     /// Groups whose selection changed since the deferred message was posted.
     pending: Vec<GroupId>,
     posted: bool,
 }
 
-impl std::fmt::Debug for LiveRegistry {
+impl std::fmt::Debug for MarkdownRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveRegistry")
+        f.debug_struct("MarkdownRegistry")
             .field("docs", &self.docs)
             .field("pending", &self.pending)
             .field("posted", &self.posted)
@@ -63,7 +59,7 @@ impl std::fmt::Debug for LiveRegistry {
 }
 
 #[derive(Default)]
-pub(crate) struct DocState {
+pub(crate) struct HelperState {
     /// A line of a table the user typed in; the table is formatted when the caret leaves it.
     /// Kept on its row as lines are added or removed above it.
     dirty_line: Option<usize>,
@@ -73,9 +69,9 @@ pub(crate) struct DocState {
     fences: FenceCache,
 }
 
-impl std::fmt::Debug for DocState {
+impl std::fmt::Debug for HelperState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DocState")
+        f.debug_struct("HelperState")
             .field("dirty_line", &self.dirty_line)
             .field("formatting", &self.formatting)
             .field("fences", &self.fences)
@@ -100,16 +96,22 @@ fn in_literal_block(hwnd: HWND, document: DocumentId, text: &str, at: usize) -> 
     literal
 }
 
-/// Drops what Live remembers about `document` (its dirty table and fence states): its text or
-/// language changed without SCN_MODIFIED reaching `text_changed` (a reload, a background
-/// Replace, a language change).
+/// Drops what the helpers remember about `document` (its dirty table and fence states): it
+/// closed, or its text or language changed without SCN_MODIFIED reaching `text_changed` (a
+/// reload, a background Replace, a language change).
 pub(crate) fn forget(hwnd: HWND, document: DocumentId) {
     with_registry(hwnd, |registry| registry.docs.remove(&document));
 }
 
-fn with_registry<R>(hwnd: HWND, run: impl FnOnce(&mut LiveRegistry) -> R) -> Option<R> {
+fn with_registry<R>(hwnd: HWND, run: impl FnOnce(&mut MarkdownRegistry) -> R) -> Option<R> {
     // SAFETY: the App pointer is used only inside `run`, which makes no Win32 call.
-    unsafe { host_window::app_ptr(hwnd) }.map(|mut app| run(&mut unsafe { app.as_mut() }.live))
+    unsafe { host_window::app_ptr(hwnd) }.map(|mut app| run(&mut unsafe { app.as_mut() }.markdown))
+}
+
+/// Whether the helpers hold any state for `document`.
+#[cfg(test)]
+pub(crate) fn has_state(hwnd: HWND, document: DocumentId) -> bool {
+    with_registry(hwnd, |registry| registry.docs.contains_key(&document)).unwrap_or(false)
 }
 
 /// The group whose editor window is `editor`, its editor and active document.
@@ -129,7 +131,7 @@ pub(crate) fn group_of_editor(
 }
 
 /// Every group editor's hooks: Enter continues lists, Tab nests list items and walks table
-/// cells, in Markdown documents only (live mode spec §8.2, §8.3).
+/// cells, in Markdown documents only (spec §8.2, §8.3).
 #[derive(Debug)]
 pub(crate) struct GroupHooks {
     main: HWND,
@@ -157,7 +159,7 @@ impl EditorHooks for GroupHooks {
         };
         if editor
             .length()
-            .map_or(true, |length| length > LIVE_MAX_BYTES)
+            .map_or(true, |length| length > MARKDOWN_HELPER_MAX_BYTES)
         {
             return false;
         }
@@ -207,7 +209,7 @@ impl EditorHooks for GroupHooks {
     }
 }
 
-/// SCN_MODIFIED for a Markdown document (live mode spec §8.3): keeps a dirty table's line on
+/// SCN_MODIFIED for a Markdown document (spec §8.3): keeps a dirty table's line on
 /// its row, and remembers a table the user typed in at the focused editor's caret. Undo, redo,
 /// Replace All and other views' edits are not typing. Reads only the edited line, never the
 /// whole document, and never edits inside the notification.
@@ -229,13 +231,13 @@ pub(crate) fn text_changed(
     let formatting = with_registry(hwnd, |registry| {
         registry.docs.get_mut(&document).is_some_and(|state| {
             state.fences.edited(position, delta, length);
-            if length > LIVE_MAX_BYTES {
+            if length > MARKDOWN_HELPER_MAX_BYTES {
                 state.dirty_line = None; // past the limit no table is tracked
             }
             state.formatting
         })
     });
-    if formatting != Some(false) || length > LIVE_MAX_BYTES {
+    if formatting != Some(false) || length > MARKDOWN_HELPER_MAX_BYTES {
         return;
     }
     let Ok(line) = editor.line_from_position(position) else {
@@ -297,7 +299,7 @@ pub(crate) fn selection_changed(hwnd: HWND, group: GroupId) {
         unsafe {
             PostMessageW(
                 hwnd,
-                crate::window::messages::WM_FASTPAD_LIVE_DEFERRED,
+                crate::window::messages::WM_FASTPAD_MARKDOWN_DEFERRED,
                 0,
                 0,
             )

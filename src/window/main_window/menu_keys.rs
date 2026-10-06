@@ -129,11 +129,6 @@ pub(super) fn open_menu(hwnd: HWND, mut index: usize) {
             menus::set_checked_language(menu, active_language(hwnd));
         }
         menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
-        // After the text commands, so Live Markdown stays grayed off Markdown tabs.
-        if index == crate::window::menu_band::VIEW_MENU_INDEX {
-            let markdown = active_language(hwnd) == crate::document::Language::Markdown;
-            menus::set_markdown_live(menu, markdown, crate::window::live_host::is_live(hwnd));
-        }
         set_menu_mode(
             hwnd,
             Some(MenuMode {
@@ -327,7 +322,7 @@ fn editing_key_off_editor(
     editing && !is_group_editor(hwnd, message.hwnd)
 }
 
-/// A Markdown-scoped shortcut (live mode spec §9): taken only when a Markdown tab's editor has
+/// A Markdown-scoped shortcut (Markdown design spec §9): taken only when a Markdown tab's editor has
 /// focus, so the same key keeps its global command everywhere else.
 fn markdown_key(hwnd: HWND, message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -> bool {
     if !matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
