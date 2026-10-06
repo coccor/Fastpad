@@ -508,9 +508,10 @@ impl<'a> Collector<'a> {
 
     fn quote_markers(&mut self, range: Range<usize>) {
         let mut previous_depth = 1;
-        for line in line_ranges(self.text, range) {
+        let quote_start = range.start;
+        for (index, line) in line_ranges(self.text, range).into_iter().enumerate() {
             let bytes = self.text.as_bytes();
-            let mut at = line.start;
+            let mut at = if index == 0 { quote_start } else { line.start };
             let mut depth = 0u8;
             loop {
                 let mut probe = at;
@@ -615,7 +616,7 @@ impl<'a> Collector<'a> {
         let lines = line_ranges(self.text, whole.clone());
         let first = lines[0].clone();
         let source = &self.text[first.clone()];
-        if source.trim_start().starts_with('#') {
+        if lines.len() == 1 && source.trim_start().starts_with('#') {
             let lead = source.len() - source.trim_start().len();
             let hashes = source[lead..].bytes().take_while(|b| *b == b'#').count();
             let gap = source[lead + hashes..]
@@ -995,6 +996,18 @@ mod tests {
         let text = "Hi\n==\nnext\n";
         assert_eq!(kinds(text), "hh.##......");
         assert_eq!(decoration_lines(&parse_block(text, &no_refs)), vec![0]);
+    }
+
+    #[test]
+    fn a_quote_inside_a_list_item_blanks_its_first_marker() {
+        assert_eq!(kinds("- > a"), "B.B.q");
+        assert_eq!(kinds("- > a\n  > b"), "B.B.q...B.q");
+        assert_eq!(kinds("1. > a"), "mm.B.q");
+    }
+
+    #[test]
+    fn a_setext_heading_whose_text_starts_with_a_hash_is_setext() {
+        assert_eq!(kinds("#x\n=="), "hh.##");
     }
 
     #[test]
