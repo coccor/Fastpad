@@ -10,7 +10,7 @@
   <g fill="#FFB020">
     <!-- The cover, notched around each ring and with the bolt cut out. -->
     <path fill-rule="evenodd" d="M66 0H208A36 36 0 0 1 244 36V220A36 36 0 0 1 208 256H66A36 36 0 0 1 30 220V216H52A24 24 0 0 0 52 168H30V152H52A24 24 0 0 0 52 104H30V88H52A24 24 0 0 0 52 40H30V36A36 36 0 0 1 66 0Z
-             M130 56H202L172 122H210L112 220L137 146H100Z"/>
+             M120 56H192L162 122H200L102 220L127 146H90Z"/>
     <use href="#rings"/>
   </g>
 </svg>
