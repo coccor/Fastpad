@@ -76,113 +76,168 @@ fn shift(position: usize, delta: isize) -> usize {
     (position as isize + delta) as usize
 }
 
+/// Two edit ranges clash when they overlap; insertions at one position never clash.
+fn edits_clash(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
 pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> EditPlan {
+    enum Kind {
+        Pair,
+        Inside,
+        Around,
+        Wrap,
+    }
     let width = marker.len();
     let byte = marker.as_bytes()[0];
-    let mut order: Vec<usize> = (0..selections.len()).collect();
-    order.sort_by_key(|index| normalized(&selections[*index]).start);
+    // (selection index, selection, target) in document order of the targets.
+    let mut items: Vec<(usize, Range<usize>, Range<usize>)> = selections
+        .iter()
+        .enumerate()
+        .map(|(index, selection)| {
+            let selection = normalized(selection);
+            let target = if selection.is_empty() {
+                word_at(text, selection.start).unwrap_or(selection.clone())
+            } else {
+                selection.clone()
+            };
+            (index, selection, target)
+        })
+        .collect();
+    items.sort_by_key(|(index, selection, target)| {
+        (target.start, target.end, selection.start, selection.end, *index)
+    });
     let mut plan = EditPlan { edits: Vec::new(), selections: vec![0..0; selections.len()] };
     let mut delta: isize = 0;
     // (target, resulting selection) of every toggle already planned.
     let mut handled: Vec<(Range<usize>, Range<usize>)> = Vec::new();
-    let insert = |plan: &mut EditPlan, at: usize, text: &str| {
-        plan.edits.push(TextEdit { range: at..at, text: text.to_owned() });
-    };
-    let remove = |plan: &mut EditPlan, range: Range<usize>| {
-        plan.edits.push(TextEdit { range, text: String::new() });
-    };
-    for index in order {
-        let selection = normalized(&selections[index]);
+    for (index, selection, target) in items {
         let caret = selection.is_empty().then_some(selection.start);
-        let target = match caret {
-            Some(at) => word_at(text, at).unwrap_or(at..at),
-            None => selection.clone(),
-        };
-        // Two carets in one word, or overlapping selections, share one toggle.
-        let shared = handled.iter().find(|(done, _)| {
-            *done == target || (target.start < done.end && done.start < target.end)
-        });
-        if let Some((_, result)) = shared {
-            plan.selections[index] = result.clone();
-            continue;
-        }
-        handled.push((target.clone(), 0..0));
-        let slot = handled.len() - 1;
-        if target.is_empty() {
-            insert(&mut plan, target.start, &marker.repeat(2));
-            let at = shift(target.start, delta) + width;
-            plan.selections[index] = at..at;
-            delta += 2 * width as isize;
-            handled[slot].1 = plan.selections[index].clone();
-            continue;
-        }
         let inner = &text[target.clone()];
-        let inside = inner.len() >= 2 * width
+        let kind = if target.is_empty() {
+            Kind::Pair
+        } else if inner.len() >= 2 * width
             && run_matches(run_after(inner, 0, byte), width)
-            && run_matches(run_before(inner, inner.len(), byte), width);
-        let around = target.start >= width
+            && run_matches(run_before(inner, inner.len(), byte), width)
+        {
+            Kind::Inside
+        } else if target.start >= width
             && run_matches(run_before(text, target.start, byte), width)
-            && run_matches(run_after(text, target.end, byte), width);
-        if inside {
-            remove(&mut plan, target.start..target.start + width);
-            remove(&mut plan, target.end - width..target.end);
-            let start = shift(target.start, delta);
-            plan.selections[index] = match caret {
-                Some(at) => {
-                    let at = shift(at, delta).saturating_sub(width).max(start);
-                    at..at
+            && run_matches(run_after(text, target.end, byte), width)
+        {
+            Kind::Around
+        } else {
+            Kind::Wrap
+        };
+        let insert = |at: usize, text: String| TextEdit { range: at..at, text };
+        let remove = |range: Range<usize>| TextEdit { range, text: String::new() };
+        let edits = match kind {
+            Kind::Pair => vec![insert(target.start, marker.repeat(2))],
+            Kind::Inside => vec![
+                remove(target.start..target.start + width),
+                remove(target.end - width..target.end),
+            ],
+            Kind::Around => vec![
+                remove(target.start - width..target.start),
+                remove(target.end..target.end + width),
+            ],
+            Kind::Wrap => {
+                vec![insert(target.start, marker.to_owned()), insert(target.end, marker.to_owned())]
+            }
+        };
+        // Selections on one word, or on words that share a marker run, share one toggle.
+        let shared = handled
+            .iter()
+            .find(|(done, _)| *done == target || (target.start < done.end && done.start < target.end))
+            .map(|(_, result)| result.clone())
+            .or_else(|| {
+                let clash = edits.iter().any(|new| {
+                    plan.edits.iter().any(|old| edits_clash(&new.range, &old.range))
+                });
+                clash.then(|| {
+                    // Follows the nearest earlier toggle.
+                    handled.last().map_or(0..0, |(_, result)| result.clone())
+                })
+            });
+        if let Some(result) = shared {
+            plan.selections[index] = result;
+            continue;
+        }
+        plan.edits.extend(edits);
+        let result = match kind {
+            Kind::Pair => {
+                let at = shift(target.start, delta) + width;
+                at..at
+            }
+            Kind::Inside => {
+                let start = shift(target.start, delta);
+                match caret {
+                    Some(at) => {
+                        let at = shift(at, delta).saturating_sub(width).max(start);
+                        at..at
+                    }
+                    None => start..start + inner.len() - 2 * width,
                 }
-                None => start..start + inner.len() - 2 * width,
-            };
-            delta -= 2 * width as isize;
-        } else if around {
-            remove(&mut plan, target.start - width..target.start);
-            remove(&mut plan, target.end..target.end + width);
-            plan.selections[index] = match caret {
+            }
+            Kind::Around => match caret {
                 Some(at) => {
                     let at = shift(at, delta) - width;
                     at..at
                 }
                 None => shift(target.start, delta) - width..shift(target.end, delta) - width,
-            };
-            delta -= 2 * width as isize;
-        } else {
-            insert(&mut plan, target.start, marker);
-            insert(&mut plan, target.end, marker);
-            plan.selections[index] = match caret {
+            },
+            Kind::Wrap => match caret {
                 Some(at) => {
                     let at = shift(at, delta) + width;
                     at..at
                 }
                 None => shift(target.start, delta) + width..shift(target.end, delta) + width,
-            };
-            delta += 2 * width as isize;
-        }
-        handled[slot].1 = plan.selections[index].clone();
+            },
+        };
+        delta += match kind {
+            Kind::Pair | Kind::Wrap => 2 * width as isize,
+            Kind::Inside | Kind::Around => -2 * (width as isize),
+        };
+        plan.selections[index] = result.clone();
+        handled.push((target, result));
     }
     plan.edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
     plan
 }
 
+/// Two link spans clash when equal, overlapping, or when a caret touches a selection.
+fn spans_clash(a: &Range<usize>, b: &Range<usize>) -> bool {
+    let touches = |caret: &Range<usize>, span: &Range<usize>| {
+        caret.is_empty() && span.start <= caret.start && caret.start <= span.end
+    };
+    a == b || (a.start < b.end && b.start < a.end) || touches(a, b) || touches(b, a)
+}
+
 pub fn insert_link(_text: &str, selections: &[Range<usize>]) -> EditPlan {
-    let mut order: Vec<usize> = (0..selections.len()).collect();
-    order.sort_by_key(|index| normalized(&selections[*index]).start);
+    let mut order: Vec<(usize, Range<usize>)> =
+        selections.iter().enumerate().map(|(index, selection)| (index, normalized(selection))).collect();
+    order.sort_by_key(|(index, selection)| (selection.start, selection.end, *index));
     let mut plan = EditPlan { edits: Vec::new(), selections: vec![0..0; selections.len()] };
     let mut delta: isize = 0;
-    for index in order {
-        let selection = normalized(&selections[index]);
-        if selection.is_empty() {
+    let mut handled: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+    for (index, selection) in order {
+        if let Some((_, result)) = handled.iter().find(|(done, _)| spans_clash(done, &selection)) {
+            plan.selections[index] = result.clone();
+            continue;
+        }
+        let at = if selection.is_empty() {
             plan.edits.push(TextEdit { range: selection.clone(), text: "[]()".into() });
-            let at = shift(selection.start, delta) + 1;
-            plan.selections[index] = at..at;
+            shift(selection.start, delta) + 1
         } else {
             plan.edits.push(TextEdit { range: selection.start..selection.start, text: "[".into() });
             plan.edits.push(TextEdit { range: selection.end..selection.end, text: "]()".into() });
-            let at = shift(selection.end, delta) + 3;
-            plan.selections[index] = at..at;
-        }
+            shift(selection.end, delta) + 3
+        };
         delta += 4;
+        plan.selections[index] = at..at;
+        handled.push((selection, at..at));
     }
+    plan.edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
     plan
 }
 
@@ -348,11 +403,16 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
         // Under a parent item: line up with its content; otherwise by the item's own marker.
         let parent = enclosing_item(text, line.start, |item| item.indent <= prefix.indent);
         let column = parent.map_or(0, |item| item.indent + item.marker_width);
-        let width = if column > prefix.indent { column - prefix.indent } else { prefix.marker_width };
-        let pad = " ".repeat(width);
-        let after = caret + pad.len();
+        let indent = if column > prefix.indent { column } else { prefix.indent + prefix.marker_width };
+        // Replace the existing indent so a tab never ends up after spaces.
+        let pad = " ".repeat(indent);
+        let after = if caret >= line.start + prefix.indent {
+            caret + indent - prefix.indent
+        } else {
+            line.start + indent
+        };
         return Some(EditPlan {
-            edits: vec![TextEdit { range: line.start..line.start, text: pad }],
+            edits: vec![TextEdit { range: line.start..line.start + prefix.indent, text: pad }],
             selections: vec![after..after],
         });
     }
@@ -823,5 +883,86 @@ mod tests {
             format_table("  |a|b|\n  |-|-|").as_deref(),
             Some("  | a   | b   |\n  | --- | --- |")
         );
+    }
+
+    fn assert_well_formed(text: &str, plan: &EditPlan, context: &str) {
+        let mut at = 0;
+        for edit in &plan.edits {
+            assert!(edit.range.start >= at, "{context}: edits overlap or are unsorted: {plan:?}");
+            assert!(edit.range.start <= edit.range.end && edit.range.end <= text.len(), "{context}");
+            assert!(text.is_char_boundary(edit.range.start) && text.is_char_boundary(edit.range.end));
+            at = edit.range.end;
+        }
+        let out = plan.apply_to(text);
+        for selection in &plan.selections {
+            assert!(selection.start <= selection.end && selection.end <= out.len(), "{context}: {plan:?}");
+            assert!(out.is_char_boundary(selection.start) && out.is_char_boundary(selection.end), "{context}");
+        }
+    }
+
+    #[test]
+    fn words_sharing_a_marker_run_toggle_once() {
+        let carets = toggle_marker("**a**b**", &[2..2, 5..5], "**");
+        assert_well_formed("**a**b**", &carets, "carets");
+        assert_eq!(carets.apply_to("**a**b**"), "ab**");
+        assert_eq!(carets.selections, vec![0..0, 0..0]);
+        let selected = toggle_marker("**a**b**", &[2..3, 5..6], "**");
+        assert_well_formed("**a**b**", &selected, "selections");
+        assert_eq!(selected.apply_to("**a**b**"), "ab**");
+        assert_eq!(selected.selections, vec![0..1, 0..1]);
+    }
+
+    #[test]
+    fn touching_targets_give_selections_independent_of_input_order() {
+        for selections in [[1..3, 1..1], [1..1, 1..3]] {
+            let plan = toggle_marker("x  y", &selections, "**");
+            assert_eq!(plan.apply_to("x  y"), "**x****  **y");
+            let caret = selections.iter().position(Range::is_empty).unwrap();
+            assert_eq!(plan.selections[caret], 3..3);
+            assert_eq!(plan.selections[1 - caret], 7..9);
+        }
+    }
+
+    #[test]
+    fn overlapping_links_share_one_insertion() {
+        for (text, selections, expected, caret) in [
+            ("abcd", vec![0..4, 2..2], "[abcd]()", 7),
+            ("abcde", vec![0..4, 2..5], "[abcd]()e", 7),
+            ("abcd", vec![0..4, 0..4], "[abcd]()", 7),
+            ("abcd", vec![0..4, 0..0], "[]()abcd", 1),
+        ] {
+            let plan = insert_link(text, &selections);
+            assert_well_formed(text, &plan, text);
+            assert_eq!(plan.apply_to(text), expected);
+            assert_eq!(plan.selections, vec![caret..caret; 2]);
+        }
+    }
+
+    #[test]
+    fn tab_replaces_a_tab_indent_instead_of_prefixing_it() {
+        assert_eq!(nest("- a\n\t- b", 8, false), Some(("- a\n  - b".into(), 9)));
+    }
+
+    #[test]
+    fn random_selections_always_give_well_formed_plans() {
+        let pieces = ["a", "b", " ", "*", "`", "é", "_", "**"];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: usize| {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).unwrap() % bound
+        };
+        for _ in 0..3000 {
+            let text: String = (0..1 + next(8)).map(|_| pieces[next(pieces.len())]).collect();
+            let boundaries: Vec<usize> = (0..=text.len()).filter(|at| text.is_char_boundary(*at)).collect();
+            let selections: Vec<Range<usize>> = (0..1 + next(3))
+                .map(|_| boundaries[next(boundaries.len())]..boundaries[next(boundaries.len())])
+                .collect();
+            for marker in ["**", "*", "`"] {
+                let plan = toggle_marker(&text, &selections, marker);
+                assert_well_formed(&text, &plan, &format!("{text:?} {selections:?} {marker}"));
+            }
+            let plan = insert_link(&text, &selections);
+            assert_well_formed(&text, &plan, &format!("link {text:?} {selections:?}"));
+        }
     }
 }
