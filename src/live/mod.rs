@@ -1,5 +1,6 @@
 //! Live Markdown (live mode spec): rendered Markdown inside the Scintilla editor.
 
+pub mod blocks;
 pub mod spans;
 
 /// Live is unavailable for documents larger than this (live mode spec §4).

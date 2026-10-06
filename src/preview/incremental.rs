@@ -150,6 +150,16 @@ impl PreviewDocument {
         Update::Full
     }
 
+    /// The destination of the reference definition `label` names, as a broken-link callback
+    /// resolves it (live mode spec §7: Live parses one block at a time).
+    pub fn refdef_dest(&self, label: &str) -> Option<&str> {
+        let key = crate::preview::model::normalize_label(label);
+        self.refdefs
+            .iter()
+            .find(|definition| definition.key == key)
+            .map(|definition| definition.dest.as_str())
+    }
+
     pub fn apply(&mut self, source: &(impl SourceText + ?Sized), edits: &[Edit]) -> Update {
         match self.try_apply(source, edits) {
             Some(update) => update,
