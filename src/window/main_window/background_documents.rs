@@ -114,6 +114,8 @@ pub(crate) fn replace_in_document(
             // The tab's text may have changed (a replacement that failed partway, or a restore
             // that failed after it), so it is marked edited whatever the result.
             if touched.get() && identity.is_live_for(hwnd) {
+                // The document host's notifications reach no window.
+                crate::window::live_host::forget(hwnd, id);
                 let changed = unsafe { app_ptr(hwnd) }
                     .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.note_background_edit(id));
                 if changed {
@@ -198,7 +200,12 @@ pub(crate) fn reload_clean_document(
             populated
         }
     };
-    if populated.is_err() || !identity.is_live_for(hwnd) {
+    if !identity.is_live_for(hwnd) {
+        return false;
+    }
+    // Population suppressed (or never raised) SCN_MODIFIED, so Live's state is stale.
+    crate::window::live_host::forget(hwnd, id);
+    if populated.is_err() {
         return false;
     }
     if let Some(mut app) = unsafe { app_ptr(hwnd) }

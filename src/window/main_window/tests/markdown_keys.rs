@@ -404,3 +404,21 @@ fn enter_list_continuation_is_one_undo_step() {
     assert_eq!(f.editor.text().unwrap(), "- a\r\n- \r\n- b");
     assert_one_undo_restores(&f.editor, "- a\r\n- b");
 }
+
+#[test]
+fn a_language_change_drops_the_documents_live_state() {
+    // Break caught: a dirty table (or fence states) surviving edits made while the document was
+    // not Markdown, which never reached Live.
+    let f = fixture(TABLE, Language::Markdown);
+    let edited = type_in_table(&f.editor);
+    super::super::apply_language(f.window.hwnd, Language::PlainText);
+    assert_eq!(
+        app_mut(f.window.hwnd).tabs.active().unwrap().language,
+        Language::PlainText
+    );
+    app_mut(f.window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), edited);
+}

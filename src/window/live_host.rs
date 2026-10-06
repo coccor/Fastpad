@@ -5,7 +5,7 @@ use crate::editor::markdown_edit::{
     EditPlan, FenceCache, enter_in_list, format_table, in_literal_block_cached, indent_list_item,
     insert_link, is_list_item, next_cell, table_at, toggle_marker,
 };
-use crate::editor::scintilla_constants::{SC_PERFORMED_REDO, SC_PERFORMED_UNDO};
+use crate::editor::scintilla_constants::{SC_MOD_DELETETEXT, SC_PERFORMED_REDO, SC_PERFORMED_UNDO};
 use crate::editor::{Editor, EditorHooks, ScintillaNotification};
 use crate::live::LIVE_MAX_BYTES;
 use crate::window::commands::CommandId;
@@ -98,6 +98,13 @@ fn in_literal_block(hwnd: HWND, document: DocumentId, text: &str, at: usize) -> 
         registry.docs.entry(document).or_default().fences = cache;
     });
     literal
+}
+
+/// Drops what Live remembers about `document` (its dirty table and fence states): its text or
+/// language changed without SCN_MODIFIED reaching `text_changed` (a reload, a background
+/// Replace, a language change).
+pub(crate) fn forget(hwnd: HWND, document: DocumentId) {
+    with_registry(hwnd, |registry| registry.docs.remove(&document));
 }
 
 fn with_registry<R>(hwnd: HWND, run: impl FnOnce(&mut LiveRegistry) -> R) -> Option<R> {
@@ -214,9 +221,17 @@ pub(crate) fn text_changed(
         return;
     };
     let position = modification.position.max(0) as usize;
+    let delta = if modification.modification_type as u32 & SC_MOD_DELETETEXT != 0 {
+        -modification.length
+    } else {
+        modification.length
+    };
     let formatting = with_registry(hwnd, |registry| {
         registry.docs.get_mut(&document).is_some_and(|state| {
-            state.fences.edited(position, length);
+            state.fences.edited(position, delta, length);
+            if length > LIVE_MAX_BYTES {
+                state.dirty_line = None; // past the limit no table is tracked
+            }
             state.formatting
         })
     });

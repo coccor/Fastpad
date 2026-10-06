@@ -1078,10 +1078,15 @@ pub struct FenceCache {
 const FENCE_CHECKPOINT_EVERY: usize = 64;
 
 impl FenceCache {
-    /// An edit at `position` that left the document `length` bytes long: a state at a line start
-    /// up to `position` still holds, since nothing before it changed.
-    pub fn edited(&mut self, position: usize, length: usize) {
-        self.points.retain(|(at, _)| *at <= position);
+    /// An edit at `position` that changed the length by `delta`, leaving it `length` bytes: a
+    /// state at a line start up to `position` still holds, since nothing before it changed.
+    /// When the lengths do not add up, an edit went unreported and every state is dropped.
+    pub fn edited(&mut self, position: usize, delta: isize, length: usize) {
+        if self.length as isize + delta == length as isize {
+            self.points.retain(|(at, _)| *at <= position);
+        } else {
+            self.points.clear();
+        }
         self.length = length;
     }
 }
@@ -1929,12 +1934,12 @@ mod tests {
         // Edits: open a fence high up, then remove it again, reporting each.
         let edit_at = lines[lines.len() / 3];
         text.insert_str(edit_at, "```\r\n");
-        cache.edited(edit_at, text.len());
+        cache.edited(edit_at, 5, text.len());
         for &at in lines.iter().rev().step_by(5) {
             check(&text, &mut cache, at.min(text.len()));
         }
         text.replace_range(edit_at..edit_at + 5, "");
-        cache.edited(edit_at, text.len());
+        cache.edited(edit_at, -5, text.len());
         for &at in lines.iter().step_by(3) {
             check(&text, &mut cache, at);
         }
@@ -1942,6 +1947,43 @@ mod tests {
         text.insert_str(lines[2], "```\r\n");
         let last = text.len();
         check(&text, &mut cache, last);
+    }
+
+    #[test]
+    fn a_reported_edit_after_an_unreported_one_does_not_resync_a_stale_cache() {
+        // Break caught: the next reported edit adopting the new length and keeping states
+        // that predate an edit nobody reported (a reload, a background Replace).
+        let text = "- a\n```\n- x\n```\n- b\n- c\n".to_owned();
+        let mut cache = FenceCache::default();
+        let end = text.len();
+        assert!(!in_literal_block_cached(&text, end, &mut cache));
+        // Unreported: a fence opened near the top.
+        let mut text = text.replacen("- a\n", "- a\n```\n", 1);
+        // Reported: one byte typed at the end.
+        text.push('x');
+        cache.edited(text.len() - 1, 1, text.len());
+        let end = text.len();
+        assert_eq!(
+            in_literal_block_cached(&text, end, &mut cache),
+            in_literal_block(&text, end)
+        );
+    }
+
+    #[test]
+    fn a_same_length_change_is_answered_fresh_after_the_cache_is_dropped() {
+        // ``` → ~~~ keeps the length, so only the window layer's reset (`live_host::forget`,
+        // which drops the document's cache) can tell; after it the answer is a fresh scan's.
+        let text = "```\n~~~\n```\n- x\n";
+        let mut cache = FenceCache::default();
+        let at = text.len();
+        assert!(!in_literal_block_cached(text, at, &mut cache));
+        let changed = text.replacen("```", "~~~", 1);
+        let mut cache = FenceCache::default();
+        assert_eq!(
+            in_literal_block_cached(&changed, at, &mut cache),
+            in_literal_block(&changed, at)
+        );
+        assert!(in_literal_block(&changed, at));
     }
 
     #[test]
