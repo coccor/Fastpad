@@ -79,6 +79,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 mod document_text;
 mod editing;
 mod line_ops;
+mod live_ops;
 mod styling;
 
 pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;

@@ -378,7 +378,7 @@ impl Editor {
     }
 
     /// Where `line` starts; the document's length past the last line.
-    fn line_start(&self, line: usize) -> Result<usize> {
+    pub(crate) fn line_start(&self, line: usize) -> Result<usize> {
         if line >= self.line_count()? {
             return self.length();
         }
@@ -386,7 +386,7 @@ impl Editor {
     }
 
     /// Where `line`'s text ends, before its line end.
-    fn line_end(&self, line: usize) -> Result<usize> {
+    pub(crate) fn line_end(&self, line: usize) -> Result<usize> {
         Ok(self.send(SCI_GETLINEENDPOSITION, line, 0)?.max(0) as usize)
     }
 
