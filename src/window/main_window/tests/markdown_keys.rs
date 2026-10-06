@@ -253,22 +253,52 @@ fn tab_in_a_table_selects_the_next_cell() {
     assert_eq!(f.editor.text().unwrap(), text);
 }
 
+/// Gives `editor` the keyboard focus, as a user typing in it has: table tracking counts only
+/// edits at the focused editor's caret.
+fn focus(editor: &crate::editor::Editor) {
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor.hwnd()) };
+    drain_messages();
+}
+
+const TABLE: &str = "|a|b|\r\n|-|-|\r\n|c|d|\r\n\r\nx";
+const FORMATTED: &str = "| za  | b   |\r\n| --- | --- |\r\n| c   | d   |\r\n\r\nx";
+
+/// Types `z` at the start of the first cell of `TABLE`, with the caret there.
+fn type_in_table(editor: &crate::editor::Editor) -> String {
+    focus(editor);
+    editor.set_selection(1..1).unwrap();
+    editor.replace_target(1..1, "z").unwrap(); // raises SCN_MODIFIED as typing does
+    drain_messages();
+    editor.text().unwrap()
+}
+
+fn caret_to_end(editor: &crate::editor::Editor) {
+    let end = editor.text().unwrap().len();
+    editor.set_selection(end..end).unwrap();
+    drain_messages();
+}
+
 #[test]
 fn a_table_is_formatted_when_the_caret_leaves_it_in_one_undo_step() {
-    let f = fixture("|a|b|\r\n|-|-|\r\n|c|d|\r\n\r\nx", Language::Markdown);
-    f.editor.set_selection(1..1).unwrap();
-    f.editor.replace_target(1..1, "z").unwrap(); // an edit inside the table
-    drain_messages();
-    let edited = f.editor.text().unwrap();
-    let x = edited.len() - 1;
-    f.editor.set_selection(x..x).unwrap();
-    drain_messages();
+    let f = fixture(TABLE, Language::Markdown);
+    let edited = type_in_table(&f.editor);
     assert_eq!(
         f.editor.text().unwrap(),
-        "| za  | b   |\r\n| --- | --- |\r\n| c   | d   |\r\n\r\nx"
+        edited,
+        "not while the caret is inside"
     );
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), FORMATTED);
     f.editor.undo().unwrap();
     assert_eq!(f.editor.text().unwrap(), edited);
+    // Break caught: the undo's own modification marking the table dirty again, so leaving it
+    // reformats and loses the redo.
+    f.editor.set_selection(1..1).unwrap();
+    drain_messages();
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), edited);
+    f.editor.redo().unwrap();
+    assert_eq!(f.editor.text().unwrap(), FORMATTED);
 }
 
 #[test]
@@ -281,4 +311,96 @@ fn an_untouched_table_is_not_rewritten_when_the_caret_passes_through() {
     drain_messages();
     assert_eq!(f.editor.text().unwrap(), text);
     assert!(!f.editor.can_undo().unwrap());
+}
+
+#[test]
+fn an_edit_away_from_the_caret_does_not_mark_a_table() {
+    // Break caught: Replace All or another view's edit inside a table formatting it, though
+    // the caret was never in it (spec §8.3).
+    let f = fixture(TABLE, Language::Markdown);
+    focus(&f.editor);
+    caret_to_end(&f.editor);
+    f.editor.replace_target(1..1, "z").unwrap();
+    drain_messages();
+    let edited = f.editor.text().unwrap();
+    f.editor.set_selection(1..1).unwrap();
+    drain_messages();
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), edited);
+}
+
+#[test]
+fn a_dirty_table_follows_lines_added_above_it() {
+    // Break caught: a stale anchor pointing above the table once lines are inserted before it.
+    let f = fixture(TABLE, Language::Markdown);
+    type_in_table(&f.editor);
+    f.editor.replace_target(0..0, "p\r\n\r\n").unwrap(); // lines added above, not typing
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), format!("p\r\n\r\n{FORMATTED}"));
+}
+
+#[test]
+fn a_table_waits_while_another_view_has_its_caret_inside() {
+    let f = fixture(TABLE, Language::Markdown);
+    execute_command(f.window.hwnd, CommandId::SplitRight);
+    let order = super::super::group_order(f.window.hwnd);
+    let other = super::super::group_editor(f.window.hwnd, order[1]).unwrap();
+    let edited = type_in_table(&f.editor);
+    caret_to_end(&other);
+    assert_eq!(
+        f.editor.text().unwrap(),
+        edited,
+        "the first view's caret is still inside"
+    );
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), FORMATTED);
+}
+
+#[test]
+fn switching_tabs_leaves_a_dirty_table_to_its_own_document() {
+    // Break caught: the deferred work formatting, or reading offsets of, the newly shown document.
+    let f = fixture(TABLE, Language::Markdown);
+    let edited = type_in_table(&f.editor);
+    execute_command(f.window.hwnd, CommandId::New);
+    drain_messages();
+    f.editor.set_text("|q|\r\n|-|\r\n\r\ny").unwrap();
+    app_mut(f.window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), "|q|\r\n|-|\r\n\r\ny");
+    super::super::activate_tab(f.window.hwnd, 0);
+    drain_messages();
+    assert_eq!(f.editor.text().unwrap(), edited);
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), FORMATTED);
+}
+
+#[test]
+fn closing_a_tab_with_a_dirty_table_leaves_the_others_alone() {
+    let f = fixture(TABLE, Language::Markdown);
+    type_in_table(&f.editor);
+    execute_command(f.window.hwnd, CommandId::New);
+    drain_messages();
+    f.editor.set_text("|q|\r\n|-|\r\n\r\ny").unwrap();
+    app_mut(f.window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    crate::window::modal::answer_next_close_prompt(|_| CloseDecision::Discard);
+    super::super::close_tab_at(f.window.hwnd, 0);
+    drain_messages();
+    assert_eq!(super::super::tab_count(f.window.hwnd), 1);
+    caret_to_end(&f.editor);
+    f.editor.set_selection(1..1).unwrap();
+    drain_messages();
+    assert_eq!(f.editor.text().unwrap(), "|q|\r\n|-|\r\n\r\ny");
+}
+
+#[test]
+fn enter_list_continuation_is_one_undo_step() {
+    let f = fixture("- a\r\n- b", Language::Markdown);
+    f.editor.set_selection(3..3).unwrap();
+    press(&f, VK_RETURN, false);
+    assert_eq!(f.editor.text().unwrap(), "- a\r\n- \r\n- b");
+    assert_one_undo_restores(&f.editor, "- a\r\n- b");
 }

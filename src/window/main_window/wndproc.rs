@@ -736,12 +736,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
             crate::window::preview_host::record_edit(hwnd, shown, modification);
         }
         if is_markdown(hwnd, document) {
-            crate::window::live_host::text_changed(
-                hwnd,
-                &editor,
-                document,
-                modification.position.max(0) as usize,
-            );
+            crate::window::live_host::text_changed(hwnd, &editor, document, modification);
         }
         return;
     }

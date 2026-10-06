@@ -2,17 +2,18 @@
 
 use crate::document::{DocumentId, Language};
 use crate::editor::markdown_edit::{
-    EditPlan, enter_in_list, format_table, in_literal_block, indent_list_item, insert_link,
-    line_bounds, next_cell, table_at, toggle_marker,
+    EditPlan, FenceCache, enter_in_list, format_table, in_literal_block_cached, indent_list_item,
+    insert_link, is_list_item, next_cell, table_at, toggle_marker,
 };
-use crate::editor::{Editor, EditorHooks};
+use crate::editor::scintilla_constants::{SC_PERFORMED_REDO, SC_PERFORMED_UNDO};
+use crate::editor::{Editor, EditorHooks, ScintillaNotification};
 use crate::live::LIVE_MAX_BYTES;
 use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use crate::window::split_tree::GroupId;
 use std::collections::HashMap;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_TAB};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_RETURN, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 /// Whether the active document is shown in Live Markdown.
@@ -63,19 +64,40 @@ impl std::fmt::Debug for LiveRegistry {
 
 #[derive(Default)]
 pub(crate) struct DocState {
-    /// A byte inside a table the user edited; the table is formatted when the caret leaves it.
-    dirty_table: Option<usize>,
+    /// A line of a table the user typed in; the table is formatted when the caret leaves it.
+    /// Kept on its row as lines are added or removed above it.
+    dirty_line: Option<usize>,
     /// Set while FastPad itself rewrites a table, so that edit does not mark it dirty again.
     formatting: bool,
+    /// Where fenced code blocks stand, so the block check need not rescan the document.
+    fences: FenceCache,
 }
 
 impl std::fmt::Debug for DocState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DocState")
-            .field("dirty_table", &self.dirty_table)
+            .field("dirty_line", &self.dirty_line)
             .field("formatting", &self.formatting)
+            .field("fences", &self.fences)
             .finish()
     }
+}
+
+/// Whether `at` is in fenced code or front matter, resuming from `document`'s fence states.
+fn in_literal_block(hwnd: HWND, document: DocumentId, text: &str, at: usize) -> bool {
+    let mut cache = with_registry(hwnd, |registry| {
+        registry
+            .docs
+            .get_mut(&document)
+            .map(|state| std::mem::take(&mut state.fences))
+    })
+    .flatten()
+    .unwrap_or_default();
+    let literal = in_literal_block_cached(text, at, &mut cache);
+    with_registry(hwnd, |registry| {
+        registry.docs.entry(document).or_default().fences = cache;
+    });
+    literal
 }
 
 fn with_registry<R>(hwnd: HWND, run: impl FnOnce(&mut LiveRegistry) -> R) -> Option<R> {
@@ -112,9 +134,9 @@ impl GroupHooks {
         Self { main, editor }
     }
 
-    fn markdown_editor(&self) -> Option<Editor> {
-        let (_, editor, _, language) = group_of_editor(self.main, self.editor)?;
-        (language == Language::Markdown).then_some(editor)
+    fn markdown_editor(&self) -> Option<(Editor, DocumentId)> {
+        let (_, editor, document, language) = group_of_editor(self.main, self.editor)?;
+        (language == Language::Markdown).then_some((editor, document))
     }
 }
 
@@ -123,7 +145,7 @@ impl EditorHooks for GroupHooks {
         if ctrl || alt || !(vk == VK_RETURN || vk == VK_TAB) {
             return false;
         }
-        let Some(editor) = self.markdown_editor() else {
+        let Some((editor, document)) = self.markdown_editor() else {
             return false;
         };
         if editor
@@ -139,28 +161,37 @@ impl EditorHooks for GroupHooks {
             return false; // multiple carets: Scintilla's own Enter / Tab
         };
         let caret = *caret;
+        // The caret's line alone rules the helpers out, so a plain Enter or Tab in prose never
+        // reads the document.
+        let line_of = |at: usize| editor.line_from_position(at).ok();
+        let Some(line_text) = line_of(caret).and_then(|line| editor.line_text(line).ok()) else {
+            return false;
+        };
+        let list = is_list_item(&line_text);
+        if vk == VK_RETURN {
+            if shift || !selection.is_empty() || !list {
+                return false;
+            }
+        } else if line_of(selection.start) != line_of(selection.end) {
+            return false; // a multi-line selection: Scintilla indents the lines
+        } else if !list && !line_text.contains('|') {
+            return false;
+        }
         let fallback = editor.eol().unwrap_or("\r\n");
         let plan = editor.with_document_text(|text| {
-            if in_literal_block(text, caret) {
-                return None; // fenced code and front matter keep the default keys
-            }
-            if vk == VK_RETURN {
-                if shift || !selection.is_empty() {
-                    return None;
-                }
-                return enter_in_list(text, caret, fallback);
-            }
-            if line_bounds(text, selection.start) != line_bounds(text, selection.end) {
-                return None; // a multi-line selection: Scintilla indents the lines
-            }
-            if let Some(cell) = next_cell(text, caret, shift) {
-                return Some(EditPlan {
+            let plan = if vk == VK_RETURN {
+                enter_in_list(text, caret, fallback)
+            } else if let Some(cell) = next_cell(text, caret, shift) {
+                Some(EditPlan {
                     edits: Vec::new(),
                     selections: vec![cell],
-                });
-            }
-            // A caret or a selection on one list item's line nests the item (spec §8.2).
-            indent_list_item(text, caret, shift)
+                })
+            } else {
+                // A caret or a selection on one list item's line nests the item (spec §8.2).
+                indent_list_item(text, caret, shift)
+            };
+            // Fenced code and front matter keep the default keys; checked only with a plan.
+            plan.filter(|_| !in_literal_block(self.main, document, text, caret))
         });
         match plan {
             Ok(Some(plan)) => editor.apply_plan(&plan).is_ok(),
@@ -169,34 +200,73 @@ impl EditorHooks for GroupHooks {
     }
 }
 
-/// SCN_MODIFIED for a Markdown document (live mode spec §8.3): remembers a table the user
-/// edited. Reads only the edited line, never the whole document, and never edits inside the
-/// notification.
-pub(crate) fn text_changed(hwnd: HWND, editor: &Editor, document: DocumentId, position: usize) {
+/// SCN_MODIFIED for a Markdown document (live mode spec §8.3): keeps a dirty table's line on
+/// its row, and remembers a table the user typed in at the focused editor's caret. Undo, redo,
+/// Replace All and other views' edits are not typing. Reads only the edited line, never the
+/// whole document, and never edits inside the notification.
+pub(crate) fn text_changed(
+    hwnd: HWND,
+    editor: &Editor,
+    document: DocumentId,
+    modification: &ScintillaNotification,
+) {
+    let Ok(length) = editor.length() else {
+        return;
+    };
+    let position = modification.position.max(0) as usize;
     let formatting = with_registry(hwnd, |registry| {
-        registry
-            .docs
-            .get(&document)
-            .is_some_and(|state| state.formatting)
+        registry.docs.get_mut(&document).is_some_and(|state| {
+            state.fences.edited(position, length);
+            state.formatting
+        })
     });
-    if formatting != Some(false) {
+    if formatting != Some(false) || length > LIVE_MAX_BYTES {
         return;
     }
-    if editor
-        .length()
-        .map_or(true, |length| length > LIVE_MAX_BYTES)
-    {
+    let Ok(line) = editor.line_from_position(position) else {
         return;
-    }
-    let row = editor
-        .line_from_position(position)
-        .and_then(|line| editor.line_text(line))
-        .is_ok_and(|line| line.contains('|'));
-    if row {
+    };
+    let lines_added = modification.lines_added;
+    if lines_added != 0 {
+        // Lines inserted at the very start of a row push that row down too.
+        let at_line_start = editor.line_start(line).is_ok_and(|start| start == position);
         with_registry(hwnd, |registry| {
-            registry.docs.entry(document).or_default().dirty_table = Some(position);
+            if let Some(dirty) = registry
+                .docs
+                .get_mut(&document)
+                .and_then(|state| state.dirty_line.as_mut())
+                && (line < *dirty || (line == *dirty && lines_added > 0 && at_line_start))
+            {
+                *dirty = (*dirty as isize + lines_added).max(line as isize) as usize;
+            }
         });
     }
+    let performed = SC_PERFORMED_UNDO | SC_PERFORMED_REDO;
+    if modification.modification_type as u32 & performed != 0 {
+        return;
+    }
+    if !typed_at_caret(hwnd, document, line, lines_added.max(0) as usize) {
+        return;
+    }
+    if editor.line_text(line).is_ok_and(|text| text.contains('|')) {
+        with_registry(hwnd, |registry| {
+            registry.docs.entry(document).or_default().dirty_line = Some(line);
+        });
+    }
+}
+
+/// Whether an edit on `line` (adding `lines_added`) is typing: the focused editor shows
+/// `document` and its main caret is on the edited lines.
+fn typed_at_caret(hwnd: HWND, document: DocumentId, line: usize, lines_added: usize) -> bool {
+    let focus = unsafe { GetFocus() };
+    let Some((_, editor, shown, _)) = group_of_editor(hwnd, focus) else {
+        return false;
+    };
+    shown == document
+        && editor
+            .caret()
+            .and_then(|caret| editor.line_from_position(caret))
+            .is_ok_and(|caret_line| (line..=line + lines_added).contains(&caret_line))
 }
 
 /// SCN_UPDATEUI with a selection change: the work runs from a posted message, never inside
@@ -231,15 +301,14 @@ pub(crate) fn run_deferred(hwnd: HWND) {
     }
 }
 
-/// Whether every line from the caret's to the dirty byte's is a table row, so the caret is
-/// still in the edited table. Walks from the caret, so a caret far away stops at once.
-fn still_in_table(editor: &Editor, caret: usize, dirty: usize) -> crate::Result<bool> {
-    let from = editor.line_from_position(caret)?;
-    let to = editor.line_from_position(dirty)?;
-    let lines: Box<dyn Iterator<Item = usize>> = if from <= to {
-        Box::new(from..=to)
+/// Whether every line from the caret's to the dirty one is a table row, so the caret is still
+/// in the edited table. Walks from the caret, so a caret far away stops at once.
+fn still_in_table(editor: &Editor, dirty: usize) -> crate::Result<bool> {
+    let from = editor.line_from_position(editor.caret()?)?;
+    let lines: Box<dyn Iterator<Item = usize>> = if from <= dirty {
+        Box::new(from..=dirty)
     } else {
-        Box::new((to..=from).rev())
+        Box::new((dirty..=from).rev())
     };
     for line in lines {
         if !editor.line_text(line)?.contains('|') {
@@ -247,6 +316,24 @@ fn still_in_table(editor: &Editor, caret: usize, dirty: usize) -> crate::Result<
         }
     }
     Ok(true)
+}
+
+/// The editors of every group whose active view shows `document`.
+fn editors_showing(hwnd: HWND, document: DocumentId) -> Vec<Editor> {
+    // SAFETY: the App reference lives only inside this function, which makes no Win32 call.
+    let Some(app) = (unsafe { host_window::app_ptr(hwnd) }) else {
+        return Vec::new();
+    };
+    let app = unsafe { app.as_ref() };
+    app.groups
+        .iter()
+        .filter(|group| {
+            app.tabs
+                .group(group.id)
+                .is_some_and(|tabs| tabs.active_document() == Some(document))
+        })
+        .map(|group| group.editor.clone())
+        .collect()
 }
 
 fn format_left_table(hwnd: HWND, group: GroupId) {
@@ -260,7 +347,7 @@ fn format_left_table(hwnd: HWND, group: GroupId) {
         registry
             .docs
             .get(&document)
-            .and_then(|state| state.dirty_table)
+            .and_then(|state| state.dirty_line)
     });
     let Some(dirty) = dirty.flatten() else {
         return;
@@ -269,28 +356,28 @@ fn format_left_table(hwnd: HWND, group: GroupId) {
         clear_dirty(hwnd, document);
         return;
     }
-    let Ok(caret) = editor
-        .carets()
-        .map(|carets| carets.first().copied().unwrap_or(0))
-    else {
-        return;
-    };
-    match still_in_table(&editor, caret, dirty) {
-        Ok(true) => return, // still inside: keep waiting
-        Ok(false) => {}
-        Err(_) => {
-            clear_dirty(hwnd, document);
-            return;
+    // Every view of the document counts: its table waits while any caret is still in it.
+    for view in editors_showing(hwnd, document) {
+        match still_in_table(&view, dirty) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(_) => {
+                clear_dirty(hwnd, document);
+                return;
+            }
         }
     }
+    clear_dirty(hwnd, document);
+    let Ok(start) = editor.line_start(dirty) else {
+        return;
+    };
     let rewrite = editor.with_document_text(|text| {
-        let table = table_at(text, dirty.min(text.len()))?;
-        if in_literal_block(text, table.start) {
+        let table = table_at(text, start.min(text.len()))?;
+        if in_literal_block(hwnd, document, text, table.start) {
             return None; // a table-like block in fenced code or front matter is left alone
         }
         format_table(&text[table.clone()]).map(|formatted| (table, formatted))
     });
-    clear_dirty(hwnd, document);
     if let Ok(Some((table, formatted))) = rewrite {
         set_formatting(hwnd, document, true);
         editor.begin_undo_action();
@@ -309,7 +396,7 @@ fn set_formatting(hwnd: HWND, document: DocumentId, formatting: bool) {
 fn clear_dirty(hwnd: HWND, document: DocumentId) {
     with_registry(hwnd, |registry| {
         if let Some(state) = registry.docs.get_mut(&document) {
-            state.dirty_table = None;
+            state.dirty_line = None;
         }
     });
 }

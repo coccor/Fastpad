@@ -1013,44 +1013,150 @@ pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
     cells.get(target).map(|(_, _, content)| content.clone())
 }
 
-/// Whether `at` sits in YAML front matter or a fenced code block, where the line-local helpers
-/// must leave Enter and Tab to the editor. Scans the lines above `at`'s line; the window layer
-/// calls it only for an Enter or Tab key, never per edit.
-pub fn in_literal_block(text: &str, at: usize) -> bool {
-    let above = &text[..line_bounds(text, at).start];
-    let mut skip = 0;
-    if text
-        .lines()
-        .next()
-        .is_some_and(|first| first.trim_end() == "---")
-    {
-        // Front matter needs its closing line (looked for in the first 64 KiB, as Live does);
-        // an unclosed `---` is a thematic break.
-        let head = &text[..text.floor_char_boundary(64 * 1024)];
-        let closing = head
-            .lines()
-            .skip(1)
-            .position(|line| matches!(line.trim_end(), "---" | "..."));
-        if let Some(closing) = closing.map(|index| index + 1) {
-            if above.lines().count() <= closing {
-                return true;
-            }
-            skip = closing + 1;
+/// Whether `line` is a list item: the first thing `enter_in_list` and `indent_list_item` check,
+/// so the window layer can rule them out from the caret's line alone.
+pub fn is_list_item(line: &str) -> bool {
+    list_prefix(line).is_some()
+}
+
+/// The byte after the closing line of YAML front matter (looked for in the first 64 KiB, as
+/// Live does), or `None`: an unclosed `---` is a thematic break.
+fn front_matter_end(text: &str) -> Option<usize> {
+    let head = &text[..text.floor_char_boundary(64 * 1024)];
+    let mut lines = head.split_inclusive('\n');
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    let mut end = head.find('\n')? + 1;
+    for line in lines {
+        end += line.len();
+        if matches!(line.trim_end(), "---" | "...") {
+            return Some(end);
         }
     }
-    let mut open: Option<(u8, usize)> = None;
-    for line in above.lines().skip(skip) {
-        let trimmed = line.trim();
-        let run = |fence: u8| trimmed.bytes().take_while(|byte| *byte == fence).count();
-        open = match open {
-            Some((fence, len)) if run(fence) >= len && run(fence) == trimmed.len() => None,
-            Some(open) => Some(open),
-            None => b"`~".iter().copied().find_map(|fence| {
-                let len = run(fence);
-                let info = &trimmed[len..];
-                (len >= 3 && !(fence == b'`' && info.contains('`'))).then_some((fence, len))
-            }),
-        };
+    None
+}
+
+/// A fence line: its character, run length, and whether nothing follows the run (so it can
+/// close a block). Indented four columns or more it is indented code, not a fence.
+fn fence_line(line: &str) -> Option<(u8, usize, bool)> {
+    let indent_len = line
+        .bytes()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count();
+    if columns(&line[..indent_len]) >= 4 {
+        return None;
+    }
+    let rest = &line[indent_len..];
+    let fence = *rest
+        .as_bytes()
+        .first()
+        .filter(|b| matches!(b, b'`' | b'~'))?;
+    let run = rest.bytes().take_while(|b| *b == fence).count();
+    let info = &rest[run..];
+    if run < 3 || (fence == b'`' && info.contains('`')) {
+        return None;
+    }
+    Some((fence, run, info.trim().is_empty()))
+}
+
+/// An open fence: its character and run length.
+type OpenFence = Option<(u8, usize)>;
+
+/// Fence states remembered at line starts, so that repeated Enter and Tab presses scan only the
+/// text since the nearest one instead of the whole document above the caret.
+#[derive(Clone, Debug, Default)]
+pub struct FenceCache {
+    /// (line start, the open fence before it), ascending.
+    points: Vec<(usize, OpenFence)>,
+    /// The document length the points were taken at; any other length means edits went
+    /// unreported, and the points are dropped.
+    length: usize,
+}
+
+/// A checkpoint every this many fence lines bounds the scan from the nearest one.
+const FENCE_CHECKPOINT_EVERY: usize = 64;
+
+impl FenceCache {
+    /// An edit at `position` that left the document `length` bytes long: a state at a line start
+    /// up to `position` still holds, since nothing before it changed.
+    pub fn edited(&mut self, position: usize, length: usize) {
+        self.points.retain(|(at, _)| *at <= position);
+        self.length = length;
+    }
+}
+
+/// Whether `at` sits in YAML front matter or a fenced code block, where the line-local helpers
+/// must leave Enter and Tab to the editor.
+#[cfg(test)]
+fn in_literal_block(text: &str, at: usize) -> bool {
+    in_literal_block_cached(text, at, &mut FenceCache::default())
+}
+
+/// `in_literal_block` resuming from `cache`'s nearest state above `at`, and leaving states for
+/// the next call. It visits only lines holding a run of three fence characters, found by
+/// substring search, and only those after the resumed state.
+pub fn in_literal_block_cached(text: &str, at: usize, cache: &mut FenceCache) -> bool {
+    if cache.length != text.len() {
+        cache.points.clear();
+        cache.length = text.len();
+    }
+    let line_start = line_bounds(text, at).start;
+    let mut from = 0;
+    if let Some(end) = front_matter_end(text) {
+        if line_start < end {
+            return true;
+        }
+        from = end;
+    }
+    let mut open: OpenFence = None;
+    match cache
+        .points
+        .iter()
+        .rposition(|(point, _)| (from..=line_start).contains(point))
+    {
+        Some(index) => {
+            (from, open) = cache.points[index];
+            cache.points.truncate(index + 1);
+        }
+        None => cache.points.clear(),
+    }
+    let above = &text[..line_start];
+    let find = |pattern: &str, from: usize| {
+        above
+            .get(from..)
+            .and_then(|rest| rest.find(pattern))
+            .map(|at| from + at)
+    };
+    let mut next = [find("```", from), find("~~~", from)];
+    let mut fences = 0;
+    while let Some(candidate) = next.iter().flatten().min().copied() {
+        let line = line_bounds(text, candidate);
+        if let Some((fence, run, bare)) = fence_line(&text[line.clone()]) {
+            open = match open {
+                Some((open_fence, len)) if fence == open_fence && run >= len && bare => None,
+                Some(open) => Some(open),
+                None => Some((fence, run)),
+            };
+            fences += 1;
+            if fences % FENCE_CHECKPOINT_EVERY == 0
+                && let Some(newline) = text[line.end..].find('\n')
+            {
+                cache.points.push((line.end + newline + 1, open));
+            }
+        }
+        for (slot, pattern) in next.iter_mut().zip(["```", "~~~"]) {
+            if slot.is_some_and(|at| at < line.end) {
+                *slot = find(pattern, line.end);
+            }
+        }
+    }
+    if cache
+        .points
+        .last()
+        .is_none_or(|(point, _)| *point < line_start)
+    {
+        cache.points.push((line_start, open));
     }
     open.is_some()
 }
@@ -1793,6 +1899,52 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_cache_answers_as_a_fresh_scan_across_queries_and_edits() {
+        // Break caught: a resumed state that is stale after an edit above it, or a checkpoint
+        // taken mid-block giving the opposite answer below it.
+        let block = "- a\r\n```\r\n- in\r\n```\r\n~~~~\r\n- in\r\n```\r\n~~~~\r\n- out\r\n";
+        let mut text = "---\r\nt: 1\r\n---\r\n".to_owned();
+        for _ in 0..(FENCE_CHECKPOINT_EVERY * 3 / 4) {
+            text.push_str(block);
+        }
+        let mut cache = FenceCache::default();
+        let lines: Vec<usize> = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+            .filter(|at| *at < text.len())
+            .collect();
+        let check = |text: &str, cache: &mut FenceCache, at: usize| {
+            assert_eq!(
+                in_literal_block_cached(text, at, cache),
+                in_literal_block(text, at),
+                "at {at}"
+            );
+        };
+        // Downwards, upwards and jumping about, one cache throughout.
+        for &at in lines.iter().chain(lines.iter().rev()) {
+            check(&text, &mut cache, at);
+        }
+        for step in 0..lines.len() {
+            check(&text, &mut cache, lines[step * 37 % lines.len()]);
+        }
+        // Edits: open a fence high up, then remove it again, reporting each.
+        let edit_at = lines[lines.len() / 3];
+        text.insert_str(edit_at, "```\r\n");
+        cache.edited(edit_at, text.len());
+        for &at in lines.iter().rev().step_by(5) {
+            check(&text, &mut cache, at.min(text.len()));
+        }
+        text.replace_range(edit_at..edit_at + 5, "");
+        cache.edited(edit_at, text.len());
+        for &at in lines.iter().step_by(3) {
+            check(&text, &mut cache, at);
+        }
+        // An edit the cache never heard of changes the length: it starts over.
+        text.insert_str(lines[2], "```\r\n");
+        let last = text.len();
+        check(&text, &mut cache, last);
+    }
+
+    #[test]
     fn literal_blocks_are_fenced_code_and_front_matter() {
         let fenced = "- a\r\n```md\r\n- x\r\n```\r\n- b";
         assert!(!in_literal_block(fenced, 0));
@@ -1814,6 +1966,24 @@ mod tests {
         let front = "---\ntitle: x\n- y\n---\n- z";
         assert!(in_literal_block(front, front.find("- y").unwrap()));
         assert!(!in_literal_block(front, front.len()));
+        let indented = "    ```\n- x";
+        assert!(
+            !in_literal_block(indented, indented.len()),
+            "four spaces make indented code, not a fence"
+        );
+        let tabbed = "\t```\n- x";
+        assert!(!in_literal_block(tabbed, tabbed.len()));
+        let in_item = "- a\n\n  ```\n- x";
+        assert!(in_literal_block(in_item, in_item.len()));
+        let info_close = "```\n```js\n- x";
+        assert!(
+            in_literal_block(info_close, info_close.len()),
+            "a fence with an info string does not close"
+        );
+        let mid_line = "a ``` b\n- x";
+        assert!(!in_literal_block(mid_line, mid_line.len()));
+        let mid_line_after = "a\n``` b\n- x";
+        assert!(in_literal_block(mid_line_after, mid_line_after.len()));
         let rule = "---\n- y";
         assert!(
             !in_literal_block(rule, rule.len()),
