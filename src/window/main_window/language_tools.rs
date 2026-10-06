@@ -71,7 +71,7 @@ pub(super) fn apply_language(hwnd: HWND, language: crate::document::Language) {
 }
 
 /// The active tab's language; plain text while no tab is open.
-pub(super) fn active_language(hwnd: HWND) -> crate::document::Language {
+pub(crate) fn active_language(hwnd: HWND) -> crate::document::Language {
     unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             unsafe { app.as_ref() }

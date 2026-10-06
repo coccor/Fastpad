@@ -98,7 +98,7 @@ pub(crate) use find::*;
 pub(crate) use focus::*;
 pub(crate) use group_layout::*;
 pub(crate) use ipc_host::*;
-use language_tools::*;
+pub(crate) use language_tools::*;
 pub(crate) use menu_keys::*;
 pub(crate) use opening::*;
 pub(crate) use placement::restore_placement;

@@ -4,19 +4,57 @@
 
 use super::*;
 use crate::editor::scintilla_constants::{
-    ANNOTATION_HIDDEN, ANNOTATION_STANDARD, INDIC_STRIKE, SCI_ANNOTATIONCLEARALL,
-    SCI_ANNOTATIONGETLINES, SCI_ANNOTATIONSETSTYLE, SCI_ANNOTATIONSETTEXT,
-    SCI_ANNOTATIONSETVISIBLE, SCI_COLOURISE, SCI_GETENDSTYLED, SCI_GETSTYLEAT,
+    ANNOTATION_HIDDEN, ANNOTATION_STANDARD, INDIC_STRIKE, SC_EOL_CR, SC_EOL_LF, SCI_ADDSELECTION,
+    SCI_ANNOTATIONCLEARALL, SCI_ANNOTATIONGETLINES, SCI_ANNOTATIONSETSTYLE, SCI_ANNOTATIONSETTEXT,
+    SCI_ANNOTATIONSETVISIBLE, SCI_COLOURISE, SCI_GETENDSTYLED, SCI_GETEOLMODE, SCI_GETSTYLEAT,
     SCI_INDICATORCLEARRANGE, SCI_INDICATORFILLRANGE, SCI_INDICSETFORE, SCI_INDICSETSTYLE,
     SCI_LINESONSCREEN, SCI_POINTXFROMPOSITION, SCI_POINTYFROMPOSITION, SCI_POSITIONFROMPOINT,
-    SCI_SETINDICATORCURRENT, SCI_SETSTYLING, SCI_STARTSTYLING, SCI_STYLESETEOLFILLED,
-    SCI_STYLESETUNDERLINE, SCI_STYLESETVISIBLE, SCI_TEXTHEIGHT, SCI_WRAPCOUNT,
+    SCI_SETINDICATORCURRENT, SCI_SETSELECTION, SCI_SETSTYLING, SCI_STARTSTYLING,
+    SCI_STYLESETEOLFILLED, SCI_STYLESETUNDERLINE, SCI_STYLESETVISIBLE, SCI_TEXTHEIGHT,
+    SCI_WRAPCOUNT,
 };
 use std::ops::Range;
 
 impl Editor {
     fn live_send(&self, message: u32, wparam: usize, lparam: isize) -> Result<isize> {
         self.endpoint.send_direct_checked(message, wparam, lparam)
+    }
+
+    /// Replaces the selections; each range's start is the anchor and its end the caret.
+    pub fn set_selections(&self, selections: &[Range<usize>]) -> Result<()> {
+        let Some((first, rest)) = selections.split_first() else {
+            return Ok(());
+        };
+        self.live_send(SCI_SETSELECTION, first.end, first.start as isize)?;
+        for selection in rest {
+            self.live_send(SCI_ADDSELECTION, selection.end, selection.start as isize)?;
+        }
+        Ok(())
+    }
+
+    /// Applies a Markdown helper's plan as one undo step (live mode spec §8).
+    pub fn apply_plan(&self, plan: &crate::editor::markdown_edit::EditPlan) -> Result<()> {
+        self.begin_undo_action();
+        let result = plan
+            .edits
+            .iter()
+            .rev()
+            .try_for_each(|edit| {
+                self.replace_target(edit.range.clone(), &edit.text)
+                    .map(drop)
+            })
+            .and_then(|()| self.set_selections(&plan.selections));
+        self.end_undo_action();
+        result
+    }
+
+    /// The line ending Enter inserts.
+    pub fn eol(&self) -> Result<&'static str> {
+        Ok(match self.live_send(SCI_GETEOLMODE, 0, 0)? as u32 {
+            SC_EOL_LF => "\n",
+            SC_EOL_CR => "\r",
+            _ => "\r\n",
+        })
     }
 
     pub fn set_style_visible(&self, style: u32, visible: bool) -> Result<()> {

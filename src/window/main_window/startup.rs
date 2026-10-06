@@ -284,7 +284,7 @@ pub(crate) unsafe fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     unsafe { app.as_ref() }.editor().map(Editor::hwnd)
 }
 
-pub(super) fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
+pub(crate) fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
     let Some(app) = (unsafe { app_ptr(hwnd) }) else {
         return;
     };
