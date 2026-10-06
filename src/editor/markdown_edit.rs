@@ -6,6 +6,8 @@
 
 use std::ops::Range;
 
+use crate::live::spans::pipe_positions;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextEdit {
     pub range: Range<usize>,
@@ -302,6 +304,171 @@ pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditP
     })
 }
 
+fn is_delimiter_row(line: &str) -> bool {
+    let cells = split_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|(_, cell)| {
+            let cell = cell.trim();
+            let body = cell.trim_start_matches(':').trim_end_matches(':');
+            !body.is_empty() && body.bytes().all(|b| b == b'-')
+        })
+}
+
+/// A table line's cells: (range within the line, raw text), the outer pipes optional.
+fn split_cells(line: &str) -> Vec<(Range<usize>, &str)> {
+    let pipes = pipe_positions(line);
+    if pipes.is_empty() {
+        return Vec::new();
+    }
+    let trimmed_start = line.len() - line.trim_start().len();
+    let trimmed_end = line.trim_end().len();
+    let mut bounds: Vec<usize> = Vec::new();
+    if pipes[0] != trimmed_start {
+        bounds.push(trimmed_start);
+    } else {
+        bounds.push(pipes[0] + 1);
+    }
+    for pipe in &pipes {
+        if *pipe != trimmed_start && *pipe + 1 != trimmed_end {
+            bounds.push(*pipe);
+            bounds.push(*pipe + 1);
+        }
+    }
+    let last = *pipes.last().expect("non-empty");
+    bounds.push(if last + 1 == trimmed_end { last } else { trimmed_end });
+    bounds
+        .chunks(2)
+        .filter(|pair| pair.len() == 2 && pair[0] <= pair[1])
+        .map(|pair| (pair[0]..pair[1], &line[pair[0]..pair[1]]))
+        .collect()
+}
+
+fn table_lines(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    crate::live::spans::line_ranges(text, range)
+}
+
+/// The table containing `at`: whole lines, no final line ending.
+pub fn table_at(text: &str, at: usize) -> Option<Range<usize>> {
+    let is_row = |line: &Range<usize>| {
+        let content = &text[line.clone()];
+        !content.trim().is_empty() && !pipe_positions(content).is_empty()
+    };
+    let here = line_bounds(text, at);
+    if !is_row(&here) {
+        return None;
+    }
+    let mut first = here.clone();
+    while first.start > 0 {
+        let previous = line_bounds(text, first.start - 1);
+        if !is_row(&previous) {
+            break;
+        }
+        first = previous;
+    }
+    let mut last = here;
+    loop {
+        let next_start = text[last.end..].find('\n').map(|newline| last.end + newline + 1);
+        let Some(next_start) = next_start.filter(|start| *start < text.len()) else { break };
+        let next = line_bounds(text, next_start);
+        if !is_row(&next) {
+            break;
+        }
+        last = next;
+    }
+    let lines = table_lines(text, first.start..last.end);
+    (lines.len() >= 2 && is_delimiter_row(&text[lines[1].clone()])).then_some(first.start..last.end)
+}
+
+#[derive(Clone, Copy)]
+enum Align {
+    None,
+    Left,
+    Right,
+    Center,
+}
+
+/// The table re-padded into aligned columns; `None` when it already is.
+pub fn format_table(table: &str) -> Option<String> {
+    let ending = if table.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = table.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect();
+    let rows: Vec<Vec<String>> = lines
+        .iter()
+        .map(|line| split_cells(line).into_iter().map(|(_, cell)| cell.trim().to_owned()).collect())
+        .collect();
+    let columns = rows.iter().map(Vec::len).max()?;
+    let aligns: Vec<Align> = (0..columns)
+        .map(|column| {
+            let cell = rows.get(1).and_then(|row| row.get(column)).map_or("", String::as_str);
+            match (cell.starts_with(':'), cell.ends_with(':') && cell.len() > 1) {
+                (true, true) => Align::Center,
+                (true, false) => Align::Left,
+                (false, true) => Align::Right,
+                (false, false) => Align::None,
+            }
+        })
+        .collect();
+    let widths: Vec<usize> = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .enumerate()
+                .filter(|(index, _)| *index != 1)
+                .filter_map(|(_, row)| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(3)
+        })
+        .collect();
+    let rendered: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let cells: Vec<String> = (0..columns)
+                .map(|column| {
+                    let width = widths[column];
+                    if index == 1 {
+                        return match aligns[column] {
+                            Align::None => "-".repeat(width),
+                            Align::Left => format!(":{}", "-".repeat(width - 1)),
+                            Align::Right => format!("{}:", "-".repeat(width - 1)),
+                            Align::Center => format!(":{}:", "-".repeat(width - 2)),
+                        };
+                    }
+                    let cell = row.get(column).map_or("", String::as_str);
+                    let pad = width - cell.chars().count();
+                    match aligns[column] {
+                        Align::Right => format!("{}{cell}", " ".repeat(pad)),
+                        _ => format!("{cell}{}", " ".repeat(pad)),
+                    }
+                })
+                .collect();
+            format!("| {} |", cells.join(" | "))
+        })
+        .collect();
+    let out = rendered.join(ending);
+    (out != table).then_some(out)
+}
+
+/// The content of the next (or previous) cell of the table around `caret`, delimiter row skipped.
+pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
+    let table = table_at(text, caret)?;
+    let mut cells: Vec<(Range<usize>, Range<usize>)> = Vec::new(); // (segment, trimmed content)
+    for (index, line) in table_lines(text, table).into_iter().enumerate() {
+        if index == 1 {
+            continue;
+        }
+        for (segment, raw) in split_cells(&text[line.clone()]) {
+            let lead = raw.len() - raw.trim_start().len();
+            let content_start = line.start + segment.start + lead;
+            let content = content_start..content_start + raw.trim().len();
+            cells.push((line.start + segment.start..line.start + segment.end, content));
+        }
+    }
+    let current = cells.iter().position(|(segment, _)| segment.start <= caret && caret <= segment.end)?;
+    let target = if back { current.checked_sub(1)? } else { current + 1 };
+    cells.get(target).map(|(_, content)| content.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +595,90 @@ mod tests {
         assert_eq!(nest("  - a", 5, true), Some(("- a".into(), 3)));
         assert_eq!(nest("- a", 3, true), None);
         assert_eq!(nest("text", 2, false), None);
+    }
+
+    #[test]
+    fn table_at_needs_a_delimiter_row() {
+        let text = "x\n\n|a|b|\n|-|-|\n|c|d|\n\ny";
+        let start = text.find("|a").unwrap();
+        let end = text.find("|\n\ny").unwrap() + 1;
+        assert_eq!(table_at(text, start + 1), Some(start..end));
+        assert_eq!(table_at("|a|b|\n|c|d|", 1), None);
+        assert_eq!(table_at(text, 0), None);
+    }
+
+    #[test]
+    fn format_pads_columns_with_a_minimum_width_of_three() {
+        assert_eq!(
+            format_table("|a|bb|\n|-|-|\n|ccc|d|").as_deref(),
+            Some("| a   | bb  |\n| --- | --- |\n| ccc | d   |")
+        );
+    }
+
+    #[test]
+    fn an_aligned_table_is_left_alone() {
+        assert_eq!(format_table("| a   | bb  |\n| --- | --- |\n| ccc | d   |"), None);
+    }
+
+    #[test]
+    fn alignment_colons_are_kept_and_right_columns_pad_left() {
+        assert_eq!(
+            format_table("|a|b|\n|:-|-:|\n|c|d|").as_deref(),
+            Some("| a   |   b |\n| :-- | --: |\n| c   |   d |")
+        );
+    }
+
+    #[test]
+    fn padding_counts_characters_not_bytes() {
+        assert_eq!(
+            format_table("|é|b|\n|-|-|").as_deref(),
+            Some("| é   | b   |\n| --- | --- |")
+        );
+    }
+
+    #[test]
+    fn crlf_tables_stay_crlf_and_short_rows_get_empty_cells() {
+        assert_eq!(
+            format_table("|a|b|\r\n|-|-|\r\n|c|").as_deref(),
+            Some("| a   | b   |\r\n| --- | --- |\r\n| c   |     |")
+        );
+    }
+
+    #[test]
+    fn escaped_pipes_stay_in_their_cell() {
+        assert_eq!(
+            format_table("|a\\|b|c|\n|-|-|").as_deref(),
+            Some("| a\\|b | c   |\n| ---- | --- |")
+        );
+    }
+
+    #[test]
+    fn tab_walks_cells_skipping_the_delimiter_row() {
+        let text = "| a | b |\n| - | - |\n| c | d |";
+        let at = |s: &str| text.find(s).unwrap();
+        assert_eq!(next_cell(text, at("a"), false), Some(at("b")..at("b") + 1));
+        assert_eq!(next_cell(text, at("b"), false), Some(at("c")..at("c") + 1));
+        assert_eq!(next_cell(text, at("c"), true), Some(at("b")..at("b") + 1));
+        assert_eq!(next_cell(text, at("d"), false), None);
+    }
+
+    #[test]
+    fn tab_from_the_last_cell_does_not_enter_a_following_table() {
+        let separated = "| a | b |\n| - | - |\n| c | d |\n\n| e | f |\n| - | - |\n| g | h |\n";
+        let at = |text: &str, s: &str| text.find(s).unwrap();
+        assert_eq!(next_cell(separated, at(separated, "d"), false), None);
+        assert_eq!(next_cell(separated, at(separated, "e"), true), None);
+        let with_text = "| a | b |\n| - | - |\n| c | d |\ntext\n| e | f |\n| - | - |\n| g | h |";
+        assert_eq!(next_cell(with_text, at(with_text, "d"), false), None);
+        assert_eq!(table_at(with_text, at(with_text, "d")), Some(0..with_text.find("\ntext").unwrap()));
+    }
+
+    #[test]
+    fn cells_are_found_in_crlf_tables() {
+        let text = "| a | b |\r\n| - | - |\r\n| c | d |\r\nafter";
+        let at = |s: &str| text.find(s).unwrap();
+        assert_eq!(next_cell(text, at("b"), false), Some(at("c")..at("c") + 1));
+        assert_eq!(next_cell(text, at("d"), false), None);
+        assert_eq!(table_at(text, at("c")), Some(0..text.find("\r\nafter").unwrap()));
     }
 }
