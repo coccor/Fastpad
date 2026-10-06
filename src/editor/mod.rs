@@ -2,6 +2,7 @@ pub mod comment;
 pub mod file_drop;
 pub mod hooks;
 pub mod input_filter;
+pub mod markdown_edit;
 pub mod scintilla;
 pub mod scintilla_constants;
 pub mod view_state;
