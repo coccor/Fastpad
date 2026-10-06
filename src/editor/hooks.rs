@@ -4,6 +4,10 @@
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 
+/// The subclass calls these while it handles the editor's own window message, and an
+/// implementation may call back into the editor (edit text, set the selection). So an
+/// implementer must not hold a `RefCell` borrow (or any other exclusive access) across a call
+/// into the editor window: that call can re-enter the hook or the window layer.
 pub trait EditorHooks: std::fmt::Debug {
     /// After Scintilla painted `update` (client coordinates).
     fn after_paint(&self, _hwnd: HWND, _update: RECT) {}

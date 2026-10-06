@@ -1013,6 +1013,48 @@ pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
     cells.get(target).map(|(_, _, content)| content.clone())
 }
 
+/// Whether `at` sits in YAML front matter or a fenced code block, where the line-local helpers
+/// must leave Enter and Tab to the editor. Scans the lines above `at`'s line; the window layer
+/// calls it only for an Enter or Tab key, never per edit.
+pub fn in_literal_block(text: &str, at: usize) -> bool {
+    let above = &text[..line_bounds(text, at).start];
+    let mut skip = 0;
+    if text
+        .lines()
+        .next()
+        .is_some_and(|first| first.trim_end() == "---")
+    {
+        // Front matter needs its closing line (looked for in the first 64 KiB, as Live does);
+        // an unclosed `---` is a thematic break.
+        let head = &text[..text.floor_char_boundary(64 * 1024)];
+        let closing = head
+            .lines()
+            .skip(1)
+            .position(|line| matches!(line.trim_end(), "---" | "..."));
+        if let Some(closing) = closing.map(|index| index + 1) {
+            if above.lines().count() <= closing {
+                return true;
+            }
+            skip = closing + 1;
+        }
+    }
+    let mut open: Option<(u8, usize)> = None;
+    for line in above.lines().skip(skip) {
+        let trimmed = line.trim();
+        let run = |fence: u8| trimmed.bytes().take_while(|byte| *byte == fence).count();
+        open = match open {
+            Some((fence, len)) if run(fence) >= len && run(fence) == trimmed.len() => None,
+            Some(open) => Some(open),
+            None => b"`~".iter().copied().find_map(|fence| {
+                let len = run(fence);
+                let info = &trimmed[len..];
+                (len >= 3 && !(fence == b'`' && info.contains('`'))).then_some((fence, len))
+            }),
+        };
+    }
+    open.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,5 +1790,34 @@ mod tests {
             let plan = insert_link(&text, &selections);
             assert_well_formed(&text, &plan, &format!("link {text:?} {selections:?}"));
         }
+    }
+
+    #[test]
+    fn literal_blocks_are_fenced_code_and_front_matter() {
+        let fenced = "- a\r\n```md\r\n- x\r\n```\r\n- b";
+        assert!(!in_literal_block(fenced, 0));
+        assert!(in_literal_block(fenced, fenced.find("- x").unwrap() + 3));
+        assert!(!in_literal_block(fenced, fenced.len()));
+        let tildes = "~~~~\n```\n- x\n~~~~\n- y";
+        assert!(in_literal_block(tildes, tildes.find("- x").unwrap()));
+        assert!(!in_literal_block(tildes, tildes.len()));
+        let open = "```\n- x";
+        assert!(
+            in_literal_block(open, open.len()),
+            "an unclosed fence runs to the end"
+        );
+        let inline = "``` a ` b\n- x";
+        assert!(
+            !in_literal_block(inline, inline.len()),
+            "a backtick info string is not a fence"
+        );
+        let front = "---\ntitle: x\n- y\n---\n- z";
+        assert!(in_literal_block(front, front.find("- y").unwrap()));
+        assert!(!in_literal_block(front, front.len()));
+        let rule = "---\n- y";
+        assert!(
+            !in_literal_block(rule, rule.len()),
+            "an unclosed `---` is a rule"
+        );
     }
 }

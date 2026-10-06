@@ -190,6 +190,7 @@ where
     // §4.2), which the main window lays out.
     let group = crate::window::editor_group::create(hwnd)?;
     let editor = create_editor(group)?.with_document_host(&host);
+    install_group_hooks(hwnd, &editor);
     let editor_hwnd = editor.hwnd();
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(

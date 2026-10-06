@@ -753,6 +753,10 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
     {
         return 0;
     }
+    if message == WM_KEYDOWN {
+        // A consumed key whose WM_CHAR never came must not eat a later key's character.
+        endpoint.swallow_char.set(None);
+    }
     if message == WM_KEYDOWN
         && let Some(hooks) = &hooks
     {

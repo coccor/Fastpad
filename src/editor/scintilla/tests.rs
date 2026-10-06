@@ -1257,3 +1257,33 @@ fn a_hook_that_takes_enter_also_swallows_its_char() {
         "without a hook Enter reaches Scintilla"
     );
 }
+
+#[test]
+fn a_consumed_key_without_its_char_does_not_eat_a_later_char() {
+    // Break caught: the swallow flag of a consumed Tab whose WM_CHAR never arrived eating the
+    // TAB character of a later key the hook declined.
+    use crate::editor::EditorHooks;
+    use std::rc::Rc;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR, WM_KEYDOWN};
+    #[derive(Debug)]
+    struct TakeTab;
+    impl EditorHooks for TakeTab {
+        fn key_down(&self, vk: u16, _: bool, _: bool, _: bool) -> bool {
+            vk == VK_TAB
+        }
+    }
+    let editor = test_editor();
+    editor.set_text("a").unwrap();
+    editor.set_selection(1..1).unwrap();
+    editor.set_hooks(Some(Rc::new(TakeTab)));
+    unsafe {
+        // A consumed Tab whose character never comes (as when focus moves away in between).
+        SendMessageW(editor.hwnd(), WM_KEYDOWN, usize::from(VK_TAB), 0);
+        // A declined key Scintilla leaves alone (Ctrl+I's key-down), then its TAB character.
+        SendMessageW(editor.hwnd(), WM_KEYDOWN, usize::from(b'I'), 0);
+        SendMessageW(editor.hwnd(), WM_CHAR, 0x09, 0);
+    }
+    assert_eq!(editor.text().unwrap(), "a\t");
+    editor.set_hooks(None);
+}
