@@ -894,8 +894,8 @@ mod tests {
 
     #[test]
     fn every_shortcut_chord_maps_to_exactly_one_command() {
-        // A Markdown-scoped key may match a global one (Markdown design spec §9), never one of its own
-        // scope.
+        // A Markdown-scoped key may match a global one (Markdown design spec §9), never one of its
+        // own scope.
         let keymap = crate::window::keymap::Keymap::defaults();
         let bindings = keymap.bindings();
         for (index, binding) in bindings.iter().enumerate() {

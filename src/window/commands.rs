@@ -245,8 +245,8 @@ pub const TEXT_COMMANDS: [CommandId; 60] = [
     CommandId::MarkdownLink,
 ];
 
-/// Where a command's key bindings apply (Markdown design spec §9): Markdown bindings are tried first,
-/// and only while a Markdown tab's editor has focus.
+/// Where a command's key bindings apply (Markdown design spec §9): Markdown bindings are tried
+/// first, and only while a Markdown tab's editor has focus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Scope {
     Global,

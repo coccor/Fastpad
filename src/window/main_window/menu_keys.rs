@@ -322,8 +322,8 @@ fn editing_key_off_editor(
     editing && !is_group_editor(hwnd, message.hwnd)
 }
 
-/// A Markdown-scoped shortcut (Markdown design spec §9): taken only when a Markdown tab's editor has
-/// focus, so the same key keeps its global command everywhere else.
+/// A Markdown-scoped shortcut (Markdown design spec §9): taken only when a Markdown tab's editor
+/// has focus, so the same key keeps its global command everywhere else.
 fn markdown_key(hwnd: HWND, message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -> bool {
     if !matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
         return false;

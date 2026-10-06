@@ -433,3 +433,102 @@ fn a_language_change_drops_the_documents_helper_state() {
     caret_to_end(&f.editor);
     assert_eq!(f.editor.text().unwrap(), edited);
 }
+
+/// Marks the active document saved, so a tab holding helper state is clean.
+fn mark_saved(f: &Fixture) {
+    f.editor.set_save_point();
+    drain_messages();
+    assert!(!app_mut(f.window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn closing_a_clean_background_tab_drops_its_helper_state() {
+    // Break caught: a clean tab closed where it is (not activated first) keeping its dirty
+    // table and fence states for the life of the window.
+    let f = fixture(TABLE, Language::Markdown);
+    type_in_table(&f.editor);
+    mark_saved(&f);
+    let id = app_mut(f.window.hwnd).tabs.active().unwrap().id;
+    assert!(crate::window::markdown_host::has_state(f.window.hwnd, id));
+    execute_command(f.window.hwnd, CommandId::New);
+    drain_messages();
+    f.editor.set_text("|q|\r\n|-|\r\n\r\ny").unwrap();
+    app_mut(f.window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    super::super::close_tab_at(f.window.hwnd, 0);
+    drain_messages();
+    assert_eq!(super::super::tab_count(f.window.hwnd), 1);
+    assert!(!crate::window::markdown_host::has_state(f.window.hwnd, id));
+    f.editor.set_selection(1..1).unwrap();
+    drain_messages();
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), "|q|\r\n|-|\r\n\r\ny");
+}
+
+#[test]
+fn opening_a_file_into_a_reused_untitled_tab_drops_the_tabs_helper_state() {
+    // Break caught: the opened file keeping the reused tab's document id and with it the
+    // untitled document's dirty table, so moving the caret reformats the file's own table.
+    let scratch = LibraryScratch::new("markdown-reuse");
+    let text = "|x|y|\r\n|-|-|\r\n\r\nz";
+    let path = scratch.note("table.md", text);
+    let f = fixture(TABLE, Language::Markdown);
+    type_in_table(&f.editor);
+    // Emptied and saved: a clean, empty untitled tab, which Open reuses.
+    f.editor.set_text("").unwrap();
+    mark_saved(&f);
+    let id = app_mut(f.window.hwnd).tabs.active().unwrap().id;
+    assert!(crate::window::markdown_host::has_state(f.window.hwnd, id));
+    super::super::open_path(f.window.hwnd, &path).unwrap();
+    drain_messages();
+    assert_eq!(
+        app_mut(f.window.hwnd).tabs.active().unwrap().id,
+        id,
+        "the untitled tab is reused"
+    );
+    // The test window has no Lexilla, so the detected language is set here.
+    app_mut(f.window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    assert!(!crate::window::markdown_host::has_state(f.window.hwnd, id));
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), text);
+}
+
+#[test]
+fn a_replaced_preview_drops_its_helper_state() {
+    // Break caught: every preview a click replaced keeping its fence states for the life of
+    // the window.
+    let scratch = LibraryScratch::new("markdown-preview");
+    let a = scratch.note("a.md", "- a");
+    let b = scratch.note("b.md", "b");
+    let f = fixture("", Language::PlainText);
+    scratch.install(f.window.hwnd);
+    super::super::open_note(f.window.hwnd, &a, super::super::OpenMode::Preview, false).unwrap();
+    drain_messages();
+    let id = app_mut(f.window.hwnd).tabs.active().unwrap().id;
+    app_mut(f.window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    // Tab on a first item is consumed without an edit, after the fence check.
+    f.editor.set_selection(3..3).unwrap();
+    press(&f, VK_TAB, false);
+    assert_eq!(f.editor.text().unwrap(), "- a");
+    assert!(crate::window::markdown_host::has_state(f.window.hwnd, id));
+    assert!(app_mut(f.window.hwnd).tabs.active().unwrap().preview);
+    super::super::open_note(f.window.hwnd, &b, super::super::OpenMode::Preview, false).unwrap();
+    drain_messages();
+    assert_eq!(tab_paths(f.window.hwnd), [Some(b)]);
+    assert!(!crate::window::markdown_host::has_state(f.window.hwnd, id));
+}
+
+#[test]
+fn clearing_documents_for_shutdown_drops_the_helper_state() {
+    let f = fixture(TABLE, Language::Markdown);
+    type_in_table(&f.editor);
+    let id = app_mut(f.window.hwnd).tabs.active().unwrap().id;
+    assert!(crate::window::markdown_host::has_state(f.window.hwnd, id));
+    super::super::clear_documents_for_shutdown(f.window.hwnd);
+    assert!(!crate::window::markdown_host::has_state(f.window.hwnd, id));
+}

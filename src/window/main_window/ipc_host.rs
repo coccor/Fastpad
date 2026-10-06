@@ -162,6 +162,9 @@ pub(super) fn shutdown_ipc(hwnd: HWND) {
 
 pub(super) fn clear_documents_for_shutdown(hwnd: HWND) {
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_mut() }.tabs.clear_for_shutdown();
+        let app = unsafe { app.as_mut() };
+        app.tabs.clear_for_shutdown();
+        // The Markdown helpers' per-document state goes with the documents.
+        app.markdown = Default::default();
     }
 }
