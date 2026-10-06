@@ -1,6 +1,9 @@
 //! Markdown writing helpers (live mode spec §8). Pure text → edit plans; the window layer
 //! applies a plan as one undo step. Edits use pre-edit byte offsets; selections are post-edit.
 
+// A plan's selections are ranges; a one-caret plan is legitimately a one-element Vec of them.
+#![allow(clippy::single_range_in_vec_init)]
+
 use std::ops::Range;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,8 +170,139 @@ pub fn insert_link(_text: &str, selections: &[Range<usize>]) -> EditPlan {
     plan
 }
 
+pub(crate) fn line_bounds(text: &str, at: usize) -> Range<usize> {
+    let start = text[..at].rfind('\n').map_or(0, |newline| newline + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |newline| at + newline);
+    let end = if end > start && text.as_bytes()[end - 1] == b'\r' { end - 1 } else { end };
+    start..end
+}
+
+/// The line ending after `line_end`; for the last line the document's first one, or `fallback`
+/// when the document has none.
+pub(crate) fn line_ending(text: &str, line_end: usize, fallback: &'static str) -> &'static str {
+    let rest = &text[line_end..];
+    if rest.starts_with("\r\n") {
+        "\r\n"
+    } else if rest.starts_with('\n') {
+        "\n"
+    } else {
+        match text.find('\n') {
+            Some(at) if at > 0 && text.as_bytes()[at - 1] == b'\r' => "\r\n",
+            Some(_) => "\n",
+            None => fallback,
+        }
+    }
+}
+
+struct ListPrefix {
+    indent: usize,
+    bullet: Option<u8>,
+    number: Option<(u64, u8)>,
+    task: bool,
+    /// Bytes from the line start to the item text.
+    len: usize,
+    /// The marker plus its space: how far a nested item indents.
+    marker_width: usize,
+}
+
+fn list_prefix(line: &str) -> Option<ListPrefix> {
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+    let mut at = indent;
+    let (bullet, number) = match *bytes.get(at)? {
+        marker @ (b'-' | b'*' | b'+') => {
+            at += 1;
+            (Some(marker), None)
+        }
+        digit if digit.is_ascii_digit() => {
+            let digits = bytes[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits > 9 {
+                return None;
+            }
+            let value = line[at..at + digits].parse().ok()?;
+            at += digits;
+            let delimiter = *bytes.get(at)?;
+            if delimiter != b'.' && delimiter != b')' {
+                return None;
+            }
+            at += 1;
+            (None, Some((value, delimiter)))
+        }
+        _ => return None,
+    };
+    match bytes.get(at) {
+        Some(b' ') => at += 1,
+        None => {}
+        Some(_) => return None,
+    }
+    let marker_width = (at - indent).max(2);
+    let rest = &line[at..];
+    let task = ["[ ]", "[x]", "[X]"].iter().any(|box_| {
+        rest.starts_with(box_) && (rest.len() == 3 || rest.as_bytes()[3] == b' ')
+    });
+    if task {
+        at = (at + 4).min(line.len());
+    }
+    Some(ListPrefix { indent, bullet, number, task, len: at, marker_width })
+}
+
+/// `fallback` is the line ending for a document with none yet (the editor's EOL mode).
+pub fn enter_in_list(text: &str, caret: usize, fallback: &'static str) -> Option<EditPlan> {
+    let line = line_bounds(text, caret);
+    let prefix = list_prefix(&text[line.clone()])?;
+    let prefix_end = line.start + prefix.len;
+    if caret < prefix_end.min(line.end) {
+        return None;
+    }
+    if text[prefix_end.min(line.end)..line.end].trim().is_empty() {
+        return Some(EditPlan {
+            edits: vec![TextEdit { range: line.clone(), text: String::new() }],
+            selections: vec![line.start..line.start],
+        });
+    }
+    let marker = match (prefix.bullet, prefix.number) {
+        (Some(bullet), _) => char::from(bullet).to_string(),
+        (None, Some((value, delimiter))) => format!("{}{}", value + 1, char::from(delimiter)),
+        (None, None) => return None,
+    };
+    let inserted = format!(
+        "{}{}{} {}",
+        line_ending(text, line.end, fallback),
+        &text[line.start..line.start + prefix.indent],
+        marker,
+        if prefix.task { "[ ] " } else { "" }
+    );
+    let after = caret + inserted.len();
+    Some(EditPlan {
+        edits: vec![TextEdit { range: caret..caret, text: inserted }],
+        selections: vec![after..after],
+    })
+}
+
+pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditPlan> {
+    let line = line_bounds(text, caret);
+    let prefix = list_prefix(&text[line.clone()])?;
+    if !outdent {
+        let pad = " ".repeat(prefix.marker_width);
+        let after = caret + pad.len();
+        return Some(EditPlan {
+            edits: vec![TextEdit { range: line.start..line.start, text: pad }],
+            selections: vec![after..after],
+        });
+    }
+    let spaces = text[line.start..line.start + prefix.indent].bytes().take_while(|b| *b == b' ').count();
+    let remove = spaces.min(prefix.marker_width);
+    if remove == 0 {
+        return None;
+    }
+    let after = caret.saturating_sub(remove).max(line.start);
+    Some(EditPlan {
+        edits: vec![TextEdit { range: line.start..line.start + remove, text: String::new() }],
+        selections: vec![after..after],
+    })
+}
+
 #[cfg(test)]
-#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -241,5 +375,58 @@ mod tests {
         let plan = insert_link("a ", &[2..2]);
         assert_eq!(plan.apply_to("a "), "a []()");
         assert_eq!(plan.selections, vec![3..3]);
+    }
+
+    fn enter(text: &str, caret: usize) -> Option<(String, usize)> {
+        enter_in_list(text, caret, "\n").map(|plan| (plan.apply_to(text), plan.selections[0].start))
+    }
+
+    fn nest(text: &str, caret: usize, outdent: bool) -> Option<(String, usize)> {
+        indent_list_item(text, caret, outdent)
+            .map(|plan| (plan.apply_to(text), plan.selections[0].start))
+    }
+
+    #[test]
+    fn enter_continues_bullets_numbers_and_tasks() {
+        assert_eq!(enter("- a", 3), Some(("- a\n- ".into(), 6)));
+        assert_eq!(enter("1. a", 4), Some(("1. a\n2. ".into(), 8)));
+        assert_eq!(enter("3) a", 4), Some(("3) a\n4) ".into(), 8)));
+        assert_eq!(enter("- [x] a", 7), Some(("- [x] a\n- [ ] ".into(), 14)));
+        assert_eq!(enter("  * a", 5), Some(("  * a\n  * ".into(), 10)));
+    }
+
+    #[test]
+    fn enter_mid_item_splits_it() {
+        assert_eq!(enter("- ab", 3), Some(("- a\n- b".into(), 6)));
+    }
+
+    #[test]
+    fn enter_on_an_empty_item_ends_the_list() {
+        assert_eq!(enter("- a\n- ", 6), Some(("- a\n".into(), 4)));
+        assert_eq!(enter("- a\n-", 5), Some(("- a\n".into(), 4)));
+        assert_eq!(enter("- a\n- [ ] ", 10), Some(("- a\n".into(), 4)));
+    }
+
+    #[test]
+    fn enter_outside_a_list_or_inside_the_marker_is_left_alone() {
+        assert_eq!(enter("text", 4), None);
+        assert_eq!(enter("**b**", 5), None);
+        assert_eq!(enter("- a", 1), None);
+    }
+
+    #[test]
+    fn continuation_uses_the_documents_line_ending() {
+        assert_eq!(enter("- a\r\nb", 3), Some(("- a\r\n- \r\nb".into(), 7)));
+        let plan = enter_in_list("- a", 3, "\r\n").unwrap();
+        assert_eq!(plan.apply_to("- a"), "- a\r\n- ", "a one-line document uses the fallback");
+    }
+
+    #[test]
+    fn tab_nests_by_the_marker_width_and_shift_tab_un_nests() {
+        assert_eq!(nest("- a", 3, false), Some(("  - a".into(), 5)));
+        assert_eq!(nest("1. a", 4, false), Some(("   1. a".into(), 7)));
+        assert_eq!(nest("  - a", 5, true), Some(("- a".into(), 3)));
+        assert_eq!(nest("- a", 3, true), None);
+        assert_eq!(nest("text", 2, false), None);
     }
 }
