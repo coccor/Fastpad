@@ -93,6 +93,8 @@ fn edits_clash(a: &Range<usize>, b: &Range<usize>) -> bool {
 pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> EditPlan {
     enum Kind {
         Pair,
+        /// A caret between an empty pair of exactly this marker: the pair is removed.
+        Unpair,
         Inside,
         Around,
         Wrap,
@@ -134,7 +136,14 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
         let caret = selection.is_empty().then_some(selection.start);
         let inner = &text[target.clone()];
         let kind = if target.is_empty() {
-            Kind::Pair
+            // Exactly the marker on both sides: `**|**` drops for `**`, not for `*`.
+            if run_before(text, target.start, byte) == width
+                && run_after(text, target.start, byte) == width
+            {
+                Kind::Unpair
+            } else {
+                Kind::Pair
+            }
         } else if inner.len() >= 2 * width
             && run_matches(run_after(inner, 0, byte), width)
             && run_matches(run_before(inner, inner.len(), byte), width)
@@ -158,6 +167,7 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
         };
         let edits = match kind {
             Kind::Pair => vec![insert(target.start, marker.repeat(2))],
+            Kind::Unpair => vec![remove(target.start - width..target.start + width)],
             Kind::Inside => vec![
                 remove(target.start..target.start + width),
                 remove(target.end - width..target.end),
@@ -192,6 +202,10 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
                 let at = shift(target.start, delta) + width;
                 at..at
             }
+            Kind::Unpair => {
+                let at = shift(target.start, delta) - width;
+                at..at
+            }
             Kind::Inside => {
                 let start = shift(target.start, delta);
                 match caret {
@@ -219,7 +233,7 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
         };
         delta += match kind {
             Kind::Pair | Kind::Wrap => 2 * width as isize,
-            Kind::Inside | Kind::Around => -2 * (width as isize),
+            Kind::Unpair | Kind::Inside | Kind::Around => -2 * (width as isize),
         };
         plan.selections[index] = result;
         handled.push(target);
@@ -1276,6 +1290,35 @@ mod tests {
     #[test]
     fn an_empty_selection_outside_a_word_inserts_a_pair() {
         assert_eq!(run("a  b", &[2..2], "**"), ("a **** b".into(), vec![4..4]));
+    }
+
+    #[test]
+    fn a_second_press_outside_a_word_removes_the_empty_pair() {
+        // Break caught: Ctrl+B twice between spaces stacking `********` (spec §8.1).
+        for marker in ["**", "*", "`"] {
+            let (once, carets) = run("a  b", &[2..2], marker);
+            assert_eq!(run(&once, &carets, marker), ("a  b".into(), vec![2..2]));
+        }
+    }
+
+    #[test]
+    fn italic_between_an_empty_bold_pair_inserts_its_own_pair() {
+        assert_eq!(
+            run("a **** b", &[4..4], "*"),
+            ("a ****** b".into(), vec![5..5])
+        );
+    }
+
+    #[test]
+    fn several_carets_remove_their_empty_pairs() {
+        let (once, carets) = run("a  b  c", &[2..2, 5..5], "**");
+        assert_eq!(once, "a **** b **** c");
+        let plan = toggle_marker(&once, &carets, "**");
+        assert_well_formed(&once, &plan, "two empty pairs");
+        assert_eq!(
+            (plan.apply_to(&once), plan.selections),
+            ("a  b  c".into(), vec![2..2, 5..5])
+        );
     }
 
     #[test]

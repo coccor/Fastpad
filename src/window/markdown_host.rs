@@ -4,8 +4,8 @@
 use crate::document::{DocumentId, Language};
 use crate::editor::markdown_edit::{
     EditPlan, FenceCache, MARKDOWN_HELPER_MAX_BYTES, enter_in_list, format_table,
-    in_literal_block_cached, indent_list_item, insert_link, is_list_item, next_cell, table_at,
-    toggle_marker,
+    in_literal_block_cached, indent_list_item, insert_link, is_list_item, line_bounds, next_cell,
+    table_at, toggle_marker,
 };
 use crate::editor::scintilla_constants::{SC_MOD_DELETETEXT, SC_PERFORMED_REDO, SC_PERFORMED_UNDO};
 use crate::editor::{Editor, EditorHooks, ScintillaNotification};
@@ -187,7 +187,14 @@ impl EditorHooks for GroupHooks {
             return false;
         }
         let fallback = editor.eol().unwrap_or("\r\n");
+        if fallback == "\r" {
+            return false; // the helpers split lines on LF only
+        }
         let plan = editor.with_document_text(|text| {
+            // A lone CR on the caret's line: a CR-only document, read as one line by the helpers.
+            if splits_on_cr(text, caret) {
+                return None;
+            }
             let plan = if vk == VK_RETURN {
                 enter_in_list(text, caret, fallback)
             } else if let Some(cell) = next_cell(text, caret, shift) {
@@ -197,7 +204,20 @@ impl EditorHooks for GroupHooks {
                 })
             } else {
                 // A caret or a selection on one list item's line nests the item (spec §8.2).
-                indent_list_item(text, caret, shift)
+                indent_list_item(text, caret, shift).or_else(|| {
+                    // No cell to move to (the last one, or the delimiter row): Tab never puts a
+                    // tab character into a table.
+                    // The selection is kept as it was, its caret end included.
+                    let kept = if caret == selection.start {
+                        selection.end..selection.start
+                    } else {
+                        selection.clone()
+                    };
+                    table_at(text, caret).map(|_| EditPlan {
+                        edits: Vec::new(),
+                        selections: vec![kept],
+                    })
+                })
             };
             // Fenced code and front matter keep the default keys; checked only with a plan.
             plan.filter(|_| !in_literal_block(self.main, document, text, caret))
@@ -389,7 +409,11 @@ fn format_left_table(hwnd: HWND, group: GroupId) {
         return;
     };
     let rewrite = editor.with_document_text(|text| {
-        let table = table_at(text, start.min(text.len()))?;
+        let start = start.min(text.len());
+        if splits_on_cr(text, start) {
+            return None; // a CR-only document: the helpers would read it as one line
+        }
+        let table = table_at(text, start)?;
         if in_literal_block(hwnd, document, text, table.start) {
             return None; // a table-like block in fenced code or front matter is left alone
         }
@@ -402,6 +426,12 @@ fn format_left_table(hwnd: HWND, group: GroupId) {
         editor.end_undo_action();
         set_formatting(hwnd, document, false);
     }
+}
+
+/// Whether the line around `at`, split on LF as the helpers split lines, holds a lone CR: the
+/// document (or that part of it) ends its lines with CR alone. Reads that one LF-delimited span.
+fn splits_on_cr(text: &str, at: usize) -> bool {
+    text[line_bounds(text, at)].contains('\r')
 }
 
 fn set_formatting(hwnd: HWND, document: DocumentId, formatting: bool) {

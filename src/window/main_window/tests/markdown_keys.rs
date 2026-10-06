@@ -532,3 +532,71 @@ fn clearing_documents_for_shutdown_drops_the_helper_state() {
     super::super::clear_documents_for_shutdown(f.window.hwnd);
     assert!(!crate::window::markdown_host::has_state(f.window.hwnd, id));
 }
+
+#[test]
+fn ctrl_b_twice_outside_a_word_leaves_the_text_as_it_was() {
+    // Break caught: a second Ctrl+B between spaces stacking `********` (spec §8.1).
+    let f = fixture("a  b", Language::Markdown);
+    f.editor.set_selection(2..2).unwrap();
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'B', true, false, false);
+    assert_eq!(f.editor.text().unwrap(), "a **** b");
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'B', true, false, false);
+    assert_eq!(f.editor.text().unwrap(), "a  b");
+    assert_eq!(f.editor.selection().unwrap(), 2..2);
+}
+
+#[test]
+fn enter_and_tab_in_a_cr_only_document_keep_their_default() {
+    // Break caught: a lone-CR document read as one line, so Tab on its last item is consumed
+    // as a "first item" and Enter continues a list from the document's first line.
+    let f = fixture("- a\r- b", Language::Markdown);
+    f.editor.set_selection(7..7).unwrap();
+    press(&f, VK_TAB, false);
+    assert_eq!(f.editor.text().unwrap(), "- a\r- b\t");
+    drop(f);
+    let f = fixture("- a\r- b", Language::Markdown);
+    f.editor.set_selection(7..7).unwrap();
+    press(&f, VK_RETURN, false);
+    assert_eq!(f.editor.text().unwrap(), "- a\r- b\r\n");
+}
+
+#[test]
+fn tab_on_the_last_cell_or_the_delimiter_row_is_consumed_without_an_edit() {
+    // Break caught: a literal tab inserted into the table where no next cell exists.
+    let text = "| a | b |\r\n| - | - |\r\n| c | d |";
+    let f = fixture(text, Language::Markdown);
+    let d = text.find('d').unwrap();
+    f.editor.set_selection(d..d).unwrap();
+    press(&f, VK_TAB, false);
+    assert_eq!(f.editor.text().unwrap(), text);
+    assert_eq!(f.editor.selection().unwrap(), d..d);
+    let delimiter = text.find("| -").unwrap() + 3;
+    f.editor.set_selection(delimiter..delimiter).unwrap();
+    press(&f, VK_TAB, false);
+    assert_eq!(f.editor.text().unwrap(), text);
+    press(&f, VK_TAB, true);
+    assert_eq!(f.editor.text().unwrap(), text);
+}
+
+#[test]
+fn a_cr_only_table_is_not_formatted_when_the_caret_leaves_it() {
+    let f = fixture("|a|b|\r|-|-|\r|c|d|\r\rx", Language::Markdown);
+    let edited = type_in_table(&f.editor);
+    caret_to_end(&f.editor);
+    assert_eq!(f.editor.text().unwrap(), edited);
+}
+
+#[test]
+fn tab_on_the_last_cell_keeps_a_backward_selection() {
+    let text = "| a | b |\r\n| - | - |\r\n| c | dd |";
+    let f = fixture(text, Language::Markdown);
+    let d = text.find("dd").unwrap();
+    let backward = d + 2..d;
+    f.editor
+        .set_selections(std::slice::from_ref(&backward))
+        .unwrap();
+    press(&f, VK_TAB, false);
+    assert_eq!(f.editor.text().unwrap(), text);
+    assert_eq!(f.editor.selections().unwrap(), vec![d..d + 2]);
+    assert_eq!(f.editor.carets().unwrap(), vec![d]);
+}
