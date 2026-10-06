@@ -109,8 +109,9 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
     });
     let mut plan = EditPlan { edits: Vec::new(), selections: vec![0..0; selections.len()] };
     let mut delta: isize = 0;
-    // (target, resulting selection) of every toggle already planned.
-    let mut handled: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+    // Targets already planned, and the selections that clashed with them.
+    let mut handled: Vec<Range<usize>> = Vec::new();
+    let mut dropped: Vec<(usize, Range<usize>)> = Vec::new();
     for (index, selection, target) in items {
         let caret = selection.is_empty().then_some(selection.start);
         let inner = &text[target.clone()];
@@ -146,21 +147,12 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
             }
         };
         // Selections on one word, or on words that share a marker run, share one toggle.
-        let shared = handled
+        let clashes = handled
             .iter()
-            .find(|(done, _)| *done == target || (target.start < done.end && done.start < target.end))
-            .map(|(_, result)| result.clone())
-            .or_else(|| {
-                let clash = edits.iter().any(|new| {
-                    plan.edits.iter().any(|old| edits_clash(&new.range, &old.range))
-                });
-                clash.then(|| {
-                    // Follows the nearest earlier toggle.
-                    handled.last().map_or(0..0, |(_, result)| result.clone())
-                })
-            });
-        if let Some(result) = shared {
-            plan.selections[index] = result;
+            .any(|done| *done == target || (target.start < done.end && done.start < target.end))
+            || edits.iter().any(|new| plan.edits.iter().any(|old| edits_clash(&new.range, &old.range)));
+        if clashes {
+            dropped.push((index, selection));
             continue;
         }
         plan.edits.extend(edits);
@@ -198,11 +190,32 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
             Kind::Pair | Kind::Wrap => 2 * width as isize,
             Kind::Inside | Kind::Around => -2 * (width as isize),
         };
-        plan.selections[index] = result.clone();
-        handled.push((target, result));
+        plan.selections[index] = result;
+        handled.push(target);
     }
     plan.edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    // A dropped selection keeps its own place, moved by the edits that were planned.
+    for (index, selection) in dropped {
+        let start = map_position(&plan.edits, selection.start);
+        plan.selections[index] = start..map_position(&plan.edits, selection.end);
+    }
     plan
+}
+
+/// Where a pre-edit position lands: shifted by the edits wholly before it; an insertion at the
+/// position itself stays after it, and a position inside a removal moves to its start.
+fn map_position(edits: &[TextEdit], position: usize) -> usize {
+    let mut mapped = position as isize;
+    for edit in edits {
+        let before =
+            if edit.range.is_empty() { edit.range.start < position } else { edit.range.end <= position };
+        if before {
+            mapped += edit.text.len() as isize - edit.range.len() as isize;
+        } else if edit.range.start < position {
+            mapped -= (position - edit.range.start) as isize;
+        }
+    }
+    mapped as usize
 }
 
 /// Two link spans clash when equal, overlapping, or when a caret touches a selection.
@@ -265,8 +278,16 @@ pub(crate) fn line_ending(text: &str, line_end: usize, fallback: &'static str) -
     }
 }
 
+/// The visual width of leading whitespace: a tab advances to the next multiple of 4.
+fn columns(whitespace: &str) -> usize {
+    whitespace.bytes().fold(0, |column, byte| if byte == 9 { column + 4 - column % 4 } else { column + 1 })
+}
+
 struct ListPrefix {
+    /// Visual columns of the leading whitespace.
     indent: usize,
+    /// Bytes of the leading whitespace.
+    indent_len: usize,
     bullet: Option<u8>,
     number: Option<(u64, u8)>,
     task: bool,
@@ -295,8 +316,9 @@ fn list_prefix(line: &str) -> Option<ListPrefix> {
         return None;
     }
     let bytes = line.as_bytes();
-    let indent = bytes.iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
-    let mut at = indent;
+    let indent_len = bytes.iter().take_while(|b| matches!(b, 32 | 9)).count();
+    let indent = columns(&line[..indent_len]);
+    let mut at = indent_len;
     let (bullet, number) = match *bytes.get(at)? {
         marker @ (b'-' | b'*' | b'+') => {
             at += 1;
@@ -323,7 +345,7 @@ fn list_prefix(line: &str) -> Option<ListPrefix> {
         None => {}
         Some(_) => return None,
     }
-    let marker_width = (at - indent).max(2);
+    let marker_width = (at - indent_len).max(2);
     let rest = &line[at..];
     let task = ["[ ]", "[x]", "[X]"].iter().any(|box_| {
         rest.starts_with(box_) && (rest.len() == 3 || rest.as_bytes()[3] == b' ')
@@ -331,7 +353,7 @@ fn list_prefix(line: &str) -> Option<ListPrefix> {
     if task {
         at = (at + 4).min(line.len());
     }
-    Some(ListPrefix { indent, bullet, number, task, len: at, marker_width })
+    Some(ListPrefix { indent, indent_len, bullet, number, task, len: at, marker_width })
 }
 
 /// `fallback` is the line ending for a document with none yet (the editor's EOL mode).
@@ -364,7 +386,7 @@ pub fn enter_in_list(text: &str, caret: usize, fallback: &'static str) -> Option
     let inserted = format!(
         "{}{}{} {}",
         line_ending(text, line.end, fallback),
-        &text[line.start..line.start + prefix.indent],
+        &text[line.start..line.start + prefix.indent_len],
         marker,
         if prefix.task { "[ ] " } else { "" }
     );
@@ -399,38 +421,27 @@ fn enclosing_item(text: &str, line_start: usize, accept: impl Fn(&ListPrefix) ->
 pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditPlan> {
     let line = line_bounds(text, caret);
     let prefix = list_prefix(&text[line.clone()])?;
-    if !outdent {
+    let new_indent = if outdent {
+        if prefix.indent == 0 {
+            return None;
+        }
+        // Back to the enclosing item's indent, or the margin.
+        enclosing_item(text, line.start, |item| item.indent < prefix.indent).map_or(0, |item| item.indent)
+    } else {
         // Under a parent item: line up with its content; otherwise by the item's own marker.
         let parent = enclosing_item(text, line.start, |item| item.indent <= prefix.indent);
         let column = parent.map_or(0, |item| item.indent + item.marker_width);
-        let indent = if column > prefix.indent { column } else { prefix.indent + prefix.marker_width };
-        // Replace the existing indent so a tab never ends up after spaces.
-        let pad = " ".repeat(indent);
-        let after = if caret >= line.start + prefix.indent {
-            caret + indent - prefix.indent
-        } else {
-            line.start + indent
-        };
-        return Some(EditPlan {
-            edits: vec![TextEdit { range: line.start..line.start + prefix.indent, text: pad }],
-            selections: vec![after..after],
-        });
-    }
-    let leading = &text[line.start..line.start + prefix.indent];
-    let remove = if leading.as_bytes().first() == Some(&b'\t') {
-        1
-    } else {
-        let spaces = leading.bytes().take_while(|b| *b == b' ').count();
-        let parent = enclosing_item(text, line.start, |item| item.indent < prefix.indent);
-        let target = parent.map_or(0, |item| item.indent);
-        spaces.min(prefix.indent.saturating_sub(target).max(1))
+        if column > prefix.indent { column } else { prefix.indent + prefix.marker_width }
     };
-    if remove == 0 {
-        return None;
-    }
-    let after = caret.saturating_sub(remove).max(line.start);
+    // The leading whitespace is replaced by spaces, so a tab never ends up after spaces.
+    let pad = " ".repeat(new_indent);
+    let after = if caret >= line.start + prefix.indent_len {
+        caret + pad.len() - prefix.indent_len
+    } else {
+        line.start + pad.len()
+    };
     Some(EditPlan {
-        edits: vec![TextEdit { range: line.start..line.start + remove, text: String::new() }],
+        edits: vec![TextEdit { range: line.start..line.start + prefix.indent_len, text: pad }],
         selections: vec![after..after],
     })
 }
@@ -830,8 +841,8 @@ mod tests {
 
     #[test]
     fn carets_in_one_word_toggle_it_once() {
-        assert_eq!(run("**hello**", &[3..3, 5..5], "**"), ("hello".into(), vec![1..1, 1..1]));
-        assert_eq!(run("hello", &[1..1, 3..3], "**"), ("**hello**".into(), vec![3..3, 3..3]));
+        assert_eq!(run("**hello**", &[3..3, 5..5], "**"), ("hello".into(), vec![1..1, 3..3]));
+        assert_eq!(run("hello", &[1..1, 3..3], "**"), ("**hello**".into(), vec![3..3, 5..5]));
         assert_eq!(run("ab cd", &[0..4, 2..5], "**").0, "**ab c**d", "the overlapping selection shares the first toggle");
     }
 
@@ -905,11 +916,11 @@ mod tests {
         let carets = toggle_marker("**a**b**", &[2..2, 5..5], "**");
         assert_well_formed("**a**b**", &carets, "carets");
         assert_eq!(carets.apply_to("**a**b**"), "ab**");
-        assert_eq!(carets.selections, vec![0..0, 0..0]);
+        assert_eq!(carets.selections, vec![0..0, 1..1]);
         let selected = toggle_marker("**a**b**", &[2..3, 5..6], "**");
         assert_well_formed("**a**b**", &selected, "selections");
         assert_eq!(selected.apply_to("**a**b**"), "ab**");
-        assert_eq!(selected.selections, vec![0..1, 0..1]);
+        assert_eq!(selected.selections, vec![0..1, 1..2]);
     }
 
     #[test]
@@ -938,9 +949,45 @@ mod tests {
         }
     }
 
+    fn visual_column(line: &str) -> usize {
+        columns(&line[..line.len() - line.trim_start_matches([' ', '\t']).len()])
+    }
+
     #[test]
-    fn tab_replaces_a_tab_indent_instead_of_prefixing_it() {
-        assert_eq!(nest("- a\n\t- b", 8, false), Some(("- a\n  - b".into(), 9)));
+    fn tab_never_moves_an_item_left_and_counts_tabs_as_columns() {
+        // A tab is 4 columns: the item is already deeper than its parent's content.
+        assert_eq!(nest("- a\n\t- b", 8, false), Some(("- a\n      - b".into(), 13)));
+        let text = "- a\n\t- b\n\t\t- c";
+        assert_eq!(
+            nest(text, text.len(), false),
+            Some(("- a\n\t- b\n          - c".into(), text.len() + 8))
+        );
+        assert_eq!(nest("\t- a", 4, false), Some(("      - a".into(), 9)));
+    }
+
+    #[test]
+    fn a_tab_indented_item_nests_under_a_space_indented_parent() {
+        let text = "  - a\n\t- b";
+        assert_eq!(nest(text, text.len(), false), Some(("  - a\n      - b".into(), text.len() + 5)));
+        assert_eq!(nest(text, text.len(), true), Some(("  - a\n  - b".into(), text.len() + 1)));
+    }
+
+    #[test]
+    fn tab_never_decreases_the_visual_column() {
+        let lead = ["", " ", "  ", "   ", "    ", "\t", " \t", "  \t", "\t\t", "\t "];
+        for parent in lead {
+            for child in lead {
+                let text = format!("{parent}- a\n{child}- b");
+                let caret = text.len();
+                let plan = indent_list_item(&text, caret, false).unwrap();
+                let out = plan.apply_to(&text);
+                let new_line = out.lines().nth(1).unwrap();
+                assert!(
+                    visual_column(new_line) > visual_column(&format!("{child}- b")),
+                    "{text:?} -> {out:?}"
+                );
+            }
+        }
     }
 
     #[test]
