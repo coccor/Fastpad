@@ -1219,3 +1219,41 @@ fn geometry_round_trips_a_position() {
     assert_eq!(editor.position_at(x + 1, y + 1).unwrap(), start);
     assert!(editor.text_height().unwrap() > 0);
 }
+
+#[test]
+fn a_hook_that_takes_enter_also_swallows_its_char() {
+    use crate::editor::EditorHooks;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR, WM_KEYDOWN};
+    #[derive(Debug)]
+    struct TakeEnter(Cell<u32>);
+    impl EditorHooks for TakeEnter {
+        fn key_down(&self, vk: u16, _: bool, _: bool, _: bool) -> bool {
+            self.0.set(self.0.get() + 1);
+            vk == VK_RETURN
+        }
+    }
+    let editor = test_editor();
+    editor.set_text("a").unwrap();
+    editor.set_selection(1..1).unwrap();
+    let hook = Rc::new(TakeEnter(Cell::new(0)));
+    editor.set_hooks(Some(hook.clone()));
+    unsafe {
+        SendMessageW(editor.hwnd(), WM_KEYDOWN, usize::from(VK_RETURN), 0);
+        // What TranslateMessage would post after the key-down.
+        SendMessageW(editor.hwnd(), WM_CHAR, 0x0D, 0);
+    }
+    assert_eq!(hook.0.get(), 1);
+    assert_eq!(editor.text().unwrap(), "a");
+    editor.set_hooks(None);
+    unsafe {
+        SendMessageW(editor.hwnd(), WM_KEYDOWN, usize::from(VK_RETURN), 0);
+    }
+    assert_ne!(
+        editor.text().unwrap(),
+        "a",
+        "without a hook Enter reaches Scintilla"
+    );
+}
