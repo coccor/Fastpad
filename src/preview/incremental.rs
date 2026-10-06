@@ -102,7 +102,17 @@ impl SourceText for str {
     }
 
     fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
-        Cow::Borrowed(&self[range])
+        // Block ranges are char boundaries; a range that is not one (a fixed-size window) is
+        // clamped inward instead of panicking.
+        let mut end = range.end.min(str::len(self));
+        while !self.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut start = range.start.min(end);
+        while !self.is_char_boundary(start) {
+            start += 1;
+        }
+        Cow::Borrowed(&self[start..end])
     }
 
     fn line_of(&self, byte: usize) -> usize {
