@@ -83,6 +83,8 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
     order.sort_by_key(|index| normalized(&selections[*index]).start);
     let mut plan = EditPlan { edits: Vec::new(), selections: vec![0..0; selections.len()] };
     let mut delta: isize = 0;
+    // (target, resulting selection) of every toggle already planned.
+    let mut handled: Vec<(Range<usize>, Range<usize>)> = Vec::new();
     let insert = |plan: &mut EditPlan, at: usize, text: &str| {
         plan.edits.push(TextEdit { range: at..at, text: text.to_owned() });
     };
@@ -96,11 +98,22 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
             Some(at) => word_at(text, at).unwrap_or(at..at),
             None => selection.clone(),
         };
+        // Two carets in one word, or overlapping selections, share one toggle.
+        let shared = handled.iter().find(|(done, _)| {
+            *done == target || (target.start < done.end && done.start < target.end)
+        });
+        if let Some((_, result)) = shared {
+            plan.selections[index] = result.clone();
+            continue;
+        }
+        handled.push((target.clone(), 0..0));
+        let slot = handled.len() - 1;
         if target.is_empty() {
             insert(&mut plan, target.start, &marker.repeat(2));
             let at = shift(target.start, delta) + width;
             plan.selections[index] = at..at;
             delta += 2 * width as isize;
+            handled[slot].1 = plan.selections[index].clone();
             continue;
         }
         let inner = &text[target.clone()];
@@ -145,6 +158,7 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
             };
             delta += 2 * width as isize;
         }
+        handled[slot].1 = plan.selections[index].clone();
     }
     plan.edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
     plan
@@ -207,7 +221,24 @@ struct ListPrefix {
     marker_width: usize,
 }
 
+/// Three or more of the same `-`, `*` or `_`, spaces and tabs between them allowed.
+fn is_thematic_break(line: &str) -> bool {
+    let mut marks = line.bytes().filter(|b| !matches!(b, b' ' | b'\t'));
+    let Some(first @ (b'-' | b'*' | b'_')) = marks.next() else { return false };
+    let mut count = 1;
+    for mark in marks {
+        if mark != first {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
+}
+
 fn list_prefix(line: &str) -> Option<ListPrefix> {
+    if is_thematic_break(line) {
+        return None;
+    }
     let bytes = line.as_bytes();
     let indent = bytes.iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
     let mut at = indent;
@@ -256,6 +287,14 @@ pub fn enter_in_list(text: &str, caret: usize, fallback: &'static str) -> Option
     if caret < prefix_end.min(line.end) {
         return None;
     }
+    // A bare `-` right under a paragraph line is a setext underline, not an empty item.
+    let bare = line.len() == prefix.len && !prefix.task && !text[line.clone()].ends_with(' ');
+    if bare && line.start > 0 {
+        let previous = line_bounds(text, line.start - 1);
+        if !text[previous.clone()].trim().is_empty() && list_prefix(&text[previous]).is_none() {
+            return None;
+        }
+    }
     if text[prefix_end.min(line.end)..line.end].trim().is_empty() {
         return Some(EditPlan {
             edits: vec![TextEdit { range: line.clone(), text: String::new() }],
@@ -281,19 +320,51 @@ pub fn enter_in_list(text: &str, caret: usize, fallback: &'static str) -> Option
     })
 }
 
+/// The nearest earlier list item above `line_start` whose indent satisfies `accept`. Blank
+/// lines are skipped; an unindented non-list line ends the search.
+fn enclosing_item(text: &str, line_start: usize, accept: impl Fn(&ListPrefix) -> bool) -> Option<ListPrefix> {
+    let mut start = line_start;
+    while start > 0 {
+        let line = line_bounds(text, start - 1);
+        start = line.start;
+        let content = &text[line];
+        if content.trim().is_empty() {
+            continue;
+        }
+        match list_prefix(content) {
+            Some(prefix) if accept(&prefix) => return Some(prefix),
+            Some(_) => {}
+            None if !content.starts_with(char::is_whitespace) => return None,
+            None => {}
+        }
+    }
+    None
+}
+
 pub fn indent_list_item(text: &str, caret: usize, outdent: bool) -> Option<EditPlan> {
     let line = line_bounds(text, caret);
     let prefix = list_prefix(&text[line.clone()])?;
     if !outdent {
-        let pad = " ".repeat(prefix.marker_width);
+        // Under a parent item: line up with its content; otherwise by the item's own marker.
+        let parent = enclosing_item(text, line.start, |item| item.indent <= prefix.indent);
+        let column = parent.map_or(0, |item| item.indent + item.marker_width);
+        let width = if column > prefix.indent { column - prefix.indent } else { prefix.marker_width };
+        let pad = " ".repeat(width);
         let after = caret + pad.len();
         return Some(EditPlan {
             edits: vec![TextEdit { range: line.start..line.start, text: pad }],
             selections: vec![after..after],
         });
     }
-    let spaces = text[line.start..line.start + prefix.indent].bytes().take_while(|b| *b == b' ').count();
-    let remove = spaces.min(prefix.marker_width);
+    let leading = &text[line.start..line.start + prefix.indent];
+    let remove = if leading.as_bytes().first() == Some(&b'\t') {
+        1
+    } else {
+        let spaces = leading.bytes().take_while(|b| *b == b' ').count();
+        let parent = enclosing_item(text, line.start, |item| item.indent < prefix.indent);
+        let target = parent.map_or(0, |item| item.indent);
+        spaces.min(prefix.indent.saturating_sub(target).max(1))
+    };
     if remove == 0 {
         return None;
     }
@@ -445,15 +516,21 @@ pub fn format_table(table: &str) -> Option<String> {
             format!("| {} |", cells.join(" | "))
         })
         .collect();
-    let out = rendered.join(ending);
+    let indent = &lines[0][..lines[0].len() - lines[0].trim_start().len()];
+    let out = rendered.iter().map(|row| format!("{indent}{row}")).collect::<Vec<_>>().join(ending);
     (out != table).then_some(out)
 }
 
 /// The content of the next (or previous) cell of the table around `caret`, delimiter row skipped.
 pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
     let table = table_at(text, caret)?;
-    let mut cells: Vec<(Range<usize>, Range<usize>)> = Vec::new(); // (segment, trimmed content)
+    // (line start, segment, trimmed content) of every cell outside the delimiter row.
+    let mut cells: Vec<(usize, Range<usize>, Range<usize>)> = Vec::new();
+    let mut caret_line = None;
     for (index, line) in table_lines(text, table).into_iter().enumerate() {
+        if line.start <= caret && caret <= line.end {
+            caret_line = Some(line.start);
+        }
         if index == 1 {
             continue;
         }
@@ -461,12 +538,21 @@ pub fn next_cell(text: &str, caret: usize, back: bool) -> Option<Range<usize>> {
             let lead = raw.len() - raw.trim_start().len();
             let content_start = line.start + segment.start + lead;
             let content = content_start..content_start + raw.trim().len();
-            cells.push((line.start + segment.start..line.start + segment.end, content));
+            cells.push((line.start, line.start + segment.start..line.start + segment.end, content));
         }
     }
-    let current = cells.iter().position(|(segment, _)| segment.start <= caret && caret <= segment.end)?;
+    let current = cells
+        .iter()
+        .position(|(_, segment, _)| segment.start <= caret && caret <= segment.end)
+        .or_else(|| {
+            // Before the first pipe is the first cell, after the last pipe the last one.
+            let on_line = |(line, _, _): &(usize, Range<usize>, Range<usize>)| Some(*line) == caret_line;
+            let first = cells.iter().position(on_line)?;
+            let last = cells.iter().rposition(on_line)?;
+            Some(if caret < cells[first].1.start { first } else { last })
+        })?;
     let target = if back { current.checked_sub(1)? } else { current + 1 };
-    cells.get(target).map(|(_, content)| content.clone())
+    cells.get(target).map(|(_, _, content)| content.clone())
 }
 
 #[cfg(test)]
@@ -680,5 +766,62 @@ mod tests {
         assert_eq!(next_cell(text, at("b"), false), Some(at("c")..at("c") + 1));
         assert_eq!(next_cell(text, at("d"), false), None);
         assert_eq!(table_at(text, at("c")), Some(0..text.find("\r\nafter").unwrap()));
+    }
+
+    #[test]
+    fn carets_in_one_word_toggle_it_once() {
+        assert_eq!(run("**hello**", &[3..3, 5..5], "**"), ("hello".into(), vec![1..1, 1..1]));
+        assert_eq!(run("hello", &[1..1, 3..3], "**"), ("**hello**".into(), vec![3..3, 3..3]));
+        assert_eq!(run("ab cd", &[0..4, 2..5], "**").0, "**ab c**d", "the overlapping selection shares the first toggle");
+    }
+
+    #[test]
+    fn a_multi_byte_word_is_toggled_whole() {
+        assert_eq!(run("é b", &[0..0], "**"), ("**é** b".into(), vec![2..2]));
+        assert_eq!(run("héllo", &[3..3], "**"), ("**héllo**".into(), vec![5..5]));
+    }
+
+    #[test]
+    fn thematic_breaks_are_not_list_items() {
+        assert_eq!(enter("* * *", 5), None);
+        assert_eq!(enter("- - -", 2), None);
+        assert_eq!(nest("- - -", 5, false), None);
+        assert_eq!(nest("***", 3, false), None);
+    }
+
+    #[test]
+    fn a_setext_underline_is_not_an_empty_item() {
+        assert_eq!(enter("Title\n-", 7), None);
+    }
+
+    #[test]
+    fn ending_a_list_keeps_crlf() {
+        assert_eq!(enter("- a\r\n- ", 7), Some(("- a\r\n".into(), 5)));
+    }
+
+    #[test]
+    fn nesting_follows_the_parent_items_content_column() {
+        assert_eq!(nest("1. a\n- b", 8, false), Some(("1. a\n   - b".into(), 11)));
+        assert_eq!(nest("1. a\n   - b", 11, true), Some(("1. a\n- b".into(), 8)));
+        assert_eq!(nest("- a\n  - b\n  - c", 15, false), Some(("- a\n  - b\n    - c".into(), 17)));
+        assert_eq!(nest("\t- a", 4, true), Some(("- a".into(), 3)));
+    }
+
+    #[test]
+    fn tab_works_from_before_the_first_pipe_and_after_the_last() {
+        let text = "| a | b |\n| - | - |\n| c | d |";
+        let at = |s: &str| text.find(s).unwrap();
+        assert_eq!(next_cell(text, 0, false), Some(at("b")..at("b") + 1));
+        assert_eq!(next_cell(text, 9, false), Some(at("c")..at("c") + 1));
+        assert_eq!(next_cell(text, 9, true), Some(at("a")..at("a") + 1));
+        assert_eq!(next_cell(text, 0, true), None);
+    }
+
+    #[test]
+    fn an_indented_table_keeps_its_indent() {
+        assert_eq!(
+            format_table("  |a|b|\n  |-|-|").as_deref(),
+            Some("  | a   | b   |\n  | --- | --- |")
+        );
     }
 }
