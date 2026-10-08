@@ -7,6 +7,16 @@ use super::persisted::{FileIconSet, Settings, SidebarView, ThemePreference};
 pub const DEFAULT_FONT_FACE: &str = "Consolas";
 /// The Markdown preview's body and heading font; code in the preview uses the editor font.
 pub const DEFAULT_PREVIEW_FONT: &str = "Segoe UI";
+/// The Markdown preview's body text size in 96-DPI pixels, and the range the Settings dialog keeps
+/// it within.
+pub const DEFAULT_PREVIEW_FONT_SIZE: u16 = 14;
+pub const MIN_PREVIEW_FONT_SIZE: u16 = 8;
+pub const MAX_PREVIEW_FONT_SIZE: u16 = 48;
+/// The Markdown preview's body line height in tenths of the text size (16 is 1.6), and the range
+/// `fastpad.ini` and the Settings dialog accept.
+pub const DEFAULT_PREVIEW_LINE_HEIGHT: u8 = 16;
+pub const MIN_PREVIEW_LINE_HEIGHT: u8 = 10;
+pub const MAX_PREVIEW_LINE_HEIGHT: u8 = 30;
 pub const DEFAULT_FONT_SIZE: u16 = 11;
 pub const DEFAULT_TAB_WIDTH: u8 = 4;
 pub const DEFAULT_WORD_WRAP: bool = false;
@@ -29,6 +39,11 @@ pub const DEFAULT_HIGHLIGHT_CURRENT_LINE: bool = true;
 pub const DEFAULT_CODE_FOLDING: bool = true;
 pub const DEFAULT_ALWAYS_ON_TOP: bool = false;
 
+/// A line height in tenths as `fastpad.ini` writes it: 16 is `1.6`.
+pub fn line_height_token(tenths: u8) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
 /// `width` pulled into `MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH`.
 pub const fn clamp_sidebar_width(width: u16) -> u16 {
     if width < MIN_SIDEBAR_WIDTH {
@@ -49,6 +64,8 @@ pub fn default_settings() -> Settings {
     Settings {
         font_face: DEFAULT_FONT_FACE.to_owned(),
         preview_font: DEFAULT_PREVIEW_FONT.to_owned(),
+        preview_font_size: DEFAULT_PREVIEW_FONT_SIZE,
+        preview_line_height: DEFAULT_PREVIEW_LINE_HEIGHT,
         font_size: DEFAULT_FONT_SIZE,
         tab_width: DEFAULT_TAB_WIDTH,
         word_wrap: DEFAULT_WORD_WRAP,
@@ -83,6 +100,8 @@ mod tests {
         let settings = default_settings();
         assert_eq!(settings.font_face, "Consolas");
         assert_eq!(settings.preview_font, "Segoe UI");
+        assert_eq!(settings.preview_font_size, 14);
+        assert_eq!(settings.preview_line_height, 16);
         assert_eq!(settings.font_size, 11);
         assert_eq!(settings.tab_width, 4);
         assert!(!settings.word_wrap);

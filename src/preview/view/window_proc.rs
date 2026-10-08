@@ -89,7 +89,7 @@ pub(super) unsafe extern "system" fn preview_proc(
             let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16 as f32;
             let keys = (wparam & 0xFFFF) as u32;
             with_state(hwnd, |state| {
-                let step = state.fonts.body_size * 1.5 * 3.0 * delta / 120.0;
+                let step = state.fonts.line_pitch() * 3.0 * delta / 120.0;
                 let horizontal = message == WM_MOUSEHWHEEL || keys & MK_SHIFT != 0;
                 if horizontal {
                     let mut point = windows_sys::Win32::Foundation::POINT {
@@ -121,7 +121,7 @@ pub(super) unsafe extern "system" fn preview_proc(
         WM_VSCROLL => {
             with_state(hwnd, |state| {
                 let (_, view_height) = view_size(hwnd);
-                let line = state.fonts.body_size * 1.5;
+                let line = state.fonts.line_pitch();
                 let page = (view_height - bar_height(state) - line).max(line);
                 let target = match (wparam & 0xFFFF) as i32 {
                     SB_LINEUP => state.scroll_y - line,
@@ -160,7 +160,7 @@ pub(super) unsafe extern "system" fn preview_proc(
             }
             with_state(hwnd, |state| {
                 let (_, view_height) = view_size(hwnd);
-                let line = state.fonts.body_size * 1.5;
+                let line = state.fonts.line_pitch();
                 let page = (view_height - bar_height(state) - line).max(line);
                 match key {
                     VK_UP => set_scroll(state, state.scroll_y - 2.0 * line, true),

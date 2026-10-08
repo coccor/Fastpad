@@ -1,4 +1,6 @@
-use super::defaults::{clamp_sidebar_width, default_settings};
+use super::defaults::{
+    MAX_PREVIEW_LINE_HEIGHT, MIN_PREVIEW_LINE_HEIGHT, clamp_sidebar_width, default_settings,
+};
 use crate::Result;
 use std::path::{Path, PathBuf};
 
@@ -92,6 +94,10 @@ pub struct Settings {
     pub font_face: String,
     /// The Markdown preview's body font.
     pub preview_font: String,
+    /// The Markdown preview's body text size in 96-DPI pixels.
+    pub preview_font_size: u16,
+    /// The Markdown preview's body line height in tenths of its text size: 16 is 1.6.
+    pub preview_line_height: u8,
     pub font_size: u16,
     pub tab_width: u8,
     pub word_wrap: bool,
@@ -143,6 +149,12 @@ impl Settings {
         }
         if let Some(preview_font) = &delta.preview_font {
             self.preview_font = preview_font.clone();
+        }
+        if let Some(size) = delta.preview_font_size {
+            self.preview_font_size = size;
+        }
+        if let Some(tenths) = delta.preview_line_height {
+            self.preview_line_height = tenths;
         }
         if let Some(font_size) = delta.font_size {
             self.font_size = font_size;
@@ -224,6 +236,8 @@ pub struct SettingWarning {
 pub struct SettingsDelta {
     pub font_face: Option<String>,
     pub preview_font: Option<String>,
+    pub preview_font_size: Option<u16>,
+    pub preview_line_height: Option<u8>,
     pub font_size: Option<u16>,
     pub tab_width: Option<u8>,
     pub word_wrap: Option<bool>,
@@ -249,13 +263,15 @@ pub struct SettingsDelta {
 
 /// Parses a hand-written, tolerant `.ini`-style settings source: one `key=value` pair per line: ASCII
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
-/// lines are skipped, and exactly `font_face`, `preview_font`, `font_size`, `tab_width`, `word_wrap`,
+/// lines are skipped, and exactly `font_face`, `preview_font`, `preview_font_size`,
+/// `preview_line_height`, `font_size`, `tab_width`, `word_wrap`,
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
 /// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
+/// `preview_line_height` is a number from 1.0 to 3.0, rounded to tenths;
 /// `window_placement` is as `WindowPlacement::token` writes it; `file_icons` is
 /// `material` or `minimal` (any case). `key.<command-id>` lines are collected as text into `key_overrides` for the keymap to validate. Every line is handled independently: a line with an
 /// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
@@ -358,6 +374,14 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
                 delta.preview_font = Some(value.to_owned());
             }
         }
+        "preview_font_size" => match value.parse::<u16>() {
+            Ok(size) if size > 0 => delta.preview_font_size = Some(size),
+            _ => warn(delta, line_number, key, value),
+        },
+        "preview_line_height" => match parse_line_height(value) {
+            Some(tenths) => delta.preview_line_height = Some(tenths),
+            None => warn(delta, line_number, key, value),
+        },
         "font_size" => match value.parse::<u16>() {
             Ok(size) if size > 0 => delta.font_size = Some(size),
             _ => warn(delta, line_number, key, value),
@@ -447,6 +471,15 @@ fn warn(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &str) {
         line: line_number,
         message: format!("invalid value for {key}: \"{value}\""),
     });
+}
+
+/// A line height from 1.0 to 3.0 in tenths: `1.6` is 16.
+fn parse_line_height(value: &str) -> Option<u8> {
+    let height = value.parse::<f32>().ok()?;
+    let tenths = (height * 10.0).round();
+    (f32::from(MIN_PREVIEW_LINE_HEIGHT)..=f32::from(MAX_PREVIEW_LINE_HEIGHT))
+        .contains(&tenths)
+        .then_some(tenths as u8)
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -888,6 +921,33 @@ mod tests {
         );
         assert_eq!(delta.preview_font, None);
         assert_eq!(delta.warnings.len(), 1);
+    }
+
+    #[test]
+    fn preview_size_and_line_height_are_read_and_out_of_range_values_are_rejected() {
+        // Break caught: a hand-edited preview size or line height ignored, or a zero size or a
+        // line height that overlaps lines reaching the preview.
+        assert_eq!(parse("preview_font_size=16").preview_font_size, Some(16));
+        assert_eq!(parse("preview_font_size=0").preview_font_size, None);
+        assert_eq!(
+            parse("preview_line_height=1.6").preview_line_height,
+            Some(16)
+        );
+        assert_eq!(parse("preview_line_height=2").preview_line_height, Some(20));
+        assert_eq!(
+            parse("preview_line_height=1.45").preview_line_height,
+            Some(15)
+        );
+        for rejected in ["0.9", "3.1", "tall", "NaN", ""] {
+            let delta = parse(&format!("preview_line_height={rejected}"));
+            assert_eq!(delta.preview_line_height, None, "{rejected}");
+            assert_eq!(delta.warnings.len(), 1, "{rejected}");
+        }
+        assert_eq!(
+            crate::config::defaults::line_height_token(16),
+            "1.6",
+            "written back as it is read"
+        );
     }
 
     #[test]

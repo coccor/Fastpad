@@ -17,7 +17,7 @@ use super::palette::Palette;
 use super::panel::inset;
 use super::settings_model::{
     Control, DialogModel, Effect, Focus, Key, Page, Row, Section, SettingsView, dropdown_action,
-    dropdown_step, step_font_size,
+    dropdown_step, step_effect, step_value, stepper_value,
 };
 use super::side_panel::paint_buffered;
 use super::soft_paint::{

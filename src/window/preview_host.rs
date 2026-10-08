@@ -534,7 +534,8 @@ fn appearance(hwnd: HWND) -> (PreviewColors, PreviewFonts, bool) {
                 PreviewFonts::from_settings(
                     &app.settings.preview_font,
                     &app.settings.font_face,
-                    app.settings.font_size,
+                    app.settings.preview_font_size,
+                    app.settings.preview_line_height,
                 ),
                 dark,
             )
@@ -545,7 +546,8 @@ fn appearance(hwnd: HWND) -> (PreviewColors, PreviewFonts, bool) {
                 PreviewFonts::from_settings(
                     crate::window::design::faces::current().text,
                     "Consolas",
-                    11,
+                    crate::config::defaults::DEFAULT_PREVIEW_FONT_SIZE,
+                    crate::config::defaults::DEFAULT_PREVIEW_LINE_HEIGHT,
                 ),
                 false,
             )

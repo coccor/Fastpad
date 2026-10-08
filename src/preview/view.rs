@@ -577,7 +577,7 @@ fn bar_height(state: &ViewState) -> f32 {
 
 /// Estimated heights for `range` of the document's blocks.
 fn estimates(state: &ViewState, range: std::ops::Range<usize>) -> Vec<f32> {
-    let line_height = state.fonts.body_size * 1.5;
+    let line_height = state.fonts.line_pitch();
     let gap = 16.0 * state.fonts.unit();
     state.document.blocks[range]
         .iter()
