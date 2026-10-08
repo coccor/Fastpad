@@ -67,6 +67,21 @@ pub(crate) fn apply_settings_action(
             })
         }),
         SettingsAction::SetFontSize(size) => set_font_size(hwnd, |_| size),
+        SettingsAction::SetPreviewFontSize(size) => change_setting(hwnd, |settings| {
+            (settings.preview_font_size != size).then(|| {
+                settings.preview_font_size = size;
+                ("preview_font_size", size.to_string())
+            })
+        }),
+        SettingsAction::SetPreviewLineHeight(tenths) => change_setting(hwnd, |settings| {
+            (settings.preview_line_height != tenths).then(|| {
+                settings.preview_line_height = tenths;
+                (
+                    "preview_line_height",
+                    crate::config::defaults::line_height_token(tenths),
+                )
+            })
+        }),
         SettingsAction::SetTabWidth(width) => set_tab_width(hwnd, width),
         SettingsAction::Toggle(toggle) => execute_command(hwnd, toggle.command()),
     }

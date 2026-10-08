@@ -237,6 +237,8 @@ line in a notification and applies the rest.
 |---|---|---|
 | `font_face` | Any installed font name | `Consolas` |
 | `preview_font` | Any installed font name, for Markdown preview text (code in the preview uses `font_face`) | `Segoe UI` |
+| `preview_font_size` | Markdown preview text size in pixels (positive integer) | `14` |
+| `preview_line_height` | Markdown preview line height, a multiple of the text size from `1.0` to `3.0` | `1.6` |
 | `font_size` | Points (positive integer) | `11` |
 | `tab_width` | 1–255 | `4` |
 | `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |

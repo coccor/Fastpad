@@ -16,7 +16,7 @@ fn view_with(parent: &TestWindow, source: &str) -> PreviewView {
         parent.0,
         graphics,
         preview_colors(Theme::Light, false),
-        PreviewFonts::from_settings("Segoe UI", "Consolas", 11),
+        PreviewFonts::from_settings("Segoe UI", "Consolas", 14, 16),
     )
     .unwrap();
     unsafe {

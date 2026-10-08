@@ -438,7 +438,7 @@ pub(super) fn compose_row<'a>(frame: &mut Frame<'a>, tones: &Tones, dialog: &'a 
             frame.text(
                 dialog.body_font,
                 colors.editor_foreground,
-                dialog.model.font_size_text(view),
+                dialog.model.stepper_text(row, view),
                 value,
                 DT_CENTER,
             );

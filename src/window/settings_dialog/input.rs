@@ -21,17 +21,10 @@ pub(super) fn click_effect(dialog: &mut Dialog, hit: Hit) -> Effect {
         Hit::Row(row, Part::Segment(index)) => view
             .segment_action(row, index)
             .map_or(Effect::None, Effect::Apply),
-        Hit::Row(_, part @ (Part::Minus | Part::Plus)) => {
+        Hit::Row(row, part @ (Part::Minus | Part::Plus)) => {
             dialog.model.typed = None;
-            let current = view.settings.font_size;
-            let size = step_font_size(current, part == Part::Plus);
-            if size == current {
-                Effect::Repaint
-            } else {
-                Effect::Apply(crate::window::settings_model::SettingsAction::SetFontSize(
-                    size,
-                ))
-            }
+            let current = stepper_value(row, &view.settings);
+            step_effect(row, current, step_value(row, current, part == Part::Plus))
         }
         Hit::Row(_, Part::Value) => Effect::Repaint,
         // Page clicks go through `page_click`.

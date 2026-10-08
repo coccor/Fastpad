@@ -301,7 +301,9 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
     // Break caught: arrows or Space that change nothing, a typed font size lost when Tab
     // leaves the field, or changes that aren't saved (settings dialog spec §3.3).
     use crate::config::FileIconSet;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RIGHT, VK_SPACE, VK_TAB};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_ESCAPE, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
     let _scintilla = load_native_scintilla();
     let scratch = RecoveryScratch::new("settings-dialog-keys");
@@ -316,11 +318,15 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
         key(VK_TAB); // File icons
         key(VK_RIGHT); // Minimal
         key(VK_TAB); // Font
-        key(VK_TAB); // Preview font
         key(VK_TAB); // Font size
         char('1');
         char('6');
-        key(VK_TAB); // commits 16; Tab width
+        key(VK_TAB); // commits 16; Preview font
+        key(VK_TAB); // Preview font size
+        key(VK_UP); // 14 -> 15
+        key(VK_TAB); // Preview line height
+        key(VK_UP); // 1.6 -> 1.7
+        key(VK_TAB); // Tab width
         key(VK_RIGHT); // 4 → 8
         key(VK_TAB); // Indent with spaces
         key(VK_SPACE);
@@ -332,12 +338,15 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
     let settings = app_mut(window.hwnd).settings.clone();
     assert_eq!(settings.file_icons, FileIconSet::Minimal);
     assert_eq!(settings.font_size, 16);
+    assert_eq!(settings.preview_font_size, 15);
+    assert_eq!(settings.preview_line_height, 17);
     assert_eq!(settings.tab_width, 8);
     assert!(settings.insert_spaces);
     super::super::save_settings_to(None);
     assert_eq!(
         std::fs::read_to_string(&ini).unwrap(),
-        "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\ntab_width=8\r\ninsert_spaces=true\r\n"
+        "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\npreview_font_size=15\r\n\
+         preview_line_height=1.7\r\ntab_width=8\r\ninsert_spaces=true\r\n"
     );
 }
 
@@ -449,8 +458,8 @@ fn edit_fastpad_ini_closes_the_dialog_and_opens_the_file_in_a_tab() {
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
     crate::window::settings_dialog::answer_next(|dialog| unsafe {
-        // 14 enabled rows (no notebook, so autosave is skipped): 14 Tabs reach the link.
-        for _ in 0..14 {
+        // 16 enabled rows (no notebook, so autosave is skipped): 16 Tabs reach the link.
+        for _ in 0..16 {
             PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
         }
         PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);

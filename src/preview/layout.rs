@@ -22,10 +22,10 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_SUBSCRIPT, DWRITE_FONT_FEATURE_TAG_SUPERSCRIPT,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
-    DWRITE_LINE_METRICS, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_JUSTIFIED, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat,
-    IDWriteTextLayout,
+    DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_DEFAULT, DWRITE_LINE_SPACING_METHOD_UNIFORM,
+    DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_JUSTIFIED,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::core::PCWSTR;
 
@@ -46,15 +46,30 @@ pub struct PreviewFonts {
     pub code_family: String,
     /// Body text size in DIPs.
     pub body_size: f32,
+    /// Body text line height as a multiple of `body_size`, as in CSS. Headings and code blocks
+    /// keep their font's own line spacing.
+    pub line_height: f32,
 }
 
 impl PreviewFonts {
-    pub fn from_settings(preview_font: &str, font_face: &str, font_size_points: u16) -> Self {
+    /// `size` is in 96-DPI pixels; `line_height_tenths` is the line height in tenths of it.
+    pub fn from_settings(
+        preview_font: &str,
+        font_face: &str,
+        size: u16,
+        line_height_tenths: u8,
+    ) -> Self {
         Self {
             body_family: preview_font.to_owned(),
             code_family: font_face.to_owned(),
-            body_size: f32::from(font_size_points) * 96.0 / 72.0,
+            body_size: f32::from(size),
+            line_height: f32::from(line_height_tenths) / 10.0,
         }
+    }
+
+    /// The height of one line of body text in DIPs.
+    pub fn line_pitch(&self) -> f32 {
+        self.body_size * self.line_height
     }
 
     /// GitHub's spacing is expressed for 16 px body text; everything scales with the body size.
@@ -305,8 +320,28 @@ impl<'a> LayoutContext<'a> {
         let format =
             self.graphics
                 .text_format(&family.name, size, weight, DWRITE_FONT_STYLE_NORMAL)?;
+        if !code {
+            self.space_lines(&format, size)?;
+        }
         self.formats.borrow_mut().insert(key, format.clone());
         Ok(format)
+    }
+
+    /// Gives every line of `format` the preview's line height, the extra space split evenly above
+    /// and below the text as CSS does.
+    fn space_lines(&self, format: &IDWriteTextFormat, size: f32) -> Result<()> {
+        let wide = "Ag".encode_utf16().collect::<Vec<_>>();
+        let sample = unsafe {
+            self.graphics
+                .dwrite
+                .CreateTextLayout(&wide, format, 1000.0, f32::MAX)
+        }
+        .map_err(hresult_error)?;
+        let natural = line_metrics(&sample)?.first().copied().unwrap_or_default();
+        let height = size * self.fonts.line_height;
+        let baseline = natural.baseline + (height - natural.height) / 2.0;
+        unsafe { format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, height, baseline) }
+            .map_err(hresult_error)
     }
 
     fn plain_layout(
@@ -377,6 +412,10 @@ impl<'a> LayoutContext<'a> {
                 }
             }
             .map_err(hresult_error)?;
+        }
+        // Uniform lines would not grow to fit an image taller than the line height.
+        if !rich.images.is_empty() {
+            natural_lines(&layout)?;
         }
         let mut images = Vec::with_capacity(rich.images.len());
         for inline in &rich.images {
@@ -593,20 +632,16 @@ fn layout_kind(
                 (role, _) => role,
             };
             let top = y + 8.0 * unit;
-            let mut bottom = top
-                + push_rich_text(
-                    context,
-                    text,
-                    size,
-                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                    x,
-                    top,
-                    width,
-                    effective_align(*align, style.align),
-                    role,
-                    false,
-                    output,
-                )?;
+            let rich =
+                context.rich_layout(text, size, DWRITE_FONT_WEIGHT_SEMI_BOLD, width, width)?;
+            natural_lines(&rich.layout)?;
+            unsafe {
+                rich.layout
+                    .SetTextAlignment(text_alignment(effective_align(*align, style.align)))
+            }
+            .map_err(hresult_error)?;
+            let mut bottom =
+                top + push_laid_text(context, text, rich, x, top, role, false, output)?;
             if *level <= 2 {
                 bottom += 0.3 * size;
                 output.ops.push(DrawOp::Fill {
@@ -854,6 +889,7 @@ fn push_image_slot(
         DWRITE_FONT_WEIGHT_NORMAL,
         (image.width - 2.0 * padding).max(1.0),
     )?;
+    natural_lines(&alt)?;
     // A chip, or a sized box too short for the wrapped alt text and its padding, shows one line
     // centred vertically: text starting at the padding would be clipped by the box.
     let fits = !image.chip && metrics(&alt)?.height + 2.0 * padding <= image.height;
@@ -873,6 +909,12 @@ fn push_image_slot(
         slot: output.images.len() - 1,
     });
     Ok(())
+}
+
+/// Puts `layout` back on its fonts' own line spacing.
+fn natural_lines(layout: &IDWriteTextLayout) -> Result<()> {
+    unsafe { layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_DEFAULT, 0.0, 0.0) }
+        .map_err(hresult_error)
 }
 
 fn line_metrics(layout: &IDWriteTextLayout) -> Result<Vec<DWRITE_LINE_METRICS>> {

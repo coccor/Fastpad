@@ -37,8 +37,10 @@ pub(crate) enum Row {
     Theme,
     FileIcons,
     Font,
-    PreviewFont,
     FontSize,
+    PreviewFont,
+    PreviewFontSize,
+    PreviewLineHeight,
     TabWidth,
     InsertSpaces,
     WordWrap,
@@ -52,12 +54,14 @@ pub(crate) enum Row {
 }
 
 impl Row {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 17] = [
         Self::Theme,
         Self::FileIcons,
         Self::Font,
-        Self::PreviewFont,
         Self::FontSize,
+        Self::PreviewFont,
+        Self::PreviewFontSize,
+        Self::PreviewLineHeight,
         Self::TabWidth,
         Self::InsertSpaces,
         Self::WordWrap,
@@ -77,6 +81,8 @@ impl Row {
             Self::Font => "Font",
             Self::PreviewFont => "Preview font",
             Self::FontSize => "Font size",
+            Self::PreviewFontSize => "Preview font size",
+            Self::PreviewLineHeight => "Preview line height",
             Self::TabWidth => "Tab width",
             Self::InsertSpaces => "Indent with spaces",
             Self::WordWrap => "Word wrap",
@@ -104,7 +110,7 @@ impl Row {
         match self {
             Self::Theme | Self::Font | Self::PreviewFont => Control::Dropdown,
             Self::FileIcons | Self::TabWidth => Control::Segmented,
-            Self::FontSize => Control::Stepper,
+            Self::FontSize | Self::PreviewFontSize | Self::PreviewLineHeight => Control::Stepper,
             _ => Control::Check,
         }
     }
@@ -188,8 +194,8 @@ pub(crate) const TAB_WIDTH_CHOICES: [u8; 3] = [2, 4, 8];
 pub(crate) const MIN_FONT_SIZE: u16 = 6;
 pub(crate) const MAX_FONT_SIZE: u16 = 72;
 
-/// Digits the font size field accepts before ignoring more.
-const MAX_TYPED_DIGITS: usize = 3;
+/// Characters a stepper's field accepts before ignoring more.
+const MAX_TYPED_CHARS: usize = 3;
 
 /// One change the dialog asks `main_window::apply_settings_action` to make.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +205,9 @@ pub(crate) enum SettingsAction {
     SetFontFace(String),
     SetPreviewFont(String),
     SetFontSize(u16),
+    SetPreviewFontSize(u16),
+    /// In tenths: 16 is a line height of 1.6.
+    SetPreviewLineHeight(u8),
     SetTabWidth(u8),
     Toggle(Toggle),
 }
@@ -370,24 +379,89 @@ pub(crate) fn dropdown_step(
     dropdown_action(row, index, fonts)
 }
 
-/// One step of the stepper from `size`. The result is within 6–72, so a size set outside that
-/// range in `fastpad.ini` comes back into it on the first step (spec §3.2).
-pub(crate) fn step_font_size(size: u16, up: bool) -> u16 {
-    let next = if up {
-        size.saturating_add(1)
-    } else {
-        size.saturating_sub(1)
+/// The values stepper `row` keeps within: font sizes in points or pixels, the line height in
+/// tenths.
+pub(crate) const fn stepper_range(row: Row) -> (u16, u16) {
+    use crate::config::defaults::{
+        MAX_PREVIEW_FONT_SIZE, MAX_PREVIEW_LINE_HEIGHT, MIN_PREVIEW_FONT_SIZE,
+        MIN_PREVIEW_LINE_HEIGHT,
     };
-    next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    match row {
+        Row::PreviewFontSize => (MIN_PREVIEW_FONT_SIZE, MAX_PREVIEW_FONT_SIZE),
+        Row::PreviewLineHeight => (
+            MIN_PREVIEW_LINE_HEIGHT as u16,
+            MAX_PREVIEW_LINE_HEIGHT as u16,
+        ),
+        _ => (MIN_FONT_SIZE, MAX_FONT_SIZE),
+    }
 }
 
-/// The size a typed entry commits: its number pulled into 6–72, or `current` when the text is
-/// empty or not a number.
-pub(crate) fn typed_font_size(text: &str, current: u16) -> u16 {
-    match text.trim().parse::<u32>() {
-        Ok(value) => value.clamp(u32::from(MIN_FONT_SIZE), u32::from(MAX_FONT_SIZE)) as u16,
-        Err(_) => current,
+/// Stepper `row`'s setting, as `stepper_range` counts it.
+pub(crate) fn stepper_value(row: Row, settings: &Settings) -> u16 {
+    match row {
+        Row::PreviewFontSize => settings.preview_font_size,
+        Row::PreviewLineHeight => u16::from(settings.preview_line_height),
+        _ => settings.font_size,
     }
+}
+
+/// How stepper `row` shows `value`: the line height as `1.6`, sizes as they are.
+pub(crate) fn stepper_label(row: Row, value: u16) -> String {
+    match row {
+        Row::PreviewLineHeight => format!("{}.{}", value / 10, value % 10),
+        _ => value.to_string(),
+    }
+}
+
+/// What setting stepper `row` to `value` does.
+pub(crate) fn stepper_action(row: Row, value: u16) -> Option<SettingsAction> {
+    match row {
+        Row::FontSize => Some(SettingsAction::SetFontSize(value)),
+        Row::PreviewFontSize => Some(SettingsAction::SetPreviewFontSize(value)),
+        Row::PreviewLineHeight => u8::try_from(value)
+            .ok()
+            .map(SettingsAction::SetPreviewLineHeight),
+        _ => None,
+    }
+}
+
+/// One step of stepper `row` from `value`: a point or pixel, or a tenth of the line height. The
+/// result is within `stepper_range`, so a value set outside it in `fastpad.ini` comes back into
+/// it on the first step (spec §3.2).
+pub(crate) fn step_value(row: Row, value: u16, up: bool) -> u16 {
+    let (min, max) = stepper_range(row);
+    let next = if up {
+        value.saturating_add(1)
+    } else {
+        value.saturating_sub(1)
+    };
+    next.clamp(min, max)
+}
+
+/// The value a typed entry commits: its number pulled into `stepper_range`, or `current` when
+/// the text is empty or not a number. The line height is typed as shown (`1.6`).
+pub(crate) fn typed_value(row: Row, text: &str, current: u16) -> u16 {
+    let (min, max) = stepper_range(row);
+    let typed = match row {
+        Row::PreviewLineHeight => text
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|value| (value * 10.0).round().clamp(0.0, f32::from(u16::MAX)) as u32),
+        _ => text.trim().parse::<u32>().ok(),
+    };
+    typed.map_or(current, |value| {
+        value.clamp(u32::from(min), u32::from(max)) as u16
+    })
+}
+
+/// Applying `value` to stepper `row`, or only a repaint when it is the `current` one.
+pub(crate) fn step_effect(row: Row, current: u16, value: u16) -> Effect {
+    if value == current {
+        return Effect::Repaint;
+    }
+    stepper_action(row, value).map_or(Effect::Repaint, Effect::Apply)
 }
 
 /// The dialog's pages, in nav order (keyboard shortcuts spec section 6.1).
@@ -490,8 +564,8 @@ pub(crate) enum Effect {
     ShowPage(Page),
 }
 
-/// The dialog's keyboard state: what has the focus, and a font size being typed but not yet
-/// committed.
+/// The dialog's keyboard state: what has the focus, and a value being typed into the focused
+/// stepper but not yet committed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DialogModel {
     pub focus: Focus,
@@ -519,7 +593,7 @@ impl DialogModel {
         Effect::Repaint
     }
 
-    /// Moves the focus, committing a typed font size on the way out.
+    /// Moves the focus, committing a typed value on the way out.
     pub(crate) fn set_focus(&mut self, focus: Focus, view: &SettingsView) -> Effect {
         let commit = self.commit_typed(view);
         self.focus = focus;
@@ -529,11 +603,12 @@ impl DialogModel {
         }
     }
 
-    /// The font size field's text: what is being typed, or the current size.
-    pub(crate) fn font_size_text(&self, view: &SettingsView) -> String {
+    /// Stepper `row`'s field text: what is being typed into it, or its current value.
+    pub(crate) fn stepper_text(&self, row: Row, view: &SettingsView) -> String {
         self.typed
             .clone()
-            .unwrap_or_else(|| view.settings.font_size.to_string())
+            .filter(|_| self.focus == Focus::Row(row))
+            .unwrap_or_else(|| stepper_label(row, stepper_value(row, &view.settings)))
     }
 
     pub(crate) fn key(&mut self, key: Key, view: &SettingsView) -> Effect {
@@ -552,7 +627,7 @@ impl DialogModel {
                     (index + 1) % count
                 };
                 let target = Page::ALL[next];
-                // A typed font size commits on the way out, as on any focus move; the page
+                // A typed value commits on the way out, as on any focus move; the page
                 // switches here because the one effect returned is the change to apply.
                 match self.commit_typed(view) {
                     Effect::None => Effect::ShowPage(target),
@@ -610,32 +685,29 @@ impl DialogModel {
                 Key::Up => Effect::StepDropdown(row, false),
                 _ => Effect::None,
             },
-            Control::Stepper => self.stepper_key(key, view),
+            Control::Stepper => self.stepper_key(row, key, view),
         }
     }
 
-    fn stepper_key(&mut self, key: Key, view: &SettingsView) -> Effect {
-        let current = view.settings.font_size;
+    fn stepper_key(&mut self, row: Row, key: Key, view: &SettingsView) -> Effect {
+        let current = stepper_value(row, &view.settings);
         match key {
             Key::Up | Key::Down => {
                 // A step replaces whatever was being typed.
                 self.typed = None;
-                let size = step_font_size(current, key == Key::Up);
-                if size == current {
-                    Effect::Repaint
-                } else {
-                    Effect::Apply(SettingsAction::SetFontSize(size))
-                }
+                step_effect(row, current, step_value(row, current, key == Key::Up))
             }
-            Key::Char(digit) if digit.is_ascii_digit() => {
+            Key::Char(c) if c.is_ascii_digit() || (c == '.' && row == Row::PreviewLineHeight) => {
                 let typed = self.typed.get_or_insert_with(String::new);
-                if typed.len() < MAX_TYPED_DIGITS {
-                    typed.push(digit);
+                if typed.len() < MAX_TYPED_CHARS {
+                    typed.push(c);
                 }
                 Effect::Repaint
             }
             Key::Backspace => {
-                self.typed.get_or_insert_with(|| current.to_string()).pop();
+                self.typed
+                    .get_or_insert_with(|| stepper_label(row, current))
+                    .pop();
                 Effect::Repaint
             }
             Key::Enter => self.commit_typed(view),
@@ -643,18 +715,17 @@ impl DialogModel {
         }
     }
 
-    /// The typed size's change, if it differs from the current size, clearing the typed text.
+    /// The focused stepper's typed change, if it differs from the current value, clearing the
+    /// typed text.
     fn commit_typed(&mut self, view: &SettingsView) -> Effect {
         let Some(text) = self.typed.take() else {
             return Effect::None;
         };
-        let current = view.settings.font_size;
-        let size = typed_font_size(&text, current);
-        if size == current {
-            Effect::Repaint
-        } else {
-            Effect::Apply(SettingsAction::SetFontSize(size))
-        }
+        let Focus::Row(row) = self.focus else {
+            return Effect::Repaint;
+        };
+        let current = stepper_value(row, &view.settings);
+        step_effect(row, current, typed_value(row, &text, current))
     }
 }
 
@@ -678,8 +749,8 @@ mod tests {
         }
         let sections = Row::ALL.map(Row::section);
         assert_eq!(&sections[..2], [Section::Appearance; 2]);
-        assert_eq!(&sections[2..12], [Section::Editor; 10]);
-        assert_eq!(&sections[12..], [Section::NotesAndSession; 3]);
+        assert_eq!(&sections[2..14], [Section::Editor; 12]);
+        assert_eq!(&sections[14..], [Section::NotesAndSession; 3]);
         for (index, section) in Section::ALL.into_iter().enumerate() {
             assert_eq!(section as usize, index);
         }
@@ -846,25 +917,77 @@ mod tests {
 
     #[test]
     fn the_stepper_stays_within_6_to_72_and_brings_outside_sizes_back() {
-        assert_eq!(step_font_size(11, true), 12);
-        assert_eq!(step_font_size(11, false), 10);
-        assert_eq!(step_font_size(72, true), 72);
-        assert_eq!(step_font_size(6, false), 6);
-        assert_eq!(
-            step_font_size(100, true),
-            72,
-            "a hand-edited 100 comes back"
-        );
-        assert_eq!(step_font_size(3, false), 6);
+        let step = |size, up| step_value(Row::FontSize, size, up);
+        assert_eq!(step(11, true), 12);
+        assert_eq!(step(11, false), 10);
+        assert_eq!(step(72, true), 72);
+        assert_eq!(step(6, false), 6);
+        assert_eq!(step(100, true), 72, "a hand-edited 100 comes back");
+        assert_eq!(step(3, false), 6);
     }
 
     #[test]
     fn a_typed_size_is_clamped_and_text_that_is_not_a_number_keeps_the_current_size() {
-        assert_eq!(typed_font_size("16", 11), 16);
-        assert_eq!(typed_font_size("999", 11), 72);
-        assert_eq!(typed_font_size("0", 11), 6);
-        assert_eq!(typed_font_size("", 11), 11);
-        assert_eq!(typed_font_size("abc", 11), 11);
+        let typed = |text| typed_value(Row::FontSize, text, 11);
+        assert_eq!(typed("16"), 16);
+        assert_eq!(typed("999"), 72);
+        assert_eq!(typed("0"), 6);
+        assert_eq!(typed(""), 11);
+        assert_eq!(typed("abc"), 11);
+    }
+
+    #[test]
+    fn the_preview_steppers_keep_their_own_ranges_and_the_line_height_steps_in_tenths() {
+        // Break caught: a preview stepper changing the editor's font size, stepping the line
+        // height a whole 1.0 at a time, or showing it as 16 instead of 1.6.
+        let mut view = view();
+        assert_eq!(
+            Row::ALL
+                .into_iter()
+                .filter(|row| row.control() == Control::Stepper)
+                .collect::<Vec<_>>(),
+            [Row::FontSize, Row::PreviewFontSize, Row::PreviewLineHeight]
+        );
+        let mut model = DialogModel::new(Page::General);
+        model.focus = Focus::Row(Row::PreviewFontSize);
+        assert_eq!(model.stepper_text(Row::PreviewFontSize, &view), "14");
+        assert_eq!(
+            model.key(Key::Up, &view),
+            Effect::Apply(SettingsAction::SetPreviewFontSize(15))
+        );
+        view.settings.preview_font_size = 48;
+        assert_eq!(model.key(Key::Up, &view), Effect::Repaint, "the largest");
+        assert_eq!(step_value(Row::PreviewFontSize, 2, true), 8);
+
+        model.focus = Focus::Row(Row::PreviewLineHeight);
+        assert_eq!(model.stepper_text(Row::PreviewLineHeight, &view), "1.6");
+        assert_eq!(
+            model.key(Key::Down, &view),
+            Effect::Apply(SettingsAction::SetPreviewLineHeight(15))
+        );
+        view.settings.preview_line_height = 30;
+        assert_eq!(
+            model.key(Key::Up, &view),
+            Effect::Repaint,
+            "3.0 is the most"
+        );
+
+        // Typed as shown, the point included; a typed value shows only in its own field.
+        for c in ['1', '.', '8'] {
+            model.key(Key::Char(c), &view);
+        }
+        assert_eq!(model.stepper_text(Row::PreviewLineHeight, &view), "1.8");
+        assert_eq!(model.stepper_text(Row::FontSize, &view), "11");
+        assert_eq!(
+            model.key(Key::Enter, &view),
+            Effect::Apply(SettingsAction::SetPreviewLineHeight(18))
+        );
+        assert_eq!(typed_value(Row::PreviewLineHeight, "9", 16), 30);
+        assert_eq!(typed_value(Row::PreviewLineHeight, "0.5", 16), 10);
+        assert_eq!(typed_value(Row::PreviewLineHeight, ".", 16), 16);
+        model.focus = Focus::Row(Row::PreviewFontSize);
+        model.key(Key::Char('.'), &view);
+        assert_eq!(model.typed, None, "sizes take no point");
     }
 
     #[test]
@@ -878,12 +1001,12 @@ mod tests {
         };
         assert_eq!(model.key(Key::Char('1'), &view), Effect::Repaint);
         assert_eq!(model.key(Key::Char('6'), &view), Effect::Repaint);
-        assert_eq!(model.font_size_text(&view), "16");
+        assert_eq!(model.stepper_text(Row::FontSize, &view), "16");
         assert_eq!(
             model.key(Key::Tab { back: false }, &view),
             Effect::Apply(SettingsAction::SetFontSize(16))
         );
-        assert_eq!(model.focus, Focus::Row(Row::TabWidth));
+        assert_eq!(model.focus, Focus::Row(Row::PreviewFont));
         assert_eq!(model.typed, None);
     }
 
@@ -898,14 +1021,14 @@ mod tests {
         for digit in ['1', '2', '3', '4'] {
             model.key(Key::Char(digit), &view);
         }
-        assert_eq!(model.font_size_text(&view), "123");
+        assert_eq!(model.stepper_text(Row::FontSize, &view), "123");
         assert_eq!(
             model.key(Key::Enter, &view),
             Effect::Apply(SettingsAction::SetFontSize(72))
         );
         model.key(Key::Backspace, &view);
         assert_eq!(
-            model.font_size_text(&view),
+            model.stepper_text(Row::FontSize, &view),
             "1",
             "backspace edits the current 11"
         );

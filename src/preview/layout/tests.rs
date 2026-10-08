@@ -17,7 +17,7 @@ fn with_setup<R>(
     let window = TestWindow::new(400, 300);
     let target = create_hwnd_target(&graphics, window.0, 400, 300, 96).unwrap();
     let brushes = Brushes::create(&target, &preview_colors(Theme::Light, false)).unwrap();
-    let fonts = PreviewFonts::from_settings("Segoe UI", "Consolas", 12);
+    let fonts = PreviewFonts::from_settings("Segoe UI", "Consolas", 16, 16);
     let context = LayoutContext::new(
         &graphics,
         &brushes,
@@ -535,7 +535,7 @@ fn the_preview_font_changes_the_body_text_layout() {
         let window = TestWindow::new(400, 300);
         let target = create_hwnd_target(&graphics, window.0, 400, 300, 96).unwrap();
         let brushes = Brushes::create(&target, &preview_colors(Theme::Light, false)).unwrap();
-        let fonts = PreviewFonts::from_settings(preview_font, "Consolas", 12);
+        let fonts = PreviewFonts::from_settings(preview_font, "Consolas", 16, 16);
         let details = HashMap::new();
         let context = LayoutContext::new(
             &graphics, &brushes, &fonts, None, &no_images, false, &details,
@@ -552,4 +552,41 @@ fn the_preview_font_changes_the_body_text_layout() {
         metrics.widthIncludingTrailingWhitespace
     };
     assert_ne!(width_with("Segoe UI"), width_with("Times New Roman"));
+}
+
+#[test]
+fn the_line_height_spaces_body_lines_but_not_headings_or_code() {
+    // Break caught: preview_line_height saved but never reaching the text, applied to headings
+    // and code blocks too, or the lines not as tall as size times line height.
+    let heights_with = |tenths: u8| {
+        let graphics = Graphics::load().unwrap();
+        let window = TestWindow::new(400, 300);
+        let target = create_hwnd_target(&graphics, window.0, 400, 300, 96).unwrap();
+        let brushes = Brushes::create(&target, &preview_colors(Theme::Light, false)).unwrap();
+        let fonts = PreviewFonts::from_settings("Segoe UI", "Consolas", 14, tenths);
+        let details = HashMap::new();
+        let context = LayoutContext::new(
+            &graphics, &brushes, &fonts, None, &no_images, false, &details,
+        )
+        .unwrap();
+        let height = |source: &str| {
+            let block = laid(&context, source, 2000.0);
+            let (layout, _) = first_text_layout(&block);
+            metrics(&layout).unwrap().height
+        };
+        (
+            context.line_height(),
+            height("One line of body text\n"),
+            height("# A heading\n"),
+            height("```\ncode\n```\n"),
+        )
+    };
+    let (line, body, heading, code) = heights_with(16);
+    assert!((line - 14.0 * 1.6).abs() < 0.01, "{line}");
+    assert!((body - line).abs() < 0.01, "{body}");
+    let (wide_line, wide_body, wide_heading, wide_code) = heights_with(25);
+    assert!((wide_line - 14.0 * 2.5).abs() < 0.01, "{wide_line}");
+    assert!((wide_body - wide_line).abs() < 0.01, "{wide_body}");
+    assert_eq!(heading, wide_heading, "headings keep their font's spacing");
+    assert_eq!(code, wide_code, "code blocks keep their font's spacing");
 }
