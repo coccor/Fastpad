@@ -1,6 +1,6 @@
 [package]
 name = "fastpad"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "Ultra fast note taking app."
 license = "MIT"
