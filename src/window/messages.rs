@@ -65,6 +65,9 @@ pub const WM_FASTPAD_IMAGE_STATUS: u32 = WM_APP + 0x59;
 /// Posted to the main window, which makes that child's editor group active. Not part of the
 /// deferred chain.
 pub const WM_FASTPAD_CONTENT_FOCUSED: u32 = WM_APP + 0x5A;
+/// Markdown helper work deferred out of a Scintilla notification (a table formatted once the
+/// caret leaves it). Posted to the main window. Not part of the deferred chain.
+pub const WM_FASTPAD_MARKDOWN_DEFERRED: u32 = WM_APP + 0x5B;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

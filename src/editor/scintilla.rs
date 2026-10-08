@@ -65,7 +65,7 @@ use std::mem::transmute;
 use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
+    GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
@@ -79,6 +79,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 mod document_text;
 mod editing;
 mod line_ops;
+mod markdown_ops;
 mod styling;
 
 pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
@@ -163,6 +164,10 @@ struct EditorEndpoint {
     occurrence_word: Cell<Option<(usize, usize)>>,
     /// The selections and point an Alt+Click started from (editing shortcuts spec §5).
     alt_click: RefCell<Option<AltClick>>,
+    /// Where the window layer plugs into key handling (the Markdown helpers' Enter and Tab).
+    hooks: RefCell<Option<Rc<dyn crate::editor::EditorHooks>>>,
+    /// The `WM_CHAR` a consumed `WM_KEYDOWN` will produce, dropped when it arrives.
+    swallow_char: Cell<Option<u16>>,
     #[cfg(test)]
     release_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -307,6 +312,10 @@ impl Editor {
         self.endpoint.hwnd
     }
 
+    pub fn set_hooks(&self, hooks: Option<Rc<dyn crate::editor::EditorHooks>>) {
+        *self.endpoint.hooks.borrow_mut() = hooks;
+    }
+
     #[cfg(test)]
     pub(crate) fn test_fixture(direct_fn: SciFnDirect, direct_ptr: isize) -> Self {
         let endpoint = Rc::new(EditorEndpoint::new(
@@ -368,6 +377,8 @@ impl EditorDocument {
                 occurrence_whole_word: Cell::new(false),
                 occurrence_word: Cell::new(None),
                 alt_click: RefCell::new(None),
+                hooks: RefCell::new(None),
+                swallow_char: Cell::new(None),
                 release_counter: Some(releases),
             }),
         }
@@ -404,6 +415,8 @@ impl EditorEndpoint {
             occurrence_whole_word: Cell::new(false),
             occurrence_word: Cell::new(None),
             alt_click: RefCell::new(None),
+            hooks: RefCell::new(None),
+            swallow_char: Cell::new(None),
             #[cfg(test)]
             release_counter: None,
         }
@@ -720,6 +733,36 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
     ref_data: usize,
 ) -> isize {
     let endpoint = unsafe { &*(ref_data as *const EditorEndpoint) };
+    if message == WM_CHAR
+        && let Some(expected) = endpoint.swallow_char.take()
+        && expected == wparam as u16
+    {
+        return 0;
+    }
+    if message == WM_KEYDOWN {
+        // A consumed key whose WM_CHAR never came must not eat a later key's character.
+        endpoint.swallow_char.set(None);
+    }
+    // Cloned out first, so no borrow is held while the hook calls back into the editor.
+    let hooks = if message == WM_KEYDOWN {
+        endpoint.hooks.borrow().clone()
+    } else {
+        None
+    };
+    if let Some(hooks) = hooks {
+        let down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
+        let vk = wparam as u16;
+        if hooks.key_down(vk, down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU)) {
+            // Enter and Tab produce a CR / TAB WM_CHAR after TranslateMessage.
+            let produced = match vk {
+                VK_RETURN => Some(0x0D),
+                VK_TAB => Some(0x09),
+                _ => None,
+            };
+            endpoint.swallow_char.set(produced);
+            return 0;
+        }
+    }
     if message == WM_CHAR {
         let ctrl_down = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
         if crate::editor::input_filter::should_ignore_char(wparam as u16, ctrl_down) {
@@ -757,6 +800,8 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
     }
     if message == WM_NCDESTROY {
         endpoint.destroyed.store(true, Ordering::Release);
+        // Hooks may own the editor; drop them so an Rc cycle cannot outlive the window.
+        *endpoint.hooks.borrow_mut() = None;
         unsafe {
             RemoveWindowSubclass(
                 hwnd,

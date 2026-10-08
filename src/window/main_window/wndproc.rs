@@ -522,6 +522,10 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 return handle_ipc_requests(hwnd);
             }
             match message {
+                crate::window::WM_FASTPAD_MARKDOWN_DEFERRED => {
+                    crate::window::markdown_host::run_deferred(hwnd);
+                    return 0;
+                }
                 crate::window::WM_FASTPAD_CONTENT_FOCUSED => {
                     if let Some(id) = group_of_child(hwnd, wparam as HWND) {
                         activate_group(hwnd, id);
@@ -631,6 +635,15 @@ unsafe fn on_nc_create(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, WM_NCCREATE, wparam, lparam) }
 }
 
+fn is_markdown(hwnd: HWND, document: DocumentId) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .document(document)
+            .is_some_and(|document| document.language == crate::document::Language::Markdown)
+    })
+}
+
 fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if file_population_active(hwnd) {
         return;
@@ -666,6 +679,11 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         let update = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
         if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_V_SCROLL != 0 {
             crate::window::preview_host::editor_scrolled(hwnd, group);
+        }
+        if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0
+            && document.is_some_and(|document| is_markdown(hwnd, document))
+        {
+            crate::window::markdown_host::selection_changed(hwnd, group);
         }
         return;
     }
@@ -716,6 +734,9 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         schedule_find_count(hwnd);
         for shown in showing {
             crate::window::preview_host::record_edit(hwnd, shown, modification);
+        }
+        if is_markdown(hwnd, document) {
+            crate::window::markdown_host::text_changed(hwnd, &editor, document, modification);
         }
         return;
     }

@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::platform::{last_error, wide_null};
-use crate::window::commands::CommandId;
+use crate::window::commands::{CommandId, Scope};
 use crate::window::menu_band::{self, MENU_TITLES};
 use crate::window::modal::ModalScope;
 use std::cell::RefCell;
@@ -22,12 +22,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 pub(crate) struct AcceleratorTable(HACCEL);
 
 impl AcceleratorTable {
-    /// The table for `keymap`'s bindings, in its precedence order: `TranslateAcceleratorW`
+    /// The table for `keymap`'s global bindings, in its precedence order: `TranslateAcceleratorW`
     /// takes the first entry that matches, so a user binding shadows a default on its key.
+    /// Markdown-scoped keys are dispatched before the table (Markdown design spec §9).
     pub(crate) fn create(keymap: &crate::window::keymap::Keymap) -> Result<Self> {
         let accelerators = keymap
             .bindings()
             .iter()
+            .filter(|binding| binding.command.scope() == Scope::Global)
             .map(|binding| ACCEL {
                 fVirt: FVIRTKEY | binding.stroke.accel_flags(),
                 key: binding.stroke.vk,
@@ -753,7 +755,7 @@ pub(crate) fn answer_next_popup_menu(answer: impl FnOnce(HWND) -> Option<Command
 
 #[cfg(test)]
 mod tests {
-    use crate::window::commands::CommandId;
+    use crate::window::commands::{CommandId, Scope};
 
     fn label(
         menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
@@ -829,10 +831,12 @@ mod tests {
         command: CommandId,
     }
 
+    /// The default bindings the accelerator table holds: the global ones.
     fn accelerator_specs() -> Vec<Spec> {
         crate::window::keymap::Keymap::defaults()
             .bindings()
             .iter()
+            .filter(|binding| binding.command.scope() == Scope::Global)
             .map(|binding| Spec {
                 modifiers: binding.stroke.accel_flags(),
                 key: binding.stroke.vk,
@@ -890,14 +894,18 @@ mod tests {
 
     #[test]
     fn every_shortcut_chord_maps_to_exactly_one_command() {
-        let specs = accelerator_specs();
-        for (index, spec) in specs.iter().enumerate() {
+        // A Markdown-scoped key may match a global one (Markdown design spec §9), never one of its
+        // own scope.
+        let keymap = crate::window::keymap::Keymap::defaults();
+        let bindings = keymap.bindings();
+        for (index, binding) in bindings.iter().enumerate() {
             assert!(
-                specs[index + 1..]
-                    .iter()
-                    .all(|other| (other.modifiers, other.key) != (spec.modifiers, spec.key)),
+                bindings[index + 1..].iter().all(|other| {
+                    (other.command.scope(), other.stroke)
+                        != (binding.command.scope(), binding.stroke)
+                }),
                 "duplicate chord for {:?}",
-                spec.command
+                binding.command
             );
         }
     }

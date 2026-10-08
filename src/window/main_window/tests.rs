@@ -48,6 +48,7 @@ mod folder_rename_and_tree_move;
 mod group_strip;
 mod inline_new_items;
 mod json_and_recovery;
+mod markdown_keys;
 mod menus_and_settings_commands;
 mod note_operations;
 mod notebook_tree;

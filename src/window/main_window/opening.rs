@@ -225,7 +225,9 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
             )
         }
     };
-    drop(retired);
+    if let Some(retired) = retired {
+        crate::window::markdown_host::forget(hwnd, retired.id);
+    }
     if commit.is_err() {
         let _ = editor.use_document(&previous);
     }
@@ -326,7 +328,9 @@ fn open_image_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Resul
     // The retired tab's text document leaves the editor for an empty placeholder.
     let blank = editor.create_document()?;
     editor.use_document(&blank)?;
-    drop(retired);
+    if let Some(retired) = retired {
+        crate::window::markdown_host::forget(hwnd, retired.id);
+    }
     unsafe {
         let _ = record_milestone(hwnd, Milestone::FileLoaded);
     }

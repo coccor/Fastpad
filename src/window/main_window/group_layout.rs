@@ -357,6 +357,14 @@ fn configure_editor(hwnd: HWND, editor: &Editor) {
     if let Some(zoom) = zoom {
         let _ = editor.set_zoom(zoom);
     }
+    install_group_hooks(hwnd, editor);
+}
+
+/// The Markdown Enter and Tab helpers (Markdown design spec §8), on every group's editor.
+pub(super) fn install_group_hooks(hwnd: HWND, editor: &Editor) {
+    editor.set_hooks(Some(std::rc::Rc::new(
+        crate::window::markdown_host::GroupHooks::new(hwnd, editor.hwnd()),
+    )));
 }
 
 pub(super) fn apply_settings_to(

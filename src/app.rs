@@ -64,6 +64,8 @@ pub struct App {
     pub(crate) file_drops_accepted: bool,
     /// The Direct2D factories every group's preview and image view share, created on first use.
     pub(crate) graphics: Option<Rc<crate::preview::dwrite::Graphics>>,
+    /// The Markdown writing helpers' per-document state and their deferred work.
+    pub(crate) markdown: crate::window::markdown_host::MarkdownRegistry,
     pub(crate) accessibility: AccessibilityState,
     pub(crate) accelerators: Option<AcceleratorTable>,
     /// The shortcuts in force: the defaults until settings load, then with the user's overrides.
@@ -150,6 +152,7 @@ impl App {
             file_drops_accepted: false,
             last_sash_click: None,
             graphics: None,
+            markdown: Default::default(),
             accessibility: AccessibilityState::default(),
             keymap: crate::window::keymap::Keymap::defaults(),
             accelerators: AcceleratorTable::create(&crate::window::keymap::Keymap::defaults()).ok(),

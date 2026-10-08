@@ -378,7 +378,7 @@ impl Editor {
     }
 
     /// Where `line` starts; the document's length past the last line.
-    fn line_start(&self, line: usize) -> Result<usize> {
+    pub(crate) fn line_start(&self, line: usize) -> Result<usize> {
         if line >= self.line_count()? {
             return self.length();
         }

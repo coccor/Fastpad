@@ -394,7 +394,9 @@ fn close_reviewed_document(
             }
         }
     }
-    drop(closed);
+    if let Some(closed) = closed {
+        crate::window::markdown_host::forget(hwnd, closed.id);
+    }
     crate::recovery::remove_snapshot_files(&snapshots);
     if identity.is_live_for(hwnd) {
         refresh_tabs(hwnd);
@@ -426,7 +428,9 @@ fn close_background_document(
     let Some((closed, snapshots)) = closed else {
         return;
     };
-    drop(closed);
+    if let Some(closed) = closed {
+        crate::window::markdown_host::forget(hwnd, closed.id);
+    }
     crate::recovery::remove_snapshot_files(&snapshots);
     if identity.is_live_for(hwnd) {
         refresh_tabs(hwnd);

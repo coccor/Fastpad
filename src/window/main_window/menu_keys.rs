@@ -240,6 +240,9 @@ pub(crate) unsafe fn translate_accelerator(
     if editing_key_off_editor(hwnd, message) {
         return false;
     }
+    if markdown_key(hwnd, message) {
+        return true;
+    }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .accelerators
@@ -317,6 +320,39 @@ fn editing_key_off_editor(
         .and_then(|app| unsafe { app.as_ref() }.keymap.command_for(stroke))
         .is_some_and(CommandId::is_editing);
     editing && !is_group_editor(hwnd, message.hwnd)
+}
+
+/// A Markdown-scoped shortcut (Markdown design spec §9): taken only when a Markdown tab's editor
+/// has focus, so the same key keeps its global command everywhere else.
+fn markdown_key(hwnd: HWND, message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -> bool {
+    if !matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        return false;
+    }
+    if active_language(hwnd) != crate::document::Language::Markdown {
+        return false;
+    }
+    if unsafe { editor_hwnd(hwnd) } != Some(message.hwnd) {
+        return false;
+    }
+    let down = |key: u16| unsafe { GetKeyState(i32::from(key)) } < 0;
+    let Some(stroke) = crate::window::keymap::KeyStroke::from_key(
+        message.wParam as u16,
+        down(VK_CONTROL),
+        down(VK_SHIFT),
+        down(VK_MENU),
+    ) else {
+        return false;
+    };
+    let command = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .keymap
+            .command_for_in(stroke, crate::window::commands::Scope::Markdown)
+    });
+    let Some(command) = command else {
+        return false;
+    };
+    execute_command(hwnd, command);
+    true
 }
 
 /// Whether `window` is one of the editor groups' editors.

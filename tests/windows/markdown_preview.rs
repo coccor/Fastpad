@@ -810,6 +810,153 @@ fn typing_with_split_open_costs_the_same_as_without_a_preview() {
     assert!(with_preview <= baseline + baseline / 10 + 100);
 }
 
+/// A Markdown document of about `bytes` with headings, prose, a list with task items, a table and
+/// fenced code in every section, and where each section's typing spots start (byte offsets):
+/// the paragraph's end, the task item's end, the table cell's end and the code line's end.
+fn writing_markdown(bytes: usize) -> (String, Vec<[usize; 4]>) {
+    let mut text = String::new();
+    let mut spots = Vec::new();
+    for n in 0.. {
+        if text.len() >= bytes {
+            break;
+        }
+        text.push_str(&format!("## Heading {n}\n\n"));
+        text.push_str("Paragraph with **bold**, *emphasis*, `code` and a [link](https://x.dev).");
+        let paragraph = text.len();
+        text.push_str("\n\n- item one\n- [ ] task two");
+        let task = text.len();
+        text.push_str("\n- [x] task three\n\n| a | b |\n|---|---|\n| 1");
+        let cell = text.len();
+        text.push_str(" | 2 |\n\n```rust\nfn f() {}");
+        let code = text.len();
+        text.push_str("\n- not a list\n```\n\n");
+        spots.push([paragraph, task, cell, code]);
+    }
+    (text, spots)
+}
+
+/// One keystroke as the message loop delivers it (key down, then the character it produces)
+/// and everything it posted, timed through the repaint.
+fn timed_key(main: &TestMain, vk: u16, char: Option<u16>) -> u64 {
+    let started = Instant::now();
+    unsafe {
+        SendMessageW(main.editor, WM_KEYDOWN, usize::from(vk), 0);
+        if let Some(char) = char {
+            SendMessageW(
+                main.editor,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR,
+                usize::from(char),
+                0,
+            );
+        }
+    }
+    pump_pending();
+    unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(main.editor) };
+    started.elapsed().as_micros() as u64
+}
+
+fn timed_typing(main: &TestMain, text: &str, samples: &mut Vec<u64>) {
+    for unit in text.encode_utf16() {
+        samples.push(timed_key(main, unit, Some(unit)));
+    }
+}
+
+fn editor_text(main: &TestMain) -> String {
+    let length = unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_GETLENGTH,
+            0,
+            0,
+        )
+    } as usize;
+    let mut bytes = vec![0u8; length + 1];
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_GETTEXT,
+            bytes.len(),
+            bytes.as_mut_ptr() as isize,
+        )
+    };
+    bytes.truncate(length);
+    String::from_utf8(bytes).unwrap()
+}
+
+/// Types into a 200 KB document in `language`: prose with Enter, a task item continued by Enter
+/// and ended by Enter on the empty item, a table cell then Down out of the table, and a code
+/// line with Enter. Sections are visited bottom-up, and within a section bottom-up, so each
+/// spot's offset is still valid when it is reached. Returns every keystroke's time.
+fn writing_samples(main: &TestMain, language: Language) -> Vec<u64> {
+    let (text, spots) = writing_markdown(200_000);
+    main.set_text(&text);
+    main.with_app(|app| app.tabs.set_active_language(language));
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(main.editor) };
+    pump_for(Duration::from_millis(200));
+    let goto = |at: usize| {
+        unsafe {
+            SendMessageW(
+                main.editor,
+                crate::editor::scintilla_constants::SCI_GOTOPOS,
+                at,
+                0,
+            )
+        };
+        pump_pending();
+    };
+    let enter = |samples: &mut Vec<u64>| samples.push(timed_key(main, VK_RETURN, Some(0x0D)));
+    let mut samples = Vec::new();
+    let count = spots.len();
+    for section in (0..12).map(|round| count - 1 - round * (count / 12)) {
+        let [paragraph, task, cell, code] = spots[section];
+        goto(code);
+        timed_typing(main, " // x", &mut samples);
+        enter(&mut samples);
+        goto(cell);
+        timed_typing(main, "23456", &mut samples);
+        samples.push(timed_key(
+            main,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DOWN,
+            None,
+        ));
+        goto(task);
+        timed_typing(main, " and more", &mut samples);
+        enter(&mut samples);
+        timed_typing(main, "next task", &mut samples);
+        enter(&mut samples);
+        enter(&mut samples); // the empty item ends the list
+        goto(paragraph);
+        timed_typing(main, " More prose follows here", &mut samples);
+        enter(&mut samples);
+        timed_typing(main, "A new line of prose", &mut samples);
+        enter(&mut samples);
+    }
+    samples
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn typing_with_the_writing_helpers_costs_the_same_as_plain_text() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    // A warm-up pass of each, then two measured passes alternating, so neither side gets the
+    // warm caches.
+    writing_samples(&main, Language::PlainText);
+    writing_samples(&main, Language::Markdown);
+    let (mut plain, mut markdown) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        plain.extend(writing_samples(&main, Language::PlainText));
+        markdown.extend(writing_samples(&main, Language::Markdown));
+        // The helpers ran: the task item was continued, and the table re-aligned on leaving it.
+        let text = editor_text(&main);
+        assert!(text.contains("- [ ] task two and more\n- [ ] next task\n\n"));
+        assert!(text.contains("| 123456 | 2   |"));
+    }
+    let (count, baseline, helpers) = (plain.len(), p95(plain), p95(markdown));
+    println!("keystroke p95 over {count} keys: plain text {baseline} us, Markdown {helpers} us");
+    assert!(helpers <= baseline + baseline / 10 + 100);
+}
+
 #[test]
 #[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
 fn private_bytes_do_not_grow_across_open_close_cycles() {
