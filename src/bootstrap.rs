@@ -25,8 +25,9 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
-    PM_REMOVE, PeekMessageW, QS_ALLINPUT, ShowWindow, TranslateMessage, WM_PAINT, WM_QUIT,
+    DispatchMessageW, GetMessageW, IsIconic, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
+    PM_REMOVE, PeekMessageW, QS_ALLINPUT, SetForegroundWindow, ShowWindow, TranslateMessage,
+    WM_PAINT, WM_QUIT,
 };
 
 pub fn run(options: LaunchOptions) -> Result<i32> {
@@ -98,6 +99,12 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
 
     unsafe {
         ShowWindow(hwnd, show);
+        // Windows 11 does not always activate a new process's first window on its own, leaving
+        // it behind the app it was launched from. The launch grants the right to ask; a window
+        // started minimized (STARTUPINFO) stays where it is.
+        if IsIconic(hwnd) == 0 {
+            SetForegroundWindow(hwnd);
+        }
     }
     if !identity.is_live_for(hwnd) {
         return Err(FastPadError::Invariant(
