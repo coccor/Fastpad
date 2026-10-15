@@ -53,6 +53,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+resvg = { version = "=0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 
 [features]
 # Portable-package builds resolve Scintilla.dll only beside FastPad.exe.

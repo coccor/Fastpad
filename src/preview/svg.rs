@@ -1,43 +1,25 @@
-//! SVG images, rasterized on the image worker thread with Direct2D's SVG renderer into the same
-//! premultiplied BGRA pixels the WIC decoders produce. Direct2D implements SVG 1.1 shapes, paths,
-//! gradients, `<use>`, transforms, opacity, and clipping, and never fetches external resources; text,
-//! filters, masks, and CSS stylesheets do not render.
+//! SVG images, rasterized on the image worker thread by resvg into the same premultiplied BGRA
+//! pixels the WIC decoders produce. resvg covers static SVG 1.1 and the parts of SVG 2 that
+//! exporters write: text in installed fonts, markers, masks, filters, patterns, `<style>`
+//! sheets, and CSS colors. Like a browser showing an SVG as an image, it loads no external
+//! resources; only `data:` images embedded in the file render.
 
-use crate::preview::dwrite::{create_d2d_factory, hresult_error, load_system_library};
-use crate::preview::html::{Token, attr, tokenize};
 use crate::preview::images::{DecodedImage, MAX_IMAGE_PIXELS};
 use crate::{FastPadError, Result};
+use resvg::usvg::{self, fontdb};
 use std::path::Path;
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_SIZE_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
-};
-use windows::Win32::Graphics::Direct2D::{
-    D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1_RENDER_TARGET_PROPERTIES, ID2D1DeviceContext5,
-    ID2D1Factory,
-};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Imaging::{
-    GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapCacheOnLoad,
-};
-use windows::core::Interface;
-use windows_numerics::Matrix3x2;
+use std::sync::{Arc, OnceLock};
 
 pub const MAX_SVG_BYTES: u64 = 8 * 1024 * 1024;
-/// A browser's size for an SVG with neither dimensions nor a viewBox.
-const DEFAULT_SIZE: (f32, f32) = (300.0, 150.0);
 
-pub fn decode_svg(wic: &IWICImagingFactory, path: &Path, max_width: u32) -> Result<DecodedImage> {
+pub fn decode_svg(path: &Path, max_width: u32) -> Result<DecodedImage> {
     if std::fs::metadata(path).map_err(FastPadError::Io)?.len() > MAX_SVG_BYTES {
         return Err(FastPadError::Invariant("SVG file is larger than 8 MB"));
     }
     let bytes = std::fs::read(path).map_err(FastPadError::Io)?;
-    let source = String::from_utf8_lossy(&bytes);
-    let natural = natural_size(&source);
-    let (natural_width, natural_height) = (natural.0.ceil() as u32, natural.1.ceil() as u32);
-    if natural_width == 0
-        || natural_height == 0
-        || u64::from(natural_width) * u64::from(natural_height) > MAX_IMAGE_PIXELS
-    {
+    let tree = parse(&String::from_utf8_lossy(&bytes))?;
+    let (natural_width, natural_height) = natural_size(&tree);
+    if u64::from(natural_width) * u64::from(natural_height) > MAX_IMAGE_PIXELS {
         return Err(FastPadError::Invariant(
             "image is empty or larger than 64 megapixels",
         ));
@@ -48,7 +30,7 @@ pub fn decode_svg(wic: &IWICImagingFactory, path: &Path, max_width: u32) -> Resu
     } else {
         (natural_width, natural_height)
     };
-    let pixels = rasterize_source(wic, &source, natural, (width, height))?;
+    let pixels = rasterize(&tree, (width, height))?;
     Ok(DecodedImage {
         width,
         height,
@@ -58,222 +40,60 @@ pub fn decode_svg(wic: &IWICImagingFactory, path: &Path, max_width: u32) -> Resu
     })
 }
 
-/// Rasterizes SVG `source` to `width`×`height` premultiplied BGRA pixels, scaling its natural
-/// size to fit exactly. Runs on a worker thread.
-pub(crate) fn rasterize_source(
-    wic: &IWICImagingFactory,
-    source: &str,
-    natural: (f32, f32),
-    (width, height): (u32, u32),
-) -> Result<Vec<u8>> {
-    let document = rewrite_for_direct2d(source);
-    let module = load_system_library("d2d1.dll")?;
-    let pixels = {
-        let factory = create_d2d_factory(&module, D2D1_FACTORY_TYPE_MULTI_THREADED)?;
-        rasterize(wic, &factory, document.as_bytes(), natural, (width, height))?
-    };
-    drop(module);
+/// Parses SVG `source`. Runs on a worker thread: the first SVG with text loads the installed
+/// fonts' tables, which takes a moment.
+pub(crate) fn parse(source: &str) -> Result<usvg::Tree> {
+    let mut options = usvg::Options::default();
+    // Embedded `data:` images only; a file or URL reference draws nothing.
+    options.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    if has_text(source) {
+        options.fontdb = system_fonts();
+    }
+    usvg::Tree::from_str(source, &options).map_err(|_| FastPadError::Invariant("SVG is malformed"))
+}
+
+/// The tree's size in whole pixels, at least 1×1: `width`/`height`, completed from the `viewBox`
+/// aspect ratio; otherwise the `viewBox` size; otherwise the extent of what it draws.
+pub(crate) fn natural_size(tree: &usvg::Tree) -> (u32, u32) {
+    let size = tree.size();
+    (
+        (size.width().ceil() as u32).max(1),
+        (size.height().ceil() as u32).max(1),
+    )
+}
+
+/// Rasterizes `tree` to `width`×`height` premultiplied BGRA pixels, scaling its natural size to
+/// fit exactly.
+pub(crate) fn rasterize(tree: &usvg::Tree, (width, height): (u32, u32)) -> Result<Vec<u8>> {
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or(FastPadError::Invariant("SVG raster size is empty"))?;
+    let size = tree.size();
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        width as f32 / size.width(),
+        height as f32 / size.height(),
+    );
+    resvg::render(tree, transform, &mut pixmap.as_mut());
+    // tiny-skia writes premultiplied RGBA.
+    let mut pixels = pixmap.take();
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
     Ok(pixels)
 }
 
-fn rasterize(
-    wic: &IWICImagingFactory,
-    factory: &ID2D1Factory,
-    document: &[u8],
-    natural: (f32, f32),
-    (width, height): (u32, u32),
-) -> Result<Vec<u8>> {
-    unsafe {
-        let bitmap = wic
-            .CreateBitmap(
-                width,
-                height,
-                &GUID_WICPixelFormat32bppPBGRA,
-                WICBitmapCacheOnLoad,
-            )
-            .map_err(hresult_error)?;
-        let properties = D2D1_RENDER_TARGET_PROPERTIES {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            ..Default::default()
-        };
-        let target = factory
-            .CreateWicBitmapRenderTarget(&bitmap, &properties)
-            .map_err(hresult_error)?;
-        // SVG support arrived with ID2D1DeviceContext5 in Windows 10 1703; older systems fail here
-        // and the image shows its placeholder.
-        let context: ID2D1DeviceContext5 = target.cast().map_err(hresult_error)?;
-        let stream = wic.CreateStream().map_err(hresult_error)?;
-        stream
-            .InitializeFromMemory(document)
-            .map_err(hresult_error)?;
-        let svg = context
-            .CreateSvgDocument(
-                &stream,
-                D2D_SIZE_F {
-                    width: natural.0,
-                    height: natural.1,
-                },
-            )
-            .map_err(hresult_error)?;
-        context.BeginDraw();
-        context.Clear(Some(&D2D1_COLOR_F {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.0,
-        }));
-        context.SetTransform(&Matrix3x2::scale(
-            width as f32 / natural.0,
-            height as f32 / natural.1,
-        ));
-        context.DrawSvgDocument(&svg);
-        context.EndDraw(None, None).map_err(hresult_error)?;
-        drop(svg);
-        drop(context);
-        drop(target);
-        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
-        bitmap
-            .CopyPixels(std::ptr::null(), width * 4, &mut pixels)
-            .map_err(hresult_error)?;
-        Ok(pixels)
-    }
+/// Whether `source` may contain a `<text>` element (or `<svg:text>`), so parsing needs fonts.
+fn has_text(source: &str) -> bool {
+    source.contains("<text") || source.contains(":text")
 }
 
-/// The root `<svg>` element's size: `width`/`height` in plain numbers or `px`, completed from the
-/// `viewBox` aspect ratio when only one is given; otherwise the `viewBox` size; otherwise 300×150.
-pub fn natural_size(svg: &str) -> (f32, f32) {
-    let Some(start) = svg
-        .match_indices("<svg")
-        .map(|(index, _)| index)
-        .find(|index| element_is(&svg[*index..], "svg"))
-    else {
-        return DEFAULT_SIZE;
-    };
-    let end = tag_end(&svg[start..]).map_or(svg.len(), |end| start + end);
-    let Some(Token::Start { attrs, .. }) = tokenize(&svg[start..end]).into_iter().next() else {
-        return DEFAULT_SIZE;
-    };
-    let width = attr(&attrs, "width").and_then(parse_length);
-    let height = attr(&attrs, "height").and_then(parse_length);
-    let view_box = attr(&attrs, "viewbox").and_then(parse_view_box);
-    match (width, height, view_box) {
-        (Some(width), Some(height), _) => (width, height),
-        (Some(width), None, Some((box_width, box_height))) => {
-            (width, width * box_height / box_width)
-        }
-        (None, Some(height), Some((box_width, box_height))) => {
-            (height * box_width / box_height, height)
-        }
-        (None, None, Some(size)) => size,
-        (Some(width), None, None) => (width, DEFAULT_SIZE.1),
-        (None, Some(height), None) => (DEFAULT_SIZE.0, height),
-        (None, None, None) => DEFAULT_SIZE,
-    }
-}
-
-fn parse_length(value: &str) -> Option<f32> {
-    let value = value.trim();
-    let number = value.strip_suffix("px").unwrap_or(value).trim();
-    number
-        .parse::<f32>()
-        .ok()
-        .filter(|value| value.is_finite() && *value > 0.0)
-}
-
-fn parse_view_box(value: &str) -> Option<(f32, f32)> {
-    let numbers = value
-        .split(|character: char| character.is_ascii_whitespace() || character == ',')
-        .filter(|part| !part.is_empty())
-        .map(|part| part.parse::<f32>().ok())
-        .collect::<Option<Vec<_>>>()?;
-    match numbers.as_slice() {
-        [_, _, width, height]
-            if width.is_finite() && height.is_finite() && *width > 0.0 && *height > 0.0 =>
-        {
-            Some((*width, *height))
-        }
-        _ => None,
-    }
-}
-
-/// Direct2D implements SVG 1.1 linking: `<use>` needs `xlink:href`, and the root must declare the
-/// `xlink` namespace. SVG 2 files written with plain `href` are rewritten to that form.
-pub fn rewrite_for_direct2d(svg: &str) -> String {
-    let mut output = String::with_capacity(svg.len() + 64);
-    let mut rest = svg;
-    let mut root_seen = false;
-    while let Some(open) = rest.find('<') {
-        output.push_str(&rest[..open]);
-        rest = &rest[open..];
-        let Some(end) = tag_end(rest) else {
-            break;
-        };
-        let tag = &rest[..end];
-        if !root_seen && element_is(tag, "svg") {
-            root_seen = true;
-            output.push_str("<svg");
-            if !tag.contains("xmlns:xlink") {
-                output.push_str(r#" xmlns:xlink="http://www.w3.org/1999/xlink""#);
-            }
-            output.push_str(&tag[4..]);
-        } else if element_is(tag, "use") {
-            output.push_str(&xlink_hrefs(tag));
-        } else {
-            output.push_str(tag);
-        }
-        rest = &rest[end..];
-    }
-    output.push_str(rest);
-    output
-}
-
-/// Whether `tag` (starting at `<`) opens element `name`.
-fn element_is(tag: &str, name: &str) -> bool {
-    tag.strip_prefix('<')
-        .and_then(|tag| tag.strip_prefix(name))
-        .is_some_and(|rest| {
-            rest.starts_with(|character: char| {
-                character.is_ascii_whitespace() || character == '>' || character == '/'
-            })
-        })
-}
-
-/// The byte length of the tag at the start of `tag`, through its `>`, skipping quoted values.
-fn tag_end(tag: &str) -> Option<usize> {
-    let mut quote = None;
-    for (index, byte) in tag.bytes().enumerate().skip(1) {
-        match quote {
-            Some(open) if byte == open => quote = None,
-            Some(_) => {}
-            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
-            None if byte == b'>' => return Some(index + 1),
-            None => {}
-        }
-    }
-    None
-}
-
-fn xlink_hrefs(tag: &str) -> String {
-    let bytes = tag.as_bytes();
-    let mut output = String::with_capacity(tag.len() + 6);
-    let mut copied = 0;
-    let mut search = 1;
-    while let Some(found) = tag[search..].find("href=") {
-        let at = search + found;
-        if bytes[at - 1].is_ascii_whitespace() {
-            output.push_str(&tag[copied..at]);
-            output.push_str("xlink:");
-            copied = at;
-        }
-        search = at + 5;
-    }
-    output.push_str(&tag[copied..]);
-    output
+/// The installed fonts, scanned once per process and shared by every later SVG with text.
+fn system_fonts() -> Arc<fontdb::Database> {
+    static FONTS: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
+    Arc::clone(FONTS.get_or_init(|| {
+        let mut fonts = fontdb::Database::new();
+        fonts.load_system_fonts();
+        Arc::new(fonts)
+    }))
 }
 
 #[cfg(test)]
@@ -327,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn use_elements_render_after_the_xlink_rewrite() {
+    fn use_elements_with_a_plain_href_render() {
         let image = decode_image(&icon(), 0).unwrap();
         // Only a binder ring drawn through `<use href="#rings">` covers (20, 128), left of the cover.
         let ring = pixel(&image, 20, 128);
@@ -355,45 +175,153 @@ mod tests {
     }
 
     #[test]
-    fn natural_size_follows_dimensions_then_view_box_then_the_browser_default() {
-        assert_eq!(
-            natural_size(r#"<svg width="64" height="32px">"#),
-            (64.0, 32.0)
+    fn natural_size_follows_dimensions_then_view_box_then_the_content() {
+        let size = |root: &str| {
+            natural_size(
+                &parse(&format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" {root}><rect x="5" y="5" width="20" height="10"/></svg>"#
+                ))
+                .unwrap(),
+            )
+        };
+        assert_eq!(size(r#"width="64" height="32px""#), (64, 32));
+        assert_eq!(size(r#"viewBox="0 0 256 128""#), (256, 128));
+        assert_eq!(size(r#"width="100%" viewBox="0,0,10,20""#), (10, 20));
+        assert_eq!(size(r#"width="50" viewBox="0 0 10 20""#), (50, 100));
+        // With neither, the image fits what it draws.
+        assert_eq!(size(""), (25, 15));
+    }
+
+    /// A 40×40 SVG with `body`, rasterized; its pixel at (10, 10) as BGRA.
+    fn center_of(body: &str) -> [u8; 4] {
+        let source = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="40" height="40">{body}</svg>"#
         );
-        assert_eq!(
-            natural_size(r#"<?xml version="1.0"?><!-- c --><svg viewBox="0 0 256 128">"#),
-            (256.0, 128.0)
-        );
-        assert_eq!(
-            natural_size(r#"<svg width="100%" viewBox="0,0,10,20">"#),
-            (10.0, 20.0)
-        );
-        assert_eq!(
-            natural_size(r#"<svg width="50" viewBox="0 0 10 20">"#),
-            (50.0, 100.0)
-        );
-        assert_eq!(natural_size("<svg>"), (300.0, 150.0));
-        assert_eq!(
-            natural_size("<svgx width='9'><svg height='40'>"),
-            (300.0, 40.0)
-        );
-        assert_eq!(natural_size("not svg"), (300.0, 150.0));
+        let pixels = rasterize(&parse(&source).unwrap(), (40, 40)).unwrap();
+        let offset = (10 * 40 + 10) * 4;
+        pixels[offset..offset + 4].try_into().unwrap()
+    }
+
+    const RED: [u8; 4] = [0, 0, 0xFF, 0xFF];
+
+    /// Break caught: Direct2D drew these blank or black, so exported diagrams lost their labels,
+    /// arrowheads, and colors.
+    #[test]
+    fn exporter_features_render() {
+        let cases = [
+            (
+                "style sheet class",
+                r#"<style>.a{fill:#f00}</style><rect class="a" width="40" height="40"/>"#,
+            ),
+            (
+                "rgba()",
+                r#"<rect width="40" height="40" fill="rgba(255,0,0,1)"/>"#,
+            ),
+            (
+                "hsl()",
+                r#"<rect width="40" height="40" fill="hsl(0,100%,50%)"/>"#,
+            ),
+            (
+                "#rrggbbaa",
+                r##"<rect width="40" height="40" fill="#ff0000ff"/>"##,
+            ),
+            (
+                "pattern",
+                r##"<pattern id="p" width="40" height="40" patternUnits="userSpaceOnUse"><rect width="40" height="40" fill="red"/></pattern><rect width="40" height="40" fill="url(#p)"/>"##,
+            ),
+            (
+                "inside <a>",
+                r#"<a href="https://example.com"><rect width="40" height="40" fill="red"/></a>"#,
+            ),
+            (
+                "<switch>",
+                r#"<switch><rect width="40" height="40" fill="red"/></switch>"#,
+            ),
+            (
+                "<symbol> through <use>",
+                r##"<symbol id="s"><rect width="40" height="40" fill="red"/></symbol><use href="#s"/>"##,
+            ),
+            (
+                "marker",
+                r##"<marker id="m" markerWidth="40" markerHeight="40" markerUnits="userSpaceOnUse" overflow="visible"><rect width="40" height="40" fill="red"/></marker><path d="M0 0 H1" marker-start="url(#m)"/>"##,
+            ),
+            (
+                "data: image",
+                r#"<image width="40" height="40" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='4' height='4' fill='red'/%3E%3C/svg%3E"/>"#,
+            ),
+        ];
+        for (name, body) in cases {
+            let pixel = center_of(body);
+            assert!(near(pixel, RED), "{name}: {pixel:?}");
+        }
     }
 
     #[test]
-    fn use_elements_get_xlink_hrefs_and_the_root_declares_the_namespace() {
-        assert_eq!(
-            rewrite_for_direct2d(
-                r##"<svg viewBox="0 0 1 1"><use href="#a"/><use xlink:href="#b"/><a href="x"/></svg>"##
-            ),
-            r##"<svg xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1 1"><use xlink:href="#a"/><use xlink:href="#b"/><a href="x"/></svg>"##
+    fn text_renders_in_an_installed_font() {
+        let ink = |body: &str| {
+            let source = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40">{body}</svg>"#
+            );
+            rasterize(&parse(&source).unwrap(), (80, 40))
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] > 0)
+                .count()
+        };
+        assert!(ink(r#"<text x="4" y="30" font-family="Arial" font-size="28">Hi</text>"#) > 50);
+        // A `<switch>` falls back past an HTML `<foreignObject>` to its `<text>`, as draw.io writes.
+        assert!(
+            ink(
+                r#"<switch><foreignObject requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" width="80" height="40"/><text x="4" y="30" font-size="28">Hi</text></switch>"#
+            ) > 50
         );
-        let declared =
-            r##"<svg xmlns:xlink="http://www.w3.org/1999/xlink"><use href="#a"/></svg>"##;
-        assert_eq!(
-            rewrite_for_direct2d(declared),
-            declared.replace(" href=", " xlink:href=")
+    }
+
+    #[test]
+    fn a_referenced_file_is_not_loaded() {
+        let mut red = resvg::tiny_skia::Pixmap::new(4, 4).unwrap();
+        red.fill(resvg::tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let image =
+            std::env::temp_dir().join(format!("fastpad-svg-red-{}.png", std::process::id()));
+        std::fs::write(&image, red.encode_png().unwrap()).unwrap();
+        let href = image.display().to_string();
+        let embedded = format!(
+            "data:image/png;base64,{}",
+            base64_of(&std::fs::read(&image).unwrap())
         );
+        // The same PNG renders when embedded, so only the file reference is refused.
+        assert!(near(
+            center_of(&format!(
+                r#"<image width="40" height="40" href="{embedded}"/>"#
+            )),
+            RED
+        ));
+        assert_eq!(
+            center_of(&format!(r#"<image width="40" height="40" href="{href}"/>"#))[3],
+            0
+        );
+        let _ = std::fs::remove_file(image);
+    }
+
+    fn base64_of(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0_u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..4 {
+                out.push(if i <= chunk.len() {
+                    ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        out
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Regenerates every set's `icons.bin` and `icons.source-hash` under `assets/icons/` from its SVGs
-//! (icon sets spec §5.1), with the Markdown preview's Direct2D SVG renderer: Material's as
+//! (icon sets spec §5.1), with the Markdown preview's SVG renderer: Material's as
 //! premultiplied BGRA, Minimal's and Solid's as coverage masks. Ignored in the suite; run by
 //! `tools/generate-file-icons.ps1`.
 
@@ -26,22 +26,13 @@ fn sized_svg(source: &str, size: u32) -> String {
 #[test]
 #[ignore = "regenerates the committed icon data; run tools/generate-file-icons.ps1"]
 fn generate_file_icons() {
-    use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory};
-    use windows::Win32::System::Com::{
-        CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-    };
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
-    let wic: IWICImagingFactory =
-        unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }.unwrap();
     let scratch = std::env::temp_dir().join(format!("fastpad-icongen-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let path = scratch.join("icon.svg");
     // `source` at `size` px: premultiplied BGRA, `size * size * 4` bytes.
     let render = |source: &str, size: u32, name: &str| {
         std::fs::write(&path, sized_svg(source, size)).unwrap();
-        let image = crate::preview::svg::decode_svg(&wic, &path, 0).unwrap();
+        let image = crate::preview::svg::decode_svg(&path, 0).unwrap();
         assert_eq!((image.width, image.height), (size, size), "{name}");
         image.pixels
     };

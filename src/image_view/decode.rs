@@ -4,7 +4,7 @@
 //! with Direct2D at the width the view asks for.
 
 use crate::preview::images::{ComScope, MAX_IMAGE_PIXELS};
-use crate::preview::svg::{MAX_SVG_BYTES, natural_size, rasterize_source};
+use crate::preview::svg::{MAX_SVG_BYTES, natural_size, parse, rasterize};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -331,16 +331,10 @@ pub fn decode_svg_source(
     if text.len() as u64 > MAX_SVG_BYTES {
         return Err(ImageError::SvgTooLarge);
     }
-    let natural = natural_size(text);
-    let (natural_width, natural_height) = (natural.0.ceil() as u32, natural.1.ceil() as u32);
-    if natural_width == 0 || natural_height == 0 {
-        return Err(ImageError::Damaged);
-    }
+    let tree = parse(text).map_err(|_| ImageError::Damaged)?;
+    let (natural_width, natural_height) = natural_size(&tree);
     let (width, height) = svg_render_size((natural_width, natural_height), target_width, max_side);
-    let _com = ComScope::enter();
-    let factory = wic_factory()?;
-    let pixels = rasterize_source(&factory, text, natural, (width, height))
-        .map_err(|_| ImageError::Damaged)?;
+    let pixels = rasterize(&tree, (width, height)).map_err(|_| ImageError::Damaged)?;
     Ok(FullImage {
         width,
         height,
