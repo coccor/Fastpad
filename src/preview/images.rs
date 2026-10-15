@@ -70,16 +70,16 @@ impl Drop for ComScope {
 }
 
 pub fn decode_image(path: &Path, max_width: u32) -> Result<DecodedImage> {
-    let _com = ComScope::enter();
-    let factory: IWICImagingFactory =
-        unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
-            .map_err(hresult_error)?;
     if path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
     {
-        return crate::preview::svg::decode_svg(&factory, path, max_width);
+        return crate::preview::svg::decode_svg(path, max_width);
     }
+    let _com = ComScope::enter();
+    let factory: IWICImagingFactory =
+        unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
+            .map_err(hresult_error)?;
     let wide = path
         .as_os_str()
         .encode_wide()
