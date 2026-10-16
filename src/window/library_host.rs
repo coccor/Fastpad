@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
 
 mod autosave;
+mod daily;
 mod external;
 mod folders;
 mod index;
@@ -23,6 +24,7 @@ mod untitled;
 mod watch;
 
 pub(crate) use autosave::*;
+pub(crate) use daily::*;
 pub(crate) use external::*;
 pub(crate) use folders::*;
 pub(crate) use index::*;
@@ -125,6 +127,12 @@ pub(crate) struct LibraryHost {
     /// were not updated yet (second brain phase 1 spec §7.6), and whether a notice said so.
     pub(crate) renamed_outside: Vec<(PathBuf, PathBuf)>,
     pub(crate) renamed_outside_told: bool,
+    /// The open notebook's `notebook.ini` (second brain phase 1 spec §9.1), and its text as last
+    /// read, so a reload reports bad lines only when the file changed.
+    pub(crate) notebook: library::notebook_ini::NotebookSettings,
+    pub(crate) notebook_text: Option<String>,
+    /// The folder an open template picker makes its note in, and the templates it lists.
+    pub(crate) shown_templates: Option<(Option<PathBuf>, Vec<PathBuf>)>,
 }
 
 impl LibraryHost {
@@ -160,6 +168,9 @@ impl LibraryHost {
             index_again: false,
             renamed_outside: Vec::new(),
             renamed_outside_told: false,
+            notebook: library::notebook_ini::NotebookSettings::default(),
+            notebook_text: None,
+            shown_templates: None,
         }
     }
 }

@@ -500,6 +500,15 @@ pub(super) fn execute_command_with_note(
             hwnd,
             crate::window::links_view::Section::Unlinked,
         ),
+        CommandId::NotesToday => crate::window::library_host::open_today(hwnd),
+        CommandId::NotesPreviousDaily => crate::window::library_host::step_daily(hwnd, false),
+        CommandId::NotesNextDaily => crate::window::library_host::step_daily(hwnd, true),
+        CommandId::NotesNewFromTemplate => {
+            crate::window::library_host::new_note_from_template(hwnd, None)
+        }
+        CommandId::NotesEditNotebookSettings => {
+            crate::window::library_host::edit_notebook_settings(hwnd)
+        }
         CommandId::NotesUpdateRenamedLinks => {
             crate::window::library_host::update_renamed_links(hwnd)
         }

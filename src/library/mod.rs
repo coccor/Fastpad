@@ -2,6 +2,7 @@
 //! kept in `.fastpad\library.ini` and attached to files by path, file ID and content fingerprint.
 //! Nothing here touches a window.
 
+pub mod dates;
 pub mod external;
 pub mod facts;
 pub mod frontmatter;
@@ -10,11 +11,13 @@ pub mod index;
 pub mod links;
 pub mod local;
 pub mod model;
+pub mod notebook_ini;
 pub mod ops;
 pub mod quick_open;
 pub mod reconcile;
 pub mod scan;
 pub mod store;
+pub mod template;
 pub mod text_replace;
 pub mod text_search;
 pub mod title;

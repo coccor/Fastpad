@@ -605,6 +605,12 @@ pub(super) fn more_menu(hwnd: HWND) {
         entries.push(MenuEntry::Separator);
     }
     entries.extend([
+        MenuEntry::command("Today's note", CommandId::NotesToday),
+        MenuEntry::command(
+            "New note from template{2026}",
+            CommandId::NotesNewFromTemplate,
+        ),
+        MenuEntry::Separator,
         MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
         MenuEntry::command("Close notebook", CommandId::CloseNotebook),
     ]);

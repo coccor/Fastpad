@@ -258,6 +258,14 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
         CommandId::NotesUpdateRenamedLinks,
         "notes.updateRenamedLinks",
     ),
+    (CommandId::NotesToday, "notes.today"),
+    (CommandId::NotesPreviousDaily, "notes.previousDaily"),
+    (CommandId::NotesNextDaily, "notes.nextDaily"),
+    (CommandId::NotesNewFromTemplate, "notes.newFromTemplate"),
+    (
+        CommandId::NotesEditNotebookSettings,
+        "notes.editNotebookSettings",
+    ),
     (CommandId::FocusNextPane, "view.focusNextPane"),
     (CommandId::FocusPreviousPane, "view.focusPreviousPane"),
     (CommandId::SplitRight, "view.splitRight"),
@@ -396,7 +404,7 @@ const fn ch(byte: u8) -> u16 {
 }
 
 /// FastPad's shortcuts before any override, in precedence order (spec §3.3).
-pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 87] = [
+pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 88] = [
     (key(C, ch(b'N')), CommandId::New),
     (key(C, ch(b'T')), CommandId::New),
     (key(C, ch(b'O')), CommandId::Open),
@@ -411,6 +419,7 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 87] = [
     (key(0, VK_F3), CommandId::FindNext),
     (key(S, VK_F3), CommandId::FindPrevious),
     (key(0, VK_F12), CommandId::NotesFollowLink),
+    (key(C | A, ch(b'D')), CommandId::NotesToday),
     (key(C, ch(b'Z')), CommandId::Undo),
     (key(C, ch(b'Y')), CommandId::Redo),
     (key(C | S, ch(b'F')), CommandId::ShowSearchView),

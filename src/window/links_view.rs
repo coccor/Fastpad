@@ -494,6 +494,7 @@ fn model(hwnd: HWND, expanded: [bool; 4]) -> LinksModel {
             ..LinksModel::default()
         };
     }
+    let settings = library_host::notebook_settings(hwnd);
     let index = library_host::note_index(hwnd);
     let Some(resolver) = library_host::resolver(hwnd) else {
         return LinksModel {
@@ -551,17 +552,21 @@ fn model(hwnd: HWND, expanded: [bool; 4]) -> LinksModel {
             .collect();
     }
     if expanded[Section::Missing as usize] {
-        model.missing = crate::library::links::missing(&index, &resolver)
-            .into_iter()
-            .map(|gap| (gap.target, gap.from.len()))
-            .collect();
+        model.missing =
+            crate::library::links::missing(&index, &resolver, &settings.templates_folder)
+                .into_iter()
+                .map(|gap| (gap.target, gap.from.len()))
+                .collect();
     }
     if expanded[Section::Unlinked as usize] {
         model.unlinked = crate::library::links::unlinked(
             &index,
             &resolver,
-            Path::new("journal"),
-            Path::new("inbox.md"),
+            &crate::library::links::Conventions {
+                daily_folder: &settings.daily_folder,
+                inbox: &settings.inbox,
+                templates: &settings.templates_folder,
+            },
         );
     }
     model

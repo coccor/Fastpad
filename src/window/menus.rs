@@ -866,7 +866,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 83);
+        assert_eq!(specs.len(), 84);
     }
 
     #[test]
@@ -875,7 +875,7 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         let table = super::AcceleratorTable::create(&crate::window::keymap::Keymap::defaults())
             .expect("accelerator table");
-        assert_eq!(table.entries().len(), 83);
+        assert_eq!(table.entries().len(), 84);
     }
 
     #[test]

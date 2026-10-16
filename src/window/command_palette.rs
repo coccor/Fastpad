@@ -55,7 +55,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 142] = [
+pub(crate) const ENTRIES: [PaletteEntry; 147] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -197,6 +197,17 @@ pub(crate) const ENTRIES: [PaletteEntry; 142] = [
         "Notes: Update links to renamed notes",
         CommandId::NotesUpdateRenamedLinks,
     ),
+    entry("Notes: Open today's note", CommandId::NotesToday),
+    entry("Notes: Previous daily note", CommandId::NotesPreviousDaily),
+    entry("Notes: Next daily note", CommandId::NotesNextDaily),
+    entry(
+        "Notes: New note from template{2026}",
+        CommandId::NotesNewFromTemplate,
+    ),
+    entry(
+        "Notes: Edit notebook settings",
+        CommandId::NotesEditNotebookSettings,
+    ),
     entry("View: Zoom in", CommandId::ZoomIn),
     entry("View: Zoom out", CommandId::ZoomOut),
     entry("View: Reset zoom", CommandId::ZoomReset),
@@ -326,6 +337,8 @@ pub(crate) enum PickerKind {
     /// Ctrl+P (quick-open spec §3): notes by name. Its rows come from `main_window`, not from
     /// `Picker::items`.
     QuickOpen,
+    /// Notes: New note from template… (second brain phase 1 spec §9.4).
+    Template,
 }
 
 /// The most rows quick open lists (spec §3.3).

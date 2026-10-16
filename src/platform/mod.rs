@@ -1,5 +1,6 @@
 pub mod annotation;
 pub mod clipboard;
+pub mod clock;
 pub mod dialogs;
 pub mod files;
 pub mod fonts;

@@ -754,3 +754,13 @@ Decisions made while building PR 1c (plan `docs/superpowers/plans/2026-10-16-wik
 - **Renames outside FastPad** are paired by volume and file ID between the scan cache and the new scan. FastPad's own renames between scans are excluded. The notice comes once the index lands, and **Notes: Update links to renamed notes** offers the edits; after that, or when a notebook closes, those renames are forgotten.
 - **Snippets in the Links view are read from the files** when the view refreshes, rather than kept in the index; the index stores each link's line and byte range.
 - **Missing notes count wikilinks only.** A Markdown link to a missing file is usually an attachment path, not a note waiting to be written.
+
+Decisions made while building PR 1d (plan `docs/superpowers/plans/2026-10-16-daily-notes-and-templates.md`):
+
+- **Settings has no "This notebook" section yet** (§9.1). The dialog is 802 of its 810 pixels tall and has no text field. **Notes: Edit notebook settings** opens `notebook.ini` instead, made first with every key commented out at its default. The watcher re-reads it when saved, and a bad line is reported once per change of the file.
+- **Unknown keys in `notebook.ini` get a notice**, as unknown keys in `fastpad.ini` do.
+- **A missing daily template** gets a notice only when `notebook.ini` names it; the default path is optional.
+- **Previous and Next daily note** look at notes directly in the daily folder whose names read back as dates in `daily_format`, with case ignored.
+- **The template picker uses the palette's own matching** rather than the quick-open matcher; template names are short.
+- **Templates are left out of link resolution and completion**, besides missing and unlinked notes (§9.4), so a template never shows up as a link target.
+- **Obsidian's `attachmentFolderPath`** is read in PR 1e, the first PR to use the attachments folder.

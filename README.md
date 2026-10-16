@@ -161,6 +161,26 @@ See [[Project Atlas]], its [[Project Atlas#Goals|goals]], or [[work/Plan]].
   program renames a note, a notice says which links still use the old name, and
   **Notes: Update links to renamed notes** fixes them.
 
+### Daily notes and templates
+
+- **`Ctrl+Alt+D`** (Notes: Open today's note) opens today's note in `journal\`, making it the
+  first time from `.fastpad\templates\daily.md`, or with the date as its heading.
+  **Notes: Previous daily note** and **Next daily note** step through the journal.
+- **Notes: New note from template…** (also in the Notebook `…` menu and a folder's right-click
+  menu) lists the templates in `.fastpad\templates` and makes a new note from the one you pick.
+- Templates fill in `{{date}}`, `{{date:dddd, D MMMM YYYY}}`, `{{time}}` and `{{title}}`, and the
+  caret starts at `{{cursor}}`. Placeholders work in front matter too.
+- A notebook's conventions live in `.fastpad\notebook.ini`, which other tools and AI agents can
+  read too. **Notes: Edit notebook settings** opens it:
+
+```ini
+daily_folder=journal
+daily_format=YYYY-MM-DD
+daily_template=.fastpad/templates/daily.md
+templates_folder=.fastpad/templates
+inbox=inbox.md
+```
+
 ### Changes made outside FastPad
 
 Edit a file in another program, sync it from another PC, or let an AI agent work on your notes:
@@ -290,7 +310,7 @@ before closing again.
 | Add next occurrence | `Ctrl+D` | | Select all occurrences | `Ctrl+Shift+L` |
 | Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
 | Bold / italic (Markdown files) | `Ctrl+B` / `Ctrl+I` | | Code / link (Markdown files) | ``Ctrl+` `` / `Ctrl+K` |
-| Follow link at caret | `F12` or `Ctrl+Click` | | | |
+| Follow link at caret | `F12` or `Ctrl+Click` | | Today's note | `Ctrl+Alt+D` |
 
 ## Make it yours
 

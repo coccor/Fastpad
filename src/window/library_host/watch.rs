@@ -63,8 +63,9 @@ pub(crate) fn stop_watcher(hwnd: HWND) {
     })
     .flatten();
     drop(watcher);
-    // The index belongs to the notebook that is going too.
+    // The index and the conventions belong to the notebook that is going too.
     reset_index(hwnd);
+    forget_notebook_settings(hwnd);
 }
 
 /// Whether a watcher is watching the open notebook right now.
@@ -152,6 +153,12 @@ pub(crate) fn files_changed(hwnd: HWND, lparam: isize) -> bool {
     }
     check_paths(hwnd, &paths);
     mark_outside_changes(hwnd, &paths);
+    if paths.iter().any(|path| {
+        path.file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(library::notebook_ini::NOTEBOOK_FILE))
+    }) {
+        reload_notebook_settings(hwnd);
+    }
     if changes.names_changed {
         // The rescan's result asks for the index itself.
         request_rescan(hwnd);

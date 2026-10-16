@@ -171,6 +171,12 @@ pub enum CommandId {
     NotesShowMissing = 272,
     NotesShowUnlinked = 273,
     NotesUpdateRenamedLinks = 274,
+    // Daily notes and templates (second brain phase 1 spec §9).
+    NotesToday = 275,
+    NotesPreviousDaily = 276,
+    NotesNextDaily = 277,
+    NotesNewFromTemplate = 278,
+    NotesEditNotebookSettings = 279,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -335,6 +341,11 @@ impl CommandId {
                 | Self::NotesShowMissing
                 | Self::NotesShowUnlinked
                 | Self::NotesUpdateRenamedLinks
+                | Self::NotesToday
+                | Self::NotesPreviousDaily
+                | Self::NotesNextDaily
+                | Self::NotesNewFromTemplate
+                | Self::NotesEditNotebookSettings
                 | Self::ToggleNotesMode
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
@@ -510,7 +521,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 164] = [
+        const COMMANDS: [CommandId; 169] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -675,6 +686,11 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotesShowMissing,
             CommandId::NotesShowUnlinked,
             CommandId::NotesUpdateRenamedLinks,
+            CommandId::NotesToday,
+            CommandId::NotesPreviousDaily,
+            CommandId::NotesNextDaily,
+            CommandId::NotesNewFromTemplate,
+            CommandId::NotesEditNotebookSettings,
         ];
         COMMANDS
             .into_iter()
@@ -1016,7 +1032,12 @@ mod tests {
             Ok(CommandId::NotesUpdateRenamedLinks)
         );
         assert!(CommandId::ShowLinksView.is_sidebar());
-        assert!(CommandId::try_from(275).is_err());
+        assert_eq!(CommandId::try_from(275), Ok(CommandId::NotesToday));
+        assert_eq!(
+            CommandId::try_from(279),
+            Ok(CommandId::NotesEditNotebookSettings)
+        );
+        assert!(CommandId::try_from(280).is_err());
     }
 
     #[test]

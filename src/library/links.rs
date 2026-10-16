@@ -284,10 +284,31 @@ pub struct MissingNote {
     pub from: Vec<PathBuf>,
 }
 
+/// Where a notebook keeps the notes the link lists treat apart (spec §7.5, §9.1, §9.4).
+#[derive(Clone, Copy, Debug)]
+pub struct Conventions<'a> {
+    pub daily_folder: &'a Path,
+    pub inbox: &'a Path,
+    /// Links written in templates are placeholders, not links.
+    pub templates: &'a Path,
+}
+
+/// Whether `path` (relative) is in `folder` or a folder under it.
+pub fn in_folder(path: &Path, folder: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        super::is_inside(folder, parent) || super::model::same_path(parent, folder)
+    })
+}
+
 /// Every wikilink target in the notebook that matches no note, most linked first (spec §7.5).
-pub fn missing(index: &NoteIndex, resolver: &Resolver) -> Vec<MissingNote> {
+/// Links in templates don't count.
+pub fn missing(index: &NoteIndex, resolver: &Resolver, templates: &Path) -> Vec<MissingNote> {
     let mut by_target: HashMap<String, MissingNote> = HashMap::new();
-    let mut notes: Vec<_> = index.notes.values().collect();
+    let mut notes: Vec<_> = index
+        .notes
+        .values()
+        .filter(|note| !in_folder(&note.path, templates))
+        .collect();
     notes.sort_by(|a, b| natural_cmp(&a.path.to_string_lossy(), &b.path.to_string_lossy()));
     for source in notes {
         for link in &source.facts.links {
@@ -319,26 +340,24 @@ pub fn missing(index: &NoteIndex, resolver: &Resolver) -> Vec<MissingNote> {
     missing
 }
 
-/// Notes nothing is expected to link to (spec §7.5): the daily notes, the inbox, the index and
-/// log of agent-maintained vaults, and instructions and readmes.
-fn expected_unlinked(path: &Path, daily_folder: &Path, inbox: &Path) -> bool {
+/// Notes nothing is expected to link to (spec §7.5): the daily notes, the inbox, templates, the
+/// index and log of agent-maintained vaults, and instructions and readmes.
+fn expected_unlinked(path: &Path, conventions: &Conventions<'_>) -> bool {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     ["index.md", "log.md", "claude.md", "readme.md"].contains(&name.as_str())
-        || super::model::same_path(path, inbox)
-        || path.parent().is_some_and(|parent| {
-            super::is_inside(daily_folder, parent) || super::model::same_path(parent, daily_folder)
-        })
+        || super::model::same_path(path, conventions.inbox)
+        || in_folder(path, conventions.daily_folder)
+        || in_folder(path, conventions.templates)
 }
 
 /// Markdown notes no other note links to, most recently changed first (spec §7.5).
 pub fn unlinked(
     index: &NoteIndex,
     resolver: &Resolver,
-    daily_folder: &Path,
-    inbox: &Path,
+    conventions: &Conventions<'_>,
 ) -> Vec<PathBuf> {
     let mut linked = HashSet::new();
     for source in index.notes.values() {
@@ -354,7 +373,7 @@ pub fn unlinked(
         .notes
         .values()
         .filter(|note| !linked.contains(&path_key(&note.path)))
-        .filter(|note| !expected_unlinked(&note.path, daily_folder, inbox))
+        .filter(|note| !expected_unlinked(&note.path, conventions))
         .collect();
     notes.sort_by(|a, b| {
         b.mtime
@@ -701,6 +720,7 @@ mod tests {
             ("lonely.md", "nothing"),
             (r"journal\2026-10-16.md", "today"),
             ("inbox.md", "- x"),
+            (r"templates\Meeting.md", "[[{{title}} notes]]"),
         ]);
         let notes = [
             "a.md",
@@ -708,6 +728,7 @@ mod tests {
             "lonely.md",
             r"journal\2026-10-16.md",
             "inbox.md",
+            r"templates\Meeting.md",
         ];
         let resolver = resolver(&notes, &index);
         let back = backlinks(&index, &resolver, Path::new("b.md"));
@@ -722,7 +743,8 @@ mod tests {
             .collect();
         assert_eq!(targets, [("b", true), ("Ghost", false)]);
 
-        let gaps = missing(&index, &resolver);
+        let gaps = missing(&index, &resolver, Path::new("templates"));
+        assert_eq!(gaps.len(), 2, "a template's links are placeholders");
         assert_eq!(gaps[0].target, "Ghost");
         assert_eq!(gaps[0].from.len(), 2);
         assert_eq!(gaps[1].target, "Phantom");
@@ -731,8 +753,11 @@ mod tests {
             unlinked(
                 &index,
                 &resolver,
-                Path::new("journal"),
-                Path::new("inbox.md")
+                &Conventions {
+                    daily_folder: Path::new("journal"),
+                    inbox: Path::new("inbox.md"),
+                    templates: Path::new("templates"),
+                }
             ),
             [PathBuf::from("lonely.md")]
         );

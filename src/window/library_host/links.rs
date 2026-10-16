@@ -10,8 +10,16 @@ use std::path::Path;
 /// loaded notebook.
 pub(crate) fn resolver(hwnd: HWND) -> Option<Resolver> {
     let index = note_index(hwnd);
+    let templates = notebook_settings(hwnd).templates_folder;
     with_state(hwnd, |state| {
-        Resolver::of(state.notes.iter().map(|note| note.path.as_path()), &index)
+        Resolver::of(
+            state
+                .notes
+                .iter()
+                .map(|note| note.path.as_path())
+                .filter(|path| !crate::library::links::in_folder(path, &templates)),
+            &index,
+        )
     })
 }
 
@@ -26,7 +34,7 @@ pub(crate) fn completion_items(hwnd: HWND, from: Option<&Path>) -> Vec<String> {
         .map_or_else(|| PathBuf::from("_"), Path::to_path_buf);
     let mut items: Vec<String> = note_paths(hwnd)
         .iter()
-        .filter(|path| !library::model::same_path(path, &from))
+        .filter(|path| !library::model::same_path(path, &from) && resolver.contains(path))
         .map(|path| crate::library::links::wiki_target(&resolver, path, &from))
         .collect();
     items.sort_by(|a, b| crate::library::tree::natural_cmp(a, b));
