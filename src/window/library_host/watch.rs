@@ -63,6 +63,8 @@ pub(crate) fn stop_watcher(hwnd: HWND) {
     })
     .flatten();
     drop(watcher);
+    // The index belongs to the notebook that is going too.
+    reset_index(hwnd);
 }
 
 /// Whether a watcher is watching the open notebook right now.
@@ -151,7 +153,10 @@ pub(crate) fn files_changed(hwnd: HWND, lparam: isize) -> bool {
     check_paths(hwnd, &paths);
     mark_outside_changes(hwnd, &paths);
     if changes.names_changed {
+        // The rescan's result asks for the index itself.
         request_rescan(hwnd);
+    } else if paths.iter().any(|path| library::index::is_indexed(path)) {
+        request_index(hwnd);
     }
     true
 }

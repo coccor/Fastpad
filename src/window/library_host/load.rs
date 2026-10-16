@@ -360,4 +360,6 @@ pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
     }
     // From now on outside changes are reported as they happen (second brain phase 1 §5.1).
     ensure_watcher(hwnd);
+    // The note list may have changed: the index reads what did (§6.4).
+    request_index(hwnd);
 }

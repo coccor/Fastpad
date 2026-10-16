@@ -10,6 +10,7 @@ use windows_sys::Win32::Foundation::HWND;
 mod autosave;
 mod external;
 mod folders;
+mod index;
 mod load;
 mod local_state;
 mod naming;
@@ -23,6 +24,7 @@ mod watch;
 pub(crate) use autosave::*;
 pub(crate) use external::*;
 pub(crate) use folders::*;
+pub(crate) use index::*;
 pub(crate) use load::*;
 pub(crate) use local_state::*;
 pub(crate) use naming::*;
@@ -107,6 +109,16 @@ pub(crate) struct LibraryHost {
     pub(crate) own_writes: std::collections::HashMap<String, Option<Instant>>,
     /// The Notebook view shows only notes changed outside FastPad ("Notes: Show changed notes").
     pub(crate) changed_only: bool,
+    /// The open notebook's note index (second brain phase 1 spec §6): replaced whole when a build
+    /// lands, so a worker can read the previous one while the UI keeps using it.
+    pub(crate) index: std::sync::Arc<library::index::NoteIndex>,
+    /// Bumped whenever the index is reset: a build for an older notebook is dropped.
+    pub(crate) index_generation: u64,
+    /// The index has loaded for the open notebook (its first build landed).
+    pub(crate) index_loaded: bool,
+    pub(crate) index_running: bool,
+    /// A request arrived while a build ran: one more runs after it.
+    pub(crate) index_again: bool,
 }
 
 impl LibraryHost {
@@ -135,6 +147,11 @@ impl LibraryHost {
             watch_failed: false,
             own_writes: std::collections::HashMap::new(),
             changed_only: false,
+            index: std::sync::Arc::default(),
+            index_generation: 0,
+            index_loaded: false,
+            index_running: false,
+            index_again: false,
         }
     }
 }

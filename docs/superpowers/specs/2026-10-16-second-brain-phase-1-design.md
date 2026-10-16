@@ -732,3 +732,14 @@ Decisions made while building PR 1a (plan `docs/superpowers/plans/2026-10-16-ext
 - **Where changed marks come from.** A rescan compares its note list with the live one, which FastPad's own saves keep current. A load at startup compares with the scan cache in the per-PC file, whose sizes and times are brought up to the live list when the window closes. After a crash, notes FastPad saved since its last scan can therefore be marked once.
 - **"Notes: Show changed notes" is a toggle**: running it again shows the whole tree. The header doesn't change while it is on; the view shows only the marked notes, under their folders, opened.
 - **Watcher tests** run against a real temporary folder in every library window test, since installing a notebook starts the watcher.
+
+Decisions made while building PR 1b (plan `docs/superpowers/plans/2026-10-16-note-index-and-tags.md`):
+
+- **The Tags view has no filter box yet** (§8.1); it needs an edit control in the panel. Everything else in §8.1 is in.
+- **Front matter in the preview uses the preview's table block**, headed "Property" and "Value", rather than a muted properties block (§6.2). Layout, selection and accessibility need no new code.
+- **A preview with front matter is always parsed whole.** Its end moves with any `---` line inserted below, so the incremental parser can't stay within nearby blocks. Its property test now has a fixture with front matter.
+- **YAML comments apply to front matter values**: `title: Atlas #draft` is "Atlas", as YAML reads it.
+- **A tag may start a text run after inline HTML** such as `<br>`, but nothing inside an inline HTML element (`<span>#x</span>`) is a tag.
+- **Tag chips** are drawn with the code background and an outline in the border color, so they stay visible in high contrast; the link color carries the text. Their link destination is `fastpad-tag:<name>`.
+- **The index is one immutable snapshot**: a worker builds the next one from the previous, rereads only notes whose size or write time changed, writes the cache when anything changed, and posts the result. Online-only (OneDrive) notes are left out, so indexing never downloads them.
+- **The activity bar has five buttons**; its button count is now a constant instead of a literal 4.

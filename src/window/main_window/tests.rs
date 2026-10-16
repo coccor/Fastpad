@@ -47,6 +47,7 @@ mod first_save_and_autosave;
 mod focus_and_accessibility;
 mod folder_rename_and_tree_move;
 mod group_strip;
+mod index_and_tags;
 mod inline_new_items;
 mod json_and_recovery;
 mod markdown_keys;
@@ -382,6 +383,11 @@ pub(super) fn open_note(
     scratch.install(window.hwnd);
     super::open_path(window.hwnd, &path).unwrap();
     pump_posted_messages(window.hwnd);
+    // The note index reads every note on a worker once the notebook loads: a test that then
+    // locks or deletes a note must not race it.
+    pump_until(window.hwnd, || {
+        crate::window::library_host::index_loaded(window.hwnd)
+    });
     path
 }
 

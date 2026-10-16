@@ -637,3 +637,53 @@ fn the_readme_fixture_renders_no_literal_markup() {
     );
     assert!(texts.iter().any(|text| text == "Back to top"));
 }
+
+#[test]
+fn front_matter_shows_as_a_table_of_its_properties() {
+    // Break caught: front matter drawn as a rule and a setext heading, its keys run together.
+    assert_eq!(
+        kinds("---\ntitle: Plan\ntags: [a, b]\n---\n# Heading\n"),
+        vec![
+            BlockKind::Table {
+                alignments: vec![CellAlign::Left, CellAlign::Left],
+                head: vec![plain("Property"), plain("Value")],
+                rows: vec![
+                    vec![plain("title"), plain("Plan")],
+                    vec![plain("tags"), plain("a, b")],
+                ],
+            },
+            heading(1, plain("Heading")),
+        ]
+    );
+    // A rule further down is still a rule.
+    assert_eq!(kinds("text\n\n---\n\nmore\n").len(), 3);
+}
+
+#[test]
+fn inline_tags_become_tag_spans_outside_links_and_code() {
+    assert_eq!(
+        kinds("Plan #project/atlas, (#todo) and C#.\n"),
+        vec![para(styled(
+            "Plan #project/atlas, (#todo) and C#.",
+            vec![
+                span(5..19, InlineStyle::Tag("project/atlas".to_owned())),
+                span(22..27, InlineStyle::Tag("todo".to_owned())),
+            ]
+        ))]
+    );
+    assert_eq!(
+        kinds("[#linked](x.md) `#code`\n"),
+        vec![para(styled(
+            "#linked #code",
+            vec![
+                span(0..7, InlineStyle::Link("x.md".to_owned())),
+                span(8..13, InlineStyle::Code),
+            ]
+        ))]
+    );
+    // After an emphasis run, the next text event starts mid-word: no tag there.
+    assert_eq!(
+        kinds("*a*#b\n"),
+        vec![para(styled("a#b", vec![span(0..1, InlineStyle::Emphasis)]))]
+    );
+}

@@ -118,6 +118,28 @@ pinned notes first. Notes are plain files, so nothing is locked in.
 Pins travel with the notebook in `.fastpad\library.ini`, and nothing is written into a folder until
 you pin something. Turn notes off with `notes_mode=false` in `fastpad.ini`.
 
+### Tags and front matter
+
+Tag a note with `#tags` anywhere in its text, or in its YAML front matter:
+
+```markdown
+---
+tags: [project/atlas, todo]
+status: active
+---
+Call Dana about the #budget.
+```
+
+- **The Tags view** (the tag button in the activity bar, or **View: Show tags**) lists every tag
+  in the notebook with how many notes use it. Nested tags like `#project/atlas` sit under
+  `#project`. Expand a tag to see its notes; click one to open it.
+- **In the preview**, front matter shows as a table of its properties, and each `#tag` is a chip
+  you can click to see the tag's notes.
+- Tags in code, links and HTML don't count, and neither do `#123` or `C#`.
+
+FastPad keeps an index of every Markdown note's tags and front matter, updated as notes are saved
+or changed outside FastPad, and cached so the next start reads only what changed.
+
 ### Changes made outside FastPad
 
 Edit a file in another program, sync it from another PC, or let an AI agent work on your notes:
@@ -273,7 +295,7 @@ line in a notification and applies the rest.
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `reload_changed_files` | `auto` (a tab without unsaved edits takes a file's outside changes by itself) or `ask` (every change waits for you) | `auto` |
-| `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
+| `sidebar_view` | `notebook`, `search`, `favorites`, `tags`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
 | `settings_size` | `<width>x<height>` (pixels at 100% scaling), saved when you resize Settings | none: its natural size |
 | `window_placement` | `<x>,<y>,<width>x<height>`, then `,maximized` if it was; saved when the main window closes | none: opens at the default spot |

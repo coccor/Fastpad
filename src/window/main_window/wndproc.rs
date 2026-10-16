@@ -492,6 +492,10 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 crate::window::library_host::files_changed(hwnd, lparam);
                 return 0;
             }
+            if message == crate::window::WM_FASTPAD_INDEX_READY {
+                crate::window::library_host::index_ready(hwnd, lparam);
+                return 0;
+            }
             // Focus left the Notebook tree's name field (inline naming spec §5.3): leaving
             // FastPad keeps the edit; a modal prompt that took it holds the commit until it ends.
             if message == crate::window::WM_FASTPAD_INLINE_NAME_LEFT {

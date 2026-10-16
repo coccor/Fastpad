@@ -306,6 +306,33 @@ pub(crate) fn editor_item(
     }
 }
 
+/// A row of an outline other than the Notebook tree (the Tags view): `expanded` is `None` for a
+/// row that has nothing under it, and `depth` 0 is the top level.
+pub(crate) fn outline_item(
+    name: String,
+    expanded: Option<bool>,
+    depth: u16,
+    selected: bool,
+    focused: bool,
+    rect: RECT,
+    visible: bool,
+) -> AccessibleItem {
+    let mut state = row_state(selected, focused, visible);
+    match expanded {
+        Some(true) => state |= STATE_EXPANDED,
+        Some(false) => state |= STATE_COLLAPSED,
+        None => {}
+    }
+    AccessibleItem {
+        name,
+        role: ROLE_SYSTEM_OUTLINEITEM,
+        state,
+        rect,
+        value: (u32::from(depth) + 1).to_string(),
+        window: std::ptr::null_mut(),
+    }
+}
+
 /// A Notebook-view row, one level under the notebook's root row (open editors spec §7). The name
 /// carries a note's type, then ", pinned", so none is conveyed by the icon alone.
 pub(crate) fn tree_item(

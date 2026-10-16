@@ -38,11 +38,19 @@ pub enum SidebarView {
     Notebook,
     Search,
     Favorites,
+    /// The notebook's tags (second brain phase 1 spec §8.1).
+    Tags,
     Hidden,
 }
 
 impl SidebarView {
-    const ALL: [Self; 4] = [Self::Notebook, Self::Search, Self::Favorites, Self::Hidden];
+    const ALL: [Self; 5] = [
+        Self::Notebook,
+        Self::Search,
+        Self::Favorites,
+        Self::Tags,
+        Self::Hidden,
+    ];
 
     /// The `sidebar_view=` value that parses back to this view.
     pub const fn token(self) -> &'static str {
@@ -50,6 +58,7 @@ impl SidebarView {
             Self::Notebook => "notebook",
             Self::Search => "search",
             Self::Favorites => "favorites",
+            Self::Tags => "tags",
             Self::Hidden => "none",
         }
     }
@@ -1048,13 +1057,14 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_view_accepts_its_four_tokens_and_warns_on_anything_else() {
+    fn sidebar_view_accepts_its_five_tokens_and_warns_on_anything_else() {
         // Break caught: a hand-edited "sidebar_view=Search" ignored, or a typo silently closing
         // the panel.
         for (value, view) in [
             ("notebook", SidebarView::Notebook),
             ("Search", SidebarView::Search),
             ("FAVORITES", SidebarView::Favorites),
+            ("Tags", SidebarView::Tags),
             ("none", SidebarView::Hidden),
         ] {
             assert_eq!(
@@ -1073,6 +1083,7 @@ mod tests {
             SidebarView::Notebook,
             SidebarView::Search,
             SidebarView::Favorites,
+            SidebarView::Tags,
             SidebarView::Hidden,
         ] {
             assert_eq!(

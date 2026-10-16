@@ -3,7 +3,10 @@
 //! Nothing here touches a window.
 
 pub mod external;
+pub mod facts;
+pub mod frontmatter;
 pub mod ids;
+pub mod index;
 pub mod local;
 pub mod model;
 pub mod ops;

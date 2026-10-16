@@ -134,6 +134,7 @@ pub(crate) struct Sidebar {
     /// The Notebook view's rows, selection and hover.
     pub(crate) notebook: crate::window::notebook_view::NotebookView,
     pub(crate) favorites: crate::window::favorites_view::FavoritesView,
+    pub(crate) tags: crate::window::tags_view::TagsView,
     pub(crate) search: crate::window::search_view::SearchView,
     /// The view Ctrl+B reopens while the panel is closed.
     last_view: SidebarView,
@@ -191,6 +192,7 @@ pub(crate) enum PanelView {
     Notebook,
     Search,
     Favorites,
+    Tags,
 }
 
 impl PanelView {
@@ -199,6 +201,7 @@ impl PanelView {
             SidebarView::Notebook => Some(Self::Notebook),
             SidebarView::Search => Some(Self::Search),
             SidebarView::Favorites => Some(Self::Favorites),
+            SidebarView::Tags => Some(Self::Tags),
             SidebarView::Hidden => None,
         }
     }
@@ -386,6 +389,7 @@ pub(crate) fn create(hwnd: HWND) -> crate::Result<Sidebar> {
         bar_focus: 0,
         notebook: crate::window::notebook_view::NotebookView::new(panel),
         favorites: crate::window::favorites_view::FavoritesView::new(dpi),
+        tags: crate::window::tags_view::TagsView::new(dpi),
         search: crate::window::search_view::SearchView::new(panel, dpi),
         last_view: SidebarView::Notebook,
         drag_width: None,
@@ -520,6 +524,7 @@ pub(crate) fn layout(hwnd: HWND, client: RECT, dpi: u32) {
 pub(crate) fn refresh_metrics(hwnd: HWND) {
     if let Some((_, panel)) = windows(hwnd) {
         crate::window::favorites_view::refresh_metrics(hwnd, panel);
+        crate::window::tags_view::refresh_metrics(hwnd, panel);
     }
 }
 
@@ -589,11 +594,19 @@ fn refresh_now(hwnd: HWND) {
     crate::window::notebook_view::editors_changed(hwnd);
     crate::window::notebook_view::rebuild(hwnd);
     crate::window::favorites_view::refresh(hwnd, panel);
+    crate::window::tags_view::refresh(hwnd, panel);
     crate::window::search_view::library_changed(hwnd);
     update_tools(hwnd);
     unsafe {
         InvalidateRect(bar, std::ptr::null(), 0);
         InvalidateRect(panel, std::ptr::null(), 0);
+    }
+}
+
+/// The note index changed (a build landed): only the Tags view reads it.
+pub(crate) fn index_changed(hwnd: HWND) {
+    if let Some((_, panel)) = windows(hwnd) {
+        with_accessible_events(hwnd, || crate::window::tags_view::refresh(hwnd, panel));
     }
 }
 
@@ -729,6 +742,7 @@ fn with_accessible_view<R>(
         SidebarView::Notebook => Some(f(&mut sidebar.notebook, client, dpi, focused)),
         SidebarView::Search => Some(f(&mut sidebar.search, client, dpi, focused)),
         SidebarView::Favorites => Some(f(&mut sidebar.favorites, client, dpi, focused)),
+        SidebarView::Tags => Some(f(&mut sidebar.tags, client, dpi, focused)),
         SidebarView::Hidden => None,
     }
 }
@@ -766,6 +780,7 @@ fn accessible_container(panel: HWND) -> (String, u32) {
         }
         SidebarView::Search => ("Search results".to_owned(), ROLE_SYSTEM_LIST),
         SidebarView::Favorites => ("Favorite notebooks".to_owned(), ROLE_SYSTEM_LIST),
+        SidebarView::Tags => ("Tags".to_owned(), ROLE_SYSTEM_OUTLINE),
         SidebarView::Hidden => ("Side panel".to_owned(), ROLE_SYSTEM_PANE),
     }
 }
@@ -806,7 +821,7 @@ fn accessible_generation(panel: HWND) -> u64 {
     let view = current_view(main) as u64;
     let generation =
         with_accessible_view(panel, |view, _, _, _| view.accessible_generation()).unwrap_or(0);
-    generation.wrapping_mul(4).wrapping_add(view)
+    generation.wrapping_mul(8).wrapping_add(view)
 }
 
 /// A child's default action: a click on its center, after scrolling it into view.
@@ -876,7 +891,7 @@ pub(crate) fn announcing() -> bool {
     ANNOUNCING.get()
 }
 
-/// The activity-bar button the keyboard is on (0 Notebook, 1 Search, 2 Favorites, 3 Settings).
+/// The activity-bar button the keyboard is on (0 Notebook, 1 Search, 2 Favorites, 3 Tags, 4 Settings).
 pub(crate) fn bar_focus(hwnd: HWND) -> usize {
     unsafe { super::main_window::app_ptr(hwnd) }
         .and_then(|app| {
@@ -892,7 +907,7 @@ pub(crate) fn set_bar_focus(hwnd: HWND, index: usize) {
     if let Some(mut app) = unsafe { super::main_window::app_ptr(hwnd) }
         && let Some(sidebar) = unsafe { app.as_mut() }.sidebar.as_mut()
     {
-        sidebar.bar_focus = index.min(3);
+        sidebar.bar_focus = index.min(activity_bar::BUTTONS - 1);
     }
 }
 
@@ -902,6 +917,7 @@ pub(crate) fn view_button(view: SidebarView) -> Option<usize> {
         SidebarView::Notebook => Some(0),
         SidebarView::Search => Some(1),
         SidebarView::Favorites => Some(2),
+        SidebarView::Tags => Some(3),
         SidebarView::Hidden => None,
     }
 }
@@ -1161,6 +1177,7 @@ fn paint_view(main: HWND, view: PanelView, paint: &ViewPaint) {
         }
         PanelView::Search => crate::window::search_view::paint(main, paint),
         PanelView::Favorites => crate::window::favorites_view::paint(main, paint),
+        PanelView::Tags => crate::window::tags_view::paint(main, paint),
     }
 }
 
@@ -1182,6 +1199,7 @@ fn view_mouse(
         PanelView::Favorites => {
             crate::window::favorites_view::handle(main, panel, message, wparam, lparam)
         }
+        PanelView::Tags => crate::window::tags_view::handle(main, panel, message, wparam, lparam),
     }
 }
 
@@ -1203,7 +1221,7 @@ fn view_key(
 /// and the padding painted around it), nor the Favorites header's Open notebook… button.
 fn header_is_caption(main: HWND, view: PanelView, panel: HWND, x: i32, y: i32) -> bool {
     match view {
-        PanelView::Notebook => true,
+        PanelView::Notebook | PanelView::Tags => true,
         PanelView::Search => !crate::window::search_view::header_hit(main, panel, x, y),
         PanelView::Favorites => {
             let mut client = RECT::default();

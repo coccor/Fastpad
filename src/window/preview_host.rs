@@ -1093,6 +1093,13 @@ fn follow(hwnd: HWND, dest: String) {
                 host_window::report_open_failure(hwnd, &path, &error);
             }
         }
+        LinkAction::Tag(tag) => {
+            if crate::window::library_host::folder(hwnd).is_some() {
+                crate::window::tags_view::reveal(hwnd, &tag);
+            } else {
+                host_window::push_notice(hwnd, "Open a notebook to browse its tags.".to_owned());
+            }
+        }
         LinkAction::Ignored => {
             host_window::push_notice(
                 hwnd,

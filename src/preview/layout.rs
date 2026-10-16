@@ -185,7 +185,7 @@ pub fn block_has_target(kind: &BlockKind) -> bool {
     let rich = |text: &RichText| {
         text.spans
             .iter()
-            .any(|span| matches!(span.style, InlineStyle::Link(_)))
+            .any(|span| matches!(span.style, InlineStyle::Link(_) | InlineStyle::Tag(_)))
     };
     match kind {
         BlockKind::Heading { text, .. } | BlockKind::Paragraph { text, .. } => rich(text),
@@ -404,7 +404,7 @@ impl<'a> LayoutContext<'a> {
                                 layout.SetTypography(&typography, range)
                             })
                     }
-                    InlineStyle::Link(_) => {
+                    InlineStyle::Link(_) | InlineStyle::Tag(_) => {
                         layout.SetDrawingEffect(self.brushes.get(ColorRole::Link), range)
                     }
                     // Drawn as a fill behind the text by `push_laid_text`.
@@ -814,6 +814,36 @@ fn push_laid_text(
                 scrolls,
                 clip: None,
             }),
+            // A chip with an outline, which stays visible in high contrast, where the code
+            // background is the page's own color. A click shows the tag in the Tags view.
+            InlineStyle::Tag(name) => {
+                let rects = range_rects(&layout, span.range.start, span.range.end, x, y)?;
+                for rect in &rects {
+                    let rect = rect.inflate(2.0 * unit);
+                    output.ops.push(DrawOp::RoundedFill {
+                        rect,
+                        radius: 4.0 * unit,
+                        role: ColorRole::CodeBackground,
+                    });
+                    output.ops.push(DrawOp::RoundedStroke {
+                        rect,
+                        radius: 4.0 * unit,
+                        role: ColorRole::Border,
+                    });
+                }
+                output.targets.push(Target {
+                    kind: TargetKind::Link(format!(
+                        "{}{name}",
+                        crate::preview::model::TAG_LINK_PREFIX
+                    )),
+                    text: format!("Tag {name}"),
+                    rects,
+                    layout: layout.clone(),
+                    range: text_range(span.range.start, span.range.end),
+                    scrolls,
+                    clip: None,
+                });
+            }
             _ => {}
         }
     }

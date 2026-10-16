@@ -488,6 +488,9 @@ pub(super) fn execute_command_with_note(
         CommandId::ShowFavoritesView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Favorites, true)
         }
+        CommandId::ShowTagsView => {
+            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, true)
+        }
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);

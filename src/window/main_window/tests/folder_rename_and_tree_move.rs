@@ -379,6 +379,11 @@ fn tree_move_a_vanished_or_locked_source_says_so_and_moves_nothing() {
     let gone = scratch.note("gone.md", "g");
     let locked = scratch.note("locked.md", "l");
     let (window, _editor) = notebook_window(&scratch);
+    // The note index reads every note once the notebook loads; the exclusive lock below must not
+    // race it.
+    pump_until(window.hwnd, || {
+        crate::window::library_host::index_loaded(window.hwnd)
+    });
     std::fs::remove_file(&gone).unwrap();
     let _lock = std::fs::OpenOptions::new()
         .read(true)

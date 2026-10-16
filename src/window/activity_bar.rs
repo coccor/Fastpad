@@ -23,10 +23,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS,
 };
 
-/// Segoe MDL2 Assets glyphs: Book, Search, FavoriteStar, Setting.
+/// Segoe MDL2 Assets glyphs: Book, Search, FavoriteStar, Tag, Setting.
 const GLYPH_NOTEBOOK: &str = "\u{E82D}";
 const GLYPH_SEARCH: &str = "\u{E721}";
 const GLYPH_FAVORITES: &str = "\u{E734}";
+const GLYPH_TAGS: &str = "\u{E8EC}";
 const GLYPH_SETTINGS: &str = "\u{E713}";
 const ACCENT_WIDTH_96: i32 = 2;
 
@@ -35,14 +36,19 @@ pub(crate) enum ActivityButton {
     Notebook,
     Search,
     Favorites,
+    Tags,
     Settings,
 }
 
+/// How many buttons the bar has.
+pub(crate) const BUTTONS: usize = ActivityButton::ALL.len();
+
 impl ActivityButton {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Notebook,
         Self::Search,
         Self::Favorites,
+        Self::Tags,
         Self::Settings,
     ];
 
@@ -56,6 +62,7 @@ impl ActivityButton {
             Self::Notebook => Some(SidebarView::Notebook),
             Self::Search => Some(SidebarView::Search),
             Self::Favorites => Some(SidebarView::Favorites),
+            Self::Tags => Some(SidebarView::Tags),
             Self::Settings => None,
         }
     }
@@ -66,6 +73,7 @@ impl ActivityButton {
             Self::Notebook => "Notebook",
             Self::Search => "Search",
             Self::Favorites => "Favorites",
+            Self::Tags => "Tags",
             Self::Settings => "Settings",
         }
     }
@@ -75,6 +83,7 @@ impl ActivityButton {
             Self::Notebook => GLYPH_NOTEBOOK,
             Self::Search => GLYPH_SEARCH,
             Self::Favorites => GLYPH_FAVORITES,
+            Self::Tags => GLYPH_TAGS,
             Self::Settings => GLYPH_SETTINGS,
         }
     }
@@ -93,7 +102,7 @@ pub(crate) struct BarState {
 /// `ActivityButton::index`. The view buttons are bar-wide squares stacked down from the bottom of
 /// the title strip (`titlebar::strip_height`), whose share of the bar is caption. Settings sits at
 /// the bottom and never covers them.
-pub(crate) fn button_rects(client: RECT, dpi: u32) -> [RECT; 4] {
+pub(crate) fn button_rects(client: RECT, dpi: u32) -> [RECT; BUTTONS] {
     let size = (client.right - client.left).max(0);
     let top = client.top + crate::window::titlebar::strip_height(dpi);
     let square = |top: i32| RECT {
@@ -102,11 +111,12 @@ pub(crate) fn button_rects(client: RECT, dpi: u32) -> [RECT; 4] {
         right: client.left + size,
         bottom: top + size,
     };
-    let settings_top = (client.bottom - size).max(top + 3 * size);
+    let settings_top = (client.bottom - size).max(top + 4 * size);
     [
         square(top),
         square(top + size),
         square(top + 2 * size),
+        square(top + 3 * size),
         square(settings_top),
     ]
 }
@@ -128,7 +138,7 @@ pub(crate) fn logo_rect(client: RECT, dpi: u32) -> RECT {
     }
 }
 
-pub(crate) fn button_at(rects: &[RECT; 4], x: i32, y: i32) -> Option<ActivityButton> {
+pub(crate) fn button_at(rects: &[RECT; BUTTONS], x: i32, y: i32) -> Option<ActivityButton> {
     ActivityButton::ALL.into_iter().find(|button| {
         let rect = rects[button.index()];
         x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
@@ -144,7 +154,7 @@ pub(crate) fn notebook_label(name: Option<&str>) -> String {
     }
 }
 
-fn rects_for(bar: HWND) -> [RECT; 4] {
+fn rects_for(bar: HWND) -> [RECT; BUTTONS] {
     let mut client = RECT::default();
     unsafe { GetClientRect(bar, &mut client) };
     button_rects(client, unsafe { GetDpiForWindow(bar) }.max(96))
@@ -354,7 +364,7 @@ fn paint(main: HWND, bar: HWND) {
 
 /// The four buttons as MSAA children, in `button_rects` order.
 pub(crate) fn bar_items(
-    rects: [RECT; 4],
+    rects: [RECT; BUTTONS],
     view: SidebarView,
     notebook: Option<&str>,
     focused: Option<usize>,
@@ -410,7 +420,7 @@ fn bar_container(_: HWND) -> (String, u32) {
 }
 
 fn bar_count(_: HWND) -> usize {
-    4
+    BUTTONS
 }
 
 fn bar_item(bar: HWND, index: usize) -> Option<AccessibleItem> {
@@ -485,9 +495,9 @@ pub(crate) fn key_down(bar: HWND, key: u16) -> bool {
     let focus = super::side_panel::bar_focus(main);
     let next = match key {
         VK_UP => focus.saturating_sub(1),
-        VK_DOWN => (focus + 1).min(3),
+        VK_DOWN => (focus + 1).min(BUTTONS - 1),
         VK_HOME => 0,
-        VK_END => 3,
+        VK_END => BUTTONS - 1,
         VK_RETURN | VK_SPACE => {
             bar_activate(bar, focus);
             return true;
@@ -548,9 +558,10 @@ mod tests {
         assert_eq!(edges(rects[0]), (0, 40, 44, 84));
         assert_eq!(edges(rects[1]), (0, 84, 44, 128));
         assert_eq!(edges(rects[2]), (0, 128, 44, 172));
-        assert_eq!(edges(rects[3]), (0, 656, 44, 700));
+        assert_eq!(edges(rects[3]), (0, 172, 44, 216));
+        assert_eq!(edges(rects[4]), (0, 656, 44, 700));
         let short = button_rects(bar(44, 150), 96);
-        assert_eq!(short[3].top, short[2].bottom);
+        assert_eq!(short[4].top, short[3].bottom);
         assert_eq!(button_at(&rects, 10, 50), Some(ActivityButton::Notebook));
         assert_eq!(button_at(&rects, 10, 130), Some(ActivityButton::Favorites));
         assert_eq!(button_at(&rects, 10, 690), Some(ActivityButton::Settings));
@@ -600,6 +611,7 @@ mod tests {
             ActivityButton::Favorites.view(),
             Some(SidebarView::Favorites)
         );
+        assert_eq!(ActivityButton::Tags.view(), Some(SidebarView::Tags));
         assert_eq!(ActivityButton::Settings.view(), None);
         for (index, button) in ActivityButton::ALL.into_iter().enumerate() {
             assert_eq!(button.index(), index);

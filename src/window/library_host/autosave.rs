@@ -263,9 +263,14 @@ pub(crate) fn document_saved(hwnd: HWND) {
         Some((path, promoted || resolved))
     });
     let (path, promoted) = saved.unwrap_or((None, false));
+    // A saved Markdown note's tags and front matter go into the index (spec §6.4).
+    let indexed = path.as_deref().is_some_and(library::index::is_indexed);
     let inserted = path
         .and_then(|path| with_state(hwnd, |state| state.add_note(&path)))
         .unwrap_or(false);
+    if indexed {
+        request_index(hwnd);
+    }
     close_stale_name_box(hwnd);
     if inserted || crate::window::notebook_view::stale(hwnd) {
         crate::window::side_panel::refresh(hwnd);

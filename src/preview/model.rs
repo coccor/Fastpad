@@ -8,10 +8,15 @@ use pulldown_cmark::{
 };
 use std::ops::Range;
 
-/// GitHub-flavored extensions the preview renders. Footnotes, math, and metadata stay literal.
+/// GitHub-flavored extensions the preview renders, and YAML front matter, which shows as a table
+/// of its properties (second brain phase 1 spec §6.2). Footnotes and math stay literal.
 pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_STRIKETHROUGH)
-    .union(Options::ENABLE_TASKLISTS);
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+
+/// The link destination a `#tag` in the preview opens: the Tags view, at that tag.
+pub const TAG_LINK_PREFIX: &str = "fastpad-tag:";
 
 /// Open inline styles beyond this depth apply no style.
 const MAX_OPEN_STYLES: usize = 64;
@@ -151,6 +156,9 @@ pub enum InlineStyle {
     Mark,
     Small,
     Keyboard,
+    /// An inline `#tag` (second brain phase 1 spec §6.3), by its name without `#`: drawn as a chip
+    /// that shows the tag in the Tags view.
+    Tag(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,6 +410,34 @@ impl TextBuilder {
         self.utf16_len += value.encode_utf16().count() as u32;
     }
 
+    /// Markdown prose: `#tags` in it become `InlineStyle::Tag` spans (second brain phase 1 spec
+    /// §6.3), except inside a link or an image's alt text, and only where a tag may start: after
+    /// whitespace or `(`, or at the start of the text.
+    fn push_prose(&mut self, value: &str) {
+        let in_link = self.open.iter().any(|open| {
+            matches!(open.style, Some(InlineStyle::Link(_))) || open.tag.as_deref() == Some("a")
+        });
+        if in_link || !self.image_stack.is_empty() || !value.contains('#') {
+            self.push(value);
+            return;
+        }
+        let before = self.text.chars().next_back();
+        let mut done = 0;
+        for (at, name) in crate::library::facts::inline_tags(value) {
+            // The run starts a tag only if the text before it allows one.
+            if at == 0 && before.is_some_and(|c| !c.is_whitespace() && c != '(') {
+                continue;
+            }
+            self.push(&value[done..at]);
+            let end = at + 1 + name.len();
+            self.open(Some(InlineStyle::Tag(name.to_owned())), None);
+            self.push(&value[at..end]);
+            self.close_markdown();
+            done = end;
+        }
+        self.push(&value[done..]);
+    }
+
     /// HTML text: whitespace runs collapse to one space, and a line never starts with a space.
     fn push_html(&mut self, value: &str) {
         self.html = true;
@@ -641,6 +677,8 @@ struct Builder {
     sanitizer: Sanitizer,
     /// The `<source>` candidates of the open `<picture>`.
     picture: Option<Vec<ImageSource>>,
+    /// The front matter being read: its text, made into a properties table when it ends.
+    metadata: Option<String>,
 }
 
 impl Builder {
@@ -733,13 +771,17 @@ impl Builder {
     }
 
     fn text(&mut self, value: &str) {
+        if let Some(metadata) = &mut self.metadata {
+            metadata.push_str(value);
+            return;
+        }
         if self.sanitizer.is_removing() {
             return;
         }
         if let Some(Frame::Code { text, .. }) = self.stack.last_mut() {
             text.push_str(value);
         } else if let Some(target) = self.inline_target() {
-            target.push(value);
+            target.push_prose(value);
         }
     }
 
@@ -846,6 +888,7 @@ impl Builder {
             }),
             Tag::TableHead | Tag::TableRow => self.stack.push(Frame::Row(Vec::new())),
             Tag::TableCell => self.stack.push(Frame::Cell(TextBuilder::default())),
+            Tag::MetadataBlock(_) => self.metadata = Some(String::new()),
             // Not enabled by PARSE_OPTIONS; their content flows into the enclosing block.
             _ => {}
         }
@@ -853,6 +896,15 @@ impl Builder {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
+            TagEnd::MetadataBlock(_) => {
+                if let Some(table) = self
+                    .metadata
+                    .take()
+                    .and_then(|text| front_matter_table(&text))
+                {
+                    self.add_block(table);
+                }
+            }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
                 if let Some(target) = self.inline_target() {
                     target.close_markdown();
@@ -1171,6 +1223,24 @@ impl Builder {
         self.flush_loose_text();
         self.attach(kind);
     }
+}
+
+/// Front matter's text (between its `---` lines) as a two-column table of its properties, or
+/// `None` when it has none FastPad can read.
+fn front_matter_table(text: &str) -> Option<BlockKind> {
+    let front = crate::library::frontmatter::parse(&format!("---\n{text}\n---\n"))?;
+    if front.entries.is_empty() {
+        return None;
+    }
+    Some(BlockKind::Table {
+        alignments: vec![CellAlign::Left, CellAlign::Left],
+        head: vec![RichText::plain("Property"), RichText::plain("Value")],
+        rows: front
+            .entries
+            .iter()
+            .map(|(key, value)| vec![RichText::plain(key), RichText::plain(&value.display())])
+            .collect(),
+    })
 }
 
 fn finish_block(frame: Frame) -> Option<BlockKind> {

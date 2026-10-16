@@ -163,6 +163,8 @@ pub enum CommandId {
     NoteCompareWithDisk = 266,
     NotesShowChanged = 267,
     NotesClearChanged = 268,
+    // The note index (second brain phase 1 spec §8).
+    ShowTagsView = 269,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -321,6 +323,7 @@ impl CommandId {
                 | Self::ToggleReloadChangedFiles
                 | Self::NotesShowChanged
                 | Self::NotesClearChanged
+                | Self::ShowTagsView
                 | Self::ToggleNotesMode
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
@@ -382,6 +385,7 @@ impl CommandId {
                 | Self::ShowNotebookView
                 | Self::ShowSearchView
                 | Self::ShowFavoritesView
+                | Self::ShowTagsView
                 | Self::SearchToggleCase
                 | Self::SearchToggleWholeWord
                 | Self::SearchToggleRegex
@@ -492,7 +496,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 158] = [
+        const COMMANDS: [CommandId; 159] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -651,6 +655,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::NoteCompareWithDisk,
             CommandId::NotesShowChanged,
             CommandId::NotesClearChanged,
+            CommandId::ShowTagsView,
         ];
         COMMANDS
             .into_iter()
@@ -979,7 +984,10 @@ mod tests {
         assert_eq!(CommandId::try_from(268), Ok(CommandId::NotesClearChanged));
         assert!(!CommandId::NotesShowChanged.needs_document());
         assert!(!CommandId::NotesClearChanged.needs_document());
-        assert!(CommandId::try_from(269).is_err());
+        assert_eq!(CommandId::try_from(269), Ok(CommandId::ShowTagsView));
+        assert!(!CommandId::ShowTagsView.needs_document());
+        assert!(CommandId::ShowTagsView.is_sidebar());
+        assert!(CommandId::try_from(270).is_err());
     }
 
     #[test]

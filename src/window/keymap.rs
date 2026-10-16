@@ -250,6 +250,7 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::ShowNotebookView, "view.showNotebook"),
     (CommandId::ShowSearchView, "view.showSearch"),
     (CommandId::ShowFavoritesView, "view.showFavorites"),
+    (CommandId::ShowTagsView, "view.showTags"),
     (CommandId::FocusNextPane, "view.focusNextPane"),
     (CommandId::FocusPreviousPane, "view.focusPreviousPane"),
     (CommandId::SplitRight, "view.splitRight"),
