@@ -23,17 +23,112 @@ pub struct TagUse {
     pub source: TagSource,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkKind {
+    /// `[[target]]`, `[[target#heading|label]]`.
+    Wiki,
+    /// `[label](relative/path.md)`: a link to a file, not a web page.
+    Markdown,
+    /// `![alt](attachments/image.png)`: an image or other file shown inline.
+    Image,
+}
+
+/// One link in a note (spec §7.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkUse {
+    /// What it points at, as written: a wikilink's target without `#heading`, or a Markdown
+    /// link's destination without `#fragment`, percent-encoded as written.
+    pub target: String,
+    pub heading: Option<String>,
+    /// 0-based line of the link.
+    pub line: u32,
+    pub kind: LinkKind,
+    /// Byte range of `target` in the note, for rewriting it after a rename.
+    pub start: u32,
+    pub end: u32,
+}
+
+/// A note's links are capped here; more are dropped (spec §6.4).
+pub const MAX_LINKS: usize = 2000;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NoteFacts {
     pub aliases: Vec<String>,
     pub tags: Vec<TagUse>,
+    pub links: Vec<LinkUse>,
     /// Front matter keys other than tags and aliases, each value as one line of text.
     pub properties: Vec<(String, String)>,
 }
 
-/// The parser options the index reads notes with: the preview's, plus front matter.
+/// The parser options the index reads notes with: the preview's, plus front matter and
+/// wikilinks.
 pub fn options() -> Options {
-    crate::preview::model::PARSE_OPTIONS.union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
+    crate::preview::model::PARSE_OPTIONS
+        .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
+        .union(Options::ENABLE_WIKILINKS)
+}
+
+/// Whether a Markdown link destination may be a file in the notebook: no scheme (`https:`,
+/// `mailto:`), not just a `#fragment`, not a network path.
+fn is_local_destination(dest: &str) -> bool {
+    let dest = dest.trim();
+    if dest.is_empty()
+        || dest.starts_with('#')
+        || dest.starts_with("//")
+        || dest.starts_with("\\\\")
+    {
+        return false;
+    }
+    let scheme = dest.find(':').is_some_and(|colon| {
+        colon > 1
+            && dest[..colon]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    !scheme
+}
+
+/// The parts of the `[[…]]` at the start of `source` (a wikilink's own text): its target's byte
+/// range within `source`, and its `#heading`.
+fn wikilink_parts(source: &str) -> Option<(std::ops::Range<usize>, Option<String>)> {
+    let inner_start = source.find("[[")? + 2;
+    let inner_end = inner_start + source[inner_start..].find("]]")?;
+    let inner = &source[inner_start..inner_end];
+    let before_label = inner.find('|').map_or(inner, |bar| &inner[..bar]);
+    let (target, heading) = match before_label.find('#') {
+        Some(hash) => (
+            &before_label[..hash],
+            Some(before_label[hash + 1..].trim().to_owned()).filter(|heading| !heading.is_empty()),
+        ),
+        None => (before_label, None),
+    };
+    let lead = target.len() - target.trim_start().len();
+    let start = inner_start + lead;
+    Some((start..start + target.trim().len(), heading))
+}
+
+/// The destination's byte range within `source`, a Markdown link's or image's own text
+/// (`[label](dest "title")`), and its `#fragment`.
+fn markdown_destination(source: &str) -> Option<(std::ops::Range<usize>, Option<String>)> {
+    let open = source.rfind("](")? + 2;
+    let rest = &source[open..];
+    let (offset, dest) = if let Some(angled) = rest.strip_prefix('<') {
+        (1, &angled[..angled.find('>')?])
+    } else {
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ')')
+            .unwrap_or(rest.len());
+        (0, &rest[..end])
+    };
+    let (path, fragment) = match dest.find('#') {
+        Some(hash) => (&dest[..hash], Some(dest[hash + 1..].to_owned())),
+        None => (dest, None),
+    };
+    let start = open + offset;
+    Some((
+        start..start + path.len(),
+        fragment.filter(|f| !f.is_empty()),
+    ))
 }
 
 /// Reads `text`'s facts.
@@ -69,6 +164,54 @@ pub fn note_facts(text: &str) -> NoteFacts {
     // Inline HTML elements open in the current block (`<span>#x</span>`).
     let mut inline_html = 0usize;
     for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+        // Links are read from their own source text. Code and HTML never produce link events.
+        if let Event::Start(
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }
+            | Tag::Image {
+                link_type,
+                dest_url,
+                ..
+            },
+        ) = &event
+            && facts.links.len() < MAX_LINKS
+        {
+            let source = &text[range.clone()];
+            let image = matches!(event, Event::Start(Tag::Image { .. }));
+            let parts = match link_type {
+                pulldown_cmark::LinkType::WikiLink { .. } => {
+                    wikilink_parts(source).map(|parts| (LinkKind::Wiki, parts))
+                }
+                pulldown_cmark::LinkType::Inline if is_local_destination(dest_url) => {
+                    markdown_destination(source).map(|parts| {
+                        (
+                            if image {
+                                LinkKind::Image
+                            } else {
+                                LinkKind::Markdown
+                            },
+                            parts,
+                        )
+                    })
+                }
+                _ => None,
+            };
+            if let Some((kind, (target, heading))) = parts
+                && !target.is_empty()
+            {
+                facts.links.push(LinkUse {
+                    target: source[target.clone()].to_owned(),
+                    heading,
+                    line: line_of(range.start),
+                    kind,
+                    start: (range.start + target.start) as u32,
+                    end: (range.start + target.end) as u32,
+                });
+            }
+        }
         match event {
             Event::InlineHtml(html) => {
                 if html.starts_with("</") {
@@ -253,5 +396,96 @@ mod tests {
     fn nested_tags_name_their_parents() {
         assert_eq!(parent_tags("a/b/c").collect::<Vec<_>>(), ["a", "a/b"]);
         assert_eq!(parent_tags("a").count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn links(text: &str) -> Vec<(String, Option<String>, LinkKind, String)> {
+        note_facts(text)
+            .links
+            .into_iter()
+            .map(|link| {
+                let span = text[link.start as usize..link.end as usize].to_owned();
+                (link.target, link.heading, link.kind, span)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_wikilink_form_is_read_with_its_target_range() {
+        let found = links(
+            "See [[Plan]], [[Project Atlas|Atlas]], [[Plan#Goals]], [[ sub/Note #Top | x ]] \
+             and [[#Local]].",
+        );
+        assert_eq!(
+            found,
+            [
+                ("Plan".into(), None, LinkKind::Wiki, "Plan".into()),
+                (
+                    "Project Atlas".into(),
+                    None,
+                    LinkKind::Wiki,
+                    "Project Atlas".into()
+                ),
+                (
+                    "Plan".into(),
+                    Some("Goals".into()),
+                    LinkKind::Wiki,
+                    "Plan".into()
+                ),
+                (
+                    "sub/Note".into(),
+                    Some("Top".into()),
+                    LinkKind::Wiki,
+                    "sub/Note".into()
+                ),
+            ],
+            "a same-note [[#heading]] has no target"
+        );
+    }
+
+    #[test]
+    fn markdown_links_to_files_and_images_count_but_web_links_do_not() {
+        let found = links(
+            "[plan](plan.md) [web](https://x.dev) [mail](mailto:a@b) [frag](#top) \
+             [sp](<my notes/a b.md>) [enc](my%20note.md#part) ![shot](att/s.png \"t\")",
+        );
+        assert_eq!(
+            found,
+            [
+                ("plan.md".into(), None, LinkKind::Markdown, "plan.md".into()),
+                (
+                    "my notes/a b.md".into(),
+                    None,
+                    LinkKind::Markdown,
+                    "my notes/a b.md".into()
+                ),
+                (
+                    "my%20note.md".into(),
+                    Some("part".into()),
+                    LinkKind::Markdown,
+                    "my%20note.md".into()
+                ),
+                (
+                    "att/s.png".into(),
+                    None,
+                    LinkKind::Image,
+                    "att/s.png".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn links_in_code_are_not_links_and_lines_are_counted() {
+        let facts = note_facts("`[[a]]`\n\n```\n[[b]]\n```\n\nreal [[c]]\n");
+        assert_eq!(facts.links.len(), 1);
+        assert_eq!(
+            (facts.links[0].target.as_str(), facts.links[0].line),
+            ("c", 6)
+        );
     }
 }

@@ -11,6 +11,7 @@ mod autosave;
 mod external;
 mod folders;
 mod index;
+mod links;
 mod load;
 mod local_state;
 mod naming;
@@ -25,6 +26,7 @@ pub(crate) use autosave::*;
 pub(crate) use external::*;
 pub(crate) use folders::*;
 pub(crate) use index::*;
+pub(crate) use links::*;
 pub(crate) use load::*;
 pub(crate) use local_state::*;
 pub(crate) use naming::*;
@@ -119,6 +121,10 @@ pub(crate) struct LibraryHost {
     pub(crate) index_running: bool,
     /// A request arrived while a build ran: one more runs after it.
     pub(crate) index_again: bool,
+    /// Notes the scans found renamed outside FastPad (relative old and new paths) whose links
+    /// were not updated yet (second brain phase 1 spec §7.6), and whether a notice said so.
+    pub(crate) renamed_outside: Vec<(PathBuf, PathBuf)>,
+    pub(crate) renamed_outside_told: bool,
 }
 
 impl LibraryHost {
@@ -152,6 +158,8 @@ impl LibraryHost {
             index_loaded: false,
             index_running: false,
             index_again: false,
+            renamed_outside: Vec::new(),
+            renamed_outside_told: false,
         }
     }
 }

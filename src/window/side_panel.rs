@@ -135,6 +135,7 @@ pub(crate) struct Sidebar {
     pub(crate) notebook: crate::window::notebook_view::NotebookView,
     pub(crate) favorites: crate::window::favorites_view::FavoritesView,
     pub(crate) tags: crate::window::tags_view::TagsView,
+    pub(crate) links: crate::window::links_view::LinksView,
     pub(crate) search: crate::window::search_view::SearchView,
     /// The view Ctrl+B reopens while the panel is closed.
     last_view: SidebarView,
@@ -193,6 +194,7 @@ pub(crate) enum PanelView {
     Search,
     Favorites,
     Tags,
+    Links,
 }
 
 impl PanelView {
@@ -202,6 +204,7 @@ impl PanelView {
             SidebarView::Search => Some(Self::Search),
             SidebarView::Favorites => Some(Self::Favorites),
             SidebarView::Tags => Some(Self::Tags),
+            SidebarView::Links => Some(Self::Links),
             SidebarView::Hidden => None,
         }
     }
@@ -390,6 +393,7 @@ pub(crate) fn create(hwnd: HWND) -> crate::Result<Sidebar> {
         notebook: crate::window::notebook_view::NotebookView::new(panel),
         favorites: crate::window::favorites_view::FavoritesView::new(dpi),
         tags: crate::window::tags_view::TagsView::new(dpi),
+        links: crate::window::links_view::LinksView::new(dpi),
         search: crate::window::search_view::SearchView::new(panel, dpi),
         last_view: SidebarView::Notebook,
         drag_width: None,
@@ -525,6 +529,7 @@ pub(crate) fn refresh_metrics(hwnd: HWND) {
     if let Some((_, panel)) = windows(hwnd) {
         crate::window::favorites_view::refresh_metrics(hwnd, panel);
         crate::window::tags_view::refresh_metrics(hwnd, panel);
+        crate::window::links_view::refresh_metrics(hwnd, panel);
     }
 }
 
@@ -561,6 +566,10 @@ fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
     if view == SidebarView::Notebook && crate::window::notebook_view::stale(hwnd) {
         crate::window::notebook_view::rebuild(hwnd);
     }
+    // The Links view is built only while it shows, so it catches up when it opens.
+    if view == SidebarView::Links {
+        crate::window::links_view::refresh(hwnd, panel);
+    }
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
     if focus && view != SidebarView::Hidden && is_shown(panel) {
@@ -595,6 +604,9 @@ fn refresh_now(hwnd: HWND) {
     crate::window::notebook_view::rebuild(hwnd);
     crate::window::favorites_view::refresh(hwnd, panel);
     crate::window::tags_view::refresh(hwnd, panel);
+    if current_view(hwnd) == SidebarView::Links {
+        crate::window::links_view::refresh(hwnd, panel);
+    }
     crate::window::search_view::library_changed(hwnd);
     update_tools(hwnd);
     unsafe {
@@ -603,10 +615,15 @@ fn refresh_now(hwnd: HWND) {
     }
 }
 
-/// The note index changed (a build landed): only the Tags view reads it.
+/// The note index changed (a build landed): the Tags and Links views read it.
 pub(crate) fn index_changed(hwnd: HWND) {
     if let Some((_, panel)) = windows(hwnd) {
-        with_accessible_events(hwnd, || crate::window::tags_view::refresh(hwnd, panel));
+        with_accessible_events(hwnd, || {
+            crate::window::tags_view::refresh(hwnd, panel);
+            if current_view(hwnd) == SidebarView::Links {
+                crate::window::links_view::refresh(hwnd, panel);
+            }
+        });
     }
 }
 
@@ -616,6 +633,10 @@ fn active_tab_changed_now(hwnd: HWND) {
         return;
     };
     crate::window::notebook_view::active_tab_changed(hwnd);
+    // The Links view follows the active note (second brain phase 1 spec §7.5).
+    if current_view(hwnd) == SidebarView::Links {
+        crate::window::links_view::refresh(hwnd, panel);
+    }
     unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
 }
 
@@ -743,6 +764,7 @@ fn with_accessible_view<R>(
         SidebarView::Search => Some(f(&mut sidebar.search, client, dpi, focused)),
         SidebarView::Favorites => Some(f(&mut sidebar.favorites, client, dpi, focused)),
         SidebarView::Tags => Some(f(&mut sidebar.tags, client, dpi, focused)),
+        SidebarView::Links => Some(f(&mut sidebar.links, client, dpi, focused)),
         SidebarView::Hidden => None,
     }
 }
@@ -781,6 +803,7 @@ fn accessible_container(panel: HWND) -> (String, u32) {
         SidebarView::Search => ("Search results".to_owned(), ROLE_SYSTEM_LIST),
         SidebarView::Favorites => ("Favorite notebooks".to_owned(), ROLE_SYSTEM_LIST),
         SidebarView::Tags => ("Tags".to_owned(), ROLE_SYSTEM_OUTLINE),
+        SidebarView::Links => ("Links".to_owned(), ROLE_SYSTEM_OUTLINE),
         SidebarView::Hidden => ("Side panel".to_owned(), ROLE_SYSTEM_PANE),
     }
 }
@@ -891,7 +914,8 @@ pub(crate) fn announcing() -> bool {
     ANNOUNCING.get()
 }
 
-/// The activity-bar button the keyboard is on (0 Notebook, 1 Search, 2 Favorites, 3 Tags, 4 Settings).
+/// The activity-bar button the keyboard is on (0 Notebook, 1 Search, 2 Favorites, 3 Tags, 4 Links,
+/// 5 Settings).
 pub(crate) fn bar_focus(hwnd: HWND) -> usize {
     unsafe { super::main_window::app_ptr(hwnd) }
         .and_then(|app| {
@@ -918,6 +942,7 @@ pub(crate) fn view_button(view: SidebarView) -> Option<usize> {
         SidebarView::Search => Some(1),
         SidebarView::Favorites => Some(2),
         SidebarView::Tags => Some(3),
+        SidebarView::Links => Some(4),
         SidebarView::Hidden => None,
     }
 }
@@ -1178,6 +1203,7 @@ fn paint_view(main: HWND, view: PanelView, paint: &ViewPaint) {
         PanelView::Search => crate::window::search_view::paint(main, paint),
         PanelView::Favorites => crate::window::favorites_view::paint(main, paint),
         PanelView::Tags => crate::window::tags_view::paint(main, paint),
+        PanelView::Links => crate::window::links_view::paint(main, paint),
     }
 }
 
@@ -1200,6 +1226,7 @@ fn view_mouse(
             crate::window::favorites_view::handle(main, panel, message, wparam, lparam)
         }
         PanelView::Tags => crate::window::tags_view::handle(main, panel, message, wparam, lparam),
+        PanelView::Links => crate::window::links_view::handle(main, panel, message, wparam, lparam),
     }
 }
 
@@ -1221,7 +1248,7 @@ fn view_key(
 /// and the padding painted around it), nor the Favorites header's Open notebook… button.
 fn header_is_caption(main: HWND, view: PanelView, panel: HWND, x: i32, y: i32) -> bool {
     match view {
-        PanelView::Notebook | PanelView::Tags => true,
+        PanelView::Notebook | PanelView::Tags | PanelView::Links => true,
         PanelView::Search => !crate::window::search_view::header_hit(main, panel, x, y),
         PanelView::Favorites => {
             let mut client = RECT::default();

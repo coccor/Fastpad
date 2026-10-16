@@ -700,11 +700,32 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_V_SCROLL != 0 {
             crate::window::preview_host::editor_scrolled(hwnd, group);
         }
+        let markdown = document.is_some_and(|document| is_markdown(hwnd, document));
         if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0
-            && document.is_some_and(|document| is_markdown(hwnd, document))
+            && markdown
         {
             crate::window::markdown_host::selection_changed(hwnd, group);
         }
+        // The text or the lines on screen changed: the links there get their underlines
+        // (second brain phase 1 spec §7.3).
+        if update.updated as u32 & !crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0
+            && document
+                .is_some_and(|document| crate::window::markdown_host::has_links(hwnd, document))
+        {
+            crate::window::markdown_host::refresh_link_marks(&editor);
+        }
+        return;
+    }
+    if notification.code == crate::editor::scintilla_constants::SCN_CHARADDED {
+        if document.is_some_and(|document| crate::window::markdown_host::has_links(hwnd, document))
+        {
+            let added = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
+            crate::window::markdown_host::char_added(hwnd, &editor, added.ch);
+        }
+        return;
+    }
+    if notification.code == crate::editor::scintilla_constants::SCN_AUTOCCOMPLETED {
+        crate::window::markdown_host::completion_done(&editor);
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {

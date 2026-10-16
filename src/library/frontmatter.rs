@@ -100,6 +100,103 @@ pub fn parse(text: &str) -> Option<FrontMatter> {
     })
 }
 
+/// `text` with `alias` added to its front matter's `aliases` (second brain phase 1 spec §7.6),
+/// changing nothing else: the block is created when there is none, a flow list (`[a, b]`) or a
+/// block list (`- a`) gets the alias in its own style, and a single `aliases: a` becomes a flow
+/// list. `None` when the `aliases` value has a form FastPad doesn't read, or the alias is
+/// already there. Line ends follow the file's.
+pub fn add_alias(text: &str, alias: &str) -> Option<String> {
+    // The first line's ending: the front matter's own, or the note's when it has none.
+    let eol = if text
+        .split('\n')
+        .next()
+        .is_some_and(|line| line.ends_with('\r'))
+    {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let quoted = if alias.contains([',', '[', ']', '#', ':', '"', '\'']) {
+        format!("\"{}\"", alias.replace('"', "\\\""))
+    } else {
+        alias.to_owned()
+    };
+    let Some(front) = parse(text) else {
+        let bom = if text.starts_with('\u{feff}') {
+            "\u{feff}"
+        } else {
+            ""
+        };
+        let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+        return Some(format!(
+            "{bom}---{eol}aliases: [{quoted}]{eol}---{eol}{body}"
+        ));
+    };
+    if front
+        .aliases()
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(alias))
+    {
+        return None;
+    }
+    let head = &text[..front.body_start];
+    let body = &text[front.body_start..];
+    // Find the aliases line in the block, by line.
+    let mut lines: Vec<&str> = head.split_inclusive('\n').collect();
+    let at = lines.iter().position(|line| {
+        key_of(line.trim_end_matches(['\r', '\n'])).is_some_and(|(key, _)| {
+            key.eq_ignore_ascii_case("aliases") || key.eq_ignore_ascii_case("alias")
+        })
+    });
+    let Some(at) = at else {
+        // No aliases key: a new line just before the closing one.
+        let close = lines.len() - 1;
+        let line = format!("aliases: [{quoted}]{eol}");
+        lines.insert(close, &line);
+        return Some(format!("{}{body}", lines.concat()));
+    };
+    let line = lines[at].trim_end_matches(['\r', '\n']);
+    let (key, value) = key_of(line)?;
+    let replaced = match front.get(key)? {
+        Value::List(_) if value.starts_with('[') => {
+            let inner = value.strip_prefix('[')?.strip_suffix(']')?.trim_end();
+            let separator = if inner.trim().is_empty() { "" } else { ", " };
+            let prefix = &line[..line.len() - value.len()];
+            Some(format!("{prefix}[{inner}{separator}{quoted}]{eol}"))
+        }
+        Value::List(items) => {
+            // A block list: a new item after the last one, indented like it.
+            let last = (at + 1..lines.len() - 1)
+                .take_while(|&index| lines[index].trim_start().starts_with('-'))
+                .last()?;
+            let indent: String = lines[last]
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let _ = items;
+            let item = format!("{indent}- {quoted}{eol}");
+            let mut out = lines.clone();
+            out.insert(last + 1, &item);
+            return Some(format!("{}{body}", out.concat()));
+        }
+        // Only a plain value, written exactly as read: no comment, no brackets, no quotes.
+        Value::Text(single) if !single.is_empty() && single == value && !value.starts_with('[') => {
+            let prefix = &line[..line.len() - value.len()];
+            Some(format!("{prefix}[{value}, {quoted}]{eol}"))
+        }
+        Value::Text(empty) if empty.is_empty() && value.is_empty() => {
+            let prefix = &line[..line.len() - value.len()];
+            Some(format!(
+                "{}[{quoted}]{eol}",
+                prefix.trim_end().to_owned() + " "
+            ))
+        }
+        Value::Text(_) | Value::Raw(_) => None,
+    }?;
+    lines[at] = &replaced;
+    Some(format!("{}{body}", lines.concat()))
+}
+
 /// Lines of `text` from byte `start`, each without its line end, with the offset just after its
 /// line end.
 struct LineIter<'a> {
@@ -369,6 +466,52 @@ mod tests {
         assert_eq!(
             aliases("---\nalias: Project Atlas\n---\n"),
             ["Project Atlas"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn an_alias_goes_in_the_existing_style_and_nothing_else_changes() {
+        assert_eq!(
+            add_alias("# Plan\n", "Old").as_deref(),
+            Some("---\naliases: [Old]\n---\n# Plan\n"),
+            "a block is created"
+        );
+        assert_eq!(
+            add_alias("---\ntitle: x\n---\nBody\r\n", "Old").as_deref(),
+            Some("---\ntitle: x\naliases: [Old]\n---\nBody\r\n"),
+            "a key is added before the closing line"
+        );
+        assert_eq!(
+            add_alias("---\naliases: [A, B] # kept\n---\n", "Old").as_deref(),
+            None,
+            "a commented flow list is a form FastPad leaves alone"
+        );
+        assert_eq!(
+            add_alias("---\naliases: [A, B]\ntags: [t]\n---\n", "Old: v2").as_deref(),
+            Some("---\naliases: [A, B, \"Old: v2\"]\ntags: [t]\n---\n")
+        );
+        assert_eq!(
+            add_alias("---\r\naliases:\r\n  - A\r\nx: 1\r\n---\r\n", "Old").as_deref(),
+            Some("---\r\naliases:\r\n  - A\r\n  - Old\r\nx: 1\r\n---\r\n")
+        );
+        assert_eq!(
+            add_alias("---\nalias: A\n---\n", "Old").as_deref(),
+            Some("---\nalias: [A, Old]\n---\n")
+        );
+        assert_eq!(
+            add_alias("---\naliases: [old]\n---\n", "Old"),
+            None,
+            "already there"
+        );
+        assert_eq!(
+            add_alias("---\naliases: {a: 1}\n---\n", "Old"),
+            None,
+            "a form FastPad doesn't read"
         );
     }
 }

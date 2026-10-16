@@ -687,3 +687,20 @@ fn inline_tags_become_tag_spans_outside_links_and_code() {
         vec![para(styled("a#b", vec![span(0..1, InlineStyle::Emphasis)]))]
     );
 }
+
+#[test]
+fn wikilinks_become_links_the_notebook_resolves() {
+    assert_eq!(
+        kinds("See [[Plan#Goals|the goals]] and [[Atlas]].\n"),
+        vec![para(styled(
+            "See the goals and Atlas.",
+            vec![
+                span(
+                    4..13,
+                    InlineStyle::Link("fastpad-wiki:Plan#Goals".to_owned())
+                ),
+                span(18..23, InlineStyle::Link("fastpad-wiki:Atlas".to_owned())),
+            ]
+        ))]
+    );
+}

@@ -11,6 +11,11 @@ pub enum LinkAction {
     LocalFile(PathBuf),
     /// A `#tag` chip: the tag's name, to show in the Tags view.
     Tag(String),
+    /// A `[[wikilink]]`: the note it names and the heading, for the notebook to resolve.
+    Wiki {
+        target: String,
+        heading: Option<String>,
+    },
     Ignored,
 }
 
@@ -18,6 +23,16 @@ pub fn classify_link(dest: &str, document_dir: Option<&Path>) -> LinkAction {
     let dest = dest.trim();
     if let Some(tag) = dest.strip_prefix(crate::preview::model::TAG_LINK_PREFIX) {
         return LinkAction::Tag(tag.to_owned());
+    }
+    if let Some(wiki) = dest.strip_prefix(crate::preview::model::WIKI_LINK_PREFIX) {
+        let (target, heading) = match wiki.split_once('#') {
+            Some((target, heading)) => (target, Some(heading.trim().to_owned())),
+            None => (wiki, None),
+        };
+        return LinkAction::Wiki {
+            target: target.trim().to_owned(),
+            heading: heading.filter(|heading| !heading.is_empty()),
+        };
     }
     let lower = dest.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
@@ -170,6 +185,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn wikilinks_name_a_note_and_a_heading() {
+        assert_eq!(
+            classify_link("fastpad-wiki:Project Atlas#Goals", None),
+            LinkAction::Wiki {
+                target: "Project Atlas".to_owned(),
+                heading: Some("Goals".to_owned())
+            }
+        );
+        assert_eq!(
+            classify_link("fastpad-wiki:#Top", None),
+            LinkAction::Wiki {
+                target: String::new(),
+                heading: Some("Top".to_owned())
+            }
+        );
     }
 
     #[test]

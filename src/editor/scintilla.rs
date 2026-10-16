@@ -80,6 +80,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 mod document_text;
 mod editing;
 mod line_ops;
+mod link_ops;
 mod markdown_ops;
 mod styling;
 
@@ -783,6 +784,16 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
         return result;
     }
     if message == WM_LBUTTONDOWN {
+        // Ctrl+click on a link follows it (second brain phase 1 spec §7.3) instead of adding a
+        // word to the selection. The hook is cloned out, so no borrow is held while it runs.
+        let down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
+        if down(VK_CONTROL) && !down(VK_SHIFT) && !down(VK_MENU) {
+            let hooks = endpoint.hooks.borrow().clone();
+            let (x, y) = mouse_point(lparam);
+            if hooks.is_some_and(|hooks| hooks.ctrl_click(x, y)) {
+                return 0;
+            }
+        }
         endpoint.begin_alt_click(lparam);
     }
     if message == WM_LBUTTONUP {

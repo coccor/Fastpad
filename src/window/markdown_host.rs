@@ -149,7 +149,187 @@ impl GroupHooks {
     }
 }
 
+/// Whether `document` is a Markdown note whose links FastPad marks, follows and completes: by
+/// its language, or by its extension when highlighting couldn't be turned on (links don't
+/// depend on syntax highlighting).
+pub(crate) fn has_links(hwnd: HWND, document: DocumentId) -> bool {
+    unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .document(document)
+            .is_some_and(|document| {
+                document.language == Language::Markdown
+                    || document
+                        .path
+                        .as_deref()
+                        .is_some_and(crate::library::index::is_indexed)
+            })
+    })
+}
+
+/// The wikilink at text position `position`, if one covers it (second brain phase 1 spec §7.3).
+fn link_at(editor: &Editor, position: usize) -> Option<crate::library::links::LineLink> {
+    let line = editor.line_from_position(position).ok()?;
+    let start = editor.line_start(line).ok()?;
+    let text = editor.line_text(line).ok()?;
+    crate::library::links::wikilinks_in_line(&text)
+        .into_iter()
+        .find(|link| (start + link.range.start..start + link.range.end).contains(&position))
+}
+
+/// Follows `link`, written in `editor`'s note, later: the click that found it is still being
+/// handled by the editor, which must not see its document swapped underneath it. The preview's
+/// link message carries it, from the editor's group.
+fn post_follow(main: HWND, editor: HWND, link: &crate::library::links::LineLink) {
+    let group = unsafe { host_window::app_ptr(main) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let group = app
+            .groups
+            .iter()
+            .find(|group| group.editor.hwnd() == editor)?;
+        Some(group.hwnd)
+    });
+    let Some(group) = group else {
+        return;
+    };
+    let payload = Box::into_raw(Box::new(link_destination(link)));
+    if unsafe {
+        PostMessageW(
+            main,
+            crate::window::WM_FASTPAD_PREVIEW_LINK,
+            group as usize,
+            payload as isize,
+        )
+    } == 0
+    {
+        drop(unsafe { Box::from_raw(payload) });
+    }
+}
+
+fn link_destination(link: &crate::library::links::LineLink) -> String {
+    let mut dest = format!("{}{}", crate::preview::model::WIKI_LINK_PREFIX, link.target);
+    if let Some(heading) = &link.heading {
+        dest.push('#');
+        dest.push_str(heading);
+    }
+    dest
+}
+
+/// Notes: Follow link at caret (F12).
+pub(crate) fn follow_link_at_caret(hwnd: HWND) {
+    let active = unsafe { host_window::app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .active()
+            .map(|document| document.id)
+    });
+    if !active.is_some_and(|document| has_links(hwnd, document)) {
+        return;
+    }
+    let Some(editor) = (unsafe { host_window::app_ptr(hwnd) })
+        .and_then(|app| unsafe { app.as_ref() }.editor().cloned())
+    else {
+        return;
+    };
+    match editor
+        .caret()
+        .ok()
+        .and_then(|caret| link_at(&editor, caret))
+    {
+        // A command runs outside the editor's own messages: the link is followed at once.
+        Some(link) => {
+            let from = unsafe { host_window::app_ptr(hwnd) }
+                .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
+            if link.target.is_empty() {
+                return;
+            }
+            crate::window::library_host::follow_wiki(
+                hwnd,
+                from.as_deref(),
+                &link.target,
+                link.heading.as_deref(),
+            );
+        }
+        None => host_window::push_notice(hwnd, "There is no [[link]] at the caret.".to_owned()),
+    }
+}
+
+/// Underlines the wikilinks on screen in a Markdown editor (spec §7.3). Only the visible lines
+/// are scanned, after each scroll or edit.
+pub(crate) fn refresh_link_marks(editor: &Editor) {
+    let Ok(lines) = editor.visible_lines() else {
+        return;
+    };
+    if lines.is_empty() {
+        return;
+    }
+    let (Ok(area_start), Ok(last_start)) = (
+        editor.line_start(lines.start),
+        editor.line_start(lines.end - 1),
+    ) else {
+        return;
+    };
+    let mut links = Vec::new();
+    let mut area_end = last_start;
+    for line in lines {
+        let (Ok(start), Ok(text)) = (editor.line_start(line), editor.line_text(line)) else {
+            continue;
+        };
+        area_end = area_end.max(start + text.len());
+        links.extend(
+            crate::library::links::wikilinks_in_line(&text)
+                .into_iter()
+                .map(|link| start + link.range.start..start + link.range.end),
+        );
+    }
+    let _ = editor.mark_links(area_start..area_end.max(area_start), &links);
+}
+
+/// `SCN_CHARADDED` in a Markdown editor: a second `[` opens the list of notes to link to
+/// (spec §7.4).
+pub(crate) fn char_added(hwnd: HWND, editor: &Editor, character: i32) {
+    if character != i32::from(b'[') || editor.completion_active() {
+        return;
+    }
+    let Ok(caret) = editor.caret() else {
+        return;
+    };
+    if caret < 2 || editor.range_bytes(caret - 2..caret).ok() != Some(b"[[".as_slice()) {
+        return;
+    }
+    let from = unsafe { host_window::app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
+    let items = crate::window::library_host::completion_items(hwnd, from.as_deref());
+    let _ = editor.show_completion(0, &items);
+}
+
+/// `SCN_AUTOCCOMPLETED`: a note was picked; the link closes after it unless it already does.
+pub(crate) fn completion_done(editor: &Editor) {
+    let Ok(caret) = editor.caret() else {
+        return;
+    };
+    let closed = editor.range_bytes(caret..caret + 2).ok() == Some(b"]]".as_slice());
+    if !closed {
+        let _ = editor.replace_target(caret..caret, "]]");
+        let _ = editor.set_selection(caret + 2..caret + 2);
+    }
+}
+
 impl EditorHooks for GroupHooks {
+    fn ctrl_click(&self, x: i32, y: i32) -> bool {
+        let Some((_, editor, document, _)) = group_of_editor(self.main, self.editor) else {
+            return false;
+        };
+        if !has_links(self.main, document) {
+            return false;
+        }
+        let Some(link) = editor.position_at(x, y).and_then(|at| link_at(&editor, at)) else {
+            return false;
+        };
+        post_follow(self.main, self.editor, &link);
+        true
+    }
+
     fn key_down(&self, vk: u16, ctrl: bool, shift: bool, alt: bool) -> bool {
         if ctrl || alt || !(vk == VK_RETURN || vk == VK_TAB) {
             return false;

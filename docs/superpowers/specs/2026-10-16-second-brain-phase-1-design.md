@@ -743,3 +743,14 @@ Decisions made while building PR 1b (plan `docs/superpowers/plans/2026-10-16-not
 - **Tag chips** are drawn with the code background and an outline in the border color, so they stay visible in high contrast; the link color carries the text. Their link destination is `fastpad-tag:<name>`.
 - **The index is one immutable snapshot**: a worker builds the next one from the previous, rereads only notes whose size or write time changed, writes the cache when anything changed, and posts the result. Online-only (OneDrive) notes are left out, so indexing never downloads them.
 - **The activity bar has five buttons**; its button count is now a constant instead of a literal 4.
+
+Decisions made while building PR 1c (plan `docs/superpowers/plans/2026-10-16-wikilinks.md`):
+
+- **Unresolved links look like resolved ones in the preview** (§7.3). Following one creates the note, so it still works; a dimmed style needs the resolver on the preview's parse path.
+- **Link completion uses Scintilla's own list** after `[[`, filtered by prefix with case ignored, rather than a fuzzy picker. Choosing an item closes the link with `]]`.
+- **A rename asks with buttons, not a checkbox**: "Update links and keep alias", "Update links" and "Leave them". The alias button appears only when one Markdown note changed its name.
+- **Moved notes' own relative links are fixed without asking**; only links in other notes prompt. Wikilinks are rewritten to the shortest form that still resolves to the note from the linking note (name, then path, then `./path`).
+- **Link edits are written to files on disk** on the UI thread, in the file's own encoding. A tab with unsaved edits is skipped and named in the notice. Clean open tabs reload through §5's path, so the change can be undone. A file changed since it was indexed is skipped too.
+- **Renames outside FastPad** are paired by volume and file ID between the scan cache and the new scan. FastPad's own renames between scans are excluded. The notice comes once the index lands, and **Notes: Update links to renamed notes** offers the edits; after that, or when a notebook closes, those renames are forgotten.
+- **Snippets in the Links view are read from the files** when the view refreshes, rather than kept in the index; the index stores each link's line and byte range.
+- **Missing notes count wikilinks only.** A Markdown link to a missing file is usually an attachment path, not a note waiting to be written.

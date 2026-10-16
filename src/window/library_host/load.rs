@@ -290,7 +290,7 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
 
 pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
     let Some((relocated, first_time, truncated, unreadable, has_pending)) = host(hwnd, |host| {
-        let state = match host.state.take() {
+        let mut state = match host.state.take() {
             Some(previous) if library::model::same_path(&previous.folder, &fresh.folder) => {
                 library::merge_rescan(previous, fresh)
             }
@@ -301,6 +301,11 @@ pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
             .as_ref()
             .is_some_and(|f| library::model::same_path(f, &state.folder));
         host.notified = Some(state.folder.clone());
+        if !state.renamed_outside.is_empty() {
+            let found = std::mem::take(&mut state.renamed_outside);
+            host.renamed_outside.extend(found);
+            host.renamed_outside_told = false;
+        }
         let state = host.state.insert(state);
         (
             std::mem::take(&mut state.relocated),

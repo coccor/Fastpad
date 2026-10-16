@@ -3,14 +3,14 @@
 //! rebuild reads only the notes that changed, and cached on disk between runs. Built on a worker;
 //! the UI thread only swaps a finished index in.
 
-use super::facts::{self, NoteFacts, TagSource, TagUse};
+use super::facts::{self, LinkKind, LinkUse, NoteFacts, TagSource, TagUse};
 use super::{NoteEntry, path_key};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Notes larger than this are left out of the index.
 pub const MAX_NOTE_BYTES: u64 = 2 * 1024 * 1024;
-const CACHE_VERSION: &str = "1";
+const CACHE_VERSION: &str = "2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedNote {
@@ -184,6 +184,21 @@ impl NoteIndex {
                 };
                 output.push_str(&format!("tag={source}|{}|{}\r\n", tag.line, tag.name));
             }
+            for link in &note.facts.links {
+                let kind = match link.kind {
+                    LinkKind::Wiki => 'w',
+                    LinkKind::Markdown => 'm',
+                    LinkKind::Image => 'i',
+                };
+                output.push_str(&format!(
+                    "link={kind}|{}|{}|{}|{}|{}\r\n",
+                    link.line,
+                    link.start,
+                    link.end,
+                    escape(link.heading.as_deref().unwrap_or("")),
+                    escape(&link.target)
+                ));
+            }
             for alias in &note.facts.aliases {
                 output.push_str(&format!("alias={}\r\n", escape(alias)));
             }
@@ -235,6 +250,28 @@ impl NoteIndex {
                         .facts
                         .tags
                         .push(TagUse { name, line, source });
+                }
+                "link" => {
+                    let mut fields = value.splitn(6, '|');
+                    let kind = match fields.next()? {
+                        "w" => LinkKind::Wiki,
+                        "m" => LinkKind::Markdown,
+                        "i" => LinkKind::Image,
+                        _ => return None,
+                    };
+                    let line = fields.next()?.parse().ok()?;
+                    let start = fields.next()?.parse().ok()?;
+                    let end = fields.next()?.parse().ok()?;
+                    let heading = unescape(fields.next()?)?;
+                    let target = unescape(fields.next()?)?;
+                    current.as_mut()?.facts.links.push(LinkUse {
+                        target,
+                        heading: Some(heading).filter(|heading| !heading.is_empty()),
+                        line,
+                        kind,
+                        start,
+                        end,
+                    });
                 }
                 "alias" => current.as_mut()?.facts.aliases.push(unescape(value)?),
                 "prop" => {
@@ -394,18 +431,20 @@ mod tests {
         let scratch = Scratch::new("cache");
         let listed = vec![scratch.note(
             r"sub\a.md",
-            "---\ntags: [x]\naliases: [A | B]\nsummary: |\n  multi\n  line\n---\nBody #y\n",
+            "---\ntags: [x]\naliases: [A | B]\nsummary: |\n  multi\n  line\n---\n\
+             Body #y [[Pl|an#H]] [f](a%20b.md#p) ![i](att/s.png)\n",
         )];
         let (index, _) = NoteIndex::build(&scratch.0, &listed, &NoteIndex::default());
+        assert_eq!(index.facts(Path::new(r"sub\a.md")).unwrap().links.len(), 3);
         let text = index.encode();
         assert_eq!(NoteIndex::parse(&text), Some(index));
-        assert_eq!(NoteIndex::parse("version=2\r\n"), None);
+        assert_eq!(NoteIndex::parse("version=1\r\n"), None, "an older cache");
         assert_eq!(
-            NoteIndex::parse("version=1\r\ntag=i|0|x\r\n"),
+            NoteIndex::parse("version=2\r\ntag=i|0|x\r\n"),
             None,
             "a tag before a note"
         );
-        assert_eq!(NoteIndex::parse("version=1\r\nwhat=ever\r\n"), None);
+        assert_eq!(NoteIndex::parse("version=2\r\nwhat=ever\r\n"), None);
     }
 
     #[test]

@@ -40,15 +40,18 @@ pub enum SidebarView {
     Favorites,
     /// The notebook's tags (second brain phase 1 spec §8.1).
     Tags,
+    /// The active note's links and backlinks (second brain phase 1 spec §7.5).
+    Links,
     Hidden,
 }
 
 impl SidebarView {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Notebook,
         Self::Search,
         Self::Favorites,
         Self::Tags,
+        Self::Links,
         Self::Hidden,
     ];
 
@@ -59,6 +62,7 @@ impl SidebarView {
             Self::Search => "search",
             Self::Favorites => "favorites",
             Self::Tags => "tags",
+            Self::Links => "links",
             Self::Hidden => "none",
         }
     }
@@ -1057,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_view_accepts_its_five_tokens_and_warns_on_anything_else() {
+    fn sidebar_view_accepts_its_six_tokens_and_warns_on_anything_else() {
         // Break caught: a hand-edited "sidebar_view=Search" ignored, or a typo silently closing
         // the panel.
         for (value, view) in [
@@ -1065,6 +1069,7 @@ mod tests {
             ("Search", SidebarView::Search),
             ("FAVORITES", SidebarView::Favorites),
             ("Tags", SidebarView::Tags),
+            ("links", SidebarView::Links),
             ("none", SidebarView::Hidden),
         ] {
             assert_eq!(
@@ -1084,6 +1089,7 @@ mod tests {
             SidebarView::Search,
             SidebarView::Favorites,
             SidebarView::Tags,
+            SidebarView::Links,
             SidebarView::Hidden,
         ] {
             assert_eq!(

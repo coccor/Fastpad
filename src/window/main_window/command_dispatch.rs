@@ -488,6 +488,21 @@ pub(super) fn execute_command_with_note(
         CommandId::ShowFavoritesView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Favorites, true)
         }
+        CommandId::NotesFollowLink => crate::window::markdown_host::follow_link_at_caret(hwnd),
+        CommandId::ShowLinksView => {
+            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Links, true)
+        }
+        CommandId::NotesShowMissing => crate::window::links_view::reveal(
+            hwnd,
+            crate::window::links_view::Section::Missing,
+        ),
+        CommandId::NotesShowUnlinked => crate::window::links_view::reveal(
+            hwnd,
+            crate::window::links_view::Section::Unlinked,
+        ),
+        CommandId::NotesUpdateRenamedLinks => {
+            crate::window::library_host::update_renamed_links(hwnd)
+        }
         CommandId::ShowTagsView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, true)
         }

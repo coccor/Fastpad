@@ -140,6 +140,27 @@ Call Dana about the #budget.
 FastPad keeps an index of every Markdown note's tags and front matter, updated as notes are saved
 or changed outside FastPad, and cached so the next start reads only what changed.
 
+### Links between notes
+
+Link to another note by name with `[[wikilinks]]`, as Obsidian does:
+
+```markdown
+See [[Project Atlas]], its [[Project Atlas#Goals|goals]], or [[work/Plan]].
+```
+
+- **Type `[[`** and FastPad offers the notebook's notes; keep typing to narrow the list.
+- **Follow a link** with `Ctrl+Click` or `F12` in the editor, or a click in the preview. A link to
+  a note that doesn't exist yet creates it.
+- A name finds a note by its file name, its path, or an `aliases:` entry in its front matter.
+  When two notes share a name, the one in the linking note's folder wins.
+- **The Links view** (the link button in the activity bar, or **View: Show links**) shows which
+  notes link to the active note, with the line that mentions it, and what the note links to.
+  It also lists **missing notes** (linked but not yet written) and notes nothing links to.
+- **Rename or move a note** in FastPad and its relative links are fixed, and FastPad offers to
+  update the links in other notes. Renaming can keep the old name as an alias. When another
+  program renames a note, a notice says which links still use the old name, and
+  **Notes: Update links to renamed notes** fixes them.
+
 ### Changes made outside FastPad
 
 Edit a file in another program, sync it from another PC, or let an AI agent work on your notes:
@@ -269,6 +290,7 @@ before closing again.
 | Add next occurrence | `Ctrl+D` | | Select all occurrences | `Ctrl+Shift+L` |
 | Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
 | Bold / italic (Markdown files) | `Ctrl+B` / `Ctrl+I` | | Code / link (Markdown files) | ``Ctrl+` `` / `Ctrl+K` |
+| Follow link at caret | `F12` or `Ctrl+Click` | | | |
 
 ## Make it yours
 

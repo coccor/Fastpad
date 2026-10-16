@@ -1235,6 +1235,8 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
             );
         }
     }
+    // Links that would no longer reach the renamed note (second brain phase 1 spec §7.6).
+    library_host::notes_moved(hwnd, &[(relative.to_path_buf(), row)]);
 }
 
 /// A folder rename (spec §4.3, §5.2): the one disk call, never onto another name, then the open
@@ -1294,6 +1296,9 @@ fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
             library_host::rename_undo_failed_notice(&old_name, &name, &moved.stuck),
         );
     }
+    // Links that would no longer reach the notes under it (second brain phase 1 spec §7.6).
+    let moves = library_host::folder_moves(hwnd, old, &new);
+    library_host::notes_moved(hwnd, &moves);
 }
 
 #[cfg(test)]

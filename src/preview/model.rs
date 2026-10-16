@@ -13,7 +13,11 @@ use std::ops::Range;
 pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS)
-    .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
+    .union(Options::ENABLE_WIKILINKS);
+
+/// The link destination a `[[wikilink]]` opens: `fastpad-wiki:<target>` with any `#heading`.
+pub const WIKI_LINK_PREFIX: &str = "fastpad-wiki:";
 
 /// The link destination a `#tag` in the preview opens: the Tags view, at that tag.
 pub const TAG_LINK_PREFIX: &str = "fastpad-tag:";
@@ -827,6 +831,15 @@ impl Builder {
             Tag::Emphasis => self.open_markdown_style(InlineStyle::Emphasis),
             Tag::Strong => self.open_markdown_style(InlineStyle::Strong),
             Tag::Strikethrough => self.open_markdown_style(InlineStyle::Strikethrough),
+            // A wikilink names a note, which only the notebook can find: FastPad resolves it when
+            // it is followed (second brain phase 1 spec §7.3).
+            Tag::Link {
+                link_type: pulldown_cmark::LinkType::WikiLink { .. },
+                dest_url,
+                ..
+            } => {
+                self.open_markdown_style(InlineStyle::Link(format!("{WIKI_LINK_PREFIX}{dest_url}")))
+            }
             Tag::Link { dest_url, .. } => {
                 self.open_markdown_style(InlineStyle::Link(dest_url.to_string()))
             }

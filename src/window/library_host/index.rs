@@ -114,6 +114,7 @@ pub(crate) fn index_ready(hwnd: HWND, lparam: isize) {
         std::mem::take(&mut host.index_again)
     })
     .unwrap_or(false);
+    outside_renames_check(hwnd);
     crate::window::side_panel::index_changed(hwnd);
     if again {
         request_index(hwnd);
@@ -129,5 +130,7 @@ pub(crate) fn reset_index(hwnd: HWND) {
         host.index_loaded = false;
         host.index_running = false;
         host.index_again = false;
+        host.renamed_outside.clear();
+        host.renamed_outside_told = false;
     });
 }

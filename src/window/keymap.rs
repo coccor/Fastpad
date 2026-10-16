@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ADD, VK_BACK, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F3,
-    VK_F6, VK_F10, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MULTIPLY, VK_NEXT, VK_NUMPAD0,
+    VK_F6, VK_F10, VK_F12, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MULTIPLY, VK_NEXT, VK_NUMPAD0,
     VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
     VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_SUBTRACT,
     VK_TAB, VK_UP,
@@ -251,6 +251,13 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::ShowSearchView, "view.showSearch"),
     (CommandId::ShowFavoritesView, "view.showFavorites"),
     (CommandId::ShowTagsView, "view.showTags"),
+    (CommandId::ShowLinksView, "view.showLinks"),
+    (CommandId::NotesShowMissing, "notes.showMissing"),
+    (CommandId::NotesShowUnlinked, "notes.showUnlinked"),
+    (
+        CommandId::NotesUpdateRenamedLinks,
+        "notes.updateRenamedLinks",
+    ),
     (CommandId::FocusNextPane, "view.focusNextPane"),
     (CommandId::FocusPreviousPane, "view.focusPreviousPane"),
     (CommandId::SplitRight, "view.splitRight"),
@@ -322,6 +329,7 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::NoteCompareWithDisk, "note.compareWithDisk"),
     (CommandId::NotesShowChanged, "notes.showChanged"),
     (CommandId::NotesClearChanged, "notes.clearChanged"),
+    (CommandId::NotesFollowLink, "notes.followLink"),
     (CommandId::NoteTogglePin, "note.togglePin"),
     (CommandId::NoteMoveToNotebook, "note.moveToNotebook"),
     (CommandId::NoteRevealInExplorer, "note.revealInExplorer"),
@@ -388,7 +396,7 @@ const fn ch(byte: u8) -> u16 {
 }
 
 /// FastPad's shortcuts before any override, in precedence order (spec §3.3).
-pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 86] = [
+pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 87] = [
     (key(C, ch(b'N')), CommandId::New),
     (key(C, ch(b'T')), CommandId::New),
     (key(C, ch(b'O')), CommandId::Open),
@@ -402,6 +410,7 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 86] = [
     (key(C | S, ch(b'H')), CommandId::ReplaceInNotes),
     (key(0, VK_F3), CommandId::FindNext),
     (key(S, VK_F3), CommandId::FindPrevious),
+    (key(0, VK_F12), CommandId::NotesFollowLink),
     (key(C, ch(b'Z')), CommandId::Undo),
     (key(C, ch(b'Y')), CommandId::Redo),
     (key(C | S, ch(b'F')), CommandId::ShowSearchView),

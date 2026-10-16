@@ -20,6 +20,7 @@ pub(crate) mod image_host;
 pub(crate) mod inline_name;
 pub(crate) mod keymap;
 pub(crate) mod library_host;
+pub(crate) mod links_view;
 mod main_window;
 pub(crate) mod markdown_host;
 pub(crate) mod menu_band;

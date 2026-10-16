@@ -165,6 +165,12 @@ pub enum CommandId {
     NotesClearChanged = 268,
     // The note index (second brain phase 1 spec §8).
     ShowTagsView = 269,
+    // Links between notes (second brain phase 1 spec §7).
+    NotesFollowLink = 270,
+    ShowLinksView = 271,
+    NotesShowMissing = 272,
+    NotesShowUnlinked = 273,
+    NotesUpdateRenamedLinks = 274,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -189,7 +195,7 @@ pub const EDITING_COMMANDS: [CommandId; 16] = [
 ];
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 61] = [
+pub const TEXT_COMMANDS: [CommandId; 62] = [
     CommandId::MoveLinesUp,
     CommandId::MoveLinesDown,
     CommandId::CopyLinesUp,
@@ -247,6 +253,7 @@ pub const TEXT_COMMANDS: [CommandId; 61] = [
     CommandId::NoteReloadFromDisk,
     CommandId::NoteKeepMine,
     CommandId::NoteCompareWithDisk,
+    CommandId::NotesFollowLink,
     CommandId::MarkdownBold,
     CommandId::MarkdownItalic,
     CommandId::MarkdownCode,
@@ -324,6 +331,10 @@ impl CommandId {
                 | Self::NotesShowChanged
                 | Self::NotesClearChanged
                 | Self::ShowTagsView
+                | Self::ShowLinksView
+                | Self::NotesShowMissing
+                | Self::NotesShowUnlinked
+                | Self::NotesUpdateRenamedLinks
                 | Self::ToggleNotesMode
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
@@ -386,6 +397,9 @@ impl CommandId {
                 | Self::ShowSearchView
                 | Self::ShowFavoritesView
                 | Self::ShowTagsView
+                | Self::ShowLinksView
+                | Self::NotesShowMissing
+                | Self::NotesShowUnlinked
                 | Self::SearchToggleCase
                 | Self::SearchToggleWholeWord
                 | Self::SearchToggleRegex
@@ -496,7 +510,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 159] = [
+        const COMMANDS: [CommandId; 164] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -656,6 +670,11 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotesShowChanged,
             CommandId::NotesClearChanged,
             CommandId::ShowTagsView,
+            CommandId::NotesFollowLink,
+            CommandId::ShowLinksView,
+            CommandId::NotesShowMissing,
+            CommandId::NotesShowUnlinked,
+            CommandId::NotesUpdateRenamedLinks,
         ];
         COMMANDS
             .into_iter()
@@ -987,7 +1006,17 @@ mod tests {
         assert_eq!(CommandId::try_from(269), Ok(CommandId::ShowTagsView));
         assert!(!CommandId::ShowTagsView.needs_document());
         assert!(CommandId::ShowTagsView.is_sidebar());
-        assert!(CommandId::try_from(270).is_err());
+        assert_eq!(CommandId::try_from(270), Ok(CommandId::NotesFollowLink));
+        assert!(CommandId::NotesFollowLink.needs_document());
+        assert_eq!(CommandId::try_from(271), Ok(CommandId::ShowLinksView));
+        assert_eq!(CommandId::try_from(272), Ok(CommandId::NotesShowMissing));
+        assert_eq!(CommandId::try_from(273), Ok(CommandId::NotesShowUnlinked));
+        assert_eq!(
+            CommandId::try_from(274),
+            Ok(CommandId::NotesUpdateRenamedLinks)
+        );
+        assert!(CommandId::ShowLinksView.is_sidebar());
+        assert!(CommandId::try_from(275).is_err());
     }
 
     #[test]

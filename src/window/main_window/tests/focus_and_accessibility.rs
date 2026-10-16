@@ -127,7 +127,7 @@ fn the_activity_bar_moves_with_arrows_and_presses_with_enter() {
     }
     assert_eq!(crate::window::side_panel::bar_focus(window.hwnd), 0);
     let items = crate::window::activity_bar::accessible_items(bar);
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 6);
     assert_ne!(
         items[0].state & crate::window::sidebar_accessibility::STATE_PRESSED,
         0
@@ -137,7 +137,8 @@ fn the_activity_bar_moves_with_arrows_and_presses_with_enter() {
         0
     );
     assert_eq!(items[3].name, "Tags");
-    assert_eq!(items[4].name, "Settings");
+    assert_eq!(items[4].name, "Links");
+    assert_eq!(items[5].name, "Settings");
 
     unsafe {
         SendMessageW(bar, WM_KEYDOWN, VK_DOWN as usize, 0);

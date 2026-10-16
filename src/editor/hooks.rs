@@ -11,4 +11,9 @@ pub trait EditorHooks: std::fmt::Debug {
     fn key_down(&self, _vk: u16, _ctrl: bool, _shift: bool, _alt: bool) -> bool {
         false
     }
+
+    /// A Ctrl+click at client point `x`, `y`; true consumes it (a link was followed).
+    fn ctrl_click(&self, _x: i32, _y: i32) -> bool {
+        false
+    }
 }

@@ -497,6 +497,8 @@ fn bare_state(scratch: &Scratch, notes: Vec<NoteEntry>, truncated: bool) -> Libr
         truncated,
         pending: Vec::new(),
         relocated: Vec::new(),
+        renamed_outside: Vec::new(),
+        own_renames: Vec::new(),
         touched: Vec::new(),
         written_local: local::Conveniences::default(),
     }
@@ -1427,4 +1429,53 @@ fn notes_changed_while_fastpad_was_closed_are_marked_at_the_next_load() {
 
     let state = load(&folder, &scratch.local(), 0).unwrap();
     assert_eq!(state.local.changed, [PathBuf::from("b.md")]);
+}
+
+#[test]
+fn a_rename_outside_fastpad_is_paired_by_file_id_but_fastpads_own_is_not() {
+    // Break caught: an agent's rename leaving links dangling unseen, or FastPad's own rename
+    // reported back as if someone else made it.
+    let scratch = Scratch::new("renamed-outside");
+    let folder = scratch.folder();
+    std::fs::write(folder.join("a.md"), "a").unwrap();
+    std::fs::write(folder.join("b.md"), "b").unwrap();
+    let first = load(&folder, &scratch.local(), 0).unwrap();
+    assert!(
+        first.renamed_outside.is_empty(),
+        "a first scan has no history"
+    );
+
+    std::fs::rename(folder.join("a.md"), folder.join("renamed.md")).unwrap();
+    let second = load(&folder, &scratch.local(), 0).unwrap();
+    assert_eq!(
+        second.renamed_outside,
+        [(PathBuf::from("a.md"), PathBuf::from("renamed.md"))]
+    );
+
+    // FastPad renames b.md itself; the rescan that follows must not report it.
+    let mut live = second;
+    std::fs::rename(folder.join("b.md"), folder.join("mine.md")).unwrap();
+    live.rename_note(&folder.join("b.md"), &folder.join("mine.md"));
+    let fresh = load(&folder, &scratch.local(), 0).unwrap();
+    let merged = merge_rescan(live, fresh);
+    assert!(
+        merged.renamed_outside.is_empty(),
+        "{:?}",
+        merged.renamed_outside
+    );
+}
+
+#[test]
+fn fastpads_own_renames_reach_the_cache_at_close() {
+    let scratch = Scratch::new("own-rename-cache");
+    let folder = scratch.folder();
+    std::fs::write(folder.join("a.md"), "a").unwrap();
+    let mut state = load(&folder, &scratch.local(), 0).unwrap();
+    std::fs::rename(folder.join("a.md"), folder.join("b.md")).unwrap();
+    state.rename_note(&folder.join("a.md"), &folder.join("b.md"));
+    assert!(state.sync_cache_from_notes());
+    local::write(&scratch.local(), &state.local).unwrap();
+    let next = load(&folder, &scratch.local(), 0).unwrap();
+    assert!(next.renamed_outside.is_empty());
+    assert!(next.local.changed.is_empty());
 }

@@ -28,6 +28,7 @@ const GLYPH_NOTEBOOK: &str = "\u{E82D}";
 const GLYPH_SEARCH: &str = "\u{E721}";
 const GLYPH_FAVORITES: &str = "\u{E734}";
 const GLYPH_TAGS: &str = "\u{E8EC}";
+const GLYPH_LINKS: &str = "\u{E71B}";
 const GLYPH_SETTINGS: &str = "\u{E713}";
 const ACCENT_WIDTH_96: i32 = 2;
 
@@ -37,6 +38,7 @@ pub(crate) enum ActivityButton {
     Search,
     Favorites,
     Tags,
+    Links,
     Settings,
 }
 
@@ -44,11 +46,12 @@ pub(crate) enum ActivityButton {
 pub(crate) const BUTTONS: usize = ActivityButton::ALL.len();
 
 impl ActivityButton {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Notebook,
         Self::Search,
         Self::Favorites,
         Self::Tags,
+        Self::Links,
         Self::Settings,
     ];
 
@@ -63,6 +66,7 @@ impl ActivityButton {
             Self::Search => Some(SidebarView::Search),
             Self::Favorites => Some(SidebarView::Favorites),
             Self::Tags => Some(SidebarView::Tags),
+            Self::Links => Some(SidebarView::Links),
             Self::Settings => None,
         }
     }
@@ -74,6 +78,7 @@ impl ActivityButton {
             Self::Search => "Search",
             Self::Favorites => "Favorites",
             Self::Tags => "Tags",
+            Self::Links => "Links",
             Self::Settings => "Settings",
         }
     }
@@ -84,6 +89,7 @@ impl ActivityButton {
             Self::Search => GLYPH_SEARCH,
             Self::Favorites => GLYPH_FAVORITES,
             Self::Tags => GLYPH_TAGS,
+            Self::Links => GLYPH_LINKS,
             Self::Settings => GLYPH_SETTINGS,
         }
     }
@@ -111,12 +117,13 @@ pub(crate) fn button_rects(client: RECT, dpi: u32) -> [RECT; BUTTONS] {
         right: client.left + size,
         bottom: top + size,
     };
-    let settings_top = (client.bottom - size).max(top + 4 * size);
+    let settings_top = (client.bottom - size).max(top + 5 * size);
     [
         square(top),
         square(top + size),
         square(top + 2 * size),
         square(top + 3 * size),
+        square(top + 4 * size),
         square(settings_top),
     ]
 }
@@ -559,9 +566,10 @@ mod tests {
         assert_eq!(edges(rects[1]), (0, 84, 44, 128));
         assert_eq!(edges(rects[2]), (0, 128, 44, 172));
         assert_eq!(edges(rects[3]), (0, 172, 44, 216));
-        assert_eq!(edges(rects[4]), (0, 656, 44, 700));
+        assert_eq!(edges(rects[4]), (0, 216, 44, 260));
+        assert_eq!(edges(rects[5]), (0, 656, 44, 700));
         let short = button_rects(bar(44, 150), 96);
-        assert_eq!(short[4].top, short[3].bottom);
+        assert_eq!(short[5].top, short[4].bottom);
         assert_eq!(button_at(&rects, 10, 50), Some(ActivityButton::Notebook));
         assert_eq!(button_at(&rects, 10, 130), Some(ActivityButton::Favorites));
         assert_eq!(button_at(&rects, 10, 690), Some(ActivityButton::Settings));
@@ -612,6 +620,7 @@ mod tests {
             Some(SidebarView::Favorites)
         );
         assert_eq!(ActivityButton::Tags.view(), Some(SidebarView::Tags));
+        assert_eq!(ActivityButton::Links.view(), Some(SidebarView::Links));
         assert_eq!(ActivityButton::Settings.view(), None);
         for (index, button) in ActivityButton::ALL.into_iter().enumerate() {
             assert_eq!(button.index(), index);

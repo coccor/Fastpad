@@ -404,6 +404,8 @@ fn apply_chrome_colors_to(editor: &Editor, palette: Palette, highlight_current_l
         palette.inactive_selection_background,
         highlight_current_line.then_some(palette.caret_line_background),
     );
+    // Wikilinks are underlined in the accent color (second brain phase 1 spec §7.3).
+    let _ = editor.set_link_color(palette.accent);
 }
 
 /// Every group's editor, the active group's first.
