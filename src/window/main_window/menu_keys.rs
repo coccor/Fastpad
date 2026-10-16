@@ -217,6 +217,11 @@ pub(crate) unsafe fn translate_accelerator(
     if !identity.is_live_for(hwnd) {
         return false;
     }
+    // The capture box runs on this thread but is no part of the main window: its keys are its
+    // own (second brain phase 1 spec §10.2).
+    if crate::window::capture_box::owns(message.hwnd) {
+        return false;
+    }
     if crate::window::tab_drag::keeps_key(hwnd, message) {
         return true;
     }

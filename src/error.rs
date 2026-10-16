@@ -42,6 +42,9 @@ impl fmt::Display for FastPadError {
             Self::Launch(LaunchError::MultiplePaths) => {
                 formatter.write_str("only one file path may be provided")
             }
+            Self::Launch(LaunchError::AttachNeedsCapture) => {
+                formatter.write_str("--attach needs --capture and a file path")
+            }
             Self::Startup { stage, source } => {
                 write!(formatter, "{}: {source}", stage.user_message())
             }

@@ -58,6 +58,7 @@ mod note_operations;
 mod notebook_tree;
 mod open_editors_and_folder_commands;
 mod preview_tabs_and_folders;
+mod quick_capture;
 mod search_replace;
 mod search_replace_writes;
 mod search_view;

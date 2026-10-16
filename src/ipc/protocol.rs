@@ -11,6 +11,9 @@ const COMMAND_OPEN: u8 = 1;
 const COMMAND_NEW: u8 = 2;
 const COMMAND_ACTIVATE: u8 = 3;
 const COMMAND_OPEN_FOLDER: u8 = 4;
+const COMMAND_CAPTURE: u8 = 5;
+/// The text field's length when a capture has no text.
+const NO_TEXT: u32 = u32::MAX;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IpcRequest {
@@ -18,6 +21,12 @@ pub enum IpcRequest {
     New,
     Activate,
     OpenFolder(PathBuf),
+    /// `--capture` (second brain phase 1 spec §10.1): with neither text nor attachments, the
+    /// capture box; otherwise filed with no window. Paths are absolute.
+    Capture {
+        text: Option<String>,
+        attachments: Vec<PathBuf>,
+    },
 }
 
 pub fn encode_frame(request: &IpcRequest) -> Result<Vec<u8>> {
@@ -26,6 +35,10 @@ pub fn encode_frame(request: &IpcRequest) -> Result<Vec<u8>> {
         IpcRequest::New => (COMMAND_NEW, Vec::new()),
         IpcRequest::Activate => (COMMAND_ACTIVATE, Vec::new()),
         IpcRequest::OpenFolder(path) => (COMMAND_OPEN_FOLDER, encode_path(path)?),
+        IpcRequest::Capture { text, attachments } => (
+            COMMAND_CAPTURE,
+            encode_capture(text.as_deref(), attachments)?,
+        ),
     };
     if HEADER_BYTES + payload.len() > MAX_FRAME_BYTES {
         return Err(FastPadError::Ipc("frame exceeds 64 KiB"));
@@ -63,8 +76,69 @@ pub fn decode_frame(bytes: &[u8]) -> Result<IpcRequest> {
         COMMAND_NEW => Ok(IpcRequest::New),
         COMMAND_ACTIVATE => Ok(IpcRequest::Activate),
         COMMAND_OPEN_FOLDER => decode_path(payload).map(IpcRequest::OpenFolder),
+        COMMAND_CAPTURE => decode_capture(payload),
         _ => Err(FastPadError::Ipc("unknown command")),
     }
+}
+
+/// A capture's payload: the text as a u32 unit count (`NO_TEXT` for none) and its UTF-16 units,
+/// then a u32 count of attachments, each a u32 unit count and its path's units. All little-endian.
+fn encode_capture(text: Option<&str>, attachments: &[PathBuf]) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    match text {
+        Some(text) => {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            payload.extend_from_slice(&(units.len() as u32).to_le_bytes());
+            payload.extend(units.iter().flat_map(|unit| unit.to_le_bytes()));
+        }
+        None => payload.extend_from_slice(&NO_TEXT.to_le_bytes()),
+    }
+    payload.extend_from_slice(&(attachments.len() as u32).to_le_bytes());
+    for path in attachments {
+        let units = encode_path(path)?;
+        payload.extend_from_slice(&((units.len() / 2) as u32).to_le_bytes());
+        payload.extend_from_slice(&units);
+    }
+    Ok(payload)
+}
+
+fn decode_capture(payload: &[u8]) -> Result<IpcRequest> {
+    let mut rest = payload;
+    let mut take = |count: usize| -> Result<&[u8]> {
+        if rest.len() < count {
+            return Err(FastPadError::Ipc("capture payload is truncated"));
+        }
+        let (head, tail) = rest.split_at(count);
+        rest = tail;
+        Ok(head)
+    };
+    let read_u32 = |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let text_units = read_u32(take(4)?);
+    let text = if text_units == NO_TEXT {
+        None
+    } else {
+        let bytes = take(text_units as usize * 2)?;
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        Some(
+            String::from_utf16(&units)
+                .map_err(|_| FastPadError::Ipc("capture text is not valid UTF-16"))?,
+        )
+    };
+    let count = read_u32(take(4)?);
+    let mut attachments = Vec::new();
+    for _ in 0..count {
+        let units = read_u32(take(4)?) as usize;
+        attachments.push(decode_path(take(units * 2)?)?);
+    }
+    if !rest.is_empty() {
+        return Err(FastPadError::Ipc("capture payload has trailing bytes"));
+    }
+    Ok(IpcRequest::Capture { text, attachments })
 }
 
 fn encode_path(path: &std::path::Path) -> Result<Vec<u8>> {
@@ -108,6 +182,51 @@ mod tests {
         assert_eq!(
             decode_frame(&encode_frame(&request).unwrap()).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn a_capture_round_trips_its_text_and_attachments() {
+        for request in [
+            IpcRequest::Capture {
+                text: None,
+                attachments: Vec::new(),
+            },
+            IpcRequest::Capture {
+                text: Some(String::new()),
+                attachments: Vec::new(),
+            },
+            IpcRequest::Capture {
+                text: Some("lag spikes 📈\nsecond line".to_owned()),
+                attachments: vec![
+                    PathBuf::from(r"C:\shots\a b.png"),
+                    PathBuf::from(r"C:\logs\ledger.log"),
+                ],
+            },
+        ] {
+            assert_eq!(
+                decode_frame(&encode_frame(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn a_damaged_capture_is_rejected() {
+        let mut payload = 2_u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[b'a', 0]);
+        assert!(decode_frame(&frame(5, payload.len() as u32, &payload)).is_err());
+        let mut payload = u32::MAX.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.push(7);
+        assert!(decode_frame(&frame(5, payload.len() as u32, &payload)).is_err());
+        let too_long = IpcRequest::Capture {
+            text: Some("x".repeat(40_000)),
+            attachments: Vec::new(),
+        };
+        assert!(
+            encode_frame(&too_long).is_err(),
+            "text past 64 KiB is refused"
         );
     }
 

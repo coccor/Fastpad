@@ -40,6 +40,7 @@ pub const DEFAULT_SHOW_WHITESPACE: bool = false;
 pub const DEFAULT_HIGHLIGHT_CURRENT_LINE: bool = true;
 pub const DEFAULT_CODE_FOLDING: bool = true;
 pub const DEFAULT_ALWAYS_ON_TOP: bool = false;
+pub const DEFAULT_CAPTURE_HOTKEY: &str = "Ctrl+Alt+N";
 
 /// A line height in tenths as `fastpad.ini` writes it: 16 is `1.6`.
 pub fn line_height_token(tenths: u8) -> String {
@@ -86,6 +87,8 @@ pub fn default_settings() -> Settings {
         highlight_current_line: DEFAULT_HIGHLIGHT_CURRENT_LINE,
         code_folding: DEFAULT_CODE_FOLDING,
         always_on_top: DEFAULT_ALWAYS_ON_TOP,
+        capture_hotkey: DEFAULT_CAPTURE_HOTKEY.to_owned(),
+        capture_source: false,
         settings_size: None,
         window_placement: None,
         key_overrides: std::collections::BTreeMap::new(),
@@ -120,6 +123,8 @@ mod tests {
         assert!(settings.highlight_current_line);
         assert!(settings.code_folding);
         assert!(!settings.always_on_top);
+        assert_eq!(settings.capture_hotkey, "Ctrl+Alt+N");
+        assert!(!settings.capture_source);
     }
 
     #[test]

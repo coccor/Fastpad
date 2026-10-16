@@ -144,6 +144,11 @@ pub struct Settings {
     pub code_folding: bool,
     /// Whether the window stays above other windows.
     pub always_on_top: bool,
+    /// The quick capture hotkey in keymap syntax (second brain phase 1 spec §10.1); empty turns
+    /// it off.
+    pub capture_hotkey: String,
+    /// Whether a capture records the title of the window in front (spec §10.4).
+    pub capture_source: bool,
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
     /// `None` opens it at its natural size. Saved when a resize drag ends.
     pub settings_size: Option<(u16, u16)>,
@@ -232,6 +237,12 @@ impl Settings {
         if let Some(always_on_top) = delta.always_on_top {
             self.always_on_top = always_on_top;
         }
+        if let Some(capture_hotkey) = &delta.capture_hotkey {
+            self.capture_hotkey = capture_hotkey.clone();
+        }
+        if let Some(capture_source) = delta.capture_source {
+            self.capture_source = capture_source;
+        }
         for (id, value) in &delta.key_overrides {
             self.key_overrides.insert(id.clone(), value.clone());
         }
@@ -277,6 +288,8 @@ pub struct SettingsDelta {
     pub highlight_current_line: Option<bool>,
     pub code_folding: Option<bool>,
     pub always_on_top: Option<bool>,
+    pub capture_hotkey: Option<String>,
+    pub capture_source: Option<bool>,
     pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
 }
@@ -288,7 +301,8 @@ pub struct SettingsDelta {
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`,
 /// `reload_changed_files` (`auto` or `ask`), `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
-/// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
+/// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line`, `always_on_top`, `capture_hotkey` (any text; empty turns it off) and
+/// `capture_source` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
@@ -482,6 +496,12 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "always_on_top" => match parse_bool(value) {
             Some(always_on_top) => delta.always_on_top = Some(always_on_top),
+            None => warn(delta, line_number, key, value),
+        },
+        // Checked when it is registered, where the keymap's key names are known.
+        "capture_hotkey" => delta.capture_hotkey = Some(value.to_owned()),
+        "capture_source" => match parse_bool(value) {
+            Some(capture_source) => delta.capture_source = Some(capture_source),
             None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
@@ -1332,6 +1352,30 @@ mod tests {
         settings.apply_delta(&delta);
         assert!(!settings.code_folding);
         assert_eq!(parse("code_folding=maybe").warnings.len(), 1);
+    }
+
+    #[test]
+    fn capture_settings_take_any_hotkey_text_and_a_bool() {
+        // Break caught: an empty hotkey (which turns it off) rejected, or the source recorded
+        // by default.
+        let delta = parse(
+            "capture_hotkey=
+capture_source=on
+",
+        );
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        let mut settings = default_settings();
+        assert_eq!(settings.capture_hotkey, "Ctrl+Alt+N");
+        settings.apply_delta(&delta);
+        assert_eq!(settings.capture_hotkey, "");
+        assert!(settings.capture_source);
+        assert_eq!(parse("capture_source=sometimes").warnings.len(), 1);
+        assert_eq!(
+            parse("capture_hotkey=Ctrl+Shift+Space")
+                .capture_hotkey
+                .as_deref(),
+            Some("Ctrl+Shift+Space")
+        );
     }
 
     #[test]

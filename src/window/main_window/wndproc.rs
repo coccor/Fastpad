@@ -70,7 +70,12 @@ pub(super) unsafe extern "system" fn main_window_proc(
             }
             0
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_HOTKEY => {
+            crate::window::capture_host::hotkey(hwnd, wparam);
+            0
+        }
         WM_DESTROY => {
+            crate::window::capture_host::unregister_hotkey(hwnd);
             // A running text search stops reading: its posts would fail from here on anyway.
             crate::window::text_search_host::cancel(hwnd);
             // A replace stops too. Its write worker finishes the note in hand and is waited for

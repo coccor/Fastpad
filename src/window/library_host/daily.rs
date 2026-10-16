@@ -27,7 +27,7 @@ pub(crate) fn set_now(date: Date, time: Time) {
     FIXED_NOW.with(|now| now.set(Some((date, time))));
 }
 
-fn now() -> (Date, Time) {
+pub(crate) fn now() -> (Date, Time) {
     #[cfg(test)]
     if let Some(now) = FIXED_NOW.with(std::cell::Cell::get) {
         return now;
@@ -176,12 +176,6 @@ fn create_note(hwnd: HWND, path: &Path, filled: &Filled) -> Result<(), String> {
     Ok(())
 }
 
-/// The daily note for `date` in the notebook at `root`.
-fn daily_path(root: &Path, settings: &NotebookSettings, date: Date) -> PathBuf {
-    let name = crate::library::title::file_name(&dates::format(date, &settings.daily_format), "md");
-    root.join(&settings.daily_folder).join(name)
-}
-
 /// Notes: Open today's note (spec §9.2): opens it, or makes it from the daily template.
 pub(crate) fn open_today(hwnd: HWND) {
     let Some(root) = folder(hwnd) else {
@@ -189,34 +183,16 @@ pub(crate) fn open_today(hwnd: HWND) {
         return;
     };
     let settings = notebook_settings(hwnd);
-    let (date, _) = now();
-    let path = daily_path(&root, &settings, date);
+    let (date, time) = now();
+    let path = root.join(crate::library::capture_file::daily_note(&settings, date));
     if path.exists() {
         links::open_at_heading(hwnd, &path, None);
         return;
     }
-    let template = root.join(&settings.daily_template);
-    let title = dates::format(date, &settings.daily_format);
-    let filled = if template.is_file() {
-        match fill_template(hwnd, &template, &title) {
-            Ok(filled) => filled,
-            Err(error) => {
-                push_notice(hwnd, error);
-                template::default_daily(date)
-            }
-        }
-    } else {
-        if settings.daily_template != NotebookSettings::default().daily_template {
-            push_notice(
-                hwnd,
-                format!(
-                    "The daily note template {} doesn't exist, so today's note starts with its date.",
-                    settings.daily_template.display()
-                ),
-            );
-        }
-        template::default_daily(date)
-    };
+    let (filled, problem) = crate::library::capture_file::daily_start(&root, &settings, date, time);
+    if let Some(problem) = problem {
+        push_notice(hwnd, problem);
+    }
     if let Err(error) = create_note(hwnd, &path, &filled) {
         push_notice(hwnd, error);
     }

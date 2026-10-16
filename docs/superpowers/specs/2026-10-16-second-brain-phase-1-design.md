@@ -764,3 +764,15 @@ Decisions made while building PR 1d (plan `docs/superpowers/plans/2026-10-16-dai
 - **The template picker uses the palette's own matching** rather than the quick-open matcher; template names are short.
 - **Templates are left out of link resolution and completion**, besides missing and unlinked notes (§9.4), so a template never shows up as a link target.
 - **Obsidian's `attachmentFolderPath`** is read in PR 1e, the first PR to use the attachments folder.
+
+Decisions made while building PR 1e (plan `docs/superpowers/plans/2026-10-17-quick-capture.md`):
+
+- **The attachment strip shows named chips** ("Image 1", or the file name) rather than thumbnails.
+- **`capture_source` records the window title only**, not the process's file description. Browser and editor titles already name the app.
+- **The 20 MB question is FastPad's prompt** shown over the box.
+- **`forward_if_running` replaces `claim_or_forward` for `--capture`.** It forwards when a FastPad owns the instance mutex and otherwise releases the mutex at once, so a capture-only process never holds it.
+- **A second `--capture` while a capture-only box is open** brings that box forward, or cycles its target when it is already in front, since the Start menu shortcut's key starts a new process. The running FastPad's own hotkey does the same through `WM_CAPTURE_AGAIN`.
+- **Ctrl+Shift+Enter in a capture-only box** starts FastPad with the note, without placing the caret on the entry.
+- **`capture_hotkey` is read once, when FastPad starts**, and has no Settings row (the dialog is full).
+- **A Ctrl+Shift+V that attached an image** swallows the Ctrl+V character that follows it, so the text isn't pasted as well.
+- **Obsidian's `attachmentFolderPath`** is read here, as PR 1d planned.

@@ -2,6 +2,8 @@
 //! kept in `.fastpad\library.ini` and attached to files by path, file ID and content fingerprint.
 //! Nothing here touches a window.
 
+pub mod capture;
+pub mod capture_file;
 pub mod dates;
 pub mod external;
 pub mod facts;

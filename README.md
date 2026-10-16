@@ -181,6 +181,22 @@ templates_folder=.fastpad/templates
 inbox=inbox.md
 ```
 
+### Quick capture
+
+Press **`Ctrl+Alt+N`** anywhere to jot something down without leaving what you're doing. The
+capture box appends it to your notebook's `inbox.md` as a time-stamped list item.
+
+- **`Ctrl+Enter`** saves and closes; **`Ctrl+Shift+Enter`** also opens the note. **`Esc`** closes
+  and keeps what you typed for next time.
+- **Images and files:** paste a screenshot or files copied in Explorer, drop files on the box, or
+  press **`Ctrl+Shift+S`** to snip part of the screen with Windows' own tool. They are copied into
+  the notebook's `attachments` folder and linked from the capture.
+- **`Ctrl+Alt+N`** again in the box switches where this capture goes: the inbox, today's daily
+  note, or a new file of its own in `inbox`, which suits AI agents that process items one by one.
+  `capture_target` in `notebook.ini` sets the default.
+- It works when FastPad isn't running too: the installer's "Quick capture shortcut" option sets
+  up the same key, and `FastPad.exe --capture "text"` captures from scripts.
+
 ### Changes made outside FastPad
 
 Edit a file in another program, sync it from another PC, or let an AI agent work on your notes:
@@ -333,6 +349,8 @@ line in a notification and applies the rest.
 | `highlight_current_line` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `code_folding` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `capture_hotkey` | A key like `Ctrl+Alt+N`; empty turns it off | `Ctrl+Alt+N` |
+| `capture_source` | `true`/`false`: note the window you were in when you pressed the capture hotkey | `false` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
@@ -349,11 +367,16 @@ Hand edits keep your comments and other lines; the palette and Settings rewrite 
 
 ```text
 FastPad.exe [--new-window] [path]
+FastPad.exe --capture ["text" | -] [--attach <file>]...
 ```
 
 - `FastPad.exe notes.md` opens the file in your running FastPad window, or starts FastPad if none is
   open.
 - `--new-window` always starts a separate, independent window.
+- `--capture` opens the quick capture box. With text (or `-` to read it from standard input) and
+  any `--attach` files, it files them into the inbox with no window and exits: `0` when filed, `1`
+  when the write failed, `2` when the request was refused (a missing file, or one over 20 MB). It
+  goes to your running FastPad when there is one.
 - `--diagnostic` is for the startup benchmark harness; you don't need it.
 
 ## FAQ

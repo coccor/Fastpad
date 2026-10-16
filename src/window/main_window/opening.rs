@@ -54,7 +54,7 @@ pub(super) fn handle_open_request(hwnd: HWND) -> LRESULT {
                 }
             }
         }
-        crate::launch::LaunchRequest::New => {
+        crate::launch::LaunchRequest::New | crate::launch::LaunchRequest::Capture(_) => {
             close_unused_startup_tab(hwnd);
             unsafe {
                 let _ = record_milestone(hwnd, Milestone::FileLoaded);

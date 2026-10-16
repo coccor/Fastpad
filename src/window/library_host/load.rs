@@ -60,7 +60,7 @@ pub(crate) fn open_library_step(hwnd: HWND) {
             crate::launch::LaunchRequest::Open(path) => {
                 Some(library::normalize_folder(Path::new(path)))
             }
-            crate::launch::LaunchRequest::New => None,
+            crate::launch::LaunchRequest::New | crate::launch::LaunchRequest::Capture(_) => None,
         });
     let recent = library::local::read_folders(&library::local::folders_file(&data));
     host(hwnd, |host| host.folders = Some(recent.clone()));
