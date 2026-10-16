@@ -889,6 +889,12 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
     }) else {
         return;
     };
+    // The notebook watcher will report these writes: they are FastPad's own, not outside changes.
+    let own = closed
+        .iter()
+        .map(|target| notebook.join(&target.path))
+        .collect::<Vec<_>>();
+    crate::window::library_host::begin_own_writes(hwnd, own.iter().map(PathBuf::as_path));
     let writer = spawn_write(
         hwnd,
         WriteJob {
@@ -987,6 +993,17 @@ pub(crate) fn replace_written(hwnd: HWND, lparam: LPARAM) {
 /// outside FastPad. Then the report is pushed and the query runs again, so the results show
 /// what still matches.
 fn report_written(hwnd: HWND, report: ReplaceReport, tab_matches: usize, tab_notes: usize) {
+    if let Some(notebook) = library_host::folder(hwnd) {
+        let done = report
+            .written
+            .iter()
+            .map(|(path, _)| path)
+            .chain(&report.changed)
+            .chain(report.failed.iter().map(|(path, _)| path))
+            .map(|path| notebook.join(path))
+            .collect::<Vec<_>>();
+        library_host::end_own_writes(hwnd, done.iter().map(PathBuf::as_path));
+    }
     if !report.written.is_empty() {
         library_host::with_state(hwnd, |state| state.record_written_all(&report.written));
         if let Some(notebook) = library_host::folder(hwnd) {

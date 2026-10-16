@@ -350,10 +350,14 @@ pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
     crate::window::text_search_host::notes_reloaded(hwnd);
     // A folder box whose folder the rescan no longer finds closes.
     close_stale_name_box(hwnd);
+    // A note the rescan found changed is no news when a tab shows it.
+    clear_visible_marks(hwnd);
     crate::window::side_panel::refresh(hwnd);
     // A notebook's first load reveals the (restored) active note: its row is selected and its
     // folders expand (spec §6.1). A rescan leaves the user's selection where it was.
     if first_time {
         crate::window::side_panel::active_tab_changed(hwnd);
     }
+    // From now on outside changes are reported as they happen (second brain phase 1 §5.1).
+    ensure_watcher(hwnd);
 }

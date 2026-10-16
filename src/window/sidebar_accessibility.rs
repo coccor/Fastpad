@@ -325,6 +325,13 @@ pub(crate) fn tree_item(
     if row.pinned {
         name.push_str(", pinned");
     }
+    // What the dot after the name shows (second brain phase 1 spec §5.5).
+    if row.changed {
+        name.push_str(match row.kind {
+            RowKind::Folder(_) => ", holds notes changed outside FastPad",
+            _ => ", changed outside FastPad",
+        });
+    }
     let mut state = row_state(selected, focused, visible);
     if matches!(row.kind, RowKind::Folder(_)) {
         state |= if row.expanded {

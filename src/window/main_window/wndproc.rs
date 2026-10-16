@@ -81,6 +81,8 @@ pub(super) unsafe extern "system" fn main_window_proc(
             // A copy into the notebook stops after the file in hand, and is waited for the same
             // way, so no copied file is left half written.
             crate::window::copy_host::stop(hwnd);
+            // The notebook watcher's thread stops and is waited for.
+            crate::window::library_host::stop_watcher(hwnd);
             // The panel goes with this window, not through `side_panel::destroy_windows`: its
             // drop target is revoked first, which releases it.
             if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
@@ -96,6 +98,7 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
                 KillTimer(hwnd, crate::window::library_host::LIBRARY_WRITE_TIMER_ID);
                 KillTimer(hwnd, crate::window::library_host::AUTOSAVE_TIMER_ID);
+                KillTimer(hwnd, super::chrome::STATUS_HINT_TIMER_ID);
                 PostQuitMessage(0);
             }
             0
@@ -114,6 +117,10 @@ pub(super) unsafe extern "system" fn main_window_proc(
         }
         WM_TIMER if wparam == crate::window::library_host::AUTOSAVE_TIMER_ID => {
             crate::window::library_host::autosave_active(hwnd);
+            0
+        }
+        WM_TIMER if wparam == super::chrome::STATUS_HINT_TIMER_ID => {
+            super::chrome::clear_status_hint(hwnd);
             0
         }
         WM_TIMER if wparam == FIND_COUNT_TIMER_ID => {
@@ -149,6 +156,9 @@ pub(super) unsafe extern "system" fn main_window_proc(
             crate::window::library_host::activation_changed(hwnd, wparam != 0);
             if wparam != 0 {
                 crate::window::image_host::check_disk(hwnd);
+                // Files changed by another program while FastPad was in the background (second
+                // brain phase 1 spec §5.1).
+                crate::window::library_host::check_all_tabs(hwnd);
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
@@ -474,6 +484,12 @@ pub(super) unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_NOTEBOOK_CHECKED {
                 crate::window::library_host::notebook_checked(hwnd, lparam);
+                return 0;
+            }
+            // The notebook watcher's batch: handled at once, modal or not, since a held message
+            // would lose its Box. It asks nothing of the user.
+            if message == crate::window::WM_FASTPAD_FILES_CHANGED {
+                crate::window::library_host::files_changed(hwnd, lparam);
                 return 0;
             }
             // Focus left the Notebook tree's name field (inline naming spec §5.3): leaving

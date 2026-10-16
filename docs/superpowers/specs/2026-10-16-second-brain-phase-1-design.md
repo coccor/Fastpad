@@ -714,3 +714,21 @@ type:concept tag:unverified updated<2026-07-01 retrieval
 - `key:value` matches a front matter property (ignoring case); `tag:` matches front matter and inline tags, including nested ones; `<`, `>`, `<=` and `>=` compare dates written as `YYYY-MM-DD`, and numbers.
 - Filters narrow the notes first, using the index, and the text search then runs only over those notes. A query with filters and no text lists the matching notes.
 - This is why §6.1 keeps every front matter property as raw text in the index (`properties`), not only the keys FastPad uses itself: Phase 1.5 needs no change to the index format.
+
+## 17. Implementation notes
+
+Decisions made while building PR 1a (plan `docs/superpowers/plans/2026-10-16-external-changes.md`), not anticipated by the sections above.
+
+- **Hidden tabs reload at once** (§5.2 said they are marked stale and reload when shown). Every tab keeps a live Scintilla document, and the document host already edits hidden ones, so one path serves every tab and no "stale" state exists. A preview tab stays a preview after a reload.
+- **Window activation checks every text tab with a path**, not only visible ones: one stat each. Showing a tab checks it too, for when the window never lost focus.
+- **`reload_changed_files` has no Settings row.** One more row put the dialog past its 810-pixel limit at 96 DPI (soft-look addendum). It is in the palette ("File: Toggle reloading files changed outside FastPad") and `fastpad.ini`.
+- **The conflict mark replaces the tab's file icon** with Segoe's Warning glyph (`U+E7BA`) in `warning_foreground`, so nothing in the tab moves. FastPad shows a dirty tab with " *" in its title, not a dot, so there was no dot to replace. Open Editors draws its dot in `warning_foreground` for a conflict.
+- **A file that can't be read during a check** (locked mid-write, or no longer text) leaves the tab as it is, with no notice; the next check tries again. A tab whose file was rewritten with the same text only takes the new stamp.
+- **No known stamp means no trusted text base.** A tab restored from a snapshot treats any difference as a conflict, even one that looks like an append.
+- **Append merge after the user rewrote the whole tab** still adds the appended text at the end: an append-only file keeps its order, and neither side's text is lost.
+- **The status hint names the file** ("Reloaded plan: changed outside FastPad"), since a hidden tab can reload too.
+- **Rescans on activation are skipped while a watcher runs**; they still happen when watching failed.
+- **FastPad's own background writes** (replace across notes, copies into the notebook) register their target paths, and anything under a copied folder, before their worker starts. The watcher's reports of them are ignored until 2 seconds after the result lands, and never longer than 60 seconds.
+- **Where changed marks come from.** A rescan compares its note list with the live one, which FastPad's own saves keep current. A load at startup compares with the scan cache in the per-PC file, whose sizes and times are brought up to the live list when the window closes. After a crash, notes FastPad saved since its last scan can therefore be marked once.
+- **"Notes: Show changed notes" is a toggle**: running it again shows the whole tree. The header doesn't change while it is on; the view shows only the marked notes, under their folders, opened.
+- **Watcher tests** run against a real temporary folder in every library window test, since installing a notebook starts the watcher.

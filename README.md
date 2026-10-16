@@ -118,6 +118,27 @@ pinned notes first. Notes are plain files, so nothing is locked in.
 Pins travel with the notebook in `.fastpad\library.ini`, and nothing is written into a folder until
 you pin something. Turn notes off with `notes_mode=false` in `fastpad.ini`.
 
+### Changes made outside FastPad
+
+Edit a file in another program, sync it from another PC, or let an AI agent work on your notes:
+FastPad keeps up while it's open.
+
+- **Open tabs follow the file.** A tab with no unsaved edits picks up the new text as soon as
+  the file changes, as one edit you can undo: **Ctrl+Z** brings back what you had.
+- **Appends join your edits.** Text added to the end of a file you're editing (a log, an inbox)
+  is added to the end of your tab, with nothing to resolve.
+- **Real conflicts wait for you.** Any other change to a tab with unsaved edits shows a warning in
+  the tab and pauses autosave. Use **Note: Reload from disk**, **Note: Keep my version**, or
+  **Note: Compare with disk** to see the file's version read-only beside yours.
+- **A deleted file keeps its tab**, marked "(deleted)". Saving creates it again.
+- **The notebook shows what changed.** A dot marks each note changed outside FastPad since you
+  last opened it, and it survives a restart. **Notes: Show changed notes** lists only those;
+  **Notes: Clear changed marks** clears them.
+
+The open notebook is watched for changes as they happen, and other open files are checked when
+FastPad comes back to the front. Changes inside folders such as `.git` and `node_modules` are
+ignored. To have every change wait for you instead, set `reload_changed_files=ask`.
+
 ### JSON you can trust
 
 <img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
@@ -251,6 +272,7 @@ line in a notification and applies the rest.
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `reload_changed_files` | `auto` (a tab without unsaved edits takes a file's outside changes by itself) or `ask` (every change waits for you) | `auto` |
 | `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
 | `settings_size` | `<width>x<height>` (pixels at 100% scaling), saved when you resize Settings | none: its natural size |

@@ -44,6 +44,7 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     }
     // The Search view goes with the sidebar: its search stops and its record is dropped.
     crate::window::text_search_host::forget(hwnd);
+    stop_watcher(hwnd);
     host(hwnd, |host| {
         host.state = None;
         host.folder = None;

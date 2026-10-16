@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
 
 mod autosave;
+mod external;
 mod folders;
 mod load;
 mod local_state;
@@ -17,8 +18,10 @@ mod notebooks;
 mod pickers;
 mod pins;
 mod untitled;
+mod watch;
 
 pub(crate) use autosave::*;
+pub(crate) use external::*;
 pub(crate) use folders::*;
 pub(crate) use load::*;
 pub(crate) use local_state::*;
@@ -28,6 +31,7 @@ pub(crate) use notebooks::*;
 pub(crate) use pickers::*;
 pub(crate) use pins::*;
 pub(crate) use untitled::*;
+pub(crate) use watch::*;
 
 pub(crate) const LIBRARY_WRITE_TIMER_ID: usize = 0x4650_4C57;
 pub(crate) const RESCAN_AFTER: Duration = Duration::from_secs(5);
@@ -89,6 +93,20 @@ pub(crate) struct LibraryHost {
     pub(crate) load_failed: bool,
     /// Copies into the tree, queued on one worker thread (open editors spec §4.5).
     pub(crate) copy_worker: super::copy_host::CopyWorker,
+    /// Watches the open notebook for outside changes (second brain phase 1 spec §5.1). `None`
+    /// before its first scan, with notes mode off, or after watching failed.
+    pub(crate) watcher: Option<library::watch::Watcher>,
+    /// Bumped whenever a watcher starts or stops: a batch from an older one is dropped.
+    pub(crate) watch_generation: u64,
+    /// Watching this notebook failed: FastPad rescans on activation instead, until the next
+    /// notebook opens.
+    pub(crate) watch_failed: bool,
+    /// Files FastPad itself is writing on a worker (replace across notes, copies), by lowercase
+    /// path: the watcher's report of them is not an outside change. `None` while the write runs,
+    /// then until when a late report is still FastPad's own.
+    pub(crate) own_writes: std::collections::HashMap<String, Option<Instant>>,
+    /// The Notebook view shows only notes changed outside FastPad ("Notes: Show changed notes").
+    pub(crate) changed_only: bool,
 }
 
 impl LibraryHost {
@@ -112,6 +130,11 @@ impl LibraryHost {
             shown_move: None,
             load_failed: false,
             copy_worker: super::copy_host::CopyWorker::default(),
+            watcher: None,
+            watch_generation: 0,
+            watch_failed: false,
+            own_writes: std::collections::HashMap::new(),
+            changed_only: false,
         }
     }
 }

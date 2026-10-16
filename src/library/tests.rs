@@ -1303,3 +1303,128 @@ fn a_flush_that_rereads_another_pcs_pins_updates_the_tree() {
         2
     );
 }
+
+fn entry(path: &str, size: u64, mtime: u64) -> NoteEntry {
+    NoteEntry {
+        path: PathBuf::from(path),
+        size,
+        mtime,
+        online_only: false,
+    }
+}
+
+#[test]
+fn a_first_scan_marks_nothing_and_later_scans_mark_what_changed_since_the_cache() {
+    // Break caught: opening a notebook on a new PC marking every note changed, or a note an
+    // agent edited while FastPad was closed going unmarked.
+    let scanned = |path: &str, size: u64, mtime: u64| scan::ScanEntry {
+        path: PathBuf::from(path),
+        size,
+        mtime,
+        file_id: 0,
+        online_only: false,
+    };
+    let cached = |path: &str, size: u64, mtime: u64| local::CachedFile {
+        volume: 1,
+        file_id: 0,
+        mtime,
+        size,
+        path: PathBuf::from(path),
+    };
+    let entries = [
+        scanned("same.md", 1, 1),
+        scanned("edited.md", 2, 9),
+        scanned("Grown.md", 3, 1),
+        scanned("new.md", 1, 1),
+    ];
+    assert!(changed_since_cache(&[], &entries).is_empty());
+    let cache = [
+        cached("same.md", 1, 1),
+        cached("edited.md", 2, 1),
+        cached("grown.md", 2, 1),
+    ];
+    assert_eq!(
+        changed_since_cache(&cache, &entries),
+        [
+            PathBuf::from("edited.md"),
+            PathBuf::from("Grown.md"),
+            PathBuf::from("new.md")
+        ]
+    );
+}
+
+#[test]
+fn a_rescan_marks_changes_against_the_live_list_but_not_fastpads_own_writes() {
+    // Break caught: a note FastPad saved while the rescan ran showing as changed outside it.
+    let previous = [
+        entry("a.md", 1, 1),
+        entry("b.md", 1, 1),
+        entry("c.md", 1, 1),
+    ];
+    let fresh = [
+        entry("a.md", 1, 1),
+        entry("b.md", 5, 2),
+        entry("c.md", 5, 2),
+        entry("renamed.md", 1, 1),
+    ];
+    assert_eq!(
+        changed_since(&previous, &fresh, &[PathBuf::from("C.md")]),
+        [PathBuf::from("b.md"), PathBuf::from("renamed.md")]
+    );
+}
+
+#[test]
+fn marks_follow_fastpads_renames_and_go_with_removed_notes() {
+    let scratch = Scratch::new("marks");
+    let folder = scratch.folder();
+    std::fs::create_dir_all(folder.join("sub")).unwrap();
+    for name in ["a.md", r"sub\b.md"] {
+        std::fs::write(folder.join(name), "x").unwrap();
+    }
+    let mut state = load(&folder, &scratch.local(), 0).unwrap();
+    assert!(state.mark_changed(Path::new("a.md")));
+    assert!(!state.mark_changed(Path::new("not-a-note.md")));
+    assert!(state.mark_changed(Path::new(r"sub\b.md")));
+
+    std::fs::rename(folder.join("a.md"), folder.join("renamed.md")).unwrap();
+    state.rename_note(&folder.join("a.md"), &folder.join("renamed.md"));
+    assert!(state.local.is_changed(Path::new("renamed.md")));
+    assert!(!state.local.is_changed(Path::new("a.md")));
+
+    state.rename_folder(Path::new("sub"), Path::new("moved"));
+    assert!(state.local.is_changed(Path::new(r"moved\b.md")));
+
+    state.remove_note(&folder.join("renamed.md"));
+    assert!(!state.local.is_changed(Path::new("renamed.md")));
+    assert!(state.clear_changed(&folder.join(r"moved\b.md")));
+    assert!(!state.clear_all_changed());
+}
+
+#[test]
+fn the_watcher_takes_a_notes_new_stamp_once() {
+    let scratch = Scratch::new("outside-stamp");
+    let folder = scratch.folder();
+    std::fs::write(folder.join("a.md"), "x").unwrap();
+    let mut state = load(&folder, &scratch.local(), 0).unwrap();
+    assert_eq!(state.take_outside_stamp(&folder.join("a.md")), Some(false));
+    std::fs::write(folder.join("a.md"), "longer").unwrap();
+    assert_eq!(state.take_outside_stamp(&folder.join("a.md")), Some(true));
+    assert_eq!(state.take_outside_stamp(&folder.join("a.md")), Some(false));
+    assert_eq!(state.take_outside_stamp(&folder.join("nope.md")), None);
+}
+
+#[test]
+fn notes_changed_while_fastpad_was_closed_are_marked_at_the_next_load() {
+    let scratch = Scratch::new("closed-marks");
+    let folder = scratch.folder();
+    std::fs::write(folder.join("a.md"), "x").unwrap();
+    std::fs::write(folder.join("b.md"), "x").unwrap();
+    let state = load(&folder, &scratch.local(), 0).unwrap();
+    assert!(state.local.changed.is_empty(), "a first load marks nothing");
+    drop(state);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(folder.join("b.md"), "changed while closed").unwrap();
+
+    let state = load(&folder, &scratch.local(), 0).unwrap();
+    assert_eq!(state.local.changed, [PathBuf::from("b.md")]);
+}

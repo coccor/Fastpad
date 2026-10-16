@@ -48,6 +48,7 @@ pub(super) fn rebuild_key(hwnd: HWND) -> RebuildKey {
         failed: crate::window::library_host::load_failed(hwnd),
         expansion: crate::window::library_host::expansion_revision(hwnd),
         root_expanded: crate::window::library_host::root_expanded(hwnd),
+        changed_only: crate::window::library_host::changed_only(hwnd),
     }
 }
 
@@ -71,7 +72,13 @@ pub(super) fn snapshot(hwnd: HWND) -> Snapshot {
     };
     let favorite = crate::window::library_host::is_favorite(hwnd);
     let built = crate::window::library_host::with_state(hwnd, |state| {
-        let rows = flatten(&state.tree, &state.local.expanded);
+        let rows = if key.changed_only {
+            changed_rows(&state.tree, &state.local.changed)
+        } else {
+            let mut rows = flatten(&state.tree, &state.local.expanded);
+            mark_changed_rows(&mut rows, &state.local.changed);
+            rows
+        };
         (rows, state.truncated)
     });
     let (mode, rows, truncated) = match built {

@@ -241,6 +241,7 @@ pub(crate) fn insert_draft(rows: &mut Vec<TreeRow>, parent: Option<usize>) -> Op
             name: String::new(),
             pinned: false,
             expanded: false,
+            changed: false,
         },
     );
     Some(at)

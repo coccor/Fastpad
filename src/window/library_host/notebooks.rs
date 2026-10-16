@@ -64,6 +64,8 @@ pub(super) fn open_checked_folder(hwnd: HWND, path: PathBuf) {
     if !save_before_leaving(hwnd) {
         return;
     }
+    // The old notebook's watcher goes; the new one starts once its first scan lands.
+    stop_watcher(hwnd);
     host(hwnd, |host| {
         host.state = None;
         host.folder = Some(path.clone());
@@ -303,6 +305,7 @@ pub(crate) fn close_notebook(hwnd: HWND) {
         KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
         KillTimer(hwnd, AUTOSAVE_TIMER_ID);
     }
+    stop_watcher(hwnd);
     host(hwnd, |host| {
         host.state = None;
         host.folder = None;

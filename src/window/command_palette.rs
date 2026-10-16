@@ -55,7 +55,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 132] = [
+pub(crate) const ENTRIES: [PaletteEntry; 136] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -68,6 +68,10 @@ pub(crate) const ENTRIES: [PaletteEntry; 132] = [
     entry(
         "File: Toggle session restore",
         CommandId::ToggleRestoreSession,
+    ),
+    entry(
+        "File: Toggle reloading files changed outside FastPad",
+        CommandId::ToggleReloadChangedFiles,
     ),
     entry("Notes: Toggle notes mode", CommandId::ToggleNotesMode),
     entry(
@@ -83,6 +87,9 @@ pub(crate) const ENTRIES: [PaletteEntry; 132] = [
     entry("Notebook: New folder\u{2026}", CommandId::NoteNewFolder),
     entry("Note: Reload from disk", CommandId::NoteReloadFromDisk),
     entry("Note: Keep my version", CommandId::NoteKeepMine),
+    entry("Note: Compare with disk", CommandId::NoteCompareWithDisk),
+    entry("Notes: Show changed notes", CommandId::NotesShowChanged),
+    entry("Notes: Clear changed marks", CommandId::NotesClearChanged),
     entry("Note: Toggle pin", CommandId::NoteTogglePin),
     entry("Note: Move to notebook...", CommandId::NoteMoveToNotebook),
     entry("Note: Reveal in Explorer", CommandId::NoteRevealInExplorer),

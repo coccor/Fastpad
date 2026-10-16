@@ -59,8 +59,10 @@ pub(crate) fn schedule_autosave(hwnd: HWND) {
 }
 
 /// Saves the active tab if autosave applies to it, unless its file changed on disk since FastPad
-/// loaded or saved it: then autosave pauses for that tab until the user reloads or keeps theirs.
-/// Only a successful write marks the tab clean.
+/// loaded or saved it. Then the tab is checked first (second brain phase 1 spec §5.4): text
+/// appended on disk is taken in and saved with the tab's edits; any other change is a conflict,
+/// and autosave pauses for that tab until the user reloads or keeps theirs. Only a successful
+/// write marks the tab clean.
 pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
     unsafe {
         KillTimer(hwnd, AUTOSAVE_TIMER_ID);
@@ -69,29 +71,30 @@ pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
         return Autosave::NotEligible;
     };
     // The guard runs right before the write: nothing between here and `complete_save` yields.
-    let known =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.active()?.disk_stamp);
-    let now = library::disk_stamp(&path);
+    let active = |hwnd: HWND| {
+        unsafe { app_ptr(hwnd) }.and_then(|app| {
+            let document = unsafe { app.as_ref() }.tabs.active()?;
+            Some((document.id, document.disk_stamp))
+        })
+    };
+    let Some((id, known)) = active(hwnd) else {
+        return Autosave::NotEligible;
+    };
     // No known stamp (a tab restored from a snapshot): FastPad cannot tell whether the file
     // changed, or was deleted on purpose, so it is treated as changed and never re-created.
-    let changed = known.is_none() || known != now;
-    if changed {
-        if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-            let app = unsafe { app.as_mut() };
-            if let Some(id) = app.tabs.active().map(|document| document.id)
-                && let Some(document) = app.tabs.document_mut(id)
-            {
-                document.autosave_paused = true;
-            }
-        }
-        push_notice(
-            hwnd,
-            format!(
-                "{} changed on disk. Autosave is paused for it: use Note: Reload from disk or Note: Keep my version.",
-                title::note_title(&path)
-            ),
+    if known.is_none() || known != library::disk_stamp(&path) {
+        let verdict = super::check_tab(hwnd, id);
+        let settled = matches!(
+            verdict,
+            library::external::TabVerdict::AppendMerge { .. }
+                | library::external::TabVerdict::Unchanged
         );
-        return Autosave::Paused;
+        // After an append (or a rewrite with the same text) the tab knows the file again.
+        let caught_up = active(hwnd)
+            .is_some_and(|(_, known)| known.is_some() && known == library::disk_stamp(&path));
+        if !settled || !caught_up || autosave_target(hwnd).is_none() {
+            return Autosave::Paused;
+        }
     }
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return Autosave::Failed;
@@ -188,56 +191,7 @@ pub(crate) fn toggle_folder_autosave(hwnd: HWND) {
     );
 }
 
-/// Replaces the tab's text with the file on disk and resumes autosave.
-pub(crate) fn reload_from_disk(hwnd: HWND) {
-    let Some(path) = unsafe { app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())
-    else {
-        return;
-    };
-    // Read before the load: a change that lands during it then still pauses the next autosave.
-    let stamp = library::disk_stamp(&path);
-    let loaded = crate::file::loader::load(&path).and_then(|loaded| {
-        // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer: the file is unsupported.
-        std::ffi::CString::new(loaded.text.as_str())
-            .map_err(|_| crate::FastPadError::UnsupportedEncoding)?;
-        Ok(loaded)
-    });
-    let loaded = match loaded {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            crate::window::main_window::report_open_failure(hwnd, &path, &error);
-            return;
-        }
-    };
-    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return;
-    };
-    let Some(editor) =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
-    else {
-        return;
-    };
-    if editor.set_text(&loaded.text).is_err() || !identity.is_live_for(hwnd) {
-        return;
-    }
-    editor.set_save_point();
-    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        let app = unsafe { app.as_mut() };
-        app.tabs.set_active_dirty(false);
-        if let Some(id) = app.tabs.active().map(|document| document.id)
-            && let Some(document) = app.tabs.document_mut(id)
-        {
-            document.encoding = loaded.encoding;
-            document.disk_stamp = stamp;
-            document.autosave_paused = false;
-        }
-    }
-    crate::window::main_window::remove_saved_document_snapshots(hwnd);
-    crate::window::main_window::invalidate_title_strip(hwnd);
-}
-
-/// Saves the tab over the changed file and resumes autosave.
+/// Saves the tab over the changed (or deleted) file and resumes autosave.
 pub(crate) fn keep_mine(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
@@ -258,6 +212,7 @@ pub(crate) fn keep_mine(hwnd: HWND) {
 /// After a file is opened into a tab: remember its disk stamp, read before the load so a change
 /// landing during it still pauses the next autosave.
 pub(crate) fn document_loaded(hwnd: HWND, stamp: Option<library::DiskStamp>) {
+    let mut opened = None;
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_mut() };
         if let Some(id) = app.tabs.active().map(|document| document.id)
@@ -265,7 +220,12 @@ pub(crate) fn document_loaded(hwnd: HWND, stamp: Option<library::DiskStamp>) {
             && document.path.is_some()
         {
             document.disk_stamp = stamp;
+            opened = document.path.clone();
         }
+    }
+    // Opening a note is seeing it: its "changed outside FastPad" mark goes.
+    if let Some(path) = opened {
+        super::note_seen(hwnd, &path);
     }
 }
 
@@ -274,6 +234,14 @@ pub(crate) fn document_loaded(hwnd: HWND, stamp: Option<library::DiskStamp>) {
 /// untitled tab that is no longer untitled. A save of a note already listed leaves the rows,
 /// and the Search view's selection, alone.
 pub(crate) fn document_saved(hwnd: HWND) {
+    // What was written: the active tab's text, so an append on disk can be told apart later.
+    let base = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.editor().cloned())
+        .and_then(|editor| {
+            editor
+                .with_document_text(library::external::TextBase::of)
+                .ok()
+        });
     let saved = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
         let id = app.tabs.active()?.id;
@@ -281,11 +249,18 @@ pub(crate) fn document_saved(hwnd: HWND) {
         let promoted = app.tabs.promote(id);
         let document = app.tabs.document_mut(id)?;
         let path = document.path.clone();
+        let resolved = document.conflict.is_some() || document.deleted_on_disk;
         if let Some(path) = &path {
             document.disk_stamp = library::disk_stamp(path);
+            document.text_base = base;
             document.autosave_paused = false;
+            document.conflict = None;
+            document.deleted_on_disk = false;
         }
-        Some((path, promoted))
+        if resolved {
+            app.tabs.refresh_views();
+        }
+        Some((path, promoted || resolved))
     });
     let (path, promoted) = saved.unwrap_or((None, false));
     let inserted = path

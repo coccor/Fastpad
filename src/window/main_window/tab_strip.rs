@@ -61,6 +61,8 @@ pub(super) struct TabSnapshot {
     pub(super) kinds: Vec<crate::window::file_icons::NoteKind>,
     pub(super) active: usize,
     pub(super) preview_tab: Option<usize>,
+    /// Whether each tab is in conflict with its file on disk (second brain phase 1 spec §5.4).
+    pub(super) conflicts: Vec<bool>,
 }
 
 /// Group `id`'s strip contents.
@@ -83,6 +85,10 @@ pub(super) fn tab_snapshot(hwnd: HWND, id: GroupId) -> TabSnapshot {
                     .collect(),
                 active: group.active_index(),
                 preview_tab: documents.iter().position(|document| document.preview),
+                conflicts: documents
+                    .iter()
+                    .map(|document| document.conflict.is_some())
+                    .collect(),
             })
         })
         .unwrap_or_else(|| TabSnapshot {
@@ -90,6 +96,7 @@ pub(super) fn tab_snapshot(hwnd: HWND, id: GroupId) -> TabSnapshot {
             kinds: vec![crate::window::file_icons::NoteKind::Text],
             active: 0,
             preview_tab: None,
+            conflicts: vec![false],
         })
 }
 

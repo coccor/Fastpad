@@ -266,6 +266,7 @@ mod tests {
             depth,
             pinned: false,
             expanded,
+            changed: false,
         }
     }
 

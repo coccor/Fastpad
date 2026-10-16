@@ -112,7 +112,12 @@ fn view_tabs<'a>(documents: impl Iterator<Item = &'a Document>) -> Vec<TabViewTa
     documents
         .map(|document| TabViewTab {
             id: document.id,
-            title: document.title(),
+            // Screen readers hear what the warning glyph shows (second brain phase 1 §5.4).
+            title: if document.conflict.is_some() {
+                format!("{}, changed on disk", document.title())
+            } else {
+                document.title()
+            },
             preview: document.preview,
         })
         .collect()
@@ -948,6 +953,30 @@ impl Tabs {
             self.refresh_views();
         }
         changed
+    }
+
+    /// A background tab took in its file's new text through the document host (second brain
+    /// phase 1 spec §5.3): a new generation, and `dirty` as the edit left it. Unlike an edit the
+    /// user made, a preview tab stays a preview.
+    pub(crate) fn note_background_disk_edit(&mut self, id: DocumentId, dirty: bool) {
+        let Some(document) = self.store.get_mut(id) else {
+            return;
+        };
+        document.generation = document.generation.saturating_add(1);
+        document.dirty = dirty || document.recovery_origin.is_some();
+        self.refresh_views();
+    }
+
+    /// Puts back the preview flag an edit cleared (`note_text_change`). A reload from disk is
+    /// not the user's edit, so it must not turn a preview tab into a normal one.
+    pub(crate) fn restore_preview(&mut self, id: DocumentId) {
+        if let Some(document) = self.store.get_mut(id)
+            && !document.preview
+            && !document.dirty
+        {
+            document.preview = true;
+            self.refresh_views();
+        }
     }
 
     /// The active group's preview tab, if it has one. There is at most one per group.

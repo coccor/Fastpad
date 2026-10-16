@@ -41,6 +41,7 @@ mod about_and_settings_dialog;
 mod command_palette;
 mod copy_host_and_panel_drop;
 mod editing_shortcuts;
+mod external_changes;
 mod find_bar;
 mod first_save_and_autosave;
 mod focus_and_accessibility;

@@ -20,6 +20,7 @@ fn row(kind: RowKind, depth: u16) -> TreeRow {
         name: String::new(),
         pinned: false,
         expanded: false,
+        changed: false,
     }
 }
 
@@ -184,6 +185,7 @@ fn a_tree_row_draws_the_chosen_sets_icon_and_minimal_in_high_contrast() {
     let note = row(RowKind::Note("a.md".into()), 0);
     let open_folder = TreeRow {
         expanded: true,
+        changed: false,
         ..row(RowKind::Folder("f".into()), 0)
     };
     let target = TestTarget::new(200, 22);
@@ -827,6 +829,7 @@ fn the_selection_bar_is_only_where_the_keyboard_is() {
             name: format!("tab{id}"),
             path: None,
             dirty: false,
+            conflict: false,
             active,
         })
     };
@@ -943,4 +946,42 @@ fn the_no_notebook_state_and_drag_label_hold_their_text_at_every_text_size() {
         assert!(layout.button.bottom <= layout.second.top);
         assert!(super::paint::drag_label_size(0, dpi).cy >= text, "{dpi}");
     }
+}
+
+#[test]
+fn changed_notes_and_the_collapsed_folders_holding_them_are_marked() {
+    let tree = crate::library::tree::NoteTree::build(
+        [
+            PathBuf::from("a.md"),
+            PathBuf::from("b.md"),
+            PathBuf::from(r"sub\c.md"),
+            PathBuf::from(r"other\d.md"),
+        ]
+        .iter(),
+        &[],
+        &[],
+    );
+    let changed = [PathBuf::from("B.md"), PathBuf::from(r"sub\c.md")];
+    let mut rows = super::flatten(&tree, &[]);
+    super::mark_changed_rows(&mut rows, &changed);
+    let marked = rows
+        .iter()
+        .filter(|row| row.changed)
+        .map(|row| row.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(marked, ["sub", "b.md"]);
+
+    // Showing only changed notes opens the folders they are in and hides everything else.
+    let shown = super::changed_rows(&tree, &changed)
+        .iter()
+        .map(|row| (row.name.clone(), row.changed))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shown,
+        [
+            ("sub".to_owned(), false),
+            ("c.md".to_owned(), true),
+            ("b.md".to_owned(), true)
+        ]
+    );
 }

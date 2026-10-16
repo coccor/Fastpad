@@ -106,6 +106,9 @@ pub struct Settings {
     pub recovery_interval_seconds: u32,
     /// Whether the primary window reopens the last session's tabs and closes without prompting.
     pub restore_session: bool,
+    /// Whether a clean tab reloads by itself when its file changes outside FastPad
+    /// (`reload_changed_files=auto`), or every change waits for the user (`ask`).
+    pub reload_changed_files: bool,
     /// Whether an open folder is treated as a note library (sidebar data, autosave, first-save
     /// naming).
     pub notes_mode: bool,
@@ -177,6 +180,9 @@ impl Settings {
         if let Some(restore_session) = delta.restore_session {
             self.restore_session = restore_session;
         }
+        if let Some(reload) = delta.reload_changed_files {
+            self.reload_changed_files = reload;
+        }
         if let Some(notes_mode) = delta.notes_mode {
             self.notes_mode = notes_mode;
         }
@@ -245,6 +251,7 @@ pub struct SettingsDelta {
     pub theme: Option<ThemePreference>,
     pub recovery_interval_seconds: Option<u32>,
     pub restore_session: Option<bool>,
+    pub reload_changed_files: Option<bool>,
     pub notes_mode: Option<bool>,
     pub sidebar_view: Option<SidebarView>,
     pub sidebar_width: Option<u16>,
@@ -265,7 +272,8 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `preview_font`, `preview_font_size`,
 /// `preview_line_height`, `font_size`, `tab_width`, `word_wrap`,
-/// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
+/// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`,
+/// `reload_changed_files` (`auto` or `ask`), `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
 /// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
@@ -406,6 +414,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
             Ok(seconds) if seconds > 0 => delta.recovery_interval_seconds = Some(seconds),
             _ => warn(delta, line_number, key, value),
         },
+        "reload_changed_files" => match reload_policy(value) {
+            Some(reload) => delta.reload_changed_files = Some(reload),
+            None => warn(delta, line_number, key, value),
+        },
         "restore_session" => match parse_bool(value) {
             Some(restore_session) => delta.restore_session = Some(restore_session),
             None => warn(delta, line_number, key, value),
@@ -488,6 +500,20 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// `reload_changed_files`: `auto` or `ask` (any case), or a boolean spelling for the same.
+fn reload_policy(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Some(true),
+        "ask" => Some(false),
+        _ => parse_bool(value),
+    }
+}
+
+/// The `reload_changed_files=` value that parses back to `reload`.
+pub const fn reload_policy_token(reload: bool) -> &'static str {
+    if reload { "auto" } else { "ask" }
 }
 
 fn parse_theme(value: &str) -> Option<ThemePreference> {
@@ -816,6 +842,30 @@ mod tests {
         let mut settings = default_settings();
         settings.apply_delta(&parse("restore_session=0"));
         assert!(!settings.restore_session);
+    }
+
+    #[test]
+    fn reload_changed_files_defaults_to_auto_and_accepts_auto_ask_and_booleans() {
+        // Break caught: outside changes waiting for the user in a new profile, or `ask` written
+        // by FastPad not reading back.
+        assert!(default_settings().reload_changed_files);
+        for (value, reload) in [
+            ("auto", true),
+            ("Ask", false),
+            ("ASK", false),
+            ("off", false),
+            ("yes", true),
+        ] {
+            let line = format!("reload_changed_files={value}");
+            assert_eq!(parse(&line).reload_changed_files, Some(reload), "{value}");
+        }
+        for reload in [true, false] {
+            let line = format!("reload_changed_files={}", reload_policy_token(reload));
+            assert_eq!(parse(&line).reload_changed_files, Some(reload));
+        }
+        let delta = parse("reload_changed_files=sometimes");
+        assert_eq!(delta.reload_changed_files, None);
+        assert_eq!(delta.warnings.len(), 1);
     }
 
     #[test]

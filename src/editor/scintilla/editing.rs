@@ -316,6 +316,14 @@ impl Editor {
         Ok(())
     }
 
+    /// Makes the shown document read-only, or editable again. Scintilla keeps the flag on the
+    /// document, so it holds whichever view shows it.
+    pub(crate) fn set_read_only(&self, read_only: bool) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETREADONLY, usize::from(read_only), 0)?;
+        Ok(())
+    }
+
     pub fn begin_undo_action(&self) {
         let _ = self
             .endpoint

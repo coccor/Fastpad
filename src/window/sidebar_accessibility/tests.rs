@@ -67,6 +67,7 @@ fn row(kind: RowKind, name: &str, depth: u16, pinned: bool, expanded: bool) -> T
         name: name.to_owned(),
         pinned,
         expanded,
+        changed: false,
     }
 }
 

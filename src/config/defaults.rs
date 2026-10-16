@@ -24,6 +24,8 @@ pub const DEFAULT_LINE_NUMBERS: bool = true;
 pub const DEFAULT_THEME: ThemePreference = ThemePreference::System;
 pub const DEFAULT_RECOVERY_INTERVAL_SECONDS: u32 = 30;
 pub const DEFAULT_RESTORE_SESSION: bool = true;
+/// `reload_changed_files=auto`: a clean tab takes its file's outside changes by itself.
+pub const DEFAULT_RELOAD_CHANGED_FILES: bool = true;
 pub const DEFAULT_NOTES_MODE: bool = true;
 pub const DEFAULT_SIDEBAR_VIEW: SidebarView = SidebarView::Notebook;
 /// The side panel's width in 96-DPI pixels: the default, and the range a drag or `fastpad.ini`
@@ -73,6 +75,7 @@ pub fn default_settings() -> Settings {
         theme: DEFAULT_THEME,
         recovery_interval_seconds: DEFAULT_RECOVERY_INTERVAL_SECONDS,
         restore_session: DEFAULT_RESTORE_SESSION,
+        reload_changed_files: DEFAULT_RELOAD_CHANGED_FILES,
         notes_mode: DEFAULT_NOTES_MODE,
         sidebar_view: DEFAULT_SIDEBAR_VIEW,
         sidebar_width: DEFAULT_SIDEBAR_WIDTH,

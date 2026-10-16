@@ -36,6 +36,10 @@ pub struct TreeRow {
     pub pinned: bool,
     /// For a folder row: whether its contents follow it.
     pub expanded: bool,
+    /// For a note row: it changed outside FastPad since the user last opened it. For a collapsed
+    /// folder row: a note somewhere inside does (second brain phase 1 spec §5.5). `rows` leaves
+    /// it off; the Notebook view marks rows from the library's changed set.
+    pub changed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -704,6 +708,7 @@ impl NoteTree {
                 name: child.name.to_string_lossy().into_owned(),
                 pinned: false,
                 expanded: open,
+                changed: false,
             });
             if open {
                 let depth = depth.saturating_add(1);
@@ -775,6 +780,7 @@ fn push_notes(rows: &mut Vec<TreeRow>, folder: &Folder, path: &Path, depth: u16,
         name: note_name(&folder.names, note).into_owned(),
         pinned: note.pinned,
         expanded: false,
+        changed: false,
     }));
 }
 

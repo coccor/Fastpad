@@ -177,6 +177,7 @@ fn open_path_placed(hwnd: HWND, path: &std::path::Path, preview: bool) -> Result
     let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
     document.path = Some(loaded.path);
     document.encoding = loaded.encoding;
+    document.text_base = Some(crate::library::external::TextBase::of(&loaded.text));
     document.preview = preview;
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(

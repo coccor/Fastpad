@@ -195,19 +195,30 @@ pub(super) fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
 /// that is not active is saved through a brief switch to it, as `autosave_all` does. False (and
 /// a notice) when the save failed: nothing may move then.
 pub(super) fn save_before_move(hwnd: HWND, note: &Path) -> bool {
-    let Some((id, active, paused, known)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let tabs = &unsafe { app.as_ref() }.tabs;
-        let id = tabs.find_stored_path(note)?;
-        let document = tabs.document(id)?;
-        document.dirty.then(|| {
-            (
-                id,
-                tabs.active().map(|document| document.id),
-                document.autosave_paused,
-                document.disk_stamp,
-            )
+    let tab = |hwnd: HWND| {
+        unsafe { app_ptr(hwnd) }.and_then(|app| {
+            let tabs = &unsafe { app.as_ref() }.tabs;
+            let id = tabs.find_stored_path(note)?;
+            let document = tabs.document(id)?;
+            document.dirty.then(|| {
+                (
+                    id,
+                    tabs.active().map(|document| document.id),
+                    document.autosave_paused,
+                    document.disk_stamp,
+                )
+            })
         })
-    }) else {
+    };
+    let Some((id, _, _, known)) = tab(hwnd) else {
+        return true;
+    };
+    // The tab takes in an append made outside FastPad, or raises the conflict, first, as
+    // autosave does (second brain phase 1 spec §5.4), whether or not the watcher got there.
+    if known.is_none() || known != library::disk_stamp(note) {
+        super::check_tab(hwnd, id);
+    }
+    let Some((id, active, paused, known)) = tab(hwnd) else {
         return true;
     };
     // The same guard as autosave: a file changed outside FastPad (or one whose stamp FastPad

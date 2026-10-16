@@ -645,6 +645,7 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
                     light_theme,
                     active: snapshot.active,
                     preview_tab: snapshot.preview_tab,
+                    conflicts: &snapshot.conflicts,
                     palette,
                     fonts,
                     pointer,

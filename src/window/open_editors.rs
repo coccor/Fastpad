@@ -42,6 +42,8 @@ pub(crate) struct EditorRow {
     pub name: String,
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    /// The file changed on disk in a way the tab couldn't take in (second brain phase 1 §5.4).
+    pub conflict: bool,
     pub active: bool,
 }
 
@@ -126,6 +128,7 @@ fn editor_row(
         },
         path: document.path.clone(),
         dirty: document.dirty,
+        conflict: document.conflict.is_some(),
         active: Some((group, document.id)) == active,
     }
 }
@@ -199,6 +202,9 @@ pub(crate) fn accessible_name(row: &EditorRow) -> String {
     let mut name = format!("{}, open editor", row.name);
     if row.dirty {
         name.push_str(", modified");
+    }
+    if row.conflict {
+        name.push_str(", changed on disk");
     }
     name
 }
@@ -402,7 +408,14 @@ pub(crate) fn draw_editor_row(
         ..rect
     };
     unsafe { draw_text(dc, &row.name, name, paint.fonts.text, foreground, LINE) };
-    if row.dirty {
+    if row.conflict {
+        let color = if palette.high_contrast {
+            foreground
+        } else {
+            palette.warning_foreground
+        };
+        unsafe { draw_text(dc, DIRTY_DOT, close, paint.fonts.text, color, CENTERED) };
+    } else if row.dirty {
         unsafe { draw_text(dc, DIRTY_DOT, close, paint.fonts.text, muted, CENTERED) };
     } else if look.hover || look.selected {
         let color = if close_hot { foreground } else { muted };
@@ -487,9 +500,18 @@ mod tests {
             name: "draft.txt".into(),
             path: Some(PathBuf::from(r"D:\x\draft.txt")),
             dirty: true,
+            conflict: false,
             active: false,
         };
         assert_eq!(accessible_name(&row), "draft.txt, open editor, modified");
+        let conflicted = EditorRow {
+            conflict: true,
+            ..row.clone()
+        };
+        assert_eq!(
+            accessible_name(&conflicted),
+            "draft.txt, open editor, modified, changed on disk"
+        );
         assert_eq!(tooltip(&row), r"D:\x\draft.txt");
         let clean = EditorRow {
             dirty: false,

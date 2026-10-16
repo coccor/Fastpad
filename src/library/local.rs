@@ -32,6 +32,9 @@ pub struct LocalState {
     pub files: Vec<CachedFile>,
     /// The notebook's root row is collapsed in the Notebook view (open editors spec §3.3).
     pub root_collapsed: bool,
+    /// Notes changed outside FastPad since the user last opened them, relative to the notebook
+    /// (second brain phase 1 spec §5.5).
+    pub changed: Vec<PathBuf>,
 }
 
 /// Everything in the local file except the scan cache: what the UI thread changes.
@@ -42,6 +45,7 @@ pub struct Conveniences {
     pub missing: Vec<(u64, NoteId)>,
     /// The notebook's root row is collapsed in the Notebook view (open editors spec §3.3).
     pub root_collapsed: bool,
+    pub changed: Vec<PathBuf>,
 }
 
 impl LocalState {
@@ -51,7 +55,27 @@ impl LocalState {
             expanded: self.expanded.clone(),
             missing: self.missing.clone(),
             root_collapsed: self.root_collapsed,
+            changed: self.changed.clone(),
         }
+    }
+
+    /// Whether `path` (relative to the notebook) is marked changed outside FastPad.
+    pub fn is_changed(&self, path: &Path) -> bool {
+        self.changed.iter().any(|changed| same_path(changed, path))
+    }
+
+    /// Marks `path` changed outside FastPad, or clears its mark. Returns whether that changed.
+    pub fn set_changed(&mut self, path: &Path, changed: bool) -> bool {
+        let known = self.is_changed(path);
+        if known == changed {
+            return false;
+        }
+        if changed {
+            self.changed.push(path.to_path_buf());
+        } else {
+            self.changed.retain(|marked| !same_path(marked, path));
+        }
+        true
     }
 
     pub fn new(folder: PathBuf) -> Self {
@@ -62,6 +86,7 @@ impl LocalState {
             missing: Vec::new(),
             files: Vec::new(),
             root_collapsed: false,
+            changed: Vec::new(),
         }
     }
 
@@ -79,6 +104,9 @@ impl LocalState {
         }
         for (time, id) in &self.missing {
             output.push_str(&format!("missing={time}|{}\r\n", id.to_hex()));
+        }
+        for path in &self.changed {
+            output.push_str(&format!("changed={}\r\n", path.to_string_lossy()));
         }
         for file in &self.files {
             output.push_str(&format!(
@@ -109,6 +137,7 @@ impl LocalState {
                 "autosave" => state.autosave = value != "false",
                 "expanded" if !value.is_empty() => state.expanded.push(PathBuf::from(value)),
                 "root" => state.root_collapsed = value == "collapsed",
+                "changed" if !value.is_empty() => state.changed.push(PathBuf::from(value)),
                 "missing" => {
                     if let Some((time, id)) = value.split_once('|')
                         && let (Ok(time), Some(id)) = (time.parse(), NoteId::parse_hex(id))
@@ -430,6 +459,7 @@ mod tests {
         state.autosave = false;
         state.expanded = vec![PathBuf::from("sub"), PathBuf::from(r"sub\a|x")];
         state.missing = vec![(5, NoteId(9))];
+        state.changed = vec![PathBuf::from(r"journal\2026-10-16.md")];
         state.files = vec![CachedFile {
             volume: 0x1234,
             file_id: 77,
@@ -459,6 +489,19 @@ mod tests {
             LocalState::parse("version=2\r\n", Path::new(r"D:\Notes")),
             None
         );
+    }
+
+    #[test]
+    fn changed_marks_are_kept_once_ignoring_case_and_clear() {
+        // Break caught: a note marked twice writing two lines, or opening `Plan.md` leaving the
+        // mark that `plan.md` got.
+        let mut state = LocalState::new(PathBuf::from(r"D:\Notes"));
+        assert!(state.set_changed(Path::new("plan.md"), true));
+        assert!(!state.set_changed(Path::new("PLAN.md"), true));
+        assert!(state.is_changed(Path::new("Plan.MD")));
+        assert!(state.encode().contains("changed=plan.md\r\n"));
+        assert!(state.set_changed(Path::new("Plan.md"), false));
+        assert!(state.changed.is_empty());
     }
 
     #[test]

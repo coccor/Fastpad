@@ -214,12 +214,100 @@ pub(crate) fn reload_clean_document(
     {
         document.encoding = loaded.encoding;
         document.disk_stamp = stamp;
+        document.text_base = Some(crate::library::external::TextBase::of(&loaded.text));
         document.autosave_paused = false;
+        document.conflict = None;
+        document.deleted_on_disk = false;
     }
     if inactive.is_none() {
         // Population suppressed SCN_MODIFIED: the preview reads the new text.
         crate::window::preview_host::document_reloaded(hwnd);
     }
+    true
+}
+
+/// How a tab takes in its file's new text (second brain phase 1 spec §5.3, §5.4).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DiskEdit<'a> {
+    /// The tab's text becomes `text`, as one undo step, and the tab is left clean.
+    Reload(&'a str),
+    /// `text` is added at the end of the tab, as one undo step; the tab stays dirty.
+    Append(&'a str),
+}
+
+/// Applies `edit` to tab `id`: in the editor showing it, whose notifications then record the
+/// change as for typing, or else through the document host, recorded here by hand. Only the
+/// changed middle of the text is replaced, so Scintilla keeps the caret, selection, folds and
+/// scroll position around it, and Ctrl+Z brings the previous text back. A preview tab stays a
+/// preview. Returns whether the edit was made. Call it with nothing of the App borrowed.
+pub(crate) fn apply_disk_edit(hwnd: HWND, id: DocumentId, edit: DiskEdit<'_>) -> bool {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return false;
+    };
+    let Some((editor, inactive, preview)) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        if app.populating_file {
+            return None;
+        }
+        let target = app.tabs.document(id)?;
+        let preview = target.preview;
+        if let Some(editor) = editor_showing(app, id) {
+            return Some((editor, None, preview));
+        }
+        let editor = app.editor().cloned()?;
+        Some((editor, Some(target.text_handle()?.clone()), preview))
+    }) else {
+        return false;
+    };
+    let run = |editor: &Editor| -> Result<()> {
+        match edit {
+            DiskEdit::Reload(text) => {
+                let replacement = editor.with_document_text(|old| {
+                    crate::library::external::minimal_replacement(old, text)
+                })?;
+                if let Some(replacement) = replacement {
+                    editor.begin_undo_action();
+                    let result = editor.replace_target(
+                        replacement.start..replacement.old_end,
+                        &replacement.new_text,
+                    );
+                    editor.end_undo_action();
+                    result?;
+                }
+                editor.set_save_point();
+            }
+            DiskEdit::Append(text) => {
+                let end = editor.length()?;
+                editor.begin_undo_action();
+                let result = editor.replace_target(end..end, text);
+                editor.end_undo_action();
+                result?;
+            }
+        }
+        Ok(())
+    };
+    let result = match &inactive {
+        None => run(&editor),
+        Some(target) => with_background_document(hwnd, target, run),
+    };
+    if !identity.is_live_for(hwnd) || result.is_err() {
+        return false;
+    }
+    let dirty = matches!(edit, DiskEdit::Append(_));
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let tabs = &mut unsafe { app.as_mut() }.tabs;
+        if inactive.is_some() {
+            // The document host's notifications reach no window.
+            tabs.note_background_disk_edit(id, dirty);
+        }
+        if preview && !dirty {
+            tabs.restore_preview(id);
+        }
+    }
+    if inactive.is_some() {
+        crate::window::markdown_host::forget(hwnd, id);
+    }
+    invalidate_title_strip(hwnd);
     true
 }
 

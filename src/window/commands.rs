@@ -158,6 +158,11 @@ pub enum CommandId {
     MarkdownItalic = 262,
     MarkdownCode = 263,
     MarkdownLink = 264,
+    // Changes made outside FastPad (second brain phase 1 spec §5).
+    ToggleReloadChangedFiles = 265,
+    NoteCompareWithDisk = 266,
+    NotesShowChanged = 267,
+    NotesClearChanged = 268,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -182,7 +187,7 @@ pub const EDITING_COMMANDS: [CommandId; 16] = [
 ];
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 60] = [
+pub const TEXT_COMMANDS: [CommandId; 61] = [
     CommandId::MoveLinesUp,
     CommandId::MoveLinesDown,
     CommandId::CopyLinesUp,
@@ -239,6 +244,7 @@ pub const TEXT_COMMANDS: [CommandId; 60] = [
     CommandId::LanguageYaml,
     CommandId::NoteReloadFromDisk,
     CommandId::NoteKeepMine,
+    CommandId::NoteCompareWithDisk,
     CommandId::MarkdownBold,
     CommandId::MarkdownItalic,
     CommandId::MarkdownCode,
@@ -312,6 +318,9 @@ impl CommandId {
                 | Self::FileIconsMinimal
                 | Self::FileIconsSolid
                 | Self::ToggleRestoreSession
+                | Self::ToggleReloadChangedFiles
+                | Self::NotesShowChanged
+                | Self::NotesClearChanged
                 | Self::ToggleNotesMode
                 | Self::OpenFolder
                 | Self::OpenRecentFolder
@@ -483,7 +492,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 154] = [
+        const COMMANDS: [CommandId; 158] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -638,6 +647,10 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownItalic,
             CommandId::MarkdownCode,
             CommandId::MarkdownLink,
+            CommandId::ToggleReloadChangedFiles,
+            CommandId::NoteCompareWithDisk,
+            CommandId::NotesShowChanged,
+            CommandId::NotesClearChanged,
         ];
         COMMANDS
             .into_iter()
@@ -954,6 +967,22 @@ mod tests {
     }
 
     #[test]
+    fn external_change_commands_have_stable_values() {
+        assert_eq!(
+            CommandId::try_from(265),
+            Ok(CommandId::ToggleReloadChangedFiles)
+        );
+        assert!(!CommandId::ToggleReloadChangedFiles.needs_document());
+        assert_eq!(CommandId::try_from(266), Ok(CommandId::NoteCompareWithDisk));
+        assert!(CommandId::NoteCompareWithDisk.needs_document());
+        assert_eq!(CommandId::try_from(267), Ok(CommandId::NotesShowChanged));
+        assert_eq!(CommandId::try_from(268), Ok(CommandId::NotesClearChanged));
+        assert!(!CommandId::NotesShowChanged.needs_document());
+        assert!(!CommandId::NotesClearChanged.needs_document());
+        assert!(CommandId::try_from(269).is_err());
+    }
+
+    #[test]
     fn markdown_edit_commands_have_stable_values() {
         for (value, command) in [
             (261, CommandId::MarkdownBold),
@@ -965,7 +994,6 @@ mod tests {
             assert!(command.is_markdown_edit());
             assert_eq!(command.scope(), Scope::Markdown);
         }
-        assert!(CommandId::try_from(265).is_err());
         assert!(!CommandId::ToggleSidebar.is_markdown_edit());
         assert_eq!(CommandId::ToggleSidebar.scope(), Scope::Global);
     }

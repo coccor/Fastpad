@@ -282,6 +282,27 @@ pub(super) fn execute_command_with_note(
                 .is_some_and(|app| unsafe { app.as_ref() }.settings.restore_session);
             push_notice(hwnd, crate::session::toggle_notice(enabled).to_owned());
         }
+        CommandId::ToggleReloadChangedFiles => {
+            change_setting(hwnd, |settings| {
+                settings.reload_changed_files = !settings.reload_changed_files;
+                Some((
+                    "reload_changed_files",
+                    crate::config::persisted::reload_policy_token(settings.reload_changed_files)
+                        .to_owned(),
+                ))
+            });
+            let enabled = unsafe { app_ptr(hwnd) }
+                .is_some_and(|app| unsafe { app.as_ref() }.settings.reload_changed_files);
+            push_notice(
+                hwnd,
+                if enabled {
+                    "Files changed outside FastPad now reload by themselves when their tab has no unsaved edits."
+                } else {
+                    "Files changed outside FastPad now wait for you: use Note: Reload from disk or Note: Keep my version."
+                }
+                .to_owned(),
+            );
+        }
         CommandId::ToggleNotesMode => {
             change_setting(hwnd, |settings| {
                 settings.notes_mode = !settings.notes_mode;
@@ -310,6 +331,9 @@ pub(super) fn execute_command_with_note(
         }
         CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
         CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
+        CommandId::NoteCompareWithDisk => compare_with_disk(hwnd),
+        CommandId::NotesShowChanged => crate::window::library_host::toggle_changed_only(hwnd),
+        CommandId::NotesClearChanged => crate::window::library_host::clear_all_marks(hwnd),
         CommandId::NoteTogglePin => {
             if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
                 crate::window::library_host::toggle_pin(hwnd, &path);

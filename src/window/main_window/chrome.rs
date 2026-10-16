@@ -322,13 +322,46 @@ pub(super) fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::St
     });
     let mut bar = crate::window::status::status_bar_text(&app.notifications, active);
     if app.notifications.pending().is_empty()
-        && let Some(hint) = app
-            .active_group()
-            .and_then(|group| group.preview.status_hint())
+        && let Some(hint) = app.status_hint.clone().or_else(|| {
+            app.active_group()
+                .and_then(|group| group.preview.status_hint())
+        })
     {
         bar.left = hint;
     }
     Some(bar)
+}
+
+/// How long a status hint stays in the bottom bar.
+const STATUS_HINT_MS: u32 = 4_000;
+pub(crate) const STATUS_HINT_TIMER_ID: usize = 0x4650_5348;
+
+/// Shows `hint` in the status bar for a few seconds, unless a notification is showing. A newer
+/// hint replaces an older one and restarts the clock.
+pub(crate) fn show_status_hint(hwnd: HWND, hint: &str) {
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    unsafe { app.as_mut() }.status_hint = Some(hint.to_owned());
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(
+            hwnd,
+            STATUS_HINT_TIMER_ID,
+            STATUS_HINT_MS,
+            None,
+        );
+    }
+    invalidate_status_bar(hwnd);
+}
+
+pub(super) fn clear_status_hint(hwnd: HWND) {
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, STATUS_HINT_TIMER_ID);
+    }
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.status_hint = None;
+    }
+    invalidate_status_bar(hwnd);
 }
 
 pub(super) fn status_bar_height(hwnd: HWND) -> i32 {

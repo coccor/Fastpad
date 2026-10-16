@@ -1134,9 +1134,14 @@ fn a_note_changed_outside_fastpad_is_not_moved_over_its_change() {
     let active = app_mut(window.hwnd).tabs.active().unwrap();
     assert_eq!(active.path.as_deref(), Some(a.as_path()));
     assert!(active.dirty && active.autosave_paused);
+    // The conflict is raised first (second brain phase 1 spec §5.4), then the move refuses.
     let added = &notices(window.hwnd)[before..];
-    assert_eq!(added.len(), 1, "{added:?}");
-    assert!(added[0].contains("Nothing was moved"), "{added:?}");
+    assert_eq!(added.len(), 2, "{added:?}");
+    assert!(
+        added[0].contains("changed on disk while you had unsaved edits"),
+        "{added:?}"
+    );
+    assert!(added[1].contains("Nothing was moved"), "{added:?}");
 
     // Already paused: refused again, without writing.
     execute_command(window.hwnd, CommandId::NoteMoveToNotebook);

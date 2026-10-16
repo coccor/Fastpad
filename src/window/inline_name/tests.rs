@@ -7,6 +7,7 @@ fn row(kind: RowKind, name: &str, depth: u16, expanded: bool) -> TreeRow {
         name: name.to_owned(),
         pinned: false,
         expanded,
+        changed: false,
     }
 }
 

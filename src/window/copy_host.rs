@@ -269,6 +269,11 @@ pub(crate) fn copy_into(
         return;
     }
     let reloads = clean_tabs_on(hwnd, &replaced);
+    // The notebook watcher will report the copies: they are FastPad's own, not outside changes.
+    library_host::begin_own_writes(
+        hwnd,
+        items.iter().map(|(_, destination)| destination.as_path()),
+    );
     queue(
         hwnd,
         CopyJob {
@@ -394,6 +399,10 @@ pub(crate) fn copy_done(hwnd: HWND, lparam: LPARAM) {
 }
 
 fn apply(hwnd: HWND, mut done: CopyDone) {
+    library_host::end_own_writes(
+        hwnd,
+        done.items.iter().map(|item| item.destination.as_path()),
+    );
     let mut notices = std::mem::take(&mut done.notices);
     // The dirty tab's drop is its one item: the notice goes with a copy that worked.
     if let Some(name) = done.dirty_tab.take()
