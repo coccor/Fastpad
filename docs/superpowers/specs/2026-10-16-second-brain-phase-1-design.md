@@ -26,12 +26,15 @@ Success looks like this: an agent edits a note while the user has it open. The c
 |---|---|
 | Link syntax | Obsidian-compatible: `[[Note]]`, `[[Note\|label]]`, `[[Note#Heading]]`, `[[folder/Note]]`. Standard Markdown links to local `.md` files count as links too. |
 | Tag syntax | Inline `#tag` and `#nested/tag` in body text, plus `tags:` in front matter |
-| Metadata | YAML front matter at the top of Markdown files, read with a small parser for a subset of YAML. FastPad never rewrites it in Phase 1. |
+| Metadata | YAML front matter at the top of Markdown files, read with a small parser for a subset of YAML. FastPad writes to it only when the user ticks "Keep the old name as an alias" on a rename (§7.6). |
 | Where links and tags are stored | Only in the note text. A per-PC **note index cache** speeds up startup and can be thrown away at any time. |
 | Notebook conventions | A new shared file, `.fastpad\notebook.ini`, holds the daily folder, the date format, the inbox file and the templates folder. It is written only when the user changes a default. |
 | Backlinks and tags UI | Two new sidebar views: **Links** (for the active note) and **Tags** (for the whole notebook) |
-| Reacting to outside changes | A `ReadDirectoryChangesW` watcher on the open notebook, plus stat checks for other tabs. A clean tab reloads as a single undoable edit. A dirty tab enters a conflict state. |
-| Capture | A global hotkey while FastPad runs; `fastpad --capture` to open the capture box even when FastPad is closed; `fastpad --capture "text"` to append with no window. FastPad stays without a background service. |
+| Reacting to outside changes | A `ReadDirectoryChangesW` watcher on the open notebook, plus stat checks for other tabs. A clean tab reloads as a single undoable edit. A dirty tab takes in text appended on disk automatically, and enters a conflict state for any other change. Notes changed outside FastPad are marked in the tree until opened. |
+| Renames | Links are updated after renames made by FastPad **and** renames made outside it (detected by file ID). A rename in FastPad can also keep the old name as an alias. |
+| Notebook health | The Links view also lists links to missing notes ("Gaps") and notes nothing links to ("Orphans") |
+| Templates | "New note from template" from `.fastpad\templates\`, sharing the daily note's placeholders |
+| Capture | A global hotkey while FastPad runs; `fastpad --capture` to open the capture box even when FastPad is closed; `fastpad --capture "text"` to append with no window. The target is one inbox file, today's daily note, or a folder that gets one file per capture. FastPad stays without a background service. |
 | Delivery | Five PRs (§12). The external-change work comes first, because agents need it most. |
 
 Rejected alternatives:
@@ -49,6 +52,13 @@ Rejected alternatives:
 - **The disk-change guard** (library spec §8.3) is kept and widened. Today it checks a file only right before an autosave. After this spec, changes are noticed when they happen, for every tab, with autosave on or off.
 - **Library sub-project 4, "links and backlinks"**, is delivered by §7 of this spec.
 
+The requirements were checked against agent-maintained vaults in use today, mainly [second-brain-os](https://github.com/undefined-ui/second-brain-os) (Karpathy's "LLM wiki" pattern: `raw/` sources, an agent-written `wiki/`, `index.md` and `log.md`, a `CLAUDE.md` of rules) and daily-note-and-inbox setups driven by Claude Code commands. Four findings shaped this spec:
+
+- **Agents renaming files directly is the most common cause of broken links** in those vaults, so outside renames update links too (§7.6).
+- **Agents append constantly** (`log.md`, inboxes, daily notes), often to a file the user has open, so appends merge instead of conflicting (§5.4).
+- **The list of links to missing notes is the most useful output of the vault** ("Gaps" in `index.md`), so FastPad shows it (§7.5).
+- **Background tools that rewrite files fight the agent**, so FastPad still never rewrites a file on its own.
+
 ## 4. Goals and non-goals
 
 ### Goals
@@ -56,9 +66,11 @@ Rejected alternatives:
 - Changes made to a file outside FastPad appear in its open tab within about half a second when the file is in the open notebook, and when the window or tab is next activated when it is not.
 - Write `[[` and pick a note. Click a link in the preview, or Ctrl+click one in the editor, to open it. A link to a note that doesn't exist yet creates the note.
 - See every note that links to the active note, with the line that links to it.
-- Renaming or moving a note in FastPad offers to update the links that point to it.
+- Renaming or moving a note, in FastPad or outside it, offers to update the links that point to it.
+- See which notes are linked but missing, and which notes nothing links to.
+- See at a glance which notes changed outside FastPad since you last opened them.
 - Tag notes inline or in front matter, and browse the notebook by tag.
-- Open today's daily note with one key, created from a template the first time.
+- Open today's daily note with one key, and create any note from a template.
 - Capture a thought from anywhere in Windows in under a second, without switching windows.
 
 ### Non-goals (for Phase 1)
@@ -68,10 +80,9 @@ Rejected alternatives:
 - "Unlinked mentions" (text that names a note without linking to it).
 - A graph view.
 - Completing `#heading` inside `[[Note#…]]`. Headings are matched when the link is followed, but not offered as you type.
-- General note templates ("New note from template"). Only the daily note has a template.
-- Editing front matter from the UI, and queries such as `tag:x` in the Search view.
-- Merging conflicting edits. A conflict is resolved by choosing one side, or by comparing the two (§5.4).
-- Updating links after a rename made outside FastPad.
+- Editing front matter from the UI (apart from adding an alias on rename, §7.6), and queries such as `tag:x` in the Search view (Phase 1.5, §16).
+- Merging conflicting edits, beyond taking in text appended on disk (§5.4). Any other conflict is resolved by choosing one side, or by comparing the two.
+- Updating links after an outside rename that reconciliation (library spec §7.3) can't match, for example a file renamed and edited on another PC before the change synced.
 
 ## 5. Changes made outside FastPad (PR 1a)
 
@@ -83,7 +94,7 @@ Rejected alternatives:
 - overlapped I/O with a 64 KB buffer, waiting on the I/O event and a stop event;
 - changes are collected for 250 ms after the last event, then posted to the UI thread as one `WM_FASTPAD_FILES_CHANGED` carrying a boxed set of paths and a flag that says whether names changed;
 - a buffer overflow (the call completes with zero bytes) posts a "full rescan" instead of paths;
-- paths under `.fastpad\` are passed on only for `library.ini` (pins changed on another PC) and `notebook.ini` (§9.1).
+- paths inside folders whose names the scan skips (library spec §5: names starting with `.`, `node_modules`, `target`, `bin`, `obj`) are dropped by name on the watcher thread, before the 250 ms window. Folders skipped for their hidden or system attribute are filtered on the UI thread, which ignores a content change to a path that is neither in the scan nor open in a tab (name changes still request the rescan below, which applies the skip rules itself). That way a `git commit`, an `.obsidian` workspace save or a package install doesn't flood the UI thread. The one exception is `.fastpad\`: changes to `library.ini` (pins changed on another PC) and `notebook.ini` (§9.1) are passed on.
 
 The watcher starts when the notebook's first scan finishes, and is stopped and joined when the notebook is closed or switched and when the window closes. If `ReadDirectoryChangesW` fails (some network shares, FAT drives, or an error later on), the watcher quits. A single line goes to the diagnostic log, and FastPad keeps today's behavior: a rescan when the window is activated after 5 seconds.
 
@@ -110,7 +121,8 @@ For a tab with a path, FastPad compares the file's current stamp with `document.
 |---|---|---|
 | Same stamp | any | Nothing |
 | Changed | Clean | **Reload** (§5.3), when the tab is visible. A hidden tab is marked `stale` and reloads when it is shown. |
-| Changed | Dirty | **Conflict** (§5.4) |
+| Changed: text added at the end only | Dirty | **Append merge** (§5.4): the added text is put into the tab, with no conflict |
+| Changed in any other way | Dirty | **Conflict** (§5.4) |
 | Missing | Clean | The title shows "(deleted)". The tab stays open with its text. Autosave doesn't re-create the file; Ctrl+S does. |
 | Missing | Dirty | Conflict, with the "deleted on disk" wording |
 | Missing, then back | any | The marker clears and the check runs again |
@@ -133,9 +145,17 @@ A reload replaces the tab's text with the file's text **as an edit, not as a new
 
 The existing "Note: Reload from disk" switches to the same edit-style replacement.
 
-### 5.4 Conflicts
+### 5.4 Append merge and conflicts
 
-A tab in conflict:
+**Append merge.** Agents and capture mostly add to the end of a file (`log.md`, an inbox, a daily note), and the user often has that file open with unsaved edits. Each document remembers its **base**: the length and a 64-bit hash of the text as last loaded or saved (the decoded text, so encodings don't matter). When the disk text is longer than the base and its first `base length` characters hash to the base hash, the change is an append:
+
+1. The added text (everything after the base length) is inserted at the end of the tab's buffer, as one undo step. The user's own edits stay where they are.
+2. The base becomes the disk text, and `disk_stamp` is updated. The tab stays dirty, and the next save (or autosave) writes the user's edits together with the appended text.
+3. The status bar shows "Added text from outside FastPad". There is no notice.
+
+If the user's edits also changed the end of the file, the added text still goes to the end of the buffer, after them. That keeps the append's order relative to everything that was on disk, which is what an append-only file needs. Any change that isn't a pure append (an edit in the middle, a truncation, a different encoding) is a conflict.
+
+**Conflicts.** A tab in conflict:
 
 - has `autosave_paused = true` (the flag that exists today);
 - shows a conflict mark in its tab: the dirty dot is replaced by a warning glyph in the theme's warning color, and its accessible name gains "changed on disk";
@@ -151,6 +171,17 @@ A later outside change to a tab already in conflict changes nothing except the s
 
 Notices still have no buttons (library spec §14). Adding buttons is a separate change; the palette commands are enough for now.
 
+### 5.5 Marking notes changed outside FastPad
+
+After an agent run, the user needs to see what changed without reading a git diff. The Notebook tree marks every note that was **created or changed outside FastPad** since the user last opened it:
+
+- The mark is a small dot in the accent color after the note's name, and the row's accessible name gains "changed outside FastPad". A folder whose collapsed contents hold marked notes shows a dimmer dot.
+- A note is marked when the watcher (§5.1) or a rescan finds a new stamp that FastPad didn't write. A note moved or renamed outside FastPad is marked too.
+- The mark clears when the note is opened in a tab (a preview tab counts), and right away for a note that is already visible in a tab, since the user sees the reload happen.
+- **Notes: Show changed notes** (palette) filters the tree to marked notes and their folders. Running it again shows the whole tree. **Notes: Clear changed marks** clears every mark.
+- Marks are per-PC state, stored as `changed=<path>` lines in the per-PC library file (library spec §6.3), so they survive a restart. A note changed outside FastPad while FastPad was closed is marked on the next scan, by comparing with the scan cache.
+- On a notebook's first scan on a PC there is no cache to compare with, so nothing is marked.
+
 ## 6. The note index (PR 1b)
 
 ### 6.1 What is indexed
@@ -163,7 +194,7 @@ struct NoteFacts {
     aliases: Vec<String>,          // front matter `aliases` / `alias`
     tags: Vec<TagUse>,             // name (as written), line, source: FrontMatter | Inline
     links: Vec<LinkUse>,           // target text, heading, label, line, kind: Wiki | Markdown
-    properties: Vec<(String, String)>, // other front matter keys, as raw text, for the preview
+    properties: Vec<(String, String)>, // every other front matter key, as raw text: the preview, and Phase 1.5 (§16)
 }
 ```
 
@@ -271,19 +302,47 @@ LINKS — Project Atlas
 - Other states: "This file isn't in the open notebook.", "No notebook open.", "Indexing notes…", and "No links yet. Type [[ to link to another note."
 - The view uses the shared tree row list, keyboard model and accessibility of the Notebook view (sidebar spec §10).
 
+Below the active note's sections, two collapsed sections cover the **whole notebook**:
+
+```
+▸ Missing notes (14)
+▾ Not linked from anywhere (6)
+    Vendor call 2026-09
+    Old ideas
+```
+
+- **Missing notes** (the "Gaps" of agent-maintained vaults) lists every unresolved link target in the notebook, sorted by how many notes link to it, then by name. Each row shows the count ("linked from 3 notes"). Expanding a row lists the linking notes. Opening the target row creates the note, as in §7.3. This is a list of what the notebook keeps referring to and nobody has written yet.
+- **Not linked from anywhere** (orphans) lists Markdown notes with no incoming links, sorted by most recently changed. Daily notes, the inbox, `index.md`, `log.md` and any file named `CLAUDE.md` or `README.md` are left out, because nothing is expected to link to them.
+- Both are computed from the index when the section is expanded, and kept up to date with the index while it stays expanded. Collapsed sections cost nothing.
+- Palette commands **Notes: Show missing notes** and **Notes: Show notes not linked from anywhere** open the view with that section expanded.
+
 ### 7.6 Updating links on rename and move
 
-When a note is renamed or moved **by FastPad** (the inline name box, a tree drag, "Note: Move to notebook…"), FastPad finds the links that resolved to the note before the change and will no longer resolve to it afterwards. If there are any, a prompt asks:
+FastPad finds the links that resolved to a note before a rename or move and will no longer resolve to it afterwards. This applies in two cases.
+
+**Renamed or moved by FastPad** (the inline name box, a tree drag, "Note: Move to notebook…"). If any links would break, a prompt asks:
 
 > Update 7 links in 4 notes to point to “New name”?  
+> ☑ Keep “Old name” as an alias  
 > **Update links** · Leave them
+
+- The alias checkbox appears for Markdown notes on a rename (not on a move that keeps the name). It is on by default. Ticked, it adds the old stem to the note's front matter `aliases`, so links FastPad can't see (in other tools, in the user's memory) keep resolving. This is the only time FastPad writes front matter. It creates the block when the note has none, adds to a flow list (`aliases: [a, b]`) or a block list (`- a`) in the existing style, and otherwise leaves every byte of the front matter alone. If `aliases` has a form FastPad doesn't parse (§6.2), the checkbox is disabled with the note "aliases can't be edited automatically in this note".
+- Moves and renames that break no links show no prompt.
+
+**Renamed or moved outside FastPad**, for example by an agent. When reconciliation (library spec §7.3) matches a note to a new path by file ID or fingerprint, FastPad checks the links against the old path the same way. If any links would break, it posts a notice:
+
+> “Old name” was renamed to “New name” outside FastPad. 7 links in 4 notes still point to the old name. Use Notes: Update links to renamed notes.
+
+- **Notes: Update links to renamed notes** shows the same prompt (without the alias checkbox, because the agent owns that note's front matter) for every outside rename still pending, listed by note. Renames left pending are dropped when the notebook closes.
+- Several outside renames found by one scan give one notice.
+- FastPad never rewrites links after an outside rename without the user's go-ahead. An agent may already be fixing them, and a second writer would conflict with it.
+
+Both cases rewrite links like this:
 
 - Wikilinks keep their form: the stem stays a stem if it is unambiguous after the change, and otherwise becomes a path. The label and `#heading` are kept.
 - Markdown links get the new relative path, with the original's percent-encoding style.
 - The rewrite reuses the replace-across-notes machinery (search spec, 3b): open tabs are edited in their buffers as one undo step each, and closed files are rewritten with the atomic saver, recorded as FastPad's own writes (§5.1).
 - A file that fails to write is listed in a notice. The others stay updated.
-
-Renames made outside FastPad don't rewrite links. The links dangle until the user fixes them.
 
 ## 8. Tags (PR 1b)
 
@@ -309,7 +368,7 @@ TAGS
 
 Inline tags are drawn as small rounded chips in the accent color. Clicking a chip shows the Tags view with that tag expanded and selected.
 
-## 9. Daily notes and notebook conventions (PR 1d)
+## 9. Daily notes, templates and notebook conventions (PR 1d)
 
 ### 9.1 `.fastpad\notebook.ini`
 
@@ -320,7 +379,9 @@ version=1
 daily_folder=journal
 daily_format=YYYY-MM-DD
 daily_template=.fastpad/templates/daily.md
+templates_folder=.fastpad/templates
 inbox=inbox.md
+capture_folder=inbox
 capture_target=inbox
 ```
 
@@ -329,11 +390,13 @@ capture_target=inbox
 | `daily_folder` | Folder for daily notes, relative to the notebook | `journal` |
 | `daily_format` | File name pattern: `YYYY`, `MM`, `DD`, `ddd` (Mon), `dddd` (Monday). Anything else is literal. Must contain `YYYY`, `MM` and `DD`. | `YYYY-MM-DD` |
 | `daily_template` | Template for a new daily note | `.fastpad/templates/daily.md` |
+| `templates_folder` | Folder of note templates (§9.4), relative to the notebook. It may be a visible folder such as `templates`, which is what Obsidian vaults usually have. | `.fastpad/templates` |
 | `inbox` | Capture inbox file | `inbox.md` |
-| `capture_target` | `inbox` or `daily` | `inbox` |
+| `capture_folder` | Folder that gets one file per capture (§10.3), relative to the notebook | `inbox` |
+| `capture_target` | `inbox` (append to the inbox file), `daily` (append to today's note) or `folder` (a new file in `capture_folder`) | `inbox` |
 
 - When the file is missing, the defaults apply. It is created only when the user changes a value, which keeps the library spec rule that nothing is written into a folder until the user organizes something.
-- Settings gains a **This notebook** section with these five values. It is disabled when no notebook is open.
+- Settings gains a **This notebook** section with these values. It is disabled when no notebook is open.
 - Hand edits keep comments and unknown lines, as `fastpad.ini` does. A bad value falls back to its default, with a notice naming the line.
 - A watcher change to the file (§5.1) re-reads it.
 
@@ -350,9 +413,9 @@ capture_target=inbox
 
 With no notebook open, these commands show "Open a notebook to use daily notes."
 
-### 9.3 Templates
+### 9.3 Placeholders
 
-A template is a plain text file. The following placeholders are replaced when a note is created from it:
+A template is a plain text file. The following placeholders are replaced when a note is created from it, whether it's a daily note (§9.2) or any other note (§9.4):
 
 | Placeholder | Value |
 |---|---|
@@ -362,7 +425,17 @@ A template is a plain text file. The following placeholders are replaced when a 
 | `{{title}}` | The new file's stem |
 | `{{cursor}}` | Removed; the caret starts here |
 
-Unknown placeholders are left as they are. A missing or unreadable template falls back to the default heading, with a notice naming the template path.
+Unknown placeholders are left as they are. Placeholders are replaced everywhere in the template, front matter included, so a template line `created: {{date:YYYY-MM-DD}}` fills in the date. A missing or unreadable daily template falls back to the default heading, with a notice naming the template path.
+
+### 9.4 New note from template
+
+Agent-maintained vaults keep one template per page type (concept, source, entity, meeting, person…), and the user writes some of those pages by hand. **Notes: New note from template…** (`notes.newFromTemplate`, palette and the Notebook header's `…` menu, no default shortcut):
+
+1. Shows a picker of the Markdown and text files in `templates_folder`, by file stem, filtered as you type (the quick-open matcher). An empty or missing folder shows "No templates in <folder>. Add .md files there to use them."
+2. Opens the inline name box (library spec §8.2) for the new note's name.
+3. Writes the note into the folder selected in the Notebook tree (or the notebook root), with the placeholders replaced and `{{title}}` set to the chosen name, then opens it with the caret at `{{cursor}}` or at the end.
+
+The tree's folder context menu gains **New note from template…**, which writes into that folder. Templates in `templates_folder` are excluded from link resolution and from the orphan list (§7.5), so links written inside templates don't show up as missing notes. (The default `.fastpad/templates` isn't scanned at all, since the scan skips folders starting with `.`.)
 
 ## 10. Quick capture (PR 1e)
 
@@ -396,14 +469,30 @@ A small top-most window (about 520 × 180 DIP), centered on the monitor under th
 - **Ctrl+Enter** appends and closes. **Ctrl+Shift+Enter** appends, closes, and opens the target in FastPad with the caret on the new entry (in a capture-only process, this starts FastPad normally with that file).
 - **Esc** closes. Text that wasn't saved is kept as a draft in `%LocalAppData%\FastPad\capture-draft.txt` and comes back the next time the box opens. A successful capture deletes the draft.
 - The box stays open when it loses focus, so the user can copy something from another window into it.
-- The title names the target. Pressing **Ctrl+Alt+N** again inside the box toggles between `inbox` and `daily` for this capture only.
+- The title names the target. Pressing **Ctrl+Alt+N** again inside the box cycles through `inbox`, `daily` and `folder` for this capture only.
 - It has an accessible name ("Quick capture to inbox.md") and is fully keyboard-operable.
 
 ### 10.3 Appending
 
-The target is the open notebook in a running instance, or the most recent notebook from `folders.ini` in a capture-only process (falling back to `Documents\FastPad`, as in library spec §7.1). It is `inbox`, or today's daily note created as in §9.2.
+The target is the open notebook in a running instance, or the most recent notebook from `folders.ini` in a capture-only process (falling back to `Documents\FastPad`, as in library spec §7.1). Within it, `capture_target` picks one of:
 
-The entry is a Markdown list item stamped with the time:
+- `inbox`: append to the inbox file;
+- `daily`: append to today's daily note, created as in §9.2;
+- `folder`: write a new file in `capture_folder`.
+
+**One file per capture** (`folder`) suits agents that process an inbox item by item: each capture is a file they can read, file and then move or delete, and "what is still unprocessed" is simply what is in the folder. The file is named `YYYY-MM-DD HHmm <first words>.md`, using up to the first five words of the first line, sanitized as in library spec §8.2, with `2`, `3`… added when the name is taken. Its content is:
+
+```markdown
+---
+captured: 2026-10-16T14:32
+---
+
+Call Dana about the Atlas budget #project/atlas
+```
+
+It is written with the atomic saver, never overwrites, and creates the folder when needed.
+
+**Appending** (`inbox` and `daily`): the entry is a Markdown list item stamped with the time:
 
 ```markdown
 - 14:32 Call Dana about the Atlas budget #project/atlas
@@ -412,7 +501,7 @@ The entry is a Markdown list item stamped with the time:
 
 Lines after the first are indented by two spaces so they stay inside the list item. A blank line is added before the entry when the file doesn't already end with a blank line or a list item.
 
-Writing:
+Writing an append:
 
 - **The target is open in a tab** of the running instance: the entry is inserted at the end of the buffer as one undo step. A tab that was clean is then saved. A dirty tab is saved by autosave when it is on; otherwise it stays dirty and a notice says the capture is in the unsaved tab.
 - **Otherwise:** FastPad reads the file with the loader (keeping its encoding and its most common line ending), appends, and writes with the atomic saver. If the stamp changed between the read and the write, it reads again and retries, up to three times. A missing inbox is created with the heading `# Inbox`.
@@ -436,11 +525,11 @@ Five PRs, in this order. Each one is useful without the ones after it.
 
 | PR | Scope | Depends on |
 |---|---|---|
-| **1a** | Outside changes: watcher, tab checks, edit-style reload, conflicts, Compare with disk (§5) | none |
+| **1a** | Outside changes: watcher, tab checks, edit-style reload, append merge, conflicts, Compare with disk, changed-note marks (§5) | none |
 | **1b** | Note index, front matter, inline tags, Tags view, front matter in the preview (§6, §8) | 1a (index updates come from the watcher) |
-| **1c** | Wikilinks: preview, editor marks and Ctrl+click, completion, Links view, link updates on rename (§7) | 1b |
-| **1d** | `notebook.ini`, Settings section, daily notes, templates (§9) | none (can come before 1b) |
-| **1e** | Quick capture: hotkey, `--capture`, capture box, appending, installer task (§10) | 1d (for `notebook.ini` and the daily target) |
+| **1c** | Wikilinks: preview, editor marks and Ctrl+click, completion, Links view with missing and unlinked notes, link updates on renames in and outside FastPad, alias on rename (§7) | 1b |
+| **1d** | `notebook.ini`, Settings section, daily notes, placeholders, New note from template (§9) | none (can come before 1b) |
+| **1e** | Quick capture: hotkey, `--capture`, capture box, appending, one file per capture, installer task (§10) | 1d (for `notebook.ini` and the daily target) |
 
 Each PR updates the README (features, shortcuts, `fastpad.ini` keys) in the style of the existing sections.
 
@@ -452,15 +541,18 @@ Each PR updates the README (features, shortcuts, `fastpad.ini` keys) in the styl
 | Watcher buffer overflow | Full rescan, then tab checks for every visible tab |
 | File changed under a clean tab, over 8 MB | Handled as a conflict |
 | Reload read fails (locked, bad encoding) | The tab is untouched and marked stale. The next check tries again. One notice per file per session. |
-| Outside change under a dirty tab | Conflict (§5.4) |
+| Outside change under a dirty tab | Append merge when the disk text only grew at the end; otherwise a conflict (§5.4) |
+| Outside rename that breaks links | One notice; links change only through Notes: Update links to renamed notes |
+| Adding the old name as an alias fails, or `aliases` can't be parsed | Links are still updated. The checkbox is disabled up front when `aliases` can't be parsed; a failed write gets a notice. |
 | Front matter that isn't valid YAML | The keys that can be read are used, and the rest is kept as raw text. Never an error. |
 | `notes.cache` unreadable or a wrong version | Thrown away and rebuilt |
 | A note can't be read while indexing | Left out of the index, and kept in the scan |
 | Link update fails for some files | The others stay updated. A notice lists the failures. |
 | Unresolved link clicked with no notebook open | Notice; nothing is created |
-| Daily folder can't be created, or template unreadable | Notice. A missing template falls back to the default heading. |
+| Daily folder can't be created, or template unreadable | Notice. A missing daily template falls back to the default heading; New note from template creates nothing. |
 | `notebook.ini` bad value | Default used, and a notice names the line |
 | `RegisterHotKey` fails | One notice, and capture still works through `--capture` |
+| Capture file can't be written (folder target) | Same as a failed append |
 | Capture append fails | The box stays open with the error, and the text is kept as a draft |
 | IPC capture text too long | Exit code 2. Nothing is appended. |
 
@@ -475,6 +567,11 @@ Each PR updates the README (features, shortcuts, `fastpad.ini` keys) in the styl
 - **Link rewrite:** stem kept, stem turned into a path when it becomes ambiguous, label and heading kept, Markdown relative paths and percent-encoding.
 - **Index cache:** round trip; a stale stamp re-parses; an unknown version discards the cache.
 - **Reload:** the prefix and suffix diff, including empty, identical, all-changed and multi-byte text at the edges.
+- **Append detection:** a pure append; an append plus an edit in the middle (conflict); a truncation (conflict); the same length with different text (conflict); a base at a multi-byte boundary.
+- **Alias writing:** no front matter (block created), flow list, block list, `alias` as a single string, an unparsed `aliases` form (refused), every other byte unchanged.
+- **Gaps and orphans:** counts and ordering; the excluded files (daily notes, inbox, `index.md`, `log.md`, `CLAUDE.md`, `README.md`, templates).
+- **Outside rename detection:** links that would break after a file-ID match and after a fingerprint match; nothing pending when every link still resolves.
+- **Capture file names:** first-words naming, sanitizing, clash numbering, an empty first line.
 - **Daily notes:** `daily_format` tokens, an invalid format, template placeholders, previous and next ordering with gaps and non-matching files.
 - **Capture entry formatting:** single and multi-line entries; blank-line rules; CRLF and LF files; UTF-16 files.
 - **`launch.rs`:** `--capture`, `--capture "text"`, `--capture -`, combined with `--new-window`.
@@ -488,6 +585,13 @@ Run with a scratch `LOCALAPPDATA` and a temp notebook, `--test-threads=1`.
 
 - An outside write to an open clean note reloads it within 1 s. Ctrl+Z restores the old text and makes the tab dirty.
 - An outside write to a dirty note gives a conflict. Autosave doesn't overwrite. Compare with disk opens the split.
+- An outside append to a dirty `log.md` adds the text to the end of the tab with no conflict; the next autosave writes the user's edit and the appended line.
+- A note written outside FastPad is marked in the tree, and the mark clears when it opens. The mark survives a restart.
+- A `git commit` in the notebook (changes under `.git\` only) causes no rescan and no tab checks.
+- Renaming a linked note with `MoveFileExW` while FastPad runs posts the outside-rename notice, and Notes: Update links to renamed notes rewrites the links.
+- Renaming a linked note in the tree with "Keep the old name as an alias" ticked adds the alias to its front matter.
+- Notes: New note from template writes the note from a template in `templates_folder`, with its placeholders replaced.
+- `fastpad --capture "x"` with `capture_target=folder` writes a new file in `capture_folder`.
 - An outside delete marks the tab "(deleted)". Ctrl+S re-creates the file.
 - An outside change to a tab outside the notebook is noticed when the window is activated.
 - Replace across notes and capture don't trigger reloads or conflicts in their own tabs.
@@ -502,3 +606,15 @@ Run with a scratch `LOCALAPPDATA` and a temp notebook, `--test-threads=1`.
 2. **Where new linked notes go.** This spec uses the notebook root, which matches first saves (library spec §8.2). The linking note's folder is the alternative, and could become a `notebook.ini` key later.
 3. **`#tag` in the editor.** Should inline tags get an editor indicator and Ctrl+click like links? It's left out to keep 1b small.
 4. **Index cache as a contract.** `<folder key>.notes.cache` sits beside the per-PC library file. Phase 2's sidecar will want the same facts. Either it reads this cache (making the format a contract) or it builds its own. To be decided in the Phase 2 spec. Until then the format stays private.
+
+## 16. Phase 1.5: searching by front matter (note for later)
+
+Not part of Phase 1, and recorded here so the index is designed with it in mind. Agent-maintained vaults answer structural questions ("concept pages not updated in 90 days", "notes tagged `unverified`") with queries over front matter, which Obsidian users get from the Dataview plugin. FastPad's Search view could take filters in front of the text query:
+
+```
+type:concept tag:unverified updated<2026-07-01 retrieval
+```
+
+- `key:value` matches a front matter property (ignoring case); `tag:` matches front matter and inline tags, including nested ones; `<`, `>`, `<=` and `>=` compare dates written as `YYYY-MM-DD`, and numbers.
+- Filters narrow the notes first, using the index, and the text search then runs only over those notes. A query with filters and no text lists the matching notes.
+- This is why §6.1 keeps every front matter property as raw text in the index (`properties`), not only the keys FastPad uses itself: Phase 1.5 needs no change to the index format.
