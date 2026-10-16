@@ -34,7 +34,8 @@ Success looks like this: an agent edits a note while the user has it open. The c
 | Renames | Links are updated after renames made by FastPad **and** renames made outside it (detected by file ID). A rename in FastPad can also keep the old name as an alias. |
 | Notebook health | The Links view also lists links to missing notes ("Gaps") and notes nothing links to ("Orphans") |
 | Templates | "New note from template" from `.fastpad\templates\`, sharing the daily note's placeholders |
-| Capture | A global hotkey while FastPad runs; `fastpad --capture` to open the capture box even when FastPad is closed; `fastpad --capture "text"` to append with no window. The target is one inbox file, today's daily note, or a folder that gets one file per capture. FastPad stays without a background service. |
+| Capture | A global hotkey while FastPad runs; `fastpad --capture` to open the capture box even when FastPad is closed; `fastpad --capture "text"` to append with no window. The target is one inbox file, today's daily note, or a folder that gets one file per capture. A capture can carry images (paste, drop, or a Windows snip) and files, saved to the notebook's attachments folder and linked with standard Markdown. FastPad stays without a background service. |
+| Attachments in notes | Pasting an image, or Ctrl+dropping files, into a Markdown note saves them to the attachments folder and inserts a link. Links to attachments are kept correct when notes or attachments move. |
 | Delivery | Five PRs (§12). The external-change work comes first, because agents need it most. |
 
 Rejected alternatives:
@@ -71,7 +72,8 @@ The requirements were checked against agent-maintained vaults in use today, main
 - See at a glance which notes changed outside FastPad since you last opened them.
 - Tag notes inline or in front matter, and browse the notebook by tag.
 - Open today's daily note with one key, and create any note from a template.
-- Capture a thought from anywhere in Windows in under a second, without switching windows.
+- Capture a thought from anywhere in Windows in under a second, without switching windows. A capture can include a screenshot, a pasted image or files.
+- Paste a screenshot into a note and have it saved and linked, with no file dialog.
 
 ### Non-goals (for Phase 1)
 
@@ -193,7 +195,7 @@ struct NoteFacts {
     stamp: DiskStamp,
     aliases: Vec<String>,          // front matter `aliases` / `alias`
     tags: Vec<TagUse>,             // name (as written), line, source: FrontMatter | Inline
-    links: Vec<LinkUse>,           // target text, heading, label, line, kind: Wiki | Markdown
+    links: Vec<LinkUse>,           // target text, heading, label, line, kind: Wiki | Markdown | Image
     properties: Vec<(String, String)>, // every other front matter key, as raw text: the preview, and Phase 1.5 (§16)
 }
 ```
@@ -383,6 +385,7 @@ templates_folder=.fastpad/templates
 inbox=inbox.md
 capture_folder=inbox
 capture_target=inbox
+attachments_folder=attachments
 ```
 
 | Key | Meaning | Default |
@@ -394,8 +397,10 @@ capture_target=inbox
 | `inbox` | Capture inbox file | `inbox.md` |
 | `capture_folder` | Folder that gets one file per capture (§10.3), relative to the notebook | `inbox` |
 | `capture_target` | `inbox` (append to the inbox file), `daily` (append to today's note) or `folder` (a new file in `capture_folder`) | `inbox` |
+| `attachments_folder` | Folder for images and files added by capture (§10.4) and by pasting or dropping into notes (§10.5), relative to the notebook | `attachments`, or the vault's own folder (below) |
 
 - When the file is missing, the defaults apply. It is created only when the user changes a value, which keeps the library spec rule that nothing is written into a folder until the user organizes something.
+- **Obsidian vaults:** when `attachments_folder` isn't set and `.obsidian\app.json` has an `attachmentFolderPath`, FastPad uses it, so both apps put attachments in the same place. A folder inside the notebook is used as it is; `./` and `./<folder>` mean next to the note, or in that subfolder of the note's folder; `/` means the notebook root. A path outside the notebook falls back to `attachments`. FastPad only reads `app.json`, with the existing `serde_json`, and never writes it.
 - Settings gains a **This notebook** section with these values. It is disabled when no notebook is open.
 - Hand edits keep comments and unknown lines, as `fastpad.ini` does. A bad value falls back to its default, with a notice naming the line.
 - A watcher change to the file (§5.1) re-reads it.
@@ -447,12 +452,13 @@ The tree's folder context menu gains **New note from template…**, which writes
 | `fastpad --capture` | Forwarded over IPC; the running instance opens the capture box | A **capture-only** FastPad starts: it shows only the capture box and exits after it closes |
 | `fastpad --capture "text"` | Forwarded; appended with no window | The capture-only process appends with no window, then exits |
 | `fastpad --capture -` | As above, with the text from stdin | As above |
+| `fastpad --capture "text" --attach <path>` | Forwarded; the text and the files (repeat `--attach` for several) are captured with no window, as in §10.4 | As above |
 
 `fastpad --capture` makes a hotkey possible without a background service: the Start menu shortcut's **Shortcut key** (or any launcher) can run it, and FastPad's fast start makes the box appear in about the time a running app would take. The installer gains an optional task, "Quick capture shortcut (Ctrl+Alt+N)", which creates a Start menu shortcut with that key. When FastPad is running, its own `RegisterHotKey` holds the same key, so the two don't fight.
 
 - `capture_hotkey` is a `fastpad.ini` setting in keymap syntax. Empty turns it off. If `RegisterHotKey` fails (another app holds the key), one notice says so and suggests changing it in Settings.
 - The capture-only process skips session restore, recovery, the library scan and the main window. It reads `fastpad.ini` and `folders.ini`, takes the instance mutex only to forward when another instance owns it, and otherwise holds no mutex. If a full FastPad starts while the capture box is open, both run, and the append (§10.3) is safe either way.
-- `LaunchRequest` gains `Capture(Option<CaptureText>)`, and `IpcRequest` gains `Capture` (command 5), with the text as UTF-16. Text that doesn't fit the 64 KB frame is refused with exit code 2. A capture-only process exits with code 0 on success, and 1 when the append failed.
+- `LaunchRequest` gains `Capture(Option<CaptureText>, Vec<PathBuf>)`, and `IpcRequest` gains `Capture` (command 5), with the text and the attachment paths as UTF-16. Paths are sent, never file contents; `--attach` paths are made absolute against the caller's working folder before forwarding. Text that doesn't fit the 64 KB frame is refused with exit code 2. A capture-only process exits with code 0 on success, and 1 when the append failed.
 
 ### 10.2 The capture box
 
@@ -460,14 +466,18 @@ A small top-most window (about 520 × 180 DIP), centered on the monitor under th
 
 ```
 ┌ Capture → inbox.md ─────────────────────────────┐
-│ Call Dana about the Atlas budget #project/atlas │
-│                                                 │
+│ consumer lag spikes when ledger batch runs??    │
+│ #investigate                                    │
+│ ┌──────┐ ┌──────┐                               │
+│ │ ▓▓▓▓ │ │ PDF  │  + Snip (Ctrl+Shift+S)        │
+│ └──────┘ └──────┘                               │
 └──────────────── Ctrl+Enter save · Esc close ────┘
 ```
 
 - A multi-line edit control. Enter inserts a new line.
+- Below it, a strip of **attachments**: images as thumbnails, other files as an icon with the name. The strip is hidden until something is attached, so a text-only box looks as above. Each item has a remove button (and Delete when it has focus). How attachments get in is in §10.4.
 - **Ctrl+Enter** appends and closes. **Ctrl+Shift+Enter** appends, closes, and opens the target in FastPad with the caret on the new entry (in a capture-only process, this starts FastPad normally with that file).
-- **Esc** closes. Text that wasn't saved is kept as a draft in `%LocalAppData%\FastPad\capture-draft.txt` and comes back the next time the box opens. A successful capture deletes the draft.
+- **Esc** closes. Text that wasn't saved is kept as a draft in `%LocalAppData%\FastPad\capture-draft\draft.txt`, with any pasted or snipped images saved beside it (dropped files are kept as their paths), and comes back the next time the box opens. A successful capture deletes the draft.
 - The box stays open when it loses focus, so the user can copy something from another window into it.
 - The title names the target. Pressing **Ctrl+Alt+N** again inside the box cycles through `inbox`, `daily` and `folder` for this capture only.
 - It has an accessible name ("Quick capture to inbox.md") and is fully keyboard-operable.
@@ -508,6 +518,71 @@ Writing an append:
 
 Errors leave the text in the draft file, keep the box open, and show the error in the box itself.
 
+### 10.4 Images and files in a capture
+
+Much of what a developer wants to keep isn't text: a screenshot of a dashboard spike, an error dialog, a whiteboard photo, a log file. A capture can carry any number of attachments alongside its text, or attachments with no text at all.
+
+**Getting them in:**
+
+| How | What happens |
+|---|---|
+| **Ctrl+V** with an image on the clipboard | With no text on the clipboard, the image is attached. With text too, the text is pasted, for the reason given in §10.5; **Ctrl+Shift+V** in the box attaches the image anyway. |
+| **Ctrl+V** with files copied in Explorer (`CF_HDROP`) | The files are attached |
+| **Dropping files** on the box | The files are attached (the box gets the same OLE drop target as the editor, `accept_file_drops_on`) |
+| **Snip** button, or **Ctrl+Shift+S** in the box | The box hides and Windows' own snipping overlay starts (`ms-screenclip:` through `ShellExecuteW`). When the clipboard next gets an image (`AddClipboardFormatListener`), the image is attached and the box comes back with focus. If no image arrives within 30 seconds, or the user presses the capture hotkey, the box comes back without one. |
+| `--attach <path>` (§10.1) | The files are attached with no window |
+
+FastPad never takes a screenshot itself and needs no screen-capture permission: the snip is Windows' own tool, and FastPad only reads the clipboard afterwards. Launching `ms-screenclip:` is a local protocol handler, not network access.
+
+**Clipboard images** are read in this order: the registered `PNG` format (browsers, Snipping Tool and most apps put it there), then `CF_DIBV5`, then `CF_DIB`. A DIB is encoded to PNG with WIC, which FastPad already loads for the preview and image tabs. WIC is loaded only when an image is attached, so a text-only capture, in a capture-only process too, costs nothing extra.
+
+**Saving.** On Ctrl+Enter, attachments are written to `attachments_folder` (§9.1) before the note, each with the atomic saver and never overwriting:
+
+- Pasted and snipped images are named `YYYY-MM-DD HHmm <first words>.png`, with the first words of the capture's text (as in §10.3) or `capture` when there is no text, plus `2`, `3`… for several in one capture or a name already taken.
+- Dropped and `--attach` files are **copied**, never moved, keeping their own sanitized name, with `2`, `3`… on a clash. The original is left alone.
+- A file over 20 MB asks first, inside the box: "report.zip is 85 MB. Copy it into the notebook anyway?" `--attach` refuses it with exit code 2 instead.
+
+**Linking.** The capture's text is followed by one line per attachment, using standard Markdown with a path relative to the note and spaces percent-encoded. That is what FastPad's preview (`classify_link`, `resolve_image_path`), Obsidian, GitHub and agents all read:
+
+```markdown
+---
+captured: 2026-10-19T10:30
+---
+
+consumer lag spikes when ledger batch runs?? #investigate
+
+![](../attachments/2026-10-19%201030%20consumer%20lag%20spikes.png)
+[ledger-batch.log](../attachments/ledger-batch.log)
+```
+
+Images use `![](…)`, other files `[name](…)`. In an append (`inbox`, `daily`), the lines are indented under the list item so they belong to it:
+
+```markdown
+- 10:30 consumer lag spikes when ledger batch runs?? #investigate
+  ![](attachments/2026-10-19%201030%20consumer%20lag%20spikes.png)
+```
+
+The capture is all or nothing. If an attachment fails to write, the files already written for this capture are removed, the note isn't written, and the box stays open with the error.
+
+**Where it came from** (optional). With `capture_source=true` in `fastpad.ini` (default `false`), FastPad records the window that was in front when the capture hotkey was pressed: the process's file description and the window title, e.g. `source: "Grafana – payments – Google Chrome"`. It goes in the front matter of a one-file capture, and after the time in an append. It is off by default because window titles can hold things the user didn't mean to save. It is never recorded for `--capture` from the command line, where the foreground window is the terminal.
+
+### 10.5 Pasting and dropping into notes (PR 1f)
+
+The same saving and linking, inside the editor, for any Markdown tab:
+
+- **Ctrl+V with an image and no text on the clipboard** saves the image as `<note stem> YYYY-MM-DD HHmmss.png` in the attachments folder and inserts `![](relative path)` at the caret, as one undo step. When the clipboard also holds text (`CF_UNICODETEXT`), Ctrl+V pastes the text as today: copying a paragraph from Word or a cell range from Excel puts a picture of it on the clipboard too, and that must not turn a text paste into an image. Snipping Tool, screenshots and a browser's "Copy image" put no text there. **Notes: Paste image as attachment** (palette, bindable) pastes the image even when there is text.
+- **Ctrl+V with files copied in Explorer**, and **dropping files with Ctrl held**, copy the files into the attachments folder and insert one link per file at the caret (the drop point for a drop). A drop **without** Ctrl keeps today's behavior and opens the files as tabs (library spec §14).
+- **Notes: Insert attachment…** (palette) does the same through the Open dialog.
+- The attachments folder is the notebook's for a note inside the open notebook. For a Markdown file outside it, it is an `attachments` folder next to that file. An untitled tab shows the notice "Save the note first, so the image has a place to go." and inserts nothing.
+- In a non-Markdown tab, Ctrl+V behaves as today.
+
+Removing a link never deletes the file. Finding attachments that nothing links to any more is an open question (§15).
+
+**Links to attachments stay correct when things move.** §7.6 covers notes being renamed or moved; attachments add two cases, both handled by the same prompt and rewrite:
+
+- **An attachment is renamed or moved** (in the tree, or outside FastPad and detected by reconciliation): links to it are offered for update, like links to a note. For this, the index (§6.1) records image references and Markdown links to any file in the notebook, not only to notes.
+- **A note is moved to another folder:** its own relative links (to images, attachments and other notes) would now point to the wrong place. FastPad rewrites them in the moved note as part of the move, with no prompt, because nothing else can be meant. The rewrite is one undo step if the note is open.
+
 ## 11. Performance
 
 - Nothing in this spec runs before the first paint or the first input. The watcher, the index worker and the hotkey registration all start after `LIBRARY_READY` or `BUILD_CHROME`.
@@ -516,12 +591,13 @@ Errors leave the text in the draft file, keep the box open, and show the error i
 - **Index:** a cold build of 10,000 notes (about 30 MB of Markdown) under 3 s on the worker, and a warm build from the cache under 300 ms. The in-memory index stays under 8 MB for that fixture.
 - **Editor link marks:** only visible lines, at most once per styling pass, under 0.5 ms per screen.
 - **Completion:** re-ranking 10,000 names per keystroke under 5 ms (it is the quick-open matcher).
-- **Capture-only start:** box visible within 80 ms warm (the main window's budget plus a margin), no Scintilla or Direct2D load.
+- **Capture-only start:** box visible within 80 ms warm (the main window's budget plus a margin), no Scintilla or Direct2D load. Attaching the first image loads WIC, under 20 ms warm; nothing image-related loads before that.
+- **Image paste:** a 4K screenshot is encoded and saved off the UI thread; the link is inserted at once and the preview shows the image when the file is written, within 300 ms.
 - `fastpad-bench` gains index build (cold and warm), reload of a 100 KB note, and capture-only time to visible.
 
 ## 12. Delivery
 
-Five PRs, in this order. Each one is useful without the ones after it.
+Six PRs, in this order. Each one is useful without the ones after it.
 
 | PR | Scope | Depends on |
 |---|---|---|
@@ -530,6 +606,7 @@ Five PRs, in this order. Each one is useful without the ones after it.
 | **1c** | Wikilinks: preview, editor marks and Ctrl+click, completion, Links view with missing and unlinked notes, link updates on renames in and outside FastPad, alias on rename (§7) | 1b |
 | **1d** | `notebook.ini`, Settings section, daily notes, placeholders, New note from template (§9) | none (can come before 1b) |
 | **1e** | Quick capture: hotkey, `--capture`, capture box, appending, one file per capture, installer task (§10) | 1d (for `notebook.ini` and the daily target) |
+| **1f** | Attachments in notes: image paste, Ctrl+drop and Insert attachment in Markdown tabs, link fixes when attachments or notes move (§10.5) | 1e (shares the attachment saving), 1c (link updates) |
 
 Each PR updates the README (features, shortcuts, `fastpad.ini` keys) in the style of the existing sections.
 
@@ -555,6 +632,12 @@ Each PR updates the README (features, shortcuts, `fastpad.ini` keys) in the styl
 | Capture file can't be written (folder target) | Same as a failed append |
 | Capture append fails | The box stays open with the error, and the text is kept as a draft |
 | IPC capture text too long | Exit code 2. Nothing is appended. |
+| Clipboard image can't be read or encoded | The box (or the editor, as a notice) says "The clipboard image couldn't be read." Nothing is attached. |
+| An attachment fails to write | The whole capture is undone: files already written for it are removed, and the box stays open with the error |
+| Attachment over 20 MB | Asked first in the box; `--attach` refuses it with exit code 2 |
+| Snip produces no image within 30 s | The box comes back with nothing attached |
+| Image pasted into an untitled tab | Notice "Save the note first, so the image has a place to go." Nothing inserted. |
+| Pasted image fails to write after its link was inserted | A notice names the file. The link stays (Ctrl+Z removes it) and shows as a missing image in the preview. |
 
 ## 14. Testing
 
@@ -572,6 +655,11 @@ Each PR updates the README (features, shortcuts, `fastpad.ini` keys) in the styl
 - **Gaps and orphans:** counts and ordering; the excluded files (daily notes, inbox, `index.md`, `log.md`, `CLAUDE.md`, `README.md`, templates).
 - **Outside rename detection:** links that would break after a file-ID match and after a fingerprint match; nothing pending when every link still resolves.
 - **Capture file names:** first-words naming, sanitizing, clash numbering, an empty first line.
+- **Attachment links:** relative paths from the inbox file, a daily note and a capture-folder note; percent-encoding of spaces, `#`, `(` and `)`; indentation under an append's list item; `![](…)` for images and `[name](…)` for other files.
+- **Clipboard image formats:** `PNG` preferred over `CF_DIBV5` over `CF_DIB`; a 32-bit DIB with alpha and a 24-bit bottom-up DIB encode to the same pixels; text plus image pastes text.
+- **Attachment folder choice:** `notebook.ini` value, Obsidian `attachmentFolderPath` (a folder, `./`, a path outside the notebook), and the default.
+- **Moving a note:** its relative links to images, attachments and notes are rewritten; absolute links, web links and wikilinks are untouched.
+- **`launch.rs`:** `--attach` repeated, `--attach` without `--capture` refused, relative `--attach` paths made absolute.
 - **Daily notes:** `daily_format` tokens, an invalid format, template placeholders, previous and next ordering with gaps and non-matching files.
 - **Capture entry formatting:** single and multi-line entries; blank-line rules; CRLF and LF files; UTF-16 files.
 - **`launch.rs`:** `--capture`, `--capture "text"`, `--capture -`, combined with `--new-window`.
@@ -592,6 +680,11 @@ Run with a scratch `LOCALAPPDATA` and a temp notebook, `--test-threads=1`.
 - Renaming a linked note in the tree with "Keep the old name as an alias" ticked adds the alias to its front matter.
 - Notes: New note from template writes the note from a template in `templates_folder`, with its placeholders replaced.
 - `fastpad --capture "x"` with `capture_target=folder` writes a new file in `capture_folder`.
+- An image put on the clipboard (a test bitmap through `SetClipboardData`) and pasted into the capture box is saved as a PNG in `attachments_folder`, and the capture note links to it; the preview of that note shows the image.
+- `fastpad --capture "x" --attach a.log` copies `a.log` into the attachments folder, leaves the original, and links it.
+- A failing attachment write (a read-only attachments folder) leaves no capture note and no partial files.
+- Ctrl+V of a clipboard image in a Markdown note inserts a link to a new PNG; with text on the clipboard as well, the text is pasted. A plain drop of a file still opens it as a tab; a Ctrl+drop inserts a link.
+- Moving a note with an image link to another folder in the tree keeps the image showing in its preview.
 - An outside delete marks the tab "(deleted)". Ctrl+S re-creates the file.
 - An outside change to a tab outside the notebook is noticed when the window is activated.
 - Replace across notes and capture don't trigger reloads or conflicts in their own tabs.
@@ -606,6 +699,9 @@ Run with a scratch `LOCALAPPDATA` and a temp notebook, `--test-threads=1`.
 2. **Where new linked notes go.** This spec uses the notebook root, which matches first saves (library spec §8.2). The linking note's folder is the alternative, and could become a `notebook.ini` key later.
 3. **`#tag` in the editor.** Should inline tags get an editor indicator and Ctrl+click like links? It's left out to keep 1b small.
 4. **Index cache as a contract.** `<folder key>.notes.cache` sits beside the per-PC library file. Phase 2's sidecar will want the same facts. Either it reads this cache (making the format a contract) or it builds its own. To be decided in the Phase 2 spec. Until then the format stays private.
+5. **Unused attachments.** Removing a link never deletes the file, so attachments nothing links to pile up. The index already knows every image reference, so the Links view could list them like orphans, with "Move to Recycle Bin". Left out of 1f to keep it small.
+6. **Obsidian embeds of images.** Obsidian vaults often write images as `![[pasted image.png]]`. The spec shows embeds as links (§4), which is fine for notes but a regression for images in an imported vault. Rendering `![[image]]` as an image in the preview is small; it could move into 1c.
+7. **Text in screenshots.** Windows has built-in offline text recognition (`Windows.Media.Ocr`). Making screenshot text searchable is useful, but it's a WinRT dependency; for now the agent can read images itself.
 
 ## 16. Phase 1.5: searching by front matter (note for later)
 
