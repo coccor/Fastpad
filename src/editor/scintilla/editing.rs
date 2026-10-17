@@ -2,6 +2,7 @@
 //! clipboard, the selection, save points and undo action groups.
 
 use super::*;
+use crate::editor::scintilla_constants::{SC_EOL_CR, SC_EOL_CRLF, SC_EOL_LF, SCI_SETEOLMODE};
 
 impl Editor {
     /// Searches `range` for `needle` with `search_flags`. A backward search passes a range whose
@@ -301,10 +302,23 @@ impl Editor {
         let _ = self.endpoint.send_direct_if_alive(SCI_SETSAVEPOINT, 0, 0);
     }
 
+    /// Makes Enter insert the line ending most of `text`'s lines use, so typing in an LF file
+    /// doesn't mix CRLF into it (another editor reading it as LF would see two line breaks
+    /// where there was one). Text without line endings keeps the current mode. Scintilla keeps
+    /// the mode on the document, so it holds whichever view shows it.
+    pub(crate) fn adopt_line_endings(&self, text: &str) -> Result<()> {
+        if let Some(mode) = dominant_eol_mode(text) {
+            self.endpoint
+                .send_direct_checked(SCI_SETEOLMODE, mode as usize, 0)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn populate_clean(&self, text: &str) -> Result<()> {
         self.endpoint
             .send_direct_checked(SCI_SETUNDOCOLLECTION, 0, 0)?;
         let result = self.set_text(text);
+        let _ = self.adopt_line_endings(text);
         let clear = self.endpoint.send_direct_checked(SCI_EMPTYUNDOBUFFER, 0, 0);
         let enable = self
             .endpoint
@@ -332,5 +346,40 @@ impl Editor {
 
     pub fn end_undo_action(&self) {
         let _ = self.endpoint.send_direct_if_alive(SCI_ENDUNDOACTION, 0, 0);
+    }
+}
+
+/// The Scintilla line-ending mode most of `text`'s line endings use: CRLF, LF or CR, with ties
+/// going in that order. `None` for text without any.
+pub(crate) fn dominant_eol_mode(text: &str) -> Option<u32> {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count() - crlf;
+    let cr = text.matches('\r').count() - crlf;
+    if crlf == 0 && lf == 0 && cr == 0 {
+        None
+    } else if crlf >= lf && crlf >= cr {
+        Some(SC_EOL_CRLF)
+    } else if lf >= cr {
+        Some(SC_EOL_LF)
+    } else {
+        Some(SC_EOL_CR)
+    }
+}
+
+#[cfg(test)]
+mod eol_tests {
+    use super::*;
+
+    #[test]
+    fn the_most_common_line_ending_sets_the_mode() {
+        assert_eq!(dominant_eol_mode("a\nb\n"), Some(SC_EOL_LF));
+        assert_eq!(dominant_eol_mode("a\r\nb\r\nc\n"), Some(SC_EOL_CRLF));
+        assert_eq!(dominant_eol_mode("a\rb\r"), Some(SC_EOL_CR));
+        assert_eq!(
+            dominant_eol_mode("a\r\nb\n"),
+            Some(SC_EOL_CRLF),
+            "a tie is CRLF"
+        );
+        assert_eq!(dominant_eol_mode("no line ending"), None);
     }
 }

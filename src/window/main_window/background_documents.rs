@@ -274,6 +274,8 @@ pub(crate) fn apply_disk_edit(hwnd: HWND, id: DocumentId, edit: DiskEdit<'_>) ->
                     editor.end_undo_action();
                     result?;
                 }
+                // The file may have changed its line endings: Enter follows them.
+                editor.adopt_line_endings(text)?;
                 editor.set_save_point();
             }
             DiskEdit::Append(text) => {

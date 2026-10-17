@@ -485,3 +485,33 @@ fn clear_changed_marks_clears_them_all() {
     execute_command(window.hwnd, CommandId::NotesClearChanged);
     assert!(!marked(window.hwnd, "b.md"));
 }
+
+#[test]
+fn enter_follows_the_files_line_endings_after_opening_and_after_a_reload() {
+    // Break caught: Enter inserting CRLF into an LF file, which Notepad then read as two line
+    // breaks and saved back doubled.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("ext-eol");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let enter = || unsafe {
+        SendMessageW(editor.hwnd(), WM_KEYDOWN, 0x0D, 0);
+        SendMessageW(editor.hwnd(), WM_CHAR, 0x0D, 0);
+    };
+    let path = open_note(&window, &scratch, "a.md", "one\ntwo\n");
+    let end = editor.text().unwrap().len();
+    editor.set_selection(end..end).unwrap();
+    enter();
+    assert_eq!(editor.text().unwrap(), "one\ntwo\n\n");
+
+    super::super::save_active_document(window.hwnd);
+    tick();
+    std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
+    crate::window::library_host::check_all_tabs(window.hwnd);
+    pump_posted_messages(window.hwnd);
+    let end = editor.text().unwrap().len();
+    editor.set_selection(end..end).unwrap();
+    enter();
+    assert_eq!(editor.text().unwrap(), "one\r\ntwo\r\n\r\n");
+}
