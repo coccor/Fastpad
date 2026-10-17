@@ -331,6 +331,20 @@ impl EditorHooks for GroupHooks {
     }
 
     fn key_down(&self, vk: u16, ctrl: bool, shift: bool, alt: bool) -> bool {
+        // Ctrl+V (and Shift+Insert) of files or a lone image attaches them (second brain phase 1
+        // spec §10.5); anything else is Scintilla's own paste.
+        let paste = (vk == u16::from(b'V') && ctrl && !shift && !alt)
+            || (vk == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_INSERT
+                && shift
+                && !ctrl
+                && !alt);
+        if paste {
+            return group_of_editor(self.main, self.editor).is_some_and(
+                |(_, editor, document, _)| {
+                    crate::window::attachments::paste(self.main, &editor, document, false)
+                },
+            );
+        }
         if ctrl || alt || !(vk == VK_RETURN || vk == VK_TAB) {
             return false;
         }

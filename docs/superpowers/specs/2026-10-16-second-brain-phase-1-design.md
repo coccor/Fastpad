@@ -776,3 +776,11 @@ Decisions made while building PR 1e (plan `docs/superpowers/plans/2026-10-17-qui
 - **`capture_hotkey` is read once, when FastPad starts**, and has no Settings row (the dialog is full).
 - **A Ctrl+Shift+V that attached an image** swallows the Ctrl+V character that follows it, so the text isn't pasted as well.
 - **Obsidian's `attachmentFolderPath`** is read here, as PR 1d planned.
+
+Decisions made while building PR 1f (plan `docs/superpowers/plans/2026-10-17-note-attachments.md`):
+
+- **Images are already listed**, so links to them follow image moves and renames through the PR 1c prompt, in FastPad and outside it. **Files the notebook doesn't list** (PDFs, logs) aren't paired across scans, so renaming one outside FastPad isn't detected. A note's own relative links to such files are rewritten when the note moves (`edits_for_moves_with`), if the file is still where the link pointed.
+- **Ctrl+V is intercepted in the editor's key hook** (and Shift+Insert, Edit > Paste and the palette's Paste). Scintilla's right-click Paste still pastes text.
+- **Insert attachment… takes one file.**
+- **The 20 MB question applies here too**, as in quick capture.
+- **Pasted images are named `<note stem> YYYY-MM-DD HHmmss.png`**; copied files keep their cleaned names, with ` 2`, ` 3`… on a clash. Both use quick capture's `capture_file::store`.

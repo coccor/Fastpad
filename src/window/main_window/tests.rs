@@ -54,6 +54,7 @@ mod json_and_recovery;
 mod links_and_backlinks;
 mod markdown_keys;
 mod menus_and_settings_commands;
+mod note_attachments;
 mod note_operations;
 mod notebook_tree;
 mod open_editors_and_folder_commands;

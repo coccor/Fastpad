@@ -177,6 +177,9 @@ pub enum CommandId {
     NotesNextDaily = 277,
     NotesNewFromTemplate = 278,
     NotesEditNotebookSettings = 279,
+    // Attachments in notes (second brain phase 1 spec §10.5).
+    NotesPasteImage = 280,
+    NotesInsertAttachment = 281,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -521,7 +524,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 169] = [
+        const COMMANDS: [CommandId; 171] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -691,6 +694,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotesNextDaily,
             CommandId::NotesNewFromTemplate,
             CommandId::NotesEditNotebookSettings,
+            CommandId::NotesPasteImage,
+            CommandId::NotesInsertAttachment,
         ];
         COMMANDS
             .into_iter()
@@ -1037,7 +1042,13 @@ mod tests {
             CommandId::try_from(279),
             Ok(CommandId::NotesEditNotebookSettings)
         );
-        assert!(CommandId::try_from(280).is_err());
+        assert_eq!(CommandId::try_from(280), Ok(CommandId::NotesPasteImage));
+        assert_eq!(
+            CommandId::try_from(281),
+            Ok(CommandId::NotesInsertAttachment)
+        );
+        assert!(CommandId::NotesPasteImage.needs_document());
+        assert!(CommandId::try_from(282).is_err());
     }
 
     #[test]

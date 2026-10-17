@@ -143,9 +143,22 @@ pub(super) fn execute_command_with_note(
         CommandId::Copy => with_editor(hwnd, |editor| {
             let _ = editor.copy();
         }),
-        CommandId::Paste => with_editor(hwnd, |editor| {
-            let _ = editor.paste();
-        }),
+        CommandId::Paste => {
+            let document = unsafe { app_ptr(hwnd) }
+                .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id));
+            with_editor(hwnd, |editor| {
+                let taken = document.is_some_and(|document| {
+                    crate::window::attachments::paste(hwnd, editor, document, false)
+                });
+                if !taken {
+                    let _ = editor.paste();
+                }
+            })
+        }
+        CommandId::NotesPasteImage => crate::window::attachments::paste_image_command(hwnd),
+        CommandId::NotesInsertAttachment => {
+            crate::window::attachments::insert_attachment_command(hwnd)
+        }
         CommandId::MoveLinesUp => with_editor(hwnd, |editor| {
             let _ = editor.move_lines(true);
         }),

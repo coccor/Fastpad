@@ -266,6 +266,8 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
         CommandId::NotesEditNotebookSettings,
         "notes.editNotebookSettings",
     ),
+    (CommandId::NotesPasteImage, "notes.pasteImage"),
+    (CommandId::NotesInsertAttachment, "notes.insertAttachment"),
     (CommandId::FocusNextPane, "view.focusNextPane"),
     (CommandId::FocusPreviousPane, "view.focusPreviousPane"),
     (CommandId::SplitRight, "view.splitRight"),

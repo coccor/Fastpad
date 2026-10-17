@@ -15,3 +15,10 @@ pub fn local_now() -> (Date, Time) {
     };
     (date, time)
 }
+
+/// The second of the minute now, for names that need it (a pasted image's).
+pub fn local_second() -> u8 {
+    let mut now = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut now) };
+    now.wSecond as u8
+}

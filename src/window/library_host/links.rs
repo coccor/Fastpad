@@ -50,6 +50,12 @@ pub(crate) fn note_paths(hwnd: HWND) -> Vec<PathBuf> {
     .unwrap_or_default()
 }
 
+/// Whether a file is at `relative` in the open notebook: link updates keep links to files the
+/// notebook doesn't list, such as PDFs (spec §10.5).
+fn root_file_exists(hwnd: HWND, relative: &Path) -> bool {
+    folder(hwnd).is_some_and(|root| root.join(relative).is_file())
+}
+
 /// Follows the wikilink `target` (with `heading`, if any) written in the note at `from`
 /// (absolute; `None` for a tab outside the notebook): opens the note it names, else offers to
 /// create it (spec §7.3).
@@ -247,7 +253,9 @@ pub(crate) fn notes_moved(hwnd: HWND, moves: &[(PathBuf, PathBuf)]) {
     }
     let index = note_index(hwnd);
     let notes = note_paths(hwnd);
-    let edits = crate::library::links::edits_for_moves(&index, &notes, moves);
+    let edits = crate::library::links::edits_for_moves_with(&index, &notes, moves, &|path| {
+        root_file_exists(hwnd, path)
+    });
     let (own, inbound): (Vec<NoteEdits>, Vec<NoteEdits>) =
         edits.into_iter().partition(|edit| edit.own);
     let mut written = LinksWritten::default();
@@ -344,10 +352,12 @@ fn outside_rename_edits(hwnd: HWND) -> Vec<NoteEdits> {
     }
     let index = note_index(hwnd);
     let notes = note_paths(hwnd);
-    crate::library::links::edits_for_moves(&index, &notes, &moves)
-        .into_iter()
-        .filter(|edit| !edit.own)
-        .collect()
+    crate::library::links::edits_for_moves_with(&index, &notes, &moves, &|path| {
+        root_file_exists(hwnd, path)
+    })
+    .into_iter()
+    .filter(|edit| !edit.own)
+    .collect()
 }
 
 /// An index build landed: notes renamed outside FastPad that links still point to are named in

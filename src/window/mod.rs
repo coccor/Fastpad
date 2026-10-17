@@ -1,6 +1,7 @@
 pub(crate) mod about;
 pub(crate) mod accessibility;
 pub(crate) mod activity_bar;
+pub(crate) mod attachments;
 pub(crate) mod capture_box;
 pub(crate) mod capture_host;
 pub mod capture_only;

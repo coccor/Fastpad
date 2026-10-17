@@ -400,10 +400,23 @@ pub struct NoteEdits {
 /// The edits that keep every link pointing at the note it pointed at before `moves` (old, new;
 /// relative paths) took place (spec §7.6, §10.5). `notes` is the note list after the moves. A
 /// link that already reaches the moved note needs no edit.
+/// `edits_for_moves`, where links to files the notebook doesn't list (a PDF, a log) count too:
+/// a moved note's own relative link to such a file, which `exists` (relative to the notebook)
+/// says is still where the link pointed, is rewritten to keep reaching it (spec §10.5).
 pub fn edits_for_moves(
     index: &NoteIndex,
     notes: &[PathBuf],
     moves: &[(PathBuf, PathBuf)],
+) -> Vec<NoteEdits> {
+    edits_for_moves_with(index, notes, moves, &|_| false)
+}
+
+/// `edits_for_moves`, also keeping a moved note's relative links to unlisted files that `exists`.
+pub fn edits_for_moves_with(
+    index: &NoteIndex,
+    notes: &[PathBuf],
+    moves: &[(PathBuf, PathBuf)],
+    exists: &dyn Fn(&Path) -> bool,
 ) -> Vec<NoteEdits> {
     let moved = |path: &Path| -> PathBuf {
         moves
@@ -438,6 +451,12 @@ pub fn edits_for_moves(
         let mut edits = Vec::new();
         for link in &source.facts.links {
             let Some(was) = before.resolve(link, old_from) else {
+                if own
+                    && link.kind != LinkKind::Wiki
+                    && let Some(text) = unlisted_target(link, old_from, &new_from, exists)
+                {
+                    edits.push((link.start as usize..link.end as usize, text));
+                }
                 continue;
             };
             let now = moved(&was);
@@ -469,6 +488,27 @@ pub fn edits_for_moves(
         }
     }
     all
+}
+
+/// A moved note's relative link to a file the notebook doesn't list: its new text when the file
+/// is still where the link pointed from `old_from` and `new_from` no longer reaches it.
+fn unlisted_target(
+    link: &LinkUse,
+    old_from: &Path,
+    new_from: &Path,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
+    let decoded = percent_decode(&link.target).replace('/', "\\");
+    let from_folder = |note: &Path| note.parent().unwrap_or(Path::new("")).to_path_buf();
+    let target = normalize(&from_folder(old_from).join(&decoded))?;
+    if !exists(&target) {
+        return None;
+    }
+    let reached = normalize(&from_folder(new_from).join(&decoded));
+    if reached.is_some_and(|reached| super::model::same_path(&reached, &target)) {
+        return None;
+    }
+    Some(relative_target(new_from, &target, &link.target))
 }
 
 /// The shortest wikilink target that reaches `note`: its stem when no other note shares it, else
@@ -816,6 +856,37 @@ mod tests {
         // From `deep\`, `[[plan]]` would now mean `deep\plan.md`, so it names the root one; the
         // image is listed in the notebook, so its relative link follows the move too.
         assert_eq!(new, ["../top.md", "./plan", "../att/s.png"]);
+    }
+
+    #[test]
+    fn a_moved_notes_links_to_unlisted_files_follow_it_while_the_files_stay() {
+        // Break caught: a PDF or log attached to a note left unreachable when the note moved.
+        let index = index(&[(
+            "note.md",
+            "[spec](attachments/spec%20v2.pdf) [gone](attachments/old.log)",
+        )]);
+        let after = paths(&[r"deep\note.md"]);
+        let on_disk = [PathBuf::from(r"attachments\spec v2.pdf")];
+        let edits = edits_for_moves_with(
+            &index,
+            &after,
+            &[(PathBuf::from("note.md"), PathBuf::from(r"deep\note.md"))],
+            &|path| {
+                on_disk
+                    .iter()
+                    .any(|file| super::super::model::same_path(file, path))
+            },
+        );
+        let new: Vec<_> = edits[0]
+            .edits
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            new,
+            ["../attachments/spec%20v2.pdf"],
+            "a missing file is left alone"
+        );
     }
 
     #[test]

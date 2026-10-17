@@ -199,6 +199,42 @@ pub fn is_image(path: &Path) -> bool {
     })
 }
 
+/// Writes `source` into `directory` (made when needed) and returns the name it got, never over a
+/// file: a pasted image as `image_stem.png`, a file as a copy under its own cleaned name, each
+/// with ` 2`, ` 3`… when the name is taken (spec §10.4, §10.5).
+pub fn store(directory: &Path, source: &Source, image_stem: &str) -> Result<String, String> {
+    let (stem, extension, bytes) = match source {
+        Source::Png(bytes) => (image_stem.to_owned(), "png".to_owned(), bytes.clone()),
+        Source::File(path) => {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let (stem, extension) = match name.rsplit_once('.') {
+                Some((stem, extension)) if !stem.is_empty() => {
+                    (stem.to_owned(), extension.to_owned())
+                }
+                _ => (name.clone().into_owned(), String::new()),
+            };
+            let bytes = std::fs::read(path)
+                .map_err(|error| format!("FastPad could not read {}: {error}", path.display()))?;
+            (super::title::sanitize_stem(&stem), extension, bytes)
+        }
+    };
+    std::fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "FastPad could not create the folder {}: {error}",
+            directory.display()
+        )
+    })?;
+    loop {
+        let name = capture::unique_name(&stem, &extension, |name| directory.join(name).exists());
+        match crate::file::saver::save_atomic_new(&directory.join(&name), &bytes) {
+            Ok(()) => return Ok(name),
+            // Something took the name between the check and the write: try the next.
+            Err(error) if crate::file::saver::is_already_exists(&error) => {}
+            Err(error) => return Err(format!("FastPad could not save {name}: {error}")),
+        }
+    }
+}
+
 /// Copies or writes the attachments into the attachments folder for `note`, never over a file.
 /// A failure removes the ones already written.
 pub fn save_attachments(request: &Request<'_>, note: &Path) -> Result<Vec<Attachment>, String> {
@@ -212,46 +248,7 @@ pub fn save_attachments(request: &Request<'_>, note: &Path) -> Result<Vec<Attach
     let mut written: Vec<Attachment> = Vec::new();
     let image_stem = capture::capture_stem(request.date, request.time, request.text);
     for source in request.attachments {
-        let (stem, extension, bytes) = match source {
-            Source::Png(bytes) => (image_stem.clone(), "png".to_owned(), Ok(bytes.clone())),
-            Source::File(path) => {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let (stem, extension) = match name.rsplit_once('.') {
-                    Some((stem, extension)) if !stem.is_empty() => {
-                        (stem.to_owned(), extension.to_owned())
-                    }
-                    _ => (name.clone().into_owned(), String::new()),
-                };
-                (
-                    super::title::sanitize_stem(&stem),
-                    extension,
-                    std::fs::read(path).map_err(|error| {
-                        format!("FastPad could not read {}: {error}", path.display())
-                    }),
-                )
-            }
-        };
-        let saved = bytes.and_then(|bytes| {
-            std::fs::create_dir_all(&directory).map_err(|error| {
-                format!(
-                    "FastPad could not create the folder {}: {error}",
-                    directory.display()
-                )
-            })?;
-            loop {
-                let name =
-                    capture::unique_name(&stem, &extension, |name| directory.join(name).exists());
-                match crate::file::saver::save_atomic_new(&directory.join(&name), &bytes) {
-                    Ok(()) => return Ok(name),
-                    // Something took the name between the check and the write: try the next.
-                    Err(error) if crate::file::saver::is_already_exists(&error) => {}
-                    Err(error) => {
-                        return Err(format!("FastPad could not save {name}: {error}"));
-                    }
-                }
-            }
-        });
-        match saved {
+        match store(&directory, source, &image_stem) {
             Ok(name) => written.push(Attachment {
                 image: matches!(source, Source::Png(_)) || is_image(Path::new(&name)),
                 path: folder.join(name),

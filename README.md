@@ -161,6 +161,19 @@ See [[Project Atlas]], its [[Project Atlas#Goals|goals]], or [[work/Plan]].
   program renames a note, a notice says which links still use the old name, and
   **Notes: Update links to renamed notes** fixes them.
 
+### Images and files in notes
+
+In a Markdown note, **paste a screenshot** (`Ctrl+V`) or files copied in Explorer, or **drop files
+with `Ctrl` held**, and FastPad copies them into the notebook's `attachments` folder (or the one
+your Obsidian vault uses) and links them where the caret is: `![](attachments/…png)` for images,
+`[name](…)` for other files. **Notes: Insert attachment…** picks a file instead.
+
+- When the clipboard has text too (a paragraph copied from Word puts a picture there as well),
+  `Ctrl+V` pastes the text. **Notes: Paste image as attachment** takes the image anyway.
+- A Markdown file outside the notebook keeps its attachments in an `attachments` folder beside it.
+- Move a note and its links to images and files keep working. Move an image in the Notebook tree
+  and FastPad offers to update the notes that show it.
+
 ### Daily notes and templates
 
 - **`Ctrl+Alt+D`** (Notes: Open today's note) opens today's note in `journal\`, making it the
