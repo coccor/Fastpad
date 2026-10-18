@@ -170,6 +170,59 @@ fn new_window_flag_starts_a_distinct_process_while_a_primary_runs() -> TestResul
     other.close()
 }
 
+#[test]
+fn capture_with_no_fastpad_running_files_the_text_and_exits_zero() -> TestResult<()> {
+    // Break caught: `fastpad --capture "text"` starting a whole FastPad, or losing the text, when
+    // nothing is running to forward to (second brain phase 1 spec §10.1).
+    let _serial = INSTANCE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let scratch = Scratch::new("capture")?;
+    let notes = scratch.root.join("Notes");
+    std::fs::create_dir_all(&notes)?;
+    let recent = fastpad::library::local::RecentFolders {
+        folders: vec![notes.clone()],
+        ..Default::default()
+    };
+    std::fs::write(
+        fastpad::library::local::folders_file(&scratch.root.join("FastPad")),
+        recent.encode(),
+    )?;
+    let run = |args: &[&std::ffi::OsStr]| -> TestResult<Option<i32>> {
+        Ok(std::process::Command::new(env!("CARGO_BIN_EXE_fastpad"))
+            .args(args)
+            .env("LOCALAPPDATA", &scratch.root)
+            .status()?
+            .code())
+    };
+
+    assert_eq!(
+        run(&["--capture".as_ref(), "from the command line".as_ref()])?,
+        Some(0)
+    );
+    let inbox = std::fs::read_to_string(notes.join("inbox.md"))?;
+    assert!(inbox.starts_with("# Inbox\n\n- "), "{inbox}");
+    assert!(inbox.ends_with(" from the command line\n"), "{inbox}");
+
+    let missing = scratch.root.join("missing.log");
+    assert_eq!(
+        run(&[
+            "--capture".as_ref(),
+            "x".as_ref(),
+            "--attach".as_ref(),
+            missing.as_os_str()
+        ])?,
+        Some(2),
+        "a missing attachment is refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.join("inbox.md"))?,
+        inbox,
+        "nothing more was filed"
+    );
+    Ok(())
+}
+
 /// A default-path FastPad past first input whose pipe server is listening.
 struct Primary {
     process: FastPadProcess,

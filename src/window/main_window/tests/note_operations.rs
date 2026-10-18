@@ -259,11 +259,7 @@ fn a_note_moved_and_changed_outside_fastpad_follows_but_does_not_autosave_over_t
     let new = scratch.folder().join("b.md");
     std::fs::rename(&old, &new).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&new)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, b" and more"))
-        .unwrap();
+    std::fs::write(&new, "rewritten elsewhere").unwrap();
 
     scratch.install(window.hwnd);
     editor.set_text("mine").unwrap();
@@ -276,7 +272,43 @@ fn a_note_moved_and_changed_outside_fastpad_follows_but_does_not_autosave_over_t
         crate::window::library_host::autosave_active(window.hwnd),
         crate::window::library_host::Autosave::Paused
     );
-    assert_eq!(std::fs::read_to_string(&new).unwrap(), "text and more");
+    assert_eq!(
+        std::fs::read_to_string(&new).unwrap(),
+        "rewritten elsewhere"
+    );
+}
+
+#[test]
+fn a_note_moved_and_appended_to_outside_fastpad_follows_and_keeps_both_texts() {
+    // An append is taken into the dirty tab and saved with it (second brain phase 1 spec
+    // §5.4), so neither side's text is lost.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("outside-rename-appended");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    let old = open_note(&window, &scratch, "a.md", "text");
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::library_host::flush_now(window.hwnd);
+    let new = scratch.folder().join("b.md");
+    std::fs::rename(&old, &new).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&new)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b" and more"))
+        .unwrap();
+
+    scratch.install(window.hwnd);
+    editor.replace_target(0..0, "mine: ").unwrap();
+
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Saved
+    );
+    assert_eq!(
+        std::fs::read_to_string(&new).unwrap(),
+        "mine: text and more"
+    );
 }
 
 #[test]

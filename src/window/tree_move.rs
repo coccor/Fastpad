@@ -246,4 +246,11 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
             library_host::rename_undo_failed_notice(&name, &new.to_string_lossy(), &moved.stuck),
         );
     }
+    // Links that would no longer reach what moved (second brain phase 1 spec §7.6).
+    let moves = if is_folder {
+        library_host::folder_moves(hwnd, old, &new)
+    } else {
+        vec![(old.to_path_buf(), new.clone())]
+    };
+    library_host::notes_moved(hwnd, &moves);
 }

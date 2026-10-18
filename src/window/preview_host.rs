@@ -1093,6 +1093,39 @@ fn follow(hwnd: HWND, dest: String) {
                 host_window::report_open_failure(hwnd, &path, &error);
             }
         }
+        LinkAction::Wiki { target, heading } => {
+            let from = unsafe { host_window::app_ptr(hwnd) }.and_then(|app| {
+                let tabs = &unsafe { app.as_ref() }.tabs;
+                tabs.document(active_document(hwnd)?.0)?.path.clone()
+            });
+            if target.is_empty() {
+                // `[[#heading]]`: a heading of this note.
+                if let Some(heading) = heading
+                    && !view(hwnd).is_some_and(|view| {
+                        view.scroll_to_anchor(&crate::preview::links::slug(&heading))
+                    })
+                {
+                    host_window::push_notice(
+                        hwnd,
+                        format!("No heading in this document matches #{heading}."),
+                    );
+                }
+            } else {
+                crate::window::library_host::follow_wiki(
+                    hwnd,
+                    from.as_deref(),
+                    &target,
+                    heading.as_deref(),
+                );
+            }
+        }
+        LinkAction::Tag(tag) => {
+            if crate::window::library_host::folder(hwnd).is_some() {
+                crate::window::tags_view::reveal(hwnd, &tag);
+            } else {
+                host_window::push_notice(hwnd, "Open a notebook to browse its tags.".to_owned());
+            }
+        }
         LinkAction::Ignored => {
             host_window::push_notice(
                 hwnd,

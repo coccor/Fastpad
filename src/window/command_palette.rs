@@ -55,7 +55,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 132] = [
+pub(crate) const ENTRIES: [PaletteEntry; 149] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -68,6 +68,10 @@ pub(crate) const ENTRIES: [PaletteEntry; 132] = [
     entry(
         "File: Toggle session restore",
         CommandId::ToggleRestoreSession,
+    ),
+    entry(
+        "File: Toggle reloading files changed outside FastPad",
+        CommandId::ToggleReloadChangedFiles,
     ),
     entry("Notes: Toggle notes mode", CommandId::ToggleNotesMode),
     entry(
@@ -83,6 +87,9 @@ pub(crate) const ENTRIES: [PaletteEntry; 132] = [
     entry("Notebook: New folder\u{2026}", CommandId::NoteNewFolder),
     entry("Note: Reload from disk", CommandId::NoteReloadFromDisk),
     entry("Note: Keep my version", CommandId::NoteKeepMine),
+    entry("Note: Compare with disk", CommandId::NoteCompareWithDisk),
+    entry("Notes: Show changed notes", CommandId::NotesShowChanged),
+    entry("Notes: Clear changed marks", CommandId::NotesClearChanged),
     entry("Note: Toggle pin", CommandId::NoteTogglePin),
     entry("Note: Move to notebook...", CommandId::NoteMoveToNotebook),
     entry("Note: Reveal in Explorer", CommandId::NoteRevealInExplorer),
@@ -178,6 +185,37 @@ pub(crate) const ENTRIES: [PaletteEntry; 132] = [
     entry("View: Show notebook", CommandId::ShowNotebookView),
     entry("View: Show search", CommandId::ShowSearchView),
     entry("View: Show favorites", CommandId::ShowFavoritesView),
+    entry("View: Show tags", CommandId::ShowTagsView),
+    entry("View: Show links", CommandId::ShowLinksView),
+    entry("Notes: Show missing notes", CommandId::NotesShowMissing),
+    entry(
+        "Notes: Show notes not linked from anywhere",
+        CommandId::NotesShowUnlinked,
+    ),
+    entry("Notes: Follow link at caret", CommandId::NotesFollowLink),
+    entry(
+        "Notes: Update links to renamed notes",
+        CommandId::NotesUpdateRenamedLinks,
+    ),
+    entry("Notes: Open today's note", CommandId::NotesToday),
+    entry("Notes: Previous daily note", CommandId::NotesPreviousDaily),
+    entry("Notes: Next daily note", CommandId::NotesNextDaily),
+    entry(
+        "Notes: New note from template{2026}",
+        CommandId::NotesNewFromTemplate,
+    ),
+    entry(
+        "Notes: Edit notebook settings",
+        CommandId::NotesEditNotebookSettings,
+    ),
+    entry(
+        "Notes: Paste image as attachment",
+        CommandId::NotesPasteImage,
+    ),
+    entry(
+        "Notes: Insert attachment{2026}",
+        CommandId::NotesInsertAttachment,
+    ),
     entry("View: Zoom in", CommandId::ZoomIn),
     entry("View: Zoom out", CommandId::ZoomOut),
     entry("View: Reset zoom", CommandId::ZoomReset),
@@ -307,6 +345,8 @@ pub(crate) enum PickerKind {
     /// Ctrl+P (quick-open spec §3): notes by name. Its rows come from `main_window`, not from
     /// `Picker::items`.
     QuickOpen,
+    /// Notes: New note from template… (second brain phase 1 spec §9.4).
+    Template,
 }
 
 /// The most rows quick open lists (spec §3.3).

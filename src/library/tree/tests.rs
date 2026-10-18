@@ -449,6 +449,7 @@ fn a_draft_row_is_found_by_its_kind() {
         name: String::new(),
         pinned: false,
         expanded: false,
+        changed: false,
     }];
     assert_eq!(row_index(&rows, &RowKind::Draft), Some(0));
     assert_eq!(row_index(&rows, &RowKind::Note(PathBuf::new())), None);

@@ -40,20 +40,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 mod about_and_settings_dialog;
 mod command_palette;
 mod copy_host_and_panel_drop;
+mod daily_notes_and_templates;
 mod editing_shortcuts;
+mod external_changes;
 mod find_bar;
 mod first_save_and_autosave;
 mod focus_and_accessibility;
 mod folder_rename_and_tree_move;
 mod group_strip;
+mod index_and_tags;
 mod inline_new_items;
 mod json_and_recovery;
+mod links_and_backlinks;
 mod markdown_keys;
 mod menus_and_settings_commands;
+mod note_attachments;
 mod note_operations;
 mod notebook_tree;
 mod open_editors_and_folder_commands;
 mod preview_tabs_and_folders;
+mod quick_capture;
 mod search_replace;
 mod search_replace_writes;
 mod search_view;
@@ -381,6 +387,11 @@ pub(super) fn open_note(
     scratch.install(window.hwnd);
     super::open_path(window.hwnd, &path).unwrap();
     pump_posted_messages(window.hwnd);
+    // The note index reads every note on a worker once the notebook loads: a test that then
+    // locks or deletes a note must not race it.
+    pump_until(window.hwnd, || {
+        crate::window::library_host::index_loaded(window.hwnd)
+    });
     path
 }
 

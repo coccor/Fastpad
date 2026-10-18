@@ -143,9 +143,22 @@ pub(super) fn execute_command_with_note(
         CommandId::Copy => with_editor(hwnd, |editor| {
             let _ = editor.copy();
         }),
-        CommandId::Paste => with_editor(hwnd, |editor| {
-            let _ = editor.paste();
-        }),
+        CommandId::Paste => {
+            let document = unsafe { app_ptr(hwnd) }
+                .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id));
+            with_editor(hwnd, |editor| {
+                let taken = document.is_some_and(|document| {
+                    crate::window::attachments::paste(hwnd, editor, document, false)
+                });
+                if !taken {
+                    let _ = editor.paste();
+                }
+            })
+        }
+        CommandId::NotesPasteImage => crate::window::attachments::paste_image_command(hwnd),
+        CommandId::NotesInsertAttachment => {
+            crate::window::attachments::insert_attachment_command(hwnd)
+        }
         CommandId::MoveLinesUp => with_editor(hwnd, |editor| {
             let _ = editor.move_lines(true);
         }),
@@ -282,6 +295,27 @@ pub(super) fn execute_command_with_note(
                 .is_some_and(|app| unsafe { app.as_ref() }.settings.restore_session);
             push_notice(hwnd, crate::session::toggle_notice(enabled).to_owned());
         }
+        CommandId::ToggleReloadChangedFiles => {
+            change_setting(hwnd, |settings| {
+                settings.reload_changed_files = !settings.reload_changed_files;
+                Some((
+                    "reload_changed_files",
+                    crate::config::persisted::reload_policy_token(settings.reload_changed_files)
+                        .to_owned(),
+                ))
+            });
+            let enabled = unsafe { app_ptr(hwnd) }
+                .is_some_and(|app| unsafe { app.as_ref() }.settings.reload_changed_files);
+            push_notice(
+                hwnd,
+                if enabled {
+                    "Files changed outside FastPad now reload by themselves when their tab has no unsaved edits."
+                } else {
+                    "Files changed outside FastPad now wait for you: use Note: Reload from disk or Note: Keep my version."
+                }
+                .to_owned(),
+            );
+        }
         CommandId::ToggleNotesMode => {
             change_setting(hwnd, |settings| {
                 settings.notes_mode = !settings.notes_mode;
@@ -310,6 +344,9 @@ pub(super) fn execute_command_with_note(
         }
         CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
         CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
+        CommandId::NoteCompareWithDisk => compare_with_disk(hwnd),
+        CommandId::NotesShowChanged => crate::window::library_host::toggle_changed_only(hwnd),
+        CommandId::NotesClearChanged => crate::window::library_host::clear_all_marks(hwnd),
         CommandId::NoteTogglePin => {
             if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
                 crate::window::library_host::toggle_pin(hwnd, &path);
@@ -463,6 +500,33 @@ pub(super) fn execute_command_with_note(
         }
         CommandId::ShowFavoritesView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Favorites, true)
+        }
+        CommandId::NotesFollowLink => crate::window::markdown_host::follow_link_at_caret(hwnd),
+        CommandId::ShowLinksView => {
+            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Links, true)
+        }
+        CommandId::NotesShowMissing => crate::window::links_view::reveal(
+            hwnd,
+            crate::window::links_view::Section::Missing,
+        ),
+        CommandId::NotesShowUnlinked => crate::window::links_view::reveal(
+            hwnd,
+            crate::window::links_view::Section::Unlinked,
+        ),
+        CommandId::NotesToday => crate::window::library_host::open_today(hwnd),
+        CommandId::NotesPreviousDaily => crate::window::library_host::step_daily(hwnd, false),
+        CommandId::NotesNextDaily => crate::window::library_host::step_daily(hwnd, true),
+        CommandId::NotesNewFromTemplate => {
+            crate::window::library_host::new_note_from_template(hwnd, None)
+        }
+        CommandId::NotesEditNotebookSettings => {
+            crate::window::library_host::edit_notebook_settings(hwnd)
+        }
+        CommandId::NotesUpdateRenamedLinks => {
+            crate::window::library_host::update_renamed_links(hwnd)
+        }
+        CommandId::ShowTagsView => {
+            crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, true)
         }
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {

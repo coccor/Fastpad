@@ -115,6 +115,12 @@ fn open_ipc_requests(hwnd: HWND) -> LRESULT {
             crate::ipc::IpcRequest::OpenFolder(path) => {
                 crate::window::library_host::open_folder(hwnd, &path)
             }
+            // A capture with something to file needs no window (spec §10.1); the box takes the
+            // foreground itself.
+            crate::ipc::IpcRequest::Capture { text, attachments } => {
+                crate::window::capture_host::forwarded(hwnd, text, attachments);
+                continue;
+            }
         }
         if identity.is_live_for(hwnd) {
             bring_to_foreground(hwnd);

@@ -118,6 +118,119 @@ pinned notes first. Notes are plain files, so nothing is locked in.
 Pins travel with the notebook in `.fastpad\library.ini`, and nothing is written into a folder until
 you pin something. Turn notes off with `notes_mode=false` in `fastpad.ini`.
 
+### Tags and front matter
+
+Tag a note with `#tags` anywhere in its text, or in its YAML front matter:
+
+```markdown
+---
+tags: [project/atlas, todo]
+status: active
+---
+Call Dana about the #budget.
+```
+
+- **The Tags view** (the tag button in the activity bar, or **View: Show tags**) lists every tag
+  in the notebook with how many notes use it. Nested tags like `#project/atlas` sit under
+  `#project`. Expand a tag to see its notes; click one to open it.
+- **In the preview**, front matter shows as a table of its properties, and each `#tag` is a chip
+  you can click to see the tag's notes.
+- Tags in code, links and HTML don't count, and neither do `#123` or `C#`.
+
+FastPad keeps an index of every Markdown note's tags and front matter, updated as notes are saved
+or changed outside FastPad, and cached so the next start reads only what changed.
+
+### Links between notes
+
+Link to another note by name with `[[wikilinks]]`, as Obsidian does:
+
+```markdown
+See [[Project Atlas]], its [[Project Atlas#Goals|goals]], or [[work/Plan]].
+```
+
+- **Type `[[`** and FastPad offers the notebook's notes; keep typing to narrow the list.
+- **Follow a link** with `Ctrl+Click` or `F12` in the editor, or a click in the preview. A link to
+  a note that doesn't exist yet creates it.
+- A name finds a note by its file name, its path, or an `aliases:` entry in its front matter.
+  When two notes share a name, the one in the linking note's folder wins.
+- **The Links view** (the link button in the activity bar, or **View: Show links**) shows which
+  notes link to the active note, with the line that mentions it, and what the note links to.
+  It also lists **missing notes** (linked but not yet written) and notes nothing links to.
+- **Rename or move a note** in FastPad and its relative links are fixed, and FastPad offers to
+  update the links in other notes. Renaming can keep the old name as an alias. When another
+  program renames a note, a notice says which links still use the old name, and
+  **Notes: Update links to renamed notes** fixes them.
+
+### Images and files in notes
+
+In a Markdown note, **paste a screenshot** (`Ctrl+V`) or files copied in Explorer, or **drop files
+with `Ctrl` held**, and FastPad copies them into the notebook's `attachments` folder (or the one
+your Obsidian vault uses) and links them where the caret is: `![](attachments/…png)` for images,
+`[name](…)` for other files. **Notes: Insert attachment…** picks a file instead.
+
+- When the clipboard has text too (a paragraph copied from Word puts a picture there as well),
+  `Ctrl+V` pastes the text. **Notes: Paste image as attachment** takes the image anyway.
+- A Markdown file outside the notebook keeps its attachments in an `attachments` folder beside it.
+- Move a note and its links to images and files keep working. Move an image in the Notebook tree
+  and FastPad offers to update the notes that show it.
+
+### Daily notes and templates
+
+- **`Ctrl+Alt+D`** (Notes: Open today's note) opens today's note in `journal\`, making it the
+  first time from `.fastpad\templates\daily.md`, or with the date as its heading.
+  **Notes: Previous daily note** and **Next daily note** step through the journal.
+- **Notes: New note from template…** (also in the Notebook `…` menu and a folder's right-click
+  menu) lists the templates in `.fastpad\templates` and makes a new note from the one you pick.
+- Templates fill in `{{date}}`, `{{date:dddd, D MMMM YYYY}}`, `{{time}}` and `{{title}}`, and the
+  caret starts at `{{cursor}}`. Placeholders work in front matter too.
+- A notebook's conventions live in `.fastpad\notebook.ini`, which other tools and AI agents can
+  read too. **Notes: Edit notebook settings** opens it:
+
+```ini
+daily_folder=journal
+daily_format=YYYY-MM-DD
+daily_template=.fastpad/templates/daily.md
+templates_folder=.fastpad/templates
+inbox=inbox.md
+```
+
+### Quick capture
+
+Press **`Ctrl+Alt+N`** anywhere to jot something down without leaving what you're doing. The
+capture box appends it to your notebook's `inbox.md` as a time-stamped list item.
+
+- **`Ctrl+Enter`** saves and closes; **`Ctrl+Shift+Enter`** also opens the note. **`Esc`** closes
+  and keeps what you typed for next time.
+- **Images and files:** paste a screenshot or files copied in Explorer, drop files on the box, or
+  press **`Ctrl+Shift+S`** to snip part of the screen with Windows' own tool. They are copied into
+  the notebook's `attachments` folder and linked from the capture.
+- **`Ctrl+Alt+N`** again in the box switches where this capture goes: the inbox, today's daily
+  note, or a new file of its own in `inbox`, which suits AI agents that process items one by one.
+  `capture_target` in `notebook.ini` sets the default.
+- It works when FastPad isn't running too: the installer's "Quick capture shortcut" option sets
+  up the same key, and `FastPad.exe --capture "text"` captures from scripts.
+
+### Changes made outside FastPad
+
+Edit a file in another program, sync it from another PC, or let an AI agent work on your notes:
+FastPad keeps up while it's open.
+
+- **Open tabs follow the file.** A tab with no unsaved edits picks up the new text as soon as
+  the file changes, as one edit you can undo: **Ctrl+Z** brings back what you had.
+- **Appends join your edits.** Text added to the end of a file you're editing (a log, an inbox)
+  is added to the end of your tab, with nothing to resolve.
+- **Real conflicts wait for you.** Any other change to a tab with unsaved edits shows a warning in
+  the tab and pauses autosave. Use **Note: Reload from disk**, **Note: Keep my version**, or
+  **Note: Compare with disk** to see the file's version read-only beside yours.
+- **A deleted file keeps its tab**, marked "(deleted)". Saving creates it again.
+- **The notebook shows what changed.** A dot marks each note changed outside FastPad since you
+  last opened it, and it survives a restart. **Notes: Show changed notes** lists only those;
+  **Notes: Clear changed marks** clears them.
+
+The open notebook is watched for changes as they happen, and other open files are checked when
+FastPad comes back to the front. Changes inside folders such as `.git` and `node_modules` are
+ignored. To have every change wait for you instead, set `reload_changed_files=ask`.
+
 ### JSON you can trust
 
 <img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
@@ -226,6 +339,7 @@ before closing again.
 | Add next occurrence | `Ctrl+D` | | Select all occurrences | `Ctrl+Shift+L` |
 | Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
 | Bold / italic (Markdown files) | `Ctrl+B` / `Ctrl+I` | | Code / link (Markdown files) | ``Ctrl+` `` / `Ctrl+K` |
+| Follow link at caret | `F12` or `Ctrl+Click` | | Today's note | `Ctrl+Alt+D` |
 
 ## Make it yours
 
@@ -248,10 +362,13 @@ line in a notification and applies the rest.
 | `highlight_current_line` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `code_folding` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `capture_hotkey` | A key like `Ctrl+Alt+N`; empty turns it off | `Ctrl+Alt+N` |
+| `capture_source` | `true`/`false`: note the window you were in when you pressed the capture hotkey | `false` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
-| `sidebar_view` | `notebook`, `search`, `favorites`, `none` | `notebook` |
+| `reload_changed_files` | `auto` (a tab without unsaved edits takes a file's outside changes by itself) or `ask` (every change waits for you) | `auto` |
+| `sidebar_view` | `notebook`, `search`, `favorites`, `tags`, `none` | `notebook` |
 | `sidebar_width` | 180–480 (pixels at 100% scaling) | `260` |
 | `settings_size` | `<width>x<height>` (pixels at 100% scaling), saved when you resize Settings | none: its natural size |
 | `window_placement` | `<x>,<y>,<width>x<height>`, then `,maximized` if it was; saved when the main window closes | none: opens at the default spot |
@@ -263,11 +380,16 @@ Hand edits keep your comments and other lines; the palette and Settings rewrite 
 
 ```text
 FastPad.exe [--new-window] [path]
+FastPad.exe --capture ["text" | -] [--attach <file>]...
 ```
 
 - `FastPad.exe notes.md` opens the file in your running FastPad window, or starts FastPad if none is
   open.
 - `--new-window` always starts a separate, independent window.
+- `--capture` opens the quick capture box. With text (or `-` to read it from standard input) and
+  any `--attach` files, it files them into the inbox with no window and exits: `0` when filed, `1`
+  when the write failed, `2` when the request was refused (a missing file, or one over 20 MB). It
+  goes to your running FastPad when there is one.
 - `--diagnostic` is for the startup benchmark harness; you don't need it.
 
 ## FAQ

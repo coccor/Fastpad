@@ -50,6 +50,12 @@ const FIELD_HOOK_ID: usize = 0x4650_494E;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Purpose {
     NewNote(PathBuf),
+    /// A new note filled in from the template at this absolute path (second brain phase 1 spec
+    /// §9.4).
+    NewNoteFrom {
+        parent: PathBuf,
+        template: PathBuf,
+    },
     NewFolder(PathBuf),
     RenameNote(PathBuf),
     RenameFolder(PathBuf),
@@ -59,7 +65,9 @@ impl Purpose {
     /// The folder the name goes in (empty for the notebook root).
     pub(crate) fn parent(&self) -> &Path {
         match self {
-            Self::NewNote(parent) | Self::NewFolder(parent) => parent,
+            Self::NewNote(parent) | Self::NewNoteFrom { parent, .. } | Self::NewFolder(parent) => {
+                parent
+            }
             Self::RenameNote(path) | Self::RenameFolder(path) => {
                 path.parent().unwrap_or(Path::new(""))
             }
@@ -69,7 +77,9 @@ impl Purpose {
     /// A new item's folder: the edit shows a draft row there (spec §3.1).
     pub(crate) fn draft_parent(&self) -> Option<&Path> {
         match self {
-            Self::NewNote(parent) | Self::NewFolder(parent) => Some(parent),
+            Self::NewNote(parent) | Self::NewNoteFrom { parent, .. } | Self::NewFolder(parent) => {
+                Some(parent)
+            }
             Self::RenameNote(_) | Self::RenameFolder(_) => None,
         }
     }
@@ -79,7 +89,7 @@ impl Purpose {
         match self {
             Self::RenameNote(path) => Some(RowKind::Note(path.clone())),
             Self::RenameFolder(path) => Some(RowKind::Folder(path.clone())),
-            Self::NewNote(_) | Self::NewFolder(_) => None,
+            Self::NewNote(_) | Self::NewNoteFrom { .. } | Self::NewFolder(_) => None,
         }
     }
 
@@ -93,7 +103,7 @@ impl Purpose {
             Self::RenameNote(path) | Self::RenameFolder(path) => {
                 Some(path.file_name()?.to_string_lossy().into_owned())
             }
-            Self::NewNote(_) | Self::NewFolder(_) => None,
+            Self::NewNote(_) | Self::NewNoteFrom { .. } | Self::NewFolder(_) => None,
         }
     }
 }
@@ -102,7 +112,7 @@ impl Purpose {
 /// cleaned, or a rename to the name it already has. A change of letter case is a rename.
 pub(crate) fn typed_name(purpose: &Purpose, text: &str) -> Option<String> {
     let name = match purpose {
-        Purpose::NewNote(_) => title::new_note_name(text)?,
+        Purpose::NewNote(_) | Purpose::NewNoteFrom { .. } => title::new_note_name(text)?,
         Purpose::NewFolder(_) | Purpose::RenameFolder(_) => title::folder_name(text)?,
         Purpose::RenameNote(path) => {
             let current = path
@@ -174,7 +184,9 @@ pub(crate) fn accessible_name(purpose: &Purpose, notebook: &str) -> String {
         )
     };
     match purpose {
-        Purpose::NewNote(parent) => format!("New note name, in {}", place(parent)),
+        Purpose::NewNote(parent) | Purpose::NewNoteFrom { parent, .. } => {
+            format!("New note name, in {}", place(parent))
+        }
         Purpose::NewFolder(parent) => format!("New folder name, in {}", place(parent)),
         Purpose::RenameNote(path) | Purpose::RenameFolder(path) => format!(
             "Rename {}",
@@ -241,6 +253,7 @@ pub(crate) fn insert_draft(rows: &mut Vec<TreeRow>, parent: Option<usize>) -> Op
             name: String::new(),
             pinned: false,
             expanded: false,
+            changed: false,
         },
     );
     Some(at)
@@ -748,6 +761,14 @@ pub(crate) fn new_note(hwnd: HWND, parent: Option<PathBuf>) {
     }
 }
 
+/// Notes: New note from template… once a template is chosen (second brain phase 1 spec §9.4):
+/// the field for the new note's name, in `parent` or the selected folder.
+pub(crate) fn new_note_from(hwnd: HWND, parent: Option<PathBuf>, template: PathBuf) {
+    if let Some(parent) = target_folder(hwnd, parent) {
+        start(hwnd, Purpose::NewNoteFrom { parent, template });
+    }
+}
+
 /// F2 or Rename… on a note or folder row (spec §3.3): the field over that row's name.
 pub(crate) fn rename(hwnd: HWND, row: &RowKind) {
     let purpose = match row {
@@ -1058,7 +1079,10 @@ pub(crate) fn commit(hwnd: HWND, how: How) {
     // Read with nothing of the App borrowed.
     let text = field_text(field);
     match purpose {
-        Purpose::NewNote(parent) => commit_new_note(hwnd, how, &parent, &text),
+        Purpose::NewNote(parent) => commit_new_note(hwnd, how, &parent, &text, None),
+        Purpose::NewNoteFrom { parent, template } => {
+            commit_new_note(hwnd, how, &parent, &text, Some(&template));
+        }
         Purpose::NewFolder(parent) => commit_new_folder(hwnd, how, &parent, &text),
         Purpose::RenameNote(relative) => commit_rename_note(hwnd, how, &relative, &text),
         Purpose::RenameFolder(relative) => commit_rename_folder(hwnd, how, &relative, &text),
@@ -1120,9 +1144,10 @@ fn commit_new_folder(hwnd: HWND, how: How, parent: &Path, text: &str) {
     }
 }
 
-/// New note (spec §4.1, §5.2): the empty file is made with the one disk call, never over an
-/// existing file, listed, and opened as a normal tab. After Enter the focus goes to the editor.
-fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str) {
+/// New note (spec §4.1, §5.2): the file is made with the one disk call, never over an existing
+/// file, listed, and opened as a normal tab. It is empty, or `template` filled in (second brain
+/// phase 1 spec §9.4) with the caret at its `{{cursor}}`. After Enter the focus goes to the editor.
+fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str, template: Option<&Path>) {
     let Some(root) = library_host::folder(hwnd) else {
         cancel(hwnd);
         return;
@@ -1138,11 +1163,27 @@ fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str) {
     }
     let folder = root.join(parent);
     let path = folder.join(&name);
+    let filled = match template {
+        Some(template) => {
+            let stem = Path::new(&name).file_stem().unwrap_or_default();
+            match library_host::fill_template(hwnd, template, &stem.to_string_lossy()) {
+                Ok(filled) => Some(filled),
+                Err(error) => {
+                    fail(hwnd, how, error);
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
     let created = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
-        .map(drop);
+        .and_then(|mut file| {
+            let text = filled.as_ref().map_or("", |filled| filled.text.as_str());
+            std::io::Write::write_all(&mut file, text.as_bytes())
+        });
     if let Err(error) = created {
         // A file the tree doesn't list may already have the name.
         let error = if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -1160,6 +1201,10 @@ fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str) {
     let mode = super::main_window::OpenMode::Permanent;
     if let Err(error) = super::main_window::open_note(hwnd, &path, mode, how == How::Enter) {
         super::main_window::report_open_failure(hwnd, &path, &error);
+        return;
+    }
+    if let Some(filled) = filled {
+        library_host::place_caret(hwnd, filled.cursor.unwrap_or(filled.text.len()));
     }
 }
 
@@ -1234,6 +1279,8 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
             );
         }
     }
+    // Links that would no longer reach the renamed note (second brain phase 1 spec §7.6).
+    library_host::notes_moved(hwnd, &[(relative.to_path_buf(), row)]);
 }
 
 /// A folder rename (spec §4.3, §5.2): the one disk call, never onto another name, then the open
@@ -1293,6 +1340,9 @@ fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
             library_host::rename_undo_failed_notice(&old_name, &name, &moved.stuck),
         );
     }
+    // Links that would no longer reach the notes under it (second brain phase 1 spec §7.6).
+    let moves = library_host::folder_moves(hwnd, old, &new);
+    library_host::notes_moved(hwnd, &moves);
 }
 
 #[cfg(test)]

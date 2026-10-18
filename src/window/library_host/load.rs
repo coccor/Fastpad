@@ -60,7 +60,7 @@ pub(crate) fn open_library_step(hwnd: HWND) {
             crate::launch::LaunchRequest::Open(path) => {
                 Some(library::normalize_folder(Path::new(path)))
             }
-            crate::launch::LaunchRequest::New => None,
+            crate::launch::LaunchRequest::New | crate::launch::LaunchRequest::Capture(_) => None,
         });
     let recent = library::local::read_folders(&library::local::folders_file(&data));
     host(hwnd, |host| host.folders = Some(recent.clone()));
@@ -290,7 +290,7 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
 
 pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
     let Some((relocated, first_time, truncated, unreadable, has_pending)) = host(hwnd, |host| {
-        let state = match host.state.take() {
+        let mut state = match host.state.take() {
             Some(previous) if library::model::same_path(&previous.folder, &fresh.folder) => {
                 library::merge_rescan(previous, fresh)
             }
@@ -301,6 +301,11 @@ pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
             .as_ref()
             .is_some_and(|f| library::model::same_path(f, &state.folder));
         host.notified = Some(state.folder.clone());
+        if !state.renamed_outside.is_empty() {
+            let found = std::mem::take(&mut state.renamed_outside);
+            host.renamed_outside.extend(found);
+            host.renamed_outside_told = false;
+        }
         let state = host.state.insert(state);
         (
             std::mem::take(&mut state.relocated),
@@ -350,10 +355,18 @@ pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
     crate::window::text_search_host::notes_reloaded(hwnd);
     // A folder box whose folder the rescan no longer finds closes.
     close_stale_name_box(hwnd);
+    // A note the rescan found changed is no news when a tab shows it.
+    clear_visible_marks(hwnd);
     crate::window::side_panel::refresh(hwnd);
     // A notebook's first load reveals the (restored) active note: its row is selected and its
     // folders expand (spec §6.1). A rescan leaves the user's selection where it was.
     if first_time {
         crate::window::side_panel::active_tab_changed(hwnd);
     }
+    // From now on outside changes are reported as they happen (second brain phase 1 §5.1).
+    ensure_watcher(hwnd);
+    // The notebook's conventions may have changed with it (second brain phase 1 §9.1).
+    reload_notebook_settings(hwnd);
+    // The note list may have changed: the index reads what did (§6.4).
+    request_index(hwnd);
 }

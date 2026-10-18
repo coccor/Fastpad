@@ -24,6 +24,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 /// A tab's file icon box, in 96 dpi pixels, and the gap after it.
 const ICON_BOX: i32 = 16;
 const ICON_GAP: i32 = 6;
+/// Segoe Fluent Icons / MDL2 Warning, drawn in place of a conflicting tab's file icon.
+const GLYPH_WARNING: &str = "\u{E7BA}";
 
 /// The width a tab's icon and its gap take from the label at `dpi`.
 fn icon_slot(dpi: u32) -> i32 {
@@ -292,6 +294,8 @@ pub(crate) struct StripPaint<'a> {
     pub(crate) active: usize,
     /// The preview tab's index; its label is drawn in italics.
     pub(crate) preview_tab: Option<usize>,
+    /// Whether each tab, parallel to `titles`, is in conflict with its file on disk.
+    pub(crate) conflicts: &'a [bool],
     pub(crate) palette: Palette,
     pub(crate) fonts: TitleFontHandles,
     pub(crate) pointer: StripPointer,
@@ -416,7 +420,28 @@ unsafe fn draw(dc: HDC, layout: &StripLayout, dpi: u32, input: &StripPaint<'_>) 
                     accent,
                 );
             }
-            if let Some(&kind) = input.kinds.get(index) {
+            if input.conflicts.get(index) == Some(&true) {
+                // A tab whose file changed on disk under unsaved edits shows a warning where its
+                // file icon goes (second brain phase 1 spec §5.4), so nothing moves.
+                let px = scale(ICON_BOX, dpi);
+                let left = tab.left + scale(12, dpi);
+                let top = tab.top + (tab.bottom - tab.top - px) / 2;
+                select_font(dc, input.fonts.glyph());
+                SetTextColor(
+                    dc,
+                    if palette.high_contrast {
+                        foreground
+                    } else {
+                        palette.warning_foreground
+                    },
+                );
+                draw_text(
+                    dc,
+                    GLYPH_WARNING,
+                    Rect::new(left, top, left + px, top + px),
+                    DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+                );
+            } else if let Some(&kind) = input.kinds.get(index) {
                 let px = scale(ICON_BOX, dpi);
                 let left = tab.left + scale(12, dpi);
                 let top = tab.top + (tab.bottom - tab.top - px) / 2;
@@ -666,6 +691,7 @@ mod tests {
             light_theme: true,
             active: 0,
             preview_tab: None,
+            conflicts: &[],
             palette,
             fonts: crate::window::titlebar::TitleFontHandles::default(),
             pointer: StripPointer::default(),

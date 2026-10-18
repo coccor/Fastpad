@@ -41,6 +41,103 @@ pub(crate) fn set_text(owner: HWND, text: &str) -> Result<()> {
     result
 }
 
+/// Opens the clipboard, waiting briefly while another program holds it.
+fn open(owner: HWND) -> bool {
+    for _ in 0..10 {
+        if unsafe { OpenClipboard(owner) } != 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// The registered `PNG` format browsers and Snipping Tool put on the clipboard.
+fn png_format() -> u32 {
+    let name = wide_null("PNG");
+    unsafe { windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW(name.as_ptr()) }
+}
+
+fn available(format: u32) -> bool {
+    format != 0
+        && unsafe { windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable(format) }
+            != 0
+}
+
+/// Whether the clipboard holds text.
+pub(crate) fn has_text() -> bool {
+    available(u32::from(CF_UNICODETEXT))
+}
+
+/// Whether the clipboard holds an image a capture can attach.
+pub(crate) fn has_image() -> bool {
+    use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5};
+    available(png_format()) || available(u32::from(CF_DIBV5)) || available(u32::from(CF_DIB))
+}
+
+/// Whether the clipboard holds files copied in Explorer.
+pub(crate) fn has_files() -> bool {
+    available(u32::from(windows_sys::Win32::System::Ole::CF_HDROP))
+}
+
+/// A copy of the clipboard's `format` block; the clipboard must be open.
+fn read_global(format: u32) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardData;
+    use windows_sys::Win32::System::Memory::GlobalSize;
+    let handle = unsafe { GetClipboardData(format) };
+    if handle.is_null() {
+        return None;
+    }
+    let size = unsafe { GlobalSize(handle) };
+    let data = unsafe { GlobalLock(handle) }.cast::<u8>();
+    if data.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
+    unsafe { GlobalUnlock(handle) };
+    Some(bytes)
+}
+
+/// The files copied in Explorer (`CF_HDROP`), or none.
+pub(crate) fn files(owner: HWND) -> Vec<std::path::PathBuf> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardData;
+    if !has_files() || !open(owner) {
+        return Vec::new();
+    }
+    let handle = unsafe { GetClipboardData(u32::from(windows_sys::Win32::System::Ole::CF_HDROP)) };
+    let paths = if handle.is_null() {
+        Vec::new()
+    } else {
+        crate::platform::win32::dropped_paths(handle)
+    };
+    unsafe { CloseClipboard() };
+    paths
+}
+
+/// The clipboard's image as PNG bytes (second brain phase 1 spec §10.4): the `PNG` format as it
+/// is, else a `CF_DIBV5` or `CF_DIB` bitmap encoded with WIC. `None` when it holds no image.
+pub(crate) fn image_png(owner: HWND) -> Option<std::result::Result<Vec<u8>, String>> {
+    use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5};
+    if !has_image() || !open(owner) {
+        return None;
+    }
+    let png = read_global(png_format()).filter(|bytes| bytes.starts_with(b"\x89PNG"));
+    let dib = png
+        .is_none()
+        .then(|| read_global(u32::from(CF_DIBV5)).or_else(|| read_global(u32::from(CF_DIB))));
+    unsafe { CloseClipboard() };
+    if let Some(png) = png {
+        return Some(Ok(png));
+    }
+    let pixels = dib
+        .flatten()
+        .and_then(|dib| crate::platform::png::dib_to_pixels(&dib));
+    Some(match pixels {
+        Some(pixels) => crate::platform::png::encode_png(&pixels),
+        None => Err("FastPad can't read this kind of image from the clipboard.".to_owned()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::System::DataExchange::{

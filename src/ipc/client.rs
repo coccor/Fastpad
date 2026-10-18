@@ -3,7 +3,7 @@
 use super::InstanceNames;
 use super::protocol::{IpcRequest, encode_frame};
 use super::security::ProcessIdentity;
-use crate::launch::LaunchRequest;
+use crate::launch::{CaptureText, LaunchRequest};
 use crate::platform::{OwnedHandle, last_error};
 use crate::{FastPadError, Result};
 use std::time::{Duration, Instant};
@@ -49,6 +49,36 @@ pub fn claim_or_forward(request: &LaunchRequest) -> InstanceClaim {
     }
 }
 
+/// What `forward_if_running` did.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Forward {
+    /// The running FastPad took the request.
+    Sent,
+    /// No FastPad is running in this session.
+    NotRunning,
+    /// One is running but did not take the request.
+    Failed,
+}
+
+/// Sends `request` to the FastPad running in this session, if there is one. Never keeps the
+/// instance mutex: a capture-only process stays out of the way of a full FastPad starting while
+/// its box is open (second brain phase 1 spec §10.1).
+pub fn forward_if_running(request: &IpcRequest) -> Forward {
+    let Ok(names) = InstanceNames::for_current_session() else {
+        return Forward::NotRunning;
+    };
+    match create_instance_mutex(&names) {
+        // Created here, so nobody owns it: dropping the handle gives it up again.
+        Ok(Some(_mutex)) => return Forward::NotRunning,
+        Ok(None) => {}
+        Err(_) => return Forward::NotRunning,
+    }
+    match encode_frame(request).and_then(|frame| send_frame(&names, &frame, FORWARD_BUDGET)) {
+        Ok(()) => Forward::Sent,
+        Err(_) => Forward::Failed,
+    }
+}
+
 /// Returns the handle only when this call created the mutex; an existing one is closed at once.
 fn create_instance_mutex(names: &InstanceNames) -> Result<Option<OwnedHandle>> {
     let raw = unsafe { CreateMutexW(std::ptr::null(), 0, names.mutex.as_ptr()) };
@@ -70,6 +100,22 @@ pub fn ipc_request_for(request: &LaunchRequest) -> Result<IpcRequest> {
             } else {
                 Ok(IpcRequest::Open(path))
             }
+        }
+        LaunchRequest::Capture(capture) => {
+            let text = match &capture.text {
+                None => None,
+                Some(CaptureText::Text(text)) => Some(text.clone()),
+                // `bootstrap` reads standard input before forwarding.
+                Some(CaptureText::Stdin) => {
+                    return Err(crate::FastPadError::Ipc("standard input was not read"));
+                }
+            };
+            let attachments = capture
+                .attachments
+                .iter()
+                .map(std::path::absolute)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            Ok(IpcRequest::Capture { text, attachments })
         }
     }
 }

@@ -1,11 +1,13 @@
 pub mod annotation;
 pub mod clipboard;
+pub mod clock;
 pub mod dialogs;
 pub mod files;
 pub mod fonts;
 pub mod handles;
 pub(crate) mod ole_drop;
 pub mod paths;
+pub mod png;
 pub mod shell;
 pub mod theme;
 pub mod win32;

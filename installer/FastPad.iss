@@ -58,6 +58,7 @@ SignedUninstaller=yes
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "contextmenu"; Description: "Add ""Edit with FastPad"" to the context menu of every file"; GroupDescription: "Shell integration:"; Flags: unchecked
+Name: "quickcapture"; Description: "Quick capture shortcut (Ctrl+Alt+N), even when FastPad isn't running"; GroupDescription: "Shell integration:"; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -65,6 +66,9 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+; Windows runs a Start menu shortcut's hotkey when FastPad isn't running; a running FastPad holds
+; the same key itself (second brain phase 1 spec, section 10.1).
+Name: "{autoprograms}\{#AppName} Quick Capture"; Filename: "{app}\{#AppExe}"; Parameters: "--capture"; HotKey: ctrl+alt+n; Tasks: quickcapture
 
 [Registry]
 ; `fastpad` from Win+R, the Explorer address bar, and `start fastpad`.

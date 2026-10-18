@@ -31,6 +31,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 pub fn run(options: LaunchOptions) -> Result<i32> {
+    // `--capture` forwards, or files on its own with at most the capture box: nothing else of
+    // FastPad starts (second brain phase 1 spec §10.1).
+    if let crate::launch::LaunchRequest::Capture(capture) = options.request {
+        return Ok(crate::window::capture_only::run(capture));
+    }
     let mut startup = StartupMetrics::begin()?;
     // Before DPI and Scintilla so a forwarding secondary loads nothing it will not use.
     let instance_mutex = if options.new_window {

@@ -161,6 +161,58 @@ pub(crate) fn confirm(hwnd: HWND, text: &str, action: &str) -> bool {
     prompt::show(hwnd, current_palette(hwnd), &spec) == 0
 }
 
+/// Themed prompt with `buttons`, the first the primary one and the last what Esc picks. Returns
+/// the index of the button chosen.
+pub(crate) fn choose(hwnd: HWND, text: &str, buttons: &[&str]) -> usize {
+    let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    {
+        LAST_CHOICE.with(|last| {
+            *last.borrow_mut() = Some((
+                text.to_owned(),
+                buttons.iter().map(|button| (*button).to_owned()).collect(),
+            ))
+        });
+        if let Some(answer) = CHOICE_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+            return answer(hwnd);
+        }
+    }
+    let spec = prompt::Spec {
+        message: text,
+        buttons,
+        quick_keys: &[],
+    };
+    prompt::show(hwnd, current_palette(hwnd), &spec)
+}
+
+/// The question and buttons the last `choose` showed.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn take_last_choice() -> Option<(String, Vec<String>)> {
+    LAST_CHOICE.with(|last| last.borrow_mut().take())
+}
+
+/// Answers the next `choose` with a button index.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn answer_next_choice(answer: impl FnOnce(HWND) -> usize + 'static) {
+    CHOICE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHOICE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<usize>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static LAST_CHOICE: std::cell::RefCell<Option<(String, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 type Answer<T> = Box<dyn FnOnce(HWND) -> T>;
 

@@ -295,6 +295,43 @@ pub(crate) fn flatten(tree: &NoteTree, expanded: &[PathBuf]) -> Vec<TreeRow> {
     tree.rows(&|path: &Path| !open.is_empty() && open.contains(&expanded_key(path)))
 }
 
+/// Marks the rows of notes changed outside FastPad, and of collapsed folders that hold one
+/// (second brain phase 1 spec §5.5). `changed` is relative to the notebook.
+pub(crate) fn mark_changed_rows(rows: &mut [TreeRow], changed: &[PathBuf]) {
+    if changed.is_empty() {
+        return;
+    }
+    let keys: HashSet<String> = changed.iter().map(|path| expanded_key(path)).collect();
+    for row in rows {
+        match &row.kind {
+            RowKind::Note(path) => row.changed = keys.contains(&expanded_key(path)),
+            RowKind::Folder(path) if !row.expanded => {
+                let prefix = format!("{}\\", expanded_key(path));
+                row.changed = keys.iter().any(|key| key.starts_with(&prefix));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The rows "Notes: Show changed notes" shows: the marked notes, each under the folders it is
+/// in, those folders open.
+pub(crate) fn changed_rows(tree: &NoteTree, changed: &[PathBuf]) -> Vec<TreeRow> {
+    let folders: Vec<PathBuf> = changed
+        .iter()
+        .flat_map(|path| tree::ancestors(path))
+        .collect();
+    let folder_keys: HashSet<String> = folders.iter().map(|path| expanded_key(path)).collect();
+    let mut rows = flatten(tree, &folders);
+    mark_changed_rows(&mut rows, changed);
+    rows.retain(|row| match &row.kind {
+        RowKind::Note(_) => row.changed,
+        RowKind::Folder(path) => folder_keys.contains(&expanded_key(path)),
+        RowKind::Draft => false,
+    });
+    rows
+}
+
 /// Letters typed into the tree within a second of each other form one prefix.
 #[derive(Debug, Default)]
 pub(crate) struct TypeAhead {
@@ -329,6 +366,8 @@ struct RebuildKey {
     expansion: u64,
     /// `library_host::root_expanded`: collapsing the root row is a rebuild.
     root_expanded: bool,
+    /// `library_host::changed_only`: the view shows only notes changed outside FastPad.
+    changed_only: bool,
 }
 
 /// The Notebook view's state, owned by `side_panel::Sidebar`.

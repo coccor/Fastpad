@@ -304,6 +304,8 @@ pub(super) fn load_settings(hwnd: HWND) {
     let (settings, warnings) = preloaded.unwrap_or_else(crate::config::load);
     apply_loaded_settings(hwnd, settings, warnings);
     start_recovery_timer(hwnd);
+    // Quick capture's hotkey, once the settings that name it are final (spec §10.1).
+    crate::window::capture_host::register_hotkey(hwnd);
 }
 
 /// Applies an already-loaded settings/warnings pair, split out of `load_settings` so tests can drive

@@ -2,18 +2,29 @@
 //! kept in `.fastpad\library.ini` and attached to files by path, file ID and content fingerprint.
 //! Nothing here touches a window.
 
+pub mod capture;
+pub mod capture_file;
+pub mod dates;
+pub mod external;
+pub mod facts;
+pub mod frontmatter;
 pub mod ids;
+pub mod index;
+pub mod links;
 pub mod local;
 pub mod model;
+pub mod notebook_ini;
 pub mod ops;
 pub mod quick_open;
 pub mod reconcile;
 pub mod scan;
 pub mod store;
+pub mod template;
 pub mod text_replace;
 pub mod text_search;
 pub mod title;
 pub mod tree;
+pub mod watch;
 
 use crate::Result;
 use ids::IdSource;
@@ -86,6 +97,12 @@ pub struct LibraryState {
     pub truncated: bool,
     pub pending: Vec<PendingOp>,
     pub relocated: Vec<(PathBuf, PathBuf)>,
+    /// Notes renamed or moved outside FastPad since the last scan, as (old, new) relative paths,
+    /// found by file ID: links to them may need updating (second brain phase 1 spec §7.6).
+    pub renamed_outside: Vec<(PathBuf, PathBuf)>,
+    /// Renames FastPad made since the last scan landed (notes and folders, old and new relative
+    /// paths): the next scan, or the next start, must not take them for outside renames.
+    pub own_renames: Vec<(PathBuf, PathBuf)>,
     /// Paths (as records store them) FastPad itself added, removed or renamed in `notes` since
     /// the running rescan started. Only these are re-checked when its result is merged.
     pub touched: Vec<PathBuf>,
@@ -221,8 +238,76 @@ const FILETIME_UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
 
 /// Converts a Unix-epoch nanosecond timestamp (as `store::stamp` reports) to Windows FILETIME
 /// ticks, the unit `scan::ScanEntry::mtime` (and so `NoteEntry::mtime`) is stored in.
-fn filetime_ticks(unix_nanos: u64) -> u64 {
+pub(crate) fn filetime_ticks(unix_nanos: u64) -> u64 {
     unix_nanos / 100 + FILETIME_UNIX_EPOCH_TICKS
+}
+
+/// The notes in `entries` (a fresh scan) that changed since `cache` (the last scan this PC wrote
+/// down): a different size or write time, or a path the cache lacks. Nothing for a first scan,
+/// whose cache is empty (second brain phase 1 spec §5.5).
+fn changed_since_cache(cache: &[local::CachedFile], entries: &[scan::ScanEntry]) -> Vec<PathBuf> {
+    if cache.is_empty() {
+        return Vec::new();
+    }
+    let known: HashMap<String, (u64, u64)> = cache
+        .iter()
+        .map(|file| (path_key(&file.path), (file.size, file.mtime)))
+        .collect();
+    entries
+        .iter()
+        .filter(|entry| known.get(&path_key(&entry.path)) != Some(&(entry.size, entry.mtime)))
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+/// Notes renamed or moved since `cache` (the last scan this PC wrote down), as (old, new):
+/// a path the cache had that the scan lacks, whose file ID a new path now has (second brain
+/// phase 1 spec §7.6). Files without a stable ID (some network drives) are never paired.
+fn renamed_since_cache(cache: &[local::CachedFile], scan: &scan::Scan) -> Vec<(PathBuf, PathBuf)> {
+    if cache.is_empty() {
+        return Vec::new();
+    }
+    let scanned: HashSet<String> = scan
+        .entries
+        .iter()
+        .map(|entry| path_key(&entry.path))
+        .collect();
+    let gone: HashMap<(u32, u64), &PathBuf> = cache
+        .iter()
+        .filter(|file| file.file_id != 0 && !scanned.contains(&path_key(&file.path)))
+        .map(|file| ((file.volume, file.file_id), &file.path))
+        .collect();
+    if gone.is_empty() {
+        return Vec::new();
+    }
+    let cached: HashSet<String> = cache.iter().map(|file| path_key(&file.path)).collect();
+    scan.entries
+        .iter()
+        .filter(|entry| entry.file_id != 0 && !cached.contains(&path_key(&entry.path)))
+        .filter_map(|entry| {
+            let old = gone.get(&(scan.volume, entry.file_id))?;
+            Some(((*old).clone(), entry.path.clone()))
+        })
+        .collect()
+}
+
+/// The notes in `fresh` (a rescan's list) that differ from `previous` (the live list, which
+/// FastPad's own saves keep current): a different size or write time, or a new path. Notes in
+/// `touched`, which FastPad wrote while the rescan ran, are FastPad's own.
+fn changed_since(previous: &[NoteEntry], fresh: &[NoteEntry], touched: &[PathBuf]) -> Vec<PathBuf> {
+    let known: HashMap<String, (u64, u64)> = previous
+        .iter()
+        .map(|note| (path_key(&note.path), (note.size, note.mtime)))
+        .collect();
+    let own: HashSet<String> = touched.iter().map(|path| path_key(path)).collect();
+    fresh
+        .iter()
+        .filter(|note| {
+            let key = path_key(&note.path);
+            !own.contains(&key) && known.get(&key) != Some(&(note.size, note.mtime))
+        })
+        .map(|note| note.path.clone())
+        .collect()
 }
 
 /// Reads both library files, scans the folder and reconciles. Runs on the worker thread.
@@ -244,6 +329,21 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
     } else {
         scan::Scan::default()
     };
+    // Before reconcile replaces the cache with this scan: what changed while FastPad wasn't
+    // looking. A rescan's result is diffed again against the live list (`merge_rescan`).
+    for path in changed_since_cache(&local.files, &scan.entries) {
+        local.set_changed(&path, true);
+    }
+    let renamed_outside = renamed_since_cache(&local.files, &scan);
+    // A marked note that is gone loses its mark.
+    let listed: HashSet<String> = scan
+        .entries
+        .iter()
+        .map(|entry| path_key(&entry.path))
+        .collect();
+    local
+        .changed
+        .retain(|path| listed.contains(&path_key(path)));
     let reconciled = if metadata == Metadata::Ready {
         reconcile::reconcile(&mut library, &mut local, &scan, now, &mut |relative| {
             ids::hash_file(&folder.join(relative), reconcile::HASH_LIMIT)
@@ -286,6 +386,8 @@ pub fn load(folder: &Path, local_path: &Path, now: u64) -> Result<LibraryState> 
         folder_changes: Vec::new(),
         pending: reconciled.ops,
         relocated: reconciled.relocated,
+        renamed_outside,
+        own_renames: Vec::new(),
         touched: Vec::new(),
         written_local: local.conveniences(),
         local,
@@ -387,6 +489,7 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         notes: previous_notes,
         touched,
         folder_changes,
+        own_renames: previous_own_renames,
         ..
     } = previous;
     let mut fresh = fresh;
@@ -414,6 +517,23 @@ pub fn merge_rescan(previous: LibraryState, fresh: LibraryState) -> LibraryState
         }
     }
     fresh.notes = merge_notes(&fresh.folder, std::mem::take(&mut fresh.notes), &touched);
+    // The marks are the UI's, plus what this rescan found changed outside FastPad since the
+    // live list last knew each note (second brain phase 1 spec §5.5).
+    let found = changed_since(&previous_notes, &fresh.notes, &touched);
+    fresh.local.changed = previous_local.changed.clone();
+    for path in found {
+        fresh.local.set_changed(&path, true);
+    }
+    fresh.prune_changed();
+    // Renames FastPad made since the last scan are its own, not outside ones.
+    fresh.renamed_outside.retain(|(old, new)| {
+        !touched
+            .iter()
+            .any(|path| same_path(path, old) || same_path(path, new))
+            && !previous_own_renames
+                .iter()
+                .any(|(from, to)| reroot(old, from, to).is_some_and(|moved| same_path(&moved, new)))
+    });
     if fresh.truncated {
         // A truncated scan's own list is already capped at the limit; touched entries that
         // survived the merge must not push it past that.
@@ -631,7 +751,94 @@ impl LibraryState {
         };
         self.notes.retain(|note| !same_path(&note.path, &stored));
         self.tree.remove_note(&stored);
+        self.local.set_changed(&stored, false);
         self.touched.push(stored);
+    }
+
+    /// Marks the note at `relative` changed outside FastPad (second brain phase 1 spec §5.5).
+    /// Returns whether its mark is new; a path that is not a listed note gets none.
+    pub fn mark_changed(&mut self, relative: &Path) -> bool {
+        self.notes
+            .iter()
+            .any(|note| same_path(&note.path, relative))
+            && self.local.set_changed(relative, true)
+    }
+
+    /// Clears the mark of the note at `path` (absolute, or relative to the notebook): the user
+    /// has seen it. Returns whether it had one.
+    pub fn clear_changed(&mut self, path: &Path) -> bool {
+        let relative = if path.is_absolute() {
+            strip_folder(&self.folder, path)
+        } else {
+            Some(path.to_path_buf())
+        };
+        relative.is_some_and(|relative| self.local.set_changed(&relative, false))
+    }
+
+    /// Clears every mark. Returns whether there were any.
+    pub fn clear_all_changed(&mut self) -> bool {
+        !std::mem::take(&mut self.local.changed).is_empty()
+    }
+
+    /// The watcher saw `path` (absolute) change: when it is a listed note whose size or write
+    /// time no longer match its entry, the entry takes the new ones, so the next rescan reads no
+    /// change, and the result says so. `None` for a path that is not a listed note, or is gone.
+    pub fn take_outside_stamp(&mut self, path: &Path) -> Option<bool> {
+        let relative = strip_folder(&self.folder, path)?;
+        let entry = self
+            .notes
+            .iter_mut()
+            .find(|note| same_path(&note.path, &relative))?;
+        let stamp = store::stamp(path)?;
+        let mtime = filetime_ticks(stamp.modified);
+        let changed = entry.size != stamp.size || entry.mtime != mtime;
+        entry.size = stamp.size;
+        entry.mtime = mtime;
+        Some(changed)
+    }
+
+    /// Brings the scan cache's sizes and write times up to the note list's before the local file
+    /// is written at close. FastPad's own saves since the last scan update only the list; without
+    /// this, the next start would take them for changes made outside FastPad.
+    pub fn sync_cache_from_notes(&mut self) -> bool {
+        // FastPad's own renames first, so the next start doesn't take them for outside ones.
+        let mut synced = false;
+        for (from, to) in &self.own_renames {
+            for file in &mut self.local.files {
+                let moved = if same_path(&file.path, from) {
+                    Some(to.clone())
+                } else {
+                    reroot(&file.path, from, to)
+                };
+                if let Some(moved) = moved {
+                    file.path = moved;
+                    synced = true;
+                }
+            }
+        }
+        let index_of: HashMap<String, usize> = self
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| (path_key(&note.path), index))
+            .collect();
+        for file in &mut self.local.files {
+            if let Some(&index) = index_of.get(&path_key(&file.path)) {
+                let note = &self.notes[index];
+                synced |= file.size != note.size || file.mtime != note.mtime;
+                file.size = note.size;
+                file.mtime = note.mtime;
+            }
+        }
+        synced
+    }
+
+    /// Drops the marks of notes that are no longer listed.
+    fn prune_changed(&mut self) {
+        let listed: HashSet<String> = self.notes.iter().map(|note| path_key(&note.path)).collect();
+        self.local
+            .changed
+            .retain(|path| listed.contains(&path_key(path)));
     }
 
     /// Follows a rename FastPad made: the record, the index and the tree. The record moves first,
@@ -655,8 +862,20 @@ impl LibraryState {
                 path: new_stored,
             });
         }
+        if let (Some(from), Some(to)) = (
+            strip_folder(&self.folder, old),
+            strip_folder(&self.folder, new),
+        ) {
+            self.own_renames.push((from, to));
+        }
+        // A note renamed in FastPad keeps its mark under its new name.
+        let marked =
+            strip_folder(&self.folder, old).is_some_and(|stored| self.local.is_changed(&stored));
         self.remove_note(old);
         let _ = self.add_note(new);
+        if marked && let Some(relative) = strip_folder(&self.folder, new) {
+            self.local.set_changed(&relative, true);
+        }
         if online_only
             && let Some(relative) = strip_folder(&self.folder, new)
             && let Some(entry) = self
@@ -736,12 +955,15 @@ impl LibraryState {
             .local
             .expanded
             .iter_mut()
+            .chain(self.local.changed.iter_mut())
             .chain(self.touched.iter_mut())
         {
             if let Some(moved) = reroot(entry, old, new) {
                 *entry = moved;
             }
         }
+        self.own_renames
+            .push((old.to_path_buf(), new.to_path_buf()));
         let change = FolderChange::Renamed {
             old: old.to_path_buf(),
             new: new.to_path_buf(),
@@ -778,6 +1000,9 @@ impl LibraryState {
         self.local
             .expanded
             .retain(|folder| !at_or_under(folder, relative));
+        self.local
+            .changed
+            .retain(|note| !at_or_under(note, relative));
         self.touched.retain(|path| !at_or_under(path, relative));
         let change = FolderChange::Removed(relative.to_path_buf());
         self.change_folders(&change);

@@ -158,7 +158,7 @@ fn the_sidebar_takes_the_left_edge_and_everything_else_starts_right_of_it() {
             .tooltip
             .unwrap()
             .tool_count(),
-        4
+        6
     );
     // An empty text removes a tool instead of showing an empty tip.
     let tooltip = app_mut(window.hwnd)
@@ -168,9 +168,9 @@ fn the_sidebar_takes_the_left_edge_and_everything_else_starts_right_of_it() {
         .tooltip
         .unwrap();
     tooltip.set_tool(9, RECT::default(), "extra");
-    assert_eq!(tooltip.tool_count(), 5);
+    assert_eq!(tooltip.tool_count(), 7);
     tooltip.set_tool(9, RECT::default(), "");
-    assert_eq!(tooltip.tool_count(), 4);
+    assert_eq!(tooltip.tool_count(), 6);
 
     execute_command(window.hwnd, CommandId::Find);
     let find = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();

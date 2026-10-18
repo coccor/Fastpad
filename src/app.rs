@@ -88,6 +88,9 @@ pub struct App {
     pub(crate) logo_icon: Option<LogoIcon>,
     pub(crate) dark_frame_applied: bool,
     pub(crate) notifications: NotificationCenter,
+    /// A short note shown in the status bar for a few seconds while no notification is pending,
+    /// such as "Reloaded: changed outside FastPad" (second brain phase 1 spec §5.3).
+    pub(crate) status_hint: Option<String>,
     pub(crate) launch_open_completed: bool,
     pub(crate) populating_file: bool,
     pub(crate) modal_depth: u32,
@@ -170,6 +173,7 @@ impl App {
             logo_icon: None,
             dark_frame_applied: false,
             notifications: NotificationCenter::new(),
+            status_hint: None,
             launch_open_completed: false,
             populating_file: false,
             modal_depth: 0,

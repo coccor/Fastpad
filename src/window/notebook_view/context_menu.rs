@@ -95,6 +95,10 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
             let entries = [
                 MenuEntry::command("New note here", CommandId::NoteNew),
                 MenuEntry::command("New folder here", CommandId::NoteNewFolder),
+                MenuEntry::command(
+                    "New note from template{2026}",
+                    CommandId::NotesNewFromTemplate,
+                ),
                 MenuEntry::Separator,
                 MenuEntry::local("Rename...\tF2", CommandId::NoteRename),
                 MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
@@ -107,6 +111,12 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 }
                 Some(CommandId::NoteNewFolder) => {
                     crate::window::inline_name::new_folder(hwnd, Some(relative.clone()));
+                }
+                Some(CommandId::NotesNewFromTemplate) => {
+                    crate::window::library_host::new_note_from_template(
+                        hwnd,
+                        Some(relative.clone()),
+                    );
                 }
                 Some(CommandId::NoteRename) => crate::window::inline_name::rename(hwnd, &row.kind),
                 Some(CommandId::NoteRevealInExplorer) => {

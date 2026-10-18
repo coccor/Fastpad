@@ -196,7 +196,8 @@ pub(crate) fn request_rescan(hwnd: HWND) {
     }
 }
 
-/// `WM_ACTIVATEAPP`. Coming back after at least `RESCAN_AFTER` rescans, to catch Explorer edits.
+/// `WM_ACTIVATEAPP`. Coming back after at least `RESCAN_AFTER` rescans, to catch Explorer edits,
+/// unless a watcher already reports them as they happen.
 pub(crate) fn activation_changed(hwnd: HWND, active: bool) {
     if !active {
         host(hwnd, |host| host.inactive_since = Some(Instant::now()));
@@ -209,7 +210,7 @@ pub(crate) fn activation_changed(hwnd: HWND, active: bool) {
             .is_some_and(|since| since.elapsed() >= RESCAN_AFTER)
     })
     .unwrap_or(false);
-    if long_enough && notes_mode(hwnd) {
+    if long_enough && notes_mode(hwnd) && !watching(hwnd) {
         request_rescan(hwnd);
     }
 }
@@ -235,6 +236,17 @@ pub(crate) fn flush_before_close(hwnd: HWND) {
         std::thread::sleep(Duration::from_millis(100));
     }
     flush_reporting(hwnd, true);
+    // FastPad's own saves since the last scan, so the next start doesn't mark them as changed
+    // outside FastPad (second brain phase 1 spec §5.5).
+    if with_state(hwnd, LibraryState::sync_cache_from_notes).unwrap_or(false) {
+        save_local(
+            hwnd,
+            LocalWrite {
+                wait: true,
+                force: true,
+            },
+        );
+    }
 }
 
 pub(super) fn flush_reporting(hwnd: HWND, wait: bool) {

@@ -94,6 +94,11 @@ pub trait SourceText {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// About the first `max` bytes, for a look at how the text starts.
+    fn head(&self, max: usize) -> Cow<'_, str> {
+        self.slice(0..self.len().min(max))
+    }
 }
 
 impl SourceText for str {
@@ -110,6 +115,10 @@ impl SourceText for str {
             .iter()
             .filter(|value| **value == b'\n')
             .count()
+    }
+
+    fn head(&self, max: usize) -> Cow<'_, str> {
+        Cow::Borrowed(&self[..self.floor_char_boundary(max)])
     }
 }
 
@@ -129,6 +138,16 @@ pub struct PreviewDocument {
     pub blocks: Vec<Block>,
     pub revision: u64,
     refdefs: Vec<RefDef>,
+    /// The text starts with a `---` line: it may hold front matter.
+    front_matter: bool,
+}
+
+/// Whether `text` starts with a `---` line (after a byte order mark): front matter, if a closing
+/// line follows anywhere below. Its extent then depends on lines far from any one edit.
+fn may_start_front_matter(text: &str) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.strip_prefix("---")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n"))
 }
 
 impl PreviewDocument {
@@ -138,6 +157,7 @@ impl PreviewDocument {
             blocks,
             revision: 1,
             refdefs,
+            front_matter: may_start_front_matter(source),
         }
     }
 
@@ -146,6 +166,7 @@ impl PreviewDocument {
         let (blocks, refdefs) = parse_document(&text);
         self.blocks = blocks;
         self.refdefs = refdefs;
+        self.front_matter = may_start_front_matter(&text);
         self.revision += 1;
         Update::Full
     }
@@ -168,6 +189,12 @@ impl PreviewDocument {
     ) -> Option<Update> {
         if edits.is_empty() {
             return Some(Update::Unchanged);
+        }
+        // Front matter ends at the first closing line, so an edit anywhere can move its end, and
+        // editing its first line can make or unmake it: such a document is parsed whole.
+        let head = source.head(8);
+        if self.front_matter || may_start_front_matter(&head) {
+            return None;
         }
         let dirty = self.shift_for_edits(edits)?;
         let count = self.blocks.len();
@@ -298,7 +325,8 @@ mod tests {
     use super::*;
     use crate::preview::model::parse_document;
 
-    const FIXTURES: [&str; 8] = [
+    const FIXTURES: [&str; 9] = [
+        "---\ntitle: Plan\ntags: [a, b]\n---\n# Heading #tag\n\nBody with #x and more.\n\n---\n\nAfter a rule\n",
         "# Title\n\nFirst paragraph with *emphasis*.\n\nSecond paragraph.\n",
         "- one\n- two\n\n- three after a blank\n\n  continued item\n\nTail paragraph.\n",
         "> quote line\n> more\n\nlazy\n\n```rust\nfn main() {}\n\nlet x = 1;\n```\n\nafter code\n",

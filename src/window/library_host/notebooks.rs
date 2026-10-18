@@ -64,6 +64,8 @@ pub(super) fn open_checked_folder(hwnd: HWND, path: PathBuf) {
     if !save_before_leaving(hwnd) {
         return;
     }
+    // The old notebook's watcher goes; the new one starts once its first scan lands.
+    stop_watcher(hwnd);
     host(hwnd, |host| {
         host.state = None;
         host.folder = Some(path.clone());
@@ -303,6 +305,7 @@ pub(crate) fn close_notebook(hwnd: HWND) {
         KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
         KillTimer(hwnd, AUTOSAVE_TIMER_ID);
     }
+    stop_watcher(hwnd);
     host(hwnd, |host| {
         host.state = None;
         host.folder = None;
@@ -367,6 +370,9 @@ pub(crate) fn accept_editor_file_drops(hwnd: HWND) {
 struct EditorDrop {
     paths: Vec<PathBuf>,
     split: Option<crate::window::split_tree::Direction>,
+    /// Dropped with Ctrl held (second brain phase 1 spec §10.5): attach to the note, at this
+    /// point in the editor's client area when it landed on the editor.
+    attach: Option<Option<(i32, i32)>>,
 }
 
 /// Makes files dropped on `editor`, and on the rest of its group window `group` (the strips and
@@ -381,7 +387,8 @@ pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
         Box<dyn Fn()>,
     );
     let (target, group_id) = (hwnd as isize, group as usize);
-    let handlers = move || -> Handlers {
+    let editor_target = editor as isize;
+    let handlers = move |on_editor: bool| -> Handlers {
         let at = move |point: POINTL| {
             let point = POINT {
                 x: point.x,
@@ -396,7 +403,31 @@ pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
                     Some(Action::Split { direction, .. }) => Some(direction),
                     _ => None,
                 };
-                let payload = Box::into_raw(Box::new(EditorDrop { paths, split }));
+                let ctrl = unsafe {
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from(
+                        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL,
+                    ))
+                } < 0;
+                let attach = ctrl.then(|| {
+                    on_editor.then(|| {
+                        let mut client = POINT {
+                            x: point.x,
+                            y: point.y,
+                        };
+                        unsafe {
+                            windows_sys::Win32::Graphics::Gdi::ScreenToClient(
+                                editor_target as HWND,
+                                &mut client,
+                            )
+                        };
+                        (client.x, client.y)
+                    })
+                });
+                let payload = Box::into_raw(Box::new(EditorDrop {
+                    paths,
+                    split,
+                    attach,
+                }));
                 if unsafe {
                     PostMessageW(
                         target as HWND,
@@ -417,9 +448,9 @@ pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
         )
     };
     // Text drag-and-drop still works without the wrappers; only file drops are lost.
-    let (files, hover, leave) = handlers();
+    let (files, hover, leave) = handlers(true);
     let _ = crate::editor::file_drop::accept_file_drops_with(editor, files, hover, leave);
-    let (files, hover, leave) = handlers();
+    let (files, hover, leave) = handlers(false);
     let _ = crate::editor::file_drop::accept_file_drops_on(group, files, hover, leave);
 }
 
@@ -434,9 +465,29 @@ pub(crate) fn editor_files_dropped(
     if lparam == 0 {
         return;
     }
-    let EditorDrop { paths, split } = *unsafe { Box::from_raw(lparam as *mut EditorDrop) };
+    let EditorDrop {
+        paths,
+        split,
+        attach,
+    } = *unsafe { Box::from_raw(lparam as *mut EditorDrop) };
     if crate::window::modal::modal_active(hwnd) {
         return;
+    }
+    if let Some(point) = attach
+        && split.is_none()
+    {
+        if let Some(group) = crate::window::main_window::group_id_of(hwnd, wparam as HWND) {
+            crate::window::main_window::activate_group(hwnd, group);
+        }
+        let active = unsafe { crate::window::main_window::app_ptr(hwnd) }.and_then(|app| {
+            let app = unsafe { app.as_ref() };
+            Some((app.editor().cloned()?, app.tabs.active()?.id))
+        });
+        if let Some((editor, document)) = active
+            && crate::window::attachments::dropped(hwnd, &editor, document, paths.clone(), point)
+        {
+            return;
+        }
     }
     if let Some(group) = crate::window::main_window::group_id_of(hwnd, wparam as HWND) {
         let target = match split {

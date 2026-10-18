@@ -114,6 +114,10 @@ pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate:
     // `None` for a document with nothing to write (a clean untitled tab); an error (`?`) for a
     // dirty one whose text is in no snapshot.
     let source_of = |document: &Document| -> Option<Option<SessionSource>> {
+        // A Compare with disk view is a moment's look at a file, not part of the session.
+        if document.compare.is_some() {
+            return Some(None);
+        }
         if document.dirty {
             let file = crate::recovery::current_snapshot_file(root, document)?;
             let id = crate::recovery::snapshot::snapshot_file_id(&file)?;

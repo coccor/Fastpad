@@ -70,7 +70,12 @@ pub(super) unsafe extern "system" fn main_window_proc(
             }
             0
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_HOTKEY => {
+            crate::window::capture_host::hotkey(hwnd, wparam);
+            0
+        }
         WM_DESTROY => {
+            crate::window::capture_host::unregister_hotkey(hwnd);
             // A running text search stops reading: its posts would fail from here on anyway.
             crate::window::text_search_host::cancel(hwnd);
             // A replace stops too. Its write worker finishes the note in hand and is waited for
@@ -81,6 +86,8 @@ pub(super) unsafe extern "system" fn main_window_proc(
             // A copy into the notebook stops after the file in hand, and is waited for the same
             // way, so no copied file is left half written.
             crate::window::copy_host::stop(hwnd);
+            // The notebook watcher's thread stops and is waited for.
+            crate::window::library_host::stop_watcher(hwnd);
             // The panel goes with this window, not through `side_panel::destroy_windows`: its
             // drop target is revoked first, which releases it.
             if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
@@ -96,6 +103,7 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
                 KillTimer(hwnd, crate::window::library_host::LIBRARY_WRITE_TIMER_ID);
                 KillTimer(hwnd, crate::window::library_host::AUTOSAVE_TIMER_ID);
+                KillTimer(hwnd, super::chrome::STATUS_HINT_TIMER_ID);
                 PostQuitMessage(0);
             }
             0
@@ -114,6 +122,10 @@ pub(super) unsafe extern "system" fn main_window_proc(
         }
         WM_TIMER if wparam == crate::window::library_host::AUTOSAVE_TIMER_ID => {
             crate::window::library_host::autosave_active(hwnd);
+            0
+        }
+        WM_TIMER if wparam == super::chrome::STATUS_HINT_TIMER_ID => {
+            super::chrome::clear_status_hint(hwnd);
             0
         }
         WM_TIMER if wparam == FIND_COUNT_TIMER_ID => {
@@ -149,6 +161,9 @@ pub(super) unsafe extern "system" fn main_window_proc(
             crate::window::library_host::activation_changed(hwnd, wparam != 0);
             if wparam != 0 {
                 crate::window::image_host::check_disk(hwnd);
+                // Files changed by another program while FastPad was in the background (second
+                // brain phase 1 spec §5.1).
+                crate::window::library_host::check_all_tabs(hwnd);
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
@@ -476,6 +491,16 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 crate::window::library_host::notebook_checked(hwnd, lparam);
                 return 0;
             }
+            // The notebook watcher's batch: handled at once, modal or not, since a held message
+            // would lose its Box. It asks nothing of the user.
+            if message == crate::window::WM_FASTPAD_FILES_CHANGED {
+                crate::window::library_host::files_changed(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_INDEX_READY {
+                crate::window::library_host::index_ready(hwnd, lparam);
+                return 0;
+            }
             // Focus left the Notebook tree's name field (inline naming spec §5.3): leaving
             // FastPad keeps the edit; a modal prompt that took it holds the commit until it ends.
             if message == crate::window::WM_FASTPAD_INLINE_NAME_LEFT {
@@ -680,11 +705,32 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_V_SCROLL != 0 {
             crate::window::preview_host::editor_scrolled(hwnd, group);
         }
+        let markdown = document.is_some_and(|document| is_markdown(hwnd, document));
         if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0
-            && document.is_some_and(|document| is_markdown(hwnd, document))
+            && markdown
         {
             crate::window::markdown_host::selection_changed(hwnd, group);
         }
+        // The text or the lines on screen changed: the links there get their underlines
+        // (second brain phase 1 spec §7.3).
+        if update.updated as u32 & !crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0
+            && document
+                .is_some_and(|document| crate::window::markdown_host::has_links(hwnd, document))
+        {
+            crate::window::markdown_host::refresh_link_marks(&editor);
+        }
+        return;
+    }
+    if notification.code == crate::editor::scintilla_constants::SCN_CHARADDED {
+        if document.is_some_and(|document| crate::window::markdown_host::has_links(hwnd, document))
+        {
+            let added = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
+            crate::window::markdown_host::char_added(hwnd, &editor, added.ch);
+        }
+        return;
+    }
+    if notification.code == crate::editor::scintilla_constants::SCN_AUTOCCOMPLETED {
+        crate::window::markdown_host::completion_done(&editor);
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {

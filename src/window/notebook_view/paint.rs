@@ -173,8 +173,31 @@ pub(super) fn draw_tree_row(
     } else {
         foreground
     };
-    unsafe { draw_text(dc, &row.name, parts.name, font, color, LINE) };
+    let mut name = parts.name;
+    if row.changed {
+        // A note changed outside FastPad since it was last opened, or a collapsed folder holding
+        // one (second brain phase 1 spec §5.5): a dot at the end of the name's room, which the
+        // name's ellipsis leaves free. A folder's is quieter than a note's.
+        let dot = RECT {
+            left: (name.right - scale(CHANGED_DOT_BOX, dpi)).max(name.left),
+            ..name
+        };
+        name.right = dot.left;
+        let dot_color = if palette.high_contrast || (look.selected && look.focused) {
+            foreground
+        } else if matches!(row.kind, RowKind::Note(_)) {
+            palette.accent
+        } else {
+            muted
+        };
+        unsafe { draw_text(dc, CHANGED_DOT, dot, font, dot_color, CENTERED) };
+    }
+    unsafe { draw_text(dc, &row.name, name, font, color, LINE) };
 }
+
+/// The mark after a changed note's name, and the box it is centered in, in 96 dpi pixels.
+const CHANGED_DOT: &str = "\u{25CF}";
+const CHANGED_DOT_BOX: i32 = 14;
 
 pub(super) fn draw_recent_row(
     dc: HDC,

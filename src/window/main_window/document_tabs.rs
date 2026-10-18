@@ -131,6 +131,19 @@ pub(crate) fn activate_document_in(
     if !activated || !show_group_view(hwnd, group) || !identity.is_live_for(hwnd) {
         return false;
     }
+    if leaving {
+        // A file changed by another program shows its new text as its tab is shown (second
+        // brain phase 1 spec §5.1), whether or not FastPad lost focus meanwhile.
+        crate::window::library_host::check_tab(hwnd, id);
+        if !identity.is_live_for(hwnd) {
+            return false;
+        }
+        let shown = unsafe { app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.document(id)?.path.clone());
+        if let Some(path) = shown {
+            crate::window::library_host::note_seen(hwnd, &path);
+        }
+    }
     if active {
         refresh_tabs(hwnd);
         crate::window::image_host::check_disk(hwnd);

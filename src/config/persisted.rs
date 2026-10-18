@@ -38,11 +38,22 @@ pub enum SidebarView {
     Notebook,
     Search,
     Favorites,
+    /// The notebook's tags (second brain phase 1 spec §8.1).
+    Tags,
+    /// The active note's links and backlinks (second brain phase 1 spec §7.5).
+    Links,
     Hidden,
 }
 
 impl SidebarView {
-    const ALL: [Self; 4] = [Self::Notebook, Self::Search, Self::Favorites, Self::Hidden];
+    const ALL: [Self; 6] = [
+        Self::Notebook,
+        Self::Search,
+        Self::Favorites,
+        Self::Tags,
+        Self::Links,
+        Self::Hidden,
+    ];
 
     /// The `sidebar_view=` value that parses back to this view.
     pub const fn token(self) -> &'static str {
@@ -50,6 +61,8 @@ impl SidebarView {
             Self::Notebook => "notebook",
             Self::Search => "search",
             Self::Favorites => "favorites",
+            Self::Tags => "tags",
+            Self::Links => "links",
             Self::Hidden => "none",
         }
     }
@@ -106,6 +119,9 @@ pub struct Settings {
     pub recovery_interval_seconds: u32,
     /// Whether the primary window reopens the last session's tabs and closes without prompting.
     pub restore_session: bool,
+    /// Whether a clean tab reloads by itself when its file changes outside FastPad
+    /// (`reload_changed_files=auto`), or every change waits for the user (`ask`).
+    pub reload_changed_files: bool,
     /// Whether an open folder is treated as a note library (sidebar data, autosave, first-save
     /// naming).
     pub notes_mode: bool,
@@ -128,6 +144,11 @@ pub struct Settings {
     pub code_folding: bool,
     /// Whether the window stays above other windows.
     pub always_on_top: bool,
+    /// The quick capture hotkey in keymap syntax (second brain phase 1 spec §10.1); empty turns
+    /// it off.
+    pub capture_hotkey: String,
+    /// Whether a capture records the title of the window in front (spec §10.4).
+    pub capture_source: bool,
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
     /// `None` opens it at its natural size. Saved when a resize drag ends.
     pub settings_size: Option<(u16, u16)>,
@@ -177,6 +198,9 @@ impl Settings {
         if let Some(restore_session) = delta.restore_session {
             self.restore_session = restore_session;
         }
+        if let Some(reload) = delta.reload_changed_files {
+            self.reload_changed_files = reload;
+        }
         if let Some(notes_mode) = delta.notes_mode {
             self.notes_mode = notes_mode;
         }
@@ -213,6 +237,12 @@ impl Settings {
         if let Some(always_on_top) = delta.always_on_top {
             self.always_on_top = always_on_top;
         }
+        if let Some(capture_hotkey) = &delta.capture_hotkey {
+            self.capture_hotkey = capture_hotkey.clone();
+        }
+        if let Some(capture_source) = delta.capture_source {
+            self.capture_source = capture_source;
+        }
         for (id, value) in &delta.key_overrides {
             self.key_overrides.insert(id.clone(), value.clone());
         }
@@ -245,6 +275,7 @@ pub struct SettingsDelta {
     pub theme: Option<ThemePreference>,
     pub recovery_interval_seconds: Option<u32>,
     pub restore_session: Option<bool>,
+    pub reload_changed_files: Option<bool>,
     pub notes_mode: Option<bool>,
     pub sidebar_view: Option<SidebarView>,
     pub sidebar_width: Option<u16>,
@@ -257,6 +288,8 @@ pub struct SettingsDelta {
     pub highlight_current_line: Option<bool>,
     pub code_folding: Option<bool>,
     pub always_on_top: Option<bool>,
+    pub capture_hotkey: Option<String>,
+    pub capture_source: Option<bool>,
     pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
 }
@@ -265,9 +298,11 @@ pub struct SettingsDelta {
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `preview_font`, `preview_font_size`,
 /// `preview_line_height`, `font_size`, `tab_width`, `word_wrap`,
-/// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`, `notes_mode`,
+/// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`,
+/// `reload_changed_files` (`auto` or `ask`), `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
-/// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line` and `always_on_top` are recognized.
+/// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line`, `always_on_top`, `capture_hotkey` (any text; empty turns it off) and
+/// `capture_source` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
@@ -406,6 +441,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
             Ok(seconds) if seconds > 0 => delta.recovery_interval_seconds = Some(seconds),
             _ => warn(delta, line_number, key, value),
         },
+        "reload_changed_files" => match reload_policy(value) {
+            Some(reload) => delta.reload_changed_files = Some(reload),
+            None => warn(delta, line_number, key, value),
+        },
         "restore_session" => match parse_bool(value) {
             Some(restore_session) => delta.restore_session = Some(restore_session),
             None => warn(delta, line_number, key, value),
@@ -459,6 +498,12 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
             Some(always_on_top) => delta.always_on_top = Some(always_on_top),
             None => warn(delta, line_number, key, value),
         },
+        // Checked when it is registered, where the keymap's key names are known.
+        "capture_hotkey" => delta.capture_hotkey = Some(value.to_owned()),
+        "capture_source" => match parse_bool(value) {
+            Some(capture_source) => delta.capture_source = Some(capture_source),
+            None => warn(delta, line_number, key, value),
+        },
         _ => delta.warnings.push(SettingWarning {
             line: line_number,
             message: format!("unknown setting key: {key}"),
@@ -488,6 +533,20 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// `reload_changed_files`: `auto` or `ask` (any case), or a boolean spelling for the same.
+fn reload_policy(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Some(true),
+        "ask" => Some(false),
+        _ => parse_bool(value),
+    }
+}
+
+/// The `reload_changed_files=` value that parses back to `reload`.
+pub const fn reload_policy_token(reload: bool) -> &'static str {
+    if reload { "auto" } else { "ask" }
 }
 
 fn parse_theme(value: &str) -> Option<ThemePreference> {
@@ -819,6 +878,30 @@ mod tests {
     }
 
     #[test]
+    fn reload_changed_files_defaults_to_auto_and_accepts_auto_ask_and_booleans() {
+        // Break caught: outside changes waiting for the user in a new profile, or `ask` written
+        // by FastPad not reading back.
+        assert!(default_settings().reload_changed_files);
+        for (value, reload) in [
+            ("auto", true),
+            ("Ask", false),
+            ("ASK", false),
+            ("off", false),
+            ("yes", true),
+        ] {
+            let line = format!("reload_changed_files={value}");
+            assert_eq!(parse(&line).reload_changed_files, Some(reload), "{value}");
+        }
+        for reload in [true, false] {
+            let line = format!("reload_changed_files={}", reload_policy_token(reload));
+            assert_eq!(parse(&line).reload_changed_files, Some(reload));
+        }
+        let delta = parse("reload_changed_files=sometimes");
+        assert_eq!(delta.reload_changed_files, None);
+        assert_eq!(delta.warnings.len(), 1);
+    }
+
+    #[test]
     fn notes_mode_accepts_the_boolean_spellings_and_defaults_on() {
         // Break caught: notes mode that cannot be turned off from fastpad.ini, or that starts off.
         assert!(crate::config::default_settings().notes_mode);
@@ -998,13 +1081,15 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_view_accepts_its_four_tokens_and_warns_on_anything_else() {
+    fn sidebar_view_accepts_its_six_tokens_and_warns_on_anything_else() {
         // Break caught: a hand-edited "sidebar_view=Search" ignored, or a typo silently closing
         // the panel.
         for (value, view) in [
             ("notebook", SidebarView::Notebook),
             ("Search", SidebarView::Search),
             ("FAVORITES", SidebarView::Favorites),
+            ("Tags", SidebarView::Tags),
+            ("links", SidebarView::Links),
             ("none", SidebarView::Hidden),
         ] {
             assert_eq!(
@@ -1023,6 +1108,8 @@ mod tests {
             SidebarView::Notebook,
             SidebarView::Search,
             SidebarView::Favorites,
+            SidebarView::Tags,
+            SidebarView::Links,
             SidebarView::Hidden,
         ] {
             assert_eq!(
@@ -1265,6 +1352,30 @@ mod tests {
         settings.apply_delta(&delta);
         assert!(!settings.code_folding);
         assert_eq!(parse("code_folding=maybe").warnings.len(), 1);
+    }
+
+    #[test]
+    fn capture_settings_take_any_hotkey_text_and_a_bool() {
+        // Break caught: an empty hotkey (which turns it off) rejected, or the source recorded
+        // by default.
+        let delta = parse(
+            "capture_hotkey=
+capture_source=on
+",
+        );
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        let mut settings = default_settings();
+        assert_eq!(settings.capture_hotkey, "Ctrl+Alt+N");
+        settings.apply_delta(&delta);
+        assert_eq!(settings.capture_hotkey, "");
+        assert!(settings.capture_source);
+        assert_eq!(parse("capture_source=sometimes").warnings.len(), 1);
+        assert_eq!(
+            parse("capture_hotkey=Ctrl+Shift+Space")
+                .capture_hotkey
+                .as_deref(),
+            Some("Ctrl+Shift+Space")
+        );
     }
 
     #[test]

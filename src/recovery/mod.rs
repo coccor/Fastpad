@@ -29,7 +29,10 @@ pub fn timer_period_ms(interval_seconds: u32) -> u32 {
 }
 
 pub fn needs_snapshot(document: &Document) -> bool {
-    document.dirty && document.recovery_generation != Some(document.generation)
+    // A Compare with disk view is read-only and holds only what is on disk.
+    document.dirty
+        && document.compare.is_none()
+        && document.recovery_generation != Some(document.generation)
 }
 
 /// The next document needing a snapshot, starting after `previous` and wrapping around, so one

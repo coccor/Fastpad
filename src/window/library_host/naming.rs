@@ -260,6 +260,16 @@ pub(super) fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &
     unsafe {
         PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
     }
+    // Links that would no longer reach the renamed note (second brain phase 1 spec §7.6).
+    if let Some(root) = folder(hwnd)
+        && library::is_inside(&root, &new)
+    {
+        let moved = (
+            library::record_path(&root, &old),
+            library::record_path(&root, &new),
+        );
+        notes_moved(hwnd, &[moved]);
+    }
 }
 
 /// Browse… in the name box: the system Save As dialog, starting in the folder.

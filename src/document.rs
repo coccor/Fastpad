@@ -114,6 +114,17 @@ pub struct Document {
     pub disk_stamp: Option<crate::library::DiskStamp>,
     /// Autosave is suspended for this document (e.g. after an on-disk conflict is detected).
     pub autosave_paused: bool,
+    /// The text last loaded from or saved to `path`, to tell an append on disk from any other
+    /// change (spec 2026-10-16-second-brain-phase-1 §5.4). `None` when it is unknown.
+    pub text_base: Option<crate::library::external::TextBase>,
+    /// The file changed on disk in a way this tab can't take in by itself (spec §5.4).
+    pub conflict: Option<crate::library::external::ConflictKind>,
+    /// The file is gone from disk while this clean tab keeps its text (spec §5.2).
+    pub deleted_on_disk: bool,
+    /// For a read-only view of a file's text on disk, opened by "Note: Compare with disk": its
+    /// title, such as "plan.md (on disk)". Such a tab is never saved, snapshotted or kept by the
+    /// session, and no first-line label replaces its title.
+    pub compare: Option<String>,
     /// The preview tab (spec §6.4): opened by a single click in the sidebar and replaced in
     /// place by the next one. Never dirty: the first edit makes it a normal tab.
     pub preview: bool,
@@ -133,6 +144,10 @@ impl PartialEq for Document {
             && self.generation == other.generation
             && self.recovery_generation == other.recovery_generation
             && self.recovery_origin == other.recovery_origin
+            && self.text_base == other.text_base
+            && self.conflict == other.conflict
+            && self.deleted_on_disk == other.deleted_on_disk
+            && self.compare == other.compare
     }
 }
 
@@ -167,6 +182,10 @@ impl Document {
             label_watch: crate::library::title::LABEL_SCAN_LINES - 1,
             disk_stamp: None,
             autosave_paused: false,
+            text_base: None,
+            conflict: None,
+            deleted_on_disk: false,
+            compare: None,
             preview: false,
             save_folder: None,
         }
@@ -190,6 +209,9 @@ impl Document {
     }
 
     pub fn title(&self) -> String {
+        if let Some(title) = &self.compare {
+            return title.clone();
+        }
         let base = match (&self.path, &self.recovery_origin) {
             (None, Some(origin)) if !origin.from_session => {
                 format!("Recovered: {}", origin.display_name())
@@ -201,6 +223,9 @@ impl Document {
                 .untitled_label
                 .clone()
                 .unwrap_or_else(|| "Untitled".to_owned()),
+            (Some(path), _) if self.deleted_on_disk => {
+                format!("{} (deleted)", file_name_or_untitled(Some(path)))
+            }
             (Some(path), _) => file_name_or_untitled(Some(path)),
         };
         if self.dirty {
@@ -232,6 +257,7 @@ mod tests {
     use super::{CloseCancelled, CloseDecision, Document, DocumentId};
     use crate::window::tabs::{CloseReviewError, Tabs};
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -520,6 +546,16 @@ mod tests {
             tabs.titles().collect::<Vec<_>>(),
             ["Untitled", "Untitled *"]
         );
+    }
+
+    #[test]
+    fn a_tab_whose_file_was_deleted_says_so_before_its_dirty_marker() {
+        let mut gone = document(1);
+        gone.path = Some(PathBuf::from(r"C:\notes\plan.md"));
+        gone.deleted_on_disk = true;
+        assert_eq!(gone.title(), "plan.md (deleted)");
+        gone.dirty = true;
+        assert_eq!(gone.title(), "plan.md (deleted) *");
     }
 
     #[test]
