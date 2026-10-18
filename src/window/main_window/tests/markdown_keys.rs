@@ -548,7 +548,8 @@ fn ctrl_b_twice_outside_a_word_leaves_the_text_as_it_was() {
 #[test]
 fn enter_and_tab_in_a_cr_only_document_keep_their_default() {
     // Break caught: a lone-CR document read as one line, so Tab on its last item is consumed
-    // as a "first item" and Enter continues a list from the document's first line.
+    // as a "first item" and Enter continues a list from the document's first line. Enter
+    // adds the document's own line ending.
     let f = fixture("- a\r- b", Language::Markdown);
     f.editor.set_selection(7..7).unwrap();
     press(&f, VK_TAB, false);
@@ -557,7 +558,7 @@ fn enter_and_tab_in_a_cr_only_document_keep_their_default() {
     let f = fixture("- a\r- b", Language::Markdown);
     f.editor.set_selection(7..7).unwrap();
     press(&f, VK_RETURN, false);
-    assert_eq!(f.editor.text().unwrap(), "- a\r- b\r\n");
+    assert_eq!(f.editor.text().unwrap(), "- a\r- b\r");
 }
 
 #[test]
