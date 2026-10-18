@@ -78,6 +78,24 @@ pub(crate) fn view_hwnd(hwnd: HWND, id: GroupId) -> Option<HWND> {
     .flatten()
 }
 
+impl LiveHost {
+    /// Whether `window` is this group's Live window and it is shown.
+    pub(crate) fn shows(&self, window: HWND) -> bool {
+        self.shown && self.view.is_some_and(|view| view.hwnd() == window)
+    }
+}
+
+/// The group whose editor, or shown Live window, is `window`: where focus means "in the
+/// editor" for keys, commands and the writing helpers.
+pub(crate) fn group_of_text_view(hwnd: HWND, window: HWND) -> Option<GroupId> {
+    // SAFETY: the App reference lives only inside this function, which makes no Win32 call.
+    let app = unsafe { host_window::app_ptr(hwnd)?.as_ref() };
+    app.groups
+        .iter()
+        .find(|group| group.editor.hwnd() == window || group.live.shows(window))
+        .map(|group| group.id)
+}
+
 /// The window showing group `id`'s text: its Live window while shown, otherwise its editor.
 pub(crate) fn text_view_hwnd(hwnd: HWND, id: GroupId) -> Option<HWND> {
     view_hwnd(hwnd, id).or_else(|| host_window::group_editor(hwnd, id).map(|editor| editor.hwnd()))

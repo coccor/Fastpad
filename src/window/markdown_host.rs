@@ -115,7 +115,8 @@ pub(crate) fn has_state(hwnd: HWND, document: DocumentId) -> bool {
     with_registry(hwnd, |registry| registry.docs.contains_key(&document)).unwrap_or(false)
 }
 
-/// The group whose editor window is `editor`, its editor and active document.
+/// The group whose editor window, or shown Live view, is `editor`, its editor and active
+/// document.
 pub(crate) fn group_of_editor(
     hwnd: HWND,
     editor: HWND,
@@ -125,7 +126,7 @@ pub(crate) fn group_of_editor(
     let group = app
         .groups
         .iter()
-        .find(|group| group.editor.hwnd() == editor)?;
+        .find(|group| group.editor.hwnd() == editor || group.live.shows(editor))?;
     let document = app.tabs.group(group.id)?.active_document()?;
     let language = app.tabs.document(document)?.language;
     Some((group.id, group.editor.clone(), document, language))
@@ -187,7 +188,7 @@ fn post_follow(main: HWND, editor: HWND, link: &crate::library::links::LineLink)
         let group = app
             .groups
             .iter()
-            .find(|group| group.editor.hwnd() == editor)?;
+            .find(|group| group.editor.hwnd() == editor || group.live.shows(editor))?;
         Some(group.hwnd)
     });
     let Some(group) = group else {
@@ -290,6 +291,12 @@ pub(crate) fn refresh_link_marks(editor: &Editor) {
 /// (spec §7.4).
 pub(crate) fn char_added(hwnd: HWND, editor: &Editor, character: i32) {
     if character != i32::from(b'[') || editor.completion_active() {
+        return;
+    }
+    // Scintilla's list would open at the hidden editor's caret (phase 1 plan, deviation 4).
+    let live = group_of_editor(hwnd, editor.hwnd())
+        .is_some_and(|(id, ..)| crate::window::live_host::view_hwnd(hwnd, id).is_some());
+    if live {
         return;
     }
     let Ok(caret) = editor.caret() else {

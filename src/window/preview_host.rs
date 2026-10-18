@@ -298,6 +298,11 @@ fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     editor(hwnd).map(|editor| editor.hwnd())
 }
 
+/// The window showing the target group's text: its Live view for a Live tab, else its editor.
+fn text_hwnd(hwnd: HWND) -> Option<HWND> {
+    crate::window::live_host::text_view_hwnd(hwnd, target_group(hwnd)?)
+}
+
 /// The target group's window, where its preview windows go.
 fn content_parent(hwnd: HWND) -> HWND {
     target_group(hwnd)
@@ -485,7 +490,7 @@ pub(crate) fn set_mode(hwnd: HWND, next: PreviewMode) {
     sync_visibility(hwnd);
     let focus = match (previous, next) {
         (_, PreviewMode::Full) => full_view_hwnd(hwnd),
-        (PreviewMode::Full, _) => editor_hwnd(hwnd),
+        (PreviewMode::Full, _) => text_hwnd(hwnd),
         _ => None,
     };
     if let Some(target) = focus {
@@ -516,7 +521,7 @@ fn close_view(hwnd: HWND) {
         had_focus |= focus == view.hwnd();
         view.destroy();
     }
-    if had_focus && let Some(editor) = editor_hwnd(hwnd) {
+    if had_focus && let Some(editor) = text_hwnd(hwnd) {
         unsafe { SetFocus(editor) };
     }
     host_window::invalidate_status_bar(hwnd);

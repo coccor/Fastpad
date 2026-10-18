@@ -131,7 +131,9 @@ pub(crate) fn sync_group(hwnd: HWND, id: GroupId) {
             if had_focus {
                 // With no tab left the editor is hidden: typing must not reach its placeholder.
                 let target = unsafe { host_window::editor_hwnd(hwnd) }
-                    .filter(|&editor| unsafe { IsWindowVisible(editor) } != 0)
+                    .into_iter()
+                    .chain(crate::window::live_host::view_hwnd(hwnd, id))
+                    .find(|&text| unsafe { IsWindowVisible(text) } != 0)
                     .unwrap_or(hwnd);
                 unsafe { SetFocus(target) };
             }
@@ -156,6 +158,7 @@ pub(crate) fn sync_group(hwnd: HWND, id: GroupId) {
     let focus = unsafe { GetFocus() };
     let in_content = focus == hwnd
         || unsafe { host_window::editor_hwnd(hwnd) } == Some(focus)
+        || crate::window::live_host::group_of_text_view(hwnd, focus).is_some()
         || crate::window::preview_host::owns_view(hwnd, focus);
     if in_content {
         unsafe { SetFocus(view.hwnd()) };
