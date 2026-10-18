@@ -1,6 +1,6 @@
 //! The `FastPadLive` child window: the Live view of one editor group's Markdown tab. The group's
 //! Scintilla stays the document (text, selection, undo); this window draws it with Direct2D and,
-//! in later tasks, turns keys and clicks into Scintilla input and selections (phase 1 plan,
+//! turns keys (and, in later tasks, clicks) into Scintilla input and selections (phase 1 plan,
 //! Architecture). Like the preview, nothing here sends messages while the state is borrowed.
 
 use crate::Result;
@@ -22,6 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_TABSTOP, WS_VSCROLL,
 };
 
+mod keys;
 mod paint;
 mod window_proc;
 
@@ -61,6 +62,9 @@ struct ViewState {
     focused: bool,
     /// The blinking caret's phase.
     caret_on: bool,
+    /// The x a run of Up/Down keeps aiming for, and the caret it left: any other caret move
+    /// leaves the two apart, which ends the run.
+    goal: Option<(f32, usize)>,
     paint_retried: bool,
     /// Last, so the target, brushes and layouts above are released before it can unload
     /// Direct2D and DirectWrite.
@@ -101,6 +105,7 @@ impl LiveView {
             scroll_y: 0.0,
             focused: false,
             caret_on: true,
+            goal: None,
             paint_retried: false,
             graphics,
         });

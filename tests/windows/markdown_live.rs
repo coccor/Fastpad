@@ -319,3 +319,226 @@ fn live_answers_wm_gettext_with_the_document() {
     let text = support::win32::scintilla_text(view.hwnd()).unwrap();
     assert_eq!(text, "héllo\n");
 }
+
+/// One step of typing: characters as `WM_CHAR`s, or a key press with Ctrl and Shift as given.
+#[derive(Clone, Copy)]
+enum Input {
+    Text(&'static str),
+    Key(u16, bool, bool),
+}
+
+/// Sends `inputs` to `target` as the message loop would deliver them, with the keyboard state
+/// holding the modifiers each key press names.
+fn send_inputs(target: HWND, inputs: &[Input]) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN, WM_KEYUP};
+    for input in inputs {
+        match *input {
+            Input::Text(text) => {
+                for unit in text.encode_utf16() {
+                    unsafe { SendMessageW(target, WM_CHAR, usize::from(unit), 0) };
+                }
+            }
+            Input::Key(vk, ctrl, shift) => {
+                let mut keys = [0u8; 256];
+                unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+                let original = keys;
+                keys[usize::from(VK_CONTROL)] = if ctrl { 0x80 } else { 0 };
+                keys[usize::from(VK_SHIFT)] = if shift { 0x80 } else { 0 };
+                unsafe { SetKeyboardState(keys.as_ptr()) };
+                unsafe { SendMessageW(target, WM_KEYDOWN, usize::from(vk), 0) };
+                // The character TranslateMessage would post for this key.
+                let character = match vk {
+                    VK_RETURN => Some(0x0D),
+                    VK_TAB => Some(0x09),
+                    VK_BACK if ctrl => Some(0x7F),
+                    VK_BACK => Some(0x08),
+                    _ => None,
+                };
+                if let Some(character) = character {
+                    unsafe { SendMessageW(target, WM_CHAR, character, 0) };
+                }
+                unsafe { SendMessageW(target, WM_KEYUP, usize::from(vk), 0) };
+                unsafe { SetKeyboardState(original.as_ptr()) };
+            }
+        }
+        pump_pending();
+    }
+}
+
+fn caret(main: &TestMain) -> (usize, usize) {
+    main.editor().anchor_and_caret().unwrap()
+}
+
+/// The document's text after `inputs` and how many undo steps they made: typed into the source
+/// view, then into the Live view, each time in a fresh Markdown tab holding `start`.
+fn typed_both_ways(start: &str, caret_at: usize, inputs: &[Input]) -> [(String, usize); 2] {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let mut results = Vec::new();
+    for live in [false, true] {
+        main.command(CommandId::New);
+        main.make_markdown("");
+        let editor = main.editor();
+        editor.populate_clean(start).unwrap();
+        editor.set_selection(caret_at..caret_at).unwrap();
+        main.set_live(live);
+        let target = if live {
+            main.live_view().unwrap().hwnd()
+        } else {
+            editor.hwnd()
+        };
+        unsafe { SetFocus(target) };
+        pump_pending();
+        send_inputs(target, inputs);
+        let text = editor.text().unwrap();
+        let mut steps = 0;
+        while editor.can_undo().unwrap() {
+            editor.undo().unwrap();
+            steps += 1;
+        }
+        assert_eq!(editor.text().unwrap(), start, "undo restores the start");
+        results.push((text, steps));
+    }
+    [results[0].clone(), results[1].clone()]
+}
+
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
+};
+
+#[test]
+fn typing_in_live_matches_typing_in_source() {
+    let script = [
+        Input::Text("Hello wörld 😀"),
+        Input::Key(VK_RETURN, false, false),
+        Input::Text("- item"),
+        Input::Key(VK_RETURN, false, false),
+        Input::Text("next one"),
+        Input::Key(VK_BACK, false, false),
+        Input::Key(VK_BACK, true, false),
+        Input::Key(VK_LEFT, false, false),
+        Input::Text("X"),
+        Input::Key(VK_LEFT, true, false),
+        Input::Key(VK_DELETE, true, false),
+        Input::Key(VK_RIGHT, false, true),
+        Input::Text("Y"),
+    ];
+    let [source, live] = typed_both_ways("start\n", 6, &script);
+    assert_eq!(live, source);
+}
+
+#[test]
+fn enter_continues_a_list_in_live() {
+    let script = [Input::Key(VK_RETURN, false, false), Input::Text("two")];
+    let [source, live] = typed_both_ways("- one", 5, &script);
+    assert_eq!(live, source);
+    assert!(live.0.ends_with("- two"), "{:?}", live.0);
+}
+
+#[test]
+fn tab_nests_a_list_item_in_live() {
+    let script = [Input::Key(VK_TAB, false, false)];
+    let [source, live] = typed_both_ways("- one\n- two", 11, &script);
+    assert_eq!(live, source);
+    assert_ne!(live.0, "- one\n- two");
+}
+
+#[test]
+fn typing_in_a_table_then_leaving_formats_it_in_live() {
+    let start = "| a | b |\n|---|---|\n| c | d |\n\nafter\n";
+    let script = [
+        Input::Text("ccc"),
+        Input::Key(VK_DOWN, false, false),
+        Input::Key(VK_DOWN, false, false),
+    ];
+    let caret_at = start.find("c |").unwrap() + 1;
+    let [source, live] = typed_both_ways(start, caret_at, &script);
+    assert_eq!(live.0, source.0);
+    let widths = live.0.lines().take(3).map(str::len).collect::<Vec<_>>();
+    assert!(
+        widths.iter().all(|&width| width == widths[0]),
+        "{:?}",
+        live.0
+    );
+}
+
+/// A shown Markdown tab in Live holding `text`, in a window narrow enough to wrap it.
+fn narrow_live(text: &str) -> (support::win32::WindowHarness, TestMain, HWND) {
+    let scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            main.hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            420,
+            600,
+            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+    }
+    main.make_markdown(text);
+    main.editor().set_selection(0..0).unwrap();
+    main.set_live(true);
+    let live = main.live_view().unwrap().hwnd();
+    unsafe {
+        SetFocus(live);
+        UpdateWindow(live);
+    }
+    pump_pending();
+    (scintilla, main, live)
+}
+
+const LONG: &str = "The quick brown fox jumps over the lazy dog and keeps running past the \
+                    river, the mill and the old stone bridge until night falls.";
+
+#[test]
+fn shift_down_extends_over_a_wrapped_row() {
+    let (_scintilla, main, live) = narrow_live(&format!("{LONG}\nnext\n"));
+    send_inputs(live, &[Input::Key(VK_DOWN, false, true)]);
+    let (anchor, caret) = caret(&main);
+    assert_eq!(anchor, 0);
+    assert!(
+        caret > 0 && caret < LONG.len(),
+        "caret {caret} left the first line"
+    );
+}
+
+#[test]
+fn home_end_follow_rows() {
+    let (_scintilla, main, live) = narrow_live(&format!("{LONG}\n"));
+    send_inputs(live, &[Input::Key(VK_END, false, false)]);
+    let (_, row_end) = caret(&main);
+    assert!(row_end > 0 && row_end < LONG.len(), "End went to {row_end}");
+    send_inputs(live, &[Input::Key(VK_DOWN, false, false)]);
+    let (_, below) = caret(&main);
+    send_inputs(live, &[Input::Key(VK_HOME, false, false)]);
+    let (_, row_start) = caret(&main);
+    assert!(
+        row_start > row_end && row_start <= below,
+        "Home went to {row_start}"
+    );
+    send_inputs(live, &[Input::Key(VK_HOME, false, false)]);
+    assert_eq!(caret(&main).1, 0, "a second Home goes to the line's start");
+}
+
+#[test]
+fn up_down_keep_the_goal_column() {
+    let (_scintilla, main, live) = narrow_live("abcdef\nab\nabcdef");
+    main.editor().set_selection(5..5).unwrap();
+    send_inputs(live, &[Input::Key(VK_DOWN, false, false)]);
+    assert_eq!(caret(&main).1, 9, "clamped to the short line's end");
+    send_inputs(live, &[Input::Key(VK_DOWN, false, false)]);
+    assert_eq!(caret(&main).1, 15, "back at the same column");
+    send_inputs(
+        live,
+        &[
+            Input::Key(VK_UP, false, false),
+            Input::Key(VK_UP, false, false),
+        ],
+    );
+    assert_eq!(caret(&main).1, 5);
+}

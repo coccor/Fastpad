@@ -1,4 +1,4 @@
-//! The `FastPadLive` window procedure: paint, size, focus and text queries. Keyboard, mouse,
+//! The `FastPadLive` window procedure: paint, size, focus, keys and text queries. Mouse,
 //! scrolling and IME arrive in later tasks of the phase 1 plan.
 
 use super::paint::{PaintOutcome, paint};
@@ -8,9 +8,9 @@ use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::ValidateRect;
 use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DLGC_WANTALLKEYS, DefWindowProcW, SB_VERT, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND,
-    WM_GETDLGCODE, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KILLFOCUS, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS,
-    WM_SIZE,
+    DLGC_WANTALLKEYS, DefWindowProcW, KillTimer, SB_VERT, WM_CHAR, WM_DPICHANGED_AFTERPARENT,
+    WM_ERASEBKGND, WM_GETDLGCODE, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_TIMER,
 };
 
 pub(super) unsafe extern "system" fn live_proc(
@@ -84,8 +84,17 @@ pub(super) unsafe extern "system" fn live_proc(
             });
             if message == WM_SETFOCUS {
                 crate::window::post_content_focus(hwnd);
+                super::keys::restart_blink(hwnd);
+            } else {
+                unsafe { KillTimer(hwnd, super::keys::CARET_TIMER) };
             }
             invalidate(hwnd);
+            0
+        }
+        WM_KEYDOWN | WM_KEYUP | WM_CHAR => super::keys::handle(hwnd, message, wparam, lparam)
+            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
+        WM_TIMER if wparam == super::keys::CARET_TIMER => {
+            super::keys::blink(hwnd);
             0
         }
         WM_DPICHANGED_AFTERPARENT => {
