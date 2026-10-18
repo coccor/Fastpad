@@ -912,3 +912,32 @@ fn ime_result_inserts_one_undo_step() {
     main.command(CommandId::Undo);
     assert_eq!(editor.text().unwrap(), "");
 }
+
+#[test]
+fn the_default_setting_opens_markdown_in_live() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.with_app(|app| app.settings.markdown_live_default = true);
+    main.make_markdown("# Opens Live\n");
+    let view = main.live_view().expect("a Live window");
+    assert!(visible(view.hwnd()));
+    assert!(!visible(main.editor().hwnd()));
+    // Ctrl+Alt+V still turns it off for this tab, and the choice sticks.
+    main.command(CommandId::MarkdownToggleLive);
+    assert!(!visible(view.hwnd()));
+    main.command(CommandId::New);
+    main.command(CommandId::PreviousTab);
+    assert!(!visible(view.hwnd()));
+    assert!(visible(main.editor().hwnd()));
+}
+
+#[test]
+fn the_default_setting_skips_files_over_the_limit_silently() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.with_app(|app| app.settings.markdown_live_default = true);
+    main.make_markdown(&"x".repeat(live::LIVE_MAX_BYTES + 1));
+    assert!(main.live_view().is_none());
+    assert!(visible(main.editor().hwnd()));
+    assert!(main.notices().is_empty(), "{:?}", main.notices());
+}

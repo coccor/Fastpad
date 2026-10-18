@@ -127,6 +127,14 @@ pub(super) fn open_menu(hwnd: HWND, mut index: usize) {
             );
             menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
             menus::set_checked_language(menu, active_language(hwnd));
+            let live = unsafe { app_ptr(hwnd) }
+                .map(|app| unsafe { app.as_ref() }.tabs.active_group())
+                .is_some_and(|id| crate::window::live_host::view_hwnd(hwnd, id).is_some());
+            menus::set_markdown_live(
+                menu,
+                active_language(hwnd) == crate::document::Language::Markdown,
+                live,
+            );
         }
         menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
         set_menu_mode(

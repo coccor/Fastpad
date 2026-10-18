@@ -15,16 +15,8 @@ use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{MoveWindow, SW_HIDE, SW_SHOWNA, ShowWindow};
 
-#[allow(
-    dead_code,
-    reason = "set_live's first caller outside markdown_live is the toggle command"
-)]
 const NOT_MARKDOWN_NOTICE: &str = "Live Markdown is available for Markdown documents. \
                                    Choose View > Markdown to treat this tab as Markdown.";
-#[allow(
-    dead_code,
-    reason = "set_live's first caller outside markdown_live is the toggle command"
-)]
 const TOO_LARGE_NOTICE: &str = "Live Markdown is available for documents up to 4 MB. This one \
                                 stays in the source view.";
 
@@ -69,7 +61,10 @@ pub(crate) fn wants_live(hwnd: HWND, id: GroupId) -> bool {
         return false;
     };
     let chosen = with_live(hwnd, id, |host| host.choices.get(&document).copied()).flatten();
-    chosen.unwrap_or(false) && document_length(hwnd, id) <= LIVE_MAX_BYTES
+    let default = unsafe { host_window::app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.settings.markdown_live_default);
+    // The default skips a file over the limit silently; a choice was checked when it was made.
+    chosen.unwrap_or(default) && document_length(hwnd, id) <= LIVE_MAX_BYTES
 }
 
 /// Group `id`'s Live window while it is shown.
@@ -103,11 +98,16 @@ pub(crate) fn text_view_hwnd(hwnd: HWND, id: GroupId) -> Option<HWND> {
     view_hwnd(hwnd, id).or_else(|| host_window::group_editor(hwnd, id).map(|editor| editor.hwnd()))
 }
 
+/// `markdown.toggleLive` (Ctrl+Alt+V): the active tab switches between Live and the source view.
+pub(crate) fn toggle(hwnd: HWND) {
+    let Some(app) = (unsafe { host_window::app_ptr(hwnd) }) else {
+        return;
+    };
+    let id = unsafe { app.as_ref() }.tabs.active_group();
+    set_live(hwnd, id, view_hwnd(hwnd, id).is_none());
+}
+
 /// Turns Live on or off for group `id`'s active tab, with a notice when it cannot be on.
-#[allow(
-    dead_code,
-    reason = "first caller outside markdown_live is the toggle command (phase 1 plan, Task 11)"
-)]
 pub(crate) fn set_live(hwnd: HWND, id: GroupId, on: bool) {
     let Some((document, language)) = active_document(hwnd, id) else {
         return;

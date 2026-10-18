@@ -226,6 +226,7 @@ impl MenuBar {
                     ),
                     MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
                     MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
+                    MenuEntry::command("Li&ve Markdown", CommandId::MarkdownToggleLive),
                     MenuEntry::Separator,
                     MenuEntry::command("Command &palette...", CommandId::CommandPalette),
                 ],
@@ -268,6 +269,17 @@ pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
         CommandId::MarkdownPreviewClose,
     ] {
         unsafe { EnableMenuItem(menu, command as u32, state) };
+    }
+}
+
+/// Grays Live Markdown off Markdown tabs and checks it while the active tab shows Live.
+pub(crate) fn set_markdown_live(menu: HMENU, enabled: bool, checked: bool) {
+    let command = CommandId::MarkdownToggleLive as u32;
+    let enable = if enabled { MF_ENABLED } else { MF_GRAYED };
+    let check = if checked { MF_CHECKED } else { MF_UNCHECKED };
+    unsafe {
+        EnableMenuItem(menu, command, MF_BYCOMMAND | enable);
+        CheckMenuItem(menu, command, MF_BYCOMMAND | check);
     }
 }
 
@@ -866,7 +878,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 84);
+        assert_eq!(specs.len(), 85);
     }
 
     #[test]
@@ -875,7 +887,7 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         let table = super::AcceleratorTable::create(&crate::window::keymap::Keymap::defaults())
             .expect("accelerator table");
-        assert_eq!(table.entries().len(), 84);
+        assert_eq!(table.entries().len(), 85);
     }
 
     #[test]
@@ -1200,5 +1212,23 @@ mod tests {
         let state =
             unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
         assert_eq!(state & MF_GRAYED, 0);
+    }
+
+    #[test]
+    fn live_markdown_grays_off_markdown_and_checks_while_live() {
+        use super::{MenuBar, set_markdown_live};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED,
+        };
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
+        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
+        let state =
+            || unsafe { GetMenuState(view, CommandId::MarkdownToggleLive as u32, MF_BYCOMMAND) };
+        set_markdown_live(view, false, false);
+        assert_ne!(state() & MF_GRAYED, 0);
+        assert_eq!(state() & MF_CHECKED, 0);
+        set_markdown_live(view, true, true);
+        assert_eq!(state() & MF_GRAYED, 0);
+        assert_ne!(state() & MF_CHECKED, 0);
     }
 }

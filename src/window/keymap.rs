@@ -372,6 +372,7 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::MarkdownItalic, "markdown.italic"),
     (CommandId::MarkdownCode, "markdown.code"),
     (CommandId::MarkdownLink, "markdown.link"),
+    (CommandId::MarkdownToggleLive, "markdown.toggleLive"),
 ];
 
 pub(crate) fn command_id(command: CommandId) -> Option<&'static str> {
@@ -406,7 +407,7 @@ const fn ch(byte: u8) -> u16 {
 }
 
 /// FastPad's shortcuts before any override, in precedence order (spec §3.3).
-pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 88] = [
+pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 89] = [
     (key(C, ch(b'N')), CommandId::New),
     (key(C, ch(b'T')), CommandId::New),
     (key(C, ch(b'O')), CommandId::Open),
@@ -470,6 +471,7 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 88] = [
     (key(C | S, ch(b'P')), CommandId::CommandPalette),
     (key(C, VK_OEM_COMMA), CommandId::OpenSettings),
     (key(C | S, ch(b'V')), CommandId::MarkdownPreviewCycle),
+    (key(C | A, ch(b'V')), CommandId::MarkdownToggleLive),
     (key(C, ch(b'B')), CommandId::ToggleSidebar),
     (key(C | S, ch(b'E')), CommandId::ShowNotebookView),
     (key(A, ch(b'Z')), CommandId::ToggleWordWrap),
