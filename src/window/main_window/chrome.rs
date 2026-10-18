@@ -200,6 +200,7 @@ pub(super) fn apply_theme(hwnd: HWND) {
         style_group_view(hwnd, id);
     }
     crate::window::preview_host::refresh_appearance(hwnd);
+    crate::window::live_host::refresh_appearance(hwnd);
     crate::window::image_host::refresh_appearance(hwnd);
     crate::window::side_panel::refresh(hwnd);
 }

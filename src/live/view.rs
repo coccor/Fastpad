@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 mod keys;
 mod paint;
+mod scrolling;
 mod window_proc;
 
 pub const CLASS_NAME: &str = "FastPadLive";
@@ -178,6 +179,36 @@ impl LiveView {
         invalidate(self.hwnd);
     }
 
+    /// The document changed: an edit starting on `first_line` added `lines_added` lines
+    /// (negative when it removed some). Only the touched lines are laid out again; the first
+    /// visible line stays where it was.
+    pub fn edited(&self, first_line: usize, lines_added: isize) {
+        self.with(|state| {
+            let anchor = state.layout.anchor(state.scroll_y);
+            let ViewState { editor, layout, .. } = state;
+            layout.edit(&EditorText(editor), first_line, lines_added);
+            state.scroll_y = state.layout.scroll_for_anchor(anchor);
+        });
+        invalidate(self.hwnd);
+    }
+
+    /// The editor's selection moved: the caret shows, is scrolled into view, and a run of Up/Down
+    /// ends unless the move was its own.
+    pub fn selection_changed(&self) {
+        self.with(|state| {
+            state.caret_on = true;
+            let caret = state
+                .editor
+                .anchor_and_caret()
+                .map_or(0, |(_, caret)| caret);
+            if state.goal.is_some_and(|(_, at)| at != caret) {
+                state.goal = None;
+            }
+            scroll_to_caret(state);
+        });
+        invalidate(self.hwnd);
+    }
+
     /// The text of each laid-out line, `None` for lines not laid out yet.
     #[cfg(test)]
     pub fn debug_lines(&self) -> Vec<Option<String>> {
@@ -192,6 +223,11 @@ impl LiveView {
                 .collect()
         })
         .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn font_size(&self) -> f32 {
+        self.with(|state| state.layout.fonts().size).unwrap_or(0.0)
     }
 
     #[cfg(test)]
@@ -285,4 +321,17 @@ fn view_size(hwnd: HWND) -> (f32, f32) {
 /// The width the text wraps to, in DIPs.
 fn text_width(hwnd: HWND) -> f32 {
     (view_size(hwnd).0 - 2.0 * PADDING).max(1.0)
+}
+
+/// Tells the main window that input here may have moved the caret, or scrolled the view when
+/// `scrolled`: a hidden Scintilla reports neither.
+fn post_changed(hwnd: HWND, scrolled: bool) {
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            crate::platform::win32::root_window(hwnd),
+            crate::window::WM_FASTPAD_LIVE_CHANGED,
+            hwnd as usize,
+            isize::from(scrolled),
+        )
+    };
 }

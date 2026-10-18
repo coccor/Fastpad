@@ -551,6 +551,12 @@ pub(super) unsafe extern "system" fn main_window_proc(
                     crate::window::markdown_host::run_deferred(hwnd);
                     return 0;
                 }
+                crate::window::WM_FASTPAD_LIVE_CHANGED => {
+                    if let Some(id) = group_of_child(hwnd, wparam as HWND) {
+                        crate::window::live_host::poll(hwnd, id, lparam != 0);
+                    }
+                    return 0;
+                }
                 crate::window::WM_FASTPAD_CONTENT_FOCUSED => {
                     if let Some(id) = group_of_child(hwnd, wparam as HWND) {
                         activate_group(hwnd, id);
@@ -719,6 +725,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         {
             crate::window::markdown_host::refresh_link_marks(&editor);
         }
+        crate::window::live_host::poll(hwnd, group, false);
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_CHARADDED {
@@ -735,7 +742,17 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {
         let _ = editor.remeasure_line_numbers();
+        crate::window::live_host::refresh_appearance(hwnd);
         return;
+    }
+    // Every editor showing the document reports each change: its group's Live view follows.
+    if notification.code == crate::editor::scintilla_constants::SCN_MODIFIED {
+        let modification = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
+        let text_changes = crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
+            | crate::editor::scintilla_constants::SC_MOD_DELETETEXT;
+        if modification.modification_type & text_changes as i32 != 0 {
+            crate::window::live_host::edited(hwnd, group, modification);
+        }
     }
     // A document shown in several groups notifies once per editor: its own changes are recorded
     // by one of them (split editors spec §3.3).

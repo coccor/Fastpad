@@ -542,3 +542,184 @@ fn up_down_keep_the_goal_column() {
     );
     assert_eq!(caret(&main).1, 5);
 }
+
+/// Paints `view`, then checks every line it has laid out shows that line of `editor`'s document
+/// as it is now.
+fn assert_layout_matches(view: LiveView, editor: &editor::Editor) {
+    unsafe { UpdateWindow(view.hwnd()) };
+    pump_pending();
+    let text = editor.text().unwrap();
+    let lines = text
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r'))
+        .collect::<Vec<_>>();
+    let laid = view.debug_lines();
+    assert_eq!(laid.len(), lines.len(), "line count of {text:?}");
+    assert!(laid.iter().any(Option::is_some), "nothing laid out");
+    for (n, (laid, line)) in laid.iter().zip(&lines).enumerate() {
+        if let Some(laid) = laid {
+            assert_eq!(laid, line, "line {n} of {text:?}");
+        }
+    }
+}
+
+/// A shown Markdown tab in Live holding `text`, focused.
+fn live_tab(text: &str) -> (support::win32::WindowHarness, TestMain, LiveView) {
+    let scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(text);
+    main.editor().set_selection(0..0).unwrap();
+    main.set_live(true);
+    let view = main.live_view().unwrap();
+    unsafe {
+        SetFocus(view.hwnd());
+        UpdateWindow(view.hwnd());
+    }
+    pump_pending();
+    (scintilla, main, view)
+}
+
+#[test]
+fn undo_and_redo_redraw_the_changed_lines() {
+    let (_scintilla, main, view) = live_tab("one\ntwo\n");
+    send_inputs(
+        view.hwnd(),
+        &[
+            Input::Key(VK_END, false, false),
+            Input::Text(" more"),
+            Input::Key(VK_RETURN, false, false),
+            Input::Text("added"),
+        ],
+    );
+    let editor = main.editor();
+    assert_eq!(editor.text().unwrap(), "one more\r\nadded\ntwo\n");
+    assert_layout_matches(view, &editor);
+    main.command(CommandId::Undo);
+    assert_layout_matches(view, &editor);
+    main.command(CommandId::Undo);
+    assert_layout_matches(view, &editor);
+    main.command(CommandId::Redo);
+    assert_layout_matches(view, &editor);
+}
+
+#[test]
+fn undo_of_a_multi_line_paste_redraws_every_line() {
+    let (_scintilla, main, view) = live_tab("first\nlast\n");
+    let editor = main.editor();
+    editor.replace_target(6..6, "a\nb\nc\nd\n").unwrap();
+    assert_layout_matches(view, &editor);
+    main.command(CommandId::Undo);
+    assert_eq!(editor.text().unwrap(), "first\nlast\n");
+    assert_layout_matches(view, &editor);
+}
+
+#[test]
+fn an_external_change_while_live_shows_the_new_text() {
+    let (_scintilla, main, view) = live_tab("old\ntext\n");
+    main.set_text("entirely\nnew\ntext\nhere\n");
+    assert_layout_matches(view, &main.editor());
+}
+
+fn long_document() -> String {
+    (0..400).map(|n| format!("line {n}\n")).collect::<String>()
+}
+
+#[test]
+fn scintilla_keys_and_commands_scroll_the_caret_into_view() {
+    let (_scintilla, main, view) = live_tab(&long_document());
+    assert_eq!(view.scroll_y(), 0.0);
+    // Scintilla's own key, forwarded.
+    send_inputs(view.hwnd(), &[Input::Key(VK_END, true, false)]);
+    assert_eq!(caret(&main).1, main.editor().length().unwrap());
+    unsafe { UpdateWindow(view.hwnd()) };
+    assert!(view.scroll_y() > 0.0, "Ctrl+End scrolled to the end");
+    // A command: Undo puts the caret back where the undone typing was.
+    send_inputs(
+        view.hwnd(),
+        &[Input::Text("x"), Input::Key(VK_HOME, true, false)],
+    );
+    unsafe { UpdateWindow(view.hwnd()) };
+    assert_eq!(view.scroll_y(), 0.0);
+    main.command(CommandId::Undo);
+    unsafe { UpdateWindow(view.hwnd()) };
+    assert!(view.scroll_y() > 0.0, "Undo left the caret at the end");
+}
+
+#[test]
+fn ctrl_d_switches_to_source_with_a_notice() {
+    let (_scintilla, main, view) = live_tab("word word word\n");
+    main.editor().set_selection(1..1).unwrap();
+    main.command(CommandId::AddNextOccurrence);
+    main.command(CommandId::AddNextOccurrence);
+    assert!(main.editor().selection_count().unwrap() > 1);
+    assert!(!visible(view.hwnd()));
+    assert!(visible(main.editor().hwnd()));
+    assert!(
+        main.notices()
+            .iter()
+            .any(|notice| notice.starts_with("Live Markdown works with one selection"))
+    );
+}
+
+#[test]
+fn a_second_group_showing_the_note_follows_edits_in_live() {
+    let (_scintilla, main, view) = live_tab("shared\n");
+    main.command(CommandId::SplitRight);
+    let second = main.editor();
+    second.set_selection(6..6).unwrap();
+    unsafe { SetFocus(second.hwnd()) };
+    send_inputs(
+        second.hwnd(),
+        &[Input::Text(" text"), Input::Key(VK_RETURN, false, false)],
+    );
+    assert_layout_matches(view, &second);
+}
+
+#[test]
+fn ctrl_wheel_zooms_live_and_source_together() {
+    let (_scintilla, main, view) = live_tab("zoom me\n");
+    let before = view.font_size();
+    let wheel_up = (120_usize << 16) | 0x0008; // MK_CONTROL
+    unsafe {
+        SendMessageW(
+            view.hwnd(),
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL,
+            wheel_up,
+            0,
+        )
+    };
+    pump_until("the zoom", Duration::from_secs(2), || {
+        view.font_size() > before
+    });
+    assert!(main.editor().zoom().unwrap() > 0);
+}
+
+#[test]
+fn scrolling_live_scrolls_the_hidden_editor_and_the_split_preview() {
+    let (_scintilla, main, view) = live_tab(&long_document());
+    main.command(CommandId::MarkdownPreviewSide);
+    unsafe {
+        SendMessageW(
+            view.hwnd(),
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_VSCROLL,
+            windows_sys::Win32::UI::WindowsAndMessaging::SB_PAGEDOWN as usize,
+            0,
+        );
+        SendMessageW(
+            view.hwnd(),
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_VSCROLL,
+            windows_sys::Win32::UI::WindowsAndMessaging::SB_PAGEDOWN as usize,
+            0,
+        );
+    }
+    assert!(view.scroll_y() > 0.0);
+    pump_until("the editor to follow", Duration::from_secs(2), || {
+        main.editor().first_visible_line().unwrap() > 0
+    });
+    let top = view.top_line();
+    let editor = main.editor();
+    let editor_top = editor
+        .doc_line_from_visible(editor.first_visible_line().unwrap())
+        .unwrap();
+    assert_eq!(editor_top, top);
+}

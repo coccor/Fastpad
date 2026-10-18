@@ -39,6 +39,8 @@ pub(crate) struct LiveHost {
     shown_for: Option<DocumentId>,
     /// Whether the view is shown in place of the editor.
     shown: bool,
+    /// The editor's selection as last followed: (anchor, caret, selection count).
+    last_selection: Option<(usize, usize, usize)>,
 }
 
 fn with_live<R>(hwnd: HWND, id: GroupId, action: impl FnOnce(&mut LiveHost) -> R) -> Option<R> {
@@ -136,6 +138,9 @@ pub(crate) fn show_text(hwnd: HWND, id: GroupId, shown: bool) {
     let document = active_document(hwnd, id).map(|(document, _)| document);
     let (view, reload) = with_live(hwnd, id, |host| {
         let reload = live && (!host.shown || host.shown_for != document);
+        if reload {
+            host.last_selection = None;
+        }
         host.shown = live;
         if live {
             host.shown_for = document;
@@ -349,6 +354,107 @@ fn appearance(
         zoom,
     );
     (colors, fonts)
+}
+
+/// Group `id`'s Live window while it is shown, as a handle.
+fn shown_view(hwnd: HWND, id: GroupId) -> Option<LiveView> {
+    with_live(hwnd, id, |host| host.view.filter(|_| host.shown)).flatten()
+}
+
+/// `SCN_MODIFIED` from group `id`'s editor: its shown Live view lays out the touched lines.
+pub(crate) fn edited(hwnd: HWND, id: GroupId, notification: &crate::editor::ScintillaNotification) {
+    let Some(view) = shown_view(hwnd, id) else {
+        return;
+    };
+    let Some(editor) = host_window::group_editor(hwnd, id) else {
+        return;
+    };
+    let position = notification.position.max(0) as usize;
+    let first_line = editor.line_from_position(position).unwrap_or(0);
+    view.edited(first_line, notification.lines_added);
+}
+
+const MULTIPLE_SELECTIONS_NOTICE: &str =
+    "Live Markdown works with one selection. Switched to the source view.";
+
+/// Follows group `id`'s editor after anything that may have moved its selection or scrolled its
+/// Live view (`scrolled`): a hidden Scintilla sends no `SCN_UPDATEUI` for either, so the Live
+/// view, the status bar and the writing helpers' table tracking are told from here. Called after
+/// Live view input, after every command, and on any `SCN_UPDATEUI` that does arrive.
+pub(crate) fn poll(hwnd: HWND, id: GroupId, scrolled: bool) {
+    let (Some(view), Some(editor)) = (shown_view(hwnd, id), host_window::group_editor(hwnd, id))
+    else {
+        return;
+    };
+    if scrolled
+        && let Ok(display) = editor.visible_from_doc_line(view.top_line())
+        && editor.set_first_visible_line(display).is_ok()
+    {
+        // Scintilla reports no scroll while hidden; a Split preview follows from here.
+        crate::window::preview_host::editor_scrolled(hwnd, id);
+    }
+    let (Ok((anchor, caret)), Ok(count)) = (editor.anchor_and_caret(), editor.selection_count())
+    else {
+        return;
+    };
+    let snapshot = (anchor, caret, count);
+    let changed = with_live(hwnd, id, |host| {
+        host.last_selection.replace(snapshot) != Some(snapshot)
+    })
+    .unwrap_or(false);
+    if !changed {
+        return;
+    }
+    if count > 1 {
+        // Several carets (Ctrl+D, a column selection) need the source view (phase 1 plan,
+        // deviation 5).
+        if let Some((document, _)) = active_document(hwnd, id) {
+            with_live(hwnd, id, |host| host.choices.insert(document, false));
+        }
+        host_window::push_notice(hwnd, MULTIPLE_SELECTIONS_NOTICE.to_owned());
+        crate::window::preview_host::in_group(id, || {
+            crate::window::preview_host::sync_visibility(hwnd)
+        });
+        return;
+    }
+    view.selection_changed();
+    let active = unsafe { host_window::app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.tabs.active_group() == id);
+    if active {
+        host_window::invalidate_status_bar(hwnd);
+    }
+    crate::window::markdown_host::selection_changed(hwnd, id);
+}
+
+/// `poll` for the active group, after a command ran.
+pub(crate) fn poll_active(hwnd: HWND) {
+    if let Some(app) = unsafe { host_window::app_ptr(hwnd) } {
+        let id = unsafe { app.as_ref() }.tabs.active_group();
+        poll(hwnd, id, false);
+    }
+}
+
+/// The editors' colours, fonts or zoom changed: every group's Live view follows.
+pub(crate) fn refresh_appearance(hwnd: HWND) {
+    let Some(app) = (unsafe { host_window::app_ptr(hwnd) }) else {
+        return;
+    };
+    let views = unsafe { app.as_ref() }
+        .groups
+        .iter()
+        .filter_map(|group| Some((group.live.view?, group.editor.clone())))
+        .collect::<Vec<_>>();
+    // No Live view yet: nothing to refresh, and DirectWrite must not load for it.
+    if views.is_empty() {
+        return;
+    }
+    let Ok(graphics) = crate::window::preview_host::shared_graphics(hwnd) else {
+        return;
+    };
+    for (view, editor) in views {
+        let (colors, fonts) = appearance(hwnd, &graphics, &editor);
+        view.set_appearance(colors, fonts);
+    }
 }
 
 #[cfg(test)]

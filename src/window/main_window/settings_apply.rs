@@ -412,5 +412,6 @@ pub(super) fn apply_editor_settings(hwnd: HWND) {
         apply_settings_to(&editor, &settings, palette);
     }
     crate::window::preview_host::refresh_appearance(hwnd);
+    crate::window::live_host::refresh_appearance(hwnd);
     crate::window::image_host::refresh_appearance(hwnd);
 }

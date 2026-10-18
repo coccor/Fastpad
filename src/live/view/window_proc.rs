@@ -10,7 +10,7 @@ use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DLGC_WANTALLKEYS, DefWindowProcW, KillTimer, SB_VERT, WM_CHAR, WM_DPICHANGED_AFTERPARENT,
     WM_ERASEBKGND, WM_GETDLGCODE, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_TIMER,
+    WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL,
 };
 
 pub(super) unsafe extern "system" fn live_proc(
@@ -93,6 +93,14 @@ pub(super) unsafe extern "system" fn live_proc(
         }
         WM_KEYDOWN | WM_KEYUP | WM_CHAR => super::keys::handle(hwnd, message, wparam, lparam)
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
+        WM_VSCROLL => {
+            super::scrolling::vscroll(hwnd, wparam);
+            0
+        }
+        WM_MOUSEWHEEL => {
+            super::scrolling::wheel(hwnd, wparam);
+            0
+        }
         WM_TIMER if wparam == super::keys::CARET_TIMER => {
             super::keys::blink(hwnd);
             0

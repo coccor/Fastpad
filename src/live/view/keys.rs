@@ -63,6 +63,7 @@ pub(super) fn handle(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> 
     }
     restart_blink(hwnd);
     invalidate(hwnd);
+    post_changed(hwnd, false);
     Some(0)
 }
 

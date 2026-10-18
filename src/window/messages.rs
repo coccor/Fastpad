@@ -75,6 +75,11 @@ pub const WM_FASTPAD_CONTENT_FOCUSED: u32 = WM_APP + 0x5A;
 /// Markdown helper work deferred out of a Scintilla notification (a table formatted once the
 /// caret leaves it). Posted to the main window. Not part of the deferred chain.
 pub const WM_FASTPAD_MARKDOWN_DEFERRED: u32 = WM_APP + 0x5B;
+/// A Live view handled input that may have moved the caret or scrolled; wparam is its window and
+/// lparam is 1 when it scrolled. Posted to the main window, which follows the hidden editor's
+/// selection from it: a hidden Scintilla sends no `SCN_UPDATEUI` for a selection change. Not part
+/// of the deferred chain.
+pub const WM_FASTPAD_LIVE_CHANGED: u32 = WM_APP + 0x5C;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {
