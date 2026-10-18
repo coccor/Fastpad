@@ -2,7 +2,10 @@
 //! tab's Scintilla document. Everything here except the layout and the window is pure.
 
 pub mod lines;
+pub mod motion;
 pub mod offsets;
+pub mod scroll;
+pub mod text;
 
 /// Larger documents stay in the source view (spec §3).
 pub const LIVE_MAX_BYTES: usize = 4 * 1024 * 1024;
