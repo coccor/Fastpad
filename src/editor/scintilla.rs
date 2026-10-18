@@ -81,6 +81,7 @@ mod document_text;
 mod editing;
 mod line_ops;
 mod link_ops;
+mod live_support;
 mod markdown_ops;
 mod styling;
 

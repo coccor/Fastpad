@@ -1253,3 +1253,119 @@ fn a_consumed_key_without_its_char_does_not_eat_a_later_char() {
     assert_eq!(editor.text().unwrap(), "a\t");
     editor.set_hooks(None);
 }
+
+#[test]
+fn anchor_and_caret_reads_the_anchor_then_the_current_position() {
+    use crate::editor::scintilla_constants::{SCI_GETANCHOR, SCI_GETCURRENTPOS};
+    let harness = TestDirectHarness::new();
+    let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+    harness.push_response(9);
+    harness.push_response(4);
+    assert_eq!(editor.anchor_and_caret().unwrap(), (9, 4));
+    assert_eq!(harness.messages(), vec![SCI_GETANCHOR, SCI_GETCURRENTPOS]);
+}
+
+#[test]
+fn selection_count_is_never_below_one() {
+    use crate::editor::scintilla_constants::SCI_GETSELECTIONS;
+    let harness = TestDirectHarness::new();
+    let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+    harness.push_response(3);
+    assert_eq!(editor.selection_count().unwrap(), 3);
+    harness.push_response(0);
+    assert_eq!(editor.selection_count().unwrap(), 1);
+    assert_eq!(
+        harness.messages(),
+        vec![SCI_GETSELECTIONS, SCI_GETSELECTIONS]
+    );
+}
+
+#[test]
+fn word_range_at_asks_for_word_characters_only() {
+    use crate::editor::scintilla_constants::{SCI_WORDENDPOSITION, SCI_WORDSTARTPOSITION};
+    let harness = TestDirectHarness::new();
+    let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+    harness.push_response(2);
+    harness.push_response(6);
+    assert_eq!(editor.word_range_at(4).unwrap(), 2..6);
+    assert_eq!(
+        harness.calls(),
+        vec![(SCI_WORDSTARTPOSITION, 4, 1), (SCI_WORDENDPOSITION, 4, 1)]
+    );
+}
+
+#[test]
+fn live_support_reads_a_real_document() {
+    let editor = test_editor();
+    editor.set_text("one two\r\nthree").unwrap();
+    // SCI_SETSEL takes anchor, caret: a selection made backwards keeps its direction.
+    editor
+        .set_selection(std::ops::Range { start: 7, end: 4 })
+        .unwrap();
+    assert_eq!(editor.anchor_and_caret().unwrap(), (7, 4));
+    assert_eq!(editor.selection_count().unwrap(), 1);
+    assert_eq!(editor.word_range_at(5).unwrap(), 4..7);
+    assert_eq!(editor.word_range_at(3).unwrap(), 0..3);
+    assert_eq!(editor.line_end(0).unwrap(), 7);
+    assert_eq!(editor.line_end(1).unwrap(), 14);
+}
+
+#[test]
+fn forwarded_chars_go_through_the_subclass_filter() {
+    let editor = test_editor();
+    editor.set_text("").unwrap();
+    editor.forward_char(usize::from(b'a'), 0);
+    // An unbound Ctrl+B's C0 character, which the subclass drops.
+    editor.forward_char(0x02, 0);
+    editor.forward_char(usize::from(b'b'), 0);
+    assert_eq!(editor.text().unwrap(), "ab");
+}
+
+#[test]
+fn forwarded_keys_run_the_hooks_first() {
+    use crate::editor::EditorHooks;
+    use std::rc::Rc;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    #[derive(Debug)]
+    struct TakeEnter;
+    impl EditorHooks for TakeEnter {
+        fn key_down(&self, vk: u16, _: bool, _: bool, _: bool) -> bool {
+            vk == VK_RETURN
+        }
+    }
+    let editor = test_editor();
+    editor.set_text("ab").unwrap();
+    editor.set_selection(2..2).unwrap();
+    editor.set_hooks(Some(Rc::new(TakeEnter)));
+    assert!(editor.hooks().is_some());
+    editor.forward_key(WM_KEYDOWN, usize::from(VK_RETURN), 0);
+    editor.forward_char(0x0D, 0);
+    assert_eq!(
+        editor.text().unwrap(),
+        "ab",
+        "the hook took Enter and its char"
+    );
+    editor.forward_key(WM_KEYDOWN, usize::from(VK_LEFT), 0);
+    assert_eq!(
+        editor.anchor_and_caret().unwrap(),
+        (1, 1),
+        "Left reached Scintilla"
+    );
+    editor.set_hooks(None);
+}
+
+#[test]
+fn forwarded_get_text_answers_with_the_document() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_GETTEXT, WM_GETTEXTLENGTH};
+    let editor = test_editor();
+    editor.set_text("héllo").unwrap();
+    let length = editor.forward_get_text(WM_GETTEXTLENGTH, 0, 0);
+    assert!(length >= 5);
+    let mut buffer = vec![0u16; length as usize + 1];
+    let copied = editor.forward_get_text(WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as isize);
+    assert_eq!(
+        String::from_utf16(&buffer[..copied as usize]).unwrap(),
+        "héllo"
+    );
+}
