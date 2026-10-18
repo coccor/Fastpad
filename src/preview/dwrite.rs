@@ -66,7 +66,7 @@ pub(crate) fn load_system_library(name: &str) -> Result<OwnedModule> {
 
 /// # Safety
 /// `F` must be the exact `extern "system"` signature of the export `name`.
-unsafe fn resolve<F: Copy>(module: &OwnedModule, name: &CStr) -> Result<F> {
+pub(crate) unsafe fn resolve<F: Copy>(module: &OwnedModule, name: &CStr) -> Result<F> {
     assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<usize>());
     let proc = unsafe { GetProcAddress(module.as_raw(), name.as_ptr().cast()) };
     let Some(proc) = proc else {

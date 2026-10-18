@@ -80,6 +80,10 @@ pub const WM_FASTPAD_MARKDOWN_DEFERRED: u32 = WM_APP + 0x5B;
 /// selection from it: a hidden Scintilla sends no `SCN_UPDATEUI` for a selection change. Not part
 /// of the deferred chain.
 pub const WM_FASTPAD_LIVE_CHANGED: u32 = WM_APP + 0x5C;
+/// Ctrl+click in a Live view; wparam is its window and lparam the document position clicked.
+/// Sent to the main window, which returns 1 when it follows a link there (the click is then
+/// taken). Not part of the deferred chain.
+pub const WM_FASTPAD_LIVE_LINK: u32 = WM_APP + 0x5D;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

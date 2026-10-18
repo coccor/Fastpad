@@ -182,6 +182,22 @@ fn link_at(editor: &Editor, position: usize) -> Option<crate::library::links::Li
 /// Follows `link`, written in `editor`'s note, later: the click that found it is still being
 /// handled by the editor, which must not see its document swapped underneath it. The preview's
 /// link message carries it, from the editor's group.
+/// Ctrl+click at document `position` in the Live view `window`: follows the wikilink there, as
+/// a Ctrl+click in the editor does. False when there is none, so the click places the caret.
+pub(crate) fn follow_link_at(hwnd: HWND, window: HWND, position: usize) -> bool {
+    let Some((_, editor, document, _)) = group_of_editor(hwnd, window) else {
+        return false;
+    };
+    if !has_links(hwnd, document) {
+        return false;
+    }
+    let Some(link) = link_at(&editor, position) else {
+        return false;
+    };
+    post_follow(hwnd, window, &link);
+    true
+}
+
 fn post_follow(main: HWND, editor: HWND, link: &crate::library::links::LineLink) {
     let group = unsafe { host_window::app_ptr(main) }.and_then(|app| {
         let app = unsafe { app.as_ref() };

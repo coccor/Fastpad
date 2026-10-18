@@ -58,6 +58,7 @@ Code is split so that everything that can be pure is pure:
 7. **`markdown_live_default` is set only in `fastpad.ini`.** It gets no Settings dialog row in this phase.
 8. **No context menu, no text drag-and-drop in Live.** File drops (attachments) work through the existing `file_drop` handler.
 9. **Selection changes are polled, not notified** (found in Task 9). A hidden Scintilla sends `SCN_UPDATEUI` only when it paints or does idle work, so a selection-only change while Live is shown is never reported. The Live view posts `WM_FASTPAD_LIVE_CHANGED` after its own input, every command ends with `live_host::poll_active`, and `poll` compares the selection with the last one seen before running what `SC_UPDATE_SELECTION` would have (status bar, table tracking, scroll to caret, the one-selection check). Live scrolling likewise drives the Split preview through `preview_host::editor_scrolled` directly.
+10. **IMM is loaded lazily, not imported** (Task 10). `imm32.dll` is resolved with `GetProcAddress` on the first composition, as Direct2D is; `windows-sys`'s `Win32_UI_Input_Ime` supplies only the types. So nothing enters the import table and the startup benchmark check is not needed. Ctrl+click on a wikilink goes through `WM_FASTPAD_LIVE_LINK` (sent, returning whether a link was followed) to `markdown_host::follow_link_at`.
 
 ## Review focus
 

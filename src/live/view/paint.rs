@@ -98,7 +98,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
     let (anchor, caret) = text.selection();
     let selection = anchor.min(caret)..anchor.max(caret);
     let selection_rects = layout.selection_rects(&text, selection, visible.clone())?;
-    let caret_rect = (state.focused && state.caret_on)
+    let caret_rect = state
+        .focused
         .then(|| layout.caret_rect(&text, caret).ok())
         .flatten();
     let tops = visible
@@ -143,7 +144,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 );
             }
         }
-        if let Some(caret) = caret_rect {
+        if let Some(caret) = caret_rect.filter(|_| state.caret_on) {
             let width = 1.0_f32.max(1.0 / dpi_scale(hwnd));
             target.FillRectangle(
                 &rect(caret.left, caret.top, caret.left + width, caret.bottom),
@@ -152,6 +153,16 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         }
         target.EndDraw(None, None)
     };
+    let scale = dpi_scale(hwnd);
+    state.caret_px = caret_rect.map(|caret| {
+        let x = ((PADDING + caret.left) * scale).round() as i32;
+        let y = ((caret.top - scroll_y) * scale).round() as i32;
+        (x, y, ((caret.bottom - caret.top) * scale).round() as i32)
+    });
+    if let Some((x, y, _)) = state.caret_px {
+        // Moving the hidden system caret sends no message.
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCaretPos(x, y) };
+    }
     match result {
         Err(error) if error.code() == D2DERR_RECREATE_TARGET => {
             state.target = None;

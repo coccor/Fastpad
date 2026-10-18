@@ -723,3 +723,192 @@ fn scrolling_live_scrolls_the_hidden_editor_and_the_split_preview() {
         .unwrap();
     assert_eq!(editor_top, top);
 }
+
+/// Sends a mouse message at client point (`x`, `y`) to `view`, with Ctrl and Shift as given.
+fn mouse(view: HWND, message: u32, (x, y): (i32, i32), ctrl: bool, shift: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_SHIFT,
+    };
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[usize::from(VK_CONTROL)] = if ctrl { 0x80 } else { 0 };
+    keys[usize::from(VK_SHIFT)] = if shift { 0x80 } else { 0 };
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    let lparam = ((y as u32 & 0xFFFF) << 16 | (x as u32 & 0xFFFF)) as isize;
+    unsafe { SendMessageW(view, message, 0, lparam) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+    pump_pending();
+}
+
+fn click(view: HWND, point: (i32, i32), ctrl: bool, shift: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    mouse(view, WM_LBUTTONDOWN, point, ctrl, shift);
+    mouse(view, WM_LBUTTONUP, point, ctrl, shift);
+}
+
+/// Client point `x_chars` average characters into row `row` (from the top of the view).
+fn row_point(view: LiveView, row: i32, x: i32) -> (i32, i32) {
+    let (height, left) = view.row_metrics();
+    (left + x, height * row + height / 2)
+}
+
+#[test]
+fn click_places_the_caret_on_a_wrapped_row() {
+    let (_scintilla, main, live) = narrow_live(&format!("{LONG}\nnext\n"));
+    let view = main.live_view().unwrap();
+    click(live, row_point(view, 1, 2), false, false);
+    let (anchor, second_row) = caret(&main);
+    assert_eq!(anchor, second_row);
+    assert!(
+        second_row > 0 && second_row < LONG.len(),
+        "caret at {second_row}"
+    );
+    // Past the end of the first row stays on that row.
+    click(live, row_point(view, 0, 2000), false, false);
+    let row_end = caret(&main).1;
+    assert!(row_end < second_row, "{row_end} is on the first row");
+}
+
+#[test]
+fn shift_click_extends() {
+    let (_scintilla, main, live) = narrow_live(&format!("{LONG}\nnext\n"));
+    let view = main.live_view().unwrap();
+    click(live, row_point(view, 0, 0), false, false);
+    click(live, row_point(view, 1, 30), false, true);
+    let (anchor, caret) = caret(&main);
+    assert_eq!(anchor, 0);
+    assert!(caret > 0);
+}
+
+#[test]
+fn double_click_selects_a_word_and_triple_click_the_line() {
+    let (_scintilla, main, view) = live_tab("alpha beta gamma\nnext\n");
+    let point = row_point(view, 0, 2);
+    click(view.hwnd(), point, false, false);
+    click(view.hwnd(), point, false, false);
+    assert_eq!(caret(&main), (0, 5), "the word");
+    click(view.hwnd(), point, false, false);
+    let (anchor, caret) = caret(&main);
+    assert_eq!(anchor, 0);
+    assert_eq!(
+        caret,
+        main.editor().line_start(1).unwrap(),
+        "the line and its ending"
+    );
+}
+
+#[test]
+fn drag_below_the_view_autoscrolls() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    };
+    let (_scintilla, main, view) = live_tab(&long_document());
+    let mut client = windows_sys::Win32::Foundation::RECT::default();
+    unsafe { GetClientRect(view.hwnd(), &mut client) };
+    mouse(
+        view.hwnd(),
+        WM_LBUTTONDOWN,
+        row_point(view, 0, 0),
+        false,
+        false,
+    );
+    let below = (40, client.bottom + 60);
+    mouse(view.hwnd(), WM_MOUSEMOVE, below, false, false);
+    pump_until("the drag to scroll", Duration::from_secs(3), || {
+        view.scroll_y() > 100.0
+    });
+    mouse(view.hwnd(), WM_LBUTTONUP, below, false, false);
+    let (anchor, caret) = caret(&main);
+    assert_eq!(anchor, 0);
+    assert!(caret > 0, "the selection grew with the scroll");
+    let after = view.scroll_y();
+    pump_for(Duration::from_millis(150));
+    assert_eq!(view.scroll_y(), after, "releasing stops the scrolling");
+}
+
+fn pump_for(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    pump_until("pump_for", duration + Duration::from_secs(1), || {
+        Instant::now() >= deadline
+    });
+}
+
+#[test]
+fn ctrl_click_follows_a_wikilink_and_takes_the_click() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW;
+    let (_scintilla, main, view) = live_tab("[[Other note]] and text\n");
+    main.editor().set_selection(20..20).unwrap();
+    // Pressed without pumping: the link is followed through the preview's link message, taken
+    // here before anything opens.
+    {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN;
+        let (x, y) = row_point(view, 0, 20);
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[usize::from(VK_CONTROL)] = 0x80;
+        unsafe {
+            SetKeyboardState(keys.as_ptr());
+            SendMessageW(
+                view.hwnd(),
+                WM_LBUTTONDOWN,
+                0,
+                ((y as u32) << 16 | x as u32) as isize,
+            );
+            SetKeyboardState(original.as_ptr());
+        }
+    }
+    let mut msg = MSG::default();
+    let posted = unsafe {
+        PeekMessageW(
+            &mut msg,
+            main.hwnd,
+            window::WM_FASTPAD_PREVIEW_LINK,
+            window::WM_FASTPAD_PREVIEW_LINK,
+            PM_REMOVE,
+        )
+    } != 0;
+    assert!(posted, "a link was followed");
+    let destination = unsafe { Box::from_raw(msg.lParam as *mut String) };
+    assert!(destination.contains("Other note"), "{destination}");
+    assert_eq!(caret(&main), (20, 20), "the click did not move the caret");
+    // Off a link, Ctrl+click places the caret.
+    click(view.hwnd(), row_point(view, 0, 2000), true, false);
+    assert!(caret(&main).1 > 20);
+}
+
+#[test]
+fn system_caret_tracks_the_caret() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCaretPos;
+    let (_scintilla, _main, view) = live_tab("\n");
+    let at = |view: LiveView| {
+        unsafe { UpdateWindow(view.hwnd()) };
+        let mut point = windows_sys::Win32::Foundation::POINT::default();
+        unsafe { GetCaretPos(&mut point) };
+        point
+    };
+    let before = at(view);
+    send_inputs(view.hwnd(), &[Input::Text("abc")]);
+    let after = at(view);
+    assert!(after.x > before.x, "{} -> {}", before.x, after.x);
+    send_inputs(view.hwnd(), &[Input::Key(VK_RETURN, false, false)]);
+    assert!(at(view).y > after.y);
+}
+
+#[test]
+fn ime_result_inserts_one_undo_step() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_IME_CHAR};
+    let (_scintilla, main, view) = live_tab("");
+    for unit in "日本".encode_utf16() {
+        unsafe { PostMessageW(view.hwnd(), WM_IME_CHAR, usize::from(unit), 1) };
+    }
+    pump_pending();
+    let editor = main.editor();
+    assert_eq!(editor.text().unwrap(), "日本");
+    main.command(CommandId::Undo);
+    assert_eq!(editor.text().unwrap(), "");
+}

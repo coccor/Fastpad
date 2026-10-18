@@ -1,6 +1,6 @@
 //! The `FastPadLive` child window: the Live view of one editor group's Markdown tab. The group's
 //! Scintilla stays the document (text, selection, undo); this window draws it with Direct2D and,
-//! turns keys (and, in later tasks, clicks) into Scintilla input and selections (phase 1 plan,
+//! turns keys and clicks into Scintilla input and selections (phase 1 plan,
 //! Architecture). Like the preview, nothing here sends messages while the state is borrowed.
 
 use crate::Result;
@@ -22,7 +22,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_TABSTOP, WS_VSCROLL,
 };
 
+mod ime;
 mod keys;
+mod mouse;
 mod paint;
 mod scrolling;
 mod window_proc;
@@ -66,6 +68,12 @@ struct ViewState {
     /// The x a run of Up/Down keeps aiming for, and the caret it left: any other caret move
     /// leaves the two apart, which ends the run.
     goal: Option<(f32, usize)>,
+    /// A button drag selecting text, from `WM_LBUTTONDOWN` to its release.
+    drag: Option<mouse::Drag>,
+    /// The last press, for counting double and triple clicks.
+    clicks: Option<mouse::Click>,
+    /// Where the caret was drawn last, in client pixels: x, y and height.
+    caret_px: Option<(i32, i32, i32)>,
     paint_retried: bool,
     /// Last, so the target, brushes and layouts above are released before it can unload
     /// Direct2D and DirectWrite.
@@ -107,6 +115,9 @@ impl LiveView {
             focused: false,
             caret_on: true,
             goal: None,
+            drag: None,
+            clicks: None,
+            caret_px: None,
             paint_retried: false,
             graphics,
         });
@@ -223,6 +234,19 @@ impl LiveView {
                 .collect()
         })
         .unwrap_or_default()
+    }
+
+    /// A row's height and the text's left edge, in client pixels.
+    #[cfg(test)]
+    pub fn row_metrics(&self) -> (i32, i32) {
+        self.with(|state| {
+            let scale = dpi_scale(state.hwnd);
+            (
+                (state.layout.fonts().line_height * scale).round() as i32,
+                (PADDING * scale).round() as i32,
+            )
+        })
+        .unwrap_or((0, 0))
     }
 
     #[cfg(test)]

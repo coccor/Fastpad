@@ -551,6 +551,14 @@ pub(super) unsafe extern "system" fn main_window_proc(
                     crate::window::markdown_host::run_deferred(hwnd);
                     return 0;
                 }
+                crate::window::WM_FASTPAD_LIVE_LINK => {
+                    let followed = crate::window::markdown_host::follow_link_at(
+                        hwnd,
+                        wparam as HWND,
+                        lparam.max(0) as usize,
+                    );
+                    return LRESULT::from(followed);
+                }
                 crate::window::WM_FASTPAD_LIVE_CHANGED => {
                     if let Some(id) = group_of_child(hwnd, wparam as HWND) {
                         crate::window::live_host::poll(hwnd, id, lparam != 0);
