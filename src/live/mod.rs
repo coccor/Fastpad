@@ -7,6 +7,7 @@ pub mod motion;
 pub mod offsets;
 pub mod scroll;
 pub mod text;
+pub mod view;
 
 /// Larger documents stay in the source view (spec §3).
 pub const LIVE_MAX_BYTES: usize = 4 * 1024 * 1024;

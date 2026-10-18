@@ -688,19 +688,22 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
     let focus_view = shown_svg
         .map(|view| view.hwnd())
         .or(view.map(|view| view.hwnd()));
+    let live_hwnd = target.and_then(|id| crate::window::live_host::view_hwnd(hwnd, id));
+    let focus = unsafe { GetFocus() };
     if let (Some(editor), Some(target)) = (editor_hwnd, focus_view)
         && hide_editor
-        && unsafe { GetFocus() } == editor
+        && (focus == editor || live_hwnd.is_some_and(|live| live == focus))
     {
         unsafe { SetFocus(target) };
     }
     if let Some(view) = view {
         unsafe { ShowWindow(view.hwnd(), if shown { SW_SHOWNA } else { SW_HIDE }) };
     }
-    if let Some(editor) = editor_hwnd
+    // The text shows in the Live view or the editor; Live decides which.
+    if let Some(id) = target
         && shows_text(hwnd)
     {
-        unsafe { ShowWindow(editor, if hide_editor { SW_HIDE } else { SW_SHOWNA }) };
+        crate::window::live_host::show_text(hwnd, id, !hide_editor);
     }
     host_window::layout_editor_and_find_bar(hwnd);
     let parent = content_parent(hwnd);

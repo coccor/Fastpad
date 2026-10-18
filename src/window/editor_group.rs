@@ -30,6 +30,8 @@ pub(crate) struct GroupWindow {
     /// Declared before `preview`, whose Direct2D objects the image view's may share.
     pub(crate) image: super::image_host::ImageHost,
     pub(crate) preview: super::preview_host::PreviewHost,
+    /// The Live Markdown view and which tabs show in it.
+    pub(crate) live: super::live_host::LiveHost,
     pub(crate) pointer: super::group_strip::StripPointer,
     /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
     pub(crate) thumb_grab: Option<i32>,
@@ -61,6 +63,7 @@ impl GroupWindow {
             find_bar: None,
             image: Default::default(),
             preview: Default::default(),
+            live: Default::default(),
             pointer: Default::default(),
             thumb_grab: None,
             middle_press: None,

@@ -172,9 +172,14 @@ pub(super) fn bar_band_height(hwnd: HWND) -> i32 {
 }
 
 /// Where keyboard focus belongs in the content area: the image view for an image tab, the preview
-/// while it replaces the editor in Full mode, otherwise the editor.
+/// while it replaces the editor in Full mode, the Live view for a Live tab, otherwise the editor.
 pub(super) fn content_focus_target(hwnd: HWND) -> Option<HWND> {
     crate::window::image_host::shown_view_hwnd(hwnd)
         .or_else(|| crate::window::preview_host::full_view_hwnd(hwnd))
+        .or_else(|| {
+            let app = unsafe { app_ptr(hwnd) }?;
+            let group = unsafe { app.as_ref() }.tabs.active_group();
+            crate::window::live_host::view_hwnd(hwnd, group)
+        })
         .or_else(|| unsafe { editor_hwnd(hwnd) })
 }

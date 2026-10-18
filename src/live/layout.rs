@@ -189,6 +189,11 @@ impl LiveLayout {
             .ok_or(crate::FastPadError::Invariant("Live line out of range"))
     }
 
+    /// `line`'s layout if it is laid out.
+    pub fn laid_line(&self, line: usize) -> Option<&LineLayout> {
+        self.lines.get(line)
+    }
+
     pub fn line_top(&mut self, line: usize) -> f32 {
         self.heights.top(line)
     }

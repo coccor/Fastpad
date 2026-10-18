@@ -101,6 +101,7 @@ fn in_literal_block(hwnd: HWND, document: DocumentId, text: &str, at: usize) -> 
 /// reload, a background Replace, a language change).
 pub(crate) fn forget(hwnd: HWND, document: DocumentId) {
     with_registry(hwnd, |registry| registry.docs.remove(&document));
+    crate::window::live_host::forget(hwnd, document);
 }
 
 fn with_registry<R>(hwnd: HWND, run: impl FnOnce(&mut MarkdownRegistry) -> R) -> Option<R> {
