@@ -168,6 +168,21 @@ Large, so it ships in phases, each behind the toggle and each mergeable on its o
 
 > **Phase 2 shipped** (plan `docs/superpowers/plans/2026-10-19-markdown-live-editor-phase-2.md`), with that plan's deviations: heading sizes are the preview's (2.0 / 1.5 / 1.25 / 1.0 / 0.875 / 0.875, bold); block constructs (lists, quotes, code blocks, tables, rules, images) stay source until phase 3; revealed lines change colour only, so typing markers never re-wraps them; footnotes and math are dimmed by a small scanner, since the preview's options parse neither; a setext underline hides to an empty row; edits are logged and applied in one flush before the next measurement or paint; block spans are parsed lazily; a selection ending at a line start does not reveal that line; Ctrl+click on Markdown links goes through the preview's link path, and a `#heading` link moves the editor's caret to the heading. Code backgrounds are drawn before the selection so a selection over inline code stays visible.
 
+> **Phase 3 shipped** (plan `docs/superpowers/plans/2026-10-19-markdown-live-editor-phase-3.md`), with that plan's deviations and these found while building it:
+> - **Revealed lines:** they drop their indent and decorations and show their source at the left edge, except code-block lines, which keep the code font so typing in a code block never re-wraps or changes height. The manual check is to judge whether the shift of a list item's text when the caret enters it reads well.
+> - **Containers:** a container's indent is fixed (quote 1 em, bullet item 1.5 em, ordered item 2 em), since an item's later lines do not know its marker's width.
+> - **Code blocks:** they use the code font on the prose rows, so line numbers stay in step.
+> - **Tables:**
+>   - Columns are sized as the preview sizes them, and a table too wide for the view shows as source.
+>   - Rows are not striped.
+>   - As in GFM, a pipe inside a code span splits cells unless it is escaped.
+>   - A row whose columns move is re-spaced in place rather than laid out again.
+> - **Images:** a line holding only an image shows its thumbnail (at most 300 DIPs times the zoom); remote, missing or not-yet-decoded images, and images inside text, show their alt text, dimmed and italic. Decoding runs on the view's own worker.
+> - **Checkboxes and tasks:** a checkbox click is the one edit Live makes on its own: one undo step that keeps the selection. Checked task text is struck through and dimmed.
+> - **Block index:** Live keeps its own block index (top-level block ranges and reference definitions, updated with the preview's sentinel rule) instead of the preview's document. That rebuilt the preview's rendering model of a block on every keystroke: 2.3 ms per keystroke for the 10k-line note's single 500 KB paragraph.
+>
+> Release keystroke p95, Live (source view): 10k-line note 2.3–2.6 ms (0.7); 60-row table 2.8 ms (0.7); 300-item list 2.0 ms (0.8); 1 MB note 1.9–2.0 ms (0.8–0.9); 500-line code block 1.6 ms (0.7). Entering Live on the 1 MB note takes 53–57 ms to the first frame.
+
 ## 13. Open questions
 
 - Should a rendered heading show its `#` markers dimmed in the gutter (as some editors do) so the level is visible without revealing? Default: no.

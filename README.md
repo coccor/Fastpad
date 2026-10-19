@@ -101,11 +101,14 @@ typing. Both panes scroll together.
 - **Live Markdown (preview):** `Ctrl+Alt+V`, or View → Live Markdown, switches a Markdown tab to a
   new view FastPad draws itself, in the preview's font with real wrapping. Typing, selecting, undo,
   find, the writing helpers and Japanese, Chinese or Korean input work as in the source view, and the
-  file is only ever changed by what you type. Headings, bold, italic, strike-through, inline code,
-  links and `[[wikilinks]]` render in place with their markup hidden, while the line you are on
+  file is only ever changed by what you type or a task checkbox you click. Headings, bold, italic,
+  strike-through, inline code, links and `[[wikilinks]]` render in place with their markup hidden,
+  and so do block elements: lists with bullets, numbers and clickable task checkboxes, quotes with
+  their bars, rules, code blocks on a full-width background, tables as aligned grids and local
+  images as thumbnails (anything else shows its alt text; nothing is fetched). The line you are on
   shows its Markdown source; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click
-  follows a link. Lists, quotes, code blocks, tables and images still show as source; they render
-  in a later release. Set `markdown_live_default=true` to open Markdown tabs in it.
+  follows a link. Find, scroll sync with Split and the rest of the command audit come in the next
+  release. Set `markdown_live_default=true` to open Markdown tabs in it.
 
 ### Notes and notebooks
 
