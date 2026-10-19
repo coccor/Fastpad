@@ -880,12 +880,12 @@ fn install_parse(hwnd: HWND, payload: ParsedPreview) {
 pub(crate) fn record_edit(hwnd: HWND, id: GroupId, notification: &ScintillaNotification) {
     let inserted = notification.modification_type as u32 & SC_MOD_INSERTTEXT != 0;
     let length = notification.length.max(0) as usize;
-    let edit = Edit {
-        position: notification.position.max(0) as usize,
-        removed: if inserted { 0 } else { length },
-        inserted: if inserted { length } else { 0 },
-        lines_delta: notification.lines_added,
-    };
+    let edit = Edit::from_change(
+        notification.position.max(0) as usize,
+        length,
+        inserted,
+        notification.lines_added,
+    );
     let recorded = with_group_host(hwnd, id, |host| {
         // The SVG preview renders the whole text again after the pause; it keeps no edit log.
         if host.svg_document.is_some() {

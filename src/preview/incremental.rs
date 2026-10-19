@@ -20,6 +20,19 @@ pub struct Edit {
     pub lines_delta: isize,
 }
 
+impl Edit {
+    /// The edit a Scintilla text change reports: `length` bytes inserted (when `inserted`) or
+    /// deleted at `position`, adding `lines_delta` lines (negative when it removed some).
+    pub fn from_change(position: usize, length: usize, inserted: bool, lines_delta: isize) -> Self {
+        Self {
+            position,
+            removed: if inserted { 0 } else { length },
+            inserted: if inserted { length } else { 0 },
+            lines_delta,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Pending {
     Nothing,
@@ -159,6 +172,16 @@ impl PreviewDocument {
             refdefs,
             front_matter: may_start_front_matter(source),
         }
+    }
+
+    /// The destination of the link reference definition whose label matches `label` (as
+    /// CommonMark matches labels: case-folded, whitespace collapsed).
+    pub fn refdef_dest(&self, label: &str) -> Option<&str> {
+        let key = crate::preview::model::normalize_label(label);
+        self.refdefs
+            .iter()
+            .find(|definition| definition.key == key)
+            .map(|definition| definition.dest.as_str())
     }
 
     pub fn reparse(&mut self, source: &(impl SourceText + ?Sized)) -> Update {
@@ -324,6 +347,38 @@ fn shift_lines(lines: Range<usize>, delta: isize) -> Range<usize> {
 mod tests {
     use super::*;
     use crate::preview::model::parse_document;
+
+    #[test]
+    fn refdef_dest_matches_labels_case_insensitively() {
+        let document =
+            PreviewDocument::parse("See [Site].\n\n[My   Site]: https://x.dev\n[o]: /other.md\n");
+        assert_eq!(document.refdef_dest("my site"), Some("https://x.dev"));
+        assert_eq!(document.refdef_dest("MY\tSITE"), Some("https://x.dev"));
+        assert_eq!(document.refdef_dest("O"), Some("/other.md"));
+        assert_eq!(document.refdef_dest("missing"), None);
+    }
+
+    #[test]
+    fn edit_from_an_insertion_and_a_deletion() {
+        assert_eq!(
+            Edit::from_change(4, 3, true, 1),
+            Edit {
+                position: 4,
+                removed: 0,
+                inserted: 3,
+                lines_delta: 1,
+            }
+        );
+        assert_eq!(
+            Edit::from_change(9, 5, false, -2),
+            Edit {
+                position: 9,
+                removed: 5,
+                inserted: 0,
+                lines_delta: -2,
+            }
+        );
+    }
 
     const FIXTURES: [&str; 9] = [
         "---\ntitle: Plan\ntags: [a, b]\n---\n# Heading #tag\n\nBody with #x and more.\n\n---\n\nAfter a rule\n",
