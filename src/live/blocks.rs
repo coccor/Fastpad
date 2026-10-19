@@ -209,14 +209,12 @@ impl LiveDocument {
             });
         }
         for (index, start) in self.blocks_in(bytes.clone()) {
-            for span in &self.block_spans(source, index).spans {
-                let range = start + span.range.start..start + span.range.end;
-                if range.end > bytes.start && range.start < bytes.end {
-                    out.push(Span {
-                        range,
-                        kind: span.kind,
-                    });
-                }
+            let relative = bytes.start.saturating_sub(start)..bytes.end.saturating_sub(start);
+            for span in self.block_spans(source, index).overlapping(relative) {
+                out.push(Span {
+                    range: start + span.range.start..start + span.range.end,
+                    kind: span.kind,
+                });
             }
         }
         out

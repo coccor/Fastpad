@@ -34,6 +34,10 @@ impl<T> LineCache<T> {
         self.slots.get(line).and_then(Option::as_ref)
     }
 
+    pub fn get_mut(&mut self, line: usize) -> Option<&mut T> {
+        self.slots.get_mut(line).and_then(Option::as_mut)
+    }
+
     pub fn set(&mut self, line: usize, value: T) {
         if let Some(slot) = self.slots.get_mut(line) {
             *slot = Some(value);

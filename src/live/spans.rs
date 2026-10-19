@@ -167,9 +167,24 @@ impl LineBlock {
 pub struct BlockSpans {
     /// Sorted by start.
     pub spans: Vec<Span>,
+    /// For each span, the furthest end of it and every span before it: the first span that can
+    /// overlap a byte is found by binary search, so styling one line of a long block does not
+    /// scan the whole block's spans.
+    pub reach: Vec<usize>,
     pub links: Vec<LinkSpan>,
     /// Sorted by start; a top-level line of plain text has none.
     pub lines: Vec<LineBlock>,
+}
+
+impl BlockSpans {
+    /// The spans overlapping `bytes` (relative to the block), in order.
+    pub fn overlapping(&self, bytes: Range<usize>) -> impl Iterator<Item = &Span> {
+        let first = self.reach.partition_point(|&end| end <= bytes.start);
+        self.spans[first..]
+            .iter()
+            .take_while(move |span| span.range.start < bytes.end)
+            .filter(move |span| span.range.end > bytes.start)
+    }
 }
 
 /// The spans and links of one block's `text`. `refs` resolves reference links defined elsewhere
@@ -552,6 +567,15 @@ impl<'a> Collector<'a> {
 
     /// Each line's containers, prefix and body; lines of plain top-level text are left out.
     fn line_blocks(&self) -> Vec<LineBlock> {
+        if self.containers.is_empty()
+            && self.code_blocks.is_empty()
+            && self.tables.is_empty()
+            && self.rules.is_empty()
+            && self.images.is_empty()
+        {
+            // Plain prose (the common block, and a 10k-line paragraph): no line has a context.
+            return Vec::new();
+        }
         let text = self.text;
         let bytes = text.as_bytes();
         // Per list item: how far its later lines are indented to its content.
@@ -656,7 +680,6 @@ impl<'a> Collector<'a> {
                 }
                 return Body::Code;
             }
-            let lines = line_ranges(text, range.clone());
             let fence_start = {
                 let mut at = *pos;
                 while at < line.end && at - *pos < 3 && bytes[at] == b' ' {
@@ -664,7 +687,7 @@ impl<'a> Collector<'a> {
                 }
                 at
             };
-            if lines.first().is_some_and(|first| first.start == line.start) {
+            if line_start(text, range.start) == line.start {
                 let fence = bytes[fence_start..line.end]
                     .iter()
                     .take_while(|b| matches!(b, b'`' | b'~'))
@@ -678,7 +701,7 @@ impl<'a> Collector<'a> {
                 });
                 return Body::Fence { info };
             }
-            let is_last = lines.last().is_some_and(|last| last.start == line.start);
+            let is_last = line_start(text, range.end.saturating_sub(1)) == line.start;
             let rest = text[fence_start..line.end].trim_end();
             if is_last
                 && rest.len() >= 3
@@ -689,10 +712,18 @@ impl<'a> Collector<'a> {
             return Body::Code;
         }
         if let Some((range, aligns)) = self.tables.iter().find(|(range, _)| overlaps(range)) {
-            let index = line_ranges(text, range.clone())
-                .iter()
-                .position(|row| row.start == line.start)
-                .unwrap_or(0);
+            // Only the first two rows differ: the header, then the delimiter.
+            let first = line_start(text, range.start);
+            let second = text[first..]
+                .find('\n')
+                .map_or(text.len(), |at| first + at + 1);
+            let index = if line.start == first {
+                0
+            } else if line.start == second {
+                1
+            } else {
+                2
+            };
             if index == 1 {
                 return Body::TableDelimiter {
                     aligns: Rc::clone(aligns),
@@ -764,8 +795,16 @@ impl<'a> Collector<'a> {
             }
         }
         spans.sort_by_key(|span| (span.range.start, span.range.end));
+        let reach = spans
+            .iter()
+            .scan(0, |furthest, span| {
+                *furthest = span.range.end.max(*furthest);
+                Some(*furthest)
+            })
+            .collect();
         BlockSpans {
             spans,
+            reach,
             links: self.links,
             lines,
         }
@@ -1475,6 +1514,30 @@ mod tests {
     #[test]
     fn an_image_inside_text_is_not() {
         assert!(lines("see ![cat](c.png) here").is_empty());
+    }
+
+    #[test]
+    fn overlapping_finds_long_spans_that_start_earlier() {
+        let text = "<div>\nhtml\n</div>\n";
+        let block = parse_block("**a** b *c*", &no_refs);
+        let found = |bytes: Range<usize>| {
+            block
+                .overlapping(bytes)
+                .map(|span| span.range.clone())
+                .collect::<Vec<_>>()
+        };
+        // `**a** b *c*`: markers 0..2, 3..5, 8..9, 10..11; bold 2..3, italic 9..10.
+        assert_eq!(found(9..10), vec![9..10]);
+        assert_eq!(found(3..9), vec![3..5, 8..9]);
+        assert_eq!(found(5..8), Vec::<Range<usize>>::new());
+        // A dimmed HTML block spans every line: a line in its middle still finds it.
+        let html = parse_block(text, &no_refs);
+        assert_eq!(
+            html.overlapping(7..8)
+                .map(|span| span.kind)
+                .collect::<Vec<_>>(),
+            vec![SpanKind::Dim]
+        );
     }
 
     #[test]

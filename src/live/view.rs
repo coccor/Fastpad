@@ -700,6 +700,8 @@ fn flush(state: &mut ViewState) {
         return;
     }
     let checks = std::mem::take(&mut state.height_checks);
+    let (_, view_height) = view_size(state.hwnd);
+    let scroll = state.scroll_y;
     let ViewState {
         editor,
         layout,
@@ -710,6 +712,8 @@ fn flush(state: &mut ViewState) {
     } = state;
     let source = EditorText(editor);
     let all = 0..layout.line_count();
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     let restyle = match pending {
         Pending::Edits(edits) => {
             let changed = document.apply(&source, &edits);
@@ -728,23 +732,54 @@ fn flush(state: &mut ViewState) {
         revealed: revealed.clone(),
         images: &|dest: &str| pictures.resolve(dest),
     };
+    #[cfg(test)]
+    record("flush: parse", started);
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     let dropped = layout.restyle(&text, restyle);
-    // One edited line: lay it out now, and repaint below it only if its height changed.
-    let mut moved_from = dropped.iter().min().copied();
+    #[cfg(test)]
+    record("flush: restyle", started);
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    // Restyled lines on screen, and the one edited line, are laid out again now: only a line
+    // whose height changed repaints everything below it, the others just their own rows (typing
+    // in a table cell restyles a row, not the screen). Restyled lines off screen keep their
+    // heights until they are laid out, so nothing on screen moves for them.
+    let first_visible = layout.line_at_y(scroll);
+    let last_visible = layout.line_at_y(scroll + view_height);
+    let mut relay = dropped
+        .iter()
+        .filter(|&&line| (first_visible..=last_visible).contains(&line))
+        .map(|&line| (line, layout.line_top(line + 1) - layout.line_top(line)))
+        .collect::<Vec<_>>();
+    let mut moved_from = (checks.len() > 1).then_some(0);
     if let [(line, old_height)] = checks[..] {
-        let top = layout.line_top(line);
-        if layout.ensure(&text, line..line + 1).is_ok() {
-            let height = layout.line_top(line + 1) - top;
-            if (height - old_height).abs() > 0.01 {
-                moved_from = Some(moved_from.map_or(line, |from| from.min(line)));
-            }
-        }
-    } else if !checks.is_empty() {
-        moved_from = Some(0);
+        // Its height in the index is an estimate since the edit; the one recorded is its own.
+        relay.retain(|(other, _)| *other != line);
+        relay.push((line, old_height));
     }
+    let mut rows = Vec::new();
+    for (line, old_height) in relay {
+        let top = layout.line_top(line);
+        if layout.ensure(&text, line..line + 1).is_err() {
+            moved_from = Some(moved_from.map_or(line, |from| from.min(line)));
+            continue;
+        }
+        let height = layout.line_top(line + 1) - top;
+        if (height - old_height).abs() > 0.01 {
+            moved_from = Some(moved_from.map_or(line, |from| from.min(line)));
+        } else {
+            rows.push((top, top + height));
+        }
+    }
+    #[cfg(test)]
+    record("flush: lay out", started);
     if let Some(line) = moved_from {
         let top = state.layout.line_top(line);
         invalidate_span(state, top, f32::MAX);
+    }
+    for (top, bottom) in rows {
+        invalidate_span(state, top, bottom);
     }
 }
 

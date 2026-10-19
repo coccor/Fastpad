@@ -134,6 +134,8 @@ pub struct LineLayout {
     /// Where the layout is drawn: its containers' indent.
     pub indent: f32,
     pub decorations: Vec<Decoration>,
+    /// Which of `decorations` are a table row's grid, replaced when its columns move.
+    grid: Range<usize>,
     /// The style it was laid out with: a line is laid out again only when this changes.
     pub style: LineStyle,
     /// Colour runs, lowest rank first, bound to brushes by `bind`.
@@ -344,12 +346,59 @@ impl LiveLayout {
         changed
     }
 
+    /// The width a line indented by `indent` wraps to: a deep nest still leaves a few words a row.
+    fn text_width(&self, indent: f32) -> f32 {
+        (self.width - indent).max((self.fonts.size * 4.0).min(self.width))
+    }
+
+    /// Moves laid-out table row `line` to `columns` in place: its spacers and grid change, its
+    /// text, rows and height do not. False when it must be laid out again instead (the table
+    /// stops or starts fitting the view, or the row is not laid out as a grid row).
+    fn respace(&mut self, line: usize, columns: &[f32], cells: &[f32]) -> bool {
+        let em = self.fonts.size;
+        let Some(width) = self
+            .lines
+            .get(line)
+            .map(|laid| self.text_width(laid.indent))
+        else {
+            return false;
+        };
+        let Some(laid) = self.lines.get_mut(line) else {
+            return false;
+        };
+        let fits = |columns: &[f32]| !columns.is_empty() && columns.iter().sum::<f32>() <= width;
+        if !fits(&laid.columns) || !fits(columns) {
+            return false;
+        }
+        if let BodyStyle::TableRow { aligns, .. } = &laid.style.block.body {
+            let spacers = tables::spacers(cells, columns, aligns, em * 0.5);
+            for (index, &object) in laid.offsets.objects().iter().enumerate() {
+                let width = spacers.get(index).copied().unwrap_or(0.0);
+                let range = DWRITE_TEXT_RANGE {
+                    startPosition: object,
+                    length: 1,
+                };
+                if unsafe { laid.layout.SetInlineObject(&inline_box(width, 1.0), range) }.is_err() {
+                    return false;
+                }
+            }
+        }
+        let grid = grid_lines(&laid.style.block.body, columns, laid.indent, laid.height);
+        let start = laid.grid.start;
+        let count = grid.len();
+        laid.decorations.splice(laid.grid.clone(), grid);
+        laid.grid = start..start + count;
+        laid.columns = columns.to_vec();
+        true
+    }
+
     /// Drops the layout of each laid-out line in `lines` whose style no longer matches `text`;
-    /// returns those lines. Their measured heights stay until they are laid out again.
+    /// returns the lines that must be drawn again. Their measured heights stay until they are
+    /// laid out again.
     ///
     /// A table line in `lines` brings its whole table along: the table's columns are measured
-    /// again (only rows whose text changed are), and every row laid out in other columns is
-    /// dropped too.
+    /// again (only rows whose text changed are), and every other row laid out in other columns
+    /// is re-spaced in place (returned too), or dropped when it cannot be.
     pub fn restyle(&mut self, text: &impl StyledLines, lines: Range<usize>) -> Vec<usize> {
         let end = lines.end.min(self.lines.len());
         let mut dropped = Vec::new();
@@ -375,15 +424,24 @@ impl LiveLayout {
             // A failed measurement drops every row, so the next paint lays them out (and reports
             // the failure) again.
             let columns = self.table_columns(text, table.clone()).unwrap_or_default();
-            for row in table {
+            for row in table.clone() {
                 let moved = self
                     .lines
                     .get(row)
                     .is_some_and(|laid| !laid.columns.is_empty() && laid.columns != columns);
-                if moved {
-                    self.lines.invalidate(row..row + 1);
-                    dropped.push(row);
+                if !moved {
+                    continue;
                 }
+                let key = row_key(&text.line(row), row == table.start);
+                let cells = self
+                    .cell_widths
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| Rc::from([]));
+                if !self.respace(row, &columns, &cells) {
+                    self.lines.invalidate(row..row + 1);
+                }
+                dropped.push(row);
             }
         }
         dropped.sort_unstable();
@@ -637,7 +695,7 @@ impl LiveLayout {
         let em = self.fonts.size;
         let (indent, starts) = self.indents(&shown.block.containers);
         // A deep nest still leaves a few words a row.
-        let text_width = (self.width - indent).max((em * 4.0).min(self.width));
+        let text_width = self.text_width(indent);
         let columns = match table {
             Table::Columns { columns, .. } => columns.to_vec(),
             Table::No | Table::Measure => Vec::new(),
@@ -829,9 +887,11 @@ impl LiveLayout {
             rows.truncate(1);
             rows[0].height = height;
         }
+        let grid_start = decorations.len();
         if grid {
             decorations.extend(grid_lines(&shown.block.body, &columns, indent, height));
         }
+        let grid_decorations = grid_start..decorations.len();
         let first = rows[0];
         // Where a marker sits: centred on the first row's lower-case letters.
         let marker_y = first.top + baseline - em * 0.32;
@@ -884,6 +944,7 @@ impl LiveLayout {
             height,
             indent,
             decorations,
+            grid: grid_decorations,
             style,
             colors,
             backgrounds,
