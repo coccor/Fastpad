@@ -1080,6 +1080,46 @@ fn typing_in_live_costs_the_same_as_typing_in_source() {
 
 #[test]
 #[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
+fn typing_in_live_inside_a_long_paragraph_stays_in_budget() {
+    // Every keystroke reparses this 40-line block and restyles its lines.
+    let paragraph = (0..40)
+        .map(|n| format!("Line {n} with **bold**, *italic*, `code` and a [link](u{n}).\n"))
+        .collect::<String>();
+    let text = format!("# Notes\n\n{paragraph}\n{}", sample_markdown(200_000));
+    let caret = text.find("Line 20").unwrap() + 4;
+    let (source, live) = live_against_source(&text, caret);
+    println!("keystroke p95, long paragraph: source {source} us, live {live} us");
+    assert!(
+        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
+        "source {source} us, live {live} us"
+    );
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
+fn typing_in_live_entering_live_on_a_1_mb_note_is_quick() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    // The process's first Direct2D device costs a one-time ~150 ms whatever is drawn; warm it
+    // on a small note so this measures what entering Live costs per document.
+    main.make_markdown("# Warm up\n");
+    main.set_live(true);
+    unsafe { UpdateWindow(main.live_view().unwrap().hwnd()) };
+    main.set_live(false);
+    main.make_markdown(&sample_markdown(1_000_000));
+    unsafe { SetFocus(main.editor().hwnd()) };
+    pump_pending();
+    let started = Instant::now();
+    main.set_live(true);
+    let view = main.live_view().unwrap();
+    unsafe { UpdateWindow(view.hwnd()) };
+    let elapsed = started.elapsed().as_millis();
+    println!("entering Live on 1 MB: {elapsed} ms to the first frame");
+    assert!(elapsed <= 200, "{elapsed} ms");
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_on_a_10k_line_note_costs_the_same_as_typing_in_source() {
     let text = (0..10_000)
         .map(|n| format!("Line {n} of a long note, with some words to wrap.\n"))

@@ -31,6 +31,9 @@ pub(crate) struct LiveHost {
     shown_for: Option<DocumentId>,
     /// Whether the view is shown in place of the editor.
     shown: bool,
+    /// Whether the view was just created, so it already lays out the editor's text: showing it
+    /// the first time needs no reload.
+    fresh: bool,
     /// The editor's selection as last followed: (anchor, caret, selection count).
     last_selection: Option<(usize, usize, usize)>,
 }
@@ -136,8 +139,9 @@ pub(crate) fn show_text(hwnd: HWND, id: GroupId, shown: bool) {
     };
     let live = shown && wants_live(hwnd, id) && ensure_view(hwnd, id).is_some();
     let document = active_document(hwnd, id).map(|(document, _)| document);
-    let (view, reload) = with_live(hwnd, id, |host| {
-        let reload = live && (!host.shown || host.shown_for != document);
+    let (view, reload, fresh) = with_live(hwnd, id, |host| {
+        let fresh = std::mem::take(&mut host.fresh);
+        let reload = live && !fresh && (!host.shown || host.shown_for != document);
         if reload {
             host.last_selection = None;
         }
@@ -145,13 +149,15 @@ pub(crate) fn show_text(hwnd: HWND, id: GroupId, shown: bool) {
         if live {
             host.shown_for = document;
         }
-        (host.view, reload)
+        (host.view, reload, fresh && live)
     })
-    .unwrap_or((None, false));
+    .unwrap_or((None, false, false));
     let focus = unsafe { GetFocus() };
     if live && let Some(view) = view {
         if reload {
             view.reload();
+        }
+        if reload || fresh {
             view.scroll_to_caret();
         }
         unsafe {
@@ -255,7 +261,10 @@ fn ensure_view(hwnd: HWND, id: GroupId) -> Option<LiveView> {
     let created = create_view(hwnd, id);
     match created {
         Ok(view) => {
-            with_live(hwnd, id, |host| host.view = Some(view));
+            with_live(hwnd, id, |host| {
+                host.view = Some(view);
+                host.fresh = true;
+            });
             Some(view)
         }
         Err(error) => {
