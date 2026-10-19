@@ -120,6 +120,12 @@ impl LineLayout {
         self.bound.set(generation);
     }
 
+    /// The brush generation the colour runs are bound for.
+    #[cfg(test)]
+    pub fn bound(&self) -> u64 {
+        self.bound.get()
+    }
+
     /// The rectangles (line coordinates) covering UTF-16 `start..end`.
     pub fn range_rects(&self, start: u32, end: u32) -> Result<Vec<RectF>> {
         range_rects(&self.layout, start, end, 0.0, 0.0)

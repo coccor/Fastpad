@@ -342,6 +342,15 @@ fn appearance(
                     crate::config::defaults::DEFAULT_FONT_SIZE,
                 )
             });
+    // The Markdown roles as the source view colours them; high contrast keeps to system pairs.
+    let roles = crate::languages::syntax_colors(host_window::effective_theme(hwnd));
+    let role = |color: u32| {
+        if palette.high_contrast {
+            palette.editor_foreground
+        } else {
+            color
+        }
+    };
     let colors = LiveColors {
         background: palette.editor_background,
         text: palette.editor_foreground,
@@ -349,6 +358,17 @@ fn appearance(
         inactive_selection: palette.inactive_selection_background,
         caret: palette.editor_foreground,
         line_number: palette.line_number_foreground,
+        heading: role(roles.heading),
+        emphasis: role(roles.emphasis),
+        marker: role(roles.operator),
+        link: role(roles.link),
+        code: role(roles.code),
+        code_background: if palette.high_contrast {
+            palette.editor_background
+        } else {
+            roles.code_background
+        },
+        dim: role(roles.comment),
     };
     let fonts = LiveFonts::new(
         graphics,

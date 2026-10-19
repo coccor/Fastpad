@@ -1227,3 +1227,167 @@ fn front_matter_is_dimmed_and_not_a_heading() {
         "the closing line is not a setext underline"
     );
 }
+
+/// `lines` lines of filler after `head`, so the view can scroll.
+fn with_filler(head: &str) -> String {
+    let mut text = head.to_owned();
+    for n in 0..200 {
+        text.push_str(&format!("filler line {n}\n"));
+    }
+    text
+}
+
+fn painted(view: LiveView) {
+    unsafe { UpdateWindow(view.hwnd()) };
+    pump_pending();
+    unsafe { UpdateWindow(view.hwnd()) };
+}
+
+#[test]
+fn clicking_below_a_heading_keeps_the_caret_under_the_pointer() {
+    let (_scintilla, main, view) = live_tab(&with_filler("# A big heading\n\nline a\nline b\n"));
+    caret_to(&main, 3);
+    painted(view);
+    // The heading shows as source (one row): line b is the fourth row.
+    let (row, _) = view.row_metrics();
+    let click_y = row * 3 + row / 2;
+    click(
+        view.hwnd(),
+        (row_point(view, 0, 0).0 + 4, click_y),
+        false,
+        false,
+    );
+    painted(view);
+    let line_b = main.editor().line_start(3).unwrap();
+    let caret = caret(&main).1;
+    assert!(
+        caret >= line_b && caret <= line_b + 6,
+        "caret {caret} on line b"
+    );
+    // The heading grew above the click; the caret is still under the pointer.
+    let caret_y = view.caret_client_y().unwrap();
+    assert!(
+        (caret_y - row * 3).abs() <= 1,
+        "caret row top {caret_y}, clicked row top {}",
+        row * 3
+    );
+}
+
+#[test]
+fn moving_onto_a_heading_keeps_the_caret_row_in_place() {
+    let (_scintilla, main, view) = live_tab(&with_filler("intro\n# A big heading\nafter\n"));
+    caret_to(&main, 2);
+    painted(view);
+    let heading_top = view.client_point_of(8).unwrap().1;
+    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
+    painted(view);
+    assert_eq!(view.revealed(), 1..2);
+    let (row, _) = view.row_metrics();
+    let caret_y = view.caret_client_y().unwrap();
+    assert!(
+        (caret_y - row).abs() <= 1,
+        "the caret row starts where the heading did: {caret_y} vs {row} (heading middle {heading_top})"
+    );
+}
+
+#[test]
+fn click_on_rendered_bold_places_the_caret_inside_it() {
+    let (_scintilla, main, view) = live_tab("top\n\naaa **bold** b\n");
+    caret_to(&main, 0);
+    painted(view);
+    // Between `o` and `l`, as drawn.
+    let (x, y) = view.client_point_of(5 + 8).unwrap();
+    click(view.hwnd(), (x + 1, y), false, false);
+    let line = main.editor().line_start(2).unwrap();
+    let inside = caret(&main).1 - line;
+    assert!(
+        (6..=10).contains(&inside),
+        "caret {inside} inside the bold text"
+    );
+    // The right half of `d`: before the closing markers, inside the bold text.
+    caret_to(&main, 0);
+    painted(view);
+    let (d, _) = view.client_point_of(line + 9).unwrap();
+    let (after, _) = view.client_point_of(line + 12).unwrap();
+    click(view.hwnd(), (d + (after - d) * 3 / 4, y), false, false);
+    assert_eq!(caret(&main).1 - line, 10);
+}
+
+#[test]
+fn up_down_cross_rendered_lines_by_their_drawn_rows() {
+    let text = "**alpha** **beta** **gamma**\nplain line here\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 38);
+    painted(view);
+    send_inputs(view.hwnd(), &[Input::Key(VK_UP, false, false)]);
+    let caret = caret(&main).1;
+    for marker in [0..2, 7..11, 15..19, 24..26] {
+        assert!(
+            caret <= marker.start || caret >= marker.end,
+            "caret {caret} inside the marker {marker:?}"
+        );
+    }
+    assert!(caret < 28, "Up went to the first line");
+}
+
+#[test]
+fn moving_the_caret_through_rendered_lines_never_dirties() {
+    let (_scintilla, main, view) = live_tab("# H\n\n**b** and `c`\n\n[l](u)\n");
+    let editor = main.editor();
+    main.mark_clean();
+    let could_undo = editor.can_undo().unwrap();
+    let dirty = || main.with_app(|app| app.tabs.active().unwrap().dirty);
+    send_inputs(
+        view.hwnd(),
+        &[
+            Input::Key(VK_DOWN, false, false),
+            Input::Key(VK_DOWN, false, false),
+            Input::Key(VK_DOWN, false, false),
+            Input::Key(VK_END, true, false),
+            Input::Key(VK_HOME, true, false),
+        ],
+    );
+    click(view.hwnd(), row_point(view, 2, 10), false, false);
+    painted(view);
+    assert_eq!(editor.can_undo().unwrap(), could_undo, "no undo step added");
+    assert!(!dirty());
+}
+
+#[test]
+fn inline_code_paints_its_background() {
+    let (_scintilla, main, view) = live_tab("top\n\nsome `code` here\n");
+    caret_to(&main, 0);
+    painted(view);
+    assert!(view.paint_stats().0 > 0, "a code background was drawn");
+}
+
+#[test]
+fn recreating_the_target_rebinds_colours() {
+    let (_scintilla, main, view) = live_tab("top\n\na [link](u)\n");
+    caret_to(&main, 0);
+    painted(view);
+    let (_, generation) = view.paint_stats();
+    assert_eq!(view.line_binding(2), generation);
+    view.drop_target();
+    painted(view);
+    let (_, recreated) = view.paint_stats();
+    assert!(recreated > generation);
+    assert_eq!(view.line_binding(2), recreated);
+}
+
+#[test]
+fn theme_change_recolours_rendered_lines() {
+    let (_scintilla, main, view) = live_tab("top\n\na [link](u)\n");
+    caret_to(&main, 0);
+    // Explicit themes: the system one may already be either.
+    let theme = |preference| {
+        main.with_app(|app| app.settings.theme = preference);
+        window::live_host::refresh_appearance(main.hwnd);
+        painted(view);
+        view.paint_stats().1
+    };
+    let light = theme(config::ThemePreference::Light);
+    let dark = theme(config::ThemePreference::Dark);
+    assert!(dark > light, "new brushes for the dark theme");
+    assert_eq!(view.line_binding(2), dark);
+}

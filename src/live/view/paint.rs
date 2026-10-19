@@ -78,7 +78,15 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             inactive_selection: brush(state.colors.inactive_selection)?,
             caret: brush(state.colors.caret)?,
             line_number: brush(state.colors.line_number)?,
+            heading: brush(state.colors.heading)?,
+            emphasis: brush(state.colors.emphasis)?,
+            marker: brush(state.colors.marker)?,
+            link: brush(state.colors.link)?,
+            code: brush(state.colors.code)?,
+            code_background: brush(state.colors.code_background)?,
+            dim: brush(state.colors.dim)?,
         });
+        state.brush_generation += 1;
     }
 
     let (_, view_height) = view_size(hwnd);
@@ -178,6 +186,33 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             D2D1_ANTIALIAS_MODE_ALIASED,
         );
         target.Clear(Some(&color_f(state.colors.background)));
+        // Code backgrounds first, so a selection over inline code still shows.
+        #[cfg(test)]
+        let mut backgrounds = 0;
+        for (line, (top, bottom)) in visible.clone().zip(spans.iter().copied()) {
+            if (bottom - scroll_y) < clip_top || (top - scroll_y) > clip_bottom {
+                continue;
+            }
+            let Some(laid) = state.layout.laid_line(line) else {
+                continue;
+            };
+            for &(start, end, paint) in &laid.backgrounds {
+                for area in laid.range_rects(start, end).unwrap_or_default() {
+                    target.FillRectangle(
+                        &rect(area.left, top + area.top, area.right, top + area.bottom),
+                        brushes.paint(paint),
+                    );
+                    #[cfg(test)]
+                    {
+                        backgrounds += 1;
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            state.painted_backgrounds = backgrounds;
+        }
         let selection_brush = if state.focused {
             &brushes.selection
         } else {
@@ -208,6 +243,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 );
             }
             if let Some(laid) = state.layout.laid_line(line) {
+                laid.bind(|paint| Some(brushes.paint(paint)), state.brush_generation);
                 target.DrawTextLayout(
                     Vector2 {
                         X: text_x,

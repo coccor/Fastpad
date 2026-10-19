@@ -14,7 +14,7 @@ use crate::live::blocks::LiveDocument;
 use crate::live::layout::{LiveFonts, LiveLayout};
 use crate::live::reveal;
 use crate::live::scroll;
-use crate::live::styles::Styled;
+use crate::live::styles::{Paint, Styled};
 use crate::live::text::{EditorText, LiveText};
 use crate::platform::{last_error, wide_null};
 use crate::preview::dwrite::Graphics;
@@ -57,6 +57,14 @@ pub struct LiveColors {
     pub inactive_selection: u32,
     pub caret: u32,
     pub line_number: u32,
+    /// The Markdown roles, as the source view colours them (`languages/markdown.rs`).
+    pub heading: u32,
+    pub emphasis: u32,
+    pub marker: u32,
+    pub link: u32,
+    pub code: u32,
+    pub code_background: u32,
+    pub dim: u32,
 }
 
 struct Brushes {
@@ -65,6 +73,29 @@ struct Brushes {
     inactive_selection: ID2D1SolidColorBrush,
     caret: ID2D1SolidColorBrush,
     line_number: ID2D1SolidColorBrush,
+    heading: ID2D1SolidColorBrush,
+    emphasis: ID2D1SolidColorBrush,
+    marker: ID2D1SolidColorBrush,
+    link: ID2D1SolidColorBrush,
+    code: ID2D1SolidColorBrush,
+    code_background: ID2D1SolidColorBrush,
+    dim: ID2D1SolidColorBrush,
+}
+
+impl Brushes {
+    /// The brush for a colour role of a styled line.
+    fn paint(&self, paint: Paint) -> &ID2D1SolidColorBrush {
+        match paint {
+            Paint::Text => &self.text,
+            Paint::Heading => &self.heading,
+            Paint::Emphasis => &self.emphasis,
+            Paint::Marker => &self.marker,
+            Paint::Link => &self.link,
+            Paint::Code => &self.code,
+            Paint::CodeBackground => &self.code_background,
+            Paint::Dim => &self.dim,
+        }
+    }
 }
 
 struct ViewState {
@@ -72,6 +103,12 @@ struct ViewState {
     editor: Editor,
     target: Option<ID2D1HwndRenderTarget>,
     brushes: Option<Brushes>,
+    /// Bumped whenever the brushes are made again: a layout bound for an older generation
+    /// re-binds its colours before it is drawn.
+    brush_generation: u64,
+    /// Code backgrounds drawn by the last frame, for the tests.
+    #[cfg(test)]
+    painted_backgrounds: usize,
     colors: LiveColors,
     layout: LiveLayout,
     /// The document's blocks and spans, as of the last `flush`.
@@ -140,6 +177,9 @@ impl LiveView {
             editor,
             target: None,
             brushes: None,
+            brush_generation: 0,
+            #[cfg(test)]
+            painted_backgrounds: 0,
             colors,
             layout,
             document: LiveDocument::default(),
@@ -367,6 +407,60 @@ impl LiveView {
         .flatten()
     }
 
+    /// Code backgrounds the last frame drew, and the brush generation it drew with.
+    #[cfg(test)]
+    pub fn paint_stats(&self) -> (usize, u64) {
+        self.with(|state| (state.painted_backgrounds, state.brush_generation))
+            .unwrap_or((0, 0))
+    }
+
+    /// The brush generation line `line`'s colours are bound for (0 when not laid out).
+    #[cfg(test)]
+    pub fn line_binding(&self, line: usize) -> u64 {
+        self.with(|state| state.layout.laid_line(line).map_or(0, |laid| laid.bound()))
+            .unwrap_or(0)
+    }
+
+    /// The client point (x, middle of its row y) where the caret at `position` is drawn.
+    #[cfg(test)]
+    pub fn client_point_of(&self, position: usize) -> Option<(i32, i32)> {
+        self.with(|state| {
+            prepare(state);
+            let scale = dpi_scale(state.hwnd);
+            let left = text_left(state);
+            let ViewState {
+                editor,
+                layout,
+                document,
+                revealed,
+                scroll_y,
+                ..
+            } = state;
+            let source = EditorText(editor);
+            let text = Styled {
+                text: &source,
+                document,
+                revealed: revealed.clone(),
+            };
+            let rect = layout.caret_rect(&text, position).ok()?;
+            Some((
+                ((left + rect.left) * scale).round() as i32,
+                (((rect.top + rect.bottom) / 2.0 - *scroll_y) * scale).round() as i32,
+            ))
+        })
+        .flatten()
+    }
+
+    /// Drops the render target, as a lost device does.
+    #[cfg(test)]
+    pub fn drop_target(&self) {
+        self.with(|state| {
+            state.target = None;
+            state.brushes = None;
+        });
+        invalidate(self.hwnd);
+    }
+
     /// The source lines showing as source.
     #[cfg(test)]
     pub fn revealed(&self) -> Range<usize> {
@@ -572,8 +666,17 @@ fn sync_reveal(state: &mut ViewState) -> bool {
         document,
         revealed: new.clone(),
     };
+    // Lines that changed state between the top of the view and the caret are laid out again
+    // now: until then they keep their old heights, and the caret's new top would not show the
+    // change. Lines above the view are held steady by the paint's anchor instead.
+    let caret_line = LiveText::line_of(&source, caret);
+    let first_visible = layout.line_at_y(*scroll_y);
     for lines in reveal::changed(old, new) {
-        layout.restyle(&text, lines);
+        layout.restyle(&text, lines.clone());
+        let relay = lines.start.max(first_visible)..lines.end.min(caret_line + 1);
+        if relay.start < relay.end {
+            let _ = layout.ensure(&text, relay);
+        }
     }
     if let (Some(before), Ok(after)) = (before, layout.caret_rect(&text, caret)) {
         *scroll_y += after.top - before.top;

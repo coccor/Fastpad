@@ -289,7 +289,7 @@ const SYNTAX_COLORS: [SyntaxColors; Theme::COUNT] = [
     LAMP_SYNTAX,
 ];
 
-#[cfg(test)]
+/// The syntax colours of `theme`: the source view's, and the Live view's Markdown roles.
 pub(crate) const fn syntax_colors(theme: Theme) -> SyntaxColors {
     SYNTAX_COLORS[theme as usize]
 }
