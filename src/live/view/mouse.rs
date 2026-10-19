@@ -108,6 +108,26 @@ pub(super) fn press(hwnd: HWND, lparam: isize) {
         if followed != 0 {
             return;
         }
+        // A Markdown link: through the preview's link path, as a preview click.
+        let dest = with_state(hwnd, |state| link_under(state, at))
+            .flatten()
+            .filter(|link| !link.wiki)
+            .map(|link| link.dest);
+        if let Some(dest) = dest {
+            let payload = Box::into_raw(Box::new(dest));
+            let posted = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    crate::platform::win32::root_window(hwnd),
+                    crate::window::WM_FASTPAD_PREVIEW_LINK,
+                    hwnd as usize,
+                    payload as isize,
+                )
+            };
+            if posted == 0 {
+                drop(unsafe { Box::from_raw(payload) });
+            }
+            return;
+        }
     }
     let time = unsafe { GetMessageTime() } as u32;
     let extend = down(VK_SHIFT);
@@ -226,6 +246,45 @@ pub(super) fn autoscroll(hwnd: HWND) {
     }
     invalidate(hwnd);
     post_changed(hwnd, true);
+}
+
+/// The link (rendered or revealed) under client point `at`.
+fn link_under(state: &mut ViewState, at: (i32, i32)) -> Option<crate::live::spans::LinkSpan> {
+    let position = position_at(state, at);
+    let source = EditorText(&state.editor);
+    state.document.link_at(&source, position)
+}
+
+/// `WM_SETCURSOR` over the text, and Ctrl going down or up: a hand over a link while Ctrl is
+/// held, the I-beam otherwise.
+pub(super) fn update_cursor(hwnd: HWND) {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, IDC_HAND, IDC_IBEAM, LoadCursorW, SetCursor,
+    };
+    let mut point = POINT::default();
+    unsafe {
+        GetCursorPos(&mut point);
+        ScreenToClient(hwnd, &mut point);
+    }
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client) };
+    let inside = point.x >= client.left
+        && point.x < client.right
+        && point.y >= client.top
+        && point.y < client.bottom;
+    if !inside {
+        return;
+    }
+    let hand = down(VK_CONTROL)
+        && with_state(hwnd, |state| {
+            link_under(state, (point.x, point.y)).is_some()
+        })
+        .unwrap_or(false);
+    with_state(hwnd, |state| state.hand = hand);
+    let cursor = if hand { IDC_HAND } else { IDC_IBEAM };
+    unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };
 }
 
 /// `WM_LBUTTONUP` and `WM_CAPTURECHANGED`: the drag ends.

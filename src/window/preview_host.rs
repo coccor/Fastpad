@@ -1089,6 +1089,18 @@ fn follow(hwnd: HWND, dest: String) {
             }
         }
         LinkAction::Anchor(anchor) => {
+            // A link clicked in the Live view goes to the heading in the editor.
+            let live = target_group(hwnd)
+                .filter(|&id| crate::window::live_host::view_hwnd(hwnd, id).is_some());
+            if let Some(id) = live {
+                if !crate::window::live_host::go_to_anchor(hwnd, id, &anchor) {
+                    host_window::push_notice(
+                        hwnd,
+                        format!("No heading in this document matches #{anchor}."),
+                    );
+                }
+                return;
+            }
             if !view(hwnd).is_some_and(|view| view.scroll_to_anchor(&anchor)) {
                 host_window::push_notice(
                     hwnd,

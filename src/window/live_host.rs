@@ -412,6 +412,36 @@ pub(crate) fn edited(hwnd: HWND, id: GroupId, notification: &crate::editor::Scin
 const MULTIPLE_SELECTIONS_NOTICE: &str =
     "Live Markdown works with one selection. Switched to the source view.";
 
+/// Moves group `id`'s caret to the ATX heading whose slug is `anchor` (a `#heading` link
+/// followed in the Live view); false when no heading matches.
+pub(crate) fn go_to_anchor(hwnd: HWND, id: GroupId, anchor: &str) -> bool {
+    let Some(editor) = host_window::group_editor(hwnd, id) else {
+        return false;
+    };
+    let Ok(count) = editor.line_count() else {
+        return false;
+    };
+    let found = (0..count).find(|&line| {
+        editor.line_text(line).is_ok_and(|text| {
+            let trimmed = text.trim_start();
+            let level = trimmed.bytes().take_while(|b| *b == b'#').count();
+            (1..=6).contains(&level)
+                && trimmed[level..].starts_with([' ', '\t'])
+                && crate::preview::links::slug(trimmed[level..].trim().trim_end_matches('#').trim())
+                    == anchor
+        })
+    });
+    let Some(line) = found else {
+        return false;
+    };
+    let Ok(start) = editor.line_start(line) else {
+        return false;
+    };
+    let _ = editor.set_selection(start..start);
+    poll(hwnd, id, false);
+    true
+}
+
 /// Follows group `id`'s editor after anything that may have moved its selection or scrolled its
 /// Live view (`scrolled`): a hidden Scintilla sends no `SCN_UPDATEUI` for either, so the Live
 /// view, the status bar and the writing helpers' table tracking are told from here. Called after

@@ -1358,6 +1358,9 @@ fn inline_code_paints_its_background() {
     let (_scintilla, main, view) = live_tab("top\n\nsome `code` here\n");
     caret_to(&main, 0);
     painted(view);
+    // A whole frame: a partial one (a caret blink) may not reach the code line.
+    view.set_top_line(0);
+    unsafe { UpdateWindow(view.hwnd()) };
     assert!(view.paint_stats().0 > 0, "a code background was drawn");
 }
 
@@ -1390,4 +1393,124 @@ fn theme_change_recolours_rendered_lines() {
     let dark = theme(config::ThemePreference::Dark);
     assert!(dark > light, "new brushes for the dark theme");
     assert_eq!(view.line_binding(2), dark);
+}
+
+#[test]
+fn ctrl_click_on_a_rendered_link_opens_it() {
+    let text = with_filler("# Target heading\n\nsee [jump](#target-heading) here\n\n");
+    let (_scintilla, main, view) = live_tab(&text);
+    let end = main.editor().length().unwrap();
+    caret_to(&main, end);
+    caret_to(&main, 36);
+    caret_to(&main, end);
+    painted(view);
+    // Scroll back to the top so the link is on screen, rendered.
+    view.set_top_line(0);
+    painted(view);
+    let link_text = text.find("jump").unwrap() + 1;
+    let point = view.client_point_of(link_text).unwrap();
+    click(view.hwnd(), point, true, false);
+    pump_pending();
+    assert_eq!(caret(&main), (0, 0), "the caret went to the heading");
+}
+
+#[test]
+fn ctrl_click_on_a_rendered_wikilink_follows_it() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN;
+    let (_scintilla, main, view) = live_tab("top\n\nsee [[Other note|the other]] end\n");
+    caret_to(&main, 0);
+    painted(view);
+    let (x, y) = view
+        .client_point_of(5 + "see [[Other note|th".len())
+        .unwrap();
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[usize::from(VK_CONTROL)] = 0x80;
+    unsafe {
+        SetKeyboardState(keys.as_ptr());
+        SendMessageW(
+            view.hwnd(),
+            WM_LBUTTONDOWN,
+            0,
+            ((y as u32) << 16 | x as u32) as isize,
+        );
+        SetKeyboardState(original.as_ptr());
+    }
+    let mut msg = MSG::default();
+    let posted = unsafe {
+        PeekMessageW(
+            &mut msg,
+            main.hwnd,
+            window::WM_FASTPAD_PREVIEW_LINK,
+            window::WM_FASTPAD_PREVIEW_LINK,
+            PM_REMOVE,
+        )
+    } != 0;
+    assert!(posted, "the wikilink was followed");
+    let destination = unsafe { Box::from_raw(msg.lParam as *mut String) };
+    assert!(destination.contains("Other note"), "{destination}");
+    assert_eq!(caret(&main), (0, 0), "the click was taken");
+}
+
+#[test]
+fn plain_click_on_a_link_places_the_caret() {
+    let (_scintilla, main, view) = live_tab("top\n\nsee [jump](#nowhere) end\n");
+    caret_to(&main, 0);
+    painted(view);
+    let point = view.client_point_of(5 + "see [ju".len()).unwrap();
+    click(view.hwnd(), point, false, false);
+    let line = main.editor().line_start(2).unwrap();
+    let at = caret(&main).1 - line;
+    assert!((5..=9).contains(&at), "caret {at} in the link text");
+    assert!(main.notices().is_empty(), "{:?}", main.notices());
+}
+
+#[test]
+fn the_cursor_is_a_hand_over_a_link_with_ctrl() {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, HTCLIENT, SetCursorPos, WM_SETCURSOR,
+    };
+    let (_scintilla, main, view) = live_tab("top\n\nsee [jump](u) and plain text\n");
+    caret_to(&main, 0);
+    painted(view);
+    let mut original_pointer = POINT::default();
+    unsafe { GetCursorPos(&mut original_pointer) };
+    let hand_at = |position: usize, ctrl: bool| {
+        let (x, y) = view.client_point_of(position).unwrap();
+        let mut point = POINT { x: x + 2, y };
+        unsafe {
+            ClientToScreen(view.hwnd(), &mut point);
+            SetCursorPos(point.x, point.y);
+        }
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[usize::from(VK_CONTROL)] = if ctrl { 0x80 } else { 0 };
+        unsafe {
+            SetKeyboardState(keys.as_ptr());
+            SendMessageW(
+                view.hwnd(),
+                WM_SETCURSOR,
+                view.hwnd() as usize,
+                HTCLIENT as isize,
+            );
+            SetKeyboardState(original.as_ptr());
+        }
+        view.hand_cursor()
+    };
+    let link = 5 + "see [ju".len();
+    let plain = 5 + "see [jump](u) and pl".len();
+    assert!(hand_at(link, true), "a hand over a link with Ctrl");
+    assert!(!hand_at(link, false), "the I-beam without Ctrl");
+    assert!(!hand_at(plain, true), "the I-beam off a link");
+    unsafe { SetCursorPos(original_pointer.x, original_pointer.y) };
 }

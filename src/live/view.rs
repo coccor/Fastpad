@@ -135,6 +135,8 @@ struct ViewState {
     drag: Option<mouse::Drag>,
     /// The last press, for counting double and triple clicks.
     clicks: Option<mouse::Click>,
+    /// Whether the pointer shows the hand: over a link with Ctrl held.
+    hand: bool,
     /// Where the caret was drawn last, in client pixels: x, y and height.
     caret_px: Option<(i32, i32, i32)>,
     /// The document rows (top, bottom in DIPs) the last frame drew the selection and caret on,
@@ -194,6 +196,7 @@ impl LiveView {
             goal: None,
             drag: None,
             clicks: None,
+            hand: false,
             caret_px: None,
             marks: None,
             caret_span: None,
@@ -449,6 +452,12 @@ impl LiveView {
             ))
         })
         .flatten()
+    }
+
+    /// Whether the pointer last showed the hand.
+    #[cfg(test)]
+    pub fn hand_cursor(&self) -> bool {
+        self.with(|state| state.hand).unwrap_or(false)
     }
 
     /// Drops the render target, as a lost device does.
