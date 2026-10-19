@@ -21,9 +21,12 @@ use crate::live::spans::{Container, Marker};
 use crate::live::styles::{BodyStyle, Effect, ImageInfo, LineStyle, Paint, StyledLines, effects};
 use crate::preview::dwrite::{Graphics, hresult_error};
 use crate::preview::heights::HeightIndex;
+use crate::preview::inline_object::inline_box;
 use crate::preview::layout::{CODE_SCALE, HEADING_SCALE};
 use crate::preview::render::RectF;
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -32,7 +35,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
     DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat,
+    IDWriteTextLayout,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -136,6 +140,9 @@ pub struct LineLayout {
     colors: Vec<(DWRITE_TEXT_RANGE, Paint)>,
     /// UTF-16 ranges filled behind the text (inline code), and their colour.
     pub backgrounds: Vec<(u32, u32, Paint)>,
+    /// A table row's column widths when it was laid out (empty for any other line): the row is
+    /// laid out again when its table's columns change.
+    pub columns: Vec<f32>,
     /// The brush generation the colour runs were bound for; 0 = never.
     bound: Cell<u64>,
 }
@@ -187,8 +194,42 @@ pub struct LiveLayout {
     char_width: f32,
     /// The width of one digit, for the line-number gutter.
     digit_width: f32,
+    /// Each table row's cell widths, by `row_key`; cleared with every reset (new fonts or width).
+    cell_widths: HashMap<u64, Rc<[f32]>>,
+    /// Lines laid out and table rows measured, for the tests that check what is redone.
+    #[cfg(test)]
+    pub(crate) counts: Cell<(usize, usize)>,
     /// Last, so the layouts and format above are released before it can unload DirectWrite.
     graphics: Rc<Graphics>,
+}
+
+/// How a table row or delimiter is laid out.
+#[derive(Clone, Copy)]
+enum Table<'a> {
+    /// Not a table line, or one whose table could not be found.
+    No,
+    /// Measuring its cells: zero-width spacers, no wrapping.
+    Measure,
+    /// In its table's `columns`; `cells` are this row's cell widths.
+    Columns {
+        columns: &'a [f32],
+        cells: &'a [f32],
+    },
+}
+
+/// The cell-width cache key of a table row: its text, and whether it is the header.
+fn row_key(source: &str, header: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    header.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn is_table(style: &LineStyle) -> bool {
+    matches!(
+        style.block.body,
+        BodyStyle::TableRow { .. } | BodyStyle::TableDelimiter
+    )
 }
 
 impl LiveLayout {
@@ -206,6 +247,9 @@ impl LiveLayout {
             heights: HeightIndex::default(),
             char_width,
             digit_width,
+            cell_widths: HashMap::new(),
+            #[cfg(test)]
+            counts: Cell::new((0, 0)),
         })
     }
 
@@ -245,6 +289,7 @@ impl LiveLayout {
     pub fn reset(&mut self, text: &impl StyledLines) {
         let count = text.line_count();
         self.lines.reset(count);
+        self.cell_widths.clear();
         let estimates = (0..count)
             .map(|line| self.estimate(text, line))
             .collect::<Vec<_>>();
@@ -295,20 +340,85 @@ impl LiveLayout {
 
     /// Drops the layout of each laid-out line in `lines` whose style no longer matches `text`;
     /// returns those lines. Their measured heights stay until they are laid out again.
+    ///
+    /// A table line in `lines` brings its whole table along: the table's columns are measured
+    /// again (only rows whose text changed are), and every row laid out in other columns is
+    /// dropped too.
     pub fn restyle(&mut self, text: &impl StyledLines, lines: Range<usize>) -> Vec<usize> {
         let end = lines.end.min(self.lines.len());
         let mut dropped = Vec::new();
+        let mut tables: Vec<Range<usize>> = Vec::new();
         for line in lines.start.min(end)..end {
-            let stale = self
-                .lines
-                .get(line)
-                .is_some_and(|laid| laid.style != text.line_style(line));
-            if stale {
+            let Some(laid) = self.lines.get(line) else {
+                continue;
+            };
+            let style = text.line_style(line);
+            let table = is_table(&style) || is_table(&laid.style) || !laid.columns.is_empty();
+            if laid.style != style {
                 self.lines.invalidate(line..line + 1);
                 dropped.push(line);
             }
+            if table
+                && !tables.iter().any(|known| known.contains(&line))
+                && let Some(lines) = text.table_lines(line)
+            {
+                tables.push(lines);
+            }
         }
+        for table in tables {
+            // A failed measurement drops every row, so the next paint lays them out (and reports
+            // the failure) again.
+            let columns = self.table_columns(text, table.clone()).unwrap_or_default();
+            for row in table {
+                let moved = self
+                    .lines
+                    .get(row)
+                    .is_some_and(|laid| !laid.columns.is_empty() && laid.columns != columns);
+                if moved {
+                    self.lines.invalidate(row..row + 1);
+                    dropped.push(row);
+                }
+            }
+        }
+        dropped.sort_unstable();
+        dropped.dedup();
         dropped
+    }
+
+    /// The column widths of the table on `lines`: each row's cells measured once per text.
+    fn table_columns(&mut self, text: &impl StyledLines, lines: Range<usize>) -> Result<Vec<f32>> {
+        let mut rows = Vec::with_capacity(lines.len());
+        for line in lines.clone() {
+            let source = text.line(line);
+            let key = row_key(&source, line == lines.start);
+            if let Some(widths) = self.cell_widths.get(&key) {
+                rows.push(Rc::clone(widths));
+                continue;
+            }
+            let style = text.rendered_style(line);
+            let widths: Rc<[f32]> = if matches!(style.block.body, BodyStyle::TableRow { .. }) {
+                #[cfg(test)]
+                {
+                    let (laid, measured) = self.counts.get();
+                    self.counts.set((laid, measured + 1));
+                }
+                let laid = self.lay_out(&source, style, None, Table::Measure)?;
+                tables::measure_row(&laid.layout, &laid.offsets)?.into()
+            } else {
+                // The delimiter row: no cells.
+                Rc::from([])
+            };
+            // Typing in a cell keeps adding texts; never let the cache grow without bound.
+            if self.cell_widths.len() >= 4096 {
+                self.cell_widths.clear();
+            }
+            self.cell_widths.insert(key, Rc::clone(&widths));
+            rows.push(widths);
+        }
+        Ok(tables::columns(
+            rows.iter().map(|row| &row[..]),
+            self.fonts.size * 0.5,
+        ))
     }
 
     /// Lays out the lines in `lines` that are not laid out yet.
@@ -316,6 +426,11 @@ impl LiveLayout {
         let end = lines.end.min(self.lines.len());
         for line in lines.start.min(end)..end {
             if self.lines.get(line).is_none() {
+                #[cfg(test)]
+                {
+                    let (laid, measured) = self.counts.get();
+                    self.counts.set((laid + 1, measured));
+                }
                 let laid = self.lay_out_line(text, line)?;
                 self.heights.set_measured(line, laid.height);
                 self.lines.set(line, laid);
@@ -443,8 +558,25 @@ impl LiveLayout {
     }
 
     /// Lays out `line` from its style, finding an image line's picture first.
-    fn lay_out_line(&self, text: &impl StyledLines, line: usize) -> Result<LineLayout> {
+    fn lay_out_line(&mut self, text: &impl StyledLines, line: usize) -> Result<LineLayout> {
         let style = text.line_style(line);
+        let source = text.line(line);
+        if is_table(&style)
+            && let Some(table) = text.table_lines(line)
+        {
+            let header = line == table.start;
+            let columns = self.table_columns(text, table)?;
+            let cells = self
+                .cell_widths
+                .get(&row_key(&source, header))
+                .cloned()
+                .unwrap_or_else(|| Rc::from([]));
+            let table = Table::Columns {
+                columns: &columns,
+                cells: &cells,
+            };
+            return self.lay_out(&source, style, None, table);
+        }
         let image = match &style.block.body {
             BodyStyle::Image { dest, .. } => match text.image(dest) {
                 ImageInfo::Ready { path, size } => Some((path, size)),
@@ -452,7 +584,7 @@ impl LiveLayout {
             },
             _ => None,
         };
-        self.lay_out(&text.line(line), style, image)
+        self.lay_out(&source, style, image, Table::No)
     }
 
     /// The indent of a line inside `containers`, and where each container's margin starts.
@@ -473,8 +605,9 @@ impl LiveLayout {
         line: &str,
         style: LineStyle,
         image: Option<(PathBuf, (u32, u32))>,
+        table: Table<'_>,
     ) -> Result<LineLayout> {
-        let shown = if image.is_none() && matches!(style.block.body, BodyStyle::Image { .. }) {
+        let mut shown = if image.is_none() && matches!(style.block.body, BodyStyle::Image { .. }) {
             style.image_fallback()
         } else {
             style.clone()
@@ -483,6 +616,15 @@ impl LiveLayout {
         let (indent, starts) = self.indents(&shown.block.containers);
         // A deep nest still leaves a few words a row.
         let text_width = (self.width - indent).max((em * 4.0).min(self.width));
+        let columns = match table {
+            Table::Columns { columns, .. } => columns.to_vec(),
+            Table::No | Table::Measure => Vec::new(),
+        };
+        let grid = !columns.is_empty() && columns.iter().sum::<f32>() <= text_width;
+        if matches!(table, Table::Columns { .. }) && !grid {
+            // Too wide for the view (no horizontal scrolling): the row shows as its source.
+            shown = LineStyle::plain(line.len());
+        }
         let offsets = OffsetMap::new(line, shown.pieces.iter().cloned());
         let layout = unsafe {
             self.graphics.dwrite.CreateTextLayout(
@@ -567,6 +709,33 @@ impl LiveLayout {
                 applied.map_err(hresult_error)?;
             }
         }
+        if matches!(shown.block.body, BodyStyle::TableRow { .. }) {
+            let widths = match table {
+                Table::Columns { columns, cells } => {
+                    let aligns = match &shown.block.body {
+                        BodyStyle::TableRow { aligns, .. } => aligns.clone(),
+                        _ => Rc::from([]),
+                    };
+                    tables::spacers(cells, columns, &aligns, em * 0.5)
+                }
+                Table::No | Table::Measure => Vec::new(),
+            };
+            unsafe {
+                layout
+                    .SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)
+                    .map_err(hresult_error)?;
+                for (index, &object) in offsets.objects().iter().enumerate() {
+                    let width = widths.get(index).copied().unwrap_or(0.0);
+                    let range = DWRITE_TEXT_RANGE {
+                        startPosition: object,
+                        length: 1,
+                    };
+                    layout
+                        .SetInlineObject(&inline_box(width, 1.0), range)
+                        .map_err(hresult_error)?;
+                }
+            }
+        }
         let colors = shown
             .colour_runs()
             .into_iter()
@@ -638,6 +807,9 @@ impl LiveLayout {
             rows.truncate(1);
             rows[0].height = height;
         }
+        if grid {
+            decorations.extend(grid_lines(&shown.block.body, &columns, indent, height));
+        }
         let first = rows[0];
         // Where a marker sits: centred on the first row's lower-case letters.
         let marker_y = first.top + baseline - em * 0.32;
@@ -693,6 +865,7 @@ impl LiveLayout {
             style,
             colors,
             backgrounds,
+            columns,
             bound: Cell::new(0),
         })
     }
@@ -818,6 +991,35 @@ impl<T: StyledLines> LineGeometry for Geometry<'_, T> {
     fn page_height(&self) -> f32 {
         self.page_height
     }
+}
+
+/// A table line's grid in `columns` from `indent`: the header's fill and top border, each row's
+/// bottom border, and the column edges down every row and the delimiter.
+fn grid_lines(body: &BodyStyle, columns: &[f32], indent: f32, height: f32) -> Vec<Decoration> {
+    let right = indent + columns.iter().sum::<f32>();
+    let line = |from: (f32, f32), to: (f32, f32)| Decoration::Line {
+        from,
+        to,
+        paint: Paint::Rule,
+    };
+    let mut decorations = Vec::new();
+    if let BodyStyle::TableRow { header, .. } = body {
+        if *header {
+            decorations.push(Decoration::Fill {
+                rect: RectF::new(indent, 0.0, right, height),
+                paint: Paint::CodeBackground,
+            });
+            decorations.push(line((indent, 0.0), (right, 0.0)));
+        }
+        decorations.push(line((indent, height), (right, height)));
+    }
+    let mut x = indent;
+    decorations.push(line((x, 0.0), (x, height)));
+    for width in columns {
+        x += width;
+        decorations.push(line((x, 0.0), (x, height)));
+    }
+    decorations
 }
 
 /// How much a container indents the lines inside it, for text size `em`: a quote's bar and gap,
@@ -983,6 +1185,8 @@ fn range_rects(
         })
         .collect())
 }
+
+mod tables;
 
 #[cfg(test)]
 mod tests;

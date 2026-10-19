@@ -648,3 +648,200 @@ mod blocks {
         assert_eq!(laid.style, lines.line_style(0));
     }
 }
+
+mod tables {
+    use super::layout;
+    use crate::live::blocks::LiveDocument;
+    use crate::live::layout::{Decoration, LiveLayout};
+    use crate::live::styles::{Paint, Styled, no_images};
+    use crate::live::text::{LiveText, MemoryText};
+    use std::ops::Range;
+
+    /// No line revealed.
+    const NONE: Range<usize> = usize::MAX - 1..usize::MAX;
+
+    /// `source`, its document and the layout at `width` with every line laid out, given to
+    /// `check` with the styled lines.
+    fn with_table(
+        source: &str,
+        width: f32,
+        revealed: Range<usize>,
+        check: impl FnOnce(&mut LiveLayout, &Styled<'_, MemoryText>),
+    ) {
+        let text = MemoryText::new(source);
+        let document = LiveDocument::parse(text.text());
+        let lines = Styled {
+            text: &text,
+            document: &document,
+            revealed,
+            images: &no_images,
+        };
+        let mut layout = layout(width);
+        layout.reset(&lines);
+        layout.ensure(&lines, 0..text.line_count()).unwrap();
+        check(&mut layout, &lines);
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.5
+    }
+
+    /// The x of the caret at the first byte of `needle` on `line`.
+    fn x_of(
+        layout: &mut LiveLayout,
+        lines: &Styled<'_, MemoryText>,
+        line: usize,
+        needle: &str,
+    ) -> f32 {
+        let start = lines.line_start(line);
+        let at = start + lines.line(line).find(needle).unwrap();
+        layout.caret_rect(lines, at).unwrap().left
+    }
+
+    #[test]
+    fn cells_line_up_across_rows() {
+        let source = "| a | bbbbbb | x |\n|---|---|--:|\n| cccccc | d | yyyy |\n";
+        with_table(source, 600.0, NONE, |layout, lines| {
+            assert!(near(
+                x_of(layout, lines, 0, "bbb"),
+                x_of(layout, lines, 2, "d")
+            ));
+            assert!(near(
+                x_of(layout, lines, 0, "a"),
+                x_of(layout, lines, 2, "ccc")
+            ));
+            // The third column is right-aligned: its cells end together.
+            let end = |layout: &mut LiveLayout, line: usize, cell: &str| {
+                let at = lines.line_start(line) + lines.line(line).find(cell).unwrap() + cell.len();
+                layout.caret_rect(lines, at).unwrap().left
+            };
+            assert!(near(end(layout, 0, "x"), end(layout, 2, "yyyy")));
+            let header = layout.laid_line(0).unwrap();
+            assert_eq!(header.columns.len(), 3);
+            assert!(header.decorations.iter().any(|decoration| matches!(
+                decoration,
+                Decoration::Fill {
+                    paint: Paint::CodeBackground,
+                    ..
+                }
+            )));
+            let delimiter = layout.laid_line(1).unwrap();
+            assert!(delimiter.height < header.height);
+            assert_eq!(
+                delimiter
+                    .decorations
+                    .iter()
+                    .filter(|decoration| matches!(decoration, Decoration::Line { .. }))
+                    .count(),
+                4
+            );
+        });
+    }
+
+    /// Lays `before` out, then restyles every line for `after` (same line count); returns the
+    /// lines dropped and how many rows were measured for it.
+    fn restyled(before: &str, after: &str) -> (Vec<usize>, usize, f32, f32) {
+        let old_text = MemoryText::new(before);
+        let old_document = LiveDocument::parse(old_text.text());
+        let old = Styled {
+            text: &old_text,
+            document: &old_document,
+            revealed: NONE,
+            images: &no_images,
+        };
+        let mut layout = layout(600.0);
+        layout.reset(&old);
+        layout.ensure(&old, 0..old_text.line_count()).unwrap();
+        let x_before = x_of(&mut layout, &old, 2, "d");
+        let new_text = MemoryText::new(after);
+        let new_document = LiveDocument::parse(new_text.text());
+        let new = Styled {
+            text: &new_text,
+            document: &new_document,
+            revealed: NONE,
+            images: &no_images,
+        };
+        let (_, measured) = layout.counts.get();
+        let dropped = layout.restyle(&new, 0..new_text.line_count());
+        let (_, measured_after) = layout.counts.get();
+        layout.ensure(&new, 0..new_text.line_count()).unwrap();
+        let x_after = x_of(&mut layout, &new, 2, "d");
+        (dropped, measured_after - measured, x_before, x_after)
+    }
+
+    #[test]
+    fn widening_a_cell_moves_its_column_in_every_row() {
+        let (dropped, measured, before, after) = restyled(
+            "| a | b |\n|---|---|\n| c | d |\n",
+            "| aaaaaaaaaaaa | b |\n|---|---|\n| c | d |\n",
+        );
+        assert_eq!(dropped, vec![0, 1, 2]);
+        assert_eq!(measured, 1);
+        assert!(after > before + 20.0, "{before} -> {after}");
+    }
+
+    #[test]
+    fn typing_in_a_cell_that_stays_narrow_lays_out_one_row() {
+        let (dropped, measured, before, after) = restyled(
+            "| aaaaaaaa | b |\n|---|---|\n| c | d |\n| e | f |\n",
+            "| aaaaaaaa | b |\n|---|---|\n| cc | d |\n| e | f |\n",
+        );
+        assert_eq!(dropped, vec![2]);
+        assert_eq!(measured, 1);
+        assert!(near(before, after));
+    }
+
+    #[test]
+    fn a_table_wider_than_the_view_shows_as_source() {
+        let row = format!("| {} | {} |", "w".repeat(60), "v".repeat(60));
+        let source = format!("{row}\n|---|---|\n| a | b |\n");
+        with_table(&source, 300.0, NONE, |layout, _| {
+            let laid = layout.laid_line(0).unwrap();
+            assert_eq!(String::from_utf16_lossy(laid.offsets.layout_text()), row);
+            assert!(!laid.columns.is_empty());
+            assert!(laid.decorations.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_revealed_row_is_source_and_the_rest_keep_the_grid() {
+        let source = "| a | b |\n|---|---|\n| c | d |\n";
+        with_table(source, 600.0, 2..3, |layout, _| {
+            let revealed = layout.laid_line(2).unwrap();
+            assert_eq!(
+                String::from_utf16_lossy(revealed.offsets.layout_text()),
+                "| c | d |"
+            );
+            assert!(revealed.columns.is_empty());
+            let header = layout.laid_line(0).unwrap();
+            assert_eq!(header.offsets.objects().len(), 3);
+            assert_eq!(header.columns.len(), 2);
+        });
+    }
+
+    #[test]
+    fn hits_on_a_spacer_land_on_a_cell_edge() {
+        let source = "| a | bbbbbbbb |\n|---|---|\n| cccccccccc | d |\n";
+        with_table(source, 600.0, NONE, |layout, lines| {
+            // Between the end of `a` and the start of `bbbbbbbb`: inside the spacer.
+            let a = x_of(layout, lines, 0, "a");
+            let b = x_of(layout, lines, 0, "bbb");
+            let top = layout.line_top(0);
+            let hit = layout.position_at(lines, (a + b) / 2.0, top + 2.0).unwrap();
+            assert!(hit == 4 || hit == 5, "{hit}");
+        });
+    }
+
+    #[test]
+    fn changing_the_width_remeasures() {
+        let source = "| a | b |\n|---|---|\n| c | d |\n";
+        with_table(source, 600.0, NONE, |layout, lines| {
+            let (_, measured) = layout.counts.get();
+            assert_eq!(measured, 2);
+            layout.set_width(lines, 500.0);
+            layout.ensure(lines, 0..3).unwrap();
+            let (_, measured) = layout.counts.get();
+            assert_eq!(measured, 4);
+        });
+    }
+}

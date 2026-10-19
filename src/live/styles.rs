@@ -490,6 +490,12 @@ pub trait StyledLines: LiveText {
         None
     }
 
+    /// `line`'s style as if it were not revealed: what a table measures its rows by, the
+    /// revealed row included.
+    fn rendered_style(&self, line: usize) -> LineStyle {
+        self.line_style(line)
+    }
+
     /// What an image line whose destination is `dest` shows.
     fn image(&self, _dest: &str) -> ImageInfo {
         ImageInfo::Unavailable
@@ -548,6 +554,13 @@ impl<T: LiveText + SourceText> StyledLines for Styled<'_, T> {
         let spans = self.document.spans_in(self.text, bytes.clone());
         let block = self.document.line_block(self.text, bytes.clone());
         line_style(&spans, block.as_ref(), bytes, self.revealed.contains(&line))
+    }
+
+    fn rendered_style(&self, line: usize) -> LineStyle {
+        let bytes = self.text.line_start(line)..self.text.line_end(line);
+        let spans = self.document.spans_in(self.text, bytes.clone());
+        let block = self.document.line_block(self.text, bytes.clone());
+        line_style(&spans, block.as_ref(), bytes, false)
     }
 
     fn table_lines(&self, line: usize) -> Option<Range<usize>> {

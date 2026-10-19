@@ -83,7 +83,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
    - **Decorations:**
      - cell borders as hairlines in the Rule paint, the outer border included;
      - a header fill in `CodeBackground`;
-     - every other body row striped in `CodeBackground` at half opacity.
+     - no body-row stripes: the paints have no half-opacity colour, and the borders already separate rows (decided while building Task 5).
    - **A revealed row** is plain source. Other rows keep the grid, re-laid only if the edit changes a column width.
 5. **Images.**
    - **Thumbnail:** a line whose only content is one image (optionally wrapped in a link) with a local destination (`resolve_image_path` against the document's folder) renders as a thumbnail. All its text is hidden; the line's height is the image's, scaled to at most `300 ×` zoom-scale DIPs tall and to the text width, plus `0.25 em` above and below. The painter draws the bitmap there.
