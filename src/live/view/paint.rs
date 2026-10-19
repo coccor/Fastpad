@@ -2,11 +2,16 @@
 //! Direct2D, and the scroll bar state a frame leaves behind.
 
 use super::*;
-use crate::preview::render::{color_f, create_hwnd_target};
+use crate::preview::render::{color_f, create_hwnd_target_with};
 use windows::Win32::Foundation::D2DERR_RECREATE_TARGET;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE;
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_PRESENT_OPTIONS, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
+    D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
+};
 use windows_numerics::{Matrix3x2, Vector2};
+use windows_sys::Win32::Graphics::Gdi::GetUpdateRect;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SCROLLINFO, SIF_ALL};
 
 /// What `WM_PAINT` must do once the state borrow has ended.
@@ -19,6 +24,8 @@ pub(super) struct PaintOutcome {
 }
 
 pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     let hwnd = state.hwnd;
     let mut client = RECT::default();
     unsafe { GetClientRect(hwnd, &mut client) };
@@ -27,14 +34,24 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         (client.bottom - client.top).max(1) as u32,
     );
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    // What this frame must repaint: the update region's bounds, or everything when the target is
+    // new, the text rewraps or the view scrolls (the target keeps the rest from the last frame).
+    let mut update = RECT::default();
+    let mut full = unsafe { GetUpdateRect(hwnd, &mut update, 0) } == 0;
     match &state.target {
         None => {
-            state.target = Some(create_hwnd_target(
+            full = true;
+            // Painting once per keystroke must not wait for the display to refresh.
+            state.target = Some(create_hwnd_target_with(
                 &state.graphics,
                 hwnd,
                 pixel_width,
                 pixel_height,
                 dpi,
+                // Kept between frames, so a frame repaints only what changed.
+                D2D1_PRESENT_OPTIONS(
+                    D2D1_PRESENT_OPTIONS_IMMEDIATELY.0 | D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS.0,
+                ),
             )?);
             state.brushes = None;
         }
@@ -70,14 +87,17 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         ..
     } = state;
     let text = EditorText(editor);
+    let scroll_before = *scroll_y;
     if layout.line_count() != text.line_count() {
         // An edit the view was not told about; never draw a stale document.
         layout.reset(&text);
+        full = true;
     }
     if (layout.width() - width).abs() > 0.5 {
         let anchor = layout.anchor(*scroll_y);
         layout.set_width(&text, width);
         *scroll_y = layout.scroll_for_anchor(anchor);
+        full = true;
     }
     // Laying out a line replaces its estimated height; keep the top line steady while it does.
     let mut visible = 0..0;
@@ -94,6 +114,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
     *scroll_y = scroll::clamp(*scroll_y, view_height, layout.total_height());
     visible = visible_lines(layout, *scroll_y, view_height);
     layout.ensure(&text, visible.clone())?;
+    full |= (*scroll_y - scroll_before).abs() > 0.01;
 
     let (anchor, caret) = text.selection();
     let selection = anchor.min(caret)..anchor.max(caret);
@@ -102,9 +123,9 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         .focused
         .then(|| layout.caret_rect(&text, caret).ok())
         .flatten();
-    let tops = visible
+    let spans = visible
         .clone()
-        .map(|line| layout.line_top(line))
+        .map(|line| (layout.line_top(line), layout.line_top(line + 1)))
         .collect::<Vec<_>>();
 
     let target = state.target.as_ref().expect("created above");
@@ -116,9 +137,29 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         right: PADDING + right,
         bottom: bottom - scroll_y,
     };
+    let scale = dpi_scale(hwnd);
+    // The repainted band, in client DIPs.
+    let (clip_top, clip_bottom) = if full {
+        (f32::MIN, f32::MAX)
+    } else {
+        (update.top as f32 / scale, update.bottom as f32 / scale)
+    };
+    #[cfg(test)]
+    record("paint: prepare", started);
+    #[cfg(test)]
+    let drawing = std::time::Instant::now();
     let result = unsafe {
         target.BeginDraw();
         target.SetTransform(&Matrix3x2::identity());
+        target.PushAxisAlignedClip(
+            &D2D_RECT_F {
+                left: f32::MIN,
+                top: clip_top,
+                right: f32::MAX,
+                bottom: clip_bottom,
+            },
+            D2D1_ANTIALIAS_MODE_ALIASED,
+        );
         target.Clear(Some(&color_f(state.colors.background)));
         let selection_brush = if state.focused {
             &brushes.selection
@@ -131,7 +172,11 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 selection_brush,
             );
         }
-        for (line, top) in visible.clone().zip(tops) {
+        for (line, (top, bottom)) in visible.clone().zip(spans) {
+            let on_screen = (top - scroll_y)..(bottom - scroll_y);
+            if on_screen.end < clip_top || on_screen.start > clip_bottom {
+                continue;
+            }
             if let Some(laid) = state.layout.laid_line(line) {
                 target.DrawTextLayout(
                     Vector2 {
@@ -151,9 +196,19 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 &brushes.caret,
             );
         }
+        target.PopAxisAlignedClip();
         target.EndDraw(None, None)
     };
-    let scale = dpi_scale(hwnd);
+    #[cfg(test)]
+    record("paint: draw and present", drawing);
+    state.caret_span = caret_rect.map(|caret| (caret.top, caret.bottom));
+    state.marks = selection_rects
+        .iter()
+        .map(|selected| (selected.top, selected.bottom))
+        .chain(state.caret_span)
+        .reduce(|(top, bottom), (next_top, next_bottom)| {
+            (top.min(next_top), bottom.max(next_bottom))
+        });
     state.caret_px = caret_rect.map(|caret| {
         let x = ((PADDING + caret.left) * scale).round() as i32;
         let y = ((caret.top - scroll_y) * scale).round() as i32;
@@ -165,6 +220,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
     }
     match result {
         Err(error) if error.code() == D2DERR_RECREATE_TARGET => {
+            // The next target starts blank: its first frame repaints everything.
+            invalidate(hwnd);
             state.target = None;
             state.brushes = None;
             Ok(PaintOutcome {

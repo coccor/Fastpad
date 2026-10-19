@@ -164,6 +164,8 @@ Large, so it ships in phases, each behind the toggle and each mergeable on its o
 3. **Block rendering:** lists, checkboxes, quotes, rules, code blocks, tables, images.
 4. **Integration:** find, Split sync, command audit, MSAA, perf scenario, README.
 
+> **Phase 1 shipped** (plan `docs/superpowers/plans/2026-10-18-markdown-live-editor-phase-1.md`), with these differences from this spec: Live state is per (group, document); typing and horizontal keys are forwarded to the hidden Scintilla rather than edited through a `TextSource` API; wikilink completion is off in Live; more than one selection switches back to the source view; a hidden Scintilla reports no selection changes, so Live polls them after its input and after every command; `imm32` is loaded lazily; there is no context menu and no text drag-and-drop yet. The MSAA object of §9 is not in phase 1: the Live window answers `WM_GETTEXT` and keeps the system caret in place, and the MSAA object moves to phase 4. Typing latency is held to 4 ms p95 (the source view runs 1.0–1.4 ms); matching the source view needs a present limited to the changed rectangle, also phase 4.
+
 ## 13. Open questions
 
 - Should a rendered heading show its `#` markers dimmed in the gutter (as some editors do) so the level is visible without revealing? Default: no.

@@ -141,7 +141,6 @@ pub(super) fn press(hwnd: HWND, lparam: isize) {
     });
     unsafe { SetCapture(hwnd) };
     super::keys::restart_blink(hwnd);
-    invalidate(hwnd);
     post_changed(hwnd, false);
 }
 
@@ -183,7 +182,6 @@ pub(super) fn moved(hwnd: HWND, lparam: isize) {
     } else {
         unsafe { KillTimer(hwnd, AUTOSCROLL_TIMER) };
     }
-    invalidate(hwnd);
     post_changed(hwnd, false);
 }
 

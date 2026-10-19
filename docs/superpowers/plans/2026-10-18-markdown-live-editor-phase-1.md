@@ -40,7 +40,7 @@ Code is split so that everything that can be pure is pure:
 - **No `SendMessageW` to the Scintilla HWND outside `src/editor/`**, except the two forwards (`WM_CHAR`, `WM_KEYDOWN`) and `WM_GETTEXT`/`WM_GETTEXTLENGTH`, which go through new `Editor::forward_char` / `forward_key` / `forward_get_text` methods.
 - **New `CommandId`:** `MarkdownToggleLive = 282`. Retired ids (133, 134, 163, 166–173) are never reused. String id `markdown.toggleLive`, never renamed.
 - **Size limit:** `LIVE_MAX_BYTES = 4 * 1024 * 1024`.
-- **Typing latency:** Live p95 ≤ `baseline + baseline / 10 + 100` µs, where baseline is the same test typing into Scintilla (the preview's rule).
+- **Typing latency:** Live p95 ≤ `baseline + baseline / 10 + 100` µs, where baseline is the same test typing into Scintilla (the preview's rule). Replaced in Task 12 by an absolute 4 ms p95; see deviation 11.
 - **No backward-compatibility code.**
 - Compile with `cargo clippy --all-targets` during tasks and run only the tests named in the step. The full suite runs once, in Task 12.
 - Window tests run with `--test-threads=1`. In a worktree, copy `native/out` DLLs in first.
@@ -59,6 +59,7 @@ Code is split so that everything that can be pure is pure:
 8. **No context menu, no text drag-and-drop in Live.** File drops (attachments) work through the existing `file_drop` handler.
 9. **Selection changes are polled, not notified** (found in Task 9). A hidden Scintilla sends `SCN_UPDATEUI` only when it paints or does idle work, so a selection-only change while Live is shown is never reported. The Live view posts `WM_FASTPAD_LIVE_CHANGED` after its own input, every command ends with `live_host::poll_active`, and `poll` compares the selection with the last one seen before running what `SC_UPDATE_SELECTION` would have (status bar, table tracking, scroll to caret, the one-selection check). Live scrolling likewise drives the Split preview through `preview_host::editor_scrolled` directly.
 10. **IMM is loaded lazily, not imported** (Task 10). `imm32.dll` is resolved with `GetProcAddress` on the first composition, as Direct2D is; `windows-sys`'s `Win32_UI_Input_Ime` supplies only the types. So nothing enters the import table and the startup benchmark check is not needed. Ctrl+click on a wikilink goes through `WM_FASTPAD_LIVE_LINK` (sent, returning whether a link was followed) to `markdown_host::follow_link_at`.
+11. **Typing latency has an absolute budget** (Task 12, decided with the user). The Live view first waited for vsync in `EndDraw` (17 ms a keystroke); it now presents immediately and repaints only the invalidated rows (`D2D1_PRESENT_OPTIONS_IMMEDIATELY | RETAIN_CONTENTS`, clipped to the update rectangle). A keystroke then costs about 2.0 ms p95 against 1.0–1.4 ms in the source view, the remaining gap being the hardware target presenting the whole window. The perf tests assert Live p95 ≤ 4 ms (a quarter frame) and print the source time; a present limited to the changed rectangle (a DC render target bound to the update rectangle, or a flip-model swap chain with dirty rectangles) is phase 4 work.
 
 ## Review focus
 

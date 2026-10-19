@@ -74,6 +74,10 @@ struct ViewState {
     clicks: Option<mouse::Click>,
     /// Where the caret was drawn last, in client pixels: x, y and height.
     caret_px: Option<(i32, i32, i32)>,
+    /// The document rows (top, bottom in DIPs) the last frame drew the selection and caret on,
+    /// and the caret's own: what a selection move or a blink repaints.
+    marks: Option<(f32, f32)>,
+    caret_span: Option<(f32, f32)>,
     paint_retried: bool,
     /// Last, so the target, brushes and layouts above are released before it can unload
     /// Direct2D and DirectWrite.
@@ -118,6 +122,8 @@ impl LiveView {
             drag: None,
             clicks: None,
             caret_px: None,
+            marks: None,
+            caret_span: None,
             paint_retried: false,
             graphics,
         });
@@ -194,19 +200,45 @@ impl LiveView {
     /// (negative when it removed some). Only the touched lines are laid out again; the first
     /// visible line stays where it was.
     pub fn edited(&self, first_line: usize, lines_added: isize) {
-        self.with(|state| {
-            let anchor = state.layout.anchor(state.scroll_y);
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let painted = self.with(|state| {
+            let scroll = state.scroll_y;
+            let anchor = state.layout.anchor(scroll);
+            let top = state.layout.line_top(first_line);
+            let old_height = state.layout.line_top(first_line + 1) - top;
             let ViewState { editor, layout, .. } = state;
-            layout.edit(&EditorText(editor), first_line, lines_added);
+            let text = EditorText(editor);
+            layout.edit(&text, first_line, lines_added);
+            if lines_added == 0 {
+                // Laid out now, so a line that kept its height repaints alone.
+                let _ = layout.ensure(&text, first_line..first_line + 1);
+            }
             state.scroll_y = state.layout.scroll_for_anchor(anchor);
+            if (state.scroll_y - scroll).abs() > 0.01 {
+                return false;
+            }
+            let new_height = state.layout.line_top(first_line + 1) - top;
+            let bottom = if lines_added == 0 && (new_height - old_height).abs() < 0.01 {
+                top + new_height
+            } else {
+                // Everything below moved.
+                f32::MAX
+            };
+            invalidate_span(state, top, bottom);
+            true
         });
-        invalidate(self.hwnd);
+        #[cfg(test)]
+        record("edited", started);
+        if painted != Some(true) {
+            invalidate(self.hwnd);
+        }
     }
 
     /// The editor's selection moved: the caret shows, is scrolled into view, and a run of Up/Down
     /// ends unless the move was its own.
     pub fn selection_changed(&self) {
-        self.with(|state| {
+        let painted = self.with(|state| {
             state.caret_on = true;
             let caret = state
                 .editor
@@ -215,9 +247,23 @@ impl LiveView {
             if state.goal.is_some_and(|(_, at)| at != caret) {
                 state.goal = None;
             }
+            let scroll = state.scroll_y;
             scroll_to_caret(state);
+            if (state.scroll_y - scroll).abs() > 0.01 {
+                return false;
+            }
+            // Where the selection and caret were drawn, and where they go now.
+            if let Some((top, bottom)) = state.marks {
+                invalidate_span(state, top, bottom);
+            }
+            if let Some((top, bottom)) = selection_span(state) {
+                invalidate_span(state, top, bottom);
+            }
+            true
         });
-        invalidate(self.hwnd);
+        if painted != Some(true) {
+            invalidate(self.hwnd);
+        }
     }
 
     /// The text of each laid-out line, `None` for lines not laid out yet.
@@ -327,6 +373,46 @@ fn invalidate(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
+/// Invalidates the document rows from `top` to `bottom` (DIPs) across the view's width, so the
+/// next frame repaints only them. Sends no message.
+fn invalidate_span(state: &ViewState, top: f32, bottom: f32) {
+    let scale = dpi_scale(state.hwnd);
+    let mut client = RECT::default();
+    unsafe { GetClientRect(state.hwnd, &mut client) };
+    let to_pixels = |y: f32| ((y - state.scroll_y) * scale).clamp(-1.0, client.bottom as f32 + 1.0);
+    let rect = RECT {
+        left: 0,
+        top: to_pixels(top).floor() as i32 - 1,
+        right: client.right,
+        bottom: to_pixels(bottom).ceil() as i32 + 1,
+    };
+    if rect.bottom > 0 && rect.top < client.bottom {
+        unsafe { InvalidateRect(state.hwnd, &rect, 0) };
+    }
+}
+
+/// The rows the selection (or caret) covers on screen now, in document DIPs.
+fn selection_span(state: &mut ViewState) -> Option<(f32, f32)> {
+    let (_, height) = view_size(state.hwnd);
+    let ViewState {
+        editor,
+        layout,
+        scroll_y,
+        ..
+    } = state;
+    let text = EditorText(editor);
+    let (anchor, caret) = text.selection();
+    let first_visible = layout.line_at_y(*scroll_y);
+    let last_visible = layout.line_at_y(*scroll_y + height);
+    let first = text.line_of(anchor.min(caret)).max(first_visible);
+    let last = text.line_of(anchor.max(caret)).min(last_visible);
+    if first > last {
+        return None;
+    }
+    layout.ensure(&text, first..last + 1).ok()?;
+    Some((layout.line_top(first), layout.line_top(last + 1)))
+}
+
 fn dpi_scale(hwnd: HWND) -> f32 {
     unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0
 }
@@ -358,4 +444,27 @@ fn post_changed(hwnd: HWND, scrolled: bool) {
             isize::from(scrolled),
         )
     };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Phase timings in microseconds, for the perf tests' breakdown.
+    static TIMINGS: std::cell::RefCell<Vec<(&'static str, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records how long phase `name` took since `started` (tests only).
+#[cfg(test)]
+fn record(name: &'static str, started: std::time::Instant) {
+    TIMINGS.with(|timings| {
+        timings
+            .borrow_mut()
+            .push((name, started.elapsed().as_micros() as u64))
+    });
+}
+
+/// Takes the phase timings recorded so far.
+#[cfg(test)]
+pub fn take_timings() -> Vec<(&'static str, u64)> {
+    TIMINGS.with(|timings| std::mem::take(&mut *timings.borrow_mut()))
 }

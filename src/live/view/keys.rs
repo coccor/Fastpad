@@ -61,8 +61,8 @@ pub(super) fn handle(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> 
         }
         _ => return None,
     }
+    // What changed repaints from the edit and selection notifications; the caret shows now.
     restart_blink(hwnd);
-    invalidate(hwnd);
     post_changed(hwnd, false);
     Some(0)
 }
@@ -113,7 +113,11 @@ fn move_caret(state: &mut ViewState, movement: Move, extend: bool) {
 /// Shows the caret and starts its blink over, as every key does.
 pub(super) fn restart_blink(hwnd: HWND) {
     let focused = with_state(hwnd, |state| {
-        state.caret_on = true;
+        if !std::mem::replace(&mut state.caret_on, true)
+            && let Some((top, bottom)) = state.caret_span
+        {
+            invalidate_span(state, top, bottom);
+        }
         state.focused
     })
     .unwrap_or(false);
@@ -127,6 +131,10 @@ pub(super) fn restart_blink(hwnd: HWND) {
 
 /// `WM_TIMER` for the caret blink.
 pub(super) fn blink(hwnd: HWND) {
-    with_state(hwnd, |state| state.caret_on = !state.caret_on);
-    invalidate(hwnd);
+    with_state(hwnd, |state| {
+        state.caret_on = !state.caret_on;
+        if let Some((top, bottom)) = state.caret_span {
+            invalidate_span(state, top, bottom);
+        }
+    });
 }

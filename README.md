@@ -98,6 +98,12 @@ typing. Both panes scroll together.
   bold, italic, code or a link. Enter continues a list (Enter on an empty item ends it), Tab and
   Shift+Tab nest list items and move between table cells, and a table lines up when you leave it.
   Each is a single undo step.
+- **Live Markdown (preview):** `Ctrl+Alt+V`, or View → Live Markdown, switches a Markdown tab to a
+  new view FastPad draws itself, in the preview's font with real wrapping. Typing, selecting, undo,
+  find, the writing helpers and Japanese, Chinese or Korean input work as in the source view, and the
+  file is only ever changed by what you type. This first release shows the text as plain prose;
+  rendered headings, emphasis, lists, tables and images follow in the next releases. Set
+  `markdown_live_default=true` to open Markdown tabs in it.
 
 ### Notes and notebooks
 
@@ -340,6 +346,7 @@ before closing again.
 | Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
 | Bold / italic (Markdown files) | `Ctrl+B` / `Ctrl+I` | | Code / link (Markdown files) | ``Ctrl+` `` / `Ctrl+K` |
 | Follow link at caret | `F12` or `Ctrl+Click` | | Today's note | `Ctrl+Alt+D` |
+| Live Markdown | `Ctrl+Alt+V` | | | |
 
 ## Make it yours
 
@@ -364,6 +371,7 @@ line in a notification and applies the rest.
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `capture_hotkey` | A key like `Ctrl+Alt+N`; empty turns it off | `Ctrl+Alt+N` |
 | `capture_source` | `true`/`false`: note the window you were in when you pressed the capture hotkey | `false` |
+| `markdown_live_default` | `true`/`false`: open Markdown tabs in the Live Markdown view | `false` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |

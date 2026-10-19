@@ -941,3 +941,116 @@ fn the_default_setting_skips_files_over_the_limit_silently() {
     assert!(visible(main.editor().hwnd()));
     assert!(main.notices().is_empty(), "{:?}", main.notices());
 }
+
+/// A Markdown document of about `bytes` with headings, prose, lists, a table and fenced code in
+/// every section, as `markdown_preview.rs` measures the preview with.
+fn sample_markdown(bytes: usize) -> String {
+    let section = "## Heading\n\nParagraph with **bold**, *emphasis*, `code`, and a [link](https://x.dev).\n\n- item one\n- item two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn f() {}\n```\n\n";
+    section.repeat(bytes / section.len() + 1)[..bytes]
+        .rsplit_once("\n\n")
+        .map_or_else(String::new, |(text, _)| format!("{text}\n"))
+}
+
+fn p95(mut samples: Vec<u64>) -> u64 {
+    samples.sort_unstable();
+    samples[(samples.len() * 95 / 100).min(samples.len() - 1)]
+}
+
+/// Keystroke-to-painted p95 in microseconds, typing into `target` with the caret at `caret`:
+/// each `x` is sent, the messages it queued are handled, and `target` paints. Runs start on a
+/// fresh line and break it every 40 characters (unmeasured), as the preview's test does.
+fn typing_p95(main: &TestMain, target: HWND, caret: usize) -> u64 {
+    main.editor().set_selection(caret..caret).unwrap();
+    pump_pending();
+    let mut samples = Vec::new();
+    send_inputs(target, &[Input::Key(VK_RETURN, false, false)]);
+    for index in 0..200 {
+        if index % 40 == 0 {
+            send_inputs(target, &[Input::Key(VK_RETURN, false, false)]);
+        }
+        let started = Instant::now();
+        unsafe {
+            SendMessageW(
+                target,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR,
+                usize::from(b'x'),
+                0,
+            )
+        };
+        pump_pending();
+        unsafe { UpdateWindow(target) };
+        samples.push(started.elapsed().as_micros() as u64);
+    }
+    p95(samples)
+}
+
+/// A Live keystroke's p95 budget: a quarter of a 60 Hz frame. The source view is measured
+/// alongside for comparison; matching it within 10% needs a present limited to the changed
+/// rectangle, planned for phase 4 (phase 1 plan, deviation 11).
+const LIVE_KEYSTROKE_BUDGET_MICROS: u64 = 4_000;
+
+/// Typing in Live against typing in the source view on the same document, in one window: three
+/// interleaved rounds of each, keeping each one's best p95, so a busy moment on the machine
+/// during one round does not decide the comparison.
+fn live_against_source(text: &str, caret: usize) -> (u64, u64) {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(text);
+    let (mut source, mut live) = (u64::MAX, u64::MAX);
+    for _ in 0..3 {
+        main.set_live(false);
+        let editor = main.editor().hwnd();
+        unsafe { SetFocus(editor) };
+        source = source.min(typing_p95(&main, editor, caret));
+        main.set_live(true);
+        let view = main.live_view().unwrap().hwnd();
+        unsafe {
+            SetFocus(view);
+            UpdateWindow(view);
+        }
+        pump_pending();
+        let _ = live::view::take_timings();
+        live = live.min(typing_p95(&main, view, caret));
+    }
+    // Where a Live keystroke's time went, in the last round.
+    let mut phases = std::collections::BTreeMap::<&str, Vec<u64>>::new();
+    for (name, micros) in live::view::take_timings() {
+        phases.entry(name).or_default().push(micros);
+    }
+    for (name, mut samples) in phases {
+        samples.sort_unstable();
+        println!(
+            "  {name}: p50 {} us, p95 {} us over {}",
+            samples[samples.len() / 2],
+            samples[(samples.len() * 95 / 100).min(samples.len() - 1)],
+            samples.len()
+        );
+    }
+    (source, live)
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
+fn typing_in_live_costs_the_same_as_typing_in_source() {
+    let (source, live) = live_against_source(&sample_markdown(1_000_000), 500_000);
+    println!("keystroke p95, 1 MB: source {source} us, live {live} us");
+    assert!(
+        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
+        "source {source} us, live {live} us"
+    );
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
+fn typing_in_live_on_a_10k_line_note_costs_the_same_as_typing_in_source() {
+    let text = (0..10_000)
+        .map(|n| format!("Line {n} of a long note, with some words to wrap.\n"))
+        .collect::<String>();
+    let caret = text.len() / 2;
+    let (source, live) = live_against_source(&text, caret);
+    println!("keystroke p95, 10k lines: source {source} us, live {live} us");
+    assert!(
+        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
+        "source {source} us, live {live} us"
+    );
+}
