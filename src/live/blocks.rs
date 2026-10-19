@@ -3,7 +3,7 @@
 //! its spans relative to its own start, parsed only when a line in it is first styled. Untouched
 //! blocks never reparse, even when an edit above them shifts their position.
 
-use super::spans::{BlockSpans, LinkSpan, Span, SpanKind, parse_block};
+use super::spans::{BlockSpans, Body, LineBlock, LinkSpan, Span, SpanKind, parse_block};
 use super::text::StrSource;
 use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
 use std::cell::{Cell, RefCell};
@@ -222,6 +222,72 @@ impl LiveDocument {
         out
     }
 
+    /// The block context of the line whose bytes (line ending excluded) are `line`, with an
+    /// absolute `start` (its other offsets are relative to the line); `None` for plain prose,
+    /// blank lines and the front matter.
+    pub fn line_block(
+        &self,
+        source: &(impl SourceText + ?Sized),
+        line: Range<usize>,
+    ) -> Option<LineBlock> {
+        let (index, start) = self
+            .blocks_in(line.start..line.end.max(line.start + 1))
+            .into_iter()
+            .next()?;
+        // A block may start after the line's indent: its first line then begins at `start`.
+        let relative = line.start.saturating_sub(start);
+        let spans = self.block_spans(source, index);
+        let found = spans
+            .lines
+            .binary_search_by_key(&relative, |block| block.start)
+            .ok()?;
+        let block = spans.lines[found].clone();
+        let delta = (start + block.start).saturating_sub(line.start);
+        Some(
+            LineBlock {
+                start: line.start,
+                ..block
+            }
+            .shifted(delta),
+        )
+    }
+
+    /// The absolute starts of the first and last lines of the table holding `at`.
+    pub fn table_extent(
+        &self,
+        source: &(impl SourceText + ?Sized),
+        at: usize,
+    ) -> Option<(usize, usize)> {
+        let (index, start) = self.blocks_in(at..at).into_iter().next()?;
+        let spans = self.block_spans(source, index);
+        let aligns_of = |block: &LineBlock| match &block.body {
+            Body::TableRow { aligns, .. } | Body::TableDelimiter { aligns } => {
+                Some(Rc::clone(aligns))
+            }
+            _ => None,
+        };
+        let relative = at.saturating_sub(start);
+        let here = spans
+            .lines
+            .partition_point(|block| block.start <= relative)
+            .checked_sub(1)?;
+        let aligns = aligns_of(&spans.lines[here])?;
+        let same = |block: &LineBlock| aligns_of(block).is_some_and(|a| Rc::ptr_eq(&a, &aligns));
+        let first = spans.lines[..here]
+            .iter()
+            .rposition(|block| !same(block))
+            .map_or(0, |other| other + 1);
+        let last = spans.lines[here..]
+            .iter()
+            .position(|block| !same(block))
+            .map_or(spans.lines.len(), |other| here + other)
+            - 1;
+        Some((
+            start + spans.lines[first].start,
+            start + spans.lines[last].start,
+        ))
+    }
+
     /// The link whose source covers `position`, in absolute bytes.
     pub fn link_at(
         &self,
@@ -247,6 +313,7 @@ impl LiveDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::spans::{Container, line_ranges};
 
     fn spans(doc: &LiveDocument, text: &str) -> Vec<(Range<usize>, SpanKind)> {
         doc.spans_in(&StrSource(text), 0..text.len())
@@ -280,6 +347,109 @@ mod tests {
         let full = LiveDocument::parse(text);
         assert_eq!(spans(doc, text), spans(&full, text), "text: {text:?}");
         assert_eq!(doc.front_matter_end(), full.front_matter_end(), "{text:?}");
+        assert_eq!(
+            line_blocks(doc, text),
+            line_blocks(&full, text),
+            "text: {text:?}"
+        );
+    }
+
+    fn line_blocks(doc: &LiveDocument, text: &str) -> Vec<Option<LineBlock>> {
+        line_ranges(text, 0..text.len())
+            .into_iter()
+            .map(|line| doc.line_block(&StrSource(text), line))
+            .collect()
+    }
+
+    fn line_of(text: &str, needle: &str) -> Range<usize> {
+        let start = text.find(needle).unwrap();
+        let start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+        line_ranges(text, start..start)[0].clone()
+    }
+
+    #[test]
+    fn line_block_is_absolute() {
+        let text = "para\n\n- a\n- b\n";
+        let doc = LiveDocument::parse(text);
+        let block = doc
+            .line_block(&StrSource(text), line_of(text, "- b"))
+            .unwrap();
+        assert_eq!(block.start, 10);
+        assert_eq!(block.prefix, 0..2);
+        assert_eq!(doc.line_block(&StrSource(text), 0..4), None);
+        assert_eq!(doc.line_block(&StrSource(text), 5..5), None);
+    }
+
+    #[test]
+    fn an_indented_block_hides_its_indent() {
+        let text = "para\n\n  - a\n";
+        let doc = LiveDocument::parse(text);
+        let block = doc
+            .line_block(&StrSource(text), line_of(text, "- a"))
+            .unwrap();
+        assert_eq!(block.start, 6);
+        assert_eq!(block.prefix, 0..4);
+    }
+
+    #[test]
+    fn indenting_an_item_changes_its_depth_and_reports_the_block() {
+        let mut text = String::from("- a\n- b\n\nafter\n");
+        let mut doc = LiveDocument::parse(&text);
+        let depth = |doc: &LiveDocument, text: &str| {
+            let block = doc
+                .line_block(&StrSource(text), line_of(text, "b"))
+                .unwrap();
+            match block.containers.last() {
+                Some(Container::Item { depth, .. }) => *depth,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(depth(&doc, &text), 1);
+        let changed = edit_at(&mut text, &mut doc, 4, 0, "  ");
+        assert_eq!(depth(&doc, &text), 2);
+        assert!(changed.start <= 4 && changed.end >= 11, "{changed:?}");
+        assert_matches_full_parse(&text, &doc);
+    }
+
+    #[test]
+    fn typing_a_pipe_row_after_a_paragraph_makes_a_table() {
+        let mut text = String::from("| a | b |\n\nafter\n");
+        let mut doc = LiveDocument::parse(&text);
+        assert_eq!(doc.line_block(&StrSource(&text), 0..9), None);
+        edit_at(&mut text, &mut doc, 10, 0, "|---|---|\n| c | d |\n");
+        let row = doc.line_block(&StrSource(&text), 0..9).unwrap();
+        assert!(
+            matches!(row.body, Body::TableRow { header: true, .. }),
+            "{row:?}"
+        );
+        assert_eq!(doc.table_extent(&StrSource(&text), 25), Some((0, 20)));
+        assert_matches_full_parse(&text, &doc);
+    }
+
+    #[test]
+    fn table_extent_stops_at_the_tables_edges() {
+        let text = "- x\n\n| a |\n|---|\n| b |\n\n| c |\n|---|\n";
+        let doc = LiveDocument::parse(text);
+        let first = text.find("| a").unwrap();
+        let last = text.find("| b").unwrap();
+        assert_eq!(
+            doc.table_extent(&StrSource(text), first + 2),
+            Some((first, last))
+        );
+        let second = text.find("| c").unwrap();
+        assert_eq!(
+            doc.table_extent(&StrSource(text), second),
+            Some((second, second + 6))
+        );
+        assert_eq!(doc.table_extent(&StrSource(text), 1), None);
+    }
+
+    #[test]
+    fn front_matter_lines_have_no_block() {
+        let text = "---\n- a\n---\n- b\n";
+        let doc = LiveDocument::parse(text);
+        assert_eq!(doc.line_block(&StrSource(text), 4..7), None);
+        assert!(doc.line_block(&StrSource(text), 12..15).is_some());
     }
 
     #[test]
@@ -426,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn scripted_edits_match_a_full_parse() {
+    fn scripted_block_edits_match_a_full_parse() {
         const PIECES: &[&str] = &[
             "---\n",
             "...\n",
@@ -459,6 +629,14 @@ mod tests {
             "[^1]",
             "Hi\n==\n",
             "\r\n",
+            "  - ",
+            "- [ ] ",
+            "- [x] ",
+            "> > ",
+            "~~~\n",
+            "***\n",
+            "![a](p.png)\n",
+            "| c |\n",
         ];
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = move |bound: usize| {
@@ -468,7 +646,7 @@ mod tests {
             ((state >> 33) as usize) % bound.max(1)
         };
         let mut text = String::from(
-            "---\ntitle: Plan\n---\n\n# Head *one*\n\nPara **b** `c` [l](u) [[N]] $m$ [^1]\n\n```\ncode\n```\n\n- item ~~s~~\n",
+            "---\ntitle: Plan\n---\n\n# Head *one*\n\nPara **b** `c` [l](u) [[N]] $m$ [^1]\n\n```\ncode\n```\n\n- item ~~s~~\n  - [ ] sub\n    1. deep\n\n> quote\n> - in\nlazy\n\n| h | i |\n|:-|-:|\n| j | k |\n\n![img](p.png)\n\n~~~py\nx\n~~~\n\n    indented\n\n---\n",
         );
         let mut doc = LiveDocument::parse(&text);
         for _ in 0..500 {

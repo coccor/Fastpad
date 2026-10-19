@@ -39,7 +39,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
   - the line's **containers**, outermost first (quotes, and list items with their marker on the item's first line);
   - the line's **prefix**: the bytes a rendered line hides (indent, `>`, list marker, task box);
   - the line's **body**: text, code, a code fence, a rule, a table row or delimiter, or an image.
-- **`blocks.rs`:** `LiveDocument::line_block(source, line_bytes)` returns the absolute `LineBlock` of a line, and `table_lines` returns a table's line range.
+- **`blocks.rs`:** `LiveDocument::line_block(source, line_bytes)` returns the absolute `LineBlock` of a line, and `table_extent` returns where a table's lines start and end.
 - **`offsets.rs`:** a piece can now be an **object**: a source range, possibly empty, shown as one U+FFFC unit. Table cell spacers use it.
 - **`styles.rs`:** `LineStyle` gains `block: BlockStyle` (indent, marker, body kind). The prefix becomes hidden pieces, and table pipes become object pieces. Block-level effects also go in the pure table, such as code lines in the code font and checked tasks struck through and dimmed.
 - **`layout.rs`:**
@@ -240,8 +240,9 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
   ```rust
   /// The block context of the line whose bytes are `line`, absolute; `None` for plain prose.
   pub fn line_block(&self, source: &(impl SourceText + ?Sized), line: Range<usize>) -> Option<LineBlock>;
-  /// The byte range of the table holding `at`, when `at` is in a table.
-  pub fn table_bytes(&self, source: &(impl SourceText + ?Sized), at: usize) -> Option<Range<usize>>;
+  /// The absolute starts of the first and last lines of the table holding `at` (a table's rows and
+  /// delimiter share one `aligns` `Rc`, which is how they are found).
+  pub fn table_extent(&self, source: &(impl SourceText + ?Sized), at: usize) -> Option<(usize, usize)>;
   ```
   Both use the same lazily parsed `BlockSpans` as `spans_in`: one parse per block serves spans, links and lines. A line inside the front matter has no block.
 - [ ] `apply`'s changed-bytes result already covers the whole re-parsed block. Check that this holds when an edit changes only a block's line contexts (indenting an item) and not its spans.
@@ -294,7 +295,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
     - An `Image` line hides everything; `BodyStyle::Image` carries `dest`. The layout decides between thumbnail and alt-text fallback (Decision 5) and, for the fallback, re-styles the line through `LineStyle::image_fallback()`, which shows the alt range as `Dim` + `Italic`.
   - **Revealed lines:** as phase 2 (one shown piece, colour runs), except `Code`/`Fence` lines keep `BodyStyle::Code` (Decision 2). Their containers are empty.
 - [ ] New `Paint`s: `Rule` (the Comment colour), `QuoteBar` (Comment), `Quote` (text inside a quote, also Comment, ranked below `Emphasis`). Rendered text inside a `Quote` container gets a `Quote` colour run under its other runs.
-- [ ] `StyledLines` gains `fn table_lines(&self, line: usize) -> Option<Range<usize>>` (the table's lines, from `table_bytes`). `Styled` implements it; `MemoryText` returns `None`.
+- [ ] `StyledLines` gains `fn table_lines(&self, line: usize) -> Option<Range<usize>>` (the table's lines, from `table_extent`). `Styled` implements it; `MemoryText` returns `None`.
 - [ ] Tests:
   - **Offsets:** `an_object_piece_is_one_unit`, `an_empty_object_maps_to_its_position`, `hits_on_an_object_land_on_its_edges`.
   - **Styles:**

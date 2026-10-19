@@ -99,7 +99,10 @@ pub enum Body {
         pipes: Vec<usize>,
         aligns: Rc<[Align]>,
     },
-    TableDelimiter,
+    /// Shares its `aligns` with its table's rows, which is how a table's lines are found.
+    TableDelimiter {
+        aligns: Rc<[Align]>,
+    },
     /// The line's only content is this image (optionally inside one link); `alt` is relative
     /// to the line.
     Image {
@@ -118,6 +121,41 @@ pub struct LineBlock {
     /// Outermost first.
     pub containers: Vec<Container>,
     pub body: Body,
+}
+
+impl LineBlock {
+    /// The same context for a line that starts `delta` bytes before the block's text does (a
+    /// block parsed from its first marker, after the line's indent): line-relative offsets move
+    /// right, and the indent joins the hidden prefix.
+    pub fn shifted(mut self, delta: usize) -> Self {
+        if delta == 0 {
+            return self;
+        }
+        let shift = |range: &mut Range<usize>| *range = range.start + delta..range.end + delta;
+        self.prefix = 0..self.prefix.end + delta;
+        for container in &mut self.containers {
+            match container {
+                Container::Item {
+                    marker: Some(Marker::Ordered(range)),
+                    ..
+                } => shift(range),
+                Container::Item {
+                    marker: Some(Marker::Task { inner, .. }),
+                    ..
+                } => *inner += delta,
+                _ => {}
+            }
+        }
+        match &mut self.body {
+            Body::Fence { info: Some(range) } | Body::Image { alt: range, .. } => shift(range),
+            Body::TableRow { cells, pipes, .. } => {
+                cells.iter_mut().for_each(shift);
+                pipes.iter_mut().for_each(|pipe| *pipe += delta);
+            }
+            _ => {}
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -651,7 +689,9 @@ impl<'a> Collector<'a> {
                 .position(|row| row.start == line.start)
                 .unwrap_or(0);
             if index == 1 {
-                return Body::TableDelimiter;
+                return Body::TableDelimiter {
+                    aligns: Rc::clone(aligns),
+                };
             }
             let (cells, pipes) = table_cells(text, *pos..line.end);
             return Body::TableRow {
@@ -1374,7 +1414,12 @@ mod tests {
                 aligns: Rc::clone(&aligns),
             }
         );
-        assert_eq!(found[1].body, Body::TableDelimiter);
+        assert_eq!(
+            found[1].body,
+            Body::TableDelimiter {
+                aligns: Rc::clone(&aligns)
+            }
+        );
         assert!(
             matches!(&found[2].body, Body::TableRow { header: false, cells, .. } if cells == &vec![2..3, 6..7])
         );
