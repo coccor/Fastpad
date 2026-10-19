@@ -3,13 +3,17 @@
 //! the block's position. Spans may overlap (`Bold` inside a `Link`); `Hidden` ranges never
 //! overlap any other span.
 //!
-//! Block constructs (lists, quotes, code blocks, tables, rules, images) emit nothing of their own
-//! in phase 2 and show as their source text; code blocks, tables and HTML blocks also keep the
-//! inline spans of their text from being emitted.
+//! Block constructs (lists, quotes, code blocks, tables, rules, images) give each of their lines
+//! a `LineBlock` (phase 3 plan, Task 1): the containers drawn in its margin, the prefix a
+//! rendered line hides and what its body is. Code blocks and HTML blocks keep the inline spans of
+//! their text from being emitted; table cells keep theirs.
 
 use crate::preview::model::PARSE_OPTIONS;
-use pulldown_cmark::{BrokenLink, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BrokenLink, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
+};
 use std::ops::Range;
+use std::rc::Rc;
 
 /// The preview's options without front matter: a block parsed on its own would read a later
 /// `---` block as metadata. `blocks.rs` finds the front matter itself.
@@ -44,11 +48,85 @@ pub struct LinkSpan {
     pub wiki: bool,
 }
 
+/// A list item's marker, on the item's first line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Marker {
+    Bullet,
+    /// `3.` or `7)`: the bytes drawn in the margin, relative to the line.
+    Ordered(Range<usize>),
+    /// The byte inside `[ ]` / `[x]`, relative to the line.
+    Task {
+        checked: bool,
+        inner: usize,
+    },
+}
+
+/// A block a line sits in, drawn in the line's margin when it is rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Container {
+    Quote,
+    /// A list item at `depth` (1 = top level); `marker` only on the item's first line.
+    Item {
+        depth: u8,
+        ordered: bool,
+        marker: Option<Marker>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// What a line holds once its containers' prefixes are skipped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Body {
+    Text,
+    Code,
+    /// A fence: an opening fence's info string, relative to the line; `None` when it has none
+    /// and for a closing fence.
+    Fence {
+        info: Option<Range<usize>>,
+    },
+    Rule,
+    /// Cell contents (whitespace trimmed) and the pipes, relative to the line.
+    TableRow {
+        header: bool,
+        cells: Vec<Range<usize>>,
+        pipes: Vec<usize>,
+        aligns: Rc<[Align]>,
+    },
+    TableDelimiter,
+    /// The line's only content is this image (optionally inside one link); `alt` is relative
+    /// to the line.
+    Image {
+        dest: String,
+        alt: Range<usize>,
+    },
+}
+
+/// A line's block context (phase 3 plan, Task 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineBlock {
+    /// The line's start, relative to the block.
+    pub start: usize,
+    /// Bytes a rendered line hides before its body, relative to the line.
+    pub prefix: Range<usize>,
+    /// Outermost first.
+    pub containers: Vec<Container>,
+    pub body: Body,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockSpans {
     /// Sorted by start.
     pub spans: Vec<Span>,
     pub links: Vec<LinkSpan>,
+    /// Sorted by start; a top-level line of plain text has none.
+    pub lines: Vec<LineBlock>,
 }
 
 /// The spans and links of one block's `text`. `refs` resolves reference links defined elsewhere
@@ -104,16 +182,53 @@ struct OpenLink {
     inner: Option<Range<usize>>,
 }
 
+struct OpenImage {
+    whole: Range<usize>,
+    dest: String,
+    /// The first and last inner event's bytes: the alt text.
+    inner: Option<Range<usize>>,
+}
+
+struct ImageSeed {
+    whole: Range<usize>,
+    dest: String,
+    alt: Range<usize>,
+}
+
+/// A container as its start event gives it; its lines' prefixes are found in `line_blocks`.
+enum Seed {
+    Quote,
+    Item {
+        depth: u8,
+        ordered: bool,
+        /// The marker's first byte.
+        marker: usize,
+        /// A task's checked state and its `[ ]` bytes.
+        task: Option<(bool, Range<usize>)>,
+    },
+}
+
 struct Collector<'a> {
     text: &'a str,
     spans: Vec<Span>,
     links: Vec<LinkSpan>,
     /// Footnote and math ranges: dimmed, and no other span inside them.
     lexical: Vec<Range<usize>>,
-    /// Inside a code block, table or HTML block: inline events add no spans.
+    /// Inside a code block or HTML block: inline events add no spans.
     suppress: u32,
     heading: Option<(u8, Range<usize>)>,
     open_links: Vec<OpenLink>,
+    open_images: Vec<OpenImage>,
+    /// Quotes and list items in the order they open: sorted by start, outer before inner.
+    containers: Vec<(Range<usize>, Seed)>,
+    /// Whether each open list is ordered.
+    lists: Vec<bool>,
+    open_items: u8,
+    /// Code blocks and whether each is fenced.
+    code_blocks: Vec<(Range<usize>, bool)>,
+    tables: Vec<(Range<usize>, Rc<[Align]>)>,
+    rules: Vec<usize>,
+    images: Vec<ImageSeed>,
 }
 
 impl<'a> Collector<'a> {
@@ -126,6 +241,14 @@ impl<'a> Collector<'a> {
             suppress: 0,
             heading: None,
             open_links: Vec::new(),
+            open_images: Vec::new(),
+            containers: Vec::new(),
+            lists: Vec::new(),
+            open_items: 0,
+            code_blocks: Vec::new(),
+            tables: Vec::new(),
+            rules: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -145,12 +268,41 @@ impl<'a> Collector<'a> {
             inner.start = inner.start.min(range.start);
             inner.end = inner.end.max(range.end);
         }
+        if !matches!(
+            event,
+            Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image)
+        ) && let Some(image) = self.open_images.last_mut()
+        {
+            let inner = image.inner.get_or_insert(range.clone());
+            inner.start = inner.start.min(range.start);
+            inner.end = inner.end.max(range.end);
+        }
         match event {
             Event::Start(tag) => self.start(tag, range),
             Event::End(tag) => self.end(tag),
             Event::Code(_) => self.inline_code(range),
             Event::InlineHtml(_) | Event::Html(_) => self.push(range, SpanKind::Dim),
+            Event::TaskListMarker(checked) => self.task(checked, range),
+            Event::Rule => self.rules.push(range.start),
             _ => {}
+        }
+    }
+
+    /// A task's `[ ]` / `[x]`: recorded on its item; a checked task's text is struck and dimmed.
+    fn task(&mut self, checked: bool, range: Range<usize>) {
+        if let Some((_, Seed::Item { task, .. })) = self
+            .containers
+            .iter_mut()
+            .rev()
+            .find(|(_, seed)| matches!(seed, Seed::Item { .. }))
+        {
+            *task = Some((checked, range.clone()));
+        }
+        if checked {
+            let line_end = line_ranges(self.text, range.end..range.end)[0].end;
+            let text_start = (range.end + 1).min(line_end);
+            self.push(text_start..line_end, SpanKind::Strike);
+            self.push(text_start..line_end, SpanKind::Dim);
         }
     }
 
@@ -208,7 +360,45 @@ impl<'a> Collector<'a> {
                 wiki: matches!(link_type, LinkType::WikiLink { .. }),
                 inner: None,
             }),
-            Tag::CodeBlock(_) | Tag::Table(_) => self.suppress += 1,
+            Tag::Image { dest_url, .. } => self.open_images.push(OpenImage {
+                whole: range,
+                dest: dest_url.to_string(),
+                inner: None,
+            }),
+            Tag::BlockQuote(_) => self.containers.push((range, Seed::Quote)),
+            Tag::List(start) => self.lists.push(start.is_some()),
+            Tag::Item => {
+                self.open_items = self.open_items.saturating_add(1);
+                let bytes = self.text.as_bytes();
+                let mut marker = range.start;
+                while marker < range.end && matches!(bytes[marker], b' ' | b'\t') {
+                    marker += 1;
+                }
+                let seed = Seed::Item {
+                    depth: self.open_items,
+                    ordered: self.lists.last().copied().unwrap_or(false),
+                    marker,
+                    task: None,
+                };
+                self.containers.push((range, seed));
+            }
+            Tag::CodeBlock(kind) => {
+                self.suppress += 1;
+                let fenced = matches!(kind, CodeBlockKind::Fenced(_));
+                self.code_blocks.push((range, fenced));
+            }
+            Tag::Table(alignments) => {
+                let aligns = alignments
+                    .iter()
+                    .map(|align| match align {
+                        Alignment::None => Align::None,
+                        Alignment::Left => Align::Left,
+                        Alignment::Center => Align::Center,
+                        Alignment::Right => Align::Right,
+                    })
+                    .collect();
+                self.tables.push((range, aligns));
+            }
             Tag::HtmlBlock => {
                 self.push(range, SpanKind::Dim);
                 self.suppress += 1;
@@ -242,7 +432,21 @@ impl<'a> Collector<'a> {
                     }
                 }
             }
-            TagEnd::CodeBlock | TagEnd::Table | TagEnd::HtmlBlock => {
+            TagEnd::Image => {
+                if let Some(image) = self.open_images.pop() {
+                    let empty = image.whole.start + 2..image.whole.start + 2;
+                    self.images.push(ImageSeed {
+                        alt: image.inner.unwrap_or(empty),
+                        whole: image.whole,
+                        dest: image.dest,
+                    });
+                }
+            }
+            TagEnd::List(_) => {
+                self.lists.pop();
+            }
+            TagEnd::Item => self.open_items = self.open_items.saturating_sub(1),
+            TagEnd::CodeBlock | TagEnd::HtmlBlock => {
                 self.suppress = self.suppress.saturating_sub(1);
             }
             _ => {}
@@ -303,7 +507,180 @@ impl<'a> Collector<'a> {
         }
     }
 
+    /// Each line's containers, prefix and body; lines of plain top-level text are left out.
+    fn line_blocks(&self) -> Vec<LineBlock> {
+        let text = self.text;
+        let bytes = text.as_bytes();
+        // Per list item: how far its later lines are indented to its content.
+        let mut widths = vec![None; self.containers.len()];
+        let mut out = Vec::new();
+        for line in line_ranges(text, 0..text.len()) {
+            let mut pos = line.start;
+            let mut containers = Vec::new();
+            // A lazy continuation line: its containers' markers are missing.
+            let mut lazy = false;
+            for (index, (range, seed)) in self.containers.iter().enumerate() {
+                if range.start > line.end {
+                    break;
+                }
+                if range.end <= line.start {
+                    continue;
+                }
+                match seed {
+                    Seed::Quote => {
+                        containers.push(Container::Quote);
+                        if lazy {
+                            continue;
+                        }
+                        let mut probe = pos;
+                        while probe < line.end && probe - pos < 3 && bytes[probe] == b' ' {
+                            probe += 1;
+                        }
+                        if probe < line.end && bytes[probe] == b'>' {
+                            pos = probe + 1;
+                            if pos < line.end && matches!(bytes[pos], b' ' | b'\t') {
+                                pos += 1;
+                            }
+                        } else {
+                            lazy = true;
+                        }
+                    }
+                    Seed::Item {
+                        depth,
+                        ordered,
+                        marker,
+                        task,
+                    } => {
+                        let marker_line = (line.start..line.end).contains(marker) && !lazy;
+                        let mut kind = None;
+                        if marker_line {
+                            let item = item_prefix(text, *marker, line.end, task.as_ref());
+                            widths[index] = Some(item.width_from(pos));
+                            pos = item.prefix_end;
+                            kind = Some(item.marker.relative_to(line.start));
+                        } else if !lazy && let Some(width) = widths[index] {
+                            let mut skipped = 0;
+                            while skipped < width
+                                && pos < line.end
+                                && matches!(bytes[pos], b' ' | b'\t')
+                            {
+                                pos += 1;
+                                skipped += 1;
+                            }
+                        }
+                        containers.push(Container::Item {
+                            depth: *depth,
+                            ordered: *ordered,
+                            marker: kind,
+                        });
+                    }
+                }
+            }
+            let body = self.body_of(&line, &mut pos);
+            if containers.is_empty() && body == Body::Text {
+                continue;
+            }
+            out.push(LineBlock {
+                start: line.start,
+                prefix: 0..pos - line.start,
+                containers,
+                body,
+            });
+        }
+        out
+    }
+
+    /// The body of `line`, whose containers' prefixes end at `pos`; moves `pos` past an indented
+    /// code block's indent.
+    fn body_of(&self, line: &Range<usize>, pos: &mut usize) -> Body {
+        let text = self.text;
+        let bytes = text.as_bytes();
+        let relative = |range: Range<usize>| range.start - line.start..range.end - line.start;
+        if self.rules.iter().any(|&at| line.contains(&at)) {
+            return Body::Rule;
+        }
+        let overlaps = |range: &Range<usize>| range.start <= line.end && range.end > line.start;
+        if let Some((range, fenced)) = self.code_blocks.iter().find(|(range, _)| overlaps(range)) {
+            if !fenced {
+                let mut columns = 0;
+                while columns < 4 && *pos < line.end {
+                    match bytes[*pos] {
+                        b' ' => columns += 1,
+                        b'\t' => columns = 4,
+                        _ => break,
+                    }
+                    *pos += 1;
+                }
+                return Body::Code;
+            }
+            let lines = line_ranges(text, range.clone());
+            let fence_start = {
+                let mut at = *pos;
+                while at < line.end && at - *pos < 3 && bytes[at] == b' ' {
+                    at += 1;
+                }
+                at
+            };
+            if lines.first().is_some_and(|first| first.start == line.start) {
+                let fence = bytes[fence_start..line.end]
+                    .iter()
+                    .take_while(|b| matches!(b, b'`' | b'~'))
+                    .count();
+                let rest = fence_start + fence..line.end;
+                let trimmed = text[rest.clone()].trim();
+                let info = (!trimmed.is_empty()).then(|| {
+                    let start = rest.start
+                        + (text[rest.clone()].len() - text[rest.clone()].trim_start().len());
+                    relative(start..start + trimmed.len())
+                });
+                return Body::Fence { info };
+            }
+            let is_last = lines.last().is_some_and(|last| last.start == line.start);
+            let rest = text[fence_start..line.end].trim_end();
+            if is_last
+                && rest.len() >= 3
+                && (rest.bytes().all(|b| b == b'`') || rest.bytes().all(|b| b == b'~'))
+            {
+                return Body::Fence { info: None };
+            }
+            return Body::Code;
+        }
+        if let Some((range, aligns)) = self.tables.iter().find(|(range, _)| overlaps(range)) {
+            let index = line_ranges(text, range.clone())
+                .iter()
+                .position(|row| row.start == line.start)
+                .unwrap_or(0);
+            if index == 1 {
+                return Body::TableDelimiter;
+            }
+            let (cells, pipes) = table_cells(text, *pos..line.end);
+            return Body::TableRow {
+                header: index == 0,
+                cells: cells.into_iter().map(relative).collect(),
+                pipes: pipes.into_iter().map(|pipe| pipe - line.start).collect(),
+                aligns: Rc::clone(aligns),
+            };
+        }
+        let content = &text[*pos..line.end];
+        let start = *pos + (content.len() - content.trim_start().len());
+        let only = start..*pos + content.trim_end().len();
+        let image = self.images.iter().find(|image| {
+            image.whole == only
+                || (image.whole.start == only.start + 1
+                    && bytes.get(image.whole.end) == Some(&b']')
+                    && self.links.iter().any(|link| link.range == only))
+        });
+        if let Some(image) = image {
+            return Body::Image {
+                dest: image.dest.clone(),
+                alt: relative(image.alt.clone()),
+            };
+        }
+        Body::Text
+    }
+
     fn finish(self) -> BlockSpans {
+        let lines = self.line_blocks();
         let lexical = merge(self.lexical);
         let hidden = merge(
             self.spans
@@ -345,8 +722,138 @@ impl<'a> Collector<'a> {
         BlockSpans {
             spans,
             links: self.links,
+            lines,
         }
     }
+}
+
+/// A list item's marker line, measured.
+struct ItemPrefix {
+    /// Absolute; `Ordered` and `Task` positions are made line-relative by `relative_to`.
+    marker: Marker,
+    /// Where the item's content starts, before a task box.
+    content: usize,
+    /// The end of the prefix a rendered line hides: past the marker, its gap and a task box.
+    prefix_end: usize,
+}
+
+impl ItemPrefix {
+    /// How far the item's later lines are indented, measured from `pos` (the item's column).
+    fn width_from(&self, pos: usize) -> usize {
+        self.content.saturating_sub(pos)
+    }
+}
+
+impl Marker {
+    fn relative_to(self, line_start: usize) -> Self {
+        match self {
+            Self::Bullet => Self::Bullet,
+            Self::Ordered(range) => Self::Ordered(range.start - line_start..range.end - line_start),
+            Self::Task { checked, inner } => Self::Task {
+                checked,
+                inner: inner - line_start,
+            },
+        }
+    }
+}
+
+/// The marker at `marker` on a line ending at `line_end`, its gap and an optional task box.
+fn item_prefix(
+    text: &str,
+    marker: usize,
+    line_end: usize,
+    task: Option<&(bool, Range<usize>)>,
+) -> ItemPrefix {
+    let bytes = text.as_bytes();
+    let (mut kind, marker_end) = if matches!(bytes.get(marker), Some(b'-' | b'*' | b'+')) {
+        (Marker::Bullet, marker + 1)
+    } else {
+        let digits = bytes[marker..line_end]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let end = (marker + digits + 1).min(line_end);
+        (Marker::Ordered(marker..end), end)
+    };
+    let gap = bytes[marker_end..line_end]
+        .iter()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count();
+    // Nothing after the marker, or more than four spaces (indented code): one column of gap.
+    let content = if marker_end + gap == line_end || gap > 4 {
+        marker_end + 1
+    } else {
+        marker_end + gap
+    };
+    let mut prefix_end = if marker_end + gap == line_end {
+        line_end
+    } else {
+        content
+    };
+    if let Some((checked, range)) = task.filter(|(_, range)| range.start >= marker_end) {
+        kind = Marker::Task {
+            checked: *checked,
+            inner: range.start + 1,
+        };
+        prefix_end = range.end;
+        if prefix_end < line_end && matches!(bytes[prefix_end], b' ' | b'\t') {
+            prefix_end += 1;
+        }
+    }
+    ItemPrefix {
+        marker: kind,
+        content,
+        prefix_end,
+    }
+}
+
+/// The cells (whitespace trimmed) and pipes of the table row `line`: unescaped pipes outside
+/// code spans separate cells, and a leading or trailing pipe opens or closes the row.
+fn table_cells(text: &str, line: Range<usize>) -> (Vec<Range<usize>>, Vec<usize>) {
+    let pipes = pipe_positions(&text[line.clone()])
+        .into_iter()
+        .map(|pipe| line.start + pipe)
+        .collect::<Vec<_>>();
+    let mut bounds = vec![line.start];
+    bounds.extend(pipes.iter().flat_map(|&pipe| [pipe, pipe + 1]));
+    bounds.push(line.end);
+    let mut cells = bounds
+        .chunks(2)
+        .map(|pair| {
+            let raw = &text[pair[0]..pair[1]];
+            let start = pair[0] + (raw.len() - raw.trim_start().len());
+            start..(pair[0] + raw.trim_end().len()).max(start)
+        })
+        .collect::<Vec<_>>();
+    if !pipes.is_empty() && text[line.start..pipes[0]].trim().is_empty() {
+        cells.remove(0);
+    }
+    if let Some(&last) = pipes.last()
+        && cells.len() > 1
+        && text[last + 1..line.end].trim().is_empty()
+    {
+        cells.pop();
+    }
+    (cells, pipes)
+}
+
+/// Byte offsets of the column separators in one table line: every unescaped pipe. As in GFM, a
+/// pipe inside a code span still separates cells unless it is escaped.
+fn pipe_positions(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut pipes = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'|' => {
+                pipes.push(index);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    pipes
 }
 
 /// `ranges` sorted, with overlapping and touching ones joined.
@@ -669,10 +1176,268 @@ mod tests {
     }
 
     #[test]
-    fn code_blocks_and_tables_get_no_inline_spans() {
+    fn code_blocks_get_no_inline_spans() {
         assert_eq!(kinds("```\n**a**\n```"), ".".repeat(13));
+        assert_eq!(kinds("    **a**"), ".".repeat(9));
+    }
+
+    #[test]
+    fn table_cells_keep_inline_spans() {
         let table = "| **a** | b |\n|---|---|\n| `c` | d |";
-        assert_eq!(kinds(table), ".".repeat(table.len()));
+        assert_eq!(kinds(table), format!("..HHbHH{}HcH......", ".".repeat(19)));
+    }
+
+    fn lines(text: &str) -> Vec<LineBlock> {
+        parse_block(text, &no_refs).lines
+    }
+
+    fn item(depth: u8, ordered: bool, marker: Option<Marker>) -> Container {
+        Container::Item {
+            depth,
+            ordered,
+            marker,
+        }
+    }
+
+    #[test]
+    fn bullet_items_have_a_marker_and_a_hidden_prefix() {
+        assert_eq!(
+            lines("- a\n- b"),
+            vec![
+                LineBlock {
+                    start: 0,
+                    prefix: 0..2,
+                    containers: vec![item(1, false, Some(Marker::Bullet))],
+                    body: Body::Text,
+                },
+                LineBlock {
+                    start: 4,
+                    prefix: 0..2,
+                    containers: vec![item(1, false, Some(Marker::Bullet))],
+                    body: Body::Text,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_items_carry_their_depth() {
+        let found = lines("- a\n  - b\n    - c");
+        assert_eq!(found[1].prefix, 0..4);
+        assert_eq!(
+            found[1].containers,
+            vec![item(1, false, None), item(2, false, Some(Marker::Bullet))]
+        );
+        assert_eq!(found[2].prefix, 0..6);
+        assert_eq!(found[2].containers.len(), 3);
+    }
+
+    #[test]
+    fn an_items_second_paragraph_has_no_marker() {
+        let found = lines("- a\n\n  more");
+        let last = found.last().unwrap();
+        assert_eq!(last.start, 5);
+        assert_eq!(last.prefix, 0..2);
+        assert_eq!(last.containers, vec![item(1, false, None)]);
+    }
+
+    #[test]
+    fn ordered_markers_keep_their_number_range() {
+        let found = lines("12. a\n13) b");
+        assert_eq!(
+            found[0].containers,
+            vec![item(1, true, Some(Marker::Ordered(0..3)))]
+        );
+        assert_eq!(found[0].prefix, 0..4);
+    }
+
+    #[test]
+    fn a_checked_task_is_struck_and_dim() {
+        assert_eq!(kinds("- [x] done"), format!("......{}", "(sd)".repeat(4)));
+        assert_eq!(
+            lines("- [x] done")[0].containers,
+            vec![item(
+                1,
+                false,
+                Some(Marker::Task {
+                    checked: true,
+                    inner: 3
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn an_unchecked_task_records_its_inner_byte() {
+        let found = lines("> - [ ] todo");
+        assert_eq!(found[0].prefix, 0..8);
+        assert_eq!(
+            found[0].containers,
+            vec![
+                Container::Quote,
+                item(
+                    1,
+                    false,
+                    Some(Marker::Task {
+                        checked: false,
+                        inner: 5
+                    })
+                ),
+            ]
+        );
+        assert_eq!(kinds("- [ ] todo"), ".".repeat(10));
+    }
+
+    #[test]
+    fn a_lazy_continuation_keeps_the_items_containers() {
+        let found = lines("> - a\nlazy");
+        assert_eq!(found[1].prefix, 0..0);
+        assert_eq!(
+            found[1].containers,
+            vec![Container::Quote, item(1, false, None)]
+        );
+    }
+
+    #[test]
+    fn quote_lines_carry_their_depth() {
+        let found = lines("> a\n> > b");
+        assert_eq!(found[0].containers, vec![Container::Quote]);
+        assert_eq!(found[0].prefix, 0..2);
+        assert_eq!(
+            found[1].containers,
+            vec![Container::Quote, Container::Quote]
+        );
+        assert_eq!(found[1].prefix, 0..4);
+    }
+
+    #[test]
+    fn a_list_inside_a_quote_has_both_containers() {
+        let found = lines("> 1. a\n>    b");
+        assert_eq!(
+            found[0].containers,
+            vec![Container::Quote, item(1, true, Some(Marker::Ordered(2..4)))]
+        );
+        assert_eq!(found[1].prefix, 0..5);
+    }
+
+    #[test]
+    fn fenced_code_marks_fences_and_code_lines() {
+        let found = lines("```rust\nlet a;\n```");
+        assert_eq!(
+            found
+                .iter()
+                .map(|line| line.body.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Body::Fence { info: Some(3..7) },
+                Body::Code,
+                Body::Fence { info: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_fence_runs_to_the_block_end() {
+        let found = lines("~~~\na\nb");
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[2].body, Body::Code);
+    }
+
+    #[test]
+    fn indented_code_hides_four_columns() {
+        let found = lines("    code\n\tmore");
+        assert_eq!(found[0].prefix, 0..4);
+        assert_eq!(found[0].body, Body::Code);
+        assert_eq!(found[1].prefix, 0..1);
+    }
+
+    #[test]
+    fn fenced_code_inside_a_list_item_keeps_the_item_prefix() {
+        let found = lines("- a\n  ```\n  x\n  ```");
+        assert_eq!(found[1].prefix, 0..2);
+        assert_eq!(found[1].body, Body::Fence { info: None });
+        assert_eq!(found[2].body, Body::Code);
+        assert_eq!(found[2].containers, vec![item(1, false, None)]);
+        assert_eq!(found[3].body, Body::Fence { info: None });
+    }
+
+    #[test]
+    fn table_rows_have_cells_pipes_and_aligns() {
+        let found = lines("| a | bb |\n|:--|--:|\n| c | d |");
+        let aligns: Rc<[Align]> = Rc::from([Align::Left, Align::Right]);
+        assert_eq!(
+            found[0].body,
+            Body::TableRow {
+                header: true,
+                cells: vec![2..3, 6..8],
+                pipes: vec![0, 4, 9],
+                aligns: Rc::clone(&aligns),
+            }
+        );
+        assert_eq!(found[1].body, Body::TableDelimiter);
+        assert!(
+            matches!(&found[2].body, Body::TableRow { header: false, cells, .. } if cells == &vec![2..3, 6..7])
+        );
+    }
+
+    #[test]
+    fn escaped_pipes_are_not_separators_even_in_code() {
+        let found = lines("a | `x\\|y` | b\\|c\n--|--|--");
+        let Body::TableRow { cells, pipes, .. } = &found[0].body else {
+            panic!("{found:?}");
+        };
+        assert_eq!(cells, &vec![0..1, 4..10, 13..17]);
+        assert_eq!(pipes, &vec![2, 11]);
+    }
+
+    #[test]
+    fn a_rule_is_a_rule_and_a_setext_underline_is_not() {
+        assert_eq!(lines("a\n\n---")[0].body, Body::Rule);
+        assert!(lines("a\n---").is_empty());
+    }
+
+    #[test]
+    fn an_image_alone_on_its_line_is_an_image_line() {
+        assert_eq!(
+            lines("![cat](c.png)")[0].body,
+            Body::Image {
+                dest: "c.png".into(),
+                alt: 2..5,
+            }
+        );
+        assert_eq!(
+            lines("[![cat](c.png)](big.png)")[0].body,
+            Body::Image {
+                dest: "c.png".into(),
+                alt: 3..6,
+            }
+        );
+        assert_eq!(
+            lines("- ![](c.png)")[0].body,
+            Body::Image {
+                dest: "c.png".into(),
+                alt: 4..4,
+            }
+        );
+    }
+
+    #[test]
+    fn an_image_inside_text_is_not() {
+        assert!(lines("see ![cat](c.png) here").is_empty());
+    }
+
+    #[test]
+    fn crlf_prefixes_and_cells_are_byte_exact() {
+        let found = lines("- a\r\n- b\r\n\r\n| x | y |\r\n|---|---|\r\n");
+        assert_eq!(found[1].start, 5);
+        assert_eq!(found[1].prefix, 0..2);
+        let row = found
+            .iter()
+            .find(|line| matches!(line.body, Body::TableRow { .. }))
+            .unwrap();
+        assert!(
+            matches!(&row.body, Body::TableRow { cells, pipes, .. } if cells == &vec![2..3, 6..7] && pipes == &vec![0, 4, 8])
+        );
     }
 
     #[test]
