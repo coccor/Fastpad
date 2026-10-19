@@ -1,11 +1,13 @@
 //! The Live Markdown view (2026-10-18 Live editor design spec): a FastPad-drawn view of a Markdown
 //! tab's Scintilla document. Everything here except the layout and the window is pure.
 
+pub mod blocks;
 pub mod layout;
 pub mod lines;
 pub mod motion;
 pub mod offsets;
 pub mod scroll;
+pub mod spans;
 pub mod text;
 pub mod view;
 

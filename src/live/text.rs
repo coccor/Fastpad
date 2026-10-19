@@ -4,6 +4,7 @@
 //! (phase 1 plan, deviation 2).
 
 use crate::editor::Editor;
+use crate::preview::incremental::SourceText;
 use std::borrow::Cow;
 use std::ops::Range;
 
@@ -51,7 +52,7 @@ impl LiveText for EditorText<'_> {
 
     fn line_end(&self, line: usize) -> usize {
         if line >= self.line_count() {
-            return self.len();
+            return LiveText::len(self);
         }
         self.0.line_end(line).unwrap_or(0)
     }
@@ -77,6 +78,55 @@ impl LiveText for EditorText<'_> {
 
     fn word_at(&self, position: usize) -> Range<usize> {
         self.0.word_range_at(position).unwrap_or(position..position)
+    }
+}
+
+/// The Scintilla document as the block parser reads it, as `preview_host::ScintillaSource` does:
+/// a slice that cuts a character shows it as U+FFFD instead of failing.
+impl SourceText for EditorText<'_> {
+    fn len(&self) -> usize {
+        self.0.length().unwrap_or(0)
+    }
+
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        match self.0.range_bytes(range) {
+            Ok(bytes) => String::from_utf8_lossy(bytes),
+            Err(_) => Cow::Borrowed(""),
+        }
+    }
+
+    fn line_of(&self, byte: usize) -> usize {
+        self.0.line_from_position(byte).unwrap_or(0)
+    }
+}
+
+/// A `str` as the block parser reads it, with every range moved back to character boundaries,
+/// so a fixed-size look at the head of a note never cuts a character in two.
+pub struct StrSource<'a>(pub &'a str);
+
+impl StrSource<'_> {
+    fn floor(&self, at: usize) -> usize {
+        let mut at = at.min(self.0.len());
+        while !self.0.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+}
+
+impl SourceText for StrSource<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        let start = self.floor(range.start);
+        let end = self.floor(range.end).max(start);
+        Cow::Borrowed(&self.0[start..end])
+    }
+
+    fn line_of(&self, byte: usize) -> usize {
+        SourceText::line_of(self.0, self.floor(byte))
     }
 }
 
@@ -121,6 +171,21 @@ impl MemoryText {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+}
+
+#[cfg(test)]
+impl SourceText for MemoryText {
+    fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        StrSource(&self.text).slice(range).into_owned().into()
+    }
+
+    fn line_of(&self, byte: usize) -> usize {
+        SourceText::line_of(&StrSource(&self.text), byte)
     }
 }
 
