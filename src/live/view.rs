@@ -34,6 +34,8 @@ pub const CLASS_NAME: &str = "FastPadLive";
 const PADDING: f32 = 16.0;
 /// Rows kept visible above and below the caret when scrolling to it, in DIPs.
 const CARET_MARGIN: f32 = 8.0;
+/// Space between the line numbers and the text, in DIPs.
+const GUTTER_GAP: f32 = 12.0;
 
 /// The colours the view draws with, as `COLORREF`s: the editor's own, so Live and source look
 /// like one editor.
@@ -44,6 +46,7 @@ pub struct LiveColors {
     pub selection: u32,
     pub inactive_selection: u32,
     pub caret: u32,
+    pub line_number: u32,
 }
 
 struct Brushes {
@@ -51,6 +54,7 @@ struct Brushes {
     selection: ID2D1SolidColorBrush,
     inactive_selection: ID2D1SolidColorBrush,
     caret: ID2D1SolidColorBrush,
+    line_number: ID2D1SolidColorBrush,
 }
 
 struct ViewState {
@@ -62,6 +66,10 @@ struct ViewState {
     layout: LiveLayout,
     /// Top of the viewport in document DIPs.
     scroll_y: f32,
+    /// Whether line numbers show (the editor's `line_numbers` setting), and the gutter's width in
+    /// DIPs as of the last frame (0 without them).
+    line_numbers: bool,
+    gutter: f32,
     focused: bool,
     /// The blinking caret's phase.
     caret_on: bool,
@@ -98,6 +106,7 @@ impl LiveView {
         graphics: Rc<Graphics>,
         colors: LiveColors,
         fonts: LiveFonts,
+        line_numbers: bool,
     ) -> Result<Self> {
         let hwnd = create_window(parent)?;
         let layout = LiveLayout::new(Rc::clone(&graphics), fonts, 1.0);
@@ -116,6 +125,8 @@ impl LiveView {
             colors,
             layout,
             scroll_y: 0.0,
+            line_numbers,
+            gutter: 0.0,
             focused: false,
             caret_on: true,
             goal: None,
@@ -127,7 +138,7 @@ impl LiveView {
             paint_retried: false,
             graphics,
         });
-        let width = text_width(hwnd);
+        let width = text_width(hwnd, 0.0);
         let ViewState { editor, layout, .. } = &mut *state;
         let text = EditorText(editor);
         layout.set_width(&text, width);
@@ -160,8 +171,9 @@ impl LiveView {
         invalidate(self.hwnd);
     }
 
-    pub fn set_appearance(&self, colors: LiveColors, fonts: LiveFonts) {
+    pub fn set_appearance(&self, colors: LiveColors, fonts: LiveFonts, line_numbers: bool) {
         self.with(|state| {
+            state.line_numbers = line_numbers;
             if state.colors != colors {
                 state.colors = colors;
                 state.brushes = None;
@@ -289,10 +301,16 @@ impl LiveView {
             let scale = dpi_scale(state.hwnd);
             (
                 (state.layout.fonts().line_height * scale).round() as i32,
-                (PADDING * scale).round() as i32,
+                (text_left(state) * scale).round() as i32,
             )
         })
         .unwrap_or((0, 0))
+    }
+
+    /// The line-number gutter's width in DIPs as of the last frame.
+    #[cfg(test)]
+    pub fn gutter(&self) -> f32 {
+        self.with(|state| state.gutter).unwrap_or(0.0)
     }
 
     #[cfg(test)]
@@ -429,8 +447,24 @@ fn view_size(hwnd: HWND) -> (f32, f32) {
 }
 
 /// The width the text wraps to, in DIPs.
-fn text_width(hwnd: HWND) -> f32 {
-    (view_size(hwnd).0 - 2.0 * PADDING).max(1.0)
+fn text_width(hwnd: HWND, gutter: f32) -> f32 {
+    (view_size(hwnd).0 - 2.0 * PADDING - gutter).max(1.0)
+}
+
+/// Where the text starts, in client DIPs: after the padding and the line-number gutter.
+fn text_left(state: &ViewState) -> f32 {
+    PADDING + state.gutter
+}
+
+/// The gutter's width for `state`'s document: room for its largest line number (two digits at
+/// least, so it does not widen at line 10) and the gap before the text; 0 without line numbers.
+fn gutter_width(state: &ViewState) -> f32 {
+    if !state.line_numbers {
+        return 0.0;
+    }
+    let lines = state.layout.line_count().max(1);
+    let digits = (lines.ilog10() + 1).max(2) as f32;
+    (digits * state.layout.digit_width()).ceil() + GUTTER_GAP
 }
 
 /// Tells the main window that input here may have moved the caret, or scrolled the view when

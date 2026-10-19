@@ -278,10 +278,10 @@ fn create_view(hwnd: HWND, id: GroupId) -> crate::Result<LiveView> {
     let parent = host_window::with_group_id(hwnd, id, |group| group.hwnd)
         .ok_or(crate::FastPadError::Invariant("Live view without a group"))?;
     let graphics = crate::window::preview_host::shared_graphics(hwnd)?;
-    let (colors, fonts) = appearance(hwnd, &graphics, &editor);
+    let (colors, fonts, line_numbers) = appearance(hwnd, &graphics, &editor);
     // Where the editor is now; the next group layout keeps the two together.
     let rect = client_rect_in_parent(editor.hwnd(), parent);
-    let view = LiveView::create(parent, editor, graphics, colors, fonts)?;
+    let view = LiveView::create(parent, editor, graphics, colors, fonts, line_numbers)?;
     unsafe {
         MoveWindow(
             view.hwnd(),
@@ -310,12 +310,14 @@ fn client_rect_in_parent(child: HWND, parent: HWND) -> RECT {
     rect
 }
 
-/// The editor's colours and the prose font at the editor's zoom.
+/// The editor's colours, the prose font at the editor's zoom, and whether line numbers show.
 fn appearance(
     hwnd: HWND,
     graphics: &crate::preview::dwrite::Graphics,
     editor: &crate::editor::Editor,
-) -> (LiveColors, LiveFonts) {
+) -> (LiveColors, LiveFonts, bool) {
+    let line_numbers = unsafe { host_window::app_ptr(hwnd) }
+        .is_none_or(|app| unsafe { app.as_ref() }.settings.line_numbers);
     let zoom = editor.zoom().unwrap_or(0);
     let (palette, preview_font, preview_size, line_height, font_size) =
         unsafe { host_window::app_ptr(hwnd) }
@@ -344,6 +346,7 @@ fn appearance(
         selection: palette.selection_background,
         inactive_selection: palette.inactive_selection_background,
         caret: palette.editor_foreground,
+        line_number: palette.line_number_foreground,
     };
     let fonts = LiveFonts::new(
         graphics,
@@ -353,7 +356,7 @@ fn appearance(
         font_size,
         zoom,
     );
-    (colors, fonts)
+    (colors, fonts, line_numbers)
 }
 
 /// Group `id`'s Live window while it is shown, as a handle.
@@ -452,8 +455,8 @@ pub(crate) fn refresh_appearance(hwnd: HWND) {
         return;
     };
     for (view, editor) in views {
-        let (colors, fonts) = appearance(hwnd, &graphics, &editor);
-        view.set_appearance(colors, fonts);
+        let (colors, fonts, line_numbers) = appearance(hwnd, &graphics, &editor);
+        view.set_appearance(colors, fonts, line_numbers);
     }
 }
 

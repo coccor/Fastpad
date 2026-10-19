@@ -75,11 +75,18 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             selection: brush(state.colors.selection)?,
             inactive_selection: brush(state.colors.inactive_selection)?,
             caret: brush(state.colors.caret)?,
+            line_number: brush(state.colors.line_number)?,
         });
     }
 
     let (_, view_height) = view_size(hwnd);
-    let width = text_width(hwnd);
+    let gutter = gutter_width(state);
+    if (gutter - state.gutter).abs() > 0.01 {
+        // Line numbers turned on or off, or the count gained a digit: the text moves.
+        state.gutter = gutter;
+        full = true;
+    }
+    let width = text_width(hwnd, gutter);
     let ViewState {
         editor,
         layout,
@@ -131,10 +138,11 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
     let target = state.target.as_ref().expect("created above");
     let brushes = state.brushes.as_ref().expect("created above");
     let scroll_y = state.scroll_y;
+    let text_x = text_left(state);
     let rect = |left: f32, top: f32, right: f32, bottom: f32| D2D_RECT_F {
-        left: PADDING + left,
+        left: text_x + left,
         top: top - scroll_y,
-        right: PADDING + right,
+        right: text_x + right,
         bottom: bottom - scroll_y,
     };
     let scale = dpi_scale(hwnd);
@@ -177,10 +185,23 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             if on_screen.end < clip_top || on_screen.start > clip_bottom {
                 continue;
             }
-            if let Some(laid) = state.layout.laid_line(line) {
+            if gutter > 0.0
+                && let Ok(number) = state.layout.number_layout(line + 1, gutter - GUTTER_GAP)
+            {
                 target.DrawTextLayout(
                     Vector2 {
                         X: PADDING,
+                        Y: top - scroll_y,
+                    },
+                    &number,
+                    &brushes.line_number,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            if let Some(laid) = state.layout.laid_line(line) {
+                target.DrawTextLayout(
+                    Vector2 {
+                        X: text_x,
                         Y: top - scroll_y,
                     },
                     &laid.layout,
@@ -210,7 +231,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             (top.min(next_top), bottom.max(next_bottom))
         });
     state.caret_px = caret_rect.map(|caret| {
-        let x = ((PADDING + caret.left) * scale).round() as i32;
+        let x = ((text_x + caret.left) * scale).round() as i32;
         let y = ((caret.top - scroll_y) * scale).round() as i32;
         (x, y, ((caret.bottom - caret.top) * scale).round() as i32)
     });

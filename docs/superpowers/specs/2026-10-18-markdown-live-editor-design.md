@@ -54,7 +54,7 @@ Rejected:
 - Multiple cursors and rectangular selection. Using them (Ctrl+Alt+click, Alt+drag, Ctrl+D) switches the tab to the source view with a notice.
 - Syntax highlighting inside code blocks.
 - Drag-and-drop of text inside Live (file drop for attachments stays, through the existing handler).
-- Line numbers and folding.
+- Folding. (Line numbers show in a gutter, following the editor's `line_numbers` setting: added after phase 1 review.)
 - A full UI Automation text provider. v1 exposes the document as an MSAA value and the caret through the system caret (§9); a UIA `TextPattern` is follow-up work.
 - Files above 4 MB: Live refuses with a notice.
 

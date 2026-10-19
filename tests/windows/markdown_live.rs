@@ -899,6 +899,44 @@ fn system_caret_tracks_the_caret() {
     assert!(at(view).y > after.y);
 }
 
+/// Sets the editor's `line_numbers` setting without writing `fastpad.ini`, and lets Live follow.
+fn set_line_numbers(main: &TestMain, on: bool) {
+    main.with_app(|app| app.settings.line_numbers = on);
+    window::live_host::refresh_appearance(main.hwnd);
+    pump_pending();
+}
+
+#[test]
+fn line_numbers_follow_the_setting_and_move_the_text() {
+    let (_scintilla, main, view) = live_tab("one\ntwo\nthree\n");
+    set_line_numbers(&main, true);
+    unsafe { UpdateWindow(view.hwnd()) };
+    let with_numbers = view.gutter();
+    let (_, text_left_numbered) = view.row_metrics();
+    assert!(with_numbers > 0.0);
+    set_line_numbers(&main, false);
+    unsafe { UpdateWindow(view.hwnd()) };
+    assert_eq!(view.gutter(), 0.0);
+    let (_, text_left_plain) = view.row_metrics();
+    assert!(text_left_numbered > text_left_plain);
+    // A click at the text's left edge lands at the line start either way.
+    set_line_numbers(&main, true);
+    unsafe { UpdateWindow(view.hwnd()) };
+    click(view.hwnd(), row_point(view, 1, 1), false, false);
+    assert_eq!(caret(&main), (4, 4));
+}
+
+#[test]
+fn the_gutter_widens_for_three_digit_line_numbers() {
+    let (_scintilla, main, view) = live_tab("a\nb\n");
+    set_line_numbers(&main, true);
+    unsafe { UpdateWindow(view.hwnd()) };
+    let two_digits = view.gutter();
+    main.set_text(&"line\n".repeat(150));
+    unsafe { UpdateWindow(view.hwnd()) };
+    assert!(view.gutter() > two_digits);
+}
+
 #[test]
 fn ime_result_inserts_one_undo_step() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_IME_CHAR};

@@ -15,7 +15,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS,
-    DWRITE_LINE_SPACING_METHOD_UNIFORM, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+    IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::core::BOOL;
 
@@ -86,6 +87,8 @@ pub struct LiveLayout {
     heights: HeightIndex,
     /// The average character width, for height estimates.
     char_width: f32,
+    /// The width of one digit, for the line-number gutter.
+    digit_width: f32,
     /// Last, so the layouts and format above are released before it can unload DirectWrite.
     graphics: Rc<Graphics>,
 }
@@ -94,6 +97,7 @@ impl LiveLayout {
     pub fn new(graphics: Rc<Graphics>, fonts: LiveFonts, width: f32) -> Result<Self> {
         let format = text_format(&graphics, &fonts)?;
         let char_width = fonts.size * 0.5;
+        let digit_width = digit_width(&graphics, &format)?;
         Ok(Self {
             graphics,
             format,
@@ -102,7 +106,28 @@ impl LiveLayout {
             lines: LineCache::default(),
             heights: HeightIndex::default(),
             char_width,
+            digit_width,
         })
+    }
+
+    /// The width of one digit in the text font.
+    pub fn digit_width(&self) -> f32 {
+        self.digit_width
+    }
+
+    /// Line number `number`, right-aligned in a box `width` wide, on the text's rows: drawn at a
+    /// line's top, it sits on that line's first row with the same baseline.
+    pub fn number_layout(&self, number: usize, width: f32) -> Result<IDWriteTextLayout> {
+        let digits = number.to_string().encode_utf16().collect::<Vec<_>>();
+        let layout = unsafe {
+            self.graphics
+                .dwrite
+                .CreateTextLayout(&digits, &self.format, width.max(1.0), f32::MAX)
+        }
+        .map_err(hresult_error)?;
+        unsafe { layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING) }
+            .map_err(hresult_error)?;
+        Ok(layout)
     }
 
     pub fn fonts(&self) -> &LiveFonts {
@@ -141,6 +166,7 @@ impl LiveLayout {
         if fonts != self.fonts {
             self.format = text_format(&self.graphics, &fonts)?;
             self.char_width = fonts.size * 0.5;
+            self.digit_width = digit_width(&self.graphics, &self.format)?;
             self.fonts = fonts;
             self.reset(text);
         }
@@ -488,6 +514,20 @@ fn text_format(graphics: &Graphics, fonts: &LiveFonts) -> Result<IDWriteTextForm
     }
     .map_err(hresult_error)?;
     Ok(format)
+}
+
+/// The width of "0" in `format`: digits share one width in the fonts FastPad offers.
+fn digit_width(graphics: &Graphics, format: &IDWriteTextFormat) -> Result<f32> {
+    let zero = "0".encode_utf16().collect::<Vec<_>>();
+    let layout = unsafe {
+        graphics
+            .dwrite
+            .CreateTextLayout(&zero, format, 1000.0, f32::MAX)
+    }
+    .map_err(hresult_error)?;
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    unsafe { layout.GetMetrics(&mut metrics) }.map_err(hresult_error)?;
+    Ok(metrics.widthIncludingTrailingWhitespace)
 }
 
 fn line_metrics(layout: &IDWriteTextLayout) -> Result<Vec<DWRITE_LINE_METRICS>> {
