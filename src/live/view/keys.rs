@@ -82,15 +82,25 @@ impl ViewState {
 }
 
 fn move_caret(state: &mut ViewState, movement: Move, extend: bool) {
+    prepare(state);
     let (_, height) = view_size(state.hwnd);
     let ViewState {
         editor,
         layout,
+        document,
+        revealed,
         goal,
         scroll_y,
         ..
     } = state;
-    let text = EditorText(editor);
+    let source = EditorText(editor);
+    // Rows as drawn now: a target on a rendered line is hit-tested rendered, and the reveal
+    // that follows keeps the caret where it landed (phase 2 plan, Decision 1).
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+    };
     let (anchor, caret) = text.selection();
     let goal_x = goal.filter(|&(_, at)| at == caret).map(|(x, _)| x);
     let before = layout.caret_rect(&text, caret).ok();

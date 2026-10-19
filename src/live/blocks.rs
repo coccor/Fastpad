@@ -18,6 +18,9 @@ pub struct LiveDocument {
     front_matter: usize,
     /// How many blocks have been parsed for spans, for the tests that check laziness.
     parsed: Cell<usize>,
+    /// How many times edits were applied or the whole document reparsed, for the tests.
+    #[cfg(test)]
+    updates: usize,
 }
 
 /// The end of a YAML front matter block (`---` … `---` or `...` lines at the very start),
@@ -55,11 +58,17 @@ impl LiveDocument {
             spans: RefCell::new(vec![None; blocks]),
             front_matter: front_matter(&StrSource(source)),
             parsed: Cell::new(0),
+            #[cfg(test)]
+            updates: 0,
         }
     }
 
     /// Parses the whole document again.
     pub fn reparse(&mut self, source: &(impl SourceText + ?Sized)) {
+        #[cfg(test)]
+        {
+            self.updates += 1;
+        }
         self.preview.reparse(source);
         *self.spans.borrow_mut() = vec![None; self.preview.blocks.len()];
         self.front_matter = front_matter(source);
@@ -70,6 +79,12 @@ impl LiveDocument {
         self.front_matter
     }
 
+    /// How many times edits were applied or the whole document reparsed.
+    #[cfg(test)]
+    pub fn updates(&self) -> usize {
+        self.updates
+    }
+
     /// How many blocks have been parsed for spans so far.
     #[cfg(test)]
     pub fn parsed_blocks(&self) -> usize {
@@ -78,6 +93,10 @@ impl LiveDocument {
 
     /// Applies edits already in `source`; returns the bytes whose spans may have changed.
     pub fn apply(&mut self, source: &(impl SourceText + ?Sized), edits: &[Edit]) -> Range<usize> {
+        #[cfg(test)]
+        {
+            self.updates += 1;
+        }
         let mut changed = self.apply_blocks(source, edits);
         // A block the preview kept because it renders the same may still have shifted bytes
         // (a tab in a blank run): forget every block the edits touched.

@@ -1092,3 +1092,138 @@ fn typing_in_live_on_a_10k_line_note_costs_the_same_as_typing_in_source() {
         "source {source} us, live {live} us"
     );
 }
+
+/// Line `line` of the Live view as laid out now: (layout text, revealed, height).
+fn shown_line(view: LiveView, line: usize) -> (String, bool, f32) {
+    unsafe { UpdateWindow(view.hwnd()) };
+    pump_pending();
+    view.debug_line(line).expect("a laid-out line")
+}
+
+/// Moves the caret to `at` the way a command does, so the view follows it.
+fn caret_to(main: &TestMain, at: usize) {
+    main.editor().set_selection(at..at).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    pump_pending();
+}
+
+#[test]
+fn rendered_lines_hide_markup_and_the_caret_line_shows_source() {
+    let (_scintilla, main, view) = live_tab("# Title\n\n**bold** and [link](u)\n");
+    let row = view.row_metrics().0 as f32;
+    caret_to(&main, 12);
+    let (title, revealed, height) = shown_line(view, 0);
+    assert_eq!(title, "Title");
+    assert!(!revealed);
+    assert!(
+        height > row * 1.5,
+        "a rendered H1 is taller: {height} vs {row}"
+    );
+    assert_eq!(shown_line(view, 2).0, "**bold** and [link](u)");
+    assert_eq!(view.revealed(), 2..3);
+
+    caret_to(&main, 3);
+    assert_eq!(shown_line(view, 0).0, "# Title");
+    assert_eq!(shown_line(view, 2).0, "bold and link");
+}
+
+#[test]
+fn a_selection_reveals_every_line_it_touches() {
+    let (_scintilla, main, view) = live_tab("**a**\n**b**\n**c**\n**d**\n");
+    main.editor().set_selection(1..13).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    assert_eq!(view.revealed(), 0..3);
+    assert_eq!(shown_line(view, 1).0, "**b**");
+    assert_eq!(shown_line(view, 3).0, "d");
+}
+
+#[test]
+fn typing_bold_markers_restyles_only_the_caret_line_until_it_is_left() {
+    let (_scintilla, main, view) = live_tab("first\nsecond\n");
+    caret_to(&main, 5);
+    send_inputs(view.hwnd(), &[Input::Text(" **b**")]);
+    assert_eq!(
+        shown_line(view, 0).0,
+        "first **b**",
+        "the caret line stays source"
+    );
+    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
+    assert_eq!(
+        shown_line(view, 0).0,
+        "first b",
+        "rendered once the caret leaves"
+    );
+    assert_eq!(shown_line(view, 1).0, "second");
+}
+
+#[test]
+fn opening_a_fence_restyles_the_lines_below() {
+    let (_scintilla, main, view) = live_tab("top\n\n**x**\n\n**y**\n");
+    assert_eq!(shown_line(view, 2).0, "x");
+    caret_to(&main, 3);
+    send_inputs(
+        view.hwnd(),
+        &[Input::Key(VK_RETURN, false, false), Input::Text("```")],
+    );
+    // Everything below an unclosed fence is code: shown as written.
+    assert_eq!(shown_line(view, 3).0, "**x**");
+    assert_eq!(shown_line(view, 5).0, "**y**");
+}
+
+#[test]
+fn undo_restores_the_rendering() {
+    let (_scintilla, main, view) = live_tab("plain\n\nend\n");
+    caret_to(&main, 5);
+    send_inputs(view.hwnd(), &[Input::Text(" *it*")]);
+    caret_to(&main, main.editor().length().unwrap());
+    assert_eq!(shown_line(view, 0).0, "plain it");
+    main.command(CommandId::Undo);
+    caret_to(&main, main.editor().length().unwrap());
+    assert_eq!(main.editor().text().unwrap(), "plain\n\nend\n");
+    assert_eq!(shown_line(view, 0).0, "plain");
+    main.command(CommandId::Redo);
+    caret_to(&main, main.editor().length().unwrap());
+    assert_eq!(shown_line(view, 0).0, "plain it");
+}
+
+#[test]
+fn a_replace_all_reparses_once() {
+    let text = "x *a* y\n".repeat(200);
+    let (_scintilla, main, view) = live_tab(&text);
+    unsafe { UpdateWindow(view.hwnd()) };
+    pump_pending();
+    let before = view.document_updates();
+    let replaced = main.editor().replace_all("a", "bb", 0).unwrap();
+    assert_eq!(replaced, 200);
+    caret_to(&main, main.editor().length().unwrap());
+    unsafe { UpdateWindow(view.hwnd()) };
+    pump_pending();
+    assert_eq!(view.document_updates() - before, 1);
+    assert_eq!(shown_line(view, 5).0, "x bb y");
+}
+
+#[test]
+fn an_external_change_while_live_rerenders() {
+    let (_scintilla, main, view) = live_tab("old\n");
+    main.set_text("# New\n\n**fresh**\n");
+    caret_to(&main, 0);
+    assert_eq!(shown_line(view, 2).0, "fresh");
+}
+
+#[test]
+fn front_matter_is_dimmed_and_not_a_heading() {
+    let (_scintilla, main, view) = live_tab("---\ntitle: x\n---\n\n# H\n");
+    caret_to(&main, 18);
+    let (front, revealed, height) = shown_line(view, 1);
+    assert_eq!(front, "title: x");
+    assert!(!revealed);
+    assert!(
+        height < view.row_metrics().0 as f32 * 1.5,
+        "not a heading: {height}"
+    );
+    assert_eq!(
+        shown_line(view, 2).0,
+        "---",
+        "the closing line is not a setext underline"
+    );
+}

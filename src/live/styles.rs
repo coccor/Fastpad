@@ -243,13 +243,6 @@ impl<T: LiveText + SourceText> StyledLines for Styled<'_, T> {
     }
 }
 
-/// Plain text, until the view styles its document (phase 2 plan, Task 6 replaces this).
-impl StyledLines for super::text::EditorText<'_> {
-    fn line_style(&self, line: usize) -> LineStyle {
-        LineStyle::plain(self.line_end(line) - self.line_start(line))
-    }
-}
-
 /// Plain text, for the layout tests that need no Markdown.
 #[cfg(test)]
 impl StyledLines for super::text::MemoryText {

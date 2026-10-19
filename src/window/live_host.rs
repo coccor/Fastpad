@@ -377,7 +377,16 @@ pub(crate) fn edited(hwnd: HWND, id: GroupId, notification: &crate::editor::Scin
     };
     let position = notification.position.max(0) as usize;
     let first_line = editor.line_from_position(position).unwrap_or(0);
-    view.edited(first_line, notification.lines_added);
+    let inserted = notification.modification_type as u32
+        & crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
+        != 0;
+    let edit = crate::preview::incremental::Edit::from_change(
+        position,
+        notification.length.max(0) as usize,
+        inserted,
+        notification.lines_added,
+    );
+    view.edited(edit, first_line);
 }
 
 const MULTIPLE_SELECTIONS_NOTICE: &str =

@@ -51,13 +51,24 @@ fn down(key: u16) -> bool {
 
 /// The document position under client point (`x`, `y`).
 fn position_at(state: &mut ViewState, (x, y): (i32, i32)) -> usize {
+    prepare(state);
     let scale = dpi_scale(state.hwnd);
     let doc_x = x as f32 / scale - text_left(state);
     let doc_y = y as f32 / scale + state.scroll_y;
-    let ViewState { editor, layout, .. } = state;
-    layout
-        .position_at(&EditorText(editor), doc_x, doc_y)
-        .unwrap_or(0)
+    let ViewState {
+        editor,
+        layout,
+        document,
+        revealed,
+        ..
+    } = state;
+    let source = EditorText(editor);
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+    };
+    layout.position_at(&text, doc_x, doc_y).unwrap_or(0)
 }
 
 /// The `unit` around `position`.

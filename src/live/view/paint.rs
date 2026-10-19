@@ -34,6 +34,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         (client.bottom - client.top).max(1) as u32,
     );
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    // Pending edits and the caret's line first: both may invalidate more of the view.
+    prepare(state);
     // What this frame must repaint: the update region's bounds, or everything when the target is
     // new, the text rewraps or the view scrolls (the target keeps the rest from the last frame).
     let mut update = RECT::default();
@@ -87,19 +89,26 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         full = true;
     }
     let width = text_width(hwnd, gutter);
+    if state.layout.line_count() != EditorText(&state.editor).line_count() {
+        // An edit the view was not told about; never draw a stale document.
+        load_document(state);
+        full = true;
+    }
     let ViewState {
         editor,
         layout,
+        document,
+        revealed,
         scroll_y,
         ..
     } = state;
-    let text = EditorText(editor);
+    let source = EditorText(editor);
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+    };
     let scroll_before = *scroll_y;
-    if layout.line_count() != text.line_count() {
-        // An edit the view was not told about; never draw a stale document.
-        layout.reset(&text);
-        full = true;
-    }
     if (layout.width() - width).abs() > 0.5 {
         let anchor = layout.anchor(*scroll_y);
         layout.set_width(&text, width);

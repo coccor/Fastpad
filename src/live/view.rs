@@ -2,14 +2,24 @@
 //! Scintilla stays the document (text, selection, undo); this window draws it with Direct2D and,
 //! turns keys and clicks into Scintilla input and selections (phase 1 plan,
 //! Architecture). Like the preview, nothing here sends messages while the state is borrowed.
+//!
+//! The view renders the document's Markdown (phase 2 plan, Task 6): edits are logged as they
+//! arrive and applied to the document's spans (`flush`) before anything measures or paints, and
+//! the lines the selection touches show as source (`sync_reveal`), keeping the caret where it was
+//! on screen when lines change between rendered and source.
 
 use crate::Result;
 use crate::editor::Editor;
+use crate::live::blocks::LiveDocument;
 use crate::live::layout::{LiveFonts, LiveLayout};
+use crate::live::reveal;
 use crate::live::scroll;
+use crate::live::styles::Styled;
 use crate::live::text::{EditorText, LiveText};
 use crate::platform::{last_error, wide_null};
 use crate::preview::dwrite::Graphics;
+use crate::preview::incremental::{Edit, EditLog, Pending, SourceText};
+use std::ops::Range;
 use std::rc::Rc;
 use windows::Win32::Graphics::Direct2D::{ID2D1HwndRenderTarget, ID2D1SolidColorBrush};
 use windows_sys::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, RECT};
@@ -64,6 +74,14 @@ struct ViewState {
     brushes: Option<Brushes>,
     colors: LiveColors,
     layout: LiveLayout,
+    /// The document's blocks and spans, as of the last `flush`.
+    document: LiveDocument,
+    /// Edits not yet applied to `document`.
+    edits: EditLog,
+    /// Edited lines whose layout height may have changed, with their height before the edit.
+    height_checks: Vec<(usize, f32)>,
+    /// The source lines showing as source: the ones the selection touches.
+    revealed: Range<usize>,
     /// Top of the viewport in document DIPs.
     scroll_y: f32,
     /// Whether line numbers show (the editor's `line_numbers` setting), and the gutter's width in
@@ -124,6 +142,10 @@ impl LiveView {
             brushes: None,
             colors,
             layout,
+            document: LiveDocument::default(),
+            edits: EditLog::default(),
+            height_checks: Vec::new(),
+            revealed: 0..1,
             scroll_y: 0.0,
             line_numbers,
             gutter: 0.0,
@@ -138,11 +160,7 @@ impl LiveView {
             paint_retried: false,
             graphics,
         });
-        let width = text_width(hwnd, 0.0);
-        let ViewState { editor, layout, .. } = &mut *state;
-        let text = EditorText(editor);
-        layout.set_width(&text, width);
-        layout.reset(&text);
+        load_document(&mut state);
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
         Ok(Self { hwnd })
     }
@@ -164,8 +182,7 @@ impl LiveView {
     pub fn reload(&self) {
         self.with(|state| {
             let top = state.layout.line_at_y(state.scroll_y);
-            let ViewState { editor, layout, .. } = state;
-            layout.reset(&EditorText(editor));
+            load_document(state);
             state.scroll_y = state.layout.line_top(top);
         });
         invalidate(self.hwnd);
@@ -179,8 +196,20 @@ impl LiveView {
                 state.brushes = None;
             }
             let anchor = state.layout.anchor(state.scroll_y);
-            let ViewState { editor, layout, .. } = state;
-            if layout.set_fonts(&EditorText(editor), fonts).is_ok() {
+            let ViewState {
+                editor,
+                layout,
+                document,
+                revealed,
+                ..
+            } = state;
+            let source = EditorText(editor);
+            let text = Styled {
+                text: &source,
+                document,
+                revealed: revealed.clone(),
+            };
+            if layout.set_fonts(&text, fonts).is_ok() {
                 state.scroll_y = state.layout.scroll_for_anchor(anchor);
             }
         });
@@ -196,6 +225,7 @@ impl LiveView {
     /// Scrolls so `line` is at the top.
     pub fn set_top_line(&self, line: usize) {
         self.with(|state| {
+            prepare(state);
             let line = line.min(state.layout.line_count().saturating_sub(1));
             state.scroll_y = state.layout.line_top(line);
         });
@@ -208,36 +238,46 @@ impl LiveView {
         invalidate(self.hwnd);
     }
 
-    /// The document changed: an edit starting on `first_line` added `lines_added` lines
-    /// (negative when it removed some). Only the touched lines are laid out again; the first
-    /// visible line stays where it was.
-    pub fn edited(&self, first_line: usize, lines_added: isize) {
+    /// The document changed: `edit` starts on `first_line`. The edit is logged for the next
+    /// `flush`, the touched lines lose their layouts, and the first visible line stays where it
+    /// was.
+    pub fn edited(&self, edit: Edit, first_line: usize) {
         #[cfg(test)]
         let started = std::time::Instant::now();
+        let lines_added = edit.lines_delta;
         let painted = self.with(|state| {
+            state.edits.record(edit);
             let scroll = state.scroll_y;
             let anchor = state.layout.anchor(scroll);
             let top = state.layout.line_top(first_line);
             let old_height = state.layout.line_top(first_line + 1) - top;
-            let ViewState { editor, layout, .. } = state;
-            let text = EditorText(editor);
+            state.revealed = reveal::shift(state.revealed.clone(), first_line, lines_added);
+            let ViewState {
+                editor,
+                layout,
+                document,
+                revealed,
+                ..
+            } = state;
+            let source = EditorText(editor);
+            let text = Styled {
+                text: &source,
+                document,
+                revealed: revealed.clone(),
+            };
             layout.edit(&text, first_line, lines_added);
-            if lines_added == 0 {
-                // Laid out now, so a line that kept its height repaints alone.
-                let _ = layout.ensure(&text, first_line..first_line + 1);
-            }
             state.scroll_y = state.layout.scroll_for_anchor(anchor);
             if (state.scroll_y - scroll).abs() > 0.01 {
                 return false;
             }
-            let new_height = state.layout.line_top(first_line + 1) - top;
-            let bottom = if lines_added == 0 && (new_height - old_height).abs() < 0.01 {
-                top + new_height
+            if lines_added == 0 {
+                // `flush` checks the line's new height once its spans are current.
+                state.height_checks.push((first_line, old_height));
+                invalidate_span(state, top, top + old_height);
             } else {
                 // Everything below moved.
-                f32::MAX
-            };
-            invalidate_span(state, top, bottom);
+                invalidate_span(state, top, f32::MAX);
+            }
             true
         });
         #[cfg(test)]
@@ -251,6 +291,11 @@ impl LiveView {
     /// ends unless the move was its own.
     pub fn selection_changed(&self) {
         let painted = self.with(|state| {
+            if prepare(state) {
+                // Lines changed between rendered and source: `sync_reveal` repaints everything.
+                scroll_to_caret(state);
+                return true;
+            }
             state.caret_on = true;
             let caret = state
                 .editor
@@ -294,6 +339,60 @@ impl LiveView {
         .unwrap_or_default()
     }
 
+    /// Line `line` as laid out now: its layout text, whether it is revealed, and its height.
+    #[cfg(test)]
+    pub fn debug_line(&self, line: usize) -> Option<(String, bool, f32)> {
+        self.with(|state| {
+            prepare(state);
+            let ViewState {
+                editor,
+                layout,
+                document,
+                revealed,
+                ..
+            } = state;
+            let source = EditorText(editor);
+            let text = Styled {
+                text: &source,
+                document,
+                revealed: revealed.clone(),
+            };
+            let laid = layout.line(&text, line).ok()?;
+            Some((
+                String::from_utf16_lossy(laid.offsets.layout_text()),
+                laid.style.revealed,
+                laid.height,
+            ))
+        })
+        .flatten()
+    }
+
+    /// The source lines showing as source.
+    #[cfg(test)]
+    pub fn revealed(&self) -> Range<usize> {
+        self.with(|state| state.revealed.clone()).unwrap_or(0..0)
+    }
+
+    /// The caret's top in client pixels, as last painted.
+    #[cfg(test)]
+    pub fn caret_client_y(&self) -> Option<i32> {
+        self.with(|state| state.caret_px.map(|(_, y, _)| y))
+            .flatten()
+    }
+
+    /// How many times the document applied edits or reparsed.
+    #[cfg(test)]
+    pub fn document_updates(&self) -> usize {
+        self.with(|state| state.document.updates()).unwrap_or(0)
+    }
+
+    /// How many blocks the document has parsed for spans.
+    #[cfg(test)]
+    pub fn parsed_blocks(&self) -> usize {
+        self.with(|state| state.document.parsed_blocks())
+            .unwrap_or(0)
+    }
+
     /// A row's height and the text's left edge, in client pixels.
     #[cfg(test)]
     pub fn row_metrics(&self) -> (i32, i32) {
@@ -325,15 +424,163 @@ impl LiveView {
 }
 
 fn scroll_to_caret(state: &mut ViewState) {
+    prepare(state);
     let (_, height) = view_size(state.hwnd);
-    let ViewState { editor, layout, .. } = state;
-    let text = EditorText(editor);
+    let ViewState {
+        editor,
+        layout,
+        document,
+        revealed,
+        ..
+    } = state;
+    let source = EditorText(editor);
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+    };
     let (_, caret) = text.selection();
     let Ok(rect) = layout.caret_rect(&text, caret) else {
         return;
     };
     let wanted = scroll::reveal(state.scroll_y, height, rect.top, rect.bottom, CARET_MARGIN);
     state.scroll_y = scroll::clamp(wanted, height, state.layout.total_height());
+}
+
+/// Parses the whole document again and lays it out from scratch, revealing the selection's
+/// lines: entering Live, or a change the view was not told about.
+fn load_document(state: &mut ViewState) {
+    let width = text_width(state.hwnd, state.gutter);
+    let ViewState {
+        editor,
+        layout,
+        document,
+        edits,
+        height_checks,
+        revealed,
+        ..
+    } = state;
+    let source = EditorText(editor);
+    *document = LiveDocument::parse(&SourceText::slice(&source, 0..SourceText::len(&source)));
+    *edits = EditLog::default();
+    height_checks.clear();
+    let (anchor, caret) = source.selection();
+    *revealed = reveal::revealed_lines(anchor, caret, |at| LiveText::line_of(&source, at));
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+    };
+    layout.set_width(&text, width);
+    layout.reset(&text);
+}
+
+/// Brings the view up to date before anything measures or paints: applies pending edits to the
+/// document (`flush`), then reveals the selection's lines (`sync_reveal`). True when the revealed
+/// lines changed (everything is then invalidated).
+fn prepare(state: &mut ViewState) -> bool {
+    flush(state);
+    sync_reveal(state)
+}
+
+/// Applies the logged edits to the document and drops the layouts of lines whose spans changed,
+/// invalidating what may have moved. Nothing to do when no edit is pending.
+fn flush(state: &mut ViewState) {
+    let pending = state.edits.take();
+    if pending == Pending::Nothing {
+        return;
+    }
+    let checks = std::mem::take(&mut state.height_checks);
+    let ViewState {
+        editor,
+        layout,
+        document,
+        revealed,
+        ..
+    } = state;
+    let source = EditorText(editor);
+    let all = 0..layout.line_count();
+    let restyle = match pending {
+        Pending::Edits(edits) => {
+            let changed = document.apply(&source, &edits);
+            let first = LiveText::line_of(&source, changed.start);
+            let last = LiveText::line_of(&source, changed.end);
+            first..last + 1
+        }
+        _ => {
+            document.reparse(&source);
+            all
+        }
+    };
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+    };
+    let dropped = layout.restyle(&text, restyle);
+    // One edited line: lay it out now, and repaint below it only if its height changed.
+    let mut moved_from = dropped.iter().min().copied();
+    if let [(line, old_height)] = checks[..] {
+        let top = layout.line_top(line);
+        if layout.ensure(&text, line..line + 1).is_ok() {
+            let height = layout.line_top(line + 1) - top;
+            if (height - old_height).abs() > 0.01 {
+                moved_from = Some(moved_from.map_or(line, |from| from.min(line)));
+            }
+        }
+    } else if !checks.is_empty() {
+        moved_from = Some(0);
+    }
+    if let Some(line) = moved_from {
+        let top = state.layout.line_top(line);
+        invalidate_span(state, top, f32::MAX);
+    }
+}
+
+/// Reveals the lines the selection touches, if they changed (Decision 2 of the phase 2 plan):
+/// the caret's rectangle is taken before and after the change and the view scrolls by the
+/// difference, so the caret keeps its place on screen however heights above or under it change.
+fn sync_reveal(state: &mut ViewState) -> bool {
+    let (_, height) = view_size(state.hwnd);
+    let ViewState {
+        editor,
+        layout,
+        document,
+        revealed,
+        scroll_y,
+        ..
+    } = state;
+    let source = EditorText(editor);
+    let (anchor, caret) = source.selection();
+    let new = reveal::revealed_lines(anchor, caret, |at| LiveText::line_of(&source, at));
+    if new == *revealed {
+        return false;
+    }
+    let before = layout
+        .caret_rect(
+            &Styled {
+                text: &source,
+                document,
+                revealed: revealed.clone(),
+            },
+            caret,
+        )
+        .ok();
+    let old = std::mem::replace(revealed, new.clone());
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: new.clone(),
+    };
+    for lines in reveal::changed(old, new) {
+        layout.restyle(&text, lines);
+    }
+    if let (Some(before), Ok(after)) = (before, layout.caret_rect(&text, caret)) {
+        *scroll_y += after.top - before.top;
+    }
+    *scroll_y = scroll::clamp(*scroll_y, height, layout.total_height());
+    invalidate(state.hwnd);
+    true
 }
 
 /// Kept out of `LiveView::create` so the public function never hands a raw `HWND` straight to an
@@ -415,10 +662,17 @@ fn selection_span(state: &mut ViewState) -> Option<(f32, f32)> {
     let ViewState {
         editor,
         layout,
+        document,
+        revealed,
         scroll_y,
         ..
     } = state;
-    let text = EditorText(editor);
+    let source = EditorText(editor);
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+    };
     let (anchor, caret) = text.selection();
     let first_visible = layout.line_at_y(*scroll_y);
     let last_visible = layout.line_at_y(*scroll_y + height);
