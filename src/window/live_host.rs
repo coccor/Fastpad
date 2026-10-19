@@ -154,6 +154,10 @@ pub(crate) fn show_text(hwnd: HWND, id: GroupId, shown: bool) {
     .unwrap_or((None, false, false));
     let focus = unsafe { GetFocus() };
     if live && let Some(view) = view {
+        // Relative image paths resolve against the document's folder.
+        let folder =
+            crate::window::preview_host::group_document(hwnd, id).and_then(|(_, _, folder)| folder);
+        view.set_document_dir(folder);
         if reload {
             view.reload();
         }

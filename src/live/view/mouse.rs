@@ -1,8 +1,11 @@
 //! The mouse in the Live view (phase 1 plan, Task 10): a press places the caret, Shift extends,
 //! a double press selects a word and a triple press a line, and a drag extends by the same unit,
-//! scrolling while the pointer is above or below the view. Ctrl+click follows a link.
+//! scrolling while the pointer is above or below the view. Ctrl+click follows a link. A plain
+//! click on a task's checkbox toggles it (phase 3 plan, Decision 6): the one edit Live makes on
+//! its own, one undo step that leaves the selection where it was.
 
 use super::*;
+use crate::live::layout::Decoration;
 use std::ops::Range;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
@@ -60,6 +63,7 @@ fn position_at(state: &mut ViewState, (x, y): (i32, i32)) -> usize {
         layout,
         document,
         revealed,
+        pictures,
         ..
     } = state;
     let source = EditorText(editor);
@@ -67,7 +71,7 @@ fn position_at(state: &mut ViewState, (x, y): (i32, i32)) -> usize {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &no_images,
+        images: &|dest: &str| pictures.resolve(dest),
     };
     layout.position_at(&text, doc_x, doc_y).unwrap_or(0)
 }
@@ -91,10 +95,67 @@ fn unit_at(text: &impl LiveText, unit: Unit, position: usize) -> Range<usize> {
     }
 }
 
+/// The rendered checkbox under client point `at`: the document position of the byte between its
+/// brackets, and whether it is checked.
+fn checkbox_under(state: &mut ViewState, (x, y): (i32, i32)) -> Option<(usize, bool)> {
+    prepare(state);
+    let scale = dpi_scale(state.hwnd);
+    let doc_x = x as f32 / scale - text_left(state);
+    let doc_y = y as f32 / scale + state.scroll_y;
+    let line = state.layout.line_at_y(doc_y);
+    let y = doc_y - state.layout.line_top(line);
+    let start = EditorText(&state.editor).line_start(line);
+    // A little slop around the box: it is small.
+    const SLOP: f32 = 2.0;
+    state
+        .layout
+        .laid_line(line)?
+        .decorations
+        .iter()
+        .find_map(|decoration| match decoration {
+            Decoration::Checkbox {
+                rect,
+                checked,
+                inner,
+            } if doc_x >= rect.left - SLOP
+                && doc_x <= rect.right + SLOP
+                && y >= rect.top - SLOP
+                && y <= rect.bottom + SLOP =>
+            {
+                Some((start + inner, *checked))
+            }
+            _ => None,
+        })
+}
+
+/// Toggles the checkbox whose inner byte is at `inner`: `[ ]` ↔ `[x]`, as one undo step, with
+/// the selection kept.
+fn toggle_checkbox(hwnd: HWND, inner: usize, checked: bool) {
+    let Some(editor) = with_state(hwnd, |state| state.editor.clone()) else {
+        return;
+    };
+    let selection = editor.anchor_and_caret().ok();
+    editor.begin_undo_action();
+    let _ = editor.replace_target(inner..inner + 1, if checked { " " } else { "x" });
+    editor.end_undo_action();
+    if let Some((anchor, caret)) = selection {
+        let _ = editor.set_selection(anchor..caret);
+    }
+    post_changed(hwnd, false);
+}
+
 /// `WM_LBUTTONDOWN`.
 pub(super) fn press(hwnd: HWND, lparam: isize) {
     unsafe { SetFocus(hwnd) };
     let at = point(lparam);
+    if !down(VK_CONTROL)
+        && !down(VK_SHIFT)
+        && let Some((inner, checked)) =
+            with_state(hwnd, |state| checkbox_under(state, at)).flatten()
+    {
+        toggle_checkbox(hwnd, inner, checked);
+        return;
+    }
     if down(VK_CONTROL) {
         let position = with_state(hwnd, |state| position_at(state, at)).unwrap_or(0);
         // The main window follows a link under the pointer; the click is then taken.
@@ -278,11 +339,11 @@ pub(super) fn update_cursor(hwnd: HWND) {
     if !inside {
         return;
     }
-    let hand = down(VK_CONTROL)
-        && with_state(hwnd, |state| {
-            link_under(state, (point.x, point.y)).is_some()
-        })
-        .unwrap_or(false);
+    let at = (point.x, point.y);
+    let hand = with_state(hwnd, |state| {
+        checkbox_under(state, at).is_some() || (down(VK_CONTROL) && link_under(state, at).is_some())
+    })
+    .unwrap_or(false);
     with_state(hwnd, |state| state.hand = hand);
     let cursor = if hand { IDC_HAND } else { IDC_IBEAM };
     unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };

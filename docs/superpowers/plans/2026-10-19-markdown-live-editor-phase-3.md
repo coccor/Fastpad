@@ -393,7 +393,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
   Fills that extend to `f32::MAX` end at the text area's right edge.
 - [ ] **Images:**
   - `ViewState` gains `images: ImageCache` (notify = the Live hwnd, `WM_FASTPAD_LIVE_IMAGE`) and `document_dir: Option<PathBuf>`.
-  - `LiveView::set_document_dir(dir)` changes the folder. When it differs, it calls `images.clear()` and `reload`. `live_host::show_text` calls it before showing.
+  - `LiveView::set_document_dir(dir)` changes the folder. When it differs, it calls `images.clear()` and drops the image lines' layouts (no reload: nothing else depends on the folder, and entering Live must still parse once). `live_host::show_text` calls it before showing.
   - At paint, every visible line whose style is an image with a `Pending` path calls `images.request(path, text width in device px)`.
   - `WM_FASTPAD_LIVE_IMAGE` runs `images.drain()`. On a change, it drops every laid-out line whose `image` is `Some`, or whose style is an image line that fell back, and invalidates.
   - A new target calls `images.release_bitmaps()`.
@@ -404,7 +404,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
   - `update_cursor` shows `IDC_HAND` over a checkbox.
 - [ ] **Other decoration clicks:** a click on a rule or image line places the caret at the line's start. A click in an indent places it at the line's first text position; this falls out of `position_at` clamping, so check it rather than code it.
 - [ ] **Tests** (`markdown_live.rs`):
-  - **Painting:** `a_bullet_list_draws_bullets_in_the_margin` (`GetPixel` at a bullet's centre is the text colour; the text starts at the indent), `quote_bars_join_across_lines`, `a_rule_draws_a_line`, `a_code_block_background_fills_the_width`, `a_table_draws_its_grid_and_lines_up_columns` (each row's second cell has the same client x).
+  - **Painting:** `a_bullet_list_draws_bullets_in_the_margin` (the paint stats count the bullets; the text starts at the indent; decoration tests use a `#[cfg(test)] painted_decorations()` count, as phase 2's `paint_stats`, rather than `GetPixel`), `quote_bars_join_across_lines`, `a_rule_draws_a_line`, `a_code_block_background_fills_the_width`, `a_table_draws_its_grid_and_lines_up_columns` (each row's second cell has the same client x).
   - **Images:** `a_local_image_renders_as_a_thumbnail` (a PNG written to a temp folder next to a saved note; wait for `WM_FASTPAD_LIVE_IMAGE`; the line is taller than a row and a pixel inside matches the image), `a_missing_image_shows_its_alt_text`.
   - **Checkboxes:** `clicking_a_checkbox_toggles_it_in_one_undo_step` (text changes, one Ctrl+Z restores it, the selection is unchanged), `the_cursor_is_a_hand_over_a_checkbox`.
   - **Device loss:** `recreating_the_target_redraws_images`.

@@ -7,6 +7,10 @@
 //! arrive and applied to the document's spans (`flush`) before anything measures or paints, and
 //! the lines the selection touches show as source (`sync_reveal`), keeping the caret where it was
 //! on screen when lines change between rendered and source.
+//!
+//! Block constructs (phase 3 plan, Task 6) are drawn from each line's decorations; images decode
+//! on the view's own `ImageCache` worker, relative to the document's folder, and an image line is
+//! laid out again when its picture arrives.
 
 use crate::Result;
 use crate::editor::Editor;
@@ -14,12 +18,14 @@ use crate::live::blocks::LiveDocument;
 use crate::live::layout::{LiveFonts, LiveLayout};
 use crate::live::reveal;
 use crate::live::scroll;
-use crate::live::styles::{Paint, Styled, no_images};
+use crate::live::styles::{ImageInfo, Paint, Styled, resolve_image};
 use crate::live::text::{EditorText, LiveText};
 use crate::platform::{last_error, wide_null};
 use crate::preview::dwrite::Graphics;
+use crate::preview::images::ImageCache;
 use crate::preview::incremental::{Edit, EditLog, Pending, SourceText};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use windows::Win32::Graphics::Direct2D::{ID2D1HwndRenderTarget, ID2D1SolidColorBrush};
 use windows_sys::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, RECT};
@@ -99,6 +105,23 @@ impl Brushes {
     }
 }
 
+/// The pictures image lines show: decoded on a worker, found relative to the document's folder.
+struct Pictures {
+    cache: ImageCache,
+    folder: Option<PathBuf>,
+}
+
+impl Pictures {
+    fn resolve(&self, dest: &str) -> ImageInfo {
+        resolve_image(
+            dest,
+            self.folder.as_deref(),
+            |path| self.cache.size(path),
+            |path| self.cache.is_failed(path),
+        )
+    }
+}
+
 struct ViewState {
     hwnd: HWND,
     editor: Editor,
@@ -110,6 +133,10 @@ struct ViewState {
     /// Code backgrounds drawn by the last frame, for the tests.
     #[cfg(test)]
     painted_backgrounds: usize,
+    /// Decorations drawn by the last frame, by kind, for the tests.
+    #[cfg(test)]
+    painted: PaintedDecorations,
+    pictures: Pictures,
     colors: LiveColors,
     layout: LiveLayout,
     /// The document's blocks and spans, as of the last `flush`.
@@ -150,6 +177,19 @@ struct ViewState {
     graphics: Rc<Graphics>,
 }
 
+/// What the last frame drew besides text, for the tests: fills (code blocks, table headers),
+/// lines (rules, table borders), bullets, numbers, checkboxes and images.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaintedDecorations {
+    pub fills: usize,
+    pub lines: usize,
+    pub bullets: usize,
+    pub numbers: usize,
+    pub checkboxes: usize,
+    pub images: usize,
+}
+
 /// A handle to a Live window; copies are cheap and all refer to the same window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveView {
@@ -183,6 +223,12 @@ impl LiveView {
             brush_generation: 0,
             #[cfg(test)]
             painted_backgrounds: 0,
+            #[cfg(test)]
+            painted: PaintedDecorations::default(),
+            pictures: Pictures {
+                cache: ImageCache::new(hwnd, crate::window::WM_FASTPAD_LIVE_IMAGE),
+                folder: None,
+            },
             colors,
             layout,
             document: LiveDocument::default(),
@@ -232,6 +278,23 @@ impl LiveView {
         invalidate(self.hwnd);
     }
 
+    /// The folder relative image paths resolve against (the document's). A change forgets the
+    /// decoded images and lays the image lines out again; nothing else depends on it.
+    pub fn set_document_dir(&self, folder: Option<PathBuf>) {
+        let changed = self.with(|state| {
+            if state.pictures.folder == folder {
+                return false;
+            }
+            state.pictures.folder = folder;
+            state.pictures.cache.clear();
+            state.layout.drop_image_lines();
+            true
+        });
+        if changed == Some(true) {
+            invalidate(self.hwnd);
+        }
+    }
+
     pub fn set_appearance(&self, colors: LiveColors, fonts: LiveFonts, line_numbers: bool) {
         self.with(|state| {
             state.line_numbers = line_numbers;
@@ -245,6 +308,7 @@ impl LiveView {
                 layout,
                 document,
                 revealed,
+                pictures,
                 ..
             } = state;
             let source = EditorText(editor);
@@ -252,7 +316,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &no_images,
+                images: &|dest: &str| pictures.resolve(dest),
             };
             if layout.set_fonts(&text, fonts).is_ok() {
                 state.scroll_y = state.layout.scroll_for_anchor(anchor);
@@ -302,6 +366,7 @@ impl LiveView {
                 layout,
                 document,
                 revealed,
+                pictures,
                 ..
             } = state;
             let source = EditorText(editor);
@@ -309,7 +374,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &no_images,
+                images: &|dest: &str| pictures.resolve(dest),
             };
             layout.edit(&text, first_line, lines_added);
             state.scroll_y = state.layout.scroll_for_anchor(anchor);
@@ -395,6 +460,7 @@ impl LiveView {
                 layout,
                 document,
                 revealed,
+                pictures,
                 ..
             } = state;
             let source = EditorText(editor);
@@ -402,7 +468,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &no_images,
+                images: &|dest: &str| pictures.resolve(dest),
             };
             let laid = layout.line(&text, line).ok()?;
             Some((
@@ -441,6 +507,7 @@ impl LiveView {
                 document,
                 revealed,
                 scroll_y,
+                pictures,
                 ..
             } = state;
             let source = EditorText(editor);
@@ -448,7 +515,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &no_images,
+                images: &|dest: &str| pictures.resolve(dest),
             };
             let rect = layout.caret_rect(&text, position).ok()?;
             Some((
@@ -457,6 +524,36 @@ impl LiveView {
             ))
         })
         .flatten()
+    }
+
+    /// The client point at the centre of the first checkbox drawn for `line`.
+    #[cfg(test)]
+    pub fn checkbox_point(&self, line: usize) -> Option<(i32, i32)> {
+        self.with(|state| {
+            prepare(state);
+            let scale = dpi_scale(state.hwnd);
+            let left = text_left(state);
+            let top = state.layout.line_top(line) - state.scroll_y;
+            state
+                .layout
+                .laid_line(line)?
+                .decorations
+                .iter()
+                .find_map(|decoration| match decoration {
+                    crate::live::layout::Decoration::Checkbox { rect, .. } => Some((
+                        ((left + (rect.left + rect.right) / 2.0) * scale).round() as i32,
+                        ((top + (rect.top + rect.bottom) / 2.0) * scale).round() as i32,
+                    )),
+                    _ => None,
+                })
+        })
+        .flatten()
+    }
+
+    /// What the last frame drew besides text.
+    #[cfg(test)]
+    pub fn painted_decorations(&self) -> PaintedDecorations {
+        self.with(|state| state.painted).unwrap_or_default()
     }
 
     /// Whether the pointer last showed the hand.
@@ -539,6 +636,7 @@ fn scroll_to_caret(state: &mut ViewState) {
         layout,
         document,
         revealed,
+        pictures,
         ..
     } = state;
     let source = EditorText(editor);
@@ -546,7 +644,7 @@ fn scroll_to_caret(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &no_images,
+        images: &|dest: &str| pictures.resolve(dest),
     };
     let (_, caret) = text.selection();
     let Ok(rect) = layout.caret_rect(&text, caret) else {
@@ -567,6 +665,7 @@ fn load_document(state: &mut ViewState) {
         edits,
         height_checks,
         revealed,
+        pictures,
         ..
     } = state;
     let source = EditorText(editor);
@@ -579,7 +678,7 @@ fn load_document(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &no_images,
+        images: &|dest: &str| pictures.resolve(dest),
     };
     layout.set_width(&text, width);
     layout.reset(&text);
@@ -606,6 +705,7 @@ fn flush(state: &mut ViewState) {
         layout,
         document,
         revealed,
+        pictures,
         ..
     } = state;
     let source = EditorText(editor);
@@ -626,7 +726,7 @@ fn flush(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &no_images,
+        images: &|dest: &str| pictures.resolve(dest),
     };
     let dropped = layout.restyle(&text, restyle);
     // One edited line: lay it out now, and repaint below it only if its height changed.
@@ -659,6 +759,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
         document,
         revealed,
         scroll_y,
+        pictures,
         ..
     } = state;
     let source = EditorText(editor);
@@ -673,7 +774,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &no_images,
+                images: &|dest: &str| pictures.resolve(dest),
             },
             caret,
         )
@@ -683,7 +784,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
         text: &source,
         document,
         revealed: new.clone(),
-        images: &no_images,
+        images: &|dest: &str| pictures.resolve(dest),
     };
     // Lines that changed state between the top of the view and the caret are laid out again
     // now: until then they keep their old heights, and the caret's new top would not show the
@@ -703,6 +804,25 @@ fn sync_reveal(state: &mut ViewState) -> bool {
     *scroll_y = scroll::clamp(*scroll_y, height, layout.total_height());
     invalidate(state.hwnd);
     true
+}
+
+/// `WM_FASTPAD_LIVE_IMAGE`: decodes finished. Image lines are laid out again with their pictures
+/// (or their alt text, for a picture that failed).
+fn images_ready(hwnd: HWND) {
+    let changed = with_state(hwnd, |state| {
+        if !state.pictures.cache.drain() {
+            return false;
+        }
+        let dropped = state.layout.drop_image_lines();
+        if let Some(&first) = dropped.first() {
+            let top = state.layout.line_top(first);
+            invalidate_span(state, top, f32::MAX);
+        }
+        true
+    });
+    if changed == Some(true) {
+        post_changed(hwnd, false);
+    }
 }
 
 /// Kept out of `LiveView::create` so the public function never hands a raw `HWND` straight to an
@@ -787,6 +907,7 @@ fn selection_span(state: &mut ViewState) -> Option<(f32, f32)> {
         document,
         revealed,
         scroll_y,
+        pictures,
         ..
     } = state;
     let source = EditorText(editor);
@@ -794,7 +915,7 @@ fn selection_span(state: &mut ViewState) -> Option<(f32, f32)> {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &no_images,
+        images: &|dest: &str| pictures.resolve(dest),
     };
     let (anchor, caret) = text.selection();
     let first_visible = layout.line_at_y(*scroll_y);

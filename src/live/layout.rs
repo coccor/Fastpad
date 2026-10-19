@@ -261,7 +261,13 @@ impl LiveLayout {
     /// Line number `number`, right-aligned in a box `width` wide, on the text's rows: drawn at a
     /// line's top, it sits on that line's first row with the same baseline.
     pub fn number_layout(&self, number: usize, width: f32) -> Result<IDWriteTextLayout> {
-        let digits = number.to_string().encode_utf16().collect::<Vec<_>>();
+        self.label_layout(&number.to_string(), width)
+    }
+
+    /// `label` right-aligned in a box `width` wide, on the text's rows: a line number, or an
+    /// ordered list's marker drawn in its margin box.
+    pub fn label_layout(&self, label: &str, width: f32) -> Result<IDWriteTextLayout> {
+        let digits = label.encode_utf16().collect::<Vec<_>>();
         let layout = unsafe {
             self.graphics
                 .dwrite
@@ -419,6 +425,22 @@ impl LiveLayout {
             rows.iter().map(|row| &row[..]),
             self.fonts.size * 0.5,
         ))
+    }
+
+    /// Drops the layout of every laid-out image line, whether it showed its picture or its alt
+    /// text: a decode finished. Returns the lines dropped.
+    pub fn drop_image_lines(&mut self) -> Vec<usize> {
+        let dropped = (0..self.lines.len())
+            .filter(|&line| {
+                self.lines
+                    .get(line)
+                    .is_some_and(|laid| matches!(laid.style.block.body, BodyStyle::Image { .. }))
+            })
+            .collect::<Vec<_>>();
+        for &line in &dropped {
+            self.lines.invalidate(line..line + 1);
+        }
+        dropped
     }
 
     /// Lays out the lines in `lines` that are not laid out yet.

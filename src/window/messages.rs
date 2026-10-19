@@ -84,6 +84,9 @@ pub const WM_FASTPAD_LIVE_CHANGED: u32 = WM_APP + 0x5C;
 /// Sent to the main window, which returns 1 when it follows a link there (the click is then
 /// taken). Not part of the deferred chain.
 pub const WM_FASTPAD_LIVE_LINK: u32 = WM_APP + 0x5D;
+/// A Live view's image decode finished; posted by its `ImageCache`'s worker to the Live window
+/// itself, which lays out its image lines again. Not part of the deferred chain.
+pub const WM_FASTPAD_LIVE_IMAGE: u32 = WM_APP + 0x5E;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

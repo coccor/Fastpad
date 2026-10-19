@@ -1,14 +1,18 @@
 //! Painting the Live view: the visible lines, the selection behind them and the caret, with
-//! Direct2D, and the scroll bar state a frame leaves behind.
+//! Direct2D, and the scroll bar state a frame leaves behind. Each line's decorations (phase 3
+//! plan, Task 6) are drawn with it: fills behind everything, then the selection, then bars,
+//! lines, markers, checkboxes and images, then the text.
 
 use super::*;
-use crate::preview::render::{color_f, create_hwnd_target_with};
+use crate::live::layout::Decoration;
+use crate::live::styles::BodyStyle;
+use crate::preview::render::{RectF, color_f, create_hwnd_target_with};
 use windows::Win32::Foundation::D2DERR_RECREATE_TARGET;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE;
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_PRESENT_OPTIONS, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
-    D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_ELLIPSE,
+    D2D1_PRESENT_OPTIONS, D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 use windows_sys::Win32::Graphics::Gdi::GetUpdateRect;
@@ -56,6 +60,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 ),
             )?);
             state.brushes = None;
+            // Bitmaps belonged to the old target's device.
+            state.pictures.cache.release_bitmaps();
         }
         Some(target) => {
             // The target takes its DPI only at creation; follow a move to another monitor.
@@ -108,6 +114,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         document,
         revealed,
         scroll_y,
+        pictures,
         ..
     } = state;
     let source = EditorText(editor);
@@ -115,7 +122,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &no_images,
+        images: &|dest: &str| pictures.resolve(dest),
     };
     let scroll_before = *scroll_y;
     if (layout.width() - width).abs() > 0.5 {
@@ -152,6 +159,23 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         .clone()
         .map(|line| (layout.line_top(line), layout.line_top(line + 1)))
         .collect::<Vec<_>>();
+    // Image lines on screen whose pictures are not decoded yet: ask for them at the text width.
+    let pending = visible
+        .clone()
+        .filter_map(|line| match &layout.laid_line(line)?.style.block.body {
+            BodyStyle::Image { dest, .. } => match pictures.resolve(dest) {
+                ImageInfo::Pending(path) => Some(path),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let pixel_text_width = (layout.width() * dpi as f32 / 96.0).ceil() as u32;
+    for path in pending {
+        pictures.cache.request(&path, pixel_text_width);
+    }
+    // Where a decoration reaching the right edge (`f32::MAX`) ends, in line coordinates.
+    let text_right = layout.width();
 
     let target = state.target.as_ref().expect("created above");
     let brushes = state.brushes.as_ref().expect("created above");
@@ -190,6 +214,9 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         // Code backgrounds first, so a selection over inline code still shows.
         #[cfg(test)]
         let mut backgrounds = 0;
+        #[cfg(test)]
+        let mut painted = PaintedDecorations::default();
+        let right = |x: f32| if x == f32::MAX { text_right } else { x };
         for (line, (top, bottom)) in visible.clone().zip(spans.iter().copied()) {
             if (bottom - scroll_y) < clip_top || (top - scroll_y) > clip_bottom {
                 continue;
@@ -197,6 +224,23 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             let Some(laid) = state.layout.laid_line(line) else {
                 continue;
             };
+            for decoration in &laid.decorations {
+                if let Decoration::Fill { rect: area, paint } = decoration {
+                    target.FillRectangle(
+                        &rect(
+                            area.left,
+                            top + area.top,
+                            right(area.right),
+                            top + area.bottom,
+                        ),
+                        brushes.paint(*paint),
+                    );
+                    #[cfg(test)]
+                    {
+                        painted.fills += 1;
+                    }
+                }
+            }
             for &(start, end, paint) in &laid.backgrounds {
                 for area in laid.range_rects(start, end).unwrap_or_default() {
                     target.FillRectangle(
@@ -225,10 +269,130 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 selection_brush,
             );
         }
+        // Pictures are drawn last: an image line has no text to cover them.
+        let mut images: Vec<(D2D_RECT_F, &std::path::Path)> = Vec::new();
         for (line, (top, bottom)) in visible.clone().zip(spans) {
             let on_screen = (top - scroll_y)..(bottom - scroll_y);
             if on_screen.end < clip_top || on_screen.start > clip_bottom {
                 continue;
+            }
+            if let Some(laid) = state.layout.laid_line(line) {
+                let at = |area: &RectF| {
+                    rect(
+                        area.left,
+                        top + area.top,
+                        right(area.right),
+                        top + area.bottom,
+                    )
+                };
+                let point = |(x, y): (f32, f32)| Vector2 {
+                    X: text_x + right(x),
+                    Y: top + y - scroll_y,
+                };
+                for decoration in &laid.decorations {
+                    match decoration {
+                        Decoration::Fill { .. } => {}
+                        Decoration::Line { from, to, paint } => {
+                            target.DrawLine(
+                                point(*from),
+                                point(*to),
+                                brushes.paint(*paint),
+                                1.0,
+                                None,
+                            );
+                            #[cfg(test)]
+                            {
+                                painted.lines += 1;
+                            }
+                        }
+                        Decoration::Bullet {
+                            center,
+                            radius,
+                            depth,
+                        } => {
+                            let center = point(*center);
+                            let ellipse = D2D1_ELLIPSE {
+                                point: center,
+                                radiusX: *radius,
+                                radiusY: *radius,
+                            };
+                            match depth {
+                                0 | 1 => target.FillEllipse(&ellipse, &brushes.text),
+                                2 => target.DrawEllipse(&ellipse, &brushes.text, 1.0, None),
+                                _ => target.FillRectangle(
+                                    &D2D_RECT_F {
+                                        left: center.X - radius * 0.8,
+                                        top: center.Y - radius * 0.8,
+                                        right: center.X + radius * 0.8,
+                                        bottom: center.Y + radius * 0.8,
+                                    },
+                                    &brushes.text,
+                                ),
+                            }
+                            #[cfg(test)]
+                            {
+                                painted.bullets += 1;
+                            }
+                        }
+                        Decoration::Number { rect: area, text } => {
+                            if let Ok(label) = state
+                                .layout
+                                .label_layout(text, (area.right - area.left).max(1.0))
+                            {
+                                target.DrawTextLayout(
+                                    Vector2 {
+                                        X: text_x + area.left,
+                                        Y: top + area.top - scroll_y,
+                                    },
+                                    &label,
+                                    &brushes.marker,
+                                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                                );
+                            }
+                            #[cfg(test)]
+                            {
+                                painted.numbers += 1;
+                            }
+                        }
+                        Decoration::Checkbox {
+                            rect: area,
+                            checked,
+                            ..
+                        } => {
+                            let outline = at(area);
+                            let inset = (area.right - area.left) * 0.22;
+                            target.DrawRectangle(
+                                &D2D_RECT_F {
+                                    left: outline.left + 0.5,
+                                    top: outline.top + 0.5,
+                                    right: outline.right - 0.5,
+                                    bottom: outline.bottom - 0.5,
+                                },
+                                &brushes.marker,
+                                1.0,
+                                None,
+                            );
+                            if *checked {
+                                target.FillRectangle(
+                                    &D2D_RECT_F {
+                                        left: outline.left + inset,
+                                        top: outline.top + inset,
+                                        right: outline.right - inset,
+                                        bottom: outline.bottom - inset,
+                                    },
+                                    &brushes.link,
+                                );
+                            }
+                            #[cfg(test)]
+                            {
+                                painted.checkboxes += 1;
+                            }
+                        }
+                        Decoration::Image { rect: area, path } => {
+                            images.push((at(area), path.as_path()));
+                        }
+                    }
+                }
             }
             if gutter > 0.0
                 && let Ok(number) = state.layout.number_layout(line + 1, gutter - GUTTER_GAP)
@@ -255,6 +419,25 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
+        }
+        for (area, path) in images {
+            if let Some(bitmap) = state.pictures.cache.bitmap(target, path) {
+                target.DrawBitmap(
+                    &bitmap,
+                    Some(&area),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+                #[cfg(test)]
+                {
+                    painted.images += 1;
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            state.painted = painted;
         }
         if let Some(caret) = caret_rect.filter(|_| state.caret_on) {
             let width = 1.0_f32.max(1.0 / dpi_scale(hwnd));

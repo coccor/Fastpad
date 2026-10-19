@@ -1554,3 +1554,200 @@ fn the_cursor_is_a_hand_over_a_link_with_ctrl() {
     assert!(!hand_at(plain, true), "the I-beam off a link");
     unsafe { SetCursorPos(original_pointer.x, original_pointer.y) };
 }
+
+/// A whole frame from the top: a partial one (a caret blink) may not reach every line.
+fn full_frame(view: LiveView) {
+    view.set_top_line(0);
+    unsafe { UpdateWindow(view.hwnd()) };
+    pump_pending();
+    unsafe { UpdateWindow(view.hwnd()) };
+}
+
+#[test]
+fn a_bullet_list_draws_bullets_in_the_margin() {
+    let (_scintilla, main, view) = live_tab("top\n\n- one\n- two\n");
+    caret_to(&main, 0);
+    full_frame(view);
+    assert_eq!(view.painted_decorations().bullets, 2);
+    let (_, text_left) = view.row_metrics();
+    let (x, _) = view.client_point_of("top\n\n- ".len()).unwrap();
+    assert!(
+        x > text_left + 10,
+        "the item's text starts at its indent: {x} vs {text_left}"
+    );
+}
+
+#[test]
+fn quote_bars_join_across_lines() {
+    let (_scintilla, main, view) = live_tab("top\n\n> a\n> b\n");
+    caret_to(&main, 0);
+    full_frame(view);
+    assert_eq!(view.painted_decorations().fills, 2);
+    let (_, first, height) = view.debug_line(2).unwrap();
+    assert!(!first);
+    // Each bar spans its line's whole height, so the two meet.
+    assert!(height > 0.0);
+}
+
+#[test]
+fn a_rule_draws_a_line() {
+    let (_scintilla, main, view) = live_tab("top\n\npara\n\n---\n\nend\n");
+    caret_to(&main, 0);
+    full_frame(view);
+    assert_eq!(view.painted_decorations().lines, 1);
+    assert_eq!(view.debug_line(4).unwrap().0, "");
+}
+
+#[test]
+fn a_code_block_background_fills_the_width() {
+    let (_scintilla, main, view) = live_tab("top\n\n```rust\ncode\n```\n");
+    caret_to(&main, 0);
+    full_frame(view);
+    assert_eq!(view.painted_decorations().fills, 3);
+    assert_eq!(view.debug_line(2).unwrap().0, "rust");
+    assert_eq!(view.debug_line(3).unwrap().0, "code");
+}
+
+#[test]
+fn a_table_draws_its_grid_and_lines_up_columns() {
+    let text = "top\n\n| a | bbbbbb |\n|---|---|\n| cccccc | d |\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 0);
+    full_frame(view);
+    let painted = view.painted_decorations();
+    assert!(painted.lines >= 9, "{painted:?}");
+    assert_eq!(painted.fills, 1, "the header's fill");
+    let (b, _) = view.client_point_of(text.find("bbbbbb").unwrap()).unwrap();
+    let (d, _) = view.client_point_of(text.find("| d").unwrap() + 2).unwrap();
+    assert!((b - d).abs() <= 1, "second column at {b} and {d}");
+}
+
+/// A 32-bit BMP `width` by `height` pixels, all one colour, in the temp folder.
+fn write_bmp(name: &str, width: u32, height: u32) -> std::path::PathBuf {
+    let pixels = (width * height * 4) as usize;
+    let mut bytes = Vec::with_capacity(54 + pixels);
+    bytes.extend_from_slice(b"BM");
+    bytes.extend_from_slice(&(54 + pixels as u32).to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&54u32.to_le_bytes());
+    bytes.extend_from_slice(&40u32.to_le_bytes());
+    bytes.extend_from_slice(&(width as i32).to_le_bytes());
+    bytes.extend_from_slice(&(height as i32).to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&32u16.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&(pixels as u32).to_le_bytes());
+    bytes.extend_from_slice(&2835u32.to_le_bytes());
+    bytes.extend_from_slice(&2835u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    for _ in 0..width * height {
+        bytes.extend_from_slice(&[40, 120, 200, 255]);
+    }
+    let path = std::env::temp_dir().join(format!("fastpad-live-{name}-{}.bmp", std::process::id()));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// Waits until a frame has drawn an image, repainting as decodes land.
+fn wait_for_image(view: LiveView) {
+    pump_until("the image to be drawn", Duration::from_secs(10), || {
+        full_frame(view);
+        view.painted_decorations().images > 0
+    });
+}
+
+#[test]
+fn a_local_image_renders_as_a_thumbnail() {
+    let image = write_bmp("thumbnail", 40, 120);
+    let text = format!("top\n\n![dot]({})\n\nend\n", image.display());
+    let (_scintilla, main, view) = live_tab(&text);
+    caret_to(&main, 0);
+    full_frame(view);
+    wait_for_image(view);
+    let (shown, revealed, height) = view.debug_line(2).unwrap();
+    assert_eq!(shown, "");
+    assert!(!revealed);
+    assert!(height > 120.0, "the line is as tall as the image: {height}");
+    let _ = std::fs::remove_file(image);
+}
+
+#[test]
+fn a_missing_image_shows_its_alt_text() {
+    let missing = std::env::temp_dir().join("fastpad-live-no-such-image.png");
+    let text = format!("top\n\n![cat]({})\n", missing.display());
+    let (_scintilla, main, view) = live_tab(&text);
+    caret_to(&main, 0);
+    full_frame(view);
+    pump_pending();
+    full_frame(view);
+    assert_eq!(view.debug_line(2).unwrap().0, "cat");
+    assert_eq!(view.painted_decorations().images, 0);
+}
+
+#[test]
+fn recreating_the_target_redraws_images() {
+    let image = write_bmp("recreate", 30, 30);
+    let text = format!("top\n\n![dot]({})\n", image.display());
+    let (_scintilla, main, view) = live_tab(&text);
+    caret_to(&main, 0);
+    wait_for_image(view);
+    view.drop_target();
+    full_frame(view);
+    assert_eq!(view.painted_decorations().images, 1);
+    let _ = std::fs::remove_file(image);
+}
+
+#[test]
+fn clicking_a_checkbox_toggles_it_in_one_undo_step() {
+    let (_scintilla, main, view) = live_tab("top\n\n- [ ] task\n");
+    caret_to(&main, 1);
+    full_frame(view);
+    assert_eq!(view.painted_decorations().checkboxes, 1);
+    let point = view.checkbox_point(2).unwrap();
+    click(view.hwnd(), point, false, false);
+    let editor = main.editor();
+    assert_eq!(editor.text().unwrap(), "top\n\n- [x] task\n");
+    assert_eq!(caret(&main), (1, 1), "the selection stays");
+    click(view.hwnd(), view.checkbox_point(2).unwrap(), false, false);
+    assert_eq!(editor.text().unwrap(), "top\n\n- [ ] task\n");
+    editor.undo().unwrap();
+    pump_pending();
+    assert_eq!(editor.text().unwrap(), "top\n\n- [x] task\n");
+    editor.undo().unwrap();
+    pump_pending();
+    assert_eq!(editor.text().unwrap(), "top\n\n- [ ] task\n");
+}
+
+#[test]
+fn the_cursor_is_a_hand_over_a_checkbox() {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, HTCLIENT, SetCursorPos, WM_SETCURSOR,
+    };
+    let (_scintilla, main, view) = live_tab("top\n\n- [ ] task\n");
+    caret_to(&main, 0);
+    full_frame(view);
+    let mut original_pointer = POINT::default();
+    unsafe { GetCursorPos(&mut original_pointer) };
+    let hand_at = |(x, y): (i32, i32)| {
+        let mut point = POINT { x, y };
+        unsafe {
+            ClientToScreen(view.hwnd(), &mut point);
+            SetCursorPos(point.x, point.y);
+            SendMessageW(
+                view.hwnd(),
+                WM_SETCURSOR,
+                view.hwnd() as usize,
+                HTCLIENT as isize,
+            );
+        }
+        view.hand_cursor()
+    };
+    let checkbox = view.checkbox_point(2).unwrap();
+    let task = view.client_point_of("top\n\n- [ ] ta".len()).unwrap();
+    assert!(hand_at(checkbox), "a hand over the checkbox");
+    assert!(!hand_at(task), "the I-beam over the task's text");
+    unsafe { SetCursorPos(original_pointer.x, original_pointer.y) };
+}

@@ -163,6 +163,10 @@ pub(super) unsafe extern "system" fn live_proc(
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        crate::window::WM_FASTPAD_LIVE_IMAGE => {
+            super::images_ready(hwnd);
+            0
+        }
         WM_DPICHANGED_AFTERPARENT => {
             invalidate(hwnd);
             0
