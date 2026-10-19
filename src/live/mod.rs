@@ -6,8 +6,10 @@ pub mod layout;
 pub mod lines;
 pub mod motion;
 pub mod offsets;
+pub mod reveal;
 pub mod scroll;
 pub mod spans;
+pub mod styles;
 pub mod text;
 pub mod view;
 
