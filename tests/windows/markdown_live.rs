@@ -2129,3 +2129,41 @@ fn revealing_blocks_never_dirties() {
     assert!(!dirty());
     let _ = std::fs::remove_file(image);
 }
+
+#[test]
+fn a_relative_image_next_to_a_saved_note_renders() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("fastpad-live-images-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("img")).unwrap();
+    let image = write_bmp("relative", 40, 120);
+    std::fs::copy(&image, dir.join("img").join("pic.bmp")).unwrap();
+    std::fs::write(
+        dir.join("img").join("dot.png"),
+        crate::preview::images::PNG_2X2,
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(image);
+    std::fs::write(
+        dir.join("note.md"),
+        "# Note\n\ntext\n\n![pic](img/pic.bmp)\n\n![dot](img/dot.png)\n\nend\n",
+    )
+    .unwrap();
+    let main = TestMain::new();
+    window::open_path(main.hwnd, &dir.join("note.md")).unwrap();
+    pump_until("note.md loaded", Duration::from_secs(3), || {
+        !main.with_app(|app| app.populating_file)
+    });
+    main.with_app(|app| app.tabs.set_active_language(Language::Markdown));
+    main.set_live(true);
+    let view = main.live_view().unwrap();
+    unsafe { SetFocus(view.hwnd()) };
+    caret_to(&main, 0);
+    wait_for_image(view);
+    assert!(view.debug_line(4).unwrap().2 > 120.0);
+    full_frame(view);
+    pump_until("the PNG to be drawn too", Duration::from_secs(10), || {
+        full_frame(view);
+        view.painted_decorations().images == 2
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

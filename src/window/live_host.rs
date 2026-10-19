@@ -295,6 +295,8 @@ fn create_view(hwnd: HWND, id: GroupId) -> crate::Result<LiveView> {
     // Where the editor is now; the next group layout keeps the two together.
     let rect = client_rect_in_parent(editor.hwnd(), parent);
     let view = LiveView::create(parent, editor, graphics, colors, fonts, line_numbers)?;
+    // The scroll bar follows the theme, as the editor's does.
+    crate::window::titlebar::apply_scrollbar_theme(view.hwnd(), dark_scrollbars(hwnd));
     unsafe {
         MoveWindow(
             view.hwnd(),
@@ -530,10 +532,20 @@ pub(crate) fn refresh_appearance(hwnd: HWND) {
     let Ok(graphics) = crate::window::preview_host::shared_graphics(hwnd) else {
         return;
     };
+    let dark = dark_scrollbars(hwnd);
     for (view, editor) in views {
         let (colors, fonts, line_numbers) = appearance(hwnd, &graphics, &editor);
         view.set_appearance(colors, fonts, line_numbers);
+        crate::window::titlebar::apply_scrollbar_theme(view.hwnd(), dark);
     }
+}
+
+/// Whether scroll bars take the dark system look, as the editor's do.
+fn dark_scrollbars(hwnd: HWND) -> bool {
+    unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        let app = unsafe { app.as_ref() };
+        Palette::for_cached_theme(app.theme, app.settings.theme).dark_frame
+    })
 }
 
 #[cfg(test)]
