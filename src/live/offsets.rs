@@ -10,6 +10,8 @@ pub struct OffsetMap {
     text: Vec<u16>,
     /// The byte offset of each UTF-16 unit; both units of a surrogate pair hold the pair's start.
     units: Vec<usize>,
+    /// The byte just past the character each UTF-16 unit belongs to.
+    ends: Vec<usize>,
     /// Hidden byte ranges, each with the UTF-16 position it collapses to.
     hidden: Vec<(Range<usize>, u32)>,
     byte_len: usize,
@@ -41,6 +43,7 @@ impl OffsetMap {
                 for unit in ch.encode_utf16(&mut buffer) {
                     map.text.push(*unit);
                     map.units.push(range.start + offset);
+                    map.ends.push(range.start + offset + ch.len_utf8());
                 }
             }
         }
@@ -80,6 +83,24 @@ impl OffsetMap {
             .get(utf16 as usize)
             .copied()
             .unwrap_or(self.byte_len)
+    }
+
+    /// The byte just past the character whose last UTF-16 unit is `utf16 - 1`: where a trailing
+    /// hit on that character lands, before any hidden range that follows it. 0 for 0.
+    pub fn to_byte_after(&self, utf16: u32) -> usize {
+        let Some(last) = (utf16 as usize).checked_sub(1) else {
+            return 0;
+        };
+        self.ends
+            .get(last)
+            .copied()
+            .unwrap_or_else(|| self.ends.last().copied().unwrap_or(0))
+    }
+
+    /// The UTF-16 range showing bytes `range`, with hidden bytes collapsed.
+    pub fn to_utf16_range(&self, range: Range<usize>) -> Range<u32> {
+        let start = self.to_utf16(range.start);
+        start..self.to_utf16(range.end).max(start)
     }
 }
 
@@ -167,6 +188,70 @@ mod tests {
         assert!(map.layout_text().is_empty());
         assert_eq!(map.to_utf16(0), 0);
         assert_eq!(map.to_byte(0), 0);
+    }
+
+    fn bold() -> OffsetMap {
+        OffsetMap::new("**bold**", [(0..2, false), (2..6, true), (6..8, false)])
+    }
+
+    #[test]
+    fn trailing_hit_on_the_last_bold_letter_stays_inside() {
+        let map = bold();
+        assert_eq!(map.to_byte_after(4), 6, "before the closing markers");
+        assert_eq!(map.to_byte(4), 8, "a leading hit at the end is past them");
+        assert_eq!(
+            map.to_byte(0),
+            2,
+            "a leading hit on the first letter is after the opener"
+        );
+        assert_eq!(map.to_byte_after(0), 0);
+    }
+
+    #[test]
+    fn trailing_hit_before_a_hidden_link_tail_stays_in_the_text() {
+        let map = OffsetMap::new("[ab](u)", [(0..1, false), (1..3, true), (3..7, false)]);
+        assert_eq!(map.to_byte_after(2), 3);
+        assert_eq!(map.to_byte_after(1), 2);
+    }
+
+    #[test]
+    fn trailing_hit_on_an_astral_char_lands_after_both_units() {
+        let map = OffsetMap::plain("a😀b");
+        assert_eq!(map.to_byte_after(3), 5);
+        assert_eq!(
+            map.to_byte_after(2),
+            5,
+            "the high surrogate's trailing hit too"
+        );
+        assert_eq!(map.to_byte_after(4), 6);
+    }
+
+    #[test]
+    fn a_fully_hidden_line_maps_everything_to_zero_and_the_end() {
+        let map = OffsetMap::new("==", [(0..2, false)]);
+        assert!(map.layout_text().is_empty());
+        assert_eq!(map.to_utf16(0), 0);
+        assert_eq!(map.to_utf16(1), 0);
+        assert_eq!(map.to_byte(0), 2);
+        assert_eq!(map.to_byte_after(0), 0);
+        assert_eq!(map.to_utf16_range(0..2), 0..0);
+    }
+
+    #[test]
+    fn utf16_range_of_a_run_skips_hidden_bytes() {
+        let map = OffsetMap::new(
+            "a **b** c",
+            [
+                (0..2, true),
+                (2..4, false),
+                (4..5, true),
+                (5..7, false),
+                (7..9, true),
+            ],
+        );
+        assert_eq!(map.to_utf16_range(4..5), 2..3);
+        assert_eq!(map.to_utf16_range(0..9), 0..5);
+        assert_eq!(map.to_utf16_range(2..7), 2..3);
     }
 
     #[test]
