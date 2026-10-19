@@ -1751,3 +1751,241 @@ fn the_cursor_is_a_hand_over_a_checkbox() {
     assert!(!hand_at(task), "the I-beam over the task's text");
     unsafe { SetCursorPos(original_pointer.x, original_pointer.y) };
 }
+
+/// The line holding the caret.
+fn caret_line(main: &TestMain) -> usize {
+    let editor = main.editor();
+    editor.line_from_position(caret(main).1).unwrap()
+}
+
+#[test]
+fn up_down_keep_their_column_across_list_levels() {
+    let text = "first plain line here\n\n- item line here\n\nlast plain line here\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 14);
+    painted(view);
+    let goal = view.client_point_of(14).unwrap().0;
+    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
+    painted(view);
+    // The item line as drawn now (rendered, at its indent): the position nearest the goal.
+    let item = text.find("- item").unwrap();
+    let expected = (item + 2..item + "- item line here".len())
+        .min_by_key(|&at| (view.client_point_of(at).unwrap().0 - goal).abs())
+        .unwrap();
+    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
+    assert_eq!(
+        caret(&main).1,
+        expected,
+        "Down lands under the goal as drawn"
+    );
+    send_inputs(
+        view.hwnd(),
+        &[
+            Input::Key(VK_DOWN, false, false),
+            Input::Key(VK_DOWN, false, false),
+        ],
+    );
+    painted(view);
+    let (row, _) = view.row_metrics();
+    let x = view.client_point_of(caret(&main).1).unwrap().0;
+    assert!(
+        (x - goal).abs() <= row / 2,
+        "back on prose, the caret is under the goal: {x} vs {goal}"
+    );
+}
+
+#[test]
+fn moving_into_a_list_item_reveals_only_that_line() {
+    let text = "top\n\n- one\n- two\n- three\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, text.find("two").unwrap());
+    assert_eq!(view.revealed(), 3..4);
+    assert_eq!(shown_line(view, 2).0, "one");
+    assert_eq!(shown_line(view, 3).0, "- two");
+    assert_eq!(shown_line(view, 4).0, "three");
+}
+
+#[test]
+fn enter_in_a_rendered_list_continues_it() {
+    let text = "top\n\n- one";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, text.len());
+    send_inputs(
+        view.hwnd(),
+        &[Input::Key(VK_RETURN, false, false), Input::Text("two")],
+    );
+    assert_eq!(main.editor().text().unwrap(), "top\n\n- one\n- two");
+    caret_to(&main, 0);
+    assert_eq!(
+        shown_line(view, 3).0,
+        "two",
+        "the new item renders once left"
+    );
+}
+
+#[test]
+fn typing_in_a_code_block_never_changes_its_height() {
+    let text = "top\n\n```\ncode line\n```\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 0);
+    let (_, revealed, rendered) = shown_line(view, 3);
+    assert!(!revealed);
+    let inside = text.find("code line").unwrap() + 4;
+    caret_to(&main, inside);
+    let (_, revealed, source) = shown_line(view, 3);
+    assert!(revealed);
+    assert_eq!(source, rendered, "revealing a code line keeps its height");
+    send_inputs(view.hwnd(), &[Input::Text("x = 1;")]);
+    assert_eq!(shown_line(view, 3).2, rendered, "typing keeps it too");
+}
+
+#[test]
+fn moving_through_a_table_reveals_one_row_at_a_time() {
+    let text = "top\n\n| a | b |\n|---|---|\n| c | d |\n| e | f |\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, text.find("| c").unwrap() + 2);
+    assert_eq!(view.revealed(), 4..5);
+    assert_eq!(shown_line(view, 4).0, "| c | d |");
+    assert!(
+        shown_line(view, 5).0.contains('\u{FFFC}'),
+        "the next row is a grid row"
+    );
+    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
+    assert_eq!(view.revealed(), 5..6);
+    assert!(
+        shown_line(view, 4).0.contains('\u{FFFC}'),
+        "the row left renders again"
+    );
+    assert_eq!(shown_line(view, 5).0, "| e | f |");
+}
+
+#[test]
+fn leaving_a_table_row_formats_the_table_and_keeps_the_grid() {
+    let text = "top\n\n| a | b |\n|---|---|\n| c | d |\n\nafter\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, text.find("c |").unwrap() + 1);
+    send_inputs(
+        view.hwnd(),
+        &[
+            Input::Text("cccc"),
+            Input::Key(VK_DOWN, false, false),
+            Input::Key(VK_DOWN, false, false),
+        ],
+    );
+    let formatted = main.editor().text().unwrap();
+    let widths = formatted
+        .lines()
+        .skip(2)
+        .take(3)
+        .map(str::len)
+        .collect::<Vec<_>>();
+    assert!(
+        widths.iter().all(|&width| width == widths[0]),
+        "{formatted:?}"
+    );
+    caret_to(&main, 0);
+    painted(view);
+    for line in [2, 4] {
+        assert!(
+            shown_line(view, line).0.contains('\u{FFFC}'),
+            "line {line} is a grid row"
+        );
+    }
+    let (b, _) = view
+        .client_point_of(formatted.find(" b").unwrap() + 1)
+        .unwrap();
+    let (d, _) = view
+        .client_point_of(formatted.find(" d").unwrap() + 1)
+        .unwrap();
+    assert!((b - d).abs() <= 1, "the second column lines up: {b} vs {d}");
+}
+
+#[test]
+fn moving_onto_an_image_line_keeps_the_caret_row_in_place() {
+    let image = write_bmp("anchor", 40, 120);
+    let text = with_filler(&format!("intro\n![dot]({})\nafter\n", image.display()));
+    let (_scintilla, main, view) = live_tab(&text);
+    caret_to(&main, 2);
+    wait_for_image(view);
+    let (_, _, image_height) = view.debug_line(1).unwrap();
+    assert!(image_height > 120.0);
+    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
+    painted(view);
+    assert_eq!(view.revealed(), 1..2);
+    let (row, _) = view.row_metrics();
+    let caret_y = view.caret_client_y().unwrap();
+    assert!(
+        (caret_y - row).abs() <= 1,
+        "the caret row starts where the image line did: {caret_y} vs {row}"
+    );
+    let _ = std::fs::remove_file(image);
+}
+
+#[test]
+fn page_down_over_an_image_line_moves_by_a_page() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_NEXT;
+    let image = write_bmp("page", 40, 200);
+    let text = with_filler(&format!("intro\n\n![dot]({})\n\n", image.display()));
+    let (_scintilla, main, view) = live_tab(&text);
+    caret_to(&main, 0);
+    wait_for_image(view);
+    send_inputs(view.hwnd(), &[Input::Key(VK_NEXT, false, false)]);
+    painted(view);
+    let line = caret_line(&main);
+    assert!(line > 2, "past the image line: {line}");
+    let (row, _) = view.row_metrics();
+    let mut client = windows_sys::Win32::Foundation::RECT::default();
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(view.hwnd(), &mut client) };
+    let caret_y = view.caret_client_y().unwrap();
+    assert!(
+        caret_y >= 0 && caret_y + row <= client.bottom,
+        "the caret stays on screen: {caret_y} in {}",
+        client.bottom
+    );
+    // About a page of rows (the image line counts as its own height), not the whole note.
+    let page_rows = (client.bottom / row) as usize;
+    assert!(
+        line <= page_rows + 3,
+        "{line} lines down for a page of {page_rows} rows"
+    );
+    let _ = std::fs::remove_file(image);
+}
+
+#[test]
+fn clicking_a_rule_places_the_caret_on_it() {
+    let text = "top\n\npara\n\n---\n\nend\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 0);
+    painted(view);
+    let rule = text.find("---").unwrap();
+    let (_, y) = view.client_point_of(rule).unwrap();
+    let (_, left) = view.row_metrics();
+    click(view.hwnd(), (left + 200, y), false, false);
+    assert_eq!(caret_line(&main), 4);
+}
+
+#[test]
+fn revealing_blocks_never_dirties() {
+    let image = write_bmp("dirty", 20, 20);
+    let text = format!(
+        "# Notes\n\n- one\n  - [ ] two\n1. three\n\n> quoted\n> - item\n\n```rs\nlet x;\n```\n\n| a | b |\n|---|---|\n| c | d |\n\n---\n\n![i]({})\n",
+        image.display()
+    );
+    let (_scintilla, main, view) = live_tab(&text);
+    let editor = main.editor();
+    main.mark_clean();
+    let could_undo = editor.can_undo().unwrap();
+    let dirty = || main.with_app(|app| app.tabs.active().unwrap().dirty);
+    let mut keys = vec![Input::Key(VK_DOWN, false, false); 22];
+    keys.push(Input::Key(VK_END, true, false));
+    keys.push(Input::Key(VK_HOME, true, false));
+    send_inputs(view.hwnd(), &keys);
+    for row in [2, 5, 9, 14, 18] {
+        click(view.hwnd(), row_point(view, row, 30), false, false);
+    }
+    painted(view);
+    assert_eq!(editor.text().unwrap(), text);
+    assert_eq!(editor.can_undo().unwrap(), could_undo, "no undo step added");
+    assert!(!dirty());
+    let _ = std::fs::remove_file(image);
+}
