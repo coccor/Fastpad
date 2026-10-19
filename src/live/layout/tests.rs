@@ -194,6 +194,7 @@ fn down_moves_to_the_next_row_of_a_wrapped_line() {
 mod styled {
     use super::{LONG, layout};
     use crate::live::blocks::LiveDocument;
+    use crate::live::offsets::Show;
     use crate::live::styles::{Styled, StyledLines};
     use crate::live::text::{LiveText, MemoryText};
     use std::ops::Range;
@@ -253,7 +254,7 @@ mod styled {
             .line_style(line)
             .pieces
             .into_iter()
-            .filter(|(_, shown)| !shown)
+            .filter(|(_, show)| *show == Show::Hidden)
             .map(|(range, _)| range)
             .collect()
     }

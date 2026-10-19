@@ -1,8 +1,21 @@
 //! One source line's map between its UTF-8 byte offsets (Scintilla positions, relative to the
 //! line start) and the UTF-16 positions of the string DirectWrite lays out. Phase 2 hides markup
-//! on rendered lines, so the map is built from pieces that are either shown or hidden.
+//! on rendered lines, so the map is built from pieces that are shown, hidden, or (phase 3) shown
+//! as one inline object: a table pipe becomes a spacer that moves the next cell to its column.
 
 use std::ops::Range;
+
+/// How a piece of a line's source shows in its layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Show {
+    Text,
+    Hidden,
+    /// One U+FFFC unit, whatever the piece's length (even zero), for an inline object.
+    Object,
+}
+
+/// The object replacement character an object piece shows as.
+const OBJECT: u16 = 0xFFFC;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OffsetMap {
@@ -12,31 +25,48 @@ pub struct OffsetMap {
     units: Vec<usize>,
     /// The byte just past the character each UTF-16 unit belongs to.
     ends: Vec<usize>,
-    /// Hidden byte ranges, each with the UTF-16 position it collapses to.
+    /// Hidden byte ranges (and those of non-empty objects), each with the UTF-16 position it
+    /// collapses to.
     hidden: Vec<(Range<usize>, u32)>,
+    /// The UTF-16 position of each object piece.
+    objects: Vec<u32>,
     byte_len: usize,
 }
 
 impl OffsetMap {
     /// A line shown in full.
     pub fn plain(line: &str) -> Self {
-        Self::new(line, [(0..line.len(), true)])
+        Self::new(line, [(0..line.len(), Show::Text)])
     }
 
-    /// A line made of `pieces`, byte ranges of `line` in order and covering it, each shown or
-    /// hidden. Ranges must fall on character boundaries.
-    pub fn new(line: &str, pieces: impl IntoIterator<Item = (Range<usize>, bool)>) -> Self {
+    /// A line made of `pieces`, byte ranges of `line` in order and covering it, each shown,
+    /// hidden or shown as an object. Ranges must fall on character boundaries. A byte inside an
+    /// object maps to the object's position; the object's unit maps back to its range's start,
+    /// and a trailing hit on it to its end.
+    pub fn new(line: &str, pieces: impl IntoIterator<Item = (Range<usize>, Show)>) -> Self {
         let mut map = Self {
             byte_len: line.len(),
             ..Self::default()
         };
-        for (range, shown) in pieces {
-            if range.is_empty() {
-                continue;
-            }
-            if !shown {
-                map.hidden.push((range, map.text.len() as u32));
-                continue;
+        for (range, show) in pieces {
+            let position = map.text.len() as u32;
+            match show {
+                Show::Object => {
+                    if !range.is_empty() {
+                        map.hidden.push((range.clone(), position));
+                    }
+                    map.objects.push(position);
+                    map.text.push(OBJECT);
+                    map.units.push(range.start);
+                    map.ends.push(range.end);
+                    continue;
+                }
+                _ if range.is_empty() => continue,
+                Show::Hidden => {
+                    map.hidden.push((range, position));
+                    continue;
+                }
+                Show::Text => {}
             }
             for (offset, ch) in line[range.clone()].char_indices() {
                 let mut buffer = [0u16; 2];
@@ -53,6 +83,11 @@ impl OffsetMap {
     /// The string DirectWrite lays out.
     pub fn layout_text(&self) -> &[u16] {
         &self.text
+    }
+
+    /// The UTF-16 position of each object piece, in order.
+    pub fn objects(&self) -> &[u32] {
+        &self.objects
     }
 
     pub fn byte_len(&self) -> usize {
@@ -106,7 +141,7 @@ impl OffsetMap {
 
 #[cfg(test)]
 mod tests {
-    use super::OffsetMap;
+    use super::{OffsetMap, Show};
 
     fn round_trip(line: &str) {
         let map = OffsetMap::plain(line);
@@ -191,7 +226,14 @@ mod tests {
     }
 
     fn bold() -> OffsetMap {
-        OffsetMap::new("**bold**", [(0..2, false), (2..6, true), (6..8, false)])
+        OffsetMap::new(
+            "**bold**",
+            [
+                (0..2, Show::Hidden),
+                (2..6, Show::Text),
+                (6..8, Show::Hidden),
+            ],
+        )
     }
 
     #[test]
@@ -209,7 +251,14 @@ mod tests {
 
     #[test]
     fn trailing_hit_before_a_hidden_link_tail_stays_in_the_text() {
-        let map = OffsetMap::new("[ab](u)", [(0..1, false), (1..3, true), (3..7, false)]);
+        let map = OffsetMap::new(
+            "[ab](u)",
+            [
+                (0..1, Show::Hidden),
+                (1..3, Show::Text),
+                (3..7, Show::Hidden),
+            ],
+        );
         assert_eq!(map.to_byte_after(2), 3);
         assert_eq!(map.to_byte_after(1), 2);
     }
@@ -228,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_fully_hidden_line_maps_everything_to_zero_and_the_end() {
-        let map = OffsetMap::new("==", [(0..2, false)]);
+        let map = OffsetMap::new("==", [(0..2, Show::Hidden)]);
         assert!(map.layout_text().is_empty());
         assert_eq!(map.to_utf16(0), 0);
         assert_eq!(map.to_utf16(1), 0);
@@ -242,11 +291,11 @@ mod tests {
         let map = OffsetMap::new(
             "a **b** c",
             [
-                (0..2, true),
-                (2..4, false),
-                (4..5, true),
-                (5..7, false),
-                (7..9, true),
+                (0..2, Show::Text),
+                (2..4, Show::Hidden),
+                (4..5, Show::Text),
+                (5..7, Show::Hidden),
+                (7..9, Show::Text),
             ],
         );
         assert_eq!(map.to_utf16_range(4..5), 2..3);
@@ -258,7 +307,14 @@ mod tests {
     fn hidden_pieces_collapse_to_one_position() {
         // "**bold**" with both markers hidden.
         let line = "**bold**";
-        let map = OffsetMap::new(line, [(0..2, false), (2..6, true), (6..8, false)]);
+        let map = OffsetMap::new(
+            line,
+            [
+                (0..2, Show::Hidden),
+                (2..6, Show::Text),
+                (6..8, Show::Hidden),
+            ],
+        );
         assert_eq!(map.layout_text(), "bold".encode_utf16().collect::<Vec<_>>());
         assert_eq!(map.to_utf16(0), 0);
         assert_eq!(map.to_utf16(1), 0);
@@ -268,5 +324,78 @@ mod tests {
         assert_eq!(map.to_utf16(7), 4);
         assert_eq!(map.to_byte(0), 2);
         assert_eq!(map.to_byte(4), 8);
+    }
+
+    /// `| ab | c |` rendered as a table row: pipes are objects, cell padding is hidden.
+    fn row() -> OffsetMap {
+        OffsetMap::new(
+            "| ab | c |",
+            [
+                (0..1, Show::Object),
+                (1..2, Show::Hidden),
+                (2..4, Show::Text),
+                (4..5, Show::Hidden),
+                (5..6, Show::Object),
+                (6..7, Show::Hidden),
+                (7..8, Show::Text),
+                (8..9, Show::Hidden),
+                (9..10, Show::Object),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_object_piece_is_one_unit() {
+        let map = row();
+        assert_eq!(
+            map.layout_text(),
+            [
+                0xFFFC,
+                u16::from(b'a'),
+                u16::from(b'b'),
+                0xFFFC,
+                u16::from(b'c'),
+                0xFFFC
+            ]
+        );
+        assert_eq!(map.objects(), &[0, 3, 5]);
+        assert_eq!(map.to_utf16(0), 0);
+        assert_eq!(map.to_utf16(2), 1);
+        assert_eq!(map.to_utf16(5), 3);
+        assert_eq!(map.to_utf16(7), 4);
+        assert_eq!(map.to_utf16(10), 6);
+    }
+
+    #[test]
+    fn an_empty_object_maps_to_its_position() {
+        // `a | b` without outer pipes: empty objects open and close the row.
+        let map = OffsetMap::new(
+            "a | b",
+            [
+                (0..0, Show::Object),
+                (0..1, Show::Text),
+                (1..2, Show::Hidden),
+                (2..3, Show::Object),
+                (3..4, Show::Hidden),
+                (4..5, Show::Text),
+                (5..5, Show::Object),
+            ],
+        );
+        assert_eq!(map.layout_text().len(), 5);
+        assert_eq!(map.objects(), &[0, 2, 4]);
+        assert_eq!(map.to_utf16(0), 0);
+        assert_eq!(map.to_byte(0), 0);
+        assert_eq!(map.to_byte(1), 0);
+        assert_eq!(map.to_byte(4), 5);
+        assert_eq!(map.to_byte_after(1), 0);
+    }
+
+    #[test]
+    fn hits_on_an_object_land_on_its_edges() {
+        let map = row();
+        assert_eq!(map.to_byte(3), 5);
+        assert_eq!(map.to_byte_after(4), 6);
+        assert_eq!(map.to_byte_after(3), 4);
+        assert_eq!(map.to_utf16_range(2..4), 1..3);
     }
 }

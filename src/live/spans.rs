@@ -32,6 +32,11 @@ pub enum SpanKind {
     Heading(u8),
     /// Raw HTML, front matter, footnotes and math: shown as dimmed source.
     Dim,
+    /// A code block line's text. Set by `styles`, never by the parser: the line's font is the
+    /// code font, so the run only colours it.
+    CodeBlock,
+    /// Text inside a quote. Set by `styles`, never by the parser: coloured under every other run.
+    Quote,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1047,6 +1052,7 @@ mod tests {
                 SpanKind::Link => 'L',
                 SpanKind::Heading(_) => 'h',
                 SpanKind::Dim => 'd',
+                SpanKind::CodeBlock | SpanKind::Quote => unreachable!("set by styles only"),
             };
             for slot in &mut out[span.range.clone()] {
                 slot.push(code);

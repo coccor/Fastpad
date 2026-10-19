@@ -294,7 +294,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
     - Table rows hide the whitespace around each cell and turn each pipe into an object. A row without a leading pipe gets an empty object at its start; one without a trailing pipe gets an empty object at its end. The header row's cells get a `Bold` run.
     - An `Image` line hides everything; `BodyStyle::Image` carries `dest`. The layout decides between thumbnail and alt-text fallback (Decision 5) and, for the fallback, re-styles the line through `LineStyle::image_fallback()`, which shows the alt range as `Dim` + `Italic`.
   - **Revealed lines:** as phase 2 (one shown piece, colour runs), except `Code`/`Fence` lines keep `BodyStyle::Code` (Decision 2). Their containers are empty.
-- [ ] New `Paint`s: `Rule` (the Comment colour), `QuoteBar` (Comment), `Quote` (text inside a quote, also Comment, ranked below `Emphasis`). Rendered text inside a `Quote` container gets a `Quote` colour run under its other runs.
+- [ ] New `Paint`s: `Rule` (the Comment colour), `QuoteBar` (Comment), `Quote` (text inside a quote, also Comment, ranked below `Emphasis`). Rendered text inside a `Quote` container gets a `Quote` colour run under its other runs. All three use the existing `dim` brush (`LiveColors.dim` is already the Comment colour), so `LiveColors` gains nothing. The style-only runs are two new `SpanKind`s the parser never emits: `CodeBlock` (colour only; the body sets the font) and `Quote`.
 - [ ] `StyledLines` gains `fn table_lines(&self, line: usize) -> Option<Range<usize>>` (the table's lines, from `table_extent`). `Styled` implements it; `MemoryText` returns `None`.
 - [ ] Tests:
   - **Offsets:** `an_object_piece_is_one_unit`, `an_empty_object_maps_to_its_position`, `hits_on_an_object_land_on_its_edges`.
@@ -382,7 +382,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
 
 **Files:** `src/live/view.rs`, `src/live/view/paint.rs`, `src/live/view/mouse.rs`, `src/live/view/window_proc.rs`, `src/window/messages.rs`, `src/window/live_host.rs`.
 
-- [ ] **Colours:** `LiveColors` gains `rule`, `quote_bar` and `quote`, filled by `live_host::appearance` from `syntax_colors(theme).comment`. High contrast uses the foreground colour, as phase 2 does. The `Paint` brushes follow.
+- [ ] **Colours:** The `Rule`, `QuoteBar` and `Quote` paints use the `dim` brush (Task 3), so no new colours are needed.
 - [ ] **Paint order per visible line:**
   1. `Fill` decorations (code backgrounds, table header and stripes);
   2. phase 2's inline code backgrounds;

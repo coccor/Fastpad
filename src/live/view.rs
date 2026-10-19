@@ -93,7 +93,8 @@ impl Brushes {
             Paint::Link => &self.link,
             Paint::Code => &self.code,
             Paint::CodeBackground => &self.code_background,
-            Paint::Dim => &self.dim,
+            // Rules, quote bars and quote text use the comment colour, as dimmed text does.
+            Paint::Dim | Paint::Rule | Paint::QuoteBar | Paint::Quote => &self.dim,
         }
     }
 }
