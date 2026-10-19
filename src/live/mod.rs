@@ -2,6 +2,7 @@
 //! tab's Scintilla document. Everything here except the layout and the window is pure.
 
 pub mod blocks;
+pub mod index;
 pub mod layout;
 pub mod lines;
 pub mod motion;

@@ -1,18 +1,20 @@
-//! The Live document model (2026-10-18 Live editor design spec §7.1, phase 2 plan Task 2): the
-//! preview's incremental block list decides which blocks an edit touched, and each block keeps
-//! its spans relative to its own start, parsed only when a line in it is first styled. Untouched
-//! blocks never reparse, even when an edit above them shifts their position.
+//! The Live document model (2026-10-18 Live editor design spec §7.1, phase 2 plan Task 2): Live's
+//! own incremental block index (`index.rs`, the preview's reparsing rule without its rendering
+//! model) decides which blocks an edit touched, and each block keeps its spans relative to its
+//! own start, parsed only when a line in it is first styled. Untouched blocks never reparse, even
+//! when an edit above them shifts their position.
 
+use super::index::BlockIndex;
 use super::spans::{BlockSpans, Body, LineBlock, LinkSpan, Span, SpanKind, parse_block};
 use super::text::StrSource;
-use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
+use crate::preview::incremental::{Edit, SourceText, Update};
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
 #[derive(Debug, Default)]
 pub struct LiveDocument {
-    preview: PreviewDocument,
+    index: BlockIndex,
     /// Each block's spans, relative to its start; `None` until a line in the block is styled.
     spans: RefCell<Vec<Option<Rc<BlockSpans>>>>,
     front_matter: usize,
@@ -51,10 +53,10 @@ fn front_matter(source: &(impl SourceText + ?Sized)) -> usize {
 
 impl LiveDocument {
     pub fn parse(source: &str) -> Self {
-        let preview = PreviewDocument::parse(source);
-        let blocks = preview.blocks.len();
+        let index = BlockIndex::parse(source);
+        let blocks = index.blocks.len();
         Self {
-            preview,
+            index,
             spans: RefCell::new(vec![None; blocks]),
             front_matter: front_matter(&StrSource(source)),
             parsed: Cell::new(0),
@@ -69,8 +71,8 @@ impl LiveDocument {
         {
             self.updates += 1;
         }
-        self.preview.reparse(source);
-        *self.spans.borrow_mut() = vec![None; self.preview.blocks.len()];
+        self.index.reparse(source);
+        *self.spans.borrow_mut() = vec![None; self.index.blocks.len()];
         self.front_matter = front_matter(source);
     }
 
@@ -98,19 +100,19 @@ impl LiveDocument {
             self.updates += 1;
         }
         let mut changed = self.apply_blocks(source, edits);
-        // A block the preview kept because it renders the same may still have shifted bytes
-        // (a tab in a blank run): forget every block the edits touched.
+        // A block the index kept because its range came back the same may still hold changed
+        // text (a letter typed in a paragraph): forget every block the edits touched.
         for edit in edits {
             let touched = edit.position..edit.position + edit.inserted;
-            let blocks = &self.preview.blocks;
-            let first = blocks.partition_point(|block| block.bytes.end < touched.start);
-            let last = blocks.partition_point(|block| block.bytes.start <= touched.end);
+            let blocks = &self.index.blocks;
+            let first = blocks.partition_point(|block| block.end < touched.start);
+            let last = blocks.partition_point(|block| block.start <= touched.end);
             if first < last {
                 for slot in &mut self.spans.borrow_mut()[first..last] {
                     *slot = None;
                 }
-                changed.start = changed.start.min(blocks[first].bytes.start);
-                changed.end = changed.end.max(blocks[last - 1].bytes.end);
+                changed.start = changed.start.min(blocks[first].start);
+                changed.end = changed.end.max(blocks[last - 1].end);
             }
         }
         let mut old_front_matter = self.front_matter;
@@ -129,11 +131,11 @@ impl LiveDocument {
         // and may extend past it.
         let bound = old_front_matter.max(self.front_matter);
         let end = self
-            .preview
+            .index
             .blocks
             .iter()
-            .take_while(|block| block.bytes.start < bound)
-            .map(|block| block.bytes.end)
+            .take_while(|block| block.start < bound)
+            .map(|block| block.end)
             .max()
             .unwrap_or(0);
         0..changed.end.max(bound).max(end)
@@ -144,7 +146,7 @@ impl LiveDocument {
         source: &(impl SourceText + ?Sized),
         edits: &[Edit],
     ) -> Range<usize> {
-        match self.preview.apply(source, edits) {
+        match self.index.apply(source, edits) {
             Update::Unchanged => {
                 let touched = edits.iter().map(|e| e.position).min().unwrap_or(0);
                 touched..touched
@@ -153,20 +155,18 @@ impl LiveDocument {
                 self.spans
                     .borrow_mut()
                     .splice(old, std::iter::repeat_n(None, new.len()));
-                let blocks = &self.preview.blocks;
-                let start = blocks
-                    .get(new.start)
-                    .map_or(source.len(), |b| b.bytes.start);
+                let blocks = &self.index.blocks;
+                let start = blocks.get(new.start).map_or(source.len(), |b| b.start);
                 let end = new
                     .end
                     .checked_sub(1)
                     .and_then(|last| blocks.get(last))
-                    .map_or(start, |b| b.bytes.end);
+                    .map_or(start, |b| b.end);
                 let edit_start = edits.iter().map(|e| e.position).min().unwrap_or(start);
                 start.min(edit_start)..end.max(edit_start)
             }
             Update::Full => {
-                *self.spans.borrow_mut() = vec![None; self.preview.blocks.len()];
+                *self.spans.borrow_mut() = vec![None; self.index.blocks.len()];
                 0..source.len()
             }
         }
@@ -177,8 +177,8 @@ impl LiveDocument {
         if let Some(spans) = &self.spans.borrow()[index] {
             return Rc::clone(spans);
         }
-        let refs = |label: &str| self.preview.refdef_dest(label).map(str::to_owned);
-        let bytes = self.preview.blocks[index].bytes.clone();
+        let refs = |label: &str| self.index.refdef_dest(label).map(str::to_owned);
+        let bytes = self.index.blocks[index].clone();
         let parsed = Rc::new(parse_block(&source.slice(bytes), &refs));
         self.parsed.set(self.parsed.get() + 1);
         self.spans.borrow_mut()[index] = Some(Rc::clone(&parsed));
@@ -188,14 +188,14 @@ impl LiveDocument {
     /// The blocks overlapping `bytes` (an empty range finds the block holding it), skipping
     /// those that start inside the front matter: (index, absolute start).
     fn blocks_in(&self, bytes: Range<usize>) -> Vec<(usize, usize)> {
-        let blocks = &self.preview.blocks;
-        let first = blocks.partition_point(|block| block.bytes.end <= bytes.start);
+        let blocks = &self.index.blocks;
+        let first = blocks.partition_point(|block| block.end <= bytes.start);
         blocks[first..]
             .iter()
             .enumerate()
-            .take_while(|(_, block)| block.bytes.start < bytes.end.max(bytes.start + 1))
-            .filter(|(_, block)| block.bytes.start >= self.front_matter)
-            .map(|(offset, block)| (first + offset, block.bytes.start))
+            .take_while(|(_, block)| block.start < bytes.end.max(bytes.start + 1))
+            .filter(|(_, block)| block.start >= self.front_matter)
+            .map(|(offset, block)| (first + offset, block.start))
             .collect()
     }
 
@@ -345,6 +345,7 @@ mod tests {
         let full = LiveDocument::parse(text);
         assert_eq!(spans(doc, text), spans(&full, text), "text: {text:?}");
         assert_eq!(doc.front_matter_end(), full.front_matter_end(), "{text:?}");
+        assert_eq!(doc.index, full.index, "block ranges, text: {text:?}");
         assert_eq!(
             line_blocks(doc, text),
             line_blocks(&full, text),
