@@ -319,13 +319,14 @@ fn appearance(
     let line_numbers = unsafe { host_window::app_ptr(hwnd) }
         .is_none_or(|app| unsafe { app.as_ref() }.settings.line_numbers);
     let zoom = editor.zoom().unwrap_or(0);
-    let (palette, preview_font, preview_size, line_height, font_size) =
+    let (palette, preview_font, code_font, preview_size, line_height, font_size) =
         unsafe { host_window::app_ptr(hwnd) }
             .map(|app| {
                 let app = unsafe { app.as_ref() };
                 (
                     Palette::for_cached_theme(app.theme, app.settings.theme),
                     app.settings.preview_font.clone(),
+                    app.settings.font_face.clone(),
                     app.settings.preview_font_size,
                     app.settings.preview_line_height,
                     app.settings.font_size,
@@ -335,6 +336,7 @@ fn appearance(
                 (
                     Palette::for_cached_theme(None, Default::default()),
                     crate::window::design::faces::current().text.to_owned(),
+                    "Consolas".to_owned(),
                     crate::config::defaults::DEFAULT_PREVIEW_FONT_SIZE,
                     crate::config::defaults::DEFAULT_PREVIEW_LINE_HEIGHT,
                     crate::config::defaults::DEFAULT_FONT_SIZE,
@@ -351,6 +353,7 @@ fn appearance(
     let fonts = LiveFonts::new(
         graphics,
         &preview_font,
+        &code_font,
         preview_size,
         line_height,
         font_size,

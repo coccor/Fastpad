@@ -2,29 +2,41 @@
 //! width, laid out only when a line is about to be shown. Lines not laid out yet have an
 //! estimated height in a `HeightIndex`, as the preview's blocks do. All y values are in document
 //! coordinates (0 is the top of the first line); x values start at the text's left edge.
+//!
+//! Each line is laid out from its `LineStyle` (phase 2 plan, Task 5): hidden markup leaves the
+//! layout string, styled runs set weights, styles, sizes and fonts, and a heading line gets its
+//! own size and line spacing. Colours are kept per layout and bound to the painter's brushes when
+//! it draws (`LineLayout::bind`), because brushes belong to a render target that can be recreated.
 
 use crate::Result;
 use crate::live::lines::LineCache;
 use crate::live::motion::{LineGeometry, Row};
 use crate::live::offsets::OffsetMap;
-use crate::live::text::LiveText;
+use crate::live::styles::{Effect, LineStyle, Paint, StyledLines, effects};
 use crate::preview::dwrite::{Graphics, hresult_error};
 use crate::preview::heights::HeightIndex;
+use crate::preview::layout::{CODE_SCALE, HEADING_SCALE};
 use crate::preview::render::RectF;
+use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
+use windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush;
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS,
-    DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
-    IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
+    DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, IDWriteTextFormat, IDWriteTextLayout,
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, PCWSTR};
 
-/// The prose font, at the size the view draws it.
+/// The prose font and the code font, at the size the view draws them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiveFonts {
     pub family: String,
     pub weight: DWRITE_FONT_WEIGHT,
+    /// The editor font, for inline code.
+    pub code_family: String,
+    pub code_weight: DWRITE_FONT_WEIGHT,
     /// Text size in DIPs, zoom included.
     pub size: f32,
     /// Height of one row in DIPs.
@@ -38,18 +50,22 @@ impl LiveFonts {
     pub fn new(
         graphics: &Graphics,
         preview_font: &str,
+        code_font: &str,
         preview_font_size: u16,
         line_height_tenths: u8,
         editor_font_size: u16,
         zoom: i32,
     ) -> Self {
         let resolved = graphics.resolve_family(preview_font);
+        let code = graphics.resolve_family(code_font);
         let base = f32::from(editor_font_size.max(1));
         let scale = ((base + zoom as f32) / base).max(1.0 / base);
         let size = f32::from(preview_font_size.max(1)) * scale;
         Self {
             family: resolved.name,
             weight: resolved.weight,
+            code_family: code.name,
+            code_weight: code.weight,
             size,
             line_height: size * (f32::from(line_height_tenths.max(10)) / 10.0),
         }
@@ -71,16 +87,49 @@ pub struct LineLayout {
     pub offsets: OffsetMap,
     rows: Vec<RowMetrics>,
     pub height: f32,
+    /// The style it was laid out with: a line is laid out again only when this changes.
+    pub style: LineStyle,
+    /// Colour runs, lowest rank first, bound to brushes by `bind`.
+    colors: Vec<(DWRITE_TEXT_RANGE, Paint)>,
+    /// UTF-16 ranges filled behind the text (inline code), and their colour.
+    pub backgrounds: Vec<(u32, u32, Paint)>,
+    /// The brush generation the colour runs were bound for; 0 = never.
+    bound: Cell<u64>,
 }
 
 impl LineLayout {
     pub fn row_count(&self) -> usize {
         self.rows.len()
     }
+
+    /// Sets each colour run's drawing effect to its brush, unless already done for
+    /// `generation` (brushes are recreated with the render target, and bump it).
+    pub fn bind<'b>(
+        &self,
+        brush: impl Fn(Paint) -> Option<&'b ID2D1SolidColorBrush>,
+        generation: u64,
+    ) {
+        if self.bound.get() == generation {
+            return;
+        }
+        for (range, paint) in &self.colors {
+            if let Some(brush) = brush(*paint) {
+                let _ = unsafe { self.layout.SetDrawingEffect(brush, *range) };
+            }
+        }
+        self.bound.set(generation);
+    }
+
+    /// The rectangles (line coordinates) covering UTF-16 `start..end`.
+    pub fn range_rects(&self, start: u32, end: u32) -> Result<Vec<RectF>> {
+        range_rects(&self.layout, start, end, 0.0, 0.0)
+    }
 }
 
 pub struct LiveLayout {
     format: IDWriteTextFormat,
+    /// The format's baseline within a row, for spacing heading rows to scale.
+    baseline: f32,
     fonts: LiveFonts,
     width: f32,
     lines: LineCache<LineLayout>,
@@ -95,12 +144,13 @@ pub struct LiveLayout {
 
 impl LiveLayout {
     pub fn new(graphics: Rc<Graphics>, fonts: LiveFonts, width: f32) -> Result<Self> {
-        let format = text_format(&graphics, &fonts)?;
+        let (format, baseline) = text_format(&graphics, &fonts)?;
         let char_width = fonts.size * 0.5;
         let digit_width = digit_width(&graphics, &format)?;
         Ok(Self {
             graphics,
             format,
+            baseline,
             fonts,
             width: width.max(1.0),
             lines: LineCache::default(),
@@ -143,7 +193,7 @@ impl LiveLayout {
     }
 
     /// Drops every layout and estimates every line of `text` again.
-    pub fn reset(&mut self, text: &impl LiveText) {
+    pub fn reset(&mut self, text: &impl StyledLines) {
         let count = text.line_count();
         self.lines.reset(count);
         let estimates = (0..count)
@@ -153,7 +203,7 @@ impl LiveLayout {
     }
 
     /// A new text width; every line is laid out again. The caller keeps its scroll anchor.
-    pub fn set_width(&mut self, text: &impl LiveText, width: f32) {
+    pub fn set_width(&mut self, text: &impl StyledLines, width: f32) {
         let width = width.max(1.0);
         if width != self.width {
             self.width = width;
@@ -162,9 +212,9 @@ impl LiveLayout {
     }
 
     /// New fonts (zoom, settings, DPI); every line is laid out again.
-    pub fn set_fonts(&mut self, text: &impl LiveText, fonts: LiveFonts) -> Result<()> {
+    pub fn set_fonts(&mut self, text: &impl StyledLines, fonts: LiveFonts) -> Result<()> {
         if fonts != self.fonts {
-            self.format = text_format(&self.graphics, &fonts)?;
+            (self.format, self.baseline) = text_format(&self.graphics, &fonts)?;
             self.char_width = fonts.size * 0.5;
             self.digit_width = digit_width(&self.graphics, &self.format)?;
             self.fonts = fonts;
@@ -177,7 +227,7 @@ impl LiveLayout {
     /// the lines that must be laid out again.
     pub fn edit(
         &mut self,
-        text: &impl LiveText,
+        text: &impl StyledLines,
         first_line: usize,
         lines_delta: isize,
     ) -> Range<usize> {
@@ -194,12 +244,30 @@ impl LiveLayout {
         changed
     }
 
+    /// Drops the layout of each laid-out line in `lines` whose style no longer matches `text`;
+    /// returns those lines. Their measured heights stay until they are laid out again.
+    pub fn restyle(&mut self, text: &impl StyledLines, lines: Range<usize>) -> Vec<usize> {
+        let end = lines.end.min(self.lines.len());
+        let mut dropped = Vec::new();
+        for line in lines.start.min(end)..end {
+            let stale = self
+                .lines
+                .get(line)
+                .is_some_and(|laid| laid.style != text.line_style(line));
+            if stale {
+                self.lines.invalidate(line..line + 1);
+                dropped.push(line);
+            }
+        }
+        dropped
+    }
+
     /// Lays out the lines in `lines` that are not laid out yet.
-    pub fn ensure(&mut self, text: &impl LiveText, lines: Range<usize>) -> Result<()> {
+    pub fn ensure(&mut self, text: &impl StyledLines, lines: Range<usize>) -> Result<()> {
         let end = lines.end.min(self.lines.len());
         for line in lines.start.min(end)..end {
             if self.lines.get(line).is_none() {
-                let laid = self.lay_out(&text.line(line))?;
+                let laid = self.lay_out(&text.line(line), text.line_style(line))?;
                 self.heights.set_measured(line, laid.height);
                 self.lines.set(line, laid);
             }
@@ -208,7 +276,7 @@ impl LiveLayout {
     }
 
     /// The laid-out `line`, laying it out first if needed.
-    pub fn line(&mut self, text: &impl LiveText, line: usize) -> Result<&LineLayout> {
+    pub fn line(&mut self, text: &impl StyledLines, line: usize) -> Result<&LineLayout> {
         self.ensure(text, line..line + 1)?;
         self.lines
             .get(line)
@@ -242,7 +310,7 @@ impl LiveLayout {
     }
 
     /// Where the caret is drawn at `position`: a zero-width rectangle as tall as its row.
-    pub fn caret_rect(&mut self, text: &impl LiveText, position: usize) -> Result<RectF> {
+    pub fn caret_rect(&mut self, text: &impl StyledLines, position: usize) -> Result<RectF> {
         let line = text.line_of(position);
         let local = position - text.line_start(line);
         let top = self.line_top(line);
@@ -253,7 +321,7 @@ impl LiveLayout {
     }
 
     /// The caret position nearest the point (`x`, `y`), on the row under it.
-    pub fn position_at(&mut self, text: &impl LiveText, x: f32, y: f32) -> Result<usize> {
+    pub fn position_at(&mut self, text: &impl StyledLines, x: f32, y: f32) -> Result<usize> {
         let line = self.line_at_y(y);
         let top = self.line_top(line);
         let start = text.line_start(line);
@@ -266,7 +334,7 @@ impl LiveLayout {
     /// at the end of each line whose line ending is selected.
     pub fn selection_rects(
         &mut self,
-        text: &impl LiveText,
+        text: &impl StyledLines,
         range: Range<usize>,
         visible: Range<usize>,
     ) -> Result<Vec<RectF>> {
@@ -303,7 +371,7 @@ impl LiveLayout {
     }
 
     /// The vertical-motion geometry over this layout and `text`.
-    pub fn geometry<'a, T: LiveText>(
+    pub fn geometry<'a, T: StyledLines>(
         &'a mut self,
         text: &'a T,
         page_height: f32,
@@ -315,7 +383,7 @@ impl LiveLayout {
         }
     }
 
-    fn estimate(&self, text: &impl LiveText, line: usize) -> f32 {
+    fn estimate(&self, text: &impl StyledLines, line: usize) -> f32 {
         let bytes = text.line_end(line).saturating_sub(text.line_start(line));
         let rows = ((bytes as f32 * self.char_width) / self.width)
             .ceil()
@@ -323,8 +391,8 @@ impl LiveLayout {
         rows * self.fonts.line_height
     }
 
-    fn lay_out(&self, line: &str) -> Result<LineLayout> {
-        let offsets = OffsetMap::plain(line);
+    fn lay_out(&self, line: &str, style: LineStyle) -> Result<LineLayout> {
+        let offsets = OffsetMap::new(line, style.pieces.iter().cloned());
         let layout = unsafe {
             self.graphics.dwrite.CreateTextLayout(
                 offsets.layout_text(),
@@ -334,6 +402,78 @@ impl LiveLayout {
             )
         }
         .map_err(hresult_error)?;
+        let whole = DWRITE_TEXT_RANGE {
+            startPosition: 0,
+            length: offsets.layout_text().len() as u32,
+        };
+        let heading_scale = style
+            .heading
+            .map(|level| HEADING_SCALE[usize::from(level).clamp(1, 6) - 1]);
+        let size = self.fonts.size * heading_scale.unwrap_or(1.0);
+        if let Some(scale) = heading_scale {
+            unsafe {
+                layout.SetFontSize(size, whole).map_err(hresult_error)?;
+                layout
+                    .SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, whole)
+                    .map_err(hresult_error)?;
+                // The format's uniform spacing would clip a large heading.
+                layout
+                    .SetLineSpacing(
+                        DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                        self.fonts.line_height * scale,
+                        self.baseline * scale,
+                    )
+                    .map_err(hresult_error)?;
+            }
+        }
+        let code_family = crate::platform::wide_null(&self.fonts.code_family);
+        let mut backgrounds = Vec::new();
+        for (range, kind) in &style.runs {
+            let span = offsets.to_utf16_range(range.clone());
+            if span.start >= span.end {
+                continue;
+            }
+            let dw = DWRITE_TEXT_RANGE {
+                startPosition: span.start,
+                length: span.end - span.start,
+            };
+            for effect in effects(*kind, style.revealed) {
+                let applied = unsafe {
+                    match effect {
+                        Effect::Bold if style.heading.is_none() => {
+                            layout.SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, dw)
+                        }
+                        Effect::Bold | Effect::Color(_) => Ok(()),
+                        Effect::Italic => layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, dw),
+                        Effect::Strike => layout.SetStrikethrough(true, dw),
+                        Effect::Underline => layout.SetUnderline(true, dw),
+                        Effect::CodeFont => layout
+                            .SetFontFamilyName(PCWSTR(code_family.as_ptr()), dw)
+                            .and_then(|()| layout.SetFontSize(size * CODE_SCALE, dw))
+                            .and_then(|()| layout.SetFontWeight(self.fonts.code_weight, dw)),
+                        Effect::Background(paint) => {
+                            backgrounds.push((span.start, span.end, *paint));
+                            Ok(())
+                        }
+                    }
+                };
+                applied.map_err(hresult_error)?;
+            }
+        }
+        let colors = style
+            .colour_runs()
+            .into_iter()
+            .filter_map(|(range, paint)| {
+                let span = offsets.to_utf16_range(range);
+                (span.start < span.end).then_some((
+                    DWRITE_TEXT_RANGE {
+                        startPosition: span.start,
+                        length: span.end - span.start,
+                    },
+                    paint,
+                ))
+            })
+            .collect();
         let mut rows = Vec::new();
         let mut start = 0;
         let mut top = 0.0;
@@ -361,10 +501,14 @@ impl LiveLayout {
             offsets,
             rows,
             height: top,
+            style,
+            colors,
+            backgrounds,
+            bound: Cell::new(0),
         })
     }
 
-    fn rows_of(&mut self, text: &impl LiveText, line: usize) -> Result<Vec<Row>> {
+    fn rows_of(&mut self, text: &impl StyledLines, line: usize) -> Result<Vec<Row>> {
         let top = self.line_top(line);
         let line_start = text.line_start(line);
         let line_end = text.line_end(line);
@@ -403,13 +547,13 @@ impl LiveLayout {
 
 /// `LineGeometry` over a `LiveLayout`, for `motion::apply`. Lines are laid out as motion reaches
 /// them. A DirectWrite failure reads as the document start, which motion then clamps.
-pub struct Geometry<'a, T: LiveText> {
+pub struct Geometry<'a, T: StyledLines> {
     layout: &'a mut LiveLayout,
     text: &'a T,
     page_height: f32,
 }
 
-impl<T: LiveText> Geometry<'_, T> {
+impl<T: StyledLines> Geometry<'_, T> {
     fn rows(&mut self, line: usize) -> Vec<Row> {
         self.layout.rows_of(self.text, line).unwrap_or_default()
     }
@@ -429,7 +573,7 @@ impl<T: LiveText> Geometry<'_, T> {
     }
 }
 
-impl<T: LiveText> LineGeometry for Geometry<'_, T> {
+impl<T: StyledLines> LineGeometry for Geometry<'_, T> {
     fn row_at(&mut self, position: usize) -> Row {
         let line = self.text.line_of(position);
         let rows = self.rows(line);
@@ -487,7 +631,8 @@ impl<T: LiveText> LineGeometry for Geometry<'_, T> {
     }
 }
 
-fn text_format(graphics: &Graphics, fonts: &LiveFonts) -> Result<IDWriteTextFormat> {
+/// The prose format with uniform rows, and the baseline within a row.
+fn text_format(graphics: &Graphics, fonts: &LiveFonts) -> Result<(IDWriteTextFormat, f32)> {
     let format = graphics.text_format(
         &fonts.family,
         fonts.size,
@@ -513,7 +658,7 @@ fn text_format(graphics: &Graphics, fonts: &LiveFonts) -> Result<IDWriteTextForm
         )
     }
     .map_err(hresult_error)?;
-    Ok(format)
+    Ok((format, baseline))
 }
 
 /// The width of "0" in `format`: digits share one width in the fonts FastPad offers.
@@ -575,15 +720,22 @@ fn hit_row(laid: &LineLayout, row: &RowMetrics, x: f32) -> Result<usize> {
             .HitTestPoint(x, y, &mut trailing, &mut inside, &mut hit)
     }
     .map_err(hresult_error)?;
-    let mut position = hit.textPosition + if trailing.as_bool() { hit.length } else { 0 };
+    let trailing = trailing.as_bool();
+    let position = hit.textPosition + if trailing { hit.length } else { 0 };
     let last_row = row.start + row.length >= laid.offsets.layout_text().len() as u32;
     let row_end = if last_row || row.length == 0 {
         row.start + row.length
     } else {
         row.start + row.length - 1
     };
-    position = position.clamp(row.start, row_end);
-    Ok(laid.offsets.to_byte(position))
+    let position = position.clamp(row.start, row_end);
+    // A trailing hit stays inside the character it hit, before hidden markup that follows it
+    // (`**bold**`: the right half of `d` puts the caret before the closing `**`).
+    Ok(if trailing && position > row.start {
+        laid.offsets.to_byte_after(position)
+    } else {
+        laid.offsets.to_byte(position)
+    })
 }
 
 fn range_rects(
