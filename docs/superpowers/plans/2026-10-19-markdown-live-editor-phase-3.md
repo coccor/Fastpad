@@ -52,7 +52,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
 
 1. **Containers become a hanging indent, drawn in the margin.**
    - On a rendered line, the prefix (leading spaces, every `>`, the list marker and its gap, a task's `[ ]`/`[x]` and its gap) is hidden. The text is laid out at `width − indent` and drawn at `x = indent`, so wrapped rows of a list item or quote line up under its text.
-   - Indent per container: quote = `0.25 em` bar + `0.75 em` gap; list item = `1.5 em` (`2.5 em` for ordered markers wider than `9.`).
+   - Indent per container: quote = `0.25 em` bar + `0.75 em` gap; list item = `1.5 em`, or `2 em` for an ordered list (its later lines do not know their marker's width).
    - Lazy continuation lines and an item's later paragraphs get the same containers without a marker.
    - The painter draws the decorations in the indent:
      - **quote bars**, one per level, spanning the line's full height so bars join across lines;
@@ -329,7 +329,7 @@ paint: backgrounds → decorations (bars, bullets, boxes, rules, grids, images) 
   - `caret_rect`, `position_at`, `hit_row`, `selection_rects`, `range_rects` and `rows_of` add or subtract `indent` through two helpers: `LineLayout::to_line_x` and `from_line_x`.
   - `Geometry::x_of` and `position_at_x` need no change, since they go through those helpers.
 - [ ] **Code lines** (`BodyStyle::Code`):
-  - The whole text uses the code family at `size × CODE_SCALE`, with uniform line spacing scaled to it.
+  - The whole text uses the code family at `size × CODE_SCALE`, on the prose rows' spacing, so line numbers stay in step.
   - `Fill { 0..MAX, CodeBackground }` covers the line's height.
   - An opening fence with `info` sets `DWRITE_TEXT_ALIGNMENT_TRAILING`.
   - A closing fence keeps one code row.

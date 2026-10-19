@@ -7,18 +7,25 @@
 //! layout string, styled runs set weights, styles, sizes and fonts, and a heading line gets its
 //! own size and line spacing. Colours are kept per layout and bound to the painter's brushes when
 //! it draws (`LineLayout::bind`), because brushes belong to a render target that can be recreated.
+//!
+//! A line inside quotes or list items is laid out at the text width less its containers' indent
+//! and drawn at `x = indent` (phase 3 plan, Decision 1); every x this module reports or accepts
+//! is in line coordinates, the indent included. The margin's quote bars, bullets, numbers and
+//! checkboxes, a code block's background and a rule are `Decoration`s the painter draws.
 
 use crate::Result;
 use crate::live::lines::LineCache;
 use crate::live::motion::{LineGeometry, Row};
 use crate::live::offsets::OffsetMap;
-use crate::live::styles::{Effect, LineStyle, Paint, StyledLines, effects};
+use crate::live::spans::{Container, Marker};
+use crate::live::styles::{BodyStyle, Effect, ImageInfo, LineStyle, Paint, StyledLines, effects};
 use crate::preview::dwrite::{Graphics, hresult_error};
 use crate::preview::heights::HeightIndex;
 use crate::preview::layout::{CODE_SCALE, HEADING_SCALE};
 use crate::preview::render::RectF;
 use std::cell::Cell;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush;
 use windows::Win32::Graphics::DirectWrite::{
@@ -41,6 +48,8 @@ pub struct LiveFonts {
     pub size: f32,
     /// Height of one row in DIPs.
     pub line_height: f32,
+    /// The editor's zoom as a factor (1.0 = none), for image sizes.
+    pub zoom: f32,
 }
 
 impl LiveFonts {
@@ -68,6 +77,7 @@ impl LiveFonts {
             code_weight: code.weight,
             size,
             line_height: size * (f32::from(line_height_tenths.max(10)) / 10.0),
+            zoom: scale,
         }
     }
 }
@@ -81,12 +91,45 @@ struct RowMetrics {
     height: f32,
 }
 
+/// Something the painter draws for a line besides its text, in line coordinates (x from the
+/// text area's left edge, y from the line's top).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Decoration {
+    /// A filled rectangle; `right == f32::MAX` reaches the text area's right edge.
+    Fill { rect: RectF, paint: Paint },
+    /// A hairline; an x of `f32::MAX` is the text area's right edge.
+    Line {
+        from: (f32, f32),
+        to: (f32, f32),
+        paint: Paint,
+    },
+    /// A list bullet: filled at depth 1, a ring at depth 2, a square deeper.
+    Bullet {
+        center: (f32, f32),
+        radius: f32,
+        depth: u8,
+    },
+    /// An ordered marker's text, drawn right-aligned in `rect` on the first row's baseline.
+    Number { rect: RectF, text: String },
+    /// A task's box; `inner` is the line-relative byte between its brackets.
+    Checkbox {
+        rect: RectF,
+        checked: bool,
+        inner: usize,
+    },
+    /// A decoded image, drawn scaled into `rect`.
+    Image { rect: RectF, path: PathBuf },
+}
+
 /// One laid-out source line.
 pub struct LineLayout {
     pub layout: IDWriteTextLayout,
     pub offsets: OffsetMap,
     rows: Vec<RowMetrics>,
     pub height: f32,
+    /// Where the layout is drawn: its containers' indent.
+    pub indent: f32,
+    pub decorations: Vec<Decoration>,
     /// The style it was laid out with: a line is laid out again only when this changes.
     pub style: LineStyle,
     /// Colour runs, lowest rank first, bound to brushes by `bind`.
@@ -128,7 +171,7 @@ impl LineLayout {
 
     /// The rectangles (line coordinates) covering UTF-16 `start..end`.
     pub fn range_rects(&self, start: u32, end: u32) -> Result<Vec<RectF>> {
-        range_rects(&self.layout, start, end, 0.0, 0.0)
+        range_rects(&self.layout, start, end, self.indent, 0.0)
     }
 }
 
@@ -273,7 +316,7 @@ impl LiveLayout {
         let end = lines.end.min(self.lines.len());
         for line in lines.start.min(end)..end {
             if self.lines.get(line).is_none() {
-                let laid = self.lay_out(&text.line(line), text.line_style(line))?;
+                let laid = self.lay_out_line(text, line)?;
                 self.heights.set_measured(line, laid.height);
                 self.lines.set(line, laid);
             }
@@ -323,6 +366,7 @@ impl LiveLayout {
         let laid = self.line(text, line)?;
         let (x, y) = position_point(&laid.layout, laid.offsets.to_utf16(local))?;
         let row = row_at_y(&laid.rows, y);
+        let x = laid.indent + x;
         Ok(RectF::new(x, top + row.top, x, top + row.top + row.height))
     }
 
@@ -333,7 +377,7 @@ impl LiveLayout {
         let start = text.line_start(line);
         let laid = self.line(text, line)?;
         let row = row_at_y(&laid.rows, y - top);
-        Ok(start + hit_row(laid, &row, x)?)
+        Ok(start + hit_row(laid, &row, x - laid.indent)?)
     }
 
     /// The rectangles that show `range` selected on the lines in `visible`, with a narrow box
@@ -361,9 +405,10 @@ impl LiveLayout {
             let laid = self.line(text, line)?;
             let from = laid.offsets.to_utf16(range.start.max(start) - start);
             let to = laid.offsets.to_utf16(range.end.min(end).max(start) - start);
-            rects.extend(range_rects(&laid.layout, from, to, 0.0, top)?);
+            rects.extend(range_rects(&laid.layout, from, to, laid.indent, top)?);
             if range.end > end && line + 1 < text.line_count() {
                 let (x, y) = position_point(&laid.layout, laid.offsets.layout_text().len() as u32)?;
+                let x = laid.indent + x;
                 let row = row_at_y(&laid.rows, y);
                 rects.push(RectF::new(
                     x,
@@ -397,13 +442,53 @@ impl LiveLayout {
         rows * self.fonts.line_height
     }
 
-    fn lay_out(&self, line: &str, style: LineStyle) -> Result<LineLayout> {
-        let offsets = OffsetMap::new(line, style.pieces.iter().cloned());
+    /// Lays out `line` from its style, finding an image line's picture first.
+    fn lay_out_line(&self, text: &impl StyledLines, line: usize) -> Result<LineLayout> {
+        let style = text.line_style(line);
+        let image = match &style.block.body {
+            BodyStyle::Image { dest, .. } => match text.image(dest) {
+                ImageInfo::Ready { path, size } => Some((path, size)),
+                ImageInfo::Pending(_) | ImageInfo::Unavailable => None,
+            },
+            _ => None,
+        };
+        self.lay_out(&text.line(line), style, image)
+    }
+
+    /// The indent of a line inside `containers`, and where each container's margin starts.
+    fn indents(&self, containers: &[Container]) -> (f32, Vec<f32>) {
+        let mut x = 0.0;
+        let mut starts = Vec::with_capacity(containers.len());
+        for container in containers {
+            starts.push(x);
+            x += container_width(container, self.fonts.size);
+        }
+        (x, starts)
+    }
+
+    /// Lays out `line` as `style` says; `image` is an image line's decoded picture (its file and
+    /// natural size), without which the line shows its alt text.
+    fn lay_out(
+        &self,
+        line: &str,
+        style: LineStyle,
+        image: Option<(PathBuf, (u32, u32))>,
+    ) -> Result<LineLayout> {
+        let shown = if image.is_none() && matches!(style.block.body, BodyStyle::Image { .. }) {
+            style.image_fallback()
+        } else {
+            style.clone()
+        };
+        let em = self.fonts.size;
+        let (indent, starts) = self.indents(&shown.block.containers);
+        // A deep nest still leaves a few words a row.
+        let text_width = (self.width - indent).max((em * 4.0).min(self.width));
+        let offsets = OffsetMap::new(line, shown.pieces.iter().cloned());
         let layout = unsafe {
             self.graphics.dwrite.CreateTextLayout(
                 offsets.layout_text(),
                 &self.format,
-                self.width,
+                text_width,
                 f32::MAX,
             )
         }
@@ -412,7 +497,7 @@ impl LiveLayout {
             startPosition: 0,
             length: offsets.layout_text().len() as u32,
         };
-        let heading_scale = style
+        let heading_scale = shown
             .heading
             .map(|level| HEADING_SCALE[usize::from(level).clamp(1, 6) - 1]);
         let size = self.fonts.size * heading_scale.unwrap_or(1.0);
@@ -433,8 +518,24 @@ impl LiveLayout {
             }
         }
         let code_family = crate::platform::wide_null(&self.fonts.code_family);
+        if let BodyStyle::Code { fence, info } = shown.block.body {
+            // A code block's line: the code font at the code size, on the prose rows, so the
+            // line numbers beside it stay in step.
+            unsafe {
+                layout
+                    .SetFontFamilyName(PCWSTR(code_family.as_ptr()), whole)
+                    .and_then(|()| layout.SetFontSize(size * CODE_SCALE, whole))
+                    .and_then(|()| layout.SetFontWeight(self.fonts.code_weight, whole))
+                    .map_err(hresult_error)?;
+                if fence && info {
+                    layout
+                        .SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)
+                        .map_err(hresult_error)?;
+                }
+            }
+        }
         let mut backgrounds = Vec::new();
-        for (range, kind) in &style.runs {
+        for (range, kind) in &shown.runs {
             let span = offsets.to_utf16_range(range.clone());
             if span.start >= span.end {
                 continue;
@@ -443,10 +544,10 @@ impl LiveLayout {
                 startPosition: span.start,
                 length: span.end - span.start,
             };
-            for effect in effects(*kind, style.revealed) {
+            for effect in effects(*kind, shown.revealed) {
                 let applied = unsafe {
                     match effect {
-                        Effect::Bold if style.heading.is_none() => {
+                        Effect::Bold if shown.heading.is_none() => {
                             layout.SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, dw)
                         }
                         Effect::Bold | Effect::Color(_) => Ok(()),
@@ -466,7 +567,7 @@ impl LiveLayout {
                 applied.map_err(hresult_error)?;
             }
         }
-        let colors = style
+        let colors = shown
             .colour_runs()
             .into_iter()
             .filter_map(|(range, paint)| {
@@ -480,10 +581,14 @@ impl LiveLayout {
                 ))
             })
             .collect();
+        let metrics = line_metrics(&layout)?;
+        let baseline = metrics
+            .first()
+            .map_or(self.baseline, |first| first.baseline);
         let mut rows = Vec::new();
         let mut start = 0;
         let mut top = 0.0;
-        for metrics in line_metrics(&layout)? {
+        for metrics in &metrics {
             rows.push(RowMetrics {
                 start,
                 length: metrics.length,
@@ -502,11 +607,89 @@ impl LiveLayout {
             });
             top = self.fonts.line_height;
         }
+        let mut height = top;
+        let mut decorations = Vec::new();
+        match &shown.block.body {
+            BodyStyle::Code { .. } => decorations.push(Decoration::Fill {
+                rect: RectF::new(indent, 0.0, f32::MAX, height),
+                paint: Paint::CodeBackground,
+            }),
+            BodyStyle::Rule => decorations.push(Decoration::Line {
+                from: (indent, height / 2.0),
+                to: (f32::MAX, height / 2.0),
+                paint: Paint::Rule,
+            }),
+            BodyStyle::TableDelimiter => height = self.fonts.line_height * 0.5,
+            BodyStyle::Image { .. } => {
+                if let Some((path, natural)) = image {
+                    let (width, image_height) = image_size(natural, text_width, self.fonts.zoom);
+                    let pad = em * 0.25;
+                    height = image_height + 2.0 * pad;
+                    decorations.push(Decoration::Image {
+                        rect: RectF::new(indent, pad, indent + width, pad + image_height),
+                        path,
+                    });
+                }
+            }
+            BodyStyle::Text | BodyStyle::TableRow { .. } => {}
+        }
+        if height != top {
+            // One row the line's whole height, so hits and vertical motion land on it.
+            rows.truncate(1);
+            rows[0].height = height;
+        }
+        let first = rows[0];
+        // Where a marker sits: centred on the first row's lower-case letters.
+        let marker_y = first.top + baseline - em * 0.32;
+        for (container, x) in shown.block.containers.iter().zip(starts) {
+            match container {
+                Container::Quote => decorations.push(Decoration::Fill {
+                    rect: RectF::new(x, 0.0, x + em * 0.25, height),
+                    paint: Paint::QuoteBar,
+                }),
+                Container::Item {
+                    depth,
+                    marker: Some(marker),
+                    ..
+                } => decorations.push(match marker {
+                    Marker::Bullet => Decoration::Bullet {
+                        center: (x + em * 0.55, marker_y),
+                        radius: em * 0.17,
+                        depth: *depth,
+                    },
+                    Marker::Ordered(range) => Decoration::Number {
+                        rect: RectF::new(
+                            x,
+                            first.top,
+                            x + container_width(container, em) - em * 0.35,
+                            first.top + first.height,
+                        ),
+                        text: line.get(range.clone()).unwrap_or_default().to_owned(),
+                    },
+                    Marker::Task { checked, inner } => {
+                        let side = em * 0.8;
+                        Decoration::Checkbox {
+                            rect: RectF::new(
+                                x + em * 0.2,
+                                marker_y - side / 2.0,
+                                x + em * 0.2 + side,
+                                marker_y + side / 2.0,
+                            ),
+                            checked: *checked,
+                            inner: *inner,
+                        }
+                    }
+                }),
+                Container::Item { marker: None, .. } => {}
+            }
+        }
         Ok(LineLayout {
             layout,
             offsets,
             rows,
-            height: top,
+            height,
+            indent,
+            decorations,
             style,
             colors,
             backgrounds,
@@ -635,6 +818,32 @@ impl<T: StyledLines> LineGeometry for Geometry<'_, T> {
     fn page_height(&self) -> f32 {
         self.page_height
     }
+}
+
+/// How much a container indents the lines inside it, for text size `em`: a quote's bar and gap,
+/// or a list item's marker box (wider for numbers).
+fn container_width(container: &Container, em: f32) -> f32 {
+    match container {
+        Container::Quote => em,
+        Container::Item { ordered: true, .. } => em * 2.0,
+        Container::Item { .. } => em * 1.5,
+    }
+}
+
+/// An image's size in DIPs: its natural pixels at the editor's `zoom`, at most 300 DIPs (times
+/// the zoom) tall and `max_width` wide, keeping its aspect ratio.
+fn image_size((width, height): (u32, u32), max_width: f32, zoom: f32) -> (f32, f32) {
+    let (mut width, mut height) = (width as f32 * zoom, height as f32 * zoom);
+    let cap = 300.0 * zoom;
+    if height > cap {
+        width *= cap / height;
+        height = cap;
+    }
+    if width > max_width && width > 0.0 {
+        height *= max_width / width;
+        width = max_width;
+    }
+    (width, height)
 }
 
 /// The prose format with uniform rows, and the baseline within a row.

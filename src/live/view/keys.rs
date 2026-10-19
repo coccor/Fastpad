@@ -100,6 +100,7 @@ fn move_caret(state: &mut ViewState, movement: Move, extend: bool) {
         text: &source,
         document,
         revealed: revealed.clone(),
+        images: &no_images,
     };
     let (anchor, caret) = text.selection();
     let goal_x = goal.filter(|&(_, at)| at == caret).map(|(x, _)| x);

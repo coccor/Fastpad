@@ -195,7 +195,7 @@ mod styled {
     use super::{LONG, layout};
     use crate::live::blocks::LiveDocument;
     use crate::live::offsets::Show;
-    use crate::live::styles::{Styled, StyledLines};
+    use crate::live::styles::{Styled, StyledLines, no_images};
     use crate::live::text::{LiveText, MemoryText};
     use std::ops::Range;
 
@@ -208,6 +208,7 @@ mod styled {
             text,
             document,
             revealed,
+            images: &no_images,
         }
     }
 
@@ -373,5 +374,277 @@ mod styled {
             heading_rows > source_rows,
             "{heading_rows} vs {source_rows}"
         );
+    }
+}
+
+mod blocks {
+    use super::{LONG, layout};
+    use crate::live::blocks::LiveDocument;
+    use crate::live::layout::{Decoration, LineLayout, LiveLayout};
+    use crate::live::styles::{ImageInfo, Paint, Styled, StyledLines, no_images};
+    use crate::live::text::MemoryText;
+    use std::ops::Range;
+    use std::path::PathBuf;
+
+    /// No line revealed.
+    const NONE: Range<usize> = usize::MAX - 1..usize::MAX;
+
+    fn styled<'a>(
+        text: &'a MemoryText,
+        document: &'a LiveDocument,
+        revealed: Range<usize>,
+        images: &'a dyn Fn(&str) -> ImageInfo,
+    ) -> Styled<'a, MemoryText> {
+        Styled {
+            text,
+            document,
+            revealed,
+            images,
+        }
+    }
+
+    /// `source` laid out at `width`, with `line` laid out; returns the layout and the text size.
+    fn laid_out(
+        source: &str,
+        width: f32,
+        line: usize,
+        revealed: Range<usize>,
+    ) -> (LiveLayout, f32) {
+        let text = MemoryText::new(source);
+        let document = LiveDocument::parse(text.text());
+        let lines = styled(&text, &document, revealed, &no_images);
+        let mut layout = layout(width);
+        layout.reset(&lines);
+        layout.ensure(&lines, line..line + 1).unwrap();
+        let em = layout.fonts().size;
+        (layout, em)
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.5
+    }
+
+    fn line(layout: &LiveLayout, line: usize) -> &LineLayout {
+        layout.laid_line(line).unwrap()
+    }
+
+    #[test]
+    fn an_item_is_laid_out_at_its_indent() {
+        let text = MemoryText::new("- item\n\nplain");
+        let document = LiveDocument::parse(text.text());
+        let lines = styled(&text, &document, NONE, &no_images);
+        let mut layout = layout(400.0);
+        layout.reset(&lines);
+        let em = layout.fonts().size;
+        let laid = layout.line(&lines, 0).unwrap();
+        assert!(near(laid.indent, em * 1.5), "{}", laid.indent);
+        assert_eq!(String::from_utf16_lossy(laid.offsets.layout_text()), "item");
+        let bullet = laid
+            .decorations
+            .iter()
+            .find_map(|decoration| match decoration {
+                Decoration::Bullet { center, depth, .. } => Some((*center, *depth)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(bullet.0.0 < em * 1.5 && bullet.1 == 1, "{bullet:?}");
+        let caret = layout.caret_rect(&lines, 2).unwrap();
+        assert!(near(caret.left, em * 1.5), "{}", caret.left);
+        assert_eq!(layout.line(&lines, 2).unwrap().indent, 0.0);
+    }
+
+    #[test]
+    fn hits_and_carets_round_trip_on_an_indented_line() {
+        let source = format!("> - {LONG}");
+        let text = MemoryText::new(&source);
+        let document = LiveDocument::parse(text.text());
+        let lines = styled(&text, &document, NONE, &no_images);
+        let mut layout = layout(260.0);
+        layout.reset(&lines);
+        assert!(layout.line(&lines, 0).unwrap().row_count() > 2);
+        for (position, _) in source.char_indices().filter(|(at, _)| *at >= 4) {
+            let rect = layout.caret_rect(&lines, position).unwrap();
+            let hit = layout
+                .position_at(&lines, rect.left + 0.5, (rect.top + rect.bottom) / 2.0)
+                .unwrap();
+            assert_eq!(hit, position, "at {position}");
+        }
+    }
+
+    #[test]
+    fn wrapped_item_rows_start_at_the_indent() {
+        let source = format!("- {LONG}");
+        let text = MemoryText::new(&source);
+        let document = LiveDocument::parse(text.text());
+        let lines = styled(&text, &document, NONE, &no_images);
+        let mut layout = layout(260.0);
+        layout.reset(&lines);
+        let em = layout.fonts().size;
+        let lefts = (2..source.len())
+            .map(|position| layout.caret_rect(&lines, position).unwrap().left)
+            .collect::<Vec<_>>();
+        let leftmost = lefts.iter().copied().fold(f32::MAX, f32::min);
+        assert!(near(leftmost, em * 1.5), "{leftmost}");
+        // Several rows start there.
+        assert!(lefts.iter().filter(|left| near(**left, leftmost)).count() > 2);
+    }
+
+    #[test]
+    fn quote_bars_cover_the_line_height() {
+        let (layout, em) = laid_out(&format!("> {LONG}"), 260.0, 0, NONE);
+        let laid = line(&layout, 0);
+        assert!(laid.row_count() > 1);
+        assert!(laid.decorations.iter().any(|decoration| matches!(
+            decoration,
+            Decoration::Fill { rect, paint: Paint::QuoteBar }
+                if rect.top == 0.0 && near(rect.bottom, laid.height) && near(rect.right, em * 0.25)
+        )));
+    }
+
+    #[test]
+    fn nested_quote_and_list_indents_add_up() {
+        let (layout, em) = laid_out("> 1. x", 400.0, 0, NONE);
+        assert!(near(line(&layout, 0).indent, em * 3.0));
+        let number = line(&layout, 0)
+            .decorations
+            .iter()
+            .find_map(|decoration| match decoration {
+                Decoration::Number { rect, text } => Some((near(rect.left, em), text.clone())),
+                _ => None,
+            });
+        assert_eq!(number, Some((true, "1.".to_owned())));
+        let (layout, em) = laid_out("- a\n  - b", 400.0, 1, NONE);
+        assert!(near(line(&layout, 1).indent, em * 3.0));
+    }
+
+    #[test]
+    fn a_task_draws_a_checkbox_for_its_inner_byte() {
+        let (layout, _) = laid_out("- [x] done", 400.0, 0, NONE);
+        let laid = line(&layout, 0);
+        assert!(laid.decorations.iter().any(|decoration| matches!(
+            decoration,
+            Decoration::Checkbox { checked: true, inner: 3, rect } if rect.right < laid.indent
+        )));
+        assert!(
+            !laid
+                .decorations
+                .iter()
+                .any(|decoration| matches!(decoration, Decoration::Bullet { .. }))
+        );
+    }
+
+    #[test]
+    fn a_revealed_item_has_no_indent() {
+        let (layout, _) = laid_out("> - item", 400.0, 0, 0..1);
+        let laid = line(&layout, 0);
+        assert_eq!(laid.indent, 0.0);
+        assert!(laid.decorations.is_empty());
+        assert_eq!(
+            String::from_utf16_lossy(laid.offsets.layout_text()),
+            "> - item"
+        );
+    }
+
+    #[test]
+    fn code_lines_use_the_code_font_and_fill_the_width() {
+        let (layout, _) = laid_out("```\nlet x;\n```", 400.0, 1, NONE);
+        let laid = line(&layout, 1);
+        assert!(laid.decorations.iter().any(|decoration| matches!(
+            decoration,
+            Decoration::Fill { rect, paint: Paint::CodeBackground }
+                if rect.left == 0.0 && rect.right == f32::MAX && near(rect.bottom, laid.height)
+        )));
+        let mut length = 0_u32;
+        unsafe { laid.layout.GetFontFamilyNameLength(0, &mut length, None) }.unwrap();
+        let mut name = vec![0u16; length as usize + 1];
+        unsafe { laid.layout.GetFontFamilyName(0, &mut name, None) }.unwrap();
+        assert_eq!(
+            String::from_utf16_lossy(&name[..length as usize]),
+            "Consolas"
+        );
+        // The fences keep a code row too.
+        let (layout, _) = laid_out("```\nlet x;\n```", 400.0, 2, NONE);
+        assert!(
+            line(&layout, 2)
+                .decorations
+                .iter()
+                .any(|decoration| matches!(decoration, Decoration::Fill { .. }))
+        );
+    }
+
+    #[test]
+    fn a_rule_is_one_row_with_a_line() {
+        let (layout, _) = laid_out("a\n\n---", 400.0, 2, NONE);
+        let laid = line(&layout, 2);
+        assert_eq!(laid.row_count(), 1);
+        assert!(laid.offsets.layout_text().is_empty());
+        assert!(laid.decorations.iter().any(|decoration| matches!(
+            decoration,
+            Decoration::Line { from, paint: Paint::Rule, .. } if near(from.1, laid.height / 2.0)
+        )));
+    }
+
+    /// An image line whose picture is `size` pixels, at `width`: its height, its image
+    /// decoration and the text size.
+    fn image_line(size: (u32, u32), width: f32) -> (f32, Option<Decoration>, f32) {
+        let text = MemoryText::new("![cat](c.png)");
+        let document = LiveDocument::parse(text.text());
+        let images = move |_: &str| ImageInfo::Ready {
+            path: PathBuf::from(r"C:\c.png"),
+            size,
+        };
+        let lines = styled(&text, &document, NONE, &images);
+        let mut layout = layout(width);
+        layout.reset(&lines);
+        let em = layout.fonts().size;
+        let laid = layout.line(&lines, 0).unwrap();
+        let image = laid
+            .decorations
+            .iter()
+            .find(|decoration| matches!(decoration, Decoration::Image { .. }))
+            .cloned();
+        (laid.height, image, em)
+    }
+
+    #[test]
+    fn a_ready_image_line_is_as_tall_as_its_scaled_image() {
+        let (height, image, em) = image_line((200, 100), 600.0);
+        let Some(Decoration::Image { rect, path }) = image else {
+            panic!("{image:?}");
+        };
+        assert_eq!(path, PathBuf::from(r"C:\c.png"));
+        assert!(near(rect.right - rect.left, 200.0) && near(rect.bottom - rect.top, 100.0));
+        assert!(near(height, 100.0 + em * 0.5), "{height}");
+        // Wider than the text: scaled to its width, the aspect kept.
+        let (_, image, _) = image_line((800, 400), 400.0);
+        let Some(Decoration::Image { rect, .. }) = image else {
+            panic!("{image:?}");
+        };
+        assert!(near(rect.right - rect.left, 400.0) && near(rect.bottom - rect.top, 200.0));
+    }
+
+    #[test]
+    fn a_tall_image_is_capped_at_300_dips_times_zoom() {
+        let (_, image, _) = image_line((100, 900), 600.0);
+        let Some(Decoration::Image { rect, .. }) = image else {
+            panic!("{image:?}");
+        };
+        assert!(near(rect.bottom - rect.top, 300.0));
+        assert!(near(rect.right - rect.left, 100.0 / 3.0));
+    }
+
+    #[test]
+    fn a_pending_image_line_shows_its_alt_text() {
+        let text = MemoryText::new("![cat](c.png)");
+        let document = LiveDocument::parse(text.text());
+        let images = |_: &str| ImageInfo::Pending(PathBuf::from(r"C:\c.png"));
+        let lines = styled(&text, &document, NONE, &images);
+        let mut layout = layout(400.0);
+        layout.reset(&lines);
+        let laid = layout.line(&lines, 0).unwrap();
+        assert_eq!(String::from_utf16_lossy(laid.offsets.layout_text()), "cat");
+        assert!(laid.decorations.is_empty());
+        // It keeps its image style, so it is laid out again once the image is ready.
+        assert_eq!(laid.style, lines.line_style(0));
     }
 }

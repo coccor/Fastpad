@@ -14,6 +14,7 @@ use super::text::LiveText;
 use crate::preview::incremental::SourceText;
 use std::borrow::Cow;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// A colour role the painter keeps a brush for.
@@ -444,6 +445,42 @@ fn pieces_of(len: usize, mut marks: Vec<(Range<usize>, Show)>) -> Vec<(Range<usi
     pieces
 }
 
+/// What the view knows about the picture of an image line (phase 3 plan, Decision 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageInfo {
+    /// Decoded: its file and natural size in pixels.
+    Ready { path: PathBuf, size: (u32, u32) },
+    /// A local file not decoded yet.
+    Pending(PathBuf),
+    /// Remote, missing, failed, or not a local path: the line shows its alt text.
+    Unavailable,
+}
+
+/// An image resolver that knows no images: every image line shows its alt text.
+pub fn no_images(_: &str) -> ImageInfo {
+    ImageInfo::Unavailable
+}
+
+/// What `dest` (an image line's destination) shows as, for a document in `document_dir`.
+/// Remote, `#`, UNC and device destinations are `Unavailable` without asking `size` or `failed`
+/// anything, so they never reach the disk or the network; a local path is `Ready` once `size`
+/// knows it, `Unavailable` once `failed` says so, and `Pending` until then.
+pub fn resolve_image(
+    dest: &str,
+    document_dir: Option<&Path>,
+    size: impl Fn(&Path) -> Option<(u32, u32)>,
+    failed: impl Fn(&Path) -> bool,
+) -> ImageInfo {
+    let Some(path) = crate::preview::links::resolve_image_path(dest, document_dir) else {
+        return ImageInfo::Unavailable;
+    };
+    match size(&path) {
+        Some(size) if size.0 > 0 && size.1 > 0 => ImageInfo::Ready { path, size },
+        _ if failed(&path) => ImageInfo::Unavailable,
+        _ => ImageInfo::Pending(path),
+    }
+}
+
 /// Lines with their styles: what `LiveLayout` lays out.
 pub trait StyledLines: LiveText {
     fn line_style(&self, line: usize) -> LineStyle;
@@ -452,13 +489,19 @@ pub trait StyledLines: LiveText {
     fn table_lines(&self, _line: usize) -> Option<Range<usize>> {
         None
     }
+
+    /// What an image line whose destination is `dest` shows.
+    fn image(&self, _dest: &str) -> ImageInfo {
+        ImageInfo::Unavailable
+    }
 }
 
-/// The document text, its spans and the revealed lines.
+/// The document text, its spans, the revealed lines and the images it can show.
 pub struct Styled<'a, T: LiveText> {
     pub text: &'a T,
     pub document: &'a LiveDocument,
     pub revealed: Range<usize>,
+    pub images: &'a dyn Fn(&str) -> ImageInfo,
 }
 
 impl<T: LiveText> LiveText for Styled<'_, T> {
@@ -513,6 +556,10 @@ impl<T: LiveText + SourceText> StyledLines for Styled<'_, T> {
         let at = self.text.line_end(line).saturating_sub(1).max(start);
         let (first, last) = self.document.table_extent(self.text, at)?;
         Some(LiveText::line_of(self.text, first)..LiveText::line_of(self.text, last) + 1)
+    }
+
+    fn image(&self, dest: &str) -> ImageInfo {
+        (self.images)(dest)
     }
 }
 
@@ -686,6 +733,53 @@ mod tests {
         let quote = colours.iter().position(|(_, paint)| *paint == Paint::Quote);
         let link = colours.iter().position(|(_, paint)| *paint == Paint::Link);
         assert!(quote < link, "{colours:?}");
+    }
+
+    #[test]
+    fn remote_and_unc_images_show_alt_text() {
+        let asked = std::cell::Cell::new(0);
+        let size = |_: &Path| {
+            asked.set(asked.get() + 1);
+            None
+        };
+        let failed = |_: &Path| {
+            asked.set(asked.get() + 1);
+            false
+        };
+        let dir = Some(Path::new(r"C:\notes"));
+        for dest in [
+            "https://example.com/a.png",
+            "//host/a.png",
+            r"\\host\share\a.png",
+            "%5C%5Chost%5Cshare%5Ca.png",
+            "#top",
+            "",
+        ] {
+            assert_eq!(
+                resolve_image(dest, dir, size, failed),
+                ImageInfo::Unavailable,
+                "{dest}"
+            );
+        }
+        assert_eq!(asked.get(), 0);
+    }
+
+    #[test]
+    fn local_images_are_pending_until_decoded() {
+        let dir = Some(Path::new(r"C:\notes"));
+        let path = PathBuf::from(r"C:\notes\img\a.png");
+        assert_eq!(
+            resolve_image("img/a.png", dir, |_| None, |_| false),
+            ImageInfo::Pending(path.clone())
+        );
+        assert_eq!(
+            resolve_image("img/a.png", dir, |_| Some((4, 3)), |_| false),
+            ImageInfo::Ready { path, size: (4, 3) }
+        );
+        assert_eq!(
+            resolve_image("img/a.png", dir, |_| None, |_| true),
+            ImageInfo::Unavailable
+        );
     }
 
     #[test]

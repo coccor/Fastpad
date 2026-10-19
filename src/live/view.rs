@@ -14,7 +14,7 @@ use crate::live::blocks::LiveDocument;
 use crate::live::layout::{LiveFonts, LiveLayout};
 use crate::live::reveal;
 use crate::live::scroll;
-use crate::live::styles::{Paint, Styled};
+use crate::live::styles::{Paint, Styled, no_images};
 use crate::live::text::{EditorText, LiveText};
 use crate::platform::{last_error, wide_null};
 use crate::preview::dwrite::Graphics;
@@ -252,6 +252,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
+                images: &no_images,
             };
             if layout.set_fonts(&text, fonts).is_ok() {
                 state.scroll_y = state.layout.scroll_for_anchor(anchor);
@@ -308,6 +309,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
+                images: &no_images,
             };
             layout.edit(&text, first_line, lines_added);
             state.scroll_y = state.layout.scroll_for_anchor(anchor);
@@ -400,6 +402,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
+                images: &no_images,
             };
             let laid = layout.line(&text, line).ok()?;
             Some((
@@ -445,6 +448,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
+                images: &no_images,
             };
             let rect = layout.caret_rect(&text, position).ok()?;
             Some((
@@ -542,6 +546,7 @@ fn scroll_to_caret(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
+        images: &no_images,
     };
     let (_, caret) = text.selection();
     let Ok(rect) = layout.caret_rect(&text, caret) else {
@@ -574,6 +579,7 @@ fn load_document(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
+        images: &no_images,
     };
     layout.set_width(&text, width);
     layout.reset(&text);
@@ -620,6 +626,7 @@ fn flush(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
+        images: &no_images,
     };
     let dropped = layout.restyle(&text, restyle);
     // One edited line: lay it out now, and repaint below it only if its height changed.
@@ -666,6 +673,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
+                images: &no_images,
             },
             caret,
         )
@@ -675,6 +683,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
         text: &source,
         document,
         revealed: new.clone(),
+        images: &no_images,
     };
     // Lines that changed state between the top of the view and the caret are laid out again
     // now: until then they keep their old heights, and the caret's new top would not show the
@@ -785,6 +794,7 @@ fn selection_span(state: &mut ViewState) -> Option<(f32, f32)> {
         text: &source,
         document,
         revealed: revealed.clone(),
+        images: &no_images,
     };
     let (anchor, caret) = text.selection();
     let first_visible = layout.line_at_y(*scroll_y);

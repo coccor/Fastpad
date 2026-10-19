@@ -115,6 +115,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         text: &source,
         document,
         revealed: revealed.clone(),
+        images: &no_images,
     };
     let scroll_before = *scroll_y;
     if (layout.width() - width).abs() > 0.5 {
@@ -246,7 +247,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 laid.bind(|paint| Some(brushes.paint(paint)), state.brush_generation);
                 target.DrawTextLayout(
                     Vector2 {
-                        X: text_x,
+                        X: text_x + laid.indent,
                         Y: top - scroll_y,
                     },
                     &laid.layout,
