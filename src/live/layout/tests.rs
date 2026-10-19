@@ -220,7 +220,7 @@ mod styled {
     }
 
     #[test]
-    fn a_rendered_heading_is_taller_than_its_revealed_line() {
+    fn a_revealed_heading_keeps_its_size() {
         let text = MemoryText::new("# Title\nbody");
         let document = LiveDocument::parse(text.text());
         let mut rendered = layout(400.0);
@@ -233,10 +233,9 @@ mod styled {
         revealed.reset(&lines);
         let revealed_height = revealed.line(&lines, 0).unwrap().height;
         assert_eq!(shown(&lines, &mut revealed, 0), "# Title");
-        assert!(
-            rendered_height > revealed_height * 1.5,
-            "{rendered_height} vs {revealed_height}"
-        );
+        assert_eq!(rendered_height, revealed_height);
+        let body = revealed.line(&lines, 1).unwrap().height;
+        assert!(revealed_height > body * 1.5, "{revealed_height} vs {body}");
     }
 
     #[test]
@@ -366,13 +365,16 @@ mod styled {
         let lines = styled(&text, &document, NONE);
         rendered.reset(&lines);
         let heading_rows = rendered.line(&lines, 0).unwrap().row_count();
-        let mut revealed = layout(300.0);
-        let lines = styled(&text, &document, 0..1);
-        revealed.reset(&lines);
-        let source_rows = revealed.line(&lines, 0).unwrap().row_count();
+        // The same words as a paragraph wrap into fewer rows.
+        let plain = MemoryText::new(LONG);
+        let document = LiveDocument::parse(plain.text());
+        let mut paragraph = layout(300.0);
+        let lines = styled(&plain, &document, NONE);
+        paragraph.reset(&lines);
+        let paragraph_rows = paragraph.line(&lines, 0).unwrap().row_count();
         assert!(
-            heading_rows > source_rows,
-            "{heading_rows} vs {source_rows}"
+            heading_rows > paragraph_rows,
+            "{heading_rows} vs {paragraph_rows}"
         );
     }
 }

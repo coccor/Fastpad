@@ -4,8 +4,9 @@
 //!
 //! A rendered line hides its markup and gets real weights, styles, sizes and fonts; its
 //! containers (quotes, list items) are drawn in its margin and their markers hidden. A revealed
-//! line (the caret's) changes colour only, so typing markers on it never re-wraps it; a code
-//! block's lines keep the code font in both states.
+//! line (in the caret's block) shows all its markup, in the marker colour, and keeps the rest of
+//! its formatting: a heading keeps its size, bold stays bold, code keeps its font (phase 3
+//! review). Only the margin and the block decorations give way to the source.
 
 use super::blocks::LiveDocument;
 use super::offsets::Show;
@@ -166,20 +167,12 @@ impl LineStyle {
     }
 }
 
-/// The effects `kind` has on a rendered line, or on a revealed one (colour only).
+/// The effects `kind` has on a rendered line, or on a revealed one: the same, except that the
+/// markup a rendered line hides shows in the marker colour.
 pub fn effects(kind: SpanKind, revealed: bool) -> &'static [Effect] {
     use Effect::*;
-    if revealed {
-        return match kind {
-            SpanKind::Hidden => &[Color(Paint::Marker)],
-            SpanKind::Heading(_) => &[Color(Paint::Heading)],
-            SpanKind::Bold | SpanKind::Italic => &[Color(Paint::Emphasis)],
-            SpanKind::Strike | SpanKind::Dim => &[Color(Paint::Dim)],
-            SpanKind::Code => &[Color(Paint::Code), Background(Paint::CodeBackground)],
-            SpanKind::Link => &[Color(Paint::Link)],
-            SpanKind::CodeBlock => &[Color(Paint::Code)],
-            SpanKind::Quote => &[],
-        };
+    if revealed && kind == SpanKind::Hidden {
+        return &[Color(Paint::Marker)];
     }
     match kind {
         SpanKind::Hidden => &[],
@@ -325,8 +318,8 @@ pub fn line_style(
     }
 }
 
-/// A revealed line: its source in full, coloured by role; its prefix in the marker colour. A
-/// code block's lines keep their code body (Decision 2).
+/// A revealed line: its source in full, formatted as when rendered, its markup and prefix in the
+/// marker colour. A code block's lines keep their code body.
 fn revealed_style(
     mut runs: Vec<(Range<usize>, SpanKind)>,
     body: Option<&Body>,
@@ -358,9 +351,14 @@ fn revealed_style(
         }
         _ => BodyStyle::Text,
     };
+    // A heading keeps its size while it is edited.
+    let heading = runs.iter().find_map(|(_, kind)| match kind {
+        SpanKind::Heading(level) => Some(*level),
+        _ => None,
+    });
     LineStyle {
         revealed: true,
-        heading: None,
+        heading,
         pieces: vec![(0..len, Show::Text)],
         runs,
         block: BlockStyle {
@@ -833,17 +831,20 @@ mod tests {
         assert!(style.runs.contains(&(2..4, SpanKind::Hidden)));
         let colours = style.colour_runs();
         assert!(colours.contains(&(2..4, Paint::Marker)));
-        assert!(colours.contains(&(4..5, Paint::Emphasis)));
+        // Bold stays bold while it is edited.
+        assert!(style.runs.contains(&(4..5, SpanKind::Bold)));
+        assert_eq!(effects(SpanKind::Bold, true), &[Effect::Bold]);
     }
 
     #[test]
-    fn a_heading_line_has_its_level_only_when_rendered() {
+    fn a_heading_keeps_its_level_when_revealed() {
         let line = "## Title";
         let rendered = line_style(&spans_of(line), None, 0..line.len(), false);
         assert_eq!(rendered.heading, Some(2));
         assert_eq!(shown(&rendered, line), "Title");
         let revealed = line_style(&spans_of(line), None, 0..line.len(), true);
-        assert_eq!(revealed.heading, None);
+        assert_eq!(revealed.heading, Some(2));
+        assert_eq!(shown(&revealed, line), "## Title");
     }
 
     #[test]
@@ -891,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn effects_never_change_metrics_on_revealed_lines() {
+    fn revealed_lines_keep_their_formatting_and_colour_their_markup() {
         for kind in [
             SpanKind::Hidden,
             SpanKind::Bold,
@@ -904,11 +905,11 @@ mod tests {
             SpanKind::CodeBlock,
             SpanKind::Quote,
         ] {
-            for effect in effects(kind, true) {
-                assert!(
-                    matches!(effect, Effect::Color(_) | Effect::Background(_)),
-                    "{kind:?}: {effect:?}"
-                );
+            if kind == SpanKind::Hidden {
+                assert_eq!(effects(kind, true), &[Effect::Color(Paint::Marker)]);
+                assert!(effects(kind, false).is_empty());
+            } else {
+                assert_eq!(effects(kind, true), effects(kind, false), "{kind:?}");
             }
         }
     }

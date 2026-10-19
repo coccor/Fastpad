@@ -71,6 +71,8 @@ pub struct LiveColors {
     pub code: u32,
     pub code_background: u32,
     pub dim: u32,
+    /// Behind the block being edited (the revealed lines): the editor's current-line colour.
+    pub active_block: u32,
 }
 
 struct Brushes {
@@ -86,6 +88,7 @@ struct Brushes {
     code: ID2D1SolidColorBrush,
     code_background: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
+    active_block: ID2D1SolidColorBrush,
 }
 
 impl Brushes {
@@ -188,6 +191,8 @@ pub struct PaintedDecorations {
     pub numbers: usize,
     pub checkboxes: usize,
     pub images: usize,
+    /// Revealed lines drawn on the edited block's highlight.
+    pub active_block: usize,
 }
 
 /// A handle to a Live window; copies are cheap and all refer to the same window.
@@ -673,7 +678,7 @@ fn load_document(state: &mut ViewState) {
     *edits = EditLog::default();
     height_checks.clear();
     let (anchor, caret) = source.selection();
-    *revealed = reveal::revealed_lines(anchor, caret, |at| LiveText::line_of(&source, at));
+    *revealed = revealed_for(&source, document, anchor, caret);
     let text = Styled {
         text: &source,
         document,
@@ -682,6 +687,58 @@ fn load_document(state: &mut ViewState) {
     };
     layout.set_width(&text, width);
     layout.reset(&text);
+}
+
+/// The lines shown as source for the selection `anchor..caret`: the blocks it touches, whole.
+fn revealed_for<T: LiveText + SourceText>(
+    source: &T,
+    document: &LiveDocument,
+    anchor: usize,
+    caret: usize,
+) -> Range<usize> {
+    reveal::revealed_blocks(
+        anchor,
+        caret,
+        |at| LiveText::line_of(source, at),
+        |line| block_lines(source, document, line),
+    )
+}
+
+/// The lines of the block holding `line`: its top-level block (a paragraph, a heading, a whole
+/// code block or table, the front matter), narrowed inside a list or quote to the lines between
+/// the blank lines around it. A blank line is a block of its own.
+fn block_lines<T: LiveText + SourceText>(
+    source: &T,
+    document: &LiveDocument,
+    line: usize,
+) -> Range<usize> {
+    let blank = |line: usize| LiveText::line(source, line).trim().is_empty();
+    if blank(line) {
+        return line..line + 1;
+    }
+    let start = source.line_start(line);
+    let end = source.line_end(line);
+    // A byte of the line itself: an indented block starts after the line's start.
+    let Some(bytes) = document.block_bytes(end.saturating_sub(1).max(start)) else {
+        return line..line + 1;
+    };
+    let first = LiveText::line_of(source, bytes.start).min(line);
+    let last = LiveText::line_of(source, bytes.end.saturating_sub(1).max(bytes.start)).max(line);
+    let nested = document
+        .line_block(source, start..end)
+        .is_some_and(|block| !block.containers.is_empty());
+    if !nested {
+        return first..last + 1;
+    }
+    let mut top = line;
+    while top > first && !blank(top - 1) {
+        top -= 1;
+    }
+    let mut bottom = line;
+    while bottom < last && !blank(bottom + 1) {
+        bottom += 1;
+    }
+    top..bottom + 1
 }
 
 /// Brings the view up to date before anything measures or paints: applies pending edits to the
@@ -799,7 +856,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
     } = state;
     let source = EditorText(editor);
     let (anchor, caret) = source.selection();
-    let new = reveal::revealed_lines(anchor, caret, |at| LiveText::line_of(&source, at));
+    let new = revealed_for(&source, document, anchor, caret);
     if new == *revealed {
         return false;
     }

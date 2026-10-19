@@ -105,8 +105,9 @@ typing. Both panes scroll together.
   strike-through, inline code, links and `[[wikilinks]]` render in place with their markup hidden,
   and so do block elements: lists with bullets, numbers and clickable task checkboxes, quotes with
   their bars, rules, code blocks on a full-width background, tables as aligned grids and local
-  images as thumbnails (anything else shows its alt text; nothing is fetched). The line you are on
-  shows its Markdown source; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click
+  images as thumbnails (anything else shows its alt text; nothing is fetched). The block you are in
+  (from blank line to blank line, a whole table or code block) shows its Markdown source, keeping
+  its formatting and highlighted; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click
   follows a link. Find, scroll sync with Split and the rest of the command audit come in the next
   release. Set `markdown_live_default=true` to open Markdown tabs in it.
 

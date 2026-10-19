@@ -22,8 +22,8 @@ Success: a whole note can be written in Live without opening the source view or 
 | What it is | A new view for Markdown tabs. Scintilla, Lexilla and the preview are unchanged. |
 | Text model | The tab's **Scintilla document stays the only copy of the text**. Live reads it and edits it through the tab's own Scintilla, which stays alive but hidden while Live is shown. Undo, the save point, autosave, recovery, find/replace, wikilink indexing and preview sync keep working because every edit still arrives as `SCN_MODIFIED`. |
 | Rendering | Our own: Direct2D + DirectWrite, one `IDWriteTextLayout` per source line, real per-line heights (large headings, image rows). Reuses `preview/dwrite.rs`, `render.rs`, `colors.rs`, `images.rs`, `svg.rs`. |
-| Reveal unit | **The source line holding the caret**, from the previous newline to the next newline, however many wrapped rows it spans. That whole line shows plain source; every other line is rendered. With a selection, every line the selection touches is revealed. |
-| Revealed line look | Plain source in the prose font, with the Markdown role colours from the source view. No hidden or resized text, so the caret never lands inside invisible markup. |
+| Reveal unit | **The block holding the caret**, from the blank line before it to the blank line after it: a paragraph, a heading, a whole table, a whole code block with its fences, the front matter; inside a list or quote, the lines between the blank lines around the caret. That whole block shows its source; every other line is rendered. With a selection, every block it touches is revealed. (Phase 3 review; phases 1–3 first revealed only the caret's line.) |
+| Revealed line look | The source with all its markup shown, in the Markdown marker colour, and the rest of its formatting kept: a heading keeps its size, bold stays bold, code keeps its font. The block is highlighted with the editor's current-line colour. Nothing is hidden, so the caret never lands inside invisible markup. |
 | Parsing | `pulldown-cmark` with the preview's options, reparsed per block with `preview/incremental.rs`'s block rules, so typing costs one block. |
 | Library shape | A new module `src/live/` with a pure, Win32-free core (model adapter trait, line spans, reveal, caret motion, layout cache keys) and a thin Win32 view on top. The core never names Scintilla. |
 | Entering Live | Per-tab toggle **Ctrl+Alt+V** (`markdown.toggleLive`), View → Live Markdown, palette entry; setting `markdown_live_default` (default off). |
@@ -69,8 +69,9 @@ Rejected:
 
 ## 5. Reveal
 
-- Revealed set = every source line touched by the selection (a caret is an empty selection). A source line is the text between two newlines; with word wrap it may be several rows on screen.
-- Multi-line constructs reveal by line, not as a whole: in a table only the caret's row shows pipes; in a fenced code block only a fence line shows its backticks (code lines always show their text).
+- Revealed set = every block the selection touches (a caret is an empty selection). A block runs from the blank line before it to the blank line after it; a top-level block the parser sees as one (a fenced code block holding blank lines, the front matter) is revealed whole, and inside a list or quote only the lines between the blank lines around the caret are. A blank line is a block of its own.
+- Multi-line constructs reveal as a whole: clicking into a table shows every row's pipes, clicking into a code block shows both fences.
+- Revealed lines keep their formatting (heading size, bold, italic, code font) and show their markup in the marker colour; the revealed block is highlighted with the editor's current-line colour.
 - Revealing only changes how lines are drawn. It never edits the text, never enters undo and never marks the document modified.
 - A line whose height changes when revealed (a heading, an image line) moves the lines below it. To keep the caret steady, the view is scrolled so the caret's line keeps its screen position when the reveal set changes.
 
@@ -169,7 +170,7 @@ Large, so it ships in phases, each behind the toggle and each mergeable on its o
 > **Phase 2 shipped** (plan `docs/superpowers/plans/2026-10-19-markdown-live-editor-phase-2.md`), with that plan's deviations: heading sizes are the preview's (2.0 / 1.5 / 1.25 / 1.0 / 0.875 / 0.875, bold); block constructs (lists, quotes, code blocks, tables, rules, images) stay source until phase 3; revealed lines change colour only, so typing markers never re-wraps them; footnotes and math are dimmed by a small scanner, since the preview's options parse neither; a setext underline hides to an empty row; edits are logged and applied in one flush before the next measurement or paint; block spans are parsed lazily; a selection ending at a line start does not reveal that line; Ctrl+click on Markdown links goes through the preview's link path, and a `#heading` link moves the editor's caret to the heading. Code backgrounds are drawn before the selection so a selection over inline code stays visible.
 
 > **Phase 3 shipped** (plan `docs/superpowers/plans/2026-10-19-markdown-live-editor-phase-3.md`), with that plan's deviations and these found while building it:
-> - **Revealed lines:** they drop their indent and decorations and show their source at the left edge, except code-block lines, which keep the code font so typing in a code block never re-wraps or changes height. The manual check is to judge whether the shift of a list item's text when the caret enters it reads well.
+> - **Revealed lines (after the phase 3 review):** the caret reveals its whole block, between blank lines (a whole table, a whole code block with its fences), not just its line. Revealed lines keep their formatting (a heading keeps its size, bold stays bold) with the markup shown in the marker colour, and the block is highlighted with the editor's current-line colour. They drop their indent and margin decorations and show their prefix as source.
 > - **Containers:** a container's indent is fixed (quote 1 em, bullet item 1.5 em, ordered item 2 em), since an item's later lines do not know its marker's width.
 > - **Code blocks:** they use the code font on the prose rows, so line numbers stay in step.
 > - **Tables:**

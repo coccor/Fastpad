@@ -18,6 +18,9 @@ use windows_numerics::{Matrix3x2, Vector2};
 use windows_sys::Win32::Graphics::Gdi::GetUpdateRect;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SCROLLINFO, SIF_ALL};
 
+/// How far the edited block's highlight reaches past the text on each side, in DIPs.
+const BLOCK_BLEED: f32 = 4.0;
+
 /// What `WM_PAINT` must do once the state borrow has ended.
 pub(super) struct PaintOutcome {
     /// Scroll bar state for a completed frame. `SetScrollInfo` can send `WM_SIZE` synchronously,
@@ -91,6 +94,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             code: brush(state.colors.code)?,
             code_background: brush(state.colors.code_background)?,
             dim: brush(state.colors.dim)?,
+            active_block: brush(state.colors.active_block)?,
         });
         state.brush_generation += 1;
     }
@@ -224,6 +228,17 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             let Some(laid) = state.layout.laid_line(line) else {
                 continue;
             };
+            // The block being edited stands out, as the source view's current line does.
+            if laid.style.revealed {
+                target.FillRectangle(
+                    &rect(-BLOCK_BLEED, top, text_right + BLOCK_BLEED, bottom),
+                    &brushes.active_block,
+                );
+                #[cfg(test)]
+                {
+                    painted.active_block += 1;
+                }
+            }
             for decoration in &laid.decorations {
                 if let Decoration::Fill { rect: area, paint } = decoration {
                     target.FillRectangle(

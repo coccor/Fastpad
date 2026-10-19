@@ -1246,18 +1246,75 @@ fn rendered_lines_hide_markup_and_the_caret_line_shows_source() {
 }
 
 #[test]
-fn a_selection_reveals_every_line_it_touches() {
-    let (_scintilla, main, view) = live_tab("**a**\n**b**\n**c**\n**d**\n");
-    main.editor().set_selection(1..13).unwrap();
+fn a_selection_reveals_every_block_it_touches() {
+    let text = "**a**\n**b**\n\n**c**\n\n**d**\n";
+    let (_scintilla, main, view) = live_tab(text);
+    // From inside `a` to inside `c`: the first block, the blank line and the second block.
+    let end = text.find("c**").unwrap();
+    main.editor().set_selection(1..end).unwrap();
     window::live_host::poll_active(main.hwnd);
-    assert_eq!(view.revealed(), 0..3);
+    assert_eq!(view.revealed(), 0..4);
     assert_eq!(shown_line(view, 1).0, "**b**");
-    assert_eq!(shown_line(view, 3).0, "d");
+    assert_eq!(shown_line(view, 3).0, "**c**");
+    assert_eq!(shown_line(view, 5).0, "d");
+}
+
+#[test]
+fn the_caret_reveals_its_whole_paragraph() {
+    let text = "top\n\n**one**\n**two**\n**three**\n\nafter\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, text.find("two").unwrap());
+    assert_eq!(view.revealed(), 2..5);
+    for (line, source) in [(2, "**one**"), (3, "**two**"), (4, "**three**")] {
+        assert_eq!(shown_line(view, line).0, source);
+    }
+    assert_eq!(shown_line(view, 0).0, "top");
+    assert_eq!(shown_line(view, 6).0, "after");
+}
+
+#[test]
+fn a_code_block_reveals_with_its_fences() {
+    let text = "top\n\n```rust\nlet a;\n\nlet b;\n```\n\nafter\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, text.find("let b").unwrap());
+    // The blank line inside the fence does not split the block.
+    assert_eq!(view.revealed(), 2..7);
+    assert_eq!(shown_line(view, 2).0, "```rust");
+    assert_eq!(shown_line(view, 6).0, "```");
+    caret_to(&main, 0);
+    assert_eq!(shown_line(view, 2).0, "rust");
+}
+
+#[test]
+fn a_revealed_heading_keeps_its_size_and_bold_stays_bold() {
+    let text = "top\n\n# Big **title**\n\nafter\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 0);
+    let (shown, revealed, rendered_height) = shown_line(view, 2);
+    assert_eq!(shown, "Big title");
+    assert!(!revealed);
+    caret_to(&main, text.find("Big").unwrap());
+    let (shown, revealed, height) = shown_line(view, 2);
+    assert_eq!(shown, "# Big **title**");
+    assert!(revealed);
+    assert_eq!(height, rendered_height, "the heading keeps its size");
+}
+
+#[test]
+fn the_edited_block_is_highlighted() {
+    let text = "one\ntwo\n\nthree\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 0);
+    full_frame(view);
+    assert_eq!(view.painted_decorations().active_block, 2);
+    caret_to(&main, text.find("three").unwrap());
+    full_frame(view);
+    assert_eq!(view.painted_decorations().active_block, 1);
 }
 
 #[test]
 fn typing_bold_markers_restyles_only_the_caret_line_until_it_is_left() {
-    let (_scintilla, main, view) = live_tab("first\nsecond\n");
+    let (_scintilla, main, view) = live_tab("first\n\nsecond\n");
     caret_to(&main, 5);
     send_inputs(view.hwnd(), &[Input::Text(" **b**")]);
     assert_eq!(
@@ -1271,7 +1328,7 @@ fn typing_bold_markers_restyles_only_the_caret_line_until_it_is_left() {
         "first b",
         "rendered once the caret leaves"
     );
-    assert_eq!(shown_line(view, 1).0, "second");
+    assert_eq!(shown_line(view, 2).0, "second");
 }
 
 #[test]
@@ -1366,28 +1423,23 @@ fn clicking_below_a_heading_keeps_the_caret_under_the_pointer() {
     let (_scintilla, main, view) = live_tab(&with_filler("# A big heading\n\nline a\nline b\n"));
     caret_to(&main, 3);
     painted(view);
-    // The heading shows as source (one row): line b is the fourth row.
-    let (row, _) = view.row_metrics();
-    let click_y = row * 3 + row / 2;
-    click(
-        view.hwnd(),
-        (row_point(view, 0, 0).0 + 4, click_y),
-        false,
-        false,
-    );
-    painted(view);
+    // Where line b is drawn while the heading is being edited.
     let line_b = main.editor().line_start(3).unwrap();
+    let (x, y) = view.client_point_of(line_b + 2).unwrap();
+    click(view.hwnd(), (x, y), false, false);
+    painted(view);
     let caret = caret(&main).1;
     assert!(
         caret >= line_b && caret <= line_b + 6,
         "caret {caret} on line b"
     );
-    // The heading grew above the click; the caret is still under the pointer.
+    // The heading keeps its size as it stops being edited: the caret is still under the
+    // pointer.
+    let (row, _) = view.row_metrics();
     let caret_y = view.caret_client_y().unwrap();
     assert!(
-        (caret_y - row * 3).abs() <= 1,
-        "caret row top {caret_y}, clicked row top {}",
-        row * 3
+        (caret_y + row / 2 - y).abs() <= row / 2 + 1,
+        "caret row top {caret_y}, clicked at {y}"
     );
 }
 
@@ -1873,14 +1925,14 @@ fn up_down_keep_their_column_across_list_levels() {
 }
 
 #[test]
-fn moving_into_a_list_item_reveals_only_that_line() {
-    let text = "top\n\n- one\n- two\n- three\n";
+fn moving_into_a_list_reveals_the_lines_between_blank_lines() {
+    let text = "top\n\n- one\n- two\n\n- three\n";
     let (_scintilla, main, view) = live_tab(text);
     caret_to(&main, text.find("two").unwrap());
-    assert_eq!(view.revealed(), 3..4);
-    assert_eq!(shown_line(view, 2).0, "one");
+    assert_eq!(view.revealed(), 2..4);
+    assert_eq!(shown_line(view, 2).0, "- one");
     assert_eq!(shown_line(view, 3).0, "- two");
-    assert_eq!(shown_line(view, 4).0, "three");
+    assert_eq!(shown_line(view, 5).0, "three");
 }
 
 #[test]
@@ -1918,23 +1970,26 @@ fn typing_in_a_code_block_never_changes_its_height() {
 }
 
 #[test]
-fn moving_through_a_table_reveals_one_row_at_a_time() {
+fn clicking_into_a_table_reveals_the_whole_table() {
     let text = "top\n\n| a | b |\n|---|---|\n| c | d |\n| e | f |\n";
     let (_scintilla, main, view) = live_tab(text);
     caret_to(&main, text.find("| c").unwrap() + 2);
-    assert_eq!(view.revealed(), 4..5);
-    assert_eq!(shown_line(view, 4).0, "| c | d |");
-    assert!(
-        shown_line(view, 5).0.contains('\u{FFFC}'),
-        "the next row is a grid row"
-    );
-    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
-    assert_eq!(view.revealed(), 5..6);
-    assert!(
-        shown_line(view, 4).0.contains('\u{FFFC}'),
-        "the row left renders again"
-    );
-    assert_eq!(shown_line(view, 5).0, "| e | f |");
+    assert_eq!(view.revealed(), 2..6);
+    for (line, source) in [
+        (2, "| a | b |"),
+        (3, "|---|---|"),
+        (4, "| c | d |"),
+        (5, "| e | f |"),
+    ] {
+        assert_eq!(shown_line(view, line).0, source);
+    }
+    caret_to(&main, 0);
+    for line in [2, 4, 5] {
+        assert!(
+            shown_line(view, line).0.contains('\u{FFFC}'),
+            "row {line} renders as a grid row once the caret leaves"
+        );
+    }
 }
 
 #[test]
@@ -1981,20 +2036,27 @@ fn leaving_a_table_row_formats_the_table_and_keeps_the_grid() {
 #[test]
 fn moving_onto_an_image_line_keeps_the_caret_row_in_place() {
     let image = write_bmp("anchor", 40, 120);
-    let text = with_filler(&format!("intro\n![dot]({})\nafter\n", image.display()));
+    let text = with_filler(&format!("intro\n\n![dot]({})\n\nafter\n", image.display()));
     let (_scintilla, main, view) = live_tab(&text);
     caret_to(&main, 2);
     wait_for_image(view);
-    let (_, _, image_height) = view.debug_line(1).unwrap();
+    let (_, _, image_height) = view.debug_line(2).unwrap();
     assert!(image_height > 120.0);
-    send_inputs(view.hwnd(), &[Input::Key(VK_DOWN, false, false)]);
+    send_inputs(
+        view.hwnd(),
+        &[
+            Input::Key(VK_DOWN, false, false),
+            Input::Key(VK_DOWN, false, false),
+        ],
+    );
     painted(view);
-    assert_eq!(view.revealed(), 1..2);
+    assert_eq!(view.revealed(), 2..3);
     let (row, _) = view.row_metrics();
     let caret_y = view.caret_client_y().unwrap();
     assert!(
-        (caret_y - row).abs() <= 1,
-        "the caret row starts where the image line did: {caret_y} vs {row}"
+        (caret_y - row * 2).abs() <= 1,
+        "the caret row starts where the image line did: {caret_y} vs {}",
+        row * 2
     );
     let _ = std::fs::remove_file(image);
 }

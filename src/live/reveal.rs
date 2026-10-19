@@ -1,9 +1,25 @@
-//! Which source lines show as source (2026-10-18 Live editor design spec §5): every line the
-//! selection touches, the caret's line included. A selection ending at the very start of a line
-//! covers the previous line's ending, not a character of that line, so that line stays rendered
-//! (phase 2 plan, deviation 8). Live has one selection (phase 1 plan, deviation 5).
+//! Which source lines show as source (2026-10-18 Live editor design spec §5): every block the
+//! selection touches, whole, from the blank line before it to the blank line after it (phase 3
+//! review: the caret's block, not just its line). A selection ending at the very start of a line
+//! covers the previous line's ending, not a character of that line, so that line's block stays
+//! rendered (phase 2 plan, deviation 8). Live has one selection (phase 1 plan, deviation 5).
 
 use std::ops::Range;
+
+/// The lines shown as source for the selection `anchor..caret`: the blocks holding the first
+/// and last lines it touches (`block_of` gives a line's block, itself for a blank line), and every
+/// line between them.
+pub fn revealed_blocks(
+    anchor: usize,
+    caret: usize,
+    line_of: impl Fn(usize) -> usize,
+    block_of: impl Fn(usize) -> Range<usize>,
+) -> Range<usize> {
+    let lines = revealed_lines(anchor, caret, line_of);
+    let first = block_of(lines.start);
+    let last = block_of(lines.end - 1);
+    first.start.min(lines.start)..last.end.max(lines.end)
+}
 
 /// The source lines the selection `anchor..caret` (either order) touches.
 pub fn revealed_lines(
@@ -66,6 +82,24 @@ mod tests {
     // Lines of "aa\nbb\ncc\n": 0..3, 3..6, 6..9.
     fn line_of(at: usize) -> usize {
         at / 3
+    }
+
+    #[test]
+    fn a_caret_reveals_its_whole_block() {
+        // Lines 2..5 are one block; line 6 is blank.
+        let block_of = |line: usize| {
+            if (2..5).contains(&line) {
+                2..5
+            } else {
+                line..line + 1
+            }
+        };
+        assert_eq!(revealed_blocks(30, 30, |at| at / 10, block_of), 2..5);
+        assert_eq!(revealed_blocks(60, 60, |at| at / 10, block_of), 6..7);
+        // A selection from the blank line into the block reveals both.
+        assert_eq!(revealed_blocks(61, 25, |at| at / 10, block_of), 2..7);
+        // One ending at the blank line's start covers only the block.
+        assert_eq!(revealed_blocks(60, 25, |at| at / 10, block_of), 2..6);
     }
 
     #[test]

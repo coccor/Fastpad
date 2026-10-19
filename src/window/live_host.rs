@@ -382,6 +382,7 @@ fn appearance(
             roles.code_background
         },
         dim: role(roles.comment),
+        active_block: palette.caret_line_background,
     };
     let fonts = LiveFonts::new(
         graphics,

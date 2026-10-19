@@ -250,6 +250,17 @@ impl LiveDocument {
         )
     }
 
+    /// The bytes of the top-level block holding `at` (the front matter counts as one), or `None`
+    /// between blocks: what the caret reveals as source.
+    pub fn block_bytes(&self, at: usize) -> Option<Range<usize>> {
+        if at < self.front_matter {
+            return Some(0..self.front_matter);
+        }
+        let blocks = &self.index.blocks;
+        let found = blocks.partition_point(|block| block.end <= at);
+        blocks.get(found).filter(|block| block.start <= at).cloned()
+    }
+
     /// The absolute starts of the first and last lines of the table holding `at`.
     pub fn table_extent(
         &self,
