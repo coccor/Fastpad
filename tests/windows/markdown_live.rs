@@ -2167,3 +2167,36 @@ fn a_relative_image_next_to_a_saved_note_renders() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_html_img_renders_at_its_width_as_in_a_readme() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("fastpad-live-html-img-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    let image = write_bmp("html", 40, 120);
+    std::fs::copy(&image, dir.join("docs").join("hero.bmp")).unwrap();
+    let _ = std::fs::remove_file(image);
+    std::fs::write(
+        dir.join("README.md"),
+        "<div align=\"center\">\n\n<img src=\"docs/hero.bmp\" alt=\"The hero\" width=\"80\">\n\n</div>\n\nA badge ![build](https://example.com/b.svg) here.\n",
+    )
+    .unwrap();
+    let main = TestMain::new();
+    window::open_path(main.hwnd, &dir.join("README.md")).unwrap();
+    pump_until("README.md loaded", Duration::from_secs(3), || {
+        !main.with_app(|app| app.populating_file)
+    });
+    main.with_app(|app| app.tabs.set_active_language(Language::Markdown));
+    main.set_live(true);
+    let view = main.live_view().unwrap();
+    unsafe { SetFocus(view.hwnd()) };
+    caret_to(&main, 0);
+    wait_for_image(view);
+    // 80 pixels wide: twice its natural width, so twice its natural height.
+    let (shown, _, height) = view.debug_line(2).unwrap();
+    assert_eq!(shown, "");
+    assert!(height > 240.0, "{height}");
+    // A remote image inside text shows its alt text.
+    assert_eq!(view.debug_line(6).unwrap().0, "A badge build here.");
+    let _ = std::fs::remove_dir_all(&dir);
+}

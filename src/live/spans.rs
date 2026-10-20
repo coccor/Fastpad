@@ -8,6 +8,7 @@
 //! rendered line hides and what its body is. Code blocks and HTML blocks keep the inline spans of
 //! their text from being emitted; table cells keep theirs.
 
+use crate::preview::html::Token;
 use crate::preview::model::PARSE_OPTIONS;
 use pulldown_cmark::{
     Alignment, BrokenLink, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
@@ -78,6 +79,9 @@ pub enum Container {
     },
 }
 
+/// An `<img>`'s `width` and `height` in pixels, when it gives them.
+pub type ImageSize = (Option<u32>, Option<u32>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
     None,
@@ -108,11 +112,13 @@ pub enum Body {
     TableDelimiter {
         aligns: Rc<[Align]>,
     },
-    /// The line's only content is this image (optionally inside one link); `alt` is relative
-    /// to the line.
+    /// The line's only content is this image: a Markdown image (optionally inside one link) or
+    /// an HTML `<img>`. `alt` is relative to the line; `size` is an `<img>`'s `width` and
+    /// `height` in pixels, when it gives them.
     Image {
         dest: String,
         alt: Range<usize>,
+        size: (Option<u32>, Option<u32>),
     },
 }
 
@@ -287,6 +293,8 @@ struct Collector<'a> {
     tables: Vec<(Range<usize>, Rc<[Align]>)>,
     rules: Vec<usize>,
     images: Vec<ImageSeed>,
+    /// The block holds HTML: a line may be an `<img>`.
+    html: bool,
 }
 
 impl<'a> Collector<'a> {
@@ -307,6 +315,7 @@ impl<'a> Collector<'a> {
             tables: Vec::new(),
             rules: Vec::new(),
             images: Vec::new(),
+            html: false,
         }
     }
 
@@ -339,7 +348,11 @@ impl<'a> Collector<'a> {
             Event::Start(tag) => self.start(tag, range),
             Event::End(tag) => self.end(tag),
             Event::Code(_) => self.inline_code(range),
-            Event::InlineHtml(_) | Event::Html(_) => self.push(range, SpanKind::Dim),
+            Event::InlineHtml(_) | Event::Html(_) => {
+                // An `<img>` alone on a line is an image line.
+                self.html = true;
+                self.push(range, SpanKind::Dim);
+            }
             Event::TaskListMarker(checked) => self.task(checked, range),
             Event::Rule => self.rules.push(range.start),
             _ => {}
@@ -493,6 +506,14 @@ impl<'a> Collector<'a> {
             TagEnd::Image => {
                 if let Some(image) = self.open_images.pop() {
                     let empty = image.whole.start + 2..image.whole.start + 2;
+                    // Inside text, an image shows its alt text, dimmed (nothing is drawn for it
+                    // there); an image line hides all of this and draws the picture instead.
+                    if let Some(alt) = image.inner.clone() {
+                        self.push(image.whole.start..alt.start, SpanKind::Hidden);
+                        self.push(alt.end..image.whole.end, SpanKind::Hidden);
+                        self.push(alt.clone(), SpanKind::Dim);
+                        self.push(alt, SpanKind::Italic);
+                    }
                     self.images.push(ImageSeed {
                         alt: image.inner.unwrap_or(empty),
                         whole: image.whole,
@@ -572,6 +593,7 @@ impl<'a> Collector<'a> {
             && self.tables.is_empty()
             && self.rules.is_empty()
             && self.images.is_empty()
+            && !self.html
         {
             // Plain prose (the common block, and a 10k-line paragraph): no line has a context.
             return Vec::new();
@@ -750,6 +772,14 @@ impl<'a> Collector<'a> {
             return Body::Image {
                 dest: image.dest.clone(),
                 alt: relative(image.alt.clone()),
+                size: (None, None),
+            };
+        }
+        if let Some((dest, alt, size)) = html_image(text, only) {
+            return Body::Image {
+                dest,
+                alt: relative(alt),
+                size,
             };
         }
         Body::Text
@@ -809,6 +839,49 @@ impl<'a> Collector<'a> {
             lines,
         }
     }
+}
+
+/// The `<img>` tag that is all of `only` (a line's content): its `src`, the bytes of its `alt`
+/// value and its pixel `width` and `height`. Percentages are left to the natural size.
+fn html_image(text: &str, only: Range<usize>) -> Option<(String, Range<usize>, ImageSize)> {
+    let source = &text[only.clone()];
+    if !source.get(..4)?.eq_ignore_ascii_case("<img") {
+        return None;
+    }
+    let mut tokens = crate::preview::html::tokenize(source)
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Text(text) if text.trim().is_empty()));
+    let (Some(Token::Start { name, attrs, .. }), None) = (tokens.next(), tokens.next()) else {
+        return None;
+    };
+    if name != "img" {
+        return None;
+    }
+    let src = crate::preview::html::attr(&attrs, "src")?.trim().to_owned();
+    if src.is_empty() {
+        return None;
+    }
+    // Where the alt value sits in the source: after `alt=`, inside its quotes if it has them.
+    let alt = crate::preview::html::attr(&attrs, "alt")
+        .filter(|alt| !alt.is_empty())
+        .and_then(|alt| {
+            let lower = source.to_ascii_lowercase();
+            let key = lower.find("alt=")? + 4;
+            let quoted = matches!(source.as_bytes().get(key), Some(b'"' | b'\''));
+            let start = key + usize::from(quoted);
+            let found = source[start..].find(alt).filter(|&at| at == 0)?;
+            Some(only.start + start + found..only.start + start + found + alt.len())
+        })
+        .unwrap_or(only.start..only.start);
+    let pixels = |name: &str| {
+        let value = crate::preview::html::attr(&attrs, name)?.trim();
+        value
+            .strip_suffix("px")
+            .unwrap_or(value)
+            .parse::<u32>()
+            .ok()
+    };
+    Some((src, alt, (pixels("width"), pixels("height"))))
 }
 
 /// A list item's marker line, measured.
@@ -1493,6 +1566,7 @@ mod tests {
             Body::Image {
                 dest: "c.png".into(),
                 alt: 2..5,
+                size: (None, None),
             }
         );
         assert_eq!(
@@ -1500,6 +1574,7 @@ mod tests {
             Body::Image {
                 dest: "c.png".into(),
                 alt: 3..6,
+                size: (None, None),
             }
         );
         assert_eq!(
@@ -1507,7 +1582,60 @@ mod tests {
             Body::Image {
                 dest: "c.png".into(),
                 alt: 4..4,
+                size: (None, None),
             }
+        );
+    }
+
+    #[test]
+    fn an_html_img_alone_on_its_line_is_an_image_line() {
+        let text = "<img src=\"docs/hero.png\" alt=\"The hero\" width=\"900\">";
+        assert_eq!(
+            lines(text)[0].body,
+            Body::Image {
+                dest: "docs/hero.png".into(),
+                alt: 30..38,
+                size: (Some(900), None),
+            }
+        );
+        assert_eq!(&text[30..38], "The hero");
+        // In a paragraph too, and with its size in pixels.
+        let found = lines("text\n<IMG SRC='a.svg' width=96px height=\"96\" />");
+        assert_eq!(
+            found.last().unwrap().body,
+            Body::Image {
+                dest: "a.svg".into(),
+                alt: 0..0,
+                size: (Some(96), Some(96)),
+            }
+        );
+        // Not an image line: another tag, text around it, or no source.
+        for text in [
+            "<div><img src=\"a.png\"></div>",
+            "see <img src=\"a.png\">",
+            "<img alt=\"x\">",
+        ] {
+            assert!(
+                lines(text)
+                    .iter()
+                    .all(|line| !matches!(line.body, Body::Image { .. })),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_inside_text_shows_its_alt_text_dimmed() {
+        assert_eq!(
+            kinds("see ![cat](c.png) here"),
+            format!("....HH{}HHHHHHHH.....", "(di)".repeat(3))
+        );
+        // A badge: an image as a link's text.
+        let badge = kinds("[![cat](c.png)](u)");
+        assert!(badge.starts_with("HHH"), "{badge}");
+        assert!(
+            badge.contains("(Ldi)") || badge.contains("(dLi)") || badge.contains("(diL)"),
+            "{badge}"
         );
     }
 

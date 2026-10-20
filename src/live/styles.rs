@@ -89,10 +89,12 @@ pub enum BodyStyle {
         aligns: Rc<[Align]>,
     },
     TableDelimiter,
-    /// A line holding only an image; `alt` is relative to the line, for the fallback.
+    /// A line holding only an image; `alt` is relative to the line, for the fallback, and
+    /// `size` an `<img>`'s pixel width and height, when it gives them.
     Image {
         dest: String,
         alt: Range<usize>,
+        size: (Option<u32>, Option<u32>),
     },
 }
 
@@ -284,12 +286,13 @@ pub fn line_style(
                 aligns: Rc::clone(aligns),
             }
         }
-        Some(Body::Image { dest, alt }) => {
+        Some(Body::Image { dest, alt, size }) => {
             runs.clear();
             marks.push((0..len, Show::Hidden));
             BodyStyle::Image {
                 dest: dest.clone(),
                 alt: alt.clone(),
+                size: *size,
             }
         }
     };
@@ -724,7 +727,8 @@ mod tests {
             style.block.body,
             BodyStyle::Image {
                 dest: "c.png".into(),
-                alt: 2..5
+                alt: 2..5,
+                size: (None, None),
             }
         );
         let fallback = style.image_fallback();

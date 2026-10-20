@@ -869,9 +869,10 @@ impl LiveLayout {
                 paint: Paint::Rule,
             }),
             BodyStyle::TableDelimiter => height = self.fonts.line_height * 0.5,
-            BodyStyle::Image { .. } => {
+            BodyStyle::Image { size, .. } => {
                 if let Some((path, natural)) = image {
-                    let (width, image_height) = image_size(natural, text_width, self.fonts.zoom);
+                    let (width, image_height) =
+                        image_size(natural, *size, text_width, self.fonts.zoom);
                     let pad = em * 0.25;
                     height = image_height + 2.0 * pad;
                     decorations.push(Decoration::Image {
@@ -1115,15 +1116,27 @@ fn container_width(container: &Container, em: f32) -> f32 {
     }
 }
 
-/// An image's size in DIPs: its natural pixels at the editor's `zoom`, at most 300 DIPs (times
-/// the zoom) tall and `max_width` wide, keeping its aspect ratio.
-fn image_size((width, height): (u32, u32), max_width: f32, zoom: f32) -> (f32, f32) {
-    let (mut width, mut height) = (width as f32 * zoom, height as f32 * zoom);
-    let cap = 300.0 * zoom;
-    if height > cap {
-        width *= cap / height;
-        height = cap;
-    }
+/// An image's size in DIPs at the editor's `zoom`, never wider than `max_width` (keeping its
+/// aspect ratio): an `<img>`'s `width` and `height` (one completed from the natural aspect
+/// ratio), as the preview sizes it, or else its natural pixels at most 300 DIPs tall.
+fn image_size(
+    (natural_width, natural_height): (u32, u32),
+    asked: (Option<u32>, Option<u32>),
+    max_width: f32,
+    zoom: f32,
+) -> (f32, f32) {
+    let (natural_width, natural_height) = (natural_width as f32, natural_height as f32);
+    let (width, height) = match asked {
+        (Some(width), Some(height)) => (width as f32, height as f32),
+        (Some(width), None) => (width as f32, width as f32 * natural_height / natural_width),
+        (None, Some(height)) => (
+            height as f32 * natural_width / natural_height,
+            height as f32,
+        ),
+        (None, None) if natural_height > 300.0 => (natural_width * 300.0 / natural_height, 300.0),
+        (None, None) => (natural_width, natural_height),
+    };
+    let (mut width, mut height) = (width * zoom, height * zoom);
     if width > max_width && width > 0.0 {
         height *= max_width / width;
         width = max_width;
