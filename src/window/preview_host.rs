@@ -298,6 +298,11 @@ fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     editor(hwnd).map(|editor| editor.hwnd())
 }
 
+/// The window showing the target group's text: its Live view for a Live tab, else its editor.
+fn text_hwnd(hwnd: HWND) -> Option<HWND> {
+    crate::window::live_host::text_view_hwnd(hwnd, target_group(hwnd)?)
+}
+
 /// The target group's window, where its preview windows go.
 fn content_parent(hwnd: HWND) -> HWND {
     target_group(hwnd)
@@ -485,7 +490,7 @@ pub(crate) fn set_mode(hwnd: HWND, next: PreviewMode) {
     sync_visibility(hwnd);
     let focus = match (previous, next) {
         (_, PreviewMode::Full) => full_view_hwnd(hwnd),
-        (PreviewMode::Full, _) => editor_hwnd(hwnd),
+        (PreviewMode::Full, _) => text_hwnd(hwnd),
         _ => None,
     };
     if let Some(target) = focus {
@@ -516,7 +521,7 @@ fn close_view(hwnd: HWND) {
         had_focus |= focus == view.hwnd();
         view.destroy();
     }
-    if had_focus && let Some(editor) = editor_hwnd(hwnd) {
+    if had_focus && let Some(editor) = text_hwnd(hwnd) {
         unsafe { SetFocus(editor) };
     }
     host_window::invalidate_status_bar(hwnd);
@@ -688,19 +693,22 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
     let focus_view = shown_svg
         .map(|view| view.hwnd())
         .or(view.map(|view| view.hwnd()));
+    let live_hwnd = target.and_then(|id| crate::window::live_host::view_hwnd(hwnd, id));
+    let focus = unsafe { GetFocus() };
     if let (Some(editor), Some(target)) = (editor_hwnd, focus_view)
         && hide_editor
-        && unsafe { GetFocus() } == editor
+        && (focus == editor || live_hwnd.is_some_and(|live| live == focus))
     {
         unsafe { SetFocus(target) };
     }
     if let Some(view) = view {
         unsafe { ShowWindow(view.hwnd(), if shown { SW_SHOWNA } else { SW_HIDE }) };
     }
-    if let Some(editor) = editor_hwnd
+    // The text shows in the Live view or the editor; Live decides which.
+    if let Some(id) = target
         && shows_text(hwnd)
     {
-        unsafe { ShowWindow(editor, if hide_editor { SW_HIDE } else { SW_SHOWNA }) };
+        crate::window::live_host::show_text(hwnd, id, !hide_editor);
     }
     host_window::layout_editor_and_find_bar(hwnd);
     let parent = content_parent(hwnd);
@@ -872,12 +880,12 @@ fn install_parse(hwnd: HWND, payload: ParsedPreview) {
 pub(crate) fn record_edit(hwnd: HWND, id: GroupId, notification: &ScintillaNotification) {
     let inserted = notification.modification_type as u32 & SC_MOD_INSERTTEXT != 0;
     let length = notification.length.max(0) as usize;
-    let edit = Edit {
-        position: notification.position.max(0) as usize,
-        removed: if inserted { 0 } else { length },
-        inserted: if inserted { length } else { 0 },
-        lines_delta: notification.lines_added,
-    };
+    let edit = Edit::from_change(
+        notification.position.max(0) as usize,
+        length,
+        inserted,
+        notification.lines_added,
+    );
     let recorded = with_group_host(hwnd, id, |host| {
         // The SVG preview renders the whole text again after the pause; it keeps no edit log.
         if host.svg_document.is_some() {
@@ -1081,6 +1089,18 @@ fn follow(hwnd: HWND, dest: String) {
             }
         }
         LinkAction::Anchor(anchor) => {
+            // A link clicked in the Live view goes to the heading in the editor.
+            let live = target_group(hwnd)
+                .filter(|&id| crate::window::live_host::view_hwnd(hwnd, id).is_some());
+            if let Some(id) = live {
+                if !crate::window::live_host::go_to_anchor(hwnd, id, &anchor) {
+                    host_window::push_notice(
+                        hwnd,
+                        format!("No heading in this document matches #{anchor}."),
+                    );
+                }
+                return;
+            }
             if !view(hwnd).is_some_and(|view| view.scroll_to_anchor(&anchor)) {
                 host_window::push_notice(
                     hwnd,
@@ -1236,6 +1256,12 @@ pub(crate) fn preview_scrolled(hwnd: HWND, id: GroupId, line: usize) {
 fn follow_preview(hwnd: HWND, line: usize) {
     if mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
         return;
+    }
+    // Live shows every line, so it takes the document line as it is. The hidden editor still
+    // follows below, keeping the place for a switch back to source; its deferred scroll
+    // notification clears the guard as a shown editor's does.
+    if let Some(id) = target_group(hwnd) {
+        crate::window::live_host::follow_preview(hwnd, id, line);
     }
     let Some(editor) = editor(hwnd) else {
         return;

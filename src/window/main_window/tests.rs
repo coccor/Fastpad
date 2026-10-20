@@ -52,6 +52,7 @@ mod index_and_tags;
 mod inline_new_items;
 mod json_and_recovery;
 mod links_and_backlinks;
+mod live_focus;
 mod markdown_keys;
 mod menus_and_settings_commands;
 mod note_attachments;

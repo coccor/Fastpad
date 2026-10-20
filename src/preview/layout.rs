@@ -29,9 +29,9 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::core::PCWSTR;
 
-const HEADING_SCALE: [f32; 6] = [2.0, 1.5, 1.25, 1.0, 0.875, 0.875];
+pub(crate) const HEADING_SCALE: [f32; 6] = [2.0, 1.5, 1.25, 1.0, 0.875, 0.875];
 const BULLETS: [&str; 3] = ["\u{2022}", "\u{25E6}", "\u{25AA}"];
-const CODE_SCALE: f32 = 0.85;
+pub(crate) const CODE_SCALE: f32 = 0.85;
 /// `<small>`, relative to the surrounding text.
 const SMALL_SCALE: f32 = 0.875;
 /// `<sub>` and `<sup>`. DirectWrite cannot shift the baseline, so glyphs a font has no subscript or

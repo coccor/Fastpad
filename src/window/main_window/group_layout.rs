@@ -494,6 +494,7 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
             );
         }
     }
+    crate::window::live_host::layout(hwnd, id, rects.editor);
     unsafe {
         InvalidateRect(group, std::ptr::null(), 0);
     }

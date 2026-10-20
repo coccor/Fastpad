@@ -101,6 +101,7 @@ fn in_literal_block(hwnd: HWND, document: DocumentId, text: &str, at: usize) -> 
 /// reload, a background Replace, a language change).
 pub(crate) fn forget(hwnd: HWND, document: DocumentId) {
     with_registry(hwnd, |registry| registry.docs.remove(&document));
+    crate::window::live_host::forget(hwnd, document);
 }
 
 fn with_registry<R>(hwnd: HWND, run: impl FnOnce(&mut MarkdownRegistry) -> R) -> Option<R> {
@@ -114,7 +115,8 @@ pub(crate) fn has_state(hwnd: HWND, document: DocumentId) -> bool {
     with_registry(hwnd, |registry| registry.docs.contains_key(&document)).unwrap_or(false)
 }
 
-/// The group whose editor window is `editor`, its editor and active document.
+/// The group whose editor window, or shown Live view, is `editor`, its editor and active
+/// document.
 pub(crate) fn group_of_editor(
     hwnd: HWND,
     editor: HWND,
@@ -124,7 +126,7 @@ pub(crate) fn group_of_editor(
     let group = app
         .groups
         .iter()
-        .find(|group| group.editor.hwnd() == editor)?;
+        .find(|group| group.editor.hwnd() == editor || group.live.shows(editor))?;
     let document = app.tabs.group(group.id)?.active_document()?;
     let language = app.tabs.document(document)?.language;
     Some((group.id, group.editor.clone(), document, language))
@@ -180,13 +182,29 @@ fn link_at(editor: &Editor, position: usize) -> Option<crate::library::links::Li
 /// Follows `link`, written in `editor`'s note, later: the click that found it is still being
 /// handled by the editor, which must not see its document swapped underneath it. The preview's
 /// link message carries it, from the editor's group.
+/// Ctrl+click at document `position` in the Live view `window`: follows the wikilink there, as
+/// a Ctrl+click in the editor does. False when there is none, so the click places the caret.
+pub(crate) fn follow_link_at(hwnd: HWND, window: HWND, position: usize) -> bool {
+    let Some((_, editor, document, _)) = group_of_editor(hwnd, window) else {
+        return false;
+    };
+    if !has_links(hwnd, document) {
+        return false;
+    }
+    let Some(link) = link_at(&editor, position) else {
+        return false;
+    };
+    post_follow(hwnd, window, &link);
+    true
+}
+
 fn post_follow(main: HWND, editor: HWND, link: &crate::library::links::LineLink) {
     let group = unsafe { host_window::app_ptr(main) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         let group = app
             .groups
             .iter()
-            .find(|group| group.editor.hwnd() == editor)?;
+            .find(|group| group.editor.hwnd() == editor || group.live.shows(editor))?;
         Some(group.hwnd)
     });
     let Some(group) = group else {
@@ -289,6 +307,12 @@ pub(crate) fn refresh_link_marks(editor: &Editor) {
 /// (spec §7.4).
 pub(crate) fn char_added(hwnd: HWND, editor: &Editor, character: i32) {
     if character != i32::from(b'[') || editor.completion_active() {
+        return;
+    }
+    // Scintilla's list would open at the hidden editor's caret (phase 1 plan, deviation 4).
+    let live = group_of_editor(hwnd, editor.hwnd())
+        .is_some_and(|(id, ..)| crate::window::live_host::view_hwnd(hwnd, id).is_some());
+    if live {
         return;
     }
     let Ok(caret) = editor.caret() else {

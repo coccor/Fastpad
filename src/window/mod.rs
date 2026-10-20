@@ -25,6 +25,7 @@ pub(crate) mod inline_name;
 pub(crate) mod keymap;
 pub(crate) mod library_host;
 pub(crate) mod links_view;
+pub(crate) mod live_host;
 mod main_window;
 pub(crate) mod markdown_host;
 pub(crate) mod menu_band;
@@ -87,6 +88,12 @@ pub(crate) use main_window::{activate_group, place_view, split_group};
 #[cfg(test)]
 #[allow(
     unused_imports,
+    reason = "consumed by the source-linked markdown_live integration target"
+)]
+pub(crate) use main_window::{find_previous, go_to_line, replace_all_matches, replace_current};
+#[cfg(test)]
+#[allow(
+    unused_imports,
     reason = "consumed by the source-linked save_file integration target"
 )]
 pub(crate) use main_window::{save_path_as, with_test_input_queue_status};
@@ -95,7 +102,8 @@ pub use messages::{
     WM_FASTPAD_COPY_DONE, WM_FASTPAD_DIAGNOSTIC_JSON_COUNT, WM_FASTPAD_DIAGNOSTIC_PREVIEW,
     WM_FASTPAD_FILES_CHANGED, WM_FASTPAD_FILES_DROPPED, WM_FASTPAD_IMAGE_DECODED,
     WM_FASTPAD_IMAGE_STATUS, WM_FASTPAD_INDEX_READY, WM_FASTPAD_INLINE_NAME_LEFT,
-    WM_FASTPAD_IPC_REQUEST, WM_FASTPAD_LIBRARY_READY, WM_FASTPAD_LOAD_SETTINGS,
+    WM_FASTPAD_IPC_REQUEST, WM_FASTPAD_LIBRARY_READY, WM_FASTPAD_LIVE_CHANGED,
+    WM_FASTPAD_LIVE_IMAGE, WM_FASTPAD_LIVE_LINK, WM_FASTPAD_LIVE_MENU, WM_FASTPAD_LOAD_SETTINGS,
     WM_FASTPAD_MARKDOWN_DEFERRED, WM_FASTPAD_NOTEBOOK_CHECKED, WM_FASTPAD_OPEN_LIBRARY,
     WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_PANEL_DROPPED, WM_FASTPAD_PREVIEW_ACTIVATE,
     WM_FASTPAD_PREVIEW_ESCAPE, WM_FASTPAD_PREVIEW_HOVER, WM_FASTPAD_PREVIEW_IMAGE,

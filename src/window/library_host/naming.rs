@@ -255,6 +255,7 @@ pub(super) fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &
     schedule_write(hwnd);
     close_name_box(hwnd);
     crate::window::main_window::invalidate_title_strip(hwnd);
+    crate::window::live_host::document_moved(hwnd);
     crate::window::side_panel::refresh(hwnd);
     // The extension may have changed, and with it the language.
     unsafe {

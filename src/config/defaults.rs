@@ -18,6 +18,8 @@ pub const DEFAULT_PREVIEW_LINE_HEIGHT: u8 = 16;
 pub const MIN_PREVIEW_LINE_HEIGHT: u8 = 10;
 pub const MAX_PREVIEW_LINE_HEIGHT: u8 = 30;
 pub const DEFAULT_FONT_SIZE: u16 = 11;
+/// Markdown tabs open in the source view until the Live view is chosen.
+pub const DEFAULT_MARKDOWN_LIVE_DEFAULT: bool = false;
 pub const DEFAULT_TAB_WIDTH: u8 = 4;
 pub const DEFAULT_WORD_WRAP: bool = false;
 pub const DEFAULT_LINE_NUMBERS: bool = true;
@@ -89,6 +91,7 @@ pub fn default_settings() -> Settings {
         always_on_top: DEFAULT_ALWAYS_ON_TOP,
         capture_hotkey: DEFAULT_CAPTURE_HOTKEY.to_owned(),
         capture_source: false,
+        markdown_live_default: DEFAULT_MARKDOWN_LIVE_DEFAULT,
         settings_size: None,
         window_placement: None,
         key_overrides: std::collections::BTreeMap::new(),

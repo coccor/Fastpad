@@ -226,6 +226,7 @@ impl MenuBar {
                     ),
                     MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
                     MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
+                    MenuEntry::command("Li&ve Markdown", CommandId::MarkdownToggleLive),
                     MenuEntry::Separator,
                     MenuEntry::command("Command &palette...", CommandId::CommandPalette),
                 ],
@@ -268,6 +269,17 @@ pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
         CommandId::MarkdownPreviewClose,
     ] {
         unsafe { EnableMenuItem(menu, command as u32, state) };
+    }
+}
+
+/// Grays Live Markdown off Markdown tabs and checks it while the active tab shows Live.
+pub(crate) fn set_markdown_live(menu: HMENU, enabled: bool, checked: bool) {
+    let command = CommandId::MarkdownToggleLive as u32;
+    let enable = if enabled { MF_ENABLED } else { MF_GRAYED };
+    let check = if checked { MF_CHECKED } else { MF_UNCHECKED };
+    unsafe {
+        EnableMenuItem(menu, command, MF_BYCOMMAND | enable);
+        CheckMenuItem(menu, command, MF_BYCOMMAND | check);
     }
 }
 
@@ -317,6 +329,8 @@ pub(crate) enum MenuEntry {
     /// global key does something else. Its label may spell the view's own key (the tree's F2
     /// and Del, which the tree handles itself).
     Local(&'static str, CommandId),
+    /// A `Command` or `Local` entry shown greyed: it cannot run now (Undo with nothing to undo).
+    Greyed(Box<MenuEntry>),
     Submenu(&'static str, Vec<MenuEntry>),
     Separator,
 }
@@ -329,6 +343,38 @@ impl MenuEntry {
     pub(crate) const fn local(label: &'static str, command: CommandId) -> Self {
         Self::Local(label, command)
     }
+
+    /// This entry, greyed unless `enabled`.
+    pub(crate) fn enabled(self, enabled: bool) -> Self {
+        if enabled {
+            self
+        } else {
+            Self::Greyed(Box::new(self))
+        }
+    }
+
+    /// The label (without its key) and whether it can run, for each command entry; tests read
+    /// the last popup's this way.
+    #[cfg(test)]
+    fn summary(&self, enabled: bool, out: &mut Vec<(String, bool)>) {
+        match self {
+            Self::Command(label, _) | Self::Local(label, _) => {
+                let label = label
+                    .split('\t')
+                    .next()
+                    .unwrap_or_default()
+                    .replace('&', "");
+                out.push((label, enabled));
+            }
+            Self::Greyed(entry) => entry.summary(false, out),
+            Self::Submenu(_, children) => {
+                for child in children {
+                    child.summary(enabled, out);
+                }
+            }
+            Self::Separator => {}
+        }
+    }
 }
 
 fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -> Result<HMENU> {
@@ -337,6 +383,10 @@ fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -
         return Err(last_error());
     }
     for entry in entries {
+        let (entry, flags) = match entry {
+            MenuEntry::Greyed(entry) => (&**entry, MF_STRING | MF_GRAYED),
+            entry => (entry, MF_STRING),
+        };
         let ok = match entry {
             MenuEntry::Command(label, command) => {
                 // Every command shows its first key from the keymap (keyboard shortcuts spec §5).
@@ -345,12 +395,14 @@ fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -
                     None => (*label).to_owned(),
                 };
                 let text = wide_null(&text);
-                unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
+                unsafe { AppendMenuW(menu, flags, *command as usize, text.as_ptr()) }
             }
             MenuEntry::Local(label, command) => {
                 let text = wide_null(label);
-                unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
+                unsafe { AppendMenuW(menu, flags, *command as usize, text.as_ptr()) }
             }
+            // Greyed only wraps a command entry.
+            MenuEntry::Greyed(_) => 1,
             MenuEntry::Submenu(label, children) => {
                 let child = match create_popup(children, keymap) {
                     Ok(child) => child,
@@ -430,6 +482,14 @@ pub(crate) fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> O
     // file dialogs do. Hold deferred, IPC and snapshot work for its duration so the command the
     // user picks still acts on the document that was active when they opened the menu.
     let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    LAST_POPUP.with(|last| {
+        let mut summary = Vec::new();
+        for entry in entries {
+            entry.summary(true, &mut summary);
+        }
+        *last.borrow_mut() = summary;
+    });
     #[cfg(test)]
     if let Some(answer) = POPUP_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return answer(hwnd);
@@ -716,6 +776,19 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static LAST_POPUP: std::cell::RefCell<Vec<(String, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The last popup menu's command entries: each label without its key, and whether it could run.
+#[cfg(test)]
+#[allow(dead_code, reason = "read by the markdown_live integration target")]
+pub(crate) fn last_popup_entries() -> Vec<(String, bool)> {
+    LAST_POPUP.with(|last| last.borrow().clone())
+}
+
+#[cfg(test)]
 type DropdownAnswer = Box<dyn FnOnce(HWND, usize) -> DropdownExit>;
 
 #[cfg(test)]
@@ -866,7 +939,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 84);
+        assert_eq!(specs.len(), 85);
     }
 
     #[test]
@@ -875,7 +948,7 @@ mod tests {
         // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
         let table = super::AcceleratorTable::create(&crate::window::keymap::Keymap::defaults())
             .expect("accelerator table");
-        assert_eq!(table.entries().len(), 84);
+        assert_eq!(table.entries().len(), 85);
     }
 
     #[test]
@@ -1200,5 +1273,23 @@ mod tests {
         let state =
             unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
         assert_eq!(state & MF_GRAYED, 0);
+    }
+
+    #[test]
+    fn live_markdown_grays_off_markdown_and_checks_while_live() {
+        use super::{MenuBar, set_markdown_live};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED,
+        };
+        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
+        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
+        let state =
+            || unsafe { GetMenuState(view, CommandId::MarkdownToggleLive as u32, MF_BYCOMMAND) };
+        set_markdown_live(view, false, false);
+        assert_ne!(state() & MF_GRAYED, 0);
+        assert_eq!(state() & MF_CHECKED, 0);
+        set_markdown_live(view, true, true);
+        assert_eq!(state() & MF_GRAYED, 0);
+        assert_ne!(state() & MF_CHECKED, 0);
     }
 }

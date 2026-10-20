@@ -534,21 +534,35 @@ pub(crate) fn refresh_tabs(hwnd: HWND) {
     // An image tab shows the image view instead of the editor (image preview spec §5).
     let text_active = count > 0 && !crate::window::image_host::active_is_image(hwnd);
     if let Some(editor_hwnd) = editor_hwnd {
-        let visible = unsafe { GetWindowLongPtrW(editor_hwnd, GWL_STYLE) } as u32 & WS_VISIBLE != 0;
+        // The text shows in the editor or, for a Live tab, the group's Live view.
+        let group = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+        let live_hwnd = group.and_then(|id| crate::window::live_host::view_hwnd(hwnd, id));
+        let shown = |window: HWND| {
+            (unsafe { GetWindowLongPtrW(window, GWL_STYLE) }) as u32 & WS_VISIBLE != 0
+        };
+        let visible = shown(editor_hwnd) || live_hwnd.is_some_and(shown);
         if !text_active && visible {
             close_find_bar(hwnd);
-            unsafe {
-                ShowWindow(editor_hwnd, SW_HIDE);
-                if GetFocus() == editor_hwnd {
-                    SetFocus(hwnd);
-                }
+            let focus = unsafe { GetFocus() };
+            if let Some(id) = group {
+                crate::window::live_host::show_text(hwnd, id, false);
+            } else {
+                unsafe { ShowWindow(editor_hwnd, SW_HIDE) };
+            }
+            if focus == editor_hwnd || live_hwnd.is_some_and(|live| live == focus) {
+                unsafe { SetFocus(hwnd) };
             }
         } else if text_active && !visible {
-            unsafe {
-                ShowWindow(editor_hwnd, SW_SHOWNA);
-                if GetFocus() == hwnd {
-                    SetFocus(editor_hwnd);
-                }
+            if let Some(id) = group {
+                crate::window::live_host::show_text(hwnd, id, true);
+            } else {
+                unsafe { ShowWindow(editor_hwnd, SW_SHOWNA) };
+            }
+            if unsafe { GetFocus() } == hwnd
+                && let Some(text) =
+                    group.and_then(|id| crate::window::live_host::text_view_hwnd(hwnd, id))
+            {
+                unsafe { SetFocus(text) };
             }
         }
     }

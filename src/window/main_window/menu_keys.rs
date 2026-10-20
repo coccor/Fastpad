@@ -127,6 +127,14 @@ pub(super) fn open_menu(hwnd: HWND, mut index: usize) {
             );
             menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
             menus::set_checked_language(menu, active_language(hwnd));
+            let live = unsafe { app_ptr(hwnd) }
+                .map(|app| unsafe { app.as_ref() }.tabs.active_group())
+                .is_some_and(|id| crate::window::live_host::view_hwnd(hwnd, id).is_some());
+            menus::set_markdown_live(
+                menu,
+                active_language(hwnd) == crate::document::Language::Markdown,
+                live,
+            );
         }
         menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
         set_menu_mode(
@@ -336,7 +344,10 @@ fn markdown_key(hwnd: HWND, message: &windows_sys::Win32::UI::WindowsAndMessagin
     if active_language(hwnd) != crate::document::Language::Markdown {
         return false;
     }
-    if unsafe { editor_hwnd(hwnd) } != Some(message.hwnd) {
+    let active = unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group());
+    if active.and_then(|id| crate::window::live_host::text_view_hwnd(hwnd, id))
+        != Some(message.hwnd)
+    {
         return false;
     }
     let down = |key: u16| unsafe { GetKeyState(i32::from(key)) } < 0;
@@ -360,11 +371,9 @@ fn markdown_key(hwnd: HWND, message: &windows_sys::Win32::UI::WindowsAndMessagin
     true
 }
 
-/// Whether `window` is one of the editor groups' editors.
+/// Whether `window` is one of the editor groups' editors, or a shown Live view.
 fn is_group_editor(hwnd: HWND, window: HWND) -> bool {
-    group_of_child(hwnd, window)
-        .and_then(|id| group_editor(hwnd, id))
-        .is_some_and(|editor| editor.hwnd() == window)
+    crate::window::live_host::group_of_text_view(hwnd, window).is_some()
 }
 
 /// Ctrl+W (without Alt) aimed at one of the command palette's controls.

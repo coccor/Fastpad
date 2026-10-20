@@ -117,3 +117,37 @@ jobs:
           name: benchmark-trend-${{ github.sha }}
           path: benchmarks/trend.jsonl
           if-no-files-found: error
+
+  live-perf:
+    # The Live Markdown view's typing latency (Live editor phase 4 plan, Decision 9): each
+    # scenario's keystroke p95 is held to the 4 ms budget, scaled because hosted runners are
+    # slower than the reference machine and draw without a GPU. The p95s go to the job summary.
+    needs: windows-integration
+    runs-on: windows-latest
+    env:
+      FASTPAD_PERF_SCALE: "2.5"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
+      - name: Fetch pinned Scintilla and Lexilla sources
+        shell: pwsh
+        run: ./tools/fetch-native.ps1
+      - name: Build native DLLs from pinned sources
+        shell: pwsh
+        run: ./tools/build-native.ps1
+      # Filtered to the typing_in_live tests: a bare --ignored would also run the asset
+      # regeneration tests.
+      - name: Live typing scenarios (release, serial)
+        shell: pwsh
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc --test markdown_live typing_in_live -- --ignored --test-threads=1 --nocapture | Tee-Object -FilePath live-perf.txt
+          $status = $LASTEXITCODE
+          "## Live typing" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          Select-String -Path live-perf.txt -Pattern 'live-perf |paint: present' | ForEach-Object { $_.Line.Trim() } >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          exit $status

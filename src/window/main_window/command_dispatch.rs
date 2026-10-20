@@ -55,6 +55,14 @@ pub(super) fn execute_command_with_note(
     command: CommandId,
     recorded: Option<std::path::PathBuf>,
 ) {
+    crate::window::live_host::before_command(hwnd, command);
+    run_command(hwnd, command, recorded);
+    // A command may have moved the selection of an editor hidden behind its Live view, which
+    // reports no SCN_UPDATEUI while hidden.
+    crate::window::live_host::poll_active(hwnd);
+}
+
+fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathBuf>) {
     #[cfg(test)]
     LAST_COMMAND.with(|last| last.set(Some(command)));
     exit_menu_mode(hwnd);
@@ -483,6 +491,7 @@ pub(super) fn execute_command_with_note(
         | CommandId::MarkdownItalic
         | CommandId::MarkdownCode
         | CommandId::MarkdownLink => crate::window::markdown_host::format(hwnd, command),
+        CommandId::MarkdownToggleLive => crate::window::live_host::toggle(hwnd),
         CommandId::ToggleSidebar => crate::window::side_panel::toggle(hwnd),
         CommandId::FocusNextPane => cycle_focus(hwnd, false),
         CommandId::FocusPreviousPane => cycle_focus(hwnd, true),

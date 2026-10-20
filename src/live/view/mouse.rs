@@ -1,0 +1,553 @@
+//! The mouse in the Live view (phase 1 plan, Task 10): a press places the caret, Shift extends,
+//! a double press selects a word and a triple press a line, and a drag extends by the same unit,
+//! scrolling while the pointer is above or below the view. Ctrl+click follows a link. A plain
+//! click on a task's checkbox toggles it (phase 3 plan, Decision 6): the one edit Live makes on
+//! its own, one undo step that leaves the selection where it was. A right press outside the
+//! selection places the caret, and the context menu is the main window's (phase 4 plan,
+//! Decision 5). A press inside the selection that moves drags the selected text: released
+//! elsewhere it moves there, or with Ctrl is copied there, as one undo step (Decision 6).
+
+use super::*;
+use crate::live::layout::Decoration;
+use std::ops::Range;
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetMessageTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK, SM_CXDRAG, SM_CYDOUBLECLK,
+    SM_CYDRAG, SendMessageW, SetTimer,
+};
+
+/// The drag autoscroll timer's id.
+pub(super) const AUTOSCROLL_TIMER: usize = 2;
+const AUTOSCROLL_MS: u32 = 30;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    Character,
+    Word,
+    Line,
+}
+
+pub(super) struct Drag {
+    unit: Unit,
+    /// What the press selected: the selection always keeps it.
+    anchor: Range<usize>,
+    /// The pointer's last client point.
+    point: (i32, i32),
+}
+
+/// A press inside a non-empty selection: a click until it moves past the drag threshold, then a
+/// drag of `source` to the drop caret.
+pub(super) struct TextDrag {
+    source: Range<usize>,
+    press: (i32, i32),
+    position: usize,
+    started: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Click {
+    time: u32,
+    point: (i32, i32),
+    count: u8,
+}
+
+fn point(lparam: isize) -> (i32, i32) {
+    (
+        (lparam & 0xFFFF) as u16 as i16 as i32,
+        ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32,
+    )
+}
+
+fn down(key: u16) -> bool {
+    (unsafe { GetKeyState(i32::from(key)) }) < 0
+}
+
+/// The document position under client point (`x`, `y`).
+pub(super) fn position_at(state: &mut ViewState, (x, y): (i32, i32)) -> usize {
+    prepare(state);
+    let scale = dpi_scale(state.hwnd);
+    let doc_x = x as f32 / scale - text_left(state);
+    let doc_y = y as f32 / scale + state.scroll_y;
+    let ViewState {
+        editor,
+        layout,
+        document,
+        revealed,
+        pictures,
+        ..
+    } = state;
+    let source = EditorText(editor);
+    let text = Styled {
+        text: &source,
+        document,
+        revealed: revealed.clone(),
+        images: &|dest: &str| pictures.resolve(dest),
+    };
+    layout.position_at(&text, doc_x, doc_y).unwrap_or(0)
+}
+
+/// The `unit` around `position`.
+fn unit_at(text: &impl LiveText, unit: Unit, position: usize) -> Range<usize> {
+    match unit {
+        Unit::Character => position..position,
+        Unit::Word => {
+            let word = text.word_at(position);
+            if word.is_empty() {
+                position..position
+            } else {
+                word
+            }
+        }
+        Unit::Line => {
+            let line = text.line_of(position);
+            text.line_start(line)..text.line_start(line + 1)
+        }
+    }
+}
+
+/// The rendered checkbox under client point `at`: the document position of the byte between its
+/// brackets, and whether it is checked.
+fn checkbox_under(state: &mut ViewState, (x, y): (i32, i32)) -> Option<(usize, bool)> {
+    prepare(state);
+    let scale = dpi_scale(state.hwnd);
+    let doc_x = x as f32 / scale - text_left(state);
+    let doc_y = y as f32 / scale + state.scroll_y;
+    let line = state.layout.line_at_y(doc_y);
+    let y = doc_y - state.layout.line_top(line);
+    let start = EditorText(&state.editor).line_start(line);
+    // A little slop around the box: it is small.
+    const SLOP: f32 = 2.0;
+    state
+        .layout
+        .laid_line(line)?
+        .decorations
+        .iter()
+        .find_map(|decoration| match decoration {
+            Decoration::Checkbox {
+                rect,
+                checked,
+                inner,
+            } if doc_x >= rect.left - SLOP
+                && doc_x <= rect.right + SLOP
+                && y >= rect.top - SLOP
+                && y <= rect.bottom + SLOP =>
+            {
+                Some((start + inner, *checked))
+            }
+            _ => None,
+        })
+}
+
+/// Toggles the checkbox whose inner byte is at `inner`: `[ ]` ↔ `[x]`, as one undo step, with
+/// the selection kept.
+fn toggle_checkbox(hwnd: HWND, inner: usize, checked: bool) {
+    let Some(editor) = with_state(hwnd, |state| state.editor.clone()) else {
+        return;
+    };
+    let selection = editor.anchor_and_caret().ok();
+    editor.begin_undo_action();
+    let _ = editor.replace_target(inner..inner + 1, if checked { " " } else { "x" });
+    editor.end_undo_action();
+    if let Some((anchor, caret)) = selection {
+        let _ = editor.set_selection(anchor..caret);
+    }
+    post_changed(hwnd, false);
+}
+
+/// `WM_LBUTTONDOWN`.
+pub(super) fn press(hwnd: HWND, lparam: isize) {
+    unsafe { SetFocus(hwnd) };
+    let at = point(lparam);
+    if !down(VK_CONTROL)
+        && !down(VK_SHIFT)
+        && let Some((inner, checked)) =
+            with_state(hwnd, |state| checkbox_under(state, at)).flatten()
+    {
+        toggle_checkbox(hwnd, inner, checked);
+        return;
+    }
+    if down(VK_CONTROL) {
+        let position = with_state(hwnd, |state| position_at(state, at)).unwrap_or(0);
+        // The main window follows a link under the pointer; the click is then taken.
+        let followed = unsafe {
+            SendMessageW(
+                crate::platform::win32::root_window(hwnd),
+                crate::window::WM_FASTPAD_LIVE_LINK,
+                hwnd as usize,
+                position as isize,
+            )
+        };
+        if followed != 0 {
+            return;
+        }
+        // A Markdown link: through the preview's link path, as a preview click.
+        let dest = with_state(hwnd, |state| link_under(state, at))
+            .flatten()
+            .filter(|link| !link.wiki)
+            .map(|link| link.dest);
+        if let Some(dest) = dest {
+            let payload = Box::into_raw(Box::new(dest));
+            let posted = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    crate::platform::win32::root_window(hwnd),
+                    crate::window::WM_FASTPAD_PREVIEW_LINK,
+                    hwnd as usize,
+                    payload as isize,
+                )
+            };
+            if posted == 0 {
+                drop(unsafe { Box::from_raw(payload) });
+            }
+            return;
+        }
+    }
+    let time = unsafe { GetMessageTime() } as u32;
+    let extend = down(VK_SHIFT);
+    let pending = !extend
+        && with_state(hwnd, |state| {
+            let position = position_at(state, at);
+            let (anchor, caret) = EditorText(&state.editor).selection();
+            let source = anchor.min(caret)..anchor.max(caret);
+            let inside = !source.is_empty() && source.start < position && position < source.end;
+            if inside {
+                state.clicks = Some(Click {
+                    time,
+                    point: at,
+                    count: 1,
+                });
+                state.text_drag = Some(TextDrag {
+                    source,
+                    press: at,
+                    position,
+                    started: false,
+                });
+            }
+            inside
+        })
+        .unwrap_or(false);
+    if pending {
+        unsafe { SetCapture(hwnd) };
+        return;
+    }
+    with_state(hwnd, |state| {
+        let count = match state.clicks {
+            Some(last)
+                if time.wrapping_sub(last.time) <= unsafe { GetDoubleClickTime() }
+                    && (at.0 - last.point.0).abs()
+                        <= unsafe { GetSystemMetrics(SM_CXDOUBLECLK) } / 2
+                    && (at.1 - last.point.1).abs()
+                        <= unsafe { GetSystemMetrics(SM_CYDOUBLECLK) } / 2 =>
+            {
+                last.count % 3 + 1
+            }
+            _ => 1,
+        };
+        state.clicks = Some(Click {
+            time,
+            point: at,
+            count,
+        });
+        let unit = match count {
+            1 => Unit::Character,
+            2 => Unit::Word,
+            _ => Unit::Line,
+        };
+        let position = position_at(state, at);
+        let text = EditorText(&state.editor);
+        let (old_anchor, _) = text.selection();
+        let anchor = if unit == Unit::Character && extend {
+            old_anchor..old_anchor
+        } else {
+            unit_at(&text, unit, position)
+        };
+        state.goal = None;
+        state.drag = Some(Drag {
+            unit,
+            anchor,
+            point: at,
+        });
+        extend_to(state, position);
+    });
+    unsafe { SetCapture(hwnd) };
+    super::keys::restart_blink(hwnd);
+    post_changed(hwnd, false);
+}
+
+/// The selection from the drag's anchor to the `unit` around `position`.
+fn extend_to(state: &mut ViewState, position: usize) {
+    let Some(drag) = &state.drag else {
+        return;
+    };
+    let text = EditorText(&state.editor);
+    let around = unit_at(&text, drag.unit, position);
+    let (anchor, caret) = if around.start < drag.anchor.start {
+        (drag.anchor.end, around.start)
+    } else {
+        (drag.anchor.start, around.end.max(drag.anchor.end))
+    };
+    text.set_selection(anchor, caret);
+}
+
+/// `WM_MOUSEMOVE`: extends a drag, and scrolls while the pointer is outside the view.
+pub(super) fn moved(hwnd: HWND, lparam: isize) {
+    let at = point(lparam);
+    let threshold = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
+    let text_drag = with_state(hwnd, |state| {
+        let drag = state.text_drag.as_mut()?;
+        drag.started |=
+            (at.0 - drag.press.0).abs() > threshold.0 || (at.1 - drag.press.1).abs() > threshold.1;
+        let started = drag.started;
+        if started {
+            state.drop_at = Some(position_at(state, at));
+        }
+        Some(started)
+    })
+    .flatten();
+    if let Some(started) = text_drag {
+        if started {
+            invalidate(hwnd);
+        }
+        return;
+    }
+    let dragging = with_state(hwnd, |state| {
+        let Some(drag) = &mut state.drag else {
+            return false;
+        };
+        drag.point = at;
+        let position = position_at(state, at);
+        extend_to(state, position);
+        true
+    })
+    .unwrap_or(false);
+    if !dragging {
+        return;
+    }
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client) };
+    if at.1 < client.top || at.1 >= client.bottom {
+        unsafe { SetTimer(hwnd, AUTOSCROLL_TIMER, AUTOSCROLL_MS, None) };
+    } else {
+        unsafe { KillTimer(hwnd, AUTOSCROLL_TIMER) };
+    }
+    post_changed(hwnd, false);
+}
+
+/// `WM_TIMER` while a drag holds the pointer above or below the view: scrolls toward it, by
+/// more the farther away it is, and extends the selection to what scrolled in.
+pub(super) fn autoscroll(hwnd: HWND) {
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client) };
+    let (_, height) = view_size(hwnd);
+    let scrolled = with_state(hwnd, |state| {
+        let point = state.drag.as_ref()?.point;
+        let distance = if point.1 < client.top {
+            point.1 - client.top
+        } else if point.1 >= client.bottom {
+            point.1 - client.bottom + 1
+        } else {
+            return None;
+        };
+        let line = state.layout.fonts().line_height;
+        let step = (distance as f32 / dpi_scale(hwnd)).clamp(-4.0 * line, 4.0 * line);
+        let total = state.layout.total_height();
+        state.scroll_y = scroll::clamp(state.scroll_y + step, height, total);
+        let position = position_at(state, point);
+        extend_to(state, position);
+        Some(())
+    })
+    .flatten();
+    if scrolled.is_none() {
+        unsafe { KillTimer(hwnd, AUTOSCROLL_TIMER) };
+        return;
+    }
+    invalidate(hwnd);
+    post_changed(hwnd, true);
+}
+
+/// A text drag ended. Dropped outside its source it moves there (or `copy`s), as one undo step
+/// that selects the text at its new place; released without moving, or on its source, it was a
+/// click and places the caret; cancelled (`dropped` false: Esc, or the capture lost) it does
+/// nothing.
+fn finish_text_drag(hwnd: HWND, drag: TextDrag, target: Option<usize>, copy: bool, dropped: bool) {
+    if !dropped {
+        return;
+    }
+    let Some(editor) = with_state(hwnd, |state| state.editor.clone()) else {
+        return;
+    };
+    let source = drag.source;
+    let target = target.filter(|_| drag.started).unwrap_or(drag.position);
+    if !drag.started || (source.start..=source.end).contains(&target) {
+        let _ = editor.set_selection(target..target);
+        post_changed(hwnd, false);
+        return;
+    }
+    let text = EditorText(&editor).slice(source.clone()).into_owned();
+    editor.begin_undo_action();
+    let placed = if copy {
+        editor.replace_target(target..target, &text)
+    } else if target > source.end {
+        // Insert first, so the source's positions still hold when it is removed.
+        let inserted = editor.replace_target(target..target, &text);
+        let _ = editor.replace_target(source.clone(), "");
+        inserted.map(|range| range.start - source.len()..range.end - source.len())
+    } else {
+        let _ = editor.replace_target(source.clone(), "");
+        editor.replace_target(target..target, &text)
+    };
+    editor.end_undo_action();
+    if let Ok(range) = placed {
+        let _ = editor.set_selection(range);
+    }
+    post_changed(hwnd, false);
+}
+
+/// Esc during a text drag: it ends with no edit.
+pub(super) fn cancel_text_drag(hwnd: HWND) -> bool {
+    let dragging = with_state(hwnd, |state| state.text_drag.is_some()).unwrap_or(false);
+    if dragging {
+        // The capture's loss ends the drag through `release`, as a cancelled one.
+        unsafe { ReleaseCapture() };
+    }
+    dragging
+}
+
+/// What a context menu acts on: where to show it and the link it was opened on.
+#[derive(Debug)]
+pub struct MenuRequest {
+    /// Screen coordinates.
+    pub screen: (i32, i32),
+    /// The document position the menu was opened at: the pointer's, or the caret's.
+    pub position: usize,
+    pub link: Option<crate::live::spans::LinkSpan>,
+}
+
+/// `WM_RBUTTONDOWN`: outside the selection the caret moves to the pointer, as Scintilla does;
+/// inside it the selection stays, for Cut or Copy from the menu.
+pub(super) fn right_press(hwnd: HWND, lparam: isize) {
+    unsafe { SetFocus(hwnd) };
+    let at = point(lparam);
+    let moved = with_state(hwnd, |state| {
+        let position = position_at(state, at);
+        let text = EditorText(&state.editor);
+        let (anchor, caret) = text.selection();
+        let inside = anchor != caret && (anchor.min(caret)..=anchor.max(caret)).contains(&position);
+        if !inside {
+            state.goal = None;
+            text.set_selection(position, position);
+        }
+        !inside
+    })
+    .unwrap_or(false);
+    if moved {
+        super::keys::restart_blink(hwnd);
+        post_changed(hwnd, false);
+    }
+}
+
+/// `WM_CONTEXTMENU`: asks the main window for the menu, at the pointer (`lparam` in screen
+/// coordinates) or, from the keyboard (`lparam == -1`), under the caret.
+pub(super) fn context_menu(hwnd: HWND, lparam: isize) {
+    let keyboard = lparam == -1;
+    let Some(request) = with_state(hwnd, |state| {
+        let (client, position) = if keyboard {
+            let (_, caret) = EditorText(&state.editor).selection();
+            let (x, y, height) = state.caret_px.unwrap_or((0, 0, 0));
+            ((x, y + height), caret)
+        } else {
+            let mut screen = POINT {
+                x: i32::from(lparam as u16 as i16),
+                y: i32::from((lparam >> 16) as u16 as i16),
+            };
+            unsafe { ScreenToClient(hwnd, &mut screen) };
+            let client = (screen.x, screen.y);
+            (client, position_at(state, client))
+        };
+        let source = EditorText(&state.editor);
+        let link = state.document.link_at(&source, position);
+        let mut screen = POINT {
+            x: client.0,
+            y: client.1,
+        };
+        unsafe { ClientToScreen(hwnd, &mut screen) };
+        MenuRequest {
+            screen: (screen.x, screen.y),
+            position,
+            link,
+        }
+    }) else {
+        return;
+    };
+    unsafe {
+        SendMessageW(
+            crate::platform::win32::root_window(hwnd),
+            crate::window::WM_FASTPAD_LIVE_MENU,
+            hwnd as usize,
+            &request as *const MenuRequest as isize,
+        )
+    };
+}
+
+/// The link (rendered or revealed) under client point `at`.
+fn link_under(state: &mut ViewState, at: (i32, i32)) -> Option<crate::live::spans::LinkSpan> {
+    let position = position_at(state, at);
+    let source = EditorText(&state.editor);
+    state.document.link_at(&source, position)
+}
+
+/// `WM_SETCURSOR` over the text, and Ctrl going down or up: a hand over a link while Ctrl is
+/// held, the I-beam otherwise.
+pub(super) fn update_cursor(hwnd: HWND) {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, IDC_HAND, IDC_IBEAM, LoadCursorW, SetCursor,
+    };
+    let mut point = POINT::default();
+    unsafe {
+        GetCursorPos(&mut point);
+        ScreenToClient(hwnd, &mut point);
+    }
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client) };
+    let inside = point.x >= client.left
+        && point.x < client.right
+        && point.y >= client.top
+        && point.y < client.bottom;
+    if !inside {
+        return;
+    }
+    let at = (point.x, point.y);
+    let hand = with_state(hwnd, |state| {
+        checkbox_under(state, at).is_some() || (down(VK_CONTROL) && link_under(state, at).is_some())
+    })
+    .unwrap_or(false);
+    with_state(hwnd, |state| state.hand = hand);
+    let cursor = if hand { IDC_HAND } else { IDC_IBEAM };
+    unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };
+}
+
+/// `WM_LBUTTONUP` and `WM_CAPTURECHANGED`: the drag ends.
+pub(super) fn release(hwnd: HWND, button_up: bool) {
+    if let Some((drag, target)) = with_state(hwnd, |state| {
+        Some((state.text_drag.take()?, state.drop_at.take()))
+    })
+    .flatten()
+    {
+        if button_up {
+            unsafe { ReleaseCapture() };
+        }
+        invalidate(hwnd);
+        finish_text_drag(hwnd, drag, target, button_up && down(VK_CONTROL), button_up);
+        return;
+    }
+    let dragging = with_state(hwnd, |state| state.drag.take().is_some()).unwrap_or(false);
+    unsafe { KillTimer(hwnd, AUTOSCROLL_TIMER) };
+    if dragging && button_up {
+        unsafe { ReleaseCapture() };
+    }
+}

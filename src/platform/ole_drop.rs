@@ -1,5 +1,6 @@
 //! The raw OLE drag-and-drop plumbing the drop targets share: the `IDropTarget` and `IDataObject`
-//! layouts, the interface IDs, and reading the files a drag offers as `CF_HDROP`.
+//! layouts, the interface IDs, and reading the files a drag offers as `CF_HDROP` and the text it
+//! offers as `CF_UNICODETEXT`.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -71,6 +72,48 @@ pub(crate) fn hdrop_format() -> FORMATETC {
         lindex: -1,
         tymed: TYMED_HGLOBAL as u32,
     }
+}
+
+/// `CF_UNICODETEXT`'s clipboard format number.
+const CF_UNICODETEXT: u16 = 13;
+
+pub(crate) fn text_format() -> FORMATETC {
+    FORMATETC {
+        cfFormat: CF_UNICODETEXT,
+        ..hdrop_format()
+    }
+}
+
+pub(crate) fn offers_text(data: Unknown) -> bool {
+    if data.is_null() {
+        return false;
+    }
+    let data_vtbl = unsafe { &**(data as *const *const DataObjectVtbl) };
+    unsafe { (data_vtbl.query_get_data)(data, &text_format()) == S_OK }
+}
+
+/// The text a drag offers, up to its first NUL; `None` when it offers none.
+pub(crate) fn dropped_text(data: Unknown) -> Option<String> {
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    let data_vtbl = unsafe { &**(data as *const *const DataObjectVtbl) };
+    let mut medium = STGMEDIUM::default();
+    if unsafe { (data_vtbl.get_data)(data, &text_format(), &mut medium) } < 0 {
+        return None;
+    }
+    let mut text = None;
+    if medium.tymed == TYMED_HGLOBAL as u32 {
+        let global = unsafe { medium.u.hGlobal };
+        let units = unsafe { GlobalSize(global) } / 2;
+        let wide = unsafe { GlobalLock(global) }.cast::<u16>();
+        if !wide.is_null() {
+            let all = unsafe { std::slice::from_raw_parts(wide, units) };
+            let length = all.iter().position(|unit| *unit == 0).unwrap_or(all.len());
+            text = Some(String::from_utf16_lossy(&all[..length]));
+            unsafe { GlobalUnlock(global) };
+        }
+    }
+    unsafe { ReleaseStgMedium(&mut medium) };
+    text
 }
 
 pub(crate) fn offers_files(data: Unknown) -> bool {

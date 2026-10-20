@@ -6,8 +6,8 @@ use crate::preview::dwrite::{Graphics, hresult_error};
 use windows::Win32::Foundation::HWND as WinHwnd;
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS, D2D1_PRESENT_OPTIONS_NONE,
+    D2D1_RENDER_TARGET_PROPERTIES, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows_sys::Win32::Foundation::HWND;
 
@@ -115,6 +115,27 @@ pub fn create_hwnd_target(
     height: u32,
     dpi: u32,
 ) -> Result<ID2D1HwndRenderTarget> {
+    create_hwnd_target_with(
+        graphics,
+        hwnd,
+        width,
+        height,
+        dpi,
+        D2D1_PRESENT_OPTIONS_NONE,
+    )
+}
+
+/// `create_hwnd_target` with its present options: `D2D1_PRESENT_OPTIONS_IMMEDIATELY` returns from
+/// `EndDraw` without waiting for the display's next refresh, which a view that paints once per
+/// keystroke needs (the Live view; GDI editors never wait either).
+pub fn create_hwnd_target_with(
+    graphics: &Graphics,
+    hwnd: HWND,
+    width: u32,
+    height: u32,
+    dpi: u32,
+    present: D2D1_PRESENT_OPTIONS,
+) -> Result<ID2D1HwndRenderTarget> {
     let properties = D2D1_RENDER_TARGET_PROPERTIES {
         dpiX: dpi as f32,
         dpiY: dpi as f32,
@@ -126,7 +147,7 @@ pub fn create_hwnd_target(
             width: width.max(1),
             height: height.max(1),
         },
-        presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        presentOptions: present,
     };
     unsafe {
         graphics

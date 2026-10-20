@@ -149,6 +149,8 @@ pub struct Settings {
     pub capture_hotkey: String,
     /// Whether a capture records the title of the window in front (spec §10.4).
     pub capture_source: bool,
+    /// Whether Markdown tabs open in the Live view (2026-10-18 Live editor design spec §4).
+    pub markdown_live_default: bool,
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
     /// `None` opens it at its natural size. Saved when a resize drag ends.
     pub settings_size: Option<(u16, u16)>,
@@ -243,6 +245,9 @@ impl Settings {
         if let Some(capture_source) = delta.capture_source {
             self.capture_source = capture_source;
         }
+        if let Some(live) = delta.markdown_live_default {
+            self.markdown_live_default = live;
+        }
         for (id, value) in &delta.key_overrides {
             self.key_overrides.insert(id.clone(), value.clone());
         }
@@ -290,6 +295,7 @@ pub struct SettingsDelta {
     pub always_on_top: Option<bool>,
     pub capture_hotkey: Option<String>,
     pub capture_source: Option<bool>,
+    pub markdown_live_default: Option<bool>,
     pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
 }
@@ -301,8 +307,8 @@ pub struct SettingsDelta {
 /// `line_numbers`, `theme`, `recovery_interval_seconds`, `restore_session`,
 /// `reload_changed_files` (`auto` or `ask`), `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
-/// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line`, `always_on_top`, `capture_hotkey` (any text; empty turns it off) and
-/// `capture_source` are recognized.
+/// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line`, `always_on_top`, `capture_hotkey` (any text; empty turns it off),
+/// `capture_source` and `markdown_live_default` are recognized.
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
@@ -502,6 +508,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         "capture_hotkey" => delta.capture_hotkey = Some(value.to_owned()),
         "capture_source" => match parse_bool(value) {
             Some(capture_source) => delta.capture_source = Some(capture_source),
+            None => warn(delta, line_number, key, value),
+        },
+        "markdown_live_default" => match parse_bool(value) {
+            Some(live) => delta.markdown_live_default = Some(live),
             None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
@@ -1352,6 +1362,17 @@ mod tests {
         settings.apply_delta(&delta);
         assert!(!settings.code_folding);
         assert_eq!(parse("code_folding=maybe").warnings.len(), 1);
+    }
+
+    #[test]
+    fn markdown_live_default_parses_as_a_bool_and_defaults_off() {
+        let mut settings = default_settings();
+        assert!(!settings.markdown_live_default);
+        let delta = parse("markdown_live_default=yes\n");
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        settings.apply_delta(&delta);
+        assert!(settings.markdown_live_default);
+        assert_eq!(parse("markdown_live_default=maybe").warnings.len(), 1);
     }
 
     #[test]

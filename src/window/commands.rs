@@ -180,6 +180,8 @@ pub enum CommandId {
     // Attachments in notes (second brain phase 1 spec §10.5).
     NotesPasteImage = 280,
     NotesInsertAttachment = 281,
+    // The Live Markdown view (2026-10-18 Live editor design spec §4).
+    MarkdownToggleLive = 282,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -204,7 +206,7 @@ pub const EDITING_COMMANDS: [CommandId; 16] = [
 ];
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 62] = [
+pub const TEXT_COMMANDS: [CommandId; 63] = [
     CommandId::MoveLinesUp,
     CommandId::MoveLinesDown,
     CommandId::CopyLinesUp,
@@ -267,6 +269,7 @@ pub const TEXT_COMMANDS: [CommandId; 62] = [
     CommandId::MarkdownItalic,
     CommandId::MarkdownCode,
     CommandId::MarkdownLink,
+    CommandId::MarkdownToggleLive,
 ];
 
 /// Where a command's key bindings apply (Markdown design spec §9): Markdown bindings are tried
@@ -288,9 +291,10 @@ impl CommandId {
         }
     }
 
-    /// Commands offered only for Markdown tabs (palette).
+    /// Commands offered only for Markdown tabs (palette). The Live toggle is one, though its key
+    /// is global so it can say why it does nothing elsewhere.
     pub const fn is_markdown_edit(self) -> bool {
-        matches!(self.scope(), Scope::Markdown)
+        matches!(self.scope(), Scope::Markdown) || matches!(self, Self::MarkdownToggleLive)
     }
 
     /// Commands that need the active tab's text, and so do nothing on an image tab.
@@ -524,7 +528,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 171] = [
+        const COMMANDS: [CommandId; 172] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -696,6 +700,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotesEditNotebookSettings,
             CommandId::NotesPasteImage,
             CommandId::NotesInsertAttachment,
+            CommandId::MarkdownToggleLive,
         ];
         COMMANDS
             .into_iter()
@@ -1048,7 +1053,10 @@ mod tests {
             Ok(CommandId::NotesInsertAttachment)
         );
         assert!(CommandId::NotesPasteImage.needs_document());
-        assert!(CommandId::try_from(282).is_err());
+        assert_eq!(CommandId::try_from(282), Ok(CommandId::MarkdownToggleLive));
+        assert_eq!(CommandId::MarkdownToggleLive.scope(), Scope::Global);
+        assert!(CommandId::MarkdownToggleLive.is_markdown_edit());
+        assert!(CommandId::try_from(283).is_err());
     }
 
     #[test]
