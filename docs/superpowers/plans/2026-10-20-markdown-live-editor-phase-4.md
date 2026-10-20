@@ -237,24 +237,32 @@ These findings come from the survey made for this plan:
 
 ### Task 4: Context menu
 
-**Files:** `src/live/view/menu.rs` (new), `src/live/view/mouse.rs`, `src/live/view/window_proc.rs`, `src/window/commands.rs`, `src/window/main_window/command_dispatch.rs`.
+**Files:**
+- `src/live/view/mouse.rs`, `src/live/view/keys.rs`, `src/live/view/window_proc.rs`
+- `src/window/messages.rs`
+- `src/window/main_window/wndproc.rs`
+- `src/window/live_host.rs`
+- `src/window/menus.rs`
 
-- [ ] **Right button down:** if the press is outside the selection, it places the caret as a click does, without Shift. Inside the selection, nothing changes.
-- [ ] **`WM_CONTEXTMENU`:** the menu shows at the cursor, or at the caret's rectangle for a keyboard invocation (`lparam == -1`).
-  - **Building the menu:** `menu::entries(state)` returns the menu: Undo, Redo, separator, Cut, Copy, Paste, Delete, separator, Select All.
-  - **Greying:** each entry is greyed from the editor (`can_undo`, `can_redo`, the selection being non-empty, `can_paste`).
-  - **Over a link:** a link hit adds a separator and two items, Open link and Copy link address.
-  - **Running the command:** the chosen `CommandId` goes through `execute_command`.
-- [ ] **Delete:** `Delete` uses the existing clear-selection command; if none exists, add `EditDelete` to the menu only.
-- [ ] Add `LiveOpenLink` and `LiveCopyLinkAddress`. They act on the link `LiveView` stored when the menu opened.
-- [ ] Tests (using `POPUP_ANSWERS`):
+- [x] **Right press** (`mouse::right_press`): outside the selection, the caret moves to the pointer; inside it, the selection stays.
+- [x] **`WM_CONTEXTMENU`** (`mouse::context_menu`): the menu opens at the pointer, or under the caret for a keyboard invocation (`lparam == -1`). Live sends `WM_FASTPAD_LIVE_MENU` (`WM_APP + 0x5F`) to the main window with a `MenuRequest`: the screen point, the position, and the link there.
+  - The Menu key opens the menu on its release, and is no longer forwarded to the hidden editor.
+  - Shift+F10 is a system key, so `DefWindowProcW` sends `WM_CONTEXTMENU`. This is checked by hand in Task 9.
+- [x] **The menu** (`live_host::context_menu`):
+  - Items: Undo and Redo (greyed from `can_undo` / `can_redo`); Cut, Copy and Delete (greyed without a selection); Paste; Select All.
+  - Over a link, two more: Open link and Copy link address.
+  - **No new command ids** (deviation from the plan): the menu-only items reuse ids as local entries, as the sidebar menus do (Delete is `DeleteLines`, Select All `SelectAllOccurrences`, Open link `NotesFollowLink`, Copy link address `MarkdownLink`). They are handled in `context_menu` and never dispatched.
+  - Open link takes the Ctrl+click paths. Copy link address puts the destination as written on the clipboard.
+- [x] **`menus.rs`:**
+  - `MenuEntry::Greyed`, with `MenuEntry::enabled(bool)`, appends an entry `MF_GRAYED`.
+  - A test-only record of the last popup, `last_popup_entries`, returns each label and whether it can run.
+- [x] Tests:
   - `right_click_outside_the_selection_moves_the_caret`
   - `right_click_inside_the_selection_keeps_it`
-  - `context_menu_copy_and_paste_work_in_live`
+  - `context_menu_copy_paste_delete_and_select_all_work_in_live`
   - `context_menu_over_a_link_copies_its_address`
-  - `shift_f10_opens_the_menu_at_the_caret`
-  - `undo_is_greyed_with_nothing_to_undo`
-- [ ] Commit `feat(live): context menu`.
+  - `the_keyboard_menu_opens_at_the_caret_with_undo_greyed` (`WM_CONTEXTMENU` with `-1`, and the Menu key)
+- [x] Commit `feat(live): context menu`.
 
 ### Task 5: Drag-and-drop
 

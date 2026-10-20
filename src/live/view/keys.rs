@@ -6,7 +6,8 @@
 use super::*;
 use crate::live::motion::{self, Move};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_SHIFT, VK_UP,
+    GetKeyState, VK_APPS, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR,
+    VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCaretBlinkTime, KillTimer, SetTimer, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
@@ -43,6 +44,15 @@ pub(super) fn handle(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> 
         state.goal_reset_unless_vertical(message, wparam);
         state.editor.clone()
     })?;
+    // The Menu key opens Live's own context menu, at the caret, on its release; the hidden
+    // editor never sees it. (Shift+F10 is a system key: `DefWindowProcW` sends the
+    // `WM_CONTEXTMENU`.)
+    if wparam == usize::from(VK_APPS) && message != WM_CHAR {
+        if message == WM_KEYUP {
+            super::mouse::context_menu(hwnd, -1);
+        }
+        return Some(0);
+    }
     match message {
         WM_KEYDOWN => {
             if let Some(movement) = row_move(wparam as u16) {

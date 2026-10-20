@@ -329,6 +329,8 @@ pub(crate) enum MenuEntry {
     /// global key does something else. Its label may spell the view's own key (the tree's F2
     /// and Del, which the tree handles itself).
     Local(&'static str, CommandId),
+    /// A `Command` or `Local` entry shown greyed: it cannot run now (Undo with nothing to undo).
+    Greyed(Box<MenuEntry>),
     Submenu(&'static str, Vec<MenuEntry>),
     Separator,
 }
@@ -341,6 +343,38 @@ impl MenuEntry {
     pub(crate) const fn local(label: &'static str, command: CommandId) -> Self {
         Self::Local(label, command)
     }
+
+    /// This entry, greyed unless `enabled`.
+    pub(crate) fn enabled(self, enabled: bool) -> Self {
+        if enabled {
+            self
+        } else {
+            Self::Greyed(Box::new(self))
+        }
+    }
+
+    /// The label (without its key) and whether it can run, for each command entry; tests read
+    /// the last popup's this way.
+    #[cfg(test)]
+    fn summary(&self, enabled: bool, out: &mut Vec<(String, bool)>) {
+        match self {
+            Self::Command(label, _) | Self::Local(label, _) => {
+                let label = label
+                    .split('\t')
+                    .next()
+                    .unwrap_or_default()
+                    .replace('&', "");
+                out.push((label, enabled));
+            }
+            Self::Greyed(entry) => entry.summary(false, out),
+            Self::Submenu(_, children) => {
+                for child in children {
+                    child.summary(enabled, out);
+                }
+            }
+            Self::Separator => {}
+        }
+    }
 }
 
 fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -> Result<HMENU> {
@@ -349,6 +383,10 @@ fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -
         return Err(last_error());
     }
     for entry in entries {
+        let (entry, flags) = match entry {
+            MenuEntry::Greyed(entry) => (&**entry, MF_STRING | MF_GRAYED),
+            entry => (entry, MF_STRING),
+        };
         let ok = match entry {
             MenuEntry::Command(label, command) => {
                 // Every command shows its first key from the keymap (keyboard shortcuts spec §5).
@@ -357,12 +395,14 @@ fn create_popup(entries: &[MenuEntry], keymap: &crate::window::keymap::Keymap) -
                     None => (*label).to_owned(),
                 };
                 let text = wide_null(&text);
-                unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
+                unsafe { AppendMenuW(menu, flags, *command as usize, text.as_ptr()) }
             }
             MenuEntry::Local(label, command) => {
                 let text = wide_null(label);
-                unsafe { AppendMenuW(menu, MF_STRING, *command as usize, text.as_ptr()) }
+                unsafe { AppendMenuW(menu, flags, *command as usize, text.as_ptr()) }
             }
+            // Greyed only wraps a command entry.
+            MenuEntry::Greyed(_) => 1,
             MenuEntry::Submenu(label, children) => {
                 let child = match create_popup(children, keymap) {
                     Ok(child) => child,
@@ -442,6 +482,14 @@ pub(crate) fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> O
     // file dialogs do. Hold deferred, IPC and snapshot work for its duration so the command the
     // user picks still acts on the document that was active when they opened the menu.
     let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    LAST_POPUP.with(|last| {
+        let mut summary = Vec::new();
+        for entry in entries {
+            entry.summary(true, &mut summary);
+        }
+        *last.borrow_mut() = summary;
+    });
     #[cfg(test)]
     if let Some(answer) = POPUP_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return answer(hwnd);
@@ -725,6 +773,19 @@ type PopupAnswer = Box<dyn FnOnce(HWND) -> Option<CommandId>>;
 thread_local! {
     static POPUP_ANSWERS: std::cell::RefCell<std::collections::VecDeque<PopupAnswer>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_POPUP: std::cell::RefCell<Vec<(String, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The last popup menu's command entries: each label without its key, and whether it could run.
+#[cfg(test)]
+#[allow(dead_code, reason = "read by the markdown_live integration target")]
+pub(crate) fn last_popup_entries() -> Vec<(String, bool)> {
+    LAST_POPUP.with(|last| last.borrow().clone())
 }
 
 #[cfg(test)]

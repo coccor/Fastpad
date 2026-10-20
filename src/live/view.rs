@@ -41,6 +41,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 mod ime;
 mod keys;
 mod mouse;
+pub use mouse::MenuRequest;
 mod paint;
 mod scrolling;
 mod window_proc;

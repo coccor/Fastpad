@@ -1235,6 +1235,179 @@ fn mouse(view: HWND, message: u32, (x, y): (i32, i32), ctrl: bool, shift: bool) 
     pump_pending();
 }
 
+/// A right-click at `point`: press and release, which sends `WM_CONTEXTMENU`. `answer` picks the
+/// menu's command; the menu's entries are returned.
+fn right_click(view: HWND, point: (i32, i32), answer: Option<CommandId>) -> Vec<(String, bool)> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+    window::menus::answer_next_popup_menu(move |_| answer);
+    mouse(view, WM_RBUTTONDOWN, point, false, false);
+    mouse(view, WM_RBUTTONUP, point, false, false);
+    window::menus::last_popup_entries()
+}
+
+fn clipboard_text() -> String {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        assert!(OpenClipboard(std::ptr::null_mut()) != 0);
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        let mut text = String::new();
+        if !handle.is_null() {
+            let wide = GlobalLock(handle).cast::<u16>();
+            let mut length = 0;
+            while *wide.add(length) != 0 {
+                length += 1;
+            }
+            text = String::from_utf16_lossy(std::slice::from_raw_parts(wide, length));
+            GlobalUnlock(handle);
+        }
+        CloseClipboard();
+        text
+    }
+}
+
+fn entry(entries: &[(String, bool)], label: &str) -> bool {
+    entries
+        .iter()
+        .find(|(name, _)| name == label)
+        .unwrap_or_else(|| panic!("no {label:?} in {entries:?}"))
+        .1
+}
+
+#[test]
+fn right_click_outside_the_selection_moves_the_caret() {
+    let (_scintilla, main, view) = live_tab("one two three\n");
+    main.editor().set_selection(0..3).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    let at = view.client_point_of(8).unwrap();
+    let entries = right_click(view.hwnd(), at, None);
+    assert_eq!(main.editor().selection().unwrap(), 8..8);
+    assert!(!entry(&entries, "Cut"));
+    assert!(!entry(&entries, "Copy"));
+    assert!(!entry(&entries, "Delete"));
+    assert!(entry(&entries, "Paste"));
+    assert!(entry(&entries, "Select All"));
+}
+
+#[test]
+fn right_click_inside_the_selection_keeps_it() {
+    let (_scintilla, main, view) = live_tab("one two three\n");
+    main.editor().set_selection(0..7).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    let at = view.client_point_of(2).unwrap();
+    let entries = right_click(view.hwnd(), at, None);
+    assert_eq!(main.editor().selection().unwrap(), 0..7);
+    assert!(entry(&entries, "Cut"));
+    assert!(entry(&entries, "Delete"));
+    assert!(!entries.iter().any(|(name, _)| name == "Open link"));
+}
+
+#[test]
+fn context_menu_copy_paste_delete_and_select_all_work_in_live() {
+    let (_scintilla, main, view) = live_tab("one two three\n");
+    let editor = main.editor();
+    editor.set_selection(4..7).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    right_click(
+        view.hwnd(),
+        view.client_point_of(5).unwrap(),
+        Some(CommandId::Copy),
+    );
+    assert_eq!(clipboard_text(), "two");
+    caret_to(&main, 13);
+    right_click(
+        view.hwnd(),
+        view.client_point_of(13).unwrap(),
+        Some(CommandId::Paste),
+    );
+    assert_eq!(editor.text().unwrap(), "one two threetwo\n");
+    assert!(
+        view.debug_lines()[0]
+            .as_deref()
+            .is_none_or(|line| line == "one two threetwo")
+    );
+    editor.set_selection(0..4).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    right_click(
+        view.hwnd(),
+        view.client_point_of(1).unwrap(),
+        Some(CommandId::DeleteLines),
+    );
+    assert_eq!(editor.text().unwrap(), "two threetwo\n");
+    assert_eq!(editor.selection().unwrap(), 0..0);
+    // One undo step brings the deleted word back.
+    main.command(CommandId::Undo);
+    assert_eq!(editor.text().unwrap(), "one two threetwo\n");
+    right_click(
+        view.hwnd(),
+        view.client_point_of(2).unwrap(),
+        Some(CommandId::SelectAllOccurrences),
+    );
+    assert_eq!(editor.selection().unwrap(), 0..editor.length().unwrap());
+    assert!(
+        visible(view.hwnd()),
+        "Select All is not the multi-caret command"
+    );
+}
+
+#[test]
+fn context_menu_over_a_link_copies_its_address() {
+    let text = "intro\n\nsee [site](https://example.com/page) now\n";
+    let (_scintilla, main, view) = live_tab(text);
+    // The link renders (the caret is in another block), so point at its shown text.
+    let site = text.find("site").unwrap();
+    let at = view.client_point_of(site + 1).unwrap();
+    let entries = right_click(view.hwnd(), at, Some(CommandId::MarkdownLink));
+    assert!(entry(&entries, "Open link"));
+    assert!(entry(&entries, "Copy link address"));
+    assert_eq!(clipboard_text(), "https://example.com/page");
+    assert!(
+        main.editor().text().unwrap() == text,
+        "copying edits nothing"
+    );
+}
+
+#[test]
+fn the_keyboard_menu_opens_at_the_caret_with_undo_greyed() {
+    const SCI_EMPTYUNDOBUFFER: u32 = 2175;
+    let (_scintilla, main, view) = live_tab("one two\n");
+    unsafe { SendMessageW(main.editor().hwnd(), SCI_EMPTYUNDOBUFFER, 0, 0) };
+    caret_to(&main, 2);
+    window::menus::answer_next_popup_menu(|_| None);
+    unsafe {
+        SendMessageW(
+            view.hwnd(),
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU,
+            view.hwnd() as usize,
+            -1,
+        )
+    };
+    pump_pending();
+    let entries = window::menus::last_popup_entries();
+    assert!(!entry(&entries, "Undo"));
+    // The Menu key opens the same menu.
+    window::menus::answer_next_popup_menu(|_| Some(CommandId::SelectAllOccurrences));
+    send_inputs(
+        view.hwnd(),
+        &[Input::Key(
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_APPS,
+            false,
+            false,
+        )],
+    );
+    assert_eq!(
+        main.editor().selection().unwrap(),
+        0..8,
+        "the Menu key's menu ran"
+    );
+    caret_to(&main, 2);
+    assert!(!entry(&entries, "Redo"));
+    assert_eq!(main.editor().selection().unwrap(), 2..2, "the caret stays");
+}
+
 fn click(view: HWND, point: (i32, i32), ctrl: bool, shift: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
     mouse(view, WM_LBUTTONDOWN, point, ctrl, shift);

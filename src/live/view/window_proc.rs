@@ -10,10 +10,10 @@ use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateCaret, DLGC_WANTALLKEYS, DefWindowProcW, DestroyCaret, KillTimer, SB_VERT,
-    WM_CAPTURECHANGED, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE,
-    WM_GETTEXT, WM_GETTEXTLENGTH, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS,
-    WM_SIZE, WM_TIMER, WM_VSCROLL,
+    WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND,
+    WM_GETDLGCODE, WM_GETTEXT, WM_GETTEXTLENGTH, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
 
@@ -139,6 +139,15 @@ pub(super) unsafe extern "system" fn live_proc(
         }
         WM_MOUSEMOVE => {
             super::mouse::moved(hwnd, lparam);
+            0
+        }
+        // The button's release goes to `DefWindowProcW`, which sends `WM_CONTEXTMENU`.
+        WM_RBUTTONDOWN => {
+            super::mouse::right_press(hwnd, lparam);
+            0
+        }
+        WM_CONTEXTMENU => {
+            super::mouse::context_menu(hwnd, lparam);
             0
         }
         WM_LBUTTONUP | WM_CAPTURECHANGED => {

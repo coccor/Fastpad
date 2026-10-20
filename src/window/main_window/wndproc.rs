@@ -559,6 +559,16 @@ pub(super) unsafe extern "system" fn main_window_proc(
                     );
                     return LRESULT::from(followed);
                 }
+                crate::window::WM_FASTPAD_LIVE_MENU => {
+                    if lparam != 0
+                        && let Some(id) = group_of_child(hwnd, wparam as HWND)
+                    {
+                        let request =
+                            unsafe { &*(lparam as *const crate::live::view::MenuRequest) };
+                        crate::window::live_host::context_menu(hwnd, id, wparam as HWND, request);
+                    }
+                    return 0;
+                }
                 crate::window::WM_FASTPAD_LIVE_CHANGED => {
                     if let Some(id) = group_of_child(hwnd, wparam as HWND) {
                         crate::window::live_host::poll(hwnd, id, lparam != 0);

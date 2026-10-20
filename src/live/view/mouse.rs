@@ -2,11 +2,15 @@
 //! a double press selects a word and a triple press a line, and a drag extends by the same unit,
 //! scrolling while the pointer is above or below the view. Ctrl+click follows a link. A plain
 //! click on a task's checkbox toggles it (phase 3 plan, Decision 6): the one edit Live makes on
-//! its own, one undo step that leaves the selection where it was.
+//! its own, one undo step that leaves the selection where it was. A right press outside the
+//! selection places the caret, and the context menu is the main window's (phase 4 plan,
+//! Decision 5).
 
 use super::*;
 use crate::live::layout::Decoration;
 use std::ops::Range;
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
 };
@@ -308,6 +312,82 @@ pub(super) fn autoscroll(hwnd: HWND) {
     }
     invalidate(hwnd);
     post_changed(hwnd, true);
+}
+
+/// What a context menu acts on: where to show it and the link it was opened on.
+#[derive(Debug)]
+pub struct MenuRequest {
+    /// Screen coordinates.
+    pub screen: (i32, i32),
+    /// The document position the menu was opened at: the pointer's, or the caret's.
+    pub position: usize,
+    pub link: Option<crate::live::spans::LinkSpan>,
+}
+
+/// `WM_RBUTTONDOWN`: outside the selection the caret moves to the pointer, as Scintilla does;
+/// inside it the selection stays, for Cut or Copy from the menu.
+pub(super) fn right_press(hwnd: HWND, lparam: isize) {
+    unsafe { SetFocus(hwnd) };
+    let at = point(lparam);
+    let moved = with_state(hwnd, |state| {
+        let position = position_at(state, at);
+        let text = EditorText(&state.editor);
+        let (anchor, caret) = text.selection();
+        let inside = anchor != caret && (anchor.min(caret)..=anchor.max(caret)).contains(&position);
+        if !inside {
+            state.goal = None;
+            text.set_selection(position, position);
+        }
+        !inside
+    })
+    .unwrap_or(false);
+    if moved {
+        super::keys::restart_blink(hwnd);
+        post_changed(hwnd, false);
+    }
+}
+
+/// `WM_CONTEXTMENU`: asks the main window for the menu, at the pointer (`lparam` in screen
+/// coordinates) or, from the keyboard (`lparam == -1`), under the caret.
+pub(super) fn context_menu(hwnd: HWND, lparam: isize) {
+    let keyboard = lparam == -1;
+    let Some(request) = with_state(hwnd, |state| {
+        let (client, position) = if keyboard {
+            let (_, caret) = EditorText(&state.editor).selection();
+            let (x, y, height) = state.caret_px.unwrap_or((0, 0, 0));
+            ((x, y + height), caret)
+        } else {
+            let mut screen = POINT {
+                x: i32::from(lparam as u16 as i16),
+                y: i32::from((lparam >> 16) as u16 as i16),
+            };
+            unsafe { ScreenToClient(hwnd, &mut screen) };
+            let client = (screen.x, screen.y);
+            (client, position_at(state, client))
+        };
+        let source = EditorText(&state.editor);
+        let link = state.document.link_at(&source, position);
+        let mut screen = POINT {
+            x: client.0,
+            y: client.1,
+        };
+        unsafe { ClientToScreen(hwnd, &mut screen) };
+        MenuRequest {
+            screen: (screen.x, screen.y),
+            position,
+            link,
+        }
+    }) else {
+        return;
+    };
+    unsafe {
+        SendMessageW(
+            crate::platform::win32::root_window(hwnd),
+            crate::window::WM_FASTPAD_LIVE_MENU,
+            hwnd as usize,
+            &request as *const MenuRequest as isize,
+        )
+    };
 }
 
 /// The link (rendered or revealed) under client point `at`.

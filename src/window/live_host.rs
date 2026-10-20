@@ -6,7 +6,7 @@
 use crate::document::{DocumentId, Language};
 use crate::live::LIVE_MAX_BYTES;
 use crate::live::layout::LiveFonts;
-use crate::live::view::{LiveColors, LiveView};
+use crate::live::view::{LiveColors, LiveView, MenuRequest};
 use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
@@ -421,6 +421,83 @@ pub(crate) fn follow_preview(hwnd: HWND, id: GroupId, line: usize) -> bool {
     };
     view.set_top_line(line);
     true
+}
+
+/// Group `id`'s Live view `view` asks for its context menu (phase 4 plan, Decision 5): the
+/// source view's items, greyed as they cannot run, and two more over a link. The menu-only
+/// items reuse command ids as local entries, as the sidebar menus do: Delete is
+/// `DeleteLines`, Select All `SelectAllOccurrences`, Open link `NotesFollowLink` and Copy link
+/// address `MarkdownLink`.
+pub(crate) fn context_menu(hwnd: HWND, id: GroupId, view: HWND, request: &MenuRequest) {
+    use crate::window::menus::{self, MenuEntry};
+    let Some(editor) = host_window::group_editor(hwnd, id) else {
+        return;
+    };
+    let selected = editor
+        .anchor_and_caret()
+        .is_ok_and(|(anchor, caret)| anchor != caret);
+    let mut entries = vec![
+        MenuEntry::command("&Undo", CommandId::Undo).enabled(editor.can_undo().unwrap_or(false)),
+        MenuEntry::command("&Redo", CommandId::Redo).enabled(editor.can_redo().unwrap_or(false)),
+        MenuEntry::Separator,
+        MenuEntry::command("Cu&t", CommandId::Cut).enabled(selected),
+        MenuEntry::command("&Copy", CommandId::Copy).enabled(selected),
+        MenuEntry::command("&Paste", CommandId::Paste),
+        MenuEntry::local("&Delete\tDel", CommandId::DeleteLines).enabled(selected),
+        MenuEntry::Separator,
+        MenuEntry::local("Select &All\tCtrl+A", CommandId::SelectAllOccurrences),
+    ];
+    if request.link.is_some() {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::local("&Open link", CommandId::NotesFollowLink),
+            MenuEntry::local("Copy link &address", CommandId::MarkdownLink),
+        ]);
+    }
+    // `track_popup` takes main-window client coordinates.
+    let mut at = windows_sys::Win32::Foundation::POINT {
+        x: request.screen.0,
+        y: request.screen.1,
+    };
+    unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut at) };
+    match menus::track_popup(hwnd, &entries, at) {
+        None => {}
+        Some(CommandId::DeleteLines) => {
+            if let Ok(selection) = editor.selection() {
+                let start = selection.start;
+                let _ = editor.replace_target(selection, "");
+                let _ = editor.set_selection(start..start);
+            }
+        }
+        Some(CommandId::SelectAllOccurrences) => {
+            if let Ok(length) = editor.length() {
+                let _ = editor.set_selection(0..length);
+            }
+        }
+        Some(CommandId::NotesFollowLink) => {
+            if let Some(link) = &request.link
+                && !crate::window::markdown_host::follow_link_at(hwnd, view, request.position)
+                && !link.wiki
+            {
+                let payload = Box::into_raw(Box::new(link.dest.clone()));
+                crate::window::preview_host::follow_link(hwnd, id, payload as isize);
+            }
+        }
+        Some(CommandId::MarkdownLink) => {
+            if let Some(link) = &request.link {
+                let _ = crate::platform::clipboard::set_text(hwnd, &link.dest);
+            }
+        }
+        Some(command) => unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                command as usize,
+                0,
+            );
+        },
+    }
+    poll(hwnd, id, false);
 }
 
 /// `SCN_MODIFIED` from group `id`'s editor: its shown Live view lays out the touched lines.
