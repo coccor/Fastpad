@@ -201,19 +201,17 @@ These findings come from the survey made for this plan:
 
 ### Task 2: Split sync from the preview to Live
 
-**Files:** `src/window/preview_host.rs`, `src/live/view.rs`, `src/window/live_host.rs`.
+**Files:** `src/window/preview_host.rs`, `src/window/live_host.rs`.
 
-- [ ] Add `LiveView::follow_line(&self, line: usize)`. It runs `prepare`, sets `scroll_y` to `layout.line_top(line)` clamped, and invalidates the view. It posts nothing. `set_top_line` becomes this function if it has no other caller.
-- [ ] `live_host::follow_preview(hwnd, id, line) -> bool` returns `false` when the group has no shown Live view.
-- [ ] `preview_host::follow_preview` changes:
-  - It calls `live_host::follow_preview` first. When that returns `true`, it sets the hidden editor's first visible line without setting `scroll_origin`, and returns.
-  - The source path is unchanged.
-- [ ] Tests:
-  - `scrolling_the_split_preview_scrolls_live`: a note with headings, a table and a tall image. Scrolling the preview to each heading puts that heading's line at Live's top, within one line.
-  - `split_sync_settles_after_scrolling_either_side`: scroll Live, pump, scroll the preview, pump, scroll Live again. Each sync happens (`sync_count` increments). Afterwards, neither top line moves on further pumping.
+- [x] `live_host::follow_preview(hwnd, id, line) -> bool` puts the preview's document line at the top of the group's shown Live view through the existing `LiveView::set_top_line`. That function posts nothing, so the scroll never syncs back. It needed no new `follow_line`.
+- [x] `preview_host::follow_preview` calls it first, then keeps its source path. The hidden editor still scrolls, which keeps the place for a switch back to source. Its deferred `SCN_UPDATEUI` clears the `ScrollOrigin::Preview` guard, as a shown editor's does, so no guard is left behind (finding 3).
+- [x] Tests:
+  - `scrolling_the_split_preview_scrolls_live`: headings and tables; three scrolls; Live's top line equals the preview's, and so does the hidden editor's.
+  - `split_sync_settles_after_scrolling_either_side`
   - `toggling_to_source_after_a_preview_scroll_keeps_the_place`
-  - The existing `scrolling_live_scrolls_the_hidden_editor_and_the_split_preview` keeps passing.
-- [ ] Commit `feat(live): scroll Live from the Split preview`.
+
+  All three failed before the change. The existing Live → preview test still passes.
+- [x] Commit `feat(live): scroll Live from the Split preview`.
 
 ### Task 3: Command audit
 

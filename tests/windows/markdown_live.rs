@@ -886,6 +886,136 @@ fn scrolling_live_scrolls_the_hidden_editor_and_the_split_preview() {
     assert_eq!(editor_top, top);
 }
 
+/// Headings, paragraphs and a table every tenth section: blocks the preview and Live size
+/// differently, so a sync by document line is what keeps them together.
+fn sectioned_document() -> String {
+    (0..120)
+        .map(|n| {
+            let mut section = format!(
+                "## Heading {n}
+
+Some **text** for section {n}.
+
+"
+            );
+            if n % 10 == 0 {
+                section.push_str(
+                    "| a | b |
+|---|---|
+| 1 | 2 |
+| 3 | 4 |
+
+",
+                );
+            }
+            section
+        })
+        .collect()
+}
+
+/// A shown Live tab holding `text`, with the preview beside it.
+fn live_split(text: &str) -> (support::win32::WindowHarness, TestMain, LiveView, HWND) {
+    let (scintilla, main, view) = live_tab(text);
+    main.command(CommandId::MarkdownPreviewSide);
+    let preview = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
+    pump_until("the preview to lay out", Duration::from_secs(5), || {
+        preview.stats().block_count > 1
+    });
+    (scintilla, main, view, preview.hwnd())
+}
+
+fn scroll_page_down(hwnd: HWND, pages: usize) {
+    for _ in 0..pages {
+        unsafe {
+            SendMessageW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_VSCROLL,
+                windows_sys::Win32::UI::WindowsAndMessaging::SB_PAGEDOWN as usize,
+                0,
+            )
+        };
+    }
+    pump_pending();
+}
+
+fn sync_count(main: &TestMain) -> u64 {
+    main.with_app(|app| app.active_group().unwrap().preview.sync_count)
+}
+
+#[test]
+fn scrolling_the_split_preview_scrolls_live() {
+    let (_scintilla, main, view, preview) = live_split(&sectioned_document());
+    let preview_view = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
+    for pages in [3, 4, 5] {
+        scroll_page_down(preview, pages);
+        let target = preview_view.top_line();
+        pump_until("Live to follow the preview", Duration::from_secs(2), || {
+            view.top_line() == target
+        });
+        // The hidden editor keeps the place for a switch back to source.
+        let editor = main.editor();
+        assert_eq!(
+            editor
+                .doc_line_from_visible(editor.first_visible_line().unwrap())
+                .unwrap(),
+            target
+        );
+    }
+}
+
+#[test]
+fn split_sync_settles_after_scrolling_either_side() {
+    let (_scintilla, main, view, preview) = live_split(&sectioned_document());
+    let preview_view = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
+    let before = sync_count(&main);
+    scroll_page_down(view.hwnd(), 3);
+    pump_until("the preview to follow Live", Duration::from_secs(2), || {
+        sync_count(&main) > before
+    });
+    let after_live = sync_count(&main);
+    scroll_page_down(preview, 3);
+    pump_until("Live to follow the preview", Duration::from_secs(2), || {
+        view.top_line() == preview_view.top_line()
+    });
+    let after_preview = sync_count(&main);
+    assert!(after_preview > after_live);
+    // No echo left behind: Live's next scroll still moves the preview.
+    let preview_top = preview_view.top_line();
+    scroll_page_down(view.hwnd(), 2);
+    pump_until(
+        "the preview to follow Live again",
+        Duration::from_secs(2),
+        || preview_view.top_line() > preview_top,
+    );
+    // And everything settles.
+    let (live_top, preview_top, count) =
+        (view.top_line(), preview_view.top_line(), sync_count(&main));
+    pump_for(Duration::from_millis(300));
+    assert_eq!(
+        (view.top_line(), preview_view.top_line(), sync_count(&main)),
+        (live_top, preview_top, count)
+    );
+}
+
+#[test]
+fn toggling_to_source_after_a_preview_scroll_keeps_the_place() {
+    let (_scintilla, main, view, preview) = live_split(&sectioned_document());
+    let preview_view = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
+    scroll_page_down(preview, 4);
+    let target = preview_view.top_line();
+    pump_until("Live to follow the preview", Duration::from_secs(2), || {
+        view.top_line() == target
+    });
+    main.set_live(false);
+    let editor = main.editor();
+    assert_eq!(
+        editor
+            .doc_line_from_visible(editor.first_visible_line().unwrap())
+            .unwrap(),
+        target
+    );
+}
+
 /// Sends a mouse message at client point (`x`, `y`) to `view`, with Ctrl and Shift as given.
 fn mouse(view: HWND, message: u32, (x, y): (i32, i32), ctrl: bool, shift: bool) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{

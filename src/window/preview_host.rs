@@ -1257,6 +1257,12 @@ fn follow_preview(hwnd: HWND, line: usize) {
     if mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
         return;
     }
+    // Live shows every line, so it takes the document line as it is. The hidden editor still
+    // follows below, keeping the place for a switch back to source; its deferred scroll
+    // notification clears the guard as a shown editor's does.
+    if let Some(id) = target_group(hwnd) {
+        crate::window::live_host::follow_preview(hwnd, id, line);
+    }
     let Some(editor) = editor(hwnd) else {
         return;
     };

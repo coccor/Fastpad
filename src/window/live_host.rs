@@ -403,6 +403,17 @@ fn shown_view(hwnd: HWND, id: GroupId) -> Option<LiveView> {
     with_live(hwnd, id, |host| host.view.filter(|_| host.shown)).flatten()
 }
 
+/// The Split preview beside group `id` was scrolled to document `line`: its shown Live view puts
+/// that line at its top, without reporting a scroll of its own (which would sync the preview
+/// back). False when the group shows no Live view.
+pub(crate) fn follow_preview(hwnd: HWND, id: GroupId, line: usize) -> bool {
+    let Some(view) = shown_view(hwnd, id) else {
+        return false;
+    };
+    view.set_top_line(line);
+    true
+}
+
 /// `SCN_MODIFIED` from group `id`'s editor: its shown Live view lays out the touched lines.
 pub(crate) fn edited(hwnd: HWND, id: GroupId, notification: &crate::editor::ScintillaNotification) {
     let Some(view) = shown_view(hwnd, id) else {
