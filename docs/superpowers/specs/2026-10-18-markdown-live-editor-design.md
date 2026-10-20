@@ -184,6 +184,31 @@ Large, so it ships in phases, each behind the toggle and each mergeable on its o
 >
 > Release keystroke p95, Live (source view): 10k-line note 2.3–2.6 ms (0.7); 60-row table 2.8 ms (0.7); 300-item list 2.0 ms (0.8); 1 MB note 1.9–2.0 ms (0.8–0.9); 500-line code block 1.6 ms (0.7). Entering Live on the 1 MB note takes 53–57 ms to the first frame.
 
+> **Phase 4 shipped** (plan `docs/superpowers/plans/2026-10-20-markdown-live-editor-phase-4.md`), with that plan's deviations and these found while building it:
+> - **Find:**
+>   - Live already followed find, replace, go to line and link jumps. A hidden Scintilla queues `SCN_UPDATEUI` as posted idle work, which reaches Live before the next paint, so phase 4 only adds tests.
+>   - Only the current match is highlighted, by the selection on its revealed block, as in the source view.
+> - **Split:** scrolling the preview scrolls Live; Live already scrolled the preview.
+> - **Commands that switch to source:** multi-caret commands, fold commands and column selections switch to the source view with a notice naming the command. Every other text and editing command is checked in both views by one table-driven test.
+> - **View toggles:** word wrap and show-whitespace do not apply to Live. Highlight current line drives the edited block's fill. Wikilink completion stays off in Live.
+> - **Context menu:**
+>   - It has the source view's items plus Open link and Copy link address, opened by right-click or the Menu key.
+>   - Menu-only items reuse command ids as local entries, so no new command ids are spent.
+> - **Drag-and-drop:**
+>   - Dropped text is copied in (Shift moves), and dropped files open as over the rest of the group.
+>   - A selection can be dragged within Live (Ctrl copies). Dragging out of Live to another app is not supported.
+> - **Image folder:** a save, a Save As, or a rename or move of an open note refreshes the folder Live resolves relative images against.
+> - **Accessibility:**
+>   - The MSAA object holds only the window and answers `CO_E_OBJNOTCONNECTED` once the window is gone.
+>   - It has no default action.
+>   - The value-change event is sent per edit.
+>   - The UIA `TextPattern` is still the follow-up.
+> - **Perf:**
+>   - The Live typing scenarios run in a `live-perf` CI job, with the budget scaled by `FASTPAD_PERF_SCALE`, rather than as an `src/perf` scenario.
+>   - There is no partial present. `EndDraw` is a quarter to a third of a keystroke, under the half that would have called for a swap chain.
+>
+> Release keystroke p95, Live (source view), measured on a machine running slower than during phase 3: 1 MB note 3.1–3.2 ms (2.4–2.6); 10k-line note 3.0–3.6 ms (1.3–1.4); 300-item list 3.0–4.5 ms (1.4–2.1); 60-row table 2.1–2.5 ms (1.3–1.6); 500-line code block 2.6–3.7 ms (1.9); Live with the Split preview 1.9–2.1 ms (1.3–1.4). Entering Live on the 1 MB note takes 84–95 ms to the first frame.
+
 ## 13. Open questions
 
 - Should a rendered heading show its `#` markers dimmed in the gutter (as some editors do) so the level is visible without revealing? Default: no.

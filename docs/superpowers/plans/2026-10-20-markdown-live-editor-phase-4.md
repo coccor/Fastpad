@@ -365,26 +365,27 @@ These findings come from the survey made for this plan:
 
 **Files:** `README.md`, the spec.
 
-- [ ] **README:** the Live section drops "come in the next release". It says what works in Live:
-  - find;
-  - Split sync both ways;
+- [x] **README:** the Live bullet no longer says find, Split sync and the command audit are coming. It says what works in Live:
+  - find and go to line;
+  - scrolling both ways with the preview;
   - the context menu;
-  - drag-and-drop within Live;
-  - screen readers through MSAA.
+  - drops and dragging a selection;
+  - screen readers.
 
   It also says which commands switch to the source view.
-- [ ] **Spec:** a "Phase 4 shipped" note under §12, with this plan's deviations, the perf numbers, and the present's share.
-- [ ] **Full suite:**
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo test --lib`
-  - `cargo test --test markdown_live -- --test-threads=1`
-  - the full window suite, `-- --test-threads=1`
-  - Report any failure other than the known `tabs::` one.
-- [ ] **Manual check** in the real app, with `fastpad.ini` backed up and restored:
+- [x] **Spec:** a "Phase 4 shipped" note under §12, with this phase's deviations and its perf numbers.
+- [x] **Full suite:**
+  - `cargo clippy --all-targets -- -D warnings` is clean.
+  - `cargo test --lib`: 2124 pass.
+  - Every integration binary, `--no-fail-fast -- --test-threads=1`: 19 of 20 binaries pass.
+  - The one failure is the known `tabs::window_close_reviews_dirty_tabs_in_order_and_cancel_aborts_shutdown`, which fails on `main` too.
+  - One full run also tripped `editing::ctrl_f_opens_find_bar_prefills_from_selection_and_escape_returns_focus_to_editor` on a focus timeout. It passed in three reruns and in the next full run, and it does not touch Live.
+- [ ] **Manual check:** this needs the user in the real app, with `fastpad.ini` backed up and restored:
   - find through the bar and F3;
   - Split scrolling both ways over the README;
-  - fold and Ctrl+D notices;
-  - the context menu on text and on a link;
-  - dragging text within Live and from another app;
+  - the fold and Ctrl+D notices;
+  - the context menu on text and on a link, including Shift+F10 and the Menu key;
+  - dragging text within Live and dropping text from a browser;
+  - renaming or moving an open note with relative images;
   - Narrator reading the Live view.
-- [ ] Commit `docs(live): phase 4 README and spec note`. Push, and tell the user PR #72 is ready for their merge.
+- [x] Commit `docs(live): phase 4 README and spec note`.

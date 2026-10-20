@@ -108,8 +108,12 @@ typing. Both panes scroll together.
   images as thumbnails (anything else shows its alt text; nothing is fetched). The block you are in
   (from blank line to blank line, a whole table or code block) shows its Markdown source, keeping
   its formatting and highlighted; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click
-  follows a link. Find, scroll sync with Split and the rest of the command audit come in the next
-  release. Set `markdown_live_default=true` to open Markdown tabs in it.
+  follows a link. Find and go to line reveal the block they land on, and with the preview beside
+  it the two scroll together both ways. Right-click gives the usual edit menu plus Open link and
+  Copy link address; dropped text lands where you drop it, and a selection can be dragged to move
+  it (Ctrl+drag copies). Screen readers see it as editable text. Commands that need the source
+  view's own features (multiple cursors, column selection, folding) switch back to it with a
+  notice. Set `markdown_live_default=true` to open Markdown tabs in it.
 
 ### Notes and notebooks
 
