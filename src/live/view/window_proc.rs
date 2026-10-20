@@ -82,6 +82,11 @@ pub(super) unsafe extern "system" fn live_proc(
             0
         }
         WM_GETDLGCODE => DLGC_WANTALLKEYS as LRESULT,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_GETOBJECT
+            if lparam as i32 == windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CLIENT =>
+        {
+            super::accessible::object_result(hwnd, wparam)
+        }
         WM_SETFOCUS | WM_KILLFOCUS => {
             with_state(hwnd, |state| {
                 state.focused = message == WM_SETFOCUS;
@@ -95,6 +100,7 @@ pub(super) unsafe extern "system" fn live_proc(
                 })
                 .unwrap_or(16);
                 unsafe { CreateCaret(hwnd, std::ptr::null_mut(), 1, height) };
+                notify(hwnd, EVENT_OBJECT_FOCUS);
                 crate::window::post_content_focus(hwnd);
                 super::keys::restart_blink(hwnd);
             } else {

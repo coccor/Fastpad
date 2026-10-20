@@ -309,6 +309,150 @@ fn live_lays_out_and_paints_the_visible_lines() {
     );
 }
 
+/// The Live view's MSAA client object, as a screen reader gets it.
+struct LiveAccessible(*mut std::ffi::c_void);
+
+impl LiveAccessible {
+    fn of(view: LiveView) -> Self {
+        let mut object = std::ptr::null_mut();
+        let status = unsafe {
+            windows_sys::Win32::UI::Accessibility::AccessibleObjectFromWindow(
+                view.hwnd(),
+                windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CLIENT as u32,
+                &window::accessibility::IID_IACCESSIBLE,
+                &mut object,
+            )
+        };
+        assert!(status >= 0 && !object.is_null(), "{status:#x}");
+        Self(object)
+    }
+
+    fn vtable(&self) -> &window::accessibility::AccessibleVtable {
+        unsafe { &**(self.0 as *const *const window::accessibility::AccessibleVtable) }
+    }
+
+    fn text(
+        &self,
+        getter: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            window::accessibility::RawVariant,
+            *mut windows_sys::core::BSTR,
+        ) -> windows_sys::core::HRESULT,
+    ) -> std::result::Result<String, i32> {
+        use window::accessibility::VariantValue;
+        let mut output: windows_sys::core::BSTR = std::ptr::null_mut();
+        let status = unsafe {
+            getter(
+                self.0,
+                window::accessibility::RawVariant::integer(0),
+                &mut output,
+            )
+        };
+        if status < 0 {
+            return Err(status);
+        }
+        let length = unsafe { windows_sys::Win32::Foundation::SysStringLen(output) } as usize;
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(output, length) });
+        unsafe { windows_sys::Win32::Foundation::SysFreeString(output) };
+        Ok(text)
+    }
+
+    fn integer(
+        &self,
+        getter: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            window::accessibility::RawVariant,
+            *mut window::accessibility::RawVariant,
+        ) -> windows_sys::core::HRESULT,
+    ) -> std::result::Result<i32, i32> {
+        use window::accessibility::VariantValue;
+        let mut output = window::accessibility::RawVariant::empty();
+        let status = unsafe {
+            getter(
+                self.0,
+                window::accessibility::RawVariant::integer(0),
+                &mut output,
+            )
+        };
+        if status < 0 {
+            return Err(status);
+        }
+        Ok(output.child_id().unwrap_or(-1))
+    }
+}
+
+impl Drop for LiveAccessible {
+    fn drop(&mut self) {
+        unsafe { (self.vtable().release)(self.0) };
+    }
+}
+
+#[test]
+fn live_exposes_an_editable_text_object() {
+    const STATE_SYSTEM_FOCUSED: i32 = 0x4;
+    const STATE_SYSTEM_READONLY: i32 = 0x40;
+    let text = "# Hello\n\nworld **bold**\n";
+    let (_scintilla, main, view) = live_tab(text);
+    let object = LiveAccessible::of(view);
+    assert_eq!(
+        object.text(object.vtable().get_acc_name).unwrap(),
+        "Live Markdown"
+    );
+    assert_eq!(
+        object.text(object.vtable().get_acc_value).unwrap(),
+        main.editor().text().unwrap()
+    );
+    assert_eq!(
+        object.integer(object.vtable().get_acc_role).unwrap(),
+        windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_TEXT as i32
+    );
+    let state = object.integer(object.vtable().get_acc_state).unwrap();
+    assert_ne!(state & STATE_SYSTEM_FOCUSED, 0, "focused: {state:#x}");
+    assert_eq!(state & STATE_SYSTEM_READONLY, 0, "editable: {state:#x}");
+    unsafe { SetFocus(main.editor().hwnd()) };
+    let state = object.integer(object.vtable().get_acc_state).unwrap();
+    assert_eq!(state & STATE_SYSTEM_FOCUSED, 0, "focus left: {state:#x}");
+}
+
+#[test]
+fn the_accessible_value_follows_typing() {
+    let (_scintilla, main, view) = live_tab("one\n");
+    let object = LiveAccessible::of(view);
+    send_inputs(
+        view.hwnd(),
+        &[Input::Key(VK_END, false, false), Input::Text(" two")],
+    );
+    assert_eq!(
+        object.text(object.vtable().get_acc_value).unwrap(),
+        "one two\n"
+    );
+    drop(main);
+}
+
+#[test]
+fn the_accessible_object_survives_closing_live() {
+    let (_scintilla, main, view) = live_tab("one\n");
+    let object = LiveAccessible::of(view);
+    main.set_live(false);
+    assert_eq!(
+        object.text(object.vtable().get_acc_name).unwrap(),
+        "Live Markdown"
+    );
+    // The view's window goes; the object a client still holds answers, without crashing.
+    view.destroy();
+    pump_pending();
+    assert_eq!(
+        object.text(object.vtable().get_acc_value),
+        Err(windows_sys::Win32::Foundation::CO_E_OBJNOTCONNECTED)
+    );
+    assert_eq!(
+        object.integer(object.vtable().get_acc_state),
+        Err(windows_sys::Win32::Foundation::CO_E_OBJNOTCONNECTED)
+    );
+    drop(object);
+    main.mark_clean();
+}
+
 #[test]
 fn live_answers_wm_gettext_with_the_document() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();

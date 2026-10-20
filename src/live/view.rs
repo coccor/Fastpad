@@ -33,11 +33,12 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_IBEAM,
-    LoadCursorW, RegisterClassW, SetWindowLongPtrW, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_TABSTOP, WS_VSCROLL,
+    CreateWindowExW, DestroyWindow, EVENT_OBJECT_FOCUS, EVENT_OBJECT_VALUECHANGE, GWLP_USERDATA,
+    GetClientRect, GetWindowLongPtrW, IDC_IBEAM, LoadCursorW, RegisterClassW, SetWindowLongPtrW,
+    WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VSCROLL,
 };
 
+mod accessible;
 mod drop;
 mod ime;
 mod keys;
@@ -410,6 +411,9 @@ impl LiveView {
         if painted != Some(true) {
             invalidate(self.hwnd);
         }
+        // Screen readers hear that the text changed; sent with no state borrowed, since an
+        // in-context hook may read the value back at once.
+        notify(self.hwnd, EVENT_OBJECT_VALUECHANGE);
     }
 
     /// The editor's selection moved: the caret shows, is scrolled into view, and a run of Up/Down
@@ -987,6 +991,18 @@ fn with_state<R>(hwnd: HWND, action: impl FnOnce(&mut ViewState) -> R) -> Option
     // SAFETY: the pointer is owned by this window until WM_NCDESTROY, and every entry point runs on
     // the window's thread without sending messages while the borrow is live.
     (!pointer.is_null()).then(|| action(unsafe { &mut *pointer }))
+}
+
+/// An MSAA event on the view's client object.
+fn notify(hwnd: HWND, event: u32) {
+    unsafe {
+        windows_sys::Win32::UI::Accessibility::NotifyWinEvent(
+            event,
+            hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CLIENT,
+            windows_sys::Win32::UI::WindowsAndMessaging::CHILDID_SELF as i32,
+        )
+    };
 }
 
 fn invalidate(hwnd: HWND) {

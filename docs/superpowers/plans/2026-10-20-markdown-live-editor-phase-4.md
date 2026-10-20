@@ -318,17 +318,19 @@ These findings come from the survey made for this plan:
 
 **Files:** `src/live/view/accessible.rs` (new), `src/live/view/window_proc.rs`, `src/live/view.rs`.
 
-- [ ] **The object:** an `IAccessible` built on `window::accessibility` (Decision 8).
-  - It holds a weak handle to the view state. After the view is destroyed, every method returns `CO_E_OBJNOTCONNECTED`.
-  - `WM_GETOBJECT` with `OBJID_CLIENT` returns it through `LresultFromObject`.
-- [ ] **Events:**
-  - `EVENT_OBJECT_VALUECHANGE` after a flush that applied edits, once per flush;
+- [x] **The object:** an `IAccessible` modelled on the image view's, answered for `WM_GETOBJECT(OBJID_CLIENT)` through `LresultFromObject`.
+  - It is one object with no children: role `ROLE_SYSTEM_TEXT`, name "Live Markdown", and state `FOCUSABLE`, plus `FOCUSED` (asked of the view's thread) while it has focus. It is not read-only.
+  - Its value is the document's text, read with `WM_GETTEXT`, which is safe from a client's RPC thread.
+  - It holds only the window handle, not a weak handle to the view state as the plan said. Once the window is gone (`IsWindow`), every call answers `CO_E_OBJNOTCONNECTED`.
+  - `put_accValue` returns `E_NOTIMPL`. Unlike the plan, the default action is none (`DISP_E_MEMBERNOTFOUND`), as for the image view.
+- [x] **Events:**
   - `EVENT_OBJECT_FOCUS` on `WM_SETFOCUS`.
-- [ ] Tests (through `AccessibleObjectFromWindow`, as the preview's accessibility tests do):
-  - `live_exposes_an_editable_text_object`: role text, name, a focused state while focused, and a value equal to the document text.
+  - `EVENT_OBJECT_VALUECHANGE` after each edit the view takes in (`LiveView::edited`), sent with no state borrowed, since an in-context hook may read the value back at once. It is sent per edit, not once per flush.
+- [x] Tests, through `AccessibleObjectFromWindow`:
+  - `live_exposes_an_editable_text_object`: name, value equal to the document, role, focused state that clears when focus leaves, and not read-only.
   - `the_accessible_value_follows_typing`
-  - `the_accessible_object_survives_closing_live`: the object is held, Live is toggled off, and calls return the error rather than crashing.
-- [ ] Commit `feat(live): MSAA editable-text object`.
+  - `the_accessible_object_survives_closing_live`: the object is held through toggling Live off and destroying the window, and then answers `CO_E_OBJNOTCONNECTED`.
+- [x] Commit `feat(live): MSAA editable-text object`.
 
 ### Task 8: Perf in CI and the present's cost
 
