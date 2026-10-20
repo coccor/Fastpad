@@ -427,6 +427,28 @@ fn shown_view(hwnd: HWND, id: GroupId) -> Option<LiveView> {
     with_live(hwnd, id, |host| host.view.filter(|_| host.shown)).flatten()
 }
 
+/// A document was saved, saved under a new name or renamed: every shown Live view resolves
+/// relative images against its document's folder as it is now. (A first save gives an untitled
+/// note its folder; showing the view again is not needed for its images to appear.)
+pub(crate) fn document_moved(hwnd: HWND) {
+    let ids = unsafe { host_window::app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .groups
+                .iter()
+                .map(|group| group.id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for id in ids {
+        if let Some(view) = shown_view(hwnd, id) {
+            let folder = crate::window::preview_host::group_document(hwnd, id)
+                .and_then(|(_, _, folder)| folder);
+            view.set_document_dir(folder);
+        }
+    }
+}
+
 /// The Split preview beside group `id` was scrolled to document `line`: its shown Live view puts
 /// that line at its top, without reporting a scroll of its own (which would sync the preview
 /// back). False when the group shows no Live view.

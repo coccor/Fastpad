@@ -175,6 +175,8 @@ pub(crate) fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) -> Result<bo
     match outcome {
         Some(Ok(true)) => {
             crate::window::main_window::invalidate_title_strip(hwnd);
+            // A Live view showing the note resolves its images from the new folder.
+            crate::window::live_host::document_moved(hwnd);
             Ok(true)
         }
         Some(Ok(false)) => Ok(false),

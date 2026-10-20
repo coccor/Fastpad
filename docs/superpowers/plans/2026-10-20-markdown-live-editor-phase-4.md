@@ -297,14 +297,22 @@ These findings come from the survey made for this plan:
 
 ### Task 6: The image folder follows saves
 
-**Files:** `src/window/live_host.rs`, `src/window/library_host/autosave.rs`, `src/window/main_window/saving.rs`.
+**Files:**
+- `src/window/live_host.rs`
+- `src/window/main_window/saving.rs`
+- `src/window/library_host/local_state.rs`, `src/window/library_host/naming.rs`
 
-- [ ] Add `live_host::document_moved(hwnd)`. For every group whose Live view shows the saved document, it reads the document's folder from `preview_host::group_document` and calls `set_document_dir`.
-- [ ] Call it from `document_saved` and after a successful Save As in `save_active_to`. Also call it from the name box's first save and from rename, if those don't reach `document_saved`.
-- [ ] Tests:
-  - `saving_an_untitled_note_shows_its_relative_images`: an untitled note in Live with `![x](pic.png)`, where `pic.png` sits in the folder it is then saved to. After saving, it shows a thumbnail with no toggle.
-  - `renaming_into_another_folder_updates_images`
-- [ ] Commit `fix(live): pick up the image folder when a note is saved`.
+- [x] `live_host::document_moved(hwnd)` re-reads each shown Live view's document folder (`preview_host::group_document`) and calls `set_document_dir`. That call does nothing when the folder is unchanged.
+- [x] **Callers:**
+  - every successful save (`save_active_to`, so Save and Save As);
+  - `rebind_open_tab`, the one place an open tab follows a renamed or moved note (tree renames, moves, relocations the rescan finds);
+  - the name box's rename.
+
+  The update no longer depends on `WM_FASTPAD_APPLY_LANGUAGE`, which skips `sync_visibility` when Lexilla fails to apply.
+- [x] Test: `saving_an_untitled_note_shows_its_relative_images`. An untitled note in Live shows its image's alt text. After a Save As next to the image, the thumbnail draws without a toggle. After a Save As into a folder without the image, the alt text is back.
+  - It failed before the change.
+  - The rename and move paths have no window test, since that needs a notebook. They are one call at the shared rebind point, and Task 9's manual check covers them.
+- [x] Commit `fix(live): pick up the image folder when a note is saved or moved`.
 
 ### Task 7: MSAA object
 

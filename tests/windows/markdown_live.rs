@@ -2988,6 +2988,45 @@ fn a_relative_image_next_to_a_saved_note_renders() {
 }
 
 #[test]
+fn saving_an_untitled_note_shows_its_relative_images() {
+    let dir = std::env::temp_dir().join(format!("fastpad-live-first-save-{}", std::process::id()));
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(dir.join("img")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let image = write_bmp("first-save", 40, 120);
+    std::fs::copy(&image, dir.join("img").join("pic.bmp")).unwrap();
+    let _ = std::fs::remove_file(image);
+    let (_scintilla, main, view) = live_tab(
+        "# Note
+
+![pic](img/pic.bmp)
+
+end
+",
+    );
+    caret_to(&main, 0);
+    full_frame(view);
+    assert_eq!(
+        view.painted_decorations().images,
+        0,
+        "no folder yet: alt text"
+    );
+
+    window::save_path_as(main.hwnd, &dir.join("note.md"));
+    wait_for_image(view);
+    assert!(visible(view.hwnd()), "still in Live");
+
+    // Saved again into a folder without the image: back to the alt text.
+    window::save_path_as(main.hwnd, &elsewhere.join("note.md"));
+    pump_until("the image to go", Duration::from_secs(10), || {
+        full_frame(view);
+        view.painted_decorations().images == 0
+    });
+    main.mark_clean();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_html_img_renders_at_its_width_as_in_a_readme() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let dir = std::env::temp_dir().join(format!("fastpad-live-html-img-{}", std::process::id()));

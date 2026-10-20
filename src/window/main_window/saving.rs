@@ -231,6 +231,7 @@ fn save_active_to(
             }
             if identity.is_live_for(hwnd) {
                 crate::window::library_host::document_saved(hwnd);
+                crate::window::live_host::document_moved(hwnd);
             }
             SaveOutcome::Saved
         }
