@@ -266,33 +266,34 @@ These findings come from the survey made for this plan:
 
 ### Task 5: Drag-and-drop
 
-**Files:** `src/live/view/drop.rs` (new), `src/live/view/mouse.rs`, `src/live/view/window_proc.rs`.
+**Files:**
+- `src/live/view/drop.rs` (new), `src/live/view/mouse.rs`, `src/live/view/keys.rs`, `src/live/view/paint.rs`, `src/live/view.rs`
+- `src/platform/ole_drop.rs`
+- `src/window/library_host/notebooks.rs`
+- `src/window/live_host.rs`
 
-- [ ] **Drop target:** on create, Live registers a target built on `ole_drop` plumbing, and revokes it on destroy.
-  - **Files:** handed to the same callback `accept_file_drops_on` uses for the group.
-  - **`CF_UNICODETEXT`:**
-    - **While dragging:** `DragOver` hit-tests the point, draws a drop caret, and autoscrolls near the edges.
-    - **On drop:** the text is inserted at that point as one undo action, and selected afterwards.
-  - **Anything else:** `DROPEFFECT_NONE`.
-- [ ] **Drag within Live:**
-  - A press inside a non-empty selection records a pending drag instead of placing the caret.
-  - Moving past `SM_CXDRAG` / `SM_CYDRAG` starts the drag:
-    - a drop caret follows the cursor;
-    - the cursor shows the move (or copy, with Ctrl) arrow.
-  - **Release outside the selection:**
-    - **Move:** one undo action that deletes the source and inserts it at the target. The target is adjusted when it lies after the source.
-    - **Copy:** an insert.
-    - The moved or copied text ends up selected.
-  - **Release inside the selection without moving:** a plain click.
-  - **Esc or losing capture:** cancels with no edit.
-- [ ] Tests:
-  - `dropping_text_inserts_it_at_the_point_in_one_undo_step`, through the test hook `file_drop` already offers for drops
+- [x] **Drop target:** `drop.rs` registers an OLE target on the Live window when the window is created, and revokes it on `WM_NCDESTROY`. It takes `CF_UNICODETEXT`, read through the new `ole_drop::offers_text` / `dropped_text`.
+  - While a drag is over the view, a steady drop caret (`ViewState::drop_at`) shows where the text would land.
+  - On drop, the text is inserted at that point in the document's line endings, as one undo step, and selected.
+  - The effect is copy, so another app's text is never taken from it unasked. Shift moves when the source allows it.
+  - Autoscroll near the edges is not done.
+- [x] **Files:** `ensure_view` calls the new `library_host::wrap_live_drop_target`, which wraps Live's target with the group's file handlers (the strips' kind: open, split, Ctrl to attach at the caret). A drag offering files never reaches the text target.
+- [x] **Drag within Live:**
+  - A press strictly inside a non-empty selection is pending until it moves past `SM_CXDRAG` / `SM_CYDRAG`. Moving past that starts a drag, with the drop caret following the pointer.
+  - **Release away from the source:** moves the text, or copies it with Ctrl, as one undo step. The text is selected in its new place.
+  - **Release with no move, or on the source:** places the caret, as a click.
+  - **Esc, or losing the capture:** cancels with no edit.
+  - The cursor is not changed during the drag.
+- [x] Tests:
+  - `dropping_text_inserts_it_at_the_point_in_one_undo_step`, through `LiveView::drop_text`, a fake `IDataObject` run through the registered target as OLE runs it.
   - `dropping_a_file_on_live_opens_it`
-  - `dragging_a_selection_moves_it`
+  - `dragging_a_selection_moves_it` (forward and back)
   - `ctrl_drag_copies`
-  - `a_drag_released_inside_the_selection_places_the_caret`
+  - `a_press_inside_the_selection_without_moving_places_the_caret`
   - `escape_cancels_a_drag`
-- [ ] Commit `feat(live): text drag-and-drop`.
+
+  The drag tests move the real cursor with the simulated pointer. While the view holds the capture, Windows synthesizes a `WM_MOUSEMOVE` at the real cursor, and that made one run flaky.
+- [x] Commit `feat(live): text drag-and-drop`.
 
 ### Task 6: The image folder follows saves
 

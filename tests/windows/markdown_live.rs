@@ -1408,6 +1408,158 @@ fn the_keyboard_menu_opens_at_the_caret_with_undo_greyed() {
     assert_eq!(main.editor().selection().unwrap(), 2..2, "the caret stays");
 }
 
+#[test]
+fn dropping_text_inserts_it_at_the_point_in_one_undo_step() {
+    let (_scintilla, main, view) = live_tab("one three\n\nnext\n");
+    const SCI_EMPTYUNDOBUFFER: u32 = 2175;
+    unsafe { SendMessageW(main.editor().hwnd(), SCI_EMPTYUNDOBUFFER, 0, 0) };
+    let at = view.client_point_of(4).unwrap();
+    let effect = view.drop_text("two\nlines ", at);
+    assert_eq!(effect, windows_sys::Win32::System::Ole::DROPEFFECT_COPY);
+    let editor = main.editor();
+    let eol = editor.eol().unwrap();
+    let dropped = format!("two{eol}lines ");
+    assert_eq!(
+        editor.text().unwrap(),
+        format!("one {dropped}three\n\nnext\n")
+    );
+    assert_eq!(editor.selection().unwrap(), 4..4 + dropped.len());
+    assert_eq!(view.drop_caret(), None, "the drop caret goes with the drag");
+    main.command(CommandId::Undo);
+    assert_eq!(editor.text().unwrap(), "one three\n\nnext\n");
+    assert!(!editor.can_undo().unwrap(), "the drop was one undo step");
+}
+
+#[test]
+fn dropping_a_file_on_live_opens_it() {
+    let folder = std::env::temp_dir().join(format!("fastpad-live-drop-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let note = folder.join("dropped.md");
+    std::fs::write(&note, "dropped").unwrap();
+    let scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    window::library_host::accept_editor_file_drops(main.hwnd);
+    main.make_markdown("# Note\n");
+    main.set_live(true);
+    let view = main.live_view().unwrap();
+    let effects = crate::editor::file_drop::test_support::drag_and_drop(view.hwnd(), &[&note]);
+    assert_eq!(
+        effects,
+        [windows_sys::Win32::System::Ole::DROPEFFECT_COPY; 3]
+    );
+    pump_until("the dropped note to open", Duration::from_secs(3), || {
+        main.editor().text().unwrap() == "dropped"
+    });
+    drop(main);
+    drop(scintilla);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// `mouse`, with the real cursor moved to `point` first: while the view holds the capture,
+/// Windows synthesizes a `WM_MOUSEMOVE` at the real cursor, which must not land elsewhere.
+fn pointer(view: HWND, message: u32, point: (i32, i32), ctrl: bool) {
+    let mut screen = windows_sys::Win32::Foundation::POINT {
+        x: point.0,
+        y: point.1,
+    };
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::ClientToScreen(view, &mut screen);
+        windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(screen.x, screen.y);
+    }
+    mouse(view, message, point, ctrl, false);
+}
+
+/// Drags from client point `from` to `to` with the left button, Ctrl held at the release when
+/// `copy`.
+fn drag(view: HWND, from: (i32, i32), to: (i32, i32), copy: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    pointer(view, WM_LBUTTONDOWN, from, false);
+    pointer(
+        view,
+        WM_MOUSEMOVE,
+        ((from.0 + to.0) / 2, (from.1 + to.1) / 2 + 20),
+        false,
+    );
+    pointer(view, WM_MOUSEMOVE, to, false);
+    pointer(view, WM_LBUTTONUP, to, copy);
+}
+
+#[test]
+fn dragging_a_selection_moves_it() {
+    let text = "alpha beta gamma\n";
+    let (_scintilla, main, view) = live_tab(text);
+    let editor = main.editor();
+    editor.set_selection(6..10).unwrap(); // "beta"
+    window::live_host::poll_active(main.hwnd);
+    let from = view.client_point_of(8).unwrap();
+    let to = view.client_point_of(16).unwrap(); // after "gamma"
+    drag(view.hwnd(), from, to, false);
+    assert_eq!(editor.text().unwrap(), "alpha  gammabeta\n");
+    assert_eq!(editor.selection().unwrap(), 12..16);
+    assert_eq!(view.drop_caret(), None);
+    main.command(CommandId::Undo);
+    assert_eq!(editor.text().unwrap(), text, "the move was one undo step");
+    // Back: to before "alpha".
+    editor.set_selection(6..10).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    let from = view.client_point_of(8).unwrap();
+    drag(view.hwnd(), from, view.client_point_of(0).unwrap(), false);
+    assert_eq!(editor.text().unwrap(), "betaalpha  gamma\n");
+    assert_eq!(editor.selection().unwrap(), 0..4);
+}
+
+#[test]
+fn ctrl_drag_copies() {
+    let (_scintilla, main, view) = live_tab("alpha beta gamma\n");
+    let editor = main.editor();
+    editor.set_selection(6..10).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    let from = view.client_point_of(8).unwrap();
+    drag(view.hwnd(), from, view.client_point_of(0).unwrap(), true);
+    assert_eq!(editor.text().unwrap(), "betaalpha beta gamma\n");
+    assert_eq!(editor.selection().unwrap(), 0..4);
+}
+
+#[test]
+fn a_press_inside_the_selection_without_moving_places_the_caret() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    let (_scintilla, main, view) = live_tab("alpha beta gamma\n");
+    let editor = main.editor();
+    editor.set_selection(6..10).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    let at = view.client_point_of(8).unwrap();
+    pointer(view.hwnd(), WM_LBUTTONDOWN, at, false);
+    pointer(view.hwnd(), WM_LBUTTONUP, at, false);
+    assert_eq!(editor.selection().unwrap(), 8..8);
+    assert_eq!(editor.text().unwrap(), "alpha beta gamma\n");
+    // Released back on its own text after moving: no edit either.
+    editor.set_selection(6..10).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    drag(view.hwnd(), at, view.client_point_of(7).unwrap(), false);
+    assert_eq!(editor.text().unwrap(), "alpha beta gamma\n");
+    assert_eq!(editor.selection().unwrap(), 7..7);
+}
+
+#[test]
+fn escape_cancels_a_drag() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    let (_scintilla, main, view) = live_tab("alpha beta gamma\n");
+    let editor = main.editor();
+    editor.set_selection(6..10).unwrap();
+    window::live_host::poll_active(main.hwnd);
+    let from = view.client_point_of(8).unwrap();
+    let to = view.client_point_of(0).unwrap();
+    pointer(view.hwnd(), WM_LBUTTONDOWN, from, false);
+    pointer(view.hwnd(), WM_MOUSEMOVE, to, false);
+    assert_eq!(view.drop_caret(), Some(0));
+    send_inputs(view.hwnd(), &[Input::Key(VK_ESCAPE, false, false)]);
+    assert_eq!(view.drop_caret(), None);
+    pointer(view.hwnd(), WM_LBUTTONUP, to, false);
+    assert_eq!(editor.text().unwrap(), "alpha beta gamma\n");
+    assert_eq!(editor.selection().unwrap(), 6..10, "the selection stays");
+}
+
 fn click(view: HWND, point: (i32, i32), ctrl: bool, shift: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
     mouse(view, WM_LBUTTONDOWN, point, ctrl, shift);

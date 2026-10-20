@@ -4,7 +4,8 @@
 //! click on a task's checkbox toggles it (phase 3 plan, Decision 6): the one edit Live makes on
 //! its own, one undo step that leaves the selection where it was. A right press outside the
 //! selection places the caret, and the context menu is the main window's (phase 4 plan,
-//! Decision 5).
+//! Decision 5). A press inside the selection that moves drags the selected text: released
+//! elsewhere it moves there, or with Ctrl is copied there, as one undo step (Decision 6).
 
 use super::*;
 use crate::live::layout::Decoration;
@@ -15,8 +16,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetMessageTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SendMessageW,
-    SetTimer,
+    GetMessageTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK, SM_CXDRAG, SM_CYDOUBLECLK,
+    SM_CYDRAG, SendMessageW, SetTimer,
 };
 
 /// The drag autoscroll timer's id.
@@ -38,6 +39,15 @@ pub(super) struct Drag {
     point: (i32, i32),
 }
 
+/// A press inside a non-empty selection: a click until it moves past the drag threshold, then a
+/// drag of `source` to the drop caret.
+pub(super) struct TextDrag {
+    source: Range<usize>,
+    press: (i32, i32),
+    position: usize,
+    started: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Click {
     time: u32,
@@ -57,7 +67,7 @@ fn down(key: u16) -> bool {
 }
 
 /// The document position under client point (`x`, `y`).
-fn position_at(state: &mut ViewState, (x, y): (i32, i32)) -> usize {
+pub(super) fn position_at(state: &mut ViewState, (x, y): (i32, i32)) -> usize {
     prepare(state);
     let scale = dpi_scale(state.hwnd);
     let doc_x = x as f32 / scale - text_left(state);
@@ -197,6 +207,32 @@ pub(super) fn press(hwnd: HWND, lparam: isize) {
     }
     let time = unsafe { GetMessageTime() } as u32;
     let extend = down(VK_SHIFT);
+    let pending = !extend
+        && with_state(hwnd, |state| {
+            let position = position_at(state, at);
+            let (anchor, caret) = EditorText(&state.editor).selection();
+            let source = anchor.min(caret)..anchor.max(caret);
+            let inside = !source.is_empty() && source.start < position && position < source.end;
+            if inside {
+                state.clicks = Some(Click {
+                    time,
+                    point: at,
+                    count: 1,
+                });
+                state.text_drag = Some(TextDrag {
+                    source,
+                    press: at,
+                    position,
+                    started: false,
+                });
+            }
+            inside
+        })
+        .unwrap_or(false);
+    if pending {
+        unsafe { SetCapture(hwnd) };
+        return;
+    }
     with_state(hwnd, |state| {
         let count = match state.clicks {
             Some(last)
@@ -259,6 +295,24 @@ fn extend_to(state: &mut ViewState, position: usize) {
 /// `WM_MOUSEMOVE`: extends a drag, and scrolls while the pointer is outside the view.
 pub(super) fn moved(hwnd: HWND, lparam: isize) {
     let at = point(lparam);
+    let threshold = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
+    let text_drag = with_state(hwnd, |state| {
+        let drag = state.text_drag.as_mut()?;
+        drag.started |=
+            (at.0 - drag.press.0).abs() > threshold.0 || (at.1 - drag.press.1).abs() > threshold.1;
+        let started = drag.started;
+        if started {
+            state.drop_at = Some(position_at(state, at));
+        }
+        Some(started)
+    })
+    .flatten();
+    if let Some(started) = text_drag {
+        if started {
+            invalidate(hwnd);
+        }
+        return;
+    }
     let dragging = with_state(hwnd, |state| {
         let Some(drag) = &mut state.drag else {
             return false;
@@ -312,6 +366,54 @@ pub(super) fn autoscroll(hwnd: HWND) {
     }
     invalidate(hwnd);
     post_changed(hwnd, true);
+}
+
+/// A text drag ended. Dropped outside its source it moves there (or `copy`s), as one undo step
+/// that selects the text at its new place; released without moving, or on its source, it was a
+/// click and places the caret; cancelled (`dropped` false: Esc, or the capture lost) it does
+/// nothing.
+fn finish_text_drag(hwnd: HWND, drag: TextDrag, target: Option<usize>, copy: bool, dropped: bool) {
+    if !dropped {
+        return;
+    }
+    let Some(editor) = with_state(hwnd, |state| state.editor.clone()) else {
+        return;
+    };
+    let source = drag.source;
+    let target = target.filter(|_| drag.started).unwrap_or(drag.position);
+    if !drag.started || (source.start..=source.end).contains(&target) {
+        let _ = editor.set_selection(target..target);
+        post_changed(hwnd, false);
+        return;
+    }
+    let text = EditorText(&editor).slice(source.clone()).into_owned();
+    editor.begin_undo_action();
+    let placed = if copy {
+        editor.replace_target(target..target, &text)
+    } else if target > source.end {
+        // Insert first, so the source's positions still hold when it is removed.
+        let inserted = editor.replace_target(target..target, &text);
+        let _ = editor.replace_target(source.clone(), "");
+        inserted.map(|range| range.start - source.len()..range.end - source.len())
+    } else {
+        let _ = editor.replace_target(source.clone(), "");
+        editor.replace_target(target..target, &text)
+    };
+    editor.end_undo_action();
+    if let Ok(range) = placed {
+        let _ = editor.set_selection(range);
+    }
+    post_changed(hwnd, false);
+}
+
+/// Esc during a text drag: it ends with no edit.
+pub(super) fn cancel_text_drag(hwnd: HWND) -> bool {
+    let dragging = with_state(hwnd, |state| state.text_drag.is_some()).unwrap_or(false);
+    if dragging {
+        // The capture's loss ends the drag through `release`, as a cancelled one.
+        unsafe { ReleaseCapture() };
+    }
+    dragging
 }
 
 /// What a context menu acts on: where to show it and the link it was opened on.
@@ -431,6 +533,18 @@ pub(super) fn update_cursor(hwnd: HWND) {
 
 /// `WM_LBUTTONUP` and `WM_CAPTURECHANGED`: the drag ends.
 pub(super) fn release(hwnd: HWND, button_up: bool) {
+    if let Some((drag, target)) = with_state(hwnd, |state| {
+        Some((state.text_drag.take()?, state.drop_at.take()))
+    })
+    .flatten()
+    {
+        if button_up {
+            unsafe { ReleaseCapture() };
+        }
+        invalidate(hwnd);
+        finish_text_drag(hwnd, drag, target, button_up && down(VK_CONTROL), button_up);
+        return;
+    }
     let dragging = with_state(hwnd, |state| state.drag.take().is_some()).unwrap_or(false);
     unsafe { KillTimer(hwnd, AUTOSCROLL_TIMER) };
     if dragging && button_up {

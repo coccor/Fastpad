@@ -159,6 +159,9 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         .focused
         .then(|| layout.caret_rect(&text, caret).ok())
         .flatten();
+    let drop_rect = state
+        .drop_at
+        .and_then(|at| layout.caret_rect(&text, at).ok());
     let spans = visible
         .clone()
         .map(|line| (layout.line_top(line), layout.line_top(line + 1)))
@@ -453,6 +456,14 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         #[cfg(test)]
         {
             state.painted = painted;
+        }
+        // Dragged text lands here: a steady caret, twice as wide as the blinking one.
+        if let Some(caret) = drop_rect {
+            let width = 2.0_f32.max(2.0 / dpi_scale(hwnd));
+            target.FillRectangle(
+                &rect(caret.left, caret.top, caret.left + width, caret.bottom),
+                &brushes.caret,
+            );
         }
         if let Some(caret) = caret_rect.filter(|_| state.caret_on) {
             let width = 1.0_f32.max(1.0 / dpi_scale(hwnd));

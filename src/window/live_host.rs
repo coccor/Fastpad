@@ -270,6 +270,21 @@ fn ensure_view(hwnd: HWND, id: GroupId) -> Option<LiveView> {
                 host.view = Some(view);
                 host.fresh = true;
             });
+            // Files dropped on the view open as they do over the rest of the group.
+            let windows = unsafe { host_window::app_ptr(hwnd) }.and_then(|app| {
+                let app = unsafe { app.as_ref() };
+                let group = app.groups.iter().find(|group| group.id == id)?;
+                app.file_drops_accepted
+                    .then(|| (group.hwnd, group.editor.hwnd()))
+            });
+            if let Some((group, editor)) = windows {
+                crate::window::library_host::wrap_live_drop_target(
+                    hwnd,
+                    group,
+                    editor,
+                    view.hwnd(),
+                );
+            }
             Some(view)
         }
         Err(error) => {

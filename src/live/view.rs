@@ -38,6 +38,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_TABSTOP, WS_VSCROLL,
 };
 
+mod drop;
 mod ime;
 mod keys;
 mod mouse;
@@ -169,6 +170,10 @@ struct ViewState {
     clicks: Option<mouse::Click>,
     /// Whether the pointer shows the hand: over a link with Ctrl held.
     hand: bool,
+    /// Where dragged text would land: drawn as a second caret while a drag is over the view.
+    drop_at: Option<usize>,
+    /// A press inside the selection, which a move turns into a text drag.
+    text_drag: Option<mouse::TextDrag>,
     /// Where the caret was drawn last, in client pixels: x, y and height.
     caret_px: Option<(i32, i32, i32)>,
     /// The document rows (top, bottom in DIPs) the last frame drew the selection and caret on,
@@ -250,6 +255,8 @@ impl LiveView {
             drag: None,
             clicks: None,
             hand: false,
+            drop_at: None,
+            text_drag: None,
             caret_px: None,
             marks: None,
             caret_span: None,
@@ -258,6 +265,7 @@ impl LiveView {
         });
         load_document(&mut state);
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
+        drop::register(hwnd);
         Ok(Self { hwnd })
     }
 
@@ -576,6 +584,18 @@ impl LiveView {
             state.brushes = None;
         });
         invalidate(self.hwnd);
+    }
+
+    /// Where the drop caret is drawn, while dragged text is over the view.
+    #[cfg(test)]
+    pub fn drop_caret(&self) -> Option<usize> {
+        self.with(|state| state.drop_at).flatten()
+    }
+
+    /// Drops `text` at client point `client` through the window's OLE drop target.
+    #[cfg(test)]
+    pub fn drop_text(&self, text: &str, client: (i32, i32)) -> u32 {
+        drop::test_drop_text(self.hwnd, text, client)
     }
 
     /// The source lines showing as source.

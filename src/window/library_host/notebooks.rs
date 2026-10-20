@@ -379,6 +379,17 @@ struct EditorDrop {
 /// margins, which OLE reaches instead of the editor), open in that group, with the drop overlay a
 /// tab drag shows: the whole group, or the half an edge would split off.
 pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
+    wrap_drop_targets(hwnd, group, editor, None);
+}
+
+/// Makes files dropped on the Live view `live`, in group window `group`, open as they do over the
+/// group's strips; its own target, wrapped here, still takes dropped text (phase 4 plan,
+/// Decision 6).
+pub(crate) fn wrap_live_drop_target(hwnd: HWND, group: HWND, editor: HWND, live: HWND) {
+    wrap_drop_targets(hwnd, group, editor, Some(live));
+}
+
+fn wrap_drop_targets(hwnd: HWND, group: HWND, editor: HWND, live: Option<HWND>) {
     use crate::window::group_drop::{Action, decide_open};
     use windows_sys::Win32::Foundation::{POINT, POINTL};
     type Handlers = (
@@ -447,6 +458,11 @@ pub(crate) fn wrap_group_drop_target(hwnd: HWND, group: HWND, editor: HWND) {
             Box::new(move || crate::window::tab_drag::hide_feedback(target as HWND)),
         )
     };
+    if let Some(live) = live {
+        let (files, hover, leave) = handlers(false);
+        let _ = crate::editor::file_drop::accept_file_drops_with(live, files, hover, leave);
+        return;
+    }
     // Text drag-and-drop still works without the wrappers; only file drops are lost.
     let (files, hover, leave) = handlers(true);
     let _ = crate::editor::file_drop::accept_file_drops_with(editor, files, hover, leave);

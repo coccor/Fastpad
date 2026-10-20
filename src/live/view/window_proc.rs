@@ -25,6 +25,7 @@ pub(super) unsafe extern "system" fn live_proc(
 ) -> LRESULT {
     match message {
         WM_NCDESTROY => {
+            super::drop::revoke(hwnd);
             let pointer = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) } as *mut ViewState;
             if !pointer.is_null() {
                 drop(unsafe { Box::from_raw(pointer) });
