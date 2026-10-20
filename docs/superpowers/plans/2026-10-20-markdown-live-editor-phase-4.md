@@ -215,21 +215,25 @@ These findings come from the survey made for this plan:
 
 ### Task 3: Command audit
 
-**Files:** `src/window/live_host.rs`, `src/window/main_window/command_dispatch.rs`, `src/editor/scintilla/*`.
+**Files:**
+- `src/window/live_host.rs`
+- `src/window/main_window/command_dispatch.rs`
+- `src/editor/scintilla/live_support.rs`, `src/editor/scintilla_constants.rs`
+- `src/live/view/paint.rs`
 
-- [ ] Add `live_host::needs_source(CommandId) -> bool` (Decision 4), with a unit test that names each command it covers.
-- [ ] Before `run_command`, `execute_command_with_note` checks two things: whether the active group shows Live, and whether `needs_source(command)`. When both hold, it calls `live_host::leave_for(hwnd, command)`. That function:
-  - turns Live off for the group;
-  - posts the notice with the command's menu label;
-  - shows the source view with the caret and the top line kept.
-- [ ] Add `Editor::is_rectangular_selection()` (`SCI_GETSELECTIONMODE != SC_SEL_STREAM`). `poll`'s switch condition becomes `selection_count > 1 || rectangular`, with a notice for each case.
-- [ ] `ToggleHighlightCurrentLine` drives the active-block fill. `appearance()` reads the setting, and `refresh_appearance` runs after the toggle.
-- [ ] Tests:
+- [x] **Source-only commands.** `live_host::source_only(CommandId) -> Option<&'static str>` names them, with the name the notice uses (Decision 4). `execute_command_with_note` calls `live_host::before_command` before `run_command`. In Live, that switches the group to source with "*Name* needs the source view. Switched to the source view.", so the command acts on the shown editor. Ctrl+D now gives that notice instead of the generic one.
+- [x] **Column selections.** Add `Editor::is_rectangular_selection()` (`SCI_SELECTIONISRECTANGLE`). `poll` switches on `selection_count > 1` as before, and on a rectangle with "Live Markdown cannot show a column selection." Both go through one `leave` helper.
+- [x] **Highlight current line.** The setting drives the active-block fill: off, the fill takes the background colour, and the painter skips it.
+- [x] Tests:
   - `fold_all_switches_to_source_with_a_notice`
   - `a_one_row_rectangular_selection_switches_to_source`
   - `turning_off_current_line_highlight_drops_the_block_fill`
-  - `every_text_command_works_in_live_or_switches_to_source`: a table-driven test over `EDITING_COMMANDS` and `TEXT_COMMANDS`, as Decision 4 describes. Commands that open a dialog are answered through the existing test hooks, or listed as skipped with a reason in the test.
-- [ ] Commit `feat(live): command audit; source-only commands switch with a notice`.
+  - `source_only_names_the_commands_that_need_scintillas_ui`
+  - `every_text_command_works_in_live_or_switches_to_source`: 35 commands from `TEXT_COMMANDS` and `EDITING_COMMANDS`.
+    - Each is run with "bold" selected on a small note, once in Live and once in source.
+    - Source-only commands switch with their notice. Every other command keeps Live shown with one selection and its caret's block revealed. In both cases the text matches the source view's.
+    - Skipped, with the reason in the test: Save and Save As (dialog), the Live toggle, the disk-conflict commands, and language changes away from Markdown, which leave Live with their own notice.
+- [x] Commit `feat(live): command audit; source-only commands switch with a notice`.
 
 ### Task 4: Context menu
 

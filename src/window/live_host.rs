@@ -7,6 +7,7 @@ use crate::document::{DocumentId, Language};
 use crate::live::LIVE_MAX_BYTES;
 use crate::live::layout::LiveFonts;
 use crate::live::view::{LiveColors, LiveView};
+use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
 use crate::window::split_tree::GroupId;
@@ -331,8 +332,11 @@ fn appearance(
     graphics: &crate::preview::dwrite::Graphics,
     editor: &crate::editor::Editor,
 ) -> (LiveColors, LiveFonts, bool) {
-    let line_numbers = unsafe { host_window::app_ptr(hwnd) }
-        .is_none_or(|app| unsafe { app.as_ref() }.settings.line_numbers);
+    let (line_numbers, highlight_block) =
+        unsafe { host_window::app_ptr(hwnd) }.map_or((true, true), |app| {
+            let settings = &unsafe { app.as_ref() }.settings;
+            (settings.line_numbers, settings.highlight_current_line)
+        });
     let zoom = editor.zoom().unwrap_or(0);
     let (palette, preview_font, code_font, preview_size, line_height, font_size) =
         unsafe { host_window::app_ptr(hwnd) }
@@ -384,7 +388,12 @@ fn appearance(
             roles.code_background
         },
         dim: role(roles.comment),
-        active_block: palette.caret_line_background,
+        // The edited block stands out as the current line does, and only when that does.
+        active_block: if highlight_block {
+            palette.caret_line_background
+        } else {
+            palette.editor_background
+        },
     };
     let fonts = LiveFonts::new(
         graphics,
@@ -438,6 +447,53 @@ pub(crate) fn edited(hwnd: HWND, id: GroupId, notification: &crate::editor::Scin
 
 const MULTIPLE_SELECTIONS_NOTICE: &str =
     "Live Markdown works with one selection. Switched to the source view.";
+const RECTANGULAR_SELECTION_NOTICE: &str =
+    "Live Markdown cannot show a column selection. Switched to the source view.";
+
+/// Commands that need Scintilla's own UI (several carets, folds): in Live they switch to the
+/// source view before they run (spec §7.3), with the name the notice gives them.
+pub(crate) const fn source_only(command: CommandId) -> Option<&'static str> {
+    Some(match command {
+        CommandId::AddNextOccurrence => "Add next occurrence",
+        CommandId::SelectAllOccurrences => "Select all occurrences",
+        CommandId::AddCursorAbove => "Add cursor above",
+        CommandId::AddCursorBelow => "Add cursor below",
+        CommandId::ToggleCodeFolding => "Code folding",
+        CommandId::FoldAll => "Fold all",
+        CommandId::UnfoldAll => "Unfold all",
+        _ => return None,
+    })
+}
+
+/// Before `command` runs: one that needs the source view switches the active group out of Live,
+/// with a notice, so it acts on the shown editor.
+pub(crate) fn before_command(hwnd: HWND, command: CommandId) {
+    let Some(name) = source_only(command) else {
+        return;
+    };
+    let Some(app) = (unsafe { host_window::app_ptr(hwnd) }) else {
+        return;
+    };
+    let id = unsafe { app.as_ref() }.tabs.active_group();
+    if shown_view(hwnd, id).is_some() {
+        leave(
+            hwnd,
+            id,
+            format!("{name} needs the source view. Switched to the source view."),
+        );
+    }
+}
+
+/// Switches group `id`'s active tab to the source view, saying why.
+fn leave(hwnd: HWND, id: GroupId, notice: String) {
+    if let Some((document, _)) = active_document(hwnd, id) {
+        with_live(hwnd, id, |host| host.choices.insert(document, false));
+    }
+    host_window::push_notice(hwnd, notice);
+    crate::window::preview_host::in_group(id, || {
+        crate::window::preview_host::sync_visibility(hwnd)
+    });
+}
 
 /// Moves group `id`'s caret to the ATX heading whose slug is `anchor` (a `#heading` link
 /// followed in the Live view); false when no heading matches.
@@ -499,16 +555,14 @@ pub(crate) fn poll(hwnd: HWND, id: GroupId, scrolled: bool) {
     if !changed {
         return;
     }
+    // Several carets or a column selection, made by keys forwarded to Scintilla (Alt+Shift+
+    // arrows), need the source view (phase 1 plan, deviation 5).
     if count > 1 {
-        // Several carets (Ctrl+D, a column selection) need the source view (phase 1 plan,
-        // deviation 5).
-        if let Some((document, _)) = active_document(hwnd, id) {
-            with_live(hwnd, id, |host| host.choices.insert(document, false));
-        }
-        host_window::push_notice(hwnd, MULTIPLE_SELECTIONS_NOTICE.to_owned());
-        crate::window::preview_host::in_group(id, || {
-            crate::window::preview_host::sync_visibility(hwnd)
-        });
+        leave(hwnd, id, MULTIPLE_SELECTIONS_NOTICE.to_owned());
+        return;
+    }
+    if editor.is_rectangular_selection().unwrap_or(false) {
+        leave(hwnd, id, RECTANGULAR_SELECTION_NOTICE.to_owned());
         return;
     }
     view.selection_changed();

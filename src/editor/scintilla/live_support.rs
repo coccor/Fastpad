@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::editor::scintilla_constants::{
-    SCI_GETANCHOR, SCI_GETCURRENTPOS, SCI_GETSELECTIONS, SCI_WORDENDPOSITION, SCI_WORDSTARTPOSITION,
+    SCI_GETANCHOR, SCI_GETCURRENTPOS, SCI_GETSELECTIONS, SCI_SELECTIONISRECTANGLE,
+    SCI_WORDENDPOSITION, SCI_WORDSTARTPOSITION,
 };
 use std::ops::Range;
 
@@ -23,6 +24,11 @@ impl Editor {
     /// How many selections Scintilla holds; 1 for a plain caret.
     pub fn selection_count(&self) -> Result<usize> {
         Ok(self.live_send(SCI_GETSELECTIONS, 0, 0)?.max(1) as usize)
+    }
+
+    /// The selection is a rectangle (Alt+Shift+arrows, Alt+drag), even one row tall.
+    pub fn is_rectangular_selection(&self) -> Result<bool> {
+        Ok(self.live_send(SCI_SELECTIONISRECTANGLE, 0, 0)? != 0)
     }
 
     /// The word around `position` by Scintilla's word rules; empty when `position` is not in or

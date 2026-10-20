@@ -229,7 +229,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 continue;
             };
             // The block being edited stands out, as the source view's current line does.
-            if laid.style.revealed {
+            if laid.style.revealed && state.colors.active_block != state.colors.background {
                 target.FillRectangle(
                     &rect(-BLOCK_BLEED, top, text_right + BLOCK_BLEED, bottom),
                     &brushes.active_block,

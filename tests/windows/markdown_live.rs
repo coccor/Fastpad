@@ -816,11 +816,213 @@ fn ctrl_d_switches_to_source_with_a_notice() {
     assert!(main.editor().selection_count().unwrap() > 1);
     assert!(!visible(view.hwnd()));
     assert!(visible(main.editor().hwnd()));
-    assert!(
-        main.notices()
-            .iter()
-            .any(|notice| notice.starts_with("Live Markdown works with one selection"))
+    assert_eq!(
+        main.notices(),
+        ["Add next occurrence needs the source view. Switched to the source view."]
     );
+}
+
+#[test]
+fn fold_all_switches_to_source_with_a_notice() {
+    let (_scintilla, main, view) = live_tab(
+        "# One
+
+text
+
+# Two
+
+more
+",
+    );
+    main.command(CommandId::FoldAll);
+    assert!(!visible(view.hwnd()));
+    assert!(visible(main.editor().hwnd()));
+    assert_eq!(
+        main.notices(),
+        ["Fold all needs the source view. Switched to the source view."]
+    );
+    // Turning Live back on shows every line again.
+    main.set_live(true);
+    assert!(visible(view.hwnd()));
+}
+
+#[test]
+fn a_one_row_rectangular_selection_switches_to_source() {
+    const SCI_SETSELECTIONMODE: u32 = 2422;
+    const SC_SEL_RECTANGLE: usize = 1;
+    const SCI_SETRECTANGULARSELECTIONANCHOR: u32 = 2590;
+    const SCI_SETRECTANGULARSELECTIONCARET: u32 = 2588;
+    let (_scintilla, main, view) = live_tab(
+        "abcdef
+ghijkl
+",
+    );
+    let editor = main.editor();
+    unsafe {
+        SendMessageW(editor.hwnd(), SCI_SETSELECTIONMODE, SC_SEL_RECTANGLE, 0);
+        SendMessageW(editor.hwnd(), SCI_SETRECTANGULARSELECTIONANCHOR, 1, 0);
+        SendMessageW(editor.hwnd(), SCI_SETRECTANGULARSELECTIONCARET, 3, 0);
+    }
+    assert_eq!(editor.selection_count().unwrap(), 1);
+    window::live_host::poll_active(main.hwnd);
+    pump_pending();
+    assert!(!visible(view.hwnd()));
+    assert_eq!(
+        main.notices(),
+        ["Live Markdown cannot show a column selection. Switched to the source view."]
+    );
+}
+
+#[test]
+fn turning_off_current_line_highlight_drops_the_block_fill() {
+    let text = "top
+
+**one**
+**two**
+
+after
+";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, text.find("two").unwrap());
+    painted(view);
+    assert_eq!(view.painted_decorations().active_block, 2);
+    main.command(CommandId::ToggleHighlightCurrentLine);
+    painted(view);
+    assert_eq!(view.painted_decorations().active_block, 0);
+    main.command(CommandId::ToggleHighlightCurrentLine);
+    painted(view);
+    assert_eq!(view.painted_decorations().active_block, 2);
+}
+
+#[test]
+fn source_only_names_the_commands_that_need_scintillas_ui() {
+    let named = [
+        CommandId::AddNextOccurrence,
+        CommandId::SelectAllOccurrences,
+        CommandId::AddCursorAbove,
+        CommandId::AddCursorBelow,
+        CommandId::ToggleCodeFolding,
+        CommandId::FoldAll,
+        CommandId::UnfoldAll,
+    ];
+    for command in named {
+        assert!(
+            window::live_host::source_only(command).is_some(),
+            "{command:?}"
+        );
+    }
+    for command in window::commands::TEXT_COMMANDS {
+        assert_eq!(
+            window::live_host::source_only(command).is_some(),
+            named.contains(&command),
+            "{command:?}"
+        );
+    }
+}
+
+const AUDIT_NOTE: &str = "# Title
+
+Some **bold** text
+second line
+
+- item one
+- item two
+";
+
+/// `command` run on `AUDIT_NOTE` with "bold" selected, in Live or in the source view: the text
+/// after, whether Live is still shown, and the notices.
+fn audited(command: CommandId, live: bool) -> (String, bool, Vec<String>) {
+    let scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(AUDIT_NOTE);
+    let bold = AUDIT_NOTE.find("bold").unwrap();
+    main.editor().set_selection(bold..bold + 4).unwrap();
+    main.set_live(live);
+    let view = main.live_view();
+    if let Some(view) = view.filter(|_| live) {
+        unsafe { SetFocus(view.hwnd()) };
+    } else {
+        unsafe { SetFocus(main.editor().hwnd()) };
+    }
+    pump_pending();
+    main.command(command);
+    pump_pending();
+    let shown = view.is_some_and(|view| visible(view.hwnd()));
+    if shown {
+        // Live followed the command's selection: the caret's block is the one revealed.
+        let editor = main.editor();
+        assert_eq!(editor.selection_count().unwrap(), 1, "{command:?}");
+        let caret = editor.anchor_and_caret().unwrap().1;
+        let line = editor.line_from_position(caret).unwrap();
+        let view = view.unwrap();
+        unsafe { UpdateWindow(view.hwnd()) };
+        if !editor.line_text(line).unwrap().trim().is_empty() {
+            assert!(
+                view.revealed().contains(&line),
+                "{command:?}: caret line {line}, revealed {:?}",
+                view.revealed()
+            );
+        }
+    }
+    let text = main.editor().text().unwrap();
+    let notices = main.notices();
+    main.mark_clean();
+    drop(main);
+    drop(scintilla);
+    (text, shown, notices)
+}
+
+#[test]
+fn every_text_command_works_in_live_or_switches_to_source() {
+    let mut commands = window::commands::TEXT_COMMANDS.to_vec();
+    for command in window::commands::EDITING_COMMANDS {
+        if !commands.contains(&command) {
+            commands.push(command);
+        }
+    }
+    for command in commands {
+        // Skipped, with why: these leave Live by design or need a dialog or a file.
+        let skip = match command {
+            CommandId::Save | CommandId::SaveAs => Some("opens the save dialog"),
+            CommandId::MarkdownToggleLive => Some("is the toggle itself"),
+            CommandId::NoteReloadFromDisk
+            | CommandId::NoteKeepMine
+            | CommandId::NoteCompareWithDisk => Some("needs a file changed on disk"),
+            command
+                if command != CommandId::LanguageMarkdown
+                    && format!("{command:?}").starts_with("Language") =>
+            {
+                Some("makes the tab not Markdown, which leaves Live with its own notice")
+            }
+            _ => None,
+        };
+        if skip.is_some() {
+            continue;
+        }
+        let (live_text, shown, notices) = audited(command, true);
+        let (source_text, _, _) = audited(command, false);
+        if let Some(name) = window::live_host::source_only(command) {
+            assert!(!shown, "{command:?} left Live");
+            assert!(
+                notices.contains(&format!(
+                    "{name} needs the source view. Switched to the source view."
+                )),
+                "{command:?}: {notices:?}"
+            );
+        } else {
+            assert!(shown, "{command:?} kept Live: {notices:?}");
+            assert!(
+                !notices
+                    .iter()
+                    .any(|notice| notice.contains("Switched to the source view")),
+                "{command:?}: {notices:?}"
+            );
+        }
+        assert_eq!(
+            live_text, source_text,
+            "{command:?} edits as in the source view"
+        );
+    }
 }
 
 #[test]
