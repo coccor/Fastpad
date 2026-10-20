@@ -217,6 +217,19 @@ impl LiveDocument {
                 });
             }
         }
+        // Link reference definitions: GitHub shows nothing for them.
+        let definitions = self
+            .index
+            .definitions()
+            .filter(|range| range.start < bytes.end.max(bytes.start + 1) && range.end > bytes.start)
+            .collect::<Vec<_>>();
+        if !definitions.is_empty() {
+            out.extend(definitions.into_iter().map(|range| Span {
+                range,
+                kind: SpanKind::Dim,
+            }));
+            out.sort_by_key(|span| (span.range.start, span.range.end));
+        }
         out
     }
 
@@ -513,6 +526,18 @@ mod tests {
         let mut doc = LiveDocument::parse(&text);
         let changed = edit_at(&mut text, &mut doc, 3, 0, "*");
         assert!(changed.start <= 3 && changed.end >= 5, "{changed:?}");
+    }
+
+    #[test]
+    fn link_reference_definitions_are_dim() {
+        let text = "A [ref] link.\n\n[ref]: https://r.example\n";
+        let doc = LiveDocument::parse(text);
+        let definition = text.find("[ref]:").unwrap()..text.len() - 1;
+        assert!(
+            spans(&doc, text).contains(&(definition, SpanKind::Dim)),
+            "{:?}",
+            spans(&doc, text)
+        );
     }
 
     #[test]

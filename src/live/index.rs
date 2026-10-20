@@ -101,6 +101,14 @@ impl BlockIndex {
         Update::Full
     }
 
+    /// The bytes of each reference definition, in order. A definition alone in its paragraph
+    /// is no block (the parser emits nothing for it), so it is dimmed from here.
+    pub fn definitions(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.definitions
+            .iter()
+            .map(|definition| definition.span.clone())
+    }
+
     /// The destination of the reference definition whose label matches `label`.
     pub fn refdef_dest(&self, label: &str) -> Option<&str> {
         let key = normalize_label(label);

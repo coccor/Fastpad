@@ -206,6 +206,9 @@ pub fn parse_block(text: &str, refs: &dyn Fn(&str) -> Option<String>) -> BlockSp
     for (_, definition) in parser.reference_definitions().iter() {
         if text[definition.span.clone()].starts_with("[^") {
             collector.lexical.push(definition.span.clone());
+        } else {
+            // A link reference definition: GitHub shows nothing for it.
+            collector.push(definition.span.clone(), SpanKind::Dim);
         }
     }
     for (event, range) in parser.by_ref() {
@@ -295,6 +298,10 @@ struct Collector<'a> {
     images: Vec<ImageSeed>,
     /// The block holds HTML: a line may be an `<img>`.
     html: bool,
+    /// Paragraphs, headings and table cells: where bare URLs and emails become links.
+    prose: Vec<Range<usize>>,
+    /// Code spans: a URL in them stays text.
+    unlinked: Vec<Range<usize>>,
 }
 
 impl<'a> Collector<'a> {
@@ -316,6 +323,8 @@ impl<'a> Collector<'a> {
             rules: Vec::new(),
             images: Vec::new(),
             html: false,
+            prose: Vec::new(),
+            unlinked: Vec::new(),
         }
     }
 
@@ -354,6 +363,10 @@ impl<'a> Collector<'a> {
                 self.push(range, SpanKind::Dim);
             }
             Event::TaskListMarker(checked) => self.task(checked, range),
+            // `\` at a line's end breaks the line; spaces need no hiding.
+            Event::HardBreak if self.text[range.clone()].starts_with('\\') => {
+                self.push(range.start..range.start + 1, SpanKind::Hidden);
+            }
             Event::Rule => self.rules.push(range.start),
             _ => {}
         }
@@ -388,6 +401,7 @@ impl<'a> Collector<'a> {
         self.push(range.start..range.start + ticks, SpanKind::Hidden);
         self.push(range.start + ticks..range.end - ticks, SpanKind::Code);
         self.push(range.end - ticks..range.end, SpanKind::Hidden);
+        self.unlinked.push(range);
     }
 
     /// Hides `width`-byte markers at both ends of `range` and gives the rest `kind`.
@@ -403,14 +417,18 @@ impl<'a> Collector<'a> {
     fn start(&mut self, tag: Tag<'a>, range: Range<usize>) {
         match tag {
             Tag::Paragraph if self.suppress == 0 => {
-                self.lexical.extend(lexical_dims(self.text, range));
+                self.lexical.extend(lexical_dims(self.text, range.clone()));
+                self.hide_leading_space(range.clone());
+                self.prose.push(range);
             }
             Tag::Heading { level, .. } => {
                 if self.suppress == 0 {
                     self.lexical.extend(lexical_dims(self.text, range.clone()));
+                    self.prose.push(range.clone());
                 }
                 self.heading = Some((level as u8, range));
             }
+            Tag::TableCell if self.suppress == 0 => self.prose.push(range),
             Tag::Strong => self.wrap(&range, 2, SpanKind::Bold),
             Tag::Emphasis => self.wrap(&range, 1, SpanKind::Italic),
             Tag::Strikethrough => {
@@ -436,7 +454,10 @@ impl<'a> Collector<'a> {
                 dest: dest_url.to_string(),
                 inner: None,
             }),
-            Tag::BlockQuote(_) => self.containers.push((range, Seed::Quote)),
+            Tag::BlockQuote(_) => {
+                self.alert(range.clone());
+                self.containers.push((range, Seed::Quote));
+            }
             Tag::List(start) => self.lists.push(start.is_some()),
             Tag::Item => {
                 self.open_items = self.open_items.saturating_add(1);
@@ -459,6 +480,14 @@ impl<'a> Collector<'a> {
                 self.code_blocks.push((range, fenced));
             }
             Tag::Table(alignments) => {
+                // GFM unescapes `\|` in a cell, inside code spans too.
+                let escapes = self.text[range.clone()]
+                    .match_indices("\\|")
+                    .map(|(at, _)| range.start + at)
+                    .collect::<Vec<_>>();
+                for at in escapes {
+                    self.push(at..at + 1, SpanKind::Hidden);
+                }
                 let aligns = alignments
                     .iter()
                     .map(|align| match align {
@@ -785,7 +814,89 @@ impl<'a> Collector<'a> {
         Body::Text
     }
 
-    fn finish(self) -> BlockSpans {
+    /// A paragraph's lines start at their text: leading spaces (an indented continuation line)
+    /// are not shown, as GitHub does not show them.
+    fn hide_leading_space(&mut self, range: Range<usize>) {
+        for line in line_ranges(self.text, range) {
+            let spaces = self.text[line.clone()]
+                .bytes()
+                .take_while(|b| matches!(b, b' ' | b'\t'))
+                .count();
+            self.push(line.start..line.start + spaces, SpanKind::Hidden);
+        }
+    }
+
+    /// A GitHub alert: a quote whose first line is `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`,
+    /// `[!WARNING]` or `[!CAUTION]` shows the kind, bold, without its brackets.
+    fn alert(&mut self, range: Range<usize>) {
+        let first = line_ranges(self.text, range)[0].clone();
+        let line = &self.text[first.clone()];
+        let Some(open) = line.find("[!") else {
+            return;
+        };
+        if !line[..open]
+            .bytes()
+            .all(|b| matches!(b, b'>' | b' ' | b'\t'))
+        {
+            return;
+        }
+        let rest = &line[open + 2..];
+        let Some(close) = rest.find(']') else {
+            return;
+        };
+        let kind = &rest[..close];
+        let known = ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"]
+            .iter()
+            .any(|name| kind.eq_ignore_ascii_case(name));
+        if !known || !rest[close + 1..].trim().is_empty() {
+            return;
+        }
+        let kind_start = first.start + open + 2;
+        self.push(first.start + open..kind_start, SpanKind::Hidden);
+        self.push(kind_start..kind_start + kind.len(), SpanKind::Bold);
+        self.push(
+            kind_start + kind.len()..kind_start + kind.len() + 1,
+            SpanKind::Hidden,
+        );
+    }
+
+    /// GFM's extended autolinks: bare `www.` and `http(s)://` URLs and email addresses in prose,
+    /// outside links, code spans, raw HTML, footnotes and math.
+    fn autolinks(&mut self) {
+        let mut taken = self
+            .links
+            .iter()
+            .map(|link| link.range.clone())
+            .chain(self.unlinked.iter().cloned())
+            .chain(self.lexical.iter().cloned())
+            .chain(
+                self.spans
+                    .iter()
+                    .filter(|span| span.kind == SpanKind::Dim)
+                    .map(|span| span.range.clone()),
+            )
+            .collect::<Vec<_>>();
+        for scope in std::mem::take(&mut self.prose) {
+            for (range, dest) in autolink_literals(self.text, scope) {
+                if taken
+                    .iter()
+                    .any(|other| other.start < range.end && range.start < other.end)
+                {
+                    continue;
+                }
+                taken.push(range.clone());
+                self.push(range.clone(), SpanKind::Link);
+                self.links.push(LinkSpan {
+                    range,
+                    dest,
+                    wiki: false,
+                });
+            }
+        }
+    }
+
+    fn finish(mut self) -> BlockSpans {
+        self.autolinks();
         let lines = self.line_blocks();
         let lexical = merge(self.lexical);
         let hidden = merge(
@@ -882,6 +993,125 @@ fn html_image(text: &str, only: Range<usize>) -> Option<(String, Range<usize>, I
             .ok()
     };
     Some((src, alt, (pixels("width"), pixels("height"))))
+}
+
+/// GFM's extended autolinks in `range` of `text`, with the destination each opens: `www.` and
+/// `http://` / `https://` URLs (a valid domain with at least one period, then a path up to the
+/// next space or `<`, without trailing punctuation or an unbalanced `)`), and email addresses.
+fn autolink_literals(text: &str, range: Range<usize>) -> Vec<(Range<usize>, String)> {
+    let bytes = text.as_bytes();
+    let end = range.end.min(text.len());
+    let mut found: Vec<(Range<usize>, String)> = Vec::new();
+    let mut at = range.start;
+    while at < end {
+        let boundary = at == range.start
+            || matches!(
+                bytes[at - 1],
+                b' ' | b'\t' | b'\r' | b'\n' | b'*' | b'_' | b'~' | b'('
+            );
+        let starts = |prefix: &[u8]| {
+            bytes.len() >= at + prefix.len()
+                && bytes[at..at + prefix.len()].eq_ignore_ascii_case(prefix)
+        };
+        let scheme = if !boundary {
+            None
+        } else if starts(b"https://") {
+            Some(8)
+        } else if starts(b"http://") {
+            Some(7)
+        } else if starts(b"www.") {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(skip) = scheme
+            && let Some(length) = url_length(bytes, at + skip, end)
+        {
+            let url = &text[at..at + skip + length];
+            let dest = if skip == 0 {
+                format!("http://{url}")
+            } else {
+                url.to_owned()
+            };
+            found.push((at..at + skip + length, dest));
+            at += skip + length;
+            continue;
+        }
+        at += 1;
+    }
+    // Email addresses: `local@domain.tld`, outside the URLs found above.
+    for (offset, _) in text[range.start..end].match_indices('@') {
+        let at = range.start + offset;
+        if found.iter().any(|(url, _)| url.contains(&at)) {
+            continue;
+        }
+        let local = bytes[range.start..at]
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_'))
+            .count();
+        let mut domain = bytes[at + 1..end]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+            .count();
+        while domain > 0 && bytes[at + domain] == b'.' {
+            domain -= 1;
+        }
+        let host = &text[at + 1..at + 1 + domain];
+        if local == 0 || !host.contains('.') || host.ends_with(['-', '_']) {
+            continue;
+        }
+        let whole = at - local..at + 1 + domain;
+        found.push((whole.clone(), format!("mailto:{}", &text[whole])));
+    }
+    found.sort_by_key(|(range, _)| range.start);
+    found
+}
+
+/// The length of a URL's domain and path starting at `start`, or `None` when it has no valid
+/// domain.
+fn url_length(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let domain = bytes[start..end]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        .count();
+    let host = &bytes[start..start + domain];
+    let segments = host
+        .split(|b| *b == b'.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    // At least one period, and no underscore in the last two segments.
+    if segments.len() < 2
+        || segments[segments.len() - 2..]
+            .iter()
+            .any(|segment| segment.contains(&b'_'))
+    {
+        return None;
+    }
+    let mut length = domain
+        + bytes[start + domain..end]
+            .iter()
+            .take_while(|b| !b.is_ascii_whitespace() && **b != b'<')
+            .count();
+    // Trailing punctuation is not part of the link, nor an unbalanced `)`.
+    loop {
+        let url = &bytes[start..start + length];
+        let Some(&last) = url.last() else {
+            break;
+        };
+        let punctuation = matches!(
+            last,
+            b'?' | b'!' | b'.' | b',' | b':' | b'*' | b'_' | b'~' | b'\'' | b'"'
+        );
+        let unbalanced = last == b')'
+            && url.iter().filter(|b| **b == b')').count()
+                > url.iter().filter(|b| **b == b'(').count();
+        if !punctuation && !unbalanced {
+            break;
+        }
+        length -= 1;
+    }
+    (length > 0).then_some(length)
 }
 
 /// A list item's marker line, measured.
@@ -1622,6 +1852,81 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn extended_autolinks_link_bare_urls_and_emails() {
+        let text =
+            "See www.commonmark.org/help, https://example.com/a_(b)?c=1. Mail foo@bar.example.com.";
+        let block = parse_block(text, &no_refs);
+        let links = block
+            .links
+            .iter()
+            .map(|link| (&text[link.range.clone()], link.dest.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            links,
+            vec![
+                ("www.commonmark.org/help", "http://www.commonmark.org/help"),
+                (
+                    "https://example.com/a_(b)?c=1",
+                    "https://example.com/a_(b)?c=1"
+                ),
+                ("foo@bar.example.com", "mailto:foo@bar.example.com"),
+            ]
+        );
+        assert!(kinds(text).contains("LLLL"));
+    }
+
+    #[test]
+    fn autolinks_skip_code_links_and_invalid_domains() {
+        for text in [
+            "`https://example.com`",
+            "[x](https://a.example) and [https://b.example](u)",
+            "http://localhost and wwwexample.com",
+            "a@b and x@y_z.com_",
+            "<span>https://in.html</span>",
+        ] {
+            let block = parse_block(text, &no_refs);
+            assert!(
+                block
+                    .links
+                    .iter()
+                    .all(|link| !text[link.range.clone()].contains("in.html")
+                        && !link.dest.contains("localhost")
+                        && !link.dest.starts_with("mailto")),
+                "{text}: {:?}",
+                block.links
+            );
+        }
+        // Inside a link's text, the link stays the only one.
+        assert_eq!(
+            parse_block("[https://b.example](u)", &no_refs).links.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_github_alert_shows_its_kind_bold() {
+        assert_eq!(kinds("> [!NOTE]\n> Info."), "..HHbbbbH........");
+        assert!(!kinds("> [!NOPE]\n> x").contains('b'));
+        assert!(!kinds("> see [!NOTE]").contains('b'));
+    }
+
+    #[test]
+    fn a_backslash_hard_break_hides_its_backslash() {
+        assert_eq!(kinds("one\\\ntwo"), "...H....");
+    }
+
+    #[test]
+    fn an_escaped_pipe_in_a_cell_hides_its_backslash() {
+        let table = "| `a\\|b` |\n|---|\n";
+        assert!(kinds(table).starts_with("..HcHccH"), "{}", kinds(table));
+    }
+
+    #[test]
+    fn an_indented_paragraph_line_hides_its_leading_spaces() {
+        assert_eq!(kinds("one\n   two"), "....HHH...");
     }
 
     #[test]
