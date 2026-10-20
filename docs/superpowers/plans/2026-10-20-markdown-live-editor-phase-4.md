@@ -24,16 +24,15 @@ After this phase, PR #72 is ready to merge.
 
 These findings come from the survey made for this plan:
 
-1. **Find does not reach Live from the find bar.**
-   - Enter and Shift+Enter in the find field (`find_bar.rs` `find_field_proc`) call `main_window::find_next`, `find_previous`, `replace_current` and `replace_all_matches` directly. So do the find bar's buttons (`find.rs` `panel_pointer`).
-   - None of these go through `execute_command`, so `live_host::poll_active` never runs.
-   - A hidden Scintilla sends no `SCN_UPDATEUI`, so Live keeps its old caret and scroll.
-   - Go to line has the same gap: `PickerChoice::GoToLine` → `main_window::go_to_line`, also called from `capture_host.rs` and `library_host/pickers.rs`.
+1. **Find already reaches Live** *(corrected in Task 1)*.
+   - The survey reported a gap. Enter in the find bar, its buttons and go to line all run outside `execute_command`, and it assumed a hidden Scintilla sends no `SCN_UPDATEUI`.
+   - That last part is wrong. A hidden Scintilla queues `SCN_UPDATEUI` as idle work: it posts a message, which runs before the next paint. `wndproc.rs` polls Live from it, so Live follows find, replace, go to line and link jumps.
+   - Task 1 confirmed this. Its tests pass without any extra poll.
 2. **Find draws no highlights in either view.** The source view shows the current match as its selection, and nothing else. The only indicator FastPad fills is the link underline.
 3. **Split sync works one way.**
    - **Live → preview works.** `live_host::poll(scrolled)` sets the hidden editor's top line and calls `preview_host::editor_scrolled`.
    - **Preview → Live is missing.** `follow_preview` scrolls only the hidden Scintilla, and `LiveView::set_top_line` has no production caller.
-   - **Echo bug:** `follow_preview` also sets `scroll_origin = Preview` and waits for an echo `SCN_UPDATEUI` that a hidden editor never sends. The stale guard then swallows the next Live → preview sync.
+   - **Echo guard:** `follow_preview` sets `scroll_origin = Preview` and waits for the echo `SCN_UPDATEUI`. Per finding 1, a hidden editor does send it, from idle work, so the guard is probably cleared. Task 2 checks this with a test rather than assuming it.
 4. **Commands.**
    - **Multiple selections** (Ctrl+D, select all occurrences, add cursor above/below, Alt+Shift+arrows) run first. `poll` then sees more than one selection and switches to source with a notice.
    - **A one-row rectangular selection** reports one selection, so it stays in Live.
@@ -55,15 +54,7 @@ These findings come from the survey made for this plan:
 
 ## Decisions this plan makes
 
-1. **Live follows the selection wherever it changes.**
-   - Every path that moves the hidden editor's selection outside `execute_command` calls `live_host::poll_active(hwnd)` once, after it acts:
-     - `find_next`, `find_previous` and `find_again`, through `navigate_to_match` / `select_match`;
-     - `replace_current` and `replace_all_matches`;
-     - `main_window::go_to_line`;
-     - the capture and library pickers that call it.
-   - These sites are found by an audit: grep for `set_selection`, `go_to_line`, `set_first_visible_line` and `scroll_caret_into_view` outside `src/live`.
-   - `poll` already scrolls Live to the caret and reveals the caret's block. A match therefore shows as revealed source, selected, in the middle of its block's formatting.
-   - Focus stays in the find bar. Live draws an unfocused selection in the inactive selection colour, as the source view does. If it draws none, this task adds it.
+1. **Live follows the selection wherever it changes.** It already does (finding 1), so Task 1 only adds tests that keep it so. A match then shows as revealed source, selected, in the middle of its block's formatting. With focus in the find bar, Live draws the match in the inactive selection colour, which it already does.
 2. **Find highlights only the current match, as the source view does.** The spec's "find highlights the match" is met by the selection on revealed source. Highlighting every match is a feature of neither view, and it stays out of scope (a later change would add it to both).
 3. **Preview → Live sync.**
    - `follow_preview` checks `live_host::view_shown(hwnd, id)`. When Live is shown, it calls a new `LiveView::follow_line(line)`, which:
@@ -196,20 +187,17 @@ These findings come from the survey made for this plan:
 
 ### Task 1: Live follows find, replace and go to line
 
-**Files:** `src/window/main_window/find.rs`, the `go_to_line` callers, `src/live/view.rs`, `src/live/view/paint.rs`.
+**Files:** `tests/windows/markdown_live.rs`, `src/window/mod.rs` (test re-exports), and a comment in `src/window/live_host.rs`.
 
-- [ ] Audit: grep for `set_selection`, `go_to_line`, `scroll_caret_into_view` and `set_first_visible_line` outside `src/live` and `command_dispatch.rs`. List every call site that can run while a group shows Live and is not inside `execute_command`.
-- [ ] Add `live_host::poll_active(hwnd)` after each of those sites:
-  - in `select_match` (which covers find next, find previous and find again), `replace_current`, `replace_all_matches` and `main_window::go_to_line`;
-  - in any other site the audit finds.
-- [ ] **Inactive selection:** if Live paints no selection without focus, paint it in `LiveColors.inactive_selection`, taken from the theme's inactive selection colour as the source view's.
-- [ ] Tests in `tests/windows/markdown_live.rs`:
-  - `find_from_the_find_bar_moves_live_to_the_match`: open the find bar, type a query whose only match is 400 lines down inside bold text, press Enter. Live's selection equals the match, the match's line is on screen, its block is revealed, and focus is still in the find field.
+- [x] Audit the call sites that move the hidden editor's selection outside `execute_command`: `select_match`, `replace_current`, `replace_all_matches`, `go_to_line`, the links view, heading jumps and daily notes. Each one's selection change reaches Live through the deferred `SCN_UPDATEUI` (finding 1), so no poll is added.
+- [x] Tests:
+  - `find_from_the_find_bar_moves_live_to_the_match`: Enter in the query field, then F3.
   - `find_previous_and_replace_follow_in_live`
   - `replace_all_keeps_live_in_step`
   - `go_to_line_moves_live`
-  - `an_unfocused_live_view_still_shows_the_match`
-- [ ] Commit `fix(live): follow find, replace and go to line`. The commit message lists the audited call sites.
+
+  Each checks that the match is drawn on screen, that its block is revealed, and that focus stays in the find field.
+- [x] Commit `test(live): Live follows find, replace and go to line`.
 
 ### Task 2: Split sync from the preview to Live
 

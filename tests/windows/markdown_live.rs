@@ -645,6 +645,168 @@ fn scintilla_keys_and_commands_scroll_the_caret_into_view() {
     assert!(view.scroll_y() > 0.0, "Undo left the caret at the end");
 }
 
+/// 200 one-line paragraphs, one per even line: `**needle** here` on line 300 and
+/// `a needle too` on line 100.
+fn needle_document() -> String {
+    (0..200)
+        .map(|n| match n {
+            50 => "a needle too\n\n".to_owned(),
+            150 => "**needle** here\n\n".to_owned(),
+            n => format!("para {n}\n\n"),
+        })
+        .collect()
+}
+
+/// The caret at byte `position` is drawn inside the Live view's client area, after a paint.
+fn on_screen(view: LiveView, position: usize) -> bool {
+    unsafe { UpdateWindow(view.hwnd()) };
+    pump_pending();
+    let mut client = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(view.hwnd(), &mut client) };
+    view.client_point_of(position)
+        .is_some_and(|(_, y)| (0..client.bottom).contains(&y))
+}
+
+/// The match's byte on line 300 or line 100 of `needle_document`.
+fn needle_at(text: &str, line: usize) -> usize {
+    match line {
+        300 => text.find("needle**").unwrap(),
+        _ => text.find("needle too").unwrap(),
+    }
+}
+
+fn open_find_bar(main: &TestMain, command: CommandId) -> HWND {
+    main.command(command);
+    main.with_app(|app| app.find_bar().unwrap().query_hwnd())
+}
+
+fn type_into(hwnd: HWND, text: &str) {
+    for unit in text.encode_utf16() {
+        unsafe {
+            SendMessageW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR,
+                unit as usize,
+                0,
+            )
+        };
+    }
+    pump_pending();
+}
+
+fn press(hwnd: HWND, key: u16) {
+    unsafe {
+        SendMessageW(
+            hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            key as usize,
+            0,
+        )
+    };
+    pump_pending();
+}
+
+#[test]
+fn find_from_the_find_bar_moves_live_to_the_match() {
+    let text = needle_document();
+    let (_scintilla, main, view) = live_tab(&text);
+    assert!(!on_screen(view, needle_at(&text, 300)));
+    let query = open_find_bar(&main, CommandId::Find);
+    type_into(query, "needle");
+    // Past the first match, so Enter lands on line 300's.
+    caret_to(&main, text.find("para 51").unwrap());
+    press(query, VK_RETURN);
+    let at = text.find("needle**").unwrap();
+    assert_eq!(main.editor().selection().unwrap(), at..at + 6);
+    assert!(
+        on_screen(view, needle_at(&text, 300)),
+        "top line {}",
+        view.top_line()
+    );
+    assert_eq!(view.revealed(), 300..301);
+    assert_eq!(shown_line(view, 300).0, "**needle** here");
+    assert_eq!(
+        unsafe { GetFocus() },
+        query,
+        "focus stays in the find field"
+    );
+    // F3 (find again, through command dispatch) wraps to line 100's.
+    main.command(CommandId::FindNext);
+    assert!(
+        on_screen(view, needle_at(&text, 100)),
+        "top line {}",
+        view.top_line()
+    );
+    assert_eq!(view.revealed(), 100..101);
+}
+
+#[test]
+fn find_previous_and_replace_follow_in_live() {
+    let text = needle_document();
+    let (_scintilla, main, view) = live_tab(&text);
+    let query = open_find_bar(&main, CommandId::Replace);
+    type_into(query, "needle");
+    let replacement = main.with_app(|app| app.find_bar().unwrap().replace_hwnd());
+    type_into(replacement, "pin");
+    caret_to(&main, text.len());
+    window::find_previous(main.hwnd);
+    assert!(on_screen(view, needle_at(&text, 300)));
+    assert_eq!(view.revealed(), 300..301);
+    // Replaces line 300's match, then moves to (and reveals) line 100's.
+    window::replace_current(main.hwnd);
+    assert!(main.editor().text().unwrap().contains("**pin** here"));
+    assert!(
+        on_screen(view, needle_at(&text, 100)),
+        "top line {}",
+        view.top_line()
+    );
+    assert_eq!(view.revealed(), 100..101);
+    assert_eq!(shown_line(view, 300).0, "pin here");
+}
+
+#[test]
+fn replace_all_keeps_live_in_step() {
+    let text = needle_document();
+    let (_scintilla, main, view) = live_tab(&text);
+    let query = open_find_bar(&main, CommandId::Replace);
+    type_into(query, "needle");
+    let replacement = main.with_app(|app| app.find_bar().unwrap().replace_hwnd());
+    type_into(replacement, "pin");
+    window::replace_all_matches(main.hwnd);
+    let editor = main.editor();
+    assert!(!editor.text().unwrap().contains("needle"));
+    let caret = editor.selection().unwrap().end;
+    assert!(
+        on_screen(view, caret),
+        "caret {caret}, top {}",
+        view.top_line()
+    );
+    let line = editor.line_from_position(caret).unwrap();
+    assert_eq!(
+        shown_line(view, line).0,
+        editor.line_text(line).unwrap().trim_end()
+    );
+}
+
+#[test]
+fn go_to_line_moves_live() {
+    let text = needle_document();
+    let (_scintilla, main, view) = live_tab(&text);
+    window::go_to_line(main.hwnd, 301);
+    let editor = main.editor();
+    assert_eq!(
+        editor.selection().unwrap(),
+        editor.line_start(300).unwrap()..editor.line_start(300).unwrap()
+    );
+    assert!(
+        on_screen(view, needle_at(&text, 300)),
+        "top line {}",
+        view.top_line()
+    );
+    assert_eq!(view.revealed(), 300..301);
+    assert_eq!(shown_line(view, 300).0, "**needle** here");
+}
+
 #[test]
 fn ctrl_d_switches_to_source_with_a_notice() {
     let (_scintilla, main, view) = live_tab("word word word\n");

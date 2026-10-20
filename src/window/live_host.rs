@@ -461,7 +461,9 @@ pub(crate) fn go_to_anchor(hwnd: HWND, id: GroupId, anchor: &str) -> bool {
 /// Follows group `id`'s editor after anything that may have moved its selection or scrolled its
 /// Live view (`scrolled`): a hidden Scintilla sends no `SCN_UPDATEUI` for either, so the Live
 /// view, the status bar and the writing helpers' table tracking are told from here. Called after
-/// Live view input, after every command, and on any `SCN_UPDATEUI` that does arrive.
+/// Live view input, after every command, and on any `SCN_UPDATEUI` that does arrive: a selection
+/// set from elsewhere (find, go to line, a link jump) arrives that way, from Scintilla's posted
+/// idle work, before the next paint.
 pub(crate) fn poll(hwnd: HWND, id: GroupId, scrolled: bool) {
     let (Some(view), Some(editor)) = (shown_view(hwnd, id), host_window::group_editor(hwnd, id))
     else {
