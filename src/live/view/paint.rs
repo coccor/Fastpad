@@ -473,7 +473,12 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             );
         }
         target.PopAxisAlignedClip();
-        target.EndDraw(None, None)
+        #[cfg(test)]
+        let presenting = std::time::Instant::now();
+        let ended = target.EndDraw(None, None);
+        #[cfg(test)]
+        record("paint: present", presenting);
+        ended
     };
     #[cfg(test)]
     record("paint: draw and present", drawing);

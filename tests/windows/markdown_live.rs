@@ -1999,9 +1999,30 @@ fn typing_p95(main: &TestMain, target: HWND, caret: usize, typing: Typing) -> u6
 }
 
 /// A Live keystroke's p95 budget: a quarter of a 60 Hz frame. The source view is measured
-/// alongside for comparison; matching it within 10% needs a present limited to the changed
-/// rectangle, planned for phase 4 (phase 1 plan, deviation 11).
+/// alongside for comparison (phase 1 plan, deviation 11).
 const LIVE_KEYSTROKE_BUDGET_MICROS: u64 = 4_000;
+
+/// How much slower than the reference machine this one may be: `FASTPAD_PERF_SCALE` (never
+/// below one). CI sets it, since hosted runners are slower and draw without a GPU (phase 4
+/// plan, Decision 9).
+fn perf_scale() -> f64 {
+    std::env::var("FASTPAD_PERF_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse::<f64>().ok())
+        .filter(|scale| *scale >= 1.0)
+        .unwrap_or(1.0)
+}
+
+/// Prints one `live-perf` line, which CI copies into the job summary, and checks the Live p95
+/// against the (scaled) budget.
+fn report_typing(name: &str, source: u64, live: u64) {
+    println!("live-perf {name} live_p95_us={live} source_p95_us={source}");
+    let budget = (LIVE_KEYSTROKE_BUDGET_MICROS as f64 * perf_scale()) as u64;
+    assert!(
+        live <= budget,
+        "{name}: source {source} us, live {live} us, budget {budget} us"
+    );
+}
 
 /// Typing in Live against typing in the source view on the same document, in one window: three
 /// interleaved rounds of each, keeping each one's best p95, so a busy moment on the machine
@@ -2011,9 +2032,17 @@ fn live_against_source(text: &str, caret: usize) -> (u64, u64) {
 }
 
 fn live_against_source_typing(text: &str, caret: usize, typing: Typing) -> (u64, u64) {
+    measure_typing(text, caret, typing, false)
+}
+
+/// `live_against_source_typing`, with the preview open beside the text when `split`.
+fn measure_typing(text: &str, caret: usize, typing: Typing, split: bool) -> (u64, u64) {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown(text);
+    if split {
+        main.command(CommandId::MarkdownPreviewSide);
+    }
     let (mut source, mut live) = (u64::MAX, u64::MAX);
     for _ in 0..3 {
         main.set_live(false);
@@ -2032,6 +2061,7 @@ fn live_against_source_typing(text: &str, caret: usize, typing: Typing) -> (u64,
     }
     // Where a Live keystroke's time went, in the last round.
     let mut phases = std::collections::BTreeMap::<&str, Vec<u64>>::new();
+    // `take_timings` was emptied before the round; every sample is from it.
     for (name, micros) in live::view::take_timings() {
         phases.entry(name).or_default().push(micros);
     }
@@ -2051,11 +2081,7 @@ fn live_against_source_typing(text: &str, caret: usize, typing: Typing) -> (u64,
 #[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_costs_the_same_as_typing_in_source() {
     let (source, live) = live_against_source(&sample_markdown(1_000_000), 500_000);
-    println!("keystroke p95, 1 MB: source {source} us, live {live} us");
-    assert!(
-        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
-        "source {source} us, live {live} us"
-    );
+    report_typing("sample_1mb", source, live);
 }
 
 #[test]
@@ -2068,11 +2094,7 @@ fn typing_in_live_inside_a_long_paragraph_stays_in_budget() {
     let text = format!("# Notes\n\n{paragraph}\n{}", sample_markdown(200_000));
     let caret = text.find("Line 20").unwrap() + 4;
     let (source, live) = live_against_source(&text, caret);
-    println!("keystroke p95, long paragraph: source {source} us, live {live} us");
-    assert!(
-        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
-        "source {source} us, live {live} us"
-    );
+    report_typing("long_paragraph", source, live);
 }
 
 #[test]
@@ -2085,11 +2107,7 @@ fn typing_in_live_inside_a_long_list_stays_in_budget() {
     let text = format!("# Notes\n\n{list}\n{}", sample_markdown(100_000));
     let caret = text.find("item 150 with a few words").unwrap() + "item 150 with".len();
     let (source, live) = live_against_source(&text, caret);
-    println!("keystroke p95, long list: source {source} us, live {live} us");
-    assert!(
-        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
-        "source {source} us, live {live} us"
-    );
+    report_typing("long_list", source, live);
 }
 
 #[test]
@@ -2104,11 +2122,7 @@ fn typing_in_live_inside_a_table_stays_in_budget() {
     let text = format!("# Table\n\n{table}\n{}", sample_markdown(100_000));
     let caret = text.find("r30c2").unwrap() + 3;
     let (source, live) = live_against_source_typing(&text, caret, Typing::InPlace);
-    println!("keystroke p95, table: source {source} us, live {live} us");
-    assert!(
-        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
-        "source {source} us, live {live} us"
-    );
+    report_typing("table", source, live);
 }
 
 #[test]
@@ -2123,11 +2137,16 @@ fn typing_in_live_inside_a_code_block_stays_in_budget() {
     );
     let caret = text.find("let value_250 =").unwrap() + "let value_250".len();
     let (source, live) = live_against_source(&text, caret);
-    println!("keystroke p95, code block: source {source} us, live {live} us");
-    assert!(
-        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
-        "source {source} us, live {live} us"
-    );
+    report_typing("code_block", source, live);
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
+fn typing_in_live_with_split_preview_stays_in_budget() {
+    // The preview beside Live updates from the same edits; its work is debounced off the
+    // keystroke, so typing costs what it does without it.
+    let (source, live) = measure_typing(&sample_markdown(1_000_000), 500_000, Typing::Lines, true);
+    report_typing("split_preview_1mb", source, live);
 }
 
 #[test]
@@ -2155,8 +2174,9 @@ fn typing_in_live_entering_live_on_a_1_mb_note_is_quick() {
         unsafe { UpdateWindow(view.hwnd()) };
         elapsed = elapsed.min(started.elapsed().as_millis());
     }
-    println!("entering Live on 1 MB: {elapsed} ms to the first frame");
-    assert!(elapsed <= 200, "{elapsed} ms");
+    println!("live-perf enter_live_1mb first_frame_ms={elapsed}");
+    let budget = (200.0 * perf_scale()) as u128;
+    assert!(elapsed <= budget, "{elapsed} ms, budget {budget} ms");
 }
 
 #[test]
@@ -2167,11 +2187,7 @@ fn typing_in_live_on_a_10k_line_note_costs_the_same_as_typing_in_source() {
         .collect::<String>();
     let caret = text.len() / 2;
     let (source, live) = live_against_source(&text, caret);
-    println!("keystroke p95, 10k lines: source {source} us, live {live} us");
-    assert!(
-        live <= LIVE_KEYSTROKE_BUDGET_MICROS,
-        "source {source} us, live {live} us"
-    );
+    report_typing("note_10k_lines", source, live);
 }
 
 /// Line `line` of the Live view as laid out now: (layout text, revealed, height).

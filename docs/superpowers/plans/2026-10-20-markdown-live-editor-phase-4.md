@@ -334,14 +334,32 @@ These findings come from the survey made for this plan:
 
 ### Task 8: Perf in CI and the present's cost
 
-**Files:** `tests/windows/markdown_live.rs`, `src/live/view.rs`, `src/live/view/paint.rs`, `.github/workflows/ci.yml`.
+**Files:**
+- `tests/windows/markdown_live.rs`
+- `src/live/view/paint.rs`
+- `.github/workflows/ci.yml`
 
-- [ ] `LIVE_KEYSTROKE_BUDGET_MICROS` is multiplied by `FASTPAD_PERF_SCALE`, when that is set and parses as a float of 1.0 or more. Each perf test prints one line `live-perf <name> live_p95_us=<n> source_p95_us=<n>`.
-- [ ] Add `typing_in_live_with_split_preview_stays_in_budget`: the 1 MB sample in Split with Live on the left, typing in the middle.
-- [ ] Record `present` (the `EndDraw` call) in `take_timings`. The 10k-line test prints its share of the keystroke.
-- [ ] CI: add a `live-perf` job on `windows-latest`. It needs `windows-integration`, sets `FASTPAD_PERF_SCALE=2.5`, runs the filtered release command, and greps the `live-perf` lines into `$GITHUB_STEP_SUMMARY`.
-- [ ] Run the perf tests locally with `CARGO_TARGET_DIR=target/perf` and record the numbers for Task 9's note.
-- [ ] Commit `ci(live): run the Live typing scenarios`.
+- [x] **Budget and reporting:** `report_typing` replaces each test's print and assert. It prints `live-perf <name> live_p95_us=<n> source_p95_us=<n>`, and holds Live to the 4 ms budget times `perf_scale()`. That scale is `FASTPAD_PERF_SCALE`, never below 1. Entering Live prints `live-perf enter_live_1mb first_frame_ms=<n>` against 200 ms times the scale.
+- [x] **Split scenario:** `typing_in_live_with_split_preview_stays_in_budget` types in the 1 MB sample with the preview beside Live. It uses `measure_typing(…, split)`.
+- [x] **Present timing:** `paint: present` times `EndDraw` alone, and each scenario prints it with the other phases.
+- [x] **CI:** a new `live-perf` job runs after `windows-integration`, with `FASTPAD_PERF_SCALE=2.5`. It builds the native DLLs and runs the filtered release command with `--nocapture`, then copies the `live-perf` and `paint: present` lines into the job summary.
+  - Hosted runners draw without a GPU (WARP), so 2.5 is a first guess. The first CI run decides whether it holds.
+- [x] **Local run** (`CARGO_TARGET_DIR=target/perf`). The machine was slower than during phase 3: the source view itself measured 1.3–2.4 ms, against 0.7–0.9 ms then.
+
+  | Scenario | Live keystroke p95 | Source keystroke p95 |
+  |---|---|---|
+  | 1 MB sample | 3.1–3.2 ms | 2.4–2.6 ms |
+  | 10k lines | 3.0–3.6 ms | 1.3–1.4 ms |
+  | 300-item list | 3.0–4.5 ms | 1.4–2.1 ms |
+  | 60-row table | 2.1–2.5 ms | 1.3–1.6 ms |
+  | 500-line code block | 2.6–3.7 ms | 1.9 ms |
+  | Long paragraph | 2.0–2.1 ms | 1.3 ms |
+  | Split preview | 1.9–2.1 ms | 1.3–1.4 ms |
+
+  - Entering Live on the 1 MB note takes 84–95 ms to the first frame.
+  - Live costs 1.5–2.8 times the source view, about phase 3's ratio. The list scenario went over 4 ms in two of five runs on this loaded machine.
+  - **The present:** `EndDraw` is 0.6–1.3 ms p95 (p50 0.4–0.7 ms), a quarter to a third of the keystroke. That is under the half that Decision 10 set for a swap-chain follow-up, so none is planned.
+- [x] Commit `ci(live): run the Live typing scenarios`.
 
 ### Task 9: Docs, full suite, manual check
 
