@@ -426,7 +426,8 @@ is on the way; until then, every release publishes SHA-256 checksums you can ver
 x64.
 
 The preview renders GitHub-flavored Markdown natively (tables, task lists, strikethrough, code
-blocks, images) and the HTML GitHub allows in READMEs: centred `<div>` and `<p>` blocks, sized
+blocks, images, bare `www.` and `https://` links and email addresses, and `> [!NOTE]`-style alerts)
+and the HTML GitHub allows in READMEs: centred `<div>` and `<p>` blocks, sized
 `<img>` tags, `<picture>` images that follow the light or dark theme, collapsible
 `<details>` sections, and inline tags such as `<kbd>`, `<sup>`, and `<br>`. Local PNG, JPEG, GIF,
 and SVG images are shown; remote images show a placeholder with their alt text, because nothing is

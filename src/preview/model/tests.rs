@@ -592,7 +592,11 @@ fn the_readme_fixture_renders_no_literal_markup() {
                     collect(block, texts);
                 }
             }
-            BlockKind::Quote(children) | BlockKind::Container { children, .. } => {
+            BlockKind::Quote(children)
+            | BlockKind::Alert {
+                blocks: children, ..
+            }
+            | BlockKind::Container { children, .. } => {
                 for child in children {
                     collect(child, texts);
                 }
@@ -703,4 +707,244 @@ fn wikilinks_become_links_the_notebook_resolves() {
             ]
         ))]
     );
+}
+
+/// The extended autolinks in the first block's text, as (linked text, destination).
+fn autolinks(source: &str) -> Vec<(String, String)> {
+    let kinds = kinds(source);
+    let (BlockKind::Paragraph { text, .. } | BlockKind::Heading { text, .. }) = &kinds[0] else {
+        panic!("expected text, got {kinds:?}");
+    };
+    let units = text.text.encode_utf16().collect::<Vec<_>>();
+    let mut links = text
+        .spans
+        .iter()
+        .filter_map(|span| match &span.style {
+            InlineStyle::Link(dest) => Some((
+                String::from_utf16_lossy(
+                    &units[span.range.start as usize..span.range.end as usize],
+                ),
+                dest.clone(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    links.sort();
+    links
+}
+
+fn link(text: &str, dest: &str) -> (String, String) {
+    (text.to_owned(), dest.to_owned())
+}
+
+#[test]
+fn bare_urls_and_emails_become_links() {
+    assert_eq!(
+        kinds("Visit https://example.com/a?b=1 now\n"),
+        vec![para(styled(
+            "Visit https://example.com/a?b=1 now",
+            vec![span(
+                6..31,
+                InlineStyle::Link("https://example.com/a?b=1".to_owned())
+            )]
+        ))]
+    );
+    assert_eq!(
+        autolinks("Go to www.commonmark.org/help or http://x.example.\n"),
+        vec![
+            link("http://x.example", "http://x.example"),
+            link("www.commonmark.org/help", "http://www.commonmark.org/help"),
+        ]
+    );
+    assert_eq!(
+        autolinks("Mail foo.bar+baz@example.com.\n"),
+        vec![link(
+            "foo.bar+baz@example.com",
+            "mailto:foo.bar+baz@example.com"
+        )]
+    );
+    // Case-insensitive schemes, and after `*_~(`.
+    assert_eq!(
+        autolinks("(WWW.example.com) and ~HTTPS://a.b~\n"),
+        vec![
+            link("HTTPS://a.b", "HTTPS://a.b"),
+            link("WWW.example.com", "http://WWW.example.com"),
+        ]
+    );
+    // Inside emphasis and across a line break; UTF-16 offsets after non-ASCII text.
+    assert_eq!(
+        autolinks("**www.a.com**\nnaïve — https://b.org\n"),
+        vec![
+            link("https://b.org", "https://b.org"),
+            link("www.a.com", "http://www.a.com"),
+        ]
+    );
+    assert_eq!(
+        autolinks("# Docs at www.docs.dev\n"),
+        vec![link("www.docs.dev", "http://www.docs.dev")]
+    );
+}
+
+#[test]
+fn autolinks_need_a_valid_domain() {
+    // No period, or an underscore in the last two segments.
+    assert_eq!(autolinks("www. and http://localhost\n"), vec![]);
+    assert_eq!(autolinks("www.ex_ample.com and http://a.b_c\n"), vec![]);
+    // An underscore before the last two segments is fine.
+    assert_eq!(
+        autolinks("www.sub_domain.example.com\n"),
+        vec![link(
+            "www.sub_domain.example.com",
+            "http://www.sub_domain.example.com"
+        )]
+    );
+    // Not a word's middle, and an email needs a dotted domain and a local part.
+    assert_eq!(
+        autolinks("xwww.example.com and a@localhost and @b.com\n"),
+        vec![]
+    );
+    assert_eq!(autolinks("a@b.c_\n"), vec![]);
+}
+
+#[test]
+fn autolink_paths_stop_at_spaces_angles_and_trailing_punctuation() {
+    assert_eq!(
+        autolinks("www.a.com/path<b> end\n"),
+        vec![link("www.a.com/path", "http://www.a.com/path")]
+    );
+    for trailing in ["?", "!", ".", ",", ":", "*", "_", "~", "'", "\"", "?!."] {
+        assert_eq!(
+            autolinks(&format!("see https://a.com/x{trailing} next\n")),
+            vec![link("https://a.com/x", "https://a.com/x")],
+            "{trailing}"
+        );
+    }
+    // Balanced parentheses stay; an unbalanced closing one does not.
+    assert_eq!(
+        autolinks("www.a.com/q(1) and (www.b.com/q(2))\n"),
+        vec![
+            link("www.a.com/q(1)", "http://www.a.com/q(1)"),
+            link("www.b.com/q(2)", "http://www.b.com/q(2)"),
+        ]
+    );
+    // An email address inside a URL's path is part of the URL.
+    assert_eq!(
+        autolinks("https://a.com/u@b.com\n"),
+        vec![link("https://a.com/u@b.com", "https://a.com/u@b.com")]
+    );
+}
+
+#[test]
+fn autolinks_skip_code_html_links_footnotes_and_math() {
+    assert_eq!(
+        kinds("`www.a.com` x\n"),
+        vec![para(styled(
+            "www.a.com x",
+            vec![span(0..9, InlineStyle::Code)]
+        ))]
+    );
+    assert_eq!(
+        kinds("[site](https://x.dev) www.y.dev\n"),
+        vec![para(styled(
+            "site www.y.dev",
+            vec![
+                span(0..4, InlineStyle::Link("https://x.dev".to_owned())),
+                span(5..14, InlineStyle::Link("http://www.y.dev".to_owned())),
+            ]
+        ))]
+    );
+    // A link's text is not linked again, nor an angle-bracket autolink.
+    assert_eq!(
+        autolinks("[www.a.com](https://b.com) <https://c.com>\n"),
+        vec![
+            link("https://c.com", "https://c.com"),
+            link("www.a.com", "https://b.com"),
+        ]
+    );
+    // An HTML block's text and a tag's attributes stay as written; Markdown text between inline
+    // tags is prose.
+    assert_eq!(autolinks("<p>www.a.com</p>\n"), vec![]);
+    assert_eq!(autolinks("x <abbr title=\"www.a.com\">y</abbr>\n"), vec![]);
+    assert_eq!(
+        autolinks("<span>www.a.com</span> x\n"),
+        vec![link("www.a.com", "http://www.a.com")]
+    );
+    // Footnote references and definitions, and math.
+    assert_eq!(autolinks("x[^www.a.com] y\n"), vec![]);
+    assert_eq!(autolinks("[^1]: see www.a.com and more\n"), vec![]);
+    assert_eq!(autolinks("$www.a.com$ and $$https://b.com$$\n"), vec![]);
+    assert_eq!(
+        autolinks("$5 and www.a.com $6\n"),
+        vec![link("www.a.com", "http://www.a.com")]
+    );
+}
+
+#[test]
+fn an_autolink_wins_over_a_tag_in_its_fragment() {
+    assert_eq!(
+        kinds("https://a.com/ #b https://a.com/x#c\n"),
+        vec![para(styled(
+            "https://a.com/ #b https://a.com/x#c",
+            vec![
+                span(15..17, InlineStyle::Tag("b".to_owned())),
+                span(0..14, InlineStyle::Link("https://a.com/".to_owned())),
+                span(18..35, InlineStyle::Link("https://a.com/x#c".to_owned())),
+            ]
+        ))]
+    );
+}
+
+#[test]
+fn github_alerts_become_alert_blocks() {
+    assert_eq!(
+        kinds("> [!NOTE]\n> Useful *info*.\n"),
+        vec![BlockKind::Alert {
+            kind: AlertKind::Note,
+            blocks: vec![para(styled(
+                "Useful info.",
+                vec![span(7..11, InlineStyle::Emphasis)]
+            ))],
+        }]
+    );
+    for (marker, kind) in [
+        ("[!tip]", AlertKind::Tip),
+        ("[!Important]", AlertKind::Important),
+        ("[!WARNING]", AlertKind::Warning),
+        ("[!caution]  ", AlertKind::Caution),
+    ] {
+        assert_eq!(
+            kinds(&format!("> {marker}\n> body\n")),
+            vec![BlockKind::Alert {
+                kind,
+                blocks: vec![para(plain("body"))],
+            }],
+            "{marker}"
+        );
+    }
+    // A marker alone is an empty alert.
+    assert_eq!(
+        kinds("> [!NOTE]\n"),
+        vec![BlockKind::Alert {
+            kind: AlertKind::Note,
+            blocks: vec![],
+        }]
+    );
+    assert_eq!(AlertKind::Important.title(), "Important");
+}
+
+#[test]
+fn other_quotes_are_not_alerts() {
+    // Text after the marker, an unknown kind, a marker not on the first line, no `!`.
+    for source in [
+        "> [!NOTE] inline\n",
+        "> [!DANGER]\n> body\n",
+        "> body\n> [!NOTE]\n",
+        "> [NOTE]\n> body\n",
+    ] {
+        assert!(
+            matches!(kinds(source).as_slice(), [BlockKind::Quote(_)]),
+            "{source}: {:?}",
+            kinds(source)
+        );
+    }
 }

@@ -462,6 +462,80 @@ fn quotes_draw_a_bar_and_indent_their_content() {
 }
 
 #[test]
+fn alerts_draw_a_link_coloured_bar_and_title_over_body_coloured_content() {
+    with_context(&no_images, None, |context| {
+        let block = laid(context, "> [!WARNING]\n> Careful.\n", 400.0);
+        let bar = block.ops.iter().find_map(|op| match op {
+            DrawOp::Fill { rect, role } => Some((*rect, *role)),
+            _ => None,
+        });
+        let (bar, role) = bar.expect("a bar");
+        assert_eq!(role, ColorRole::Link);
+        assert!(!block.ops.iter().any(|op| matches!(
+            op,
+            DrawOp::Fill {
+                role: ColorRole::QuoteBar,
+                ..
+            }
+        )));
+        let texts = block
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { layout, x, y, role } => Some((layout.clone(), *x, *y, *role)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts.len(), 2);
+        let (title, title_x, title_y, title_role) = &texts[0];
+        assert_eq!(*title_role, ColorRole::Link);
+        assert!(*title_x > 0.0);
+        let mut weight = DWRITE_FONT_WEIGHT_NORMAL;
+        unsafe { title.GetFontWeight(0, &mut weight, None) }.unwrap();
+        assert_eq!(weight, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        let (_, body_x, body_y, body_role) = &texts[1];
+        assert_eq!(*body_role, ColorRole::Text);
+        assert_eq!(body_x, title_x);
+        assert!(body_y > title_y);
+        // The bar spans the title and the content.
+        assert!(bar.bottom >= *body_y + context.line_height - 1.0);
+        assert!(block.height >= bar.bottom - bar.top);
+    });
+}
+
+#[test]
+fn an_empty_alert_draws_its_title() {
+    with_context(&no_images, None, |context| {
+        let block = laid(context, "> [!TIP]\n", 400.0);
+        let titles = block
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    DrawOp::Text {
+                        role: ColorRole::Link,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(titles, 1);
+        assert!(block.height > 0.0);
+    });
+}
+
+#[test]
+fn bare_urls_are_link_targets() {
+    with_context(&no_images, None, |context| {
+        let block = laid(context, "See www.example.com today\n", 400.0);
+        assert_eq!(block.targets.len(), 1);
+        assert_eq!(block.targets[0].dest(), Some("http://www.example.com"));
+        assert_eq!(block.targets[0].text, "www.example.com");
+    });
+}
+
+#[test]
 fn details_start_collapsed_and_open_through_their_state() {
     let source =
         "<details>\n<summary>More</summary>\n\n# Inside\n\n[x](https://x.dev)\n\n</details>\n";

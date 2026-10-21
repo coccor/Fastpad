@@ -4,13 +4,16 @@
 
 use crate::preview::html::{self, Sanitizer, Token};
 use pulldown_cmark::{
-    Alignment, BrokenLink, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, BrokenLink, CodeBlockKind, CowStr, Event, Options, Parser, Tag,
+    TagEnd,
 };
 use std::ops::Range;
 
 /// GitHub-flavored extensions the preview renders, and YAML front matter, which shows as a table
-/// of its properties (second brain phase 1 spec §6.2). Footnotes and math stay literal.
+/// of its properties (second brain phase 1 spec §6.2). `ENABLE_GFM` parses GitHub alerts. Footnotes
+/// and math stay literal. Extended autolinks have no parser option: `autolink_literals` finds them.
 pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_GFM)
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS)
     .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
@@ -57,6 +60,12 @@ pub enum BlockKind {
         items: Vec<ListItem>,
     },
     Quote(Vec<BlockKind>),
+    /// A GitHub alert: a quote whose first line is `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`,
+    /// `[!WARNING]` or `[!CAUTION]`, drawn with its kind as a title.
+    Alert {
+        kind: AlertKind,
+        blocks: Vec<BlockKind>,
+    },
     Code {
         language: String,
         text: String,
@@ -78,6 +87,40 @@ pub enum BlockKind {
         summary: RichText,
         children: Vec<BlockKind>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl AlertKind {
+    /// The title an alert shows, as GitHub shows it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Tip => "Tip",
+            Self::Important => "Important",
+            Self::Warning => "Warning",
+            Self::Caution => "Caution",
+        }
+    }
+}
+
+impl From<BlockQuoteKind> for AlertKind {
+    fn from(kind: BlockQuoteKind) -> Self {
+        match kind {
+            BlockQuoteKind::Note => Self::Note,
+            BlockQuoteKind::Tip => Self::Tip,
+            BlockQuoteKind::Important => Self::Important,
+            BlockQuoteKind::Warning => Self::Warning,
+            BlockQuoteKind::Caution => Self::Caution,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -394,6 +437,9 @@ struct TextBuilder {
     image_stack: Vec<ImageRef>,
     /// HTML text arrived: the collapsed trailing space is trimmed when the text is finished.
     html: bool,
+    /// Byte ranges of `text` that came from Markdown prose outside links, where extended autolinks
+    /// are found when the text is finished. Adjacent pushes merge into one range.
+    prose: Vec<Range<usize>>,
 }
 
 struct OpenStyle {
@@ -421,7 +467,20 @@ impl TextBuilder {
         let in_link = self.open.iter().any(|open| {
             matches!(open.style, Some(InlineStyle::Link(_))) || open.tag.as_deref() == Some("a")
         });
-        if in_link || !self.image_stack.is_empty() || !value.contains('#') {
+        if in_link || !self.image_stack.is_empty() {
+            self.push(value);
+            return;
+        }
+        let start = self.text.len();
+        self.push_tagged(value);
+        match self.prose.last_mut() {
+            Some(last) if last.end == start => last.end = self.text.len(),
+            _ => self.prose.push(start..self.text.len()),
+        }
+    }
+
+    fn push_tagged(&mut self, value: &str) {
+        if !value.contains('#') {
             self.push(value);
             return;
         }
@@ -528,6 +587,40 @@ impl TextBuilder {
         }
     }
 
+    /// GFM's extended autolinks in the prose, outside footnotes and math. A link wins over a `#tag`
+    /// it overlaps, such as a URL's fragment.
+    fn link_literals(&mut self) {
+        // Byte and UTF-16 offsets of a point in `text`; links are found in increasing order.
+        let mut cursor = (0, 0);
+        let mut utf16_at = |text: &str, byte: usize| {
+            cursor.1 += text[cursor.0..byte].encode_utf16().count() as u32;
+            cursor.0 = byte;
+            cursor.1
+        };
+        for scope in std::mem::take(&mut self.prose) {
+            let literal = footnotes_and_math(&self.text, scope.clone());
+            for (range, dest) in autolink_literals(&self.text, scope) {
+                if literal
+                    .iter()
+                    .any(|other| other.start < range.end && range.start < other.end)
+                {
+                    continue;
+                }
+                let start = utf16_at(&self.text, range.start);
+                let end = utf16_at(&self.text, range.end);
+                self.spans.retain(|span| {
+                    !matches!(span.style, InlineStyle::Tag(_))
+                        || span.range.end <= start
+                        || end <= span.range.start
+                });
+                self.spans.push(Span {
+                    range: start..end,
+                    style: InlineStyle::Link(dest),
+                });
+            }
+        }
+    }
+
     fn is_blank(&self) -> bool {
         self.images.is_empty() && self.text.trim().is_empty()
     }
@@ -536,6 +629,7 @@ impl TextBuilder {
         while !self.open.is_empty() {
             self.close_last();
         }
+        self.link_literals();
         if self.html {
             let trimmed = self.text.trim_end_matches(' ').len();
             // Spaces are one byte and one UTF-16 unit each.
@@ -579,6 +673,7 @@ enum Frame {
         loose: Option<TextBuilder>,
     },
     Quote {
+        alert: Option<AlertKind>,
         blocks: Vec<BlockKind>,
         loose: Option<TextBuilder>,
     },
@@ -866,7 +961,8 @@ impl Builder {
                 text: TextBuilder::default(),
                 html: false,
             }),
-            Tag::BlockQuote(_) => self.push_block_frame(Frame::Quote {
+            Tag::BlockQuote(kind) => self.push_block_frame(Frame::Quote {
+                alert: kind.map(AlertKind::from),
                 blocks: Vec::new(),
                 loose: None,
             }),
@@ -1280,9 +1376,16 @@ fn finish_block(frame: Frame) -> Option<BlockKind> {
             }
         }
         Frame::List { start, items } => BlockKind::List { start, items },
-        Frame::Quote { mut blocks, loose } => {
+        Frame::Quote {
+            alert,
+            mut blocks,
+            loose,
+        } => {
             push_loose(&mut blocks, loose);
-            BlockKind::Quote(blocks)
+            match alert {
+                Some(kind) => BlockKind::Alert { kind, blocks },
+                None => BlockKind::Quote(blocks),
+            }
         }
         Frame::Code { language, text } => BlockKind::Code {
             language,
@@ -1371,6 +1474,189 @@ fn first_candidate(srcset: &str) -> Option<String> {
         .split(|character: char| character.is_ascii_whitespace() || character == ',')
         .find(|part| !part.is_empty())
         .map(str::to_owned)
+}
+
+/// GFM's extended autolinks in `range` of `text`, with the destination each opens: `www.` and
+/// `http://` / `https://` URLs (a valid domain with at least one period, then a path up to the
+/// next space or `<`, without trailing punctuation or an unbalanced `)`), and email addresses.
+/// Mirrors the Live view's scan of the same name.
+fn autolink_literals(text: &str, range: Range<usize>) -> Vec<(Range<usize>, String)> {
+    let bytes = text.as_bytes();
+    let end = range.end.min(text.len());
+    let mut found: Vec<(Range<usize>, String)> = Vec::new();
+    let mut at = range.start;
+    while at < end {
+        // A link starts the text or follows whitespace or `*_~(`, wherever the prose began.
+        let boundary = at == 0
+            || matches!(
+                bytes[at - 1],
+                b' ' | b'\t' | b'\r' | b'\n' | b'*' | b'_' | b'~' | b'('
+            );
+        let starts = |prefix: &[u8]| {
+            end >= at + prefix.len() && bytes[at..at + prefix.len()].eq_ignore_ascii_case(prefix)
+        };
+        let scheme = if !boundary {
+            None
+        } else if starts(b"https://") {
+            Some(8)
+        } else if starts(b"http://") {
+            Some(7)
+        } else if starts(b"www.") {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(skip) = scheme
+            && let Some(length) = url_length(bytes, at + skip, end)
+        {
+            let url = &text[at..at + skip + length];
+            let dest = if skip == 0 {
+                format!("http://{url}")
+            } else {
+                url.to_owned()
+            };
+            found.push((at..at + skip + length, dest));
+            at += skip + length;
+            continue;
+        }
+        at += 1;
+    }
+    // Email addresses: `local@domain.tld`, outside the URLs found above.
+    for (offset, _) in text[range.start..end].match_indices('@') {
+        let at = range.start + offset;
+        if found.iter().any(|(url, _)| url.contains(&at)) {
+            continue;
+        }
+        let local = bytes[range.start..at]
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_'))
+            .count();
+        let mut domain = bytes[at + 1..end]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+            .count();
+        while domain > 0 && bytes[at + domain] == b'.' {
+            domain -= 1;
+        }
+        let host = &text[at + 1..at + 1 + domain];
+        if local == 0 || !host.contains('.') || host.ends_with(['-', '_']) {
+            continue;
+        }
+        let whole = at - local..at + 1 + domain;
+        found.push((whole.clone(), format!("mailto:{}", &text[whole])));
+    }
+    found.sort_by_key(|(range, _)| range.start);
+    found
+}
+
+/// The length of a URL's domain and path starting at `start`, or `None` when it has no valid
+/// domain.
+fn url_length(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let domain = bytes[start..end]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        .count();
+    let host = &bytes[start..start + domain];
+    let segments = host
+        .split(|b| *b == b'.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    // At least one period, and no underscore in the last two segments.
+    if segments.len() < 2
+        || segments[segments.len() - 2..]
+            .iter()
+            .any(|segment| segment.contains(&b'_'))
+    {
+        return None;
+    }
+    let mut length = domain
+        + bytes[start + domain..end]
+            .iter()
+            .take_while(|b| !b.is_ascii_whitespace() && **b != b'<')
+            .count();
+    // Trailing punctuation is not part of the link, nor an unbalanced `)`.
+    loop {
+        let url = &bytes[start..start + length];
+        let Some(&last) = url.last() else {
+            break;
+        };
+        let punctuation = matches!(
+            last,
+            b'?' | b'!' | b'.' | b',' | b':' | b'*' | b'_' | b'~' | b'\'' | b'"'
+        );
+        let unbalanced = last == b')'
+            && url.iter().filter(|b| **b == b')').count()
+                > url.iter().filter(|b| **b == b'(').count();
+        if !punctuation && !unbalanced {
+            break;
+        }
+        length -= 1;
+    }
+    (length > 0).then_some(length)
+}
+
+/// Footnotes and math in the prose `range` of `text`, which PARSE_OPTIONS leaves literal and
+/// autolinks skip: `[^label]` references, a `[^label]:` definition to the end of the prose,
+/// `$$…$$` and `$…$`.
+fn footnotes_and_math(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let end = range.end.min(text.len());
+    let mut found = Vec::new();
+    let mut at = range.start;
+    while at < end {
+        match bytes[at] {
+            b'[' if bytes.get(at + 1) == Some(&b'^') => {
+                let label = bytes[at + 2..end]
+                    .iter()
+                    .take_while(|b| **b != b']' && !b.is_ascii_whitespace())
+                    .count();
+                let close = at + 2 + label;
+                if label == 0 || close >= end || bytes[close] != b']' {
+                    at += 1;
+                } else if at == range.start && bytes.get(close + 1) == Some(&b':') {
+                    found.push(at..end);
+                    break;
+                } else {
+                    found.push(at..close + 1);
+                    at = close + 1;
+                }
+            }
+            b'$' if bytes.get(at + 1) == Some(&b'$') => match text[at + 2..end].find("$$") {
+                Some(offset) => {
+                    let close = at + 2 + offset + 2;
+                    found.push(at..close);
+                    at = close;
+                }
+                None => at += 2,
+            },
+            b'$' => match inline_math_end(bytes, at, end) {
+                Some(close) => {
+                    found.push(at..close);
+                    at = close;
+                }
+                None => at += 1,
+            },
+            _ => at += 1,
+        }
+    }
+    found
+}
+
+/// The end (past the closing `$`) of inline math opening at `open`: the opening `$` is not
+/// followed by whitespace, and the closing one is not preceded by whitespace nor followed by a
+/// digit, so `$5 and $6` is not math.
+fn inline_math_end(bytes: &[u8], open: usize, end: usize) -> Option<usize> {
+    let first = *bytes.get(open + 1)?;
+    if open + 1 >= end || first.is_ascii_whitespace() || first == b'$' {
+        return None;
+    }
+    (open + 2..end).find_map(|at| {
+        (bytes[at] == b'$'
+            && !bytes[at - 1].is_ascii_whitespace()
+            && !bytes.get(at + 1).is_some_and(u8::is_ascii_digit))
+        .then_some(at + 1)
+    })
 }
 
 fn cell_align(alignment: Alignment) -> CellAlign {

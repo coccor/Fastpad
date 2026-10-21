@@ -97,7 +97,11 @@ fn visit(kind: &BlockKind, block: usize, walk: &mut Walk, keys: &mut Vec<Details
             }
             walk.enclosing.pop();
         }
-        BlockKind::Container { children, .. } | BlockKind::Quote(children) => {
+        BlockKind::Container { children, .. }
+        | BlockKind::Quote(children)
+        | BlockKind::Alert {
+            blocks: children, ..
+        } => {
             for child in children {
                 visit(child, block, walk, keys);
             }
@@ -129,9 +133,11 @@ pub fn count_nested(blocks: &[BlockKind]) -> (u32, usize) {
                 let (headings, details) = count_nested(children);
                 (headings, details + 1)
             }
-            BlockKind::Container { children, .. } | BlockKind::Quote(children) => {
-                count_nested(children)
-            }
+            BlockKind::Container { children, .. }
+            | BlockKind::Quote(children)
+            | BlockKind::Alert {
+                blocks: children, ..
+            } => count_nested(children),
             BlockKind::List { items, .. } => items.iter().fold((0, 0), |(h, d), item| {
                 let (inner_h, inner_d) = count_nested(&item.blocks);
                 (h + inner_h, d + inner_d)
@@ -160,9 +166,11 @@ pub fn details_open_attribute(kind: &BlockKind, index: usize) -> Option<bool> {
                 *seen += 1;
                 children.iter().find_map(|child| find(child, index, seen))
             }
-            BlockKind::Container { children, .. } | BlockKind::Quote(children) => {
-                children.iter().find_map(|child| find(child, index, seen))
-            }
+            BlockKind::Container { children, .. }
+            | BlockKind::Quote(children)
+            | BlockKind::Alert {
+                blocks: children, ..
+            } => children.iter().find_map(|child| find(child, index, seen)),
             BlockKind::List { items, .. } => items
                 .iter()
                 .flat_map(|item| &item.blocks)

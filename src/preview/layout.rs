@@ -9,8 +9,8 @@ use crate::preview::dwrite::{Graphics, ResolvedFamily, hresult_error};
 use crate::preview::inline_object::inline_box;
 use crate::preview::links::resolve_image_path;
 use crate::preview::model::{
-    BlockKind, CellAlign, ColorScheme, ImageRef, InlineStyle, Length, ListItem, OBJECT_REPLACEMENT,
-    RichText, TextAlign,
+    AlertKind, BlockKind, CellAlign, ColorScheme, ImageRef, InlineStyle, Length, ListItem,
+    OBJECT_REPLACEMENT, RichText, TextAlign,
 };
 use crate::preview::outline::{DetailsKey, count_nested, summary_text};
 use crate::preview::render::{Brushes, RectF};
@@ -193,6 +193,7 @@ pub fn block_has_target(kind: &BlockKind) -> bool {
             .iter()
             .any(|item| item.blocks.iter().any(block_has_target)),
         BlockKind::Quote(blocks)
+        | BlockKind::Alert { blocks, .. }
         | BlockKind::Container {
             children: blocks, ..
         } => blocks.iter().any(block_has_target),
@@ -690,6 +691,9 @@ fn layout_kind(
                 },
             );
             Ok(Extent { content, margin })
+        }
+        BlockKind::Alert { kind, blocks } => {
+            push_alert(context, *kind, blocks, x, y, width, style, output, margin)
         }
         BlockKind::List { start, items } => {
             push_list(context, *start, items, x, y, width, style, output, margin)
@@ -1314,6 +1318,61 @@ fn push_details(
         output.next_heading += headings;
         output.next_details += details;
     }
+    Ok(Extent { content, margin })
+}
+
+/// A GitHub alert: a quote whose bar and bold title (its kind) are drawn in the link colour, and
+/// whose content keeps the body colour rather than a quote's muted one.
+#[allow(clippy::too_many_arguments)]
+fn push_alert(
+    context: &LayoutContext<'_>,
+    kind: AlertKind,
+    blocks: &[BlockKind],
+    x: f32,
+    y: f32,
+    width: f32,
+    style: Style,
+    output: &mut Output<'_>,
+    margin: f32,
+) -> Result<Extent> {
+    let unit = context.fonts.unit();
+    let indent = 16.0 * unit;
+    let bar_index = output.ops.len();
+    let title = context.plain_layout(
+        kind.title(),
+        false,
+        context.fonts.body_size,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        (width - indent).max(1.0),
+    )?;
+    let title_height = metrics(&title)?.height.max(context.line_height);
+    output.ops.push(DrawOp::Text {
+        layout: title,
+        x: x + indent,
+        y,
+        role: ColorRole::Link,
+    });
+    let mut content = title_height;
+    if !blocks.is_empty() {
+        let top = y + title_height + 8.0 * unit;
+        let inner = layout_children(
+            context,
+            blocks,
+            x + indent,
+            top,
+            (width - indent).max(1.0),
+            style,
+            output,
+        )?;
+        content = top - y + inner;
+    }
+    output.ops.insert(
+        bar_index,
+        DrawOp::Fill {
+            rect: RectF::new(x, y, x + 4.0 * unit, y + content),
+            role: ColorRole::Link,
+        },
+    );
     Ok(Extent { content, margin })
 }
 
