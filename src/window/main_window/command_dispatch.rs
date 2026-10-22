@@ -481,17 +481,17 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
                 let _ = editor.reset_zoom();
             }
         }
-        CommandId::MarkdownPreviewCycle
-        | CommandId::MarkdownPreviewSide
-        | CommandId::MarkdownPreviewFull
-        | CommandId::MarkdownPreviewClose => {
+        CommandId::MarkdownViewCycle
+        | CommandId::MarkdownViewSource
+        | CommandId::MarkdownViewLive
+        | CommandId::MarkdownViewSplit
+        | CommandId::MarkdownViewPreview => {
             crate::window::preview_host::run_command(hwnd, command)
         }
         CommandId::MarkdownBold
         | CommandId::MarkdownItalic
         | CommandId::MarkdownCode
         | CommandId::MarkdownLink => crate::window::markdown_host::format(hwnd, command),
-        CommandId::MarkdownToggleLive => crate::window::live_host::toggle(hwnd),
         CommandId::ToggleSidebar => crate::window::side_panel::toggle(hwnd),
         CommandId::FocusNextPane => cycle_focus(hwnd, false),
         CommandId::FocusPreviousPane => cycle_focus(hwnd, true),

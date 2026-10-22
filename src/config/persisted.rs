@@ -2,6 +2,7 @@ use super::defaults::{
     MAX_PREVIEW_LINE_HEIGHT, MIN_PREVIEW_LINE_HEIGHT, clamp_sidebar_width, default_settings,
 };
 use crate::Result;
+use crate::preview::ViewMode;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -149,8 +150,8 @@ pub struct Settings {
     pub capture_hotkey: String,
     /// Whether a capture records the title of the window in front (spec §10.4).
     pub capture_source: bool,
-    /// Whether Markdown tabs open in the Live view (2026-10-18 Live editor design spec §4).
-    pub markdown_live_default: bool,
+    /// The view mode a Markdown tab opens in (2026-10-22 view modes spec §2).
+    pub markdown_view: crate::preview::ViewMode,
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
     /// `None` opens it at its natural size. Saved when a resize drag ends.
     pub settings_size: Option<(u16, u16)>,
@@ -245,8 +246,18 @@ impl Settings {
         if let Some(capture_source) = delta.capture_source {
             self.capture_source = capture_source;
         }
-        if let Some(live) = delta.markdown_live_default {
-            self.markdown_live_default = live;
+        // The old Live switch counts only where the new key is absent.
+        if let Some(mode) = delta
+            .markdown_view
+            .or(delta.markdown_live_default.map(|live| {
+                if live {
+                    ViewMode::Live
+                } else {
+                    ViewMode::Source
+                }
+            }))
+        {
+            self.markdown_view = mode;
         }
         for (id, value) in &delta.key_overrides {
             self.key_overrides.insert(id.clone(), value.clone());
@@ -295,6 +306,8 @@ pub struct SettingsDelta {
     pub always_on_top: Option<bool>,
     pub capture_hotkey: Option<String>,
     pub capture_source: Option<bool>,
+    pub markdown_view: Option<ViewMode>,
+    /// `markdown_live_default=`, read as `markdown_view=live` or `source` when that key is absent.
     pub markdown_live_default: Option<bool>,
     pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
@@ -308,7 +321,8 @@ pub struct SettingsDelta {
 /// `reload_changed_files` (`auto` or `ask`), `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
 /// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line`, `always_on_top`, `capture_hotkey` (any text; empty turns it off),
-/// `capture_source` and `markdown_live_default` are recognized.
+/// `capture_source`, `markdown_view` and `markdown_live_default` are recognized.
+/// `markdown_view` is `source`, `live`, `split` or `preview` (any case).
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
@@ -508,6 +522,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         "capture_hotkey" => delta.capture_hotkey = Some(value.to_owned()),
         "capture_source" => match parse_bool(value) {
             Some(capture_source) => delta.capture_source = Some(capture_source),
+            None => warn(delta, line_number, key, value),
+        },
+        "markdown_view" => match ViewMode::parse(value) {
+            Some(mode) => delta.markdown_view = Some(mode),
             None => warn(delta, line_number, key, value),
         },
         "markdown_live_default" => match parse_bool(value) {
@@ -1365,13 +1383,35 @@ mod tests {
     }
 
     #[test]
-    fn markdown_live_default_parses_as_a_bool_and_defaults_off() {
+    fn markdown_view_parses_its_four_tokens_and_defaults_to_source() {
         let mut settings = default_settings();
-        assert!(!settings.markdown_live_default);
-        let delta = parse("markdown_live_default=yes\n");
+        assert_eq!(settings.markdown_view, ViewMode::Source);
+        let delta = parse(
+            "markdown_view=Split
+",
+        );
         assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
         settings.apply_delta(&delta);
-        assert!(settings.markdown_live_default);
+        assert_eq!(settings.markdown_view, ViewMode::Split);
+        assert_eq!(parse("markdown_view=full").warnings.len(), 1);
+    }
+
+    #[test]
+    fn markdown_live_default_still_opens_live_unless_markdown_view_is_set() {
+        // Break caught: an existing `markdown_live_default=yes` silently going back to Source.
+        let mut settings = default_settings();
+        settings.apply_delta(&parse(
+            "markdown_live_default=yes
+",
+        ));
+        assert_eq!(settings.markdown_view, ViewMode::Live);
+        let mut settings = default_settings();
+        settings.apply_delta(&parse(
+            "markdown_live_default=yes
+markdown_view=preview
+",
+        ));
+        assert_eq!(settings.markdown_view, ViewMode::Preview);
         assert_eq!(parse("markdown_live_default=maybe").warnings.len(), 1);
     }
 

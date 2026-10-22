@@ -1,7 +1,7 @@
 use crate::document::DocumentId;
+use crate::preview::ViewMode;
 use crate::window::commands::CommandId;
 use crate::window::group_strip::StripLayout;
-use crate::window::preview_buttons::PreviewButton;
 use crate::window::tabs::{TabSelection, TabView, TabViewSnapshot};
 use crate::window::titlebar::{Point, Rect, Size, TitleBarLayout};
 use std::ffi::c_void;
@@ -15,14 +15,14 @@ use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{
     LresultFromObject, NAVDIR_FIRSTCHILD, NAVDIR_LASTCHILD, NAVDIR_NEXT, NAVDIR_PREVIOUS,
-    ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TITLEBAR,
-    SELFLAG_TAKESELECTION,
+    ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_RADIOBUTTON,
+    ROLE_SYSTEM_TITLEBAR, SELFLAG_TAKESELECTION,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
-    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, SendMessageW, WM_APP, WM_COMMAND,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSCOMMAND,
+    STATE_SYSTEM_CHECKED, STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, SendMessageW, WM_APP,
+    WM_COMMAND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSCOMMAND,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -67,13 +67,16 @@ pub(crate) enum ProviderKind {
 const MINIMIZE: &str = "Minimize";
 const MAXIMIZE: &str = "Maximize";
 const CLOSE: &str = "Close";
-const PREVIEW_SIDE: &str = "Open preview to the side";
-const PREVIEW_FULL: &str = "Open preview";
+
+/// The view mode a button child named `name` selects, for a segment of the view control.
+fn view_mode_named(name: &str) -> Option<ViewMode> {
+    ViewMode::ALL.into_iter().find(|mode| mode.label() == name)
+}
 
 pub(crate) fn accessible_children(
     kind: ProviderKind,
     tab_titles: &[&str],
-    preview_buttons: bool,
+    view_buttons: &[ViewMode],
 ) -> Vec<AccessibleChild> {
     match kind {
         ProviderKind::TitleBar => [MINIMIZE, MAXIMIZE, CLOSE]
@@ -85,12 +88,11 @@ pub(crate) fn accessible_children(
                 .iter()
                 .map(|title| AccessibleChild::Tab((*title).to_owned()))
                 .collect::<Vec<_>>();
-            if preview_buttons {
-                children.extend([
-                    AccessibleChild::Button(PREVIEW_SIDE),
-                    AccessibleChild::Button(PREVIEW_FULL),
-                ]);
-            }
+            children.extend(
+                view_buttons
+                    .iter()
+                    .map(|mode| AccessibleChild::Button(mode.label())),
+            );
             children
         }
     }
@@ -512,6 +514,9 @@ unsafe extern "system" fn accessible_get_role(
         let children = current_children(item);
         match accessible_child(&children, &child).map(|(_, child)| child) {
             Some(AccessibleChild::Tab(_)) => ROLE_SYSTEM_PAGETAB,
+            Some(AccessibleChild::Button(name)) if view_mode_named(name).is_some() => {
+                ROLE_SYSTEM_RADIOBUTTON
+            }
             Some(AccessibleChild::Button(_)) => ROLE_SYSTEM_PUSHBUTTON,
             None => return E_INVALIDARG,
         }
@@ -545,7 +550,14 @@ unsafe extern "system" fn accessible_get_state(
                 };
                 STATE_SYSTEM_SELECTABLE | STATE_SYSTEM_FOCUSABLE | selected
             }
-            Some((_, AccessibleChild::Button(_))) => STATE_SYSTEM_FOCUSABLE,
+            Some((_, AccessibleChild::Button(name))) => {
+                let current = item.view.snapshot().view_buttons.current;
+                if view_mode_named(name).is_some_and(|mode| mode == current) {
+                    STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_CHECKED
+                } else {
+                    STATE_SYSTEM_FOCUSABLE
+                }
+            }
             None => return E_INVALIDARG,
         }
     };
@@ -678,11 +690,10 @@ unsafe extern "system" fn accessible_select(
     if selected != 0 { S_OK } else { E_INVALIDARG }
 }
 
-/// A floating preview button, whose action is a click at its centre.
+/// A segment of the floating view control, whose action is a click at its centre.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClickTarget {
-    PreviewSide,
-    PreviewFull,
+    View(ViewMode),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -706,9 +717,8 @@ fn accessible_default_action(
             MINIMIZE => Some(AccessibleDefaultAction::SystemCommand(SC_MINIMIZE as usize)),
             MAXIMIZE => Some(AccessibleDefaultAction::SystemCommand(SC_MAXIMIZE as usize)),
             CLOSE => Some(AccessibleDefaultAction::SystemCommand(SC_CLOSE as usize)),
-            PREVIEW_SIDE => Some(AccessibleDefaultAction::Click(ClickTarget::PreviewSide)),
-            PREVIEW_FULL => Some(AccessibleDefaultAction::Click(ClickTarget::PreviewFull)),
-            _ => None,
+            name => view_mode_named(name)
+                .map(|mode| AccessibleDefaultAction::Click(ClickTarget::View(mode))),
         },
     }
 }
@@ -842,15 +852,16 @@ unsafe extern "system" fn accessible_do_default_action(
             PostMessageW(item.hwnd, WM_COMMAND, command as usize, 0)
         },
         Some(AccessibleDefaultAction::Click(target)) => {
-            // The preview buttons are their own window, floating over the group's content.
-            let button = match target {
-                ClickTarget::PreviewSide => PreviewButton::Side,
-                ClickTarget::PreviewFull => PreviewButton::Full,
-            };
-            let Some(window) = crate::window::preview_buttons::find(item.hwnd) else {
+            // The view control is its own window, floating over the group's content.
+            let ClickTarget::View(mode) = target;
+            let segments = item.view.snapshot().view_buttons.segments;
+            let (Some(window), Some(index)) = (
+                crate::window::preview_buttons::find(item.hwnd),
+                segments.iter().position(|segment| *segment == mode),
+            ) else {
                 return E_INVALIDARG;
             };
-            let rect = crate::window::preview_buttons::button_rect(window, button);
+            let rect = crate::window::preview_buttons::button_rect(window, index);
             let center = rect.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
             // A whole click: the strip acts only on a release over the target it was pressed on.
@@ -975,16 +986,13 @@ fn child_client_rect(
                 tabs,
                 item.selection.scroll_offset(),
             );
-            // The preview buttons float over the group's content (spec §4.1).
+            // The view control floats over the group's content (spec §4.1); its segments follow
+            // the tabs.
             match child {
                 AccessibleChild::Tab(_) => layout.tab(index),
-                AccessibleChild::Button(PREVIEW_SIDE) => {
-                    crate::window::preview_buttons::rect_in_group(item.hwnd, PreviewButton::Side)
+                AccessibleChild::Button(_) => {
+                    crate::window::preview_buttons::rect_in_group(item.hwnd, index - tabs)
                 }
-                AccessibleChild::Button(PREVIEW_FULL) => {
-                    crate::window::preview_buttons::rect_in_group(item.hwnd, PreviewButton::Full)
-                }
-                AccessibleChild::Button(_) => None,
             }
         }
     }
@@ -1000,7 +1008,7 @@ fn children_from_view(kind: ProviderKind, view: &TabViewSnapshot) -> Vec<Accessi
         .iter()
         .map(|tab| tab.title.as_str())
         .collect::<Vec<_>>();
-    accessible_children(kind, &titles, view.preview_buttons)
+    accessible_children(kind, &titles, view.view_buttons.segments)
 }
 
 #[cfg(test)]
@@ -1012,6 +1020,7 @@ mod tests {
         accessible_get_state, accessible_location, accessible_select,
     };
     use crate::document::{Document, DocumentId};
+    use crate::preview::ViewMode;
     use crate::window::tabs::Tabs;
     use windows_sys::Win32::Foundation::{
         E_INVALIDARG, S_FALSE, S_OK, SysFreeString, SysStringLen,
@@ -1051,23 +1060,26 @@ mod tests {
     fn the_group_strip_lists_its_tabs_and_strip_buttons_only() {
         // Break caught: Narrator on the strip announcing caption buttons, or missing the tabs
         // after they moved out of the title bar.
-        let children = accessible_children(ProviderKind::GroupStrip, &["a", "b"], true);
+        let children = accessible_children(ProviderKind::GroupStrip, &["a", "b"], &ViewMode::ALL);
         assert_eq!(children[0], AccessibleChild::Tab("a".into()));
         assert_eq!(children[1], AccessibleChild::Tab("b".into()));
         let names = children
             .iter()
             .filter_map(AccessibleChild::button_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["Open preview to the side", "Open preview"]);
-        let without = accessible_children(ProviderKind::GroupStrip, &["a"], false);
+        assert_eq!(names, vec!["Source", "Live", "Split", "Preview"]);
+        let without = accessible_children(ProviderKind::GroupStrip, &["a"], &[]);
         assert_eq!(without.len(), 1);
+        // Break caught: an SVG tab announcing a Live segment it does not show.
+        let svg = accessible_children(ProviderKind::GroupStrip, &["a"], &ViewMode::SVG);
+        assert_eq!(svg.len(), 4);
     }
 
     #[test]
     fn the_title_bar_lists_the_caption_buttons() {
         // Break caught: caption buttons unreachable by Narrator, tabs listed twice, once per
         // provider, or a removed app menu button still announced.
-        let children = accessible_children(ProviderKind::TitleBar, &["a"], true);
+        let children = accessible_children(ProviderKind::TitleBar, &["a"], &ViewMode::ALL);
         let names = children
             .iter()
             .filter_map(AccessibleChild::button_name)
@@ -1198,7 +1210,7 @@ mod tests {
     fn default_actions_route_each_button_to_its_real_action() {
         // Break caught: Narrator's default action on a button doing nothing, or pressing the
         // wrong one, now that the buttons are split over two providers.
-        let strip = accessible_children(ProviderKind::GroupStrip, &["Untitled"], true);
+        let strip = accessible_children(ProviderKind::GroupStrip, &["Untitled"], &ViewMode::SVG);
         assert_eq!(
             accessible_default_action(&strip, 1),
             Some(AccessibleDefaultAction::Command(
@@ -1207,16 +1219,26 @@ mod tests {
         );
         assert_eq!(
             accessible_default_action(&strip, 2),
-            Some(AccessibleDefaultAction::Click(ClickTarget::PreviewSide))
+            Some(AccessibleDefaultAction::Click(ClickTarget::View(
+                ViewMode::Source
+            )))
         );
         assert_eq!(
             accessible_default_action(&strip, 3),
-            Some(AccessibleDefaultAction::Click(ClickTarget::PreviewFull))
+            Some(AccessibleDefaultAction::Click(ClickTarget::View(
+                ViewMode::Split
+            )))
+        );
+        assert_eq!(
+            accessible_default_action(&strip, 4),
+            Some(AccessibleDefaultAction::Click(ClickTarget::View(
+                ViewMode::Preview
+            )))
         );
         assert_eq!(accessible_default_action(&strip, 0), None);
-        assert_eq!(accessible_default_action(&strip, 4), None);
+        assert_eq!(accessible_default_action(&strip, 5), None);
 
-        let title = accessible_children(ProviderKind::TitleBar, &[], false);
+        let title = accessible_children(ProviderKind::TitleBar, &[], &[]);
         assert_eq!(
             accessible_default_action(&title, 1),
             Some(AccessibleDefaultAction::SystemCommand(

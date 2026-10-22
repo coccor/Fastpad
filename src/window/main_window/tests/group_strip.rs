@@ -443,24 +443,27 @@ fn the_floating_side_button_opens_and_closes_the_side_preview() {
         .set_active_language(crate::document::Language::Markdown);
     crate::window::preview_host::sync_visibility(window.hwnd);
     let hwnd = crate::window::preview_buttons::hwnd(window.hwnd).unwrap();
-    let side = crate::window::preview_buttons::button_rect(
-        hwnd,
-        crate::window::preview_buttons::PreviewButton::Side,
-    )
-    .center();
-    let click = || unsafe {
-        SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(side.x, side.y));
-        SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(side.x, side.y));
+    // Segments: Source, Live, Split, Preview.
+    let click = |index| unsafe {
+        let at = crate::window::preview_buttons::button_rect(hwnd, index).center();
+        SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(at.x, at.y));
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(at.x, at.y));
     };
-    click();
+    click(2);
     assert_eq!(
         crate::window::preview_host::mode(window.hwnd),
-        crate::preview::PreviewMode::Split
+        crate::preview::ViewMode::Split
     );
-    click();
+    // The current segment stays selected.
+    click(2);
     assert_eq!(
         crate::window::preview_host::mode(window.hwnd),
-        crate::preview::PreviewMode::Off
+        crate::preview::ViewMode::Split
+    );
+    click(0);
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        crate::preview::ViewMode::Source
     );
 }
 

@@ -53,7 +53,15 @@ pub(crate) struct TabView {
 pub(crate) struct TabViewSnapshot {
     pub(crate) revision: u64,
     pub(crate) tabs: Vec<TabViewTab>,
-    pub(crate) preview_buttons: bool,
+    pub(crate) view_buttons: ViewButtons,
+}
+
+/// The floating view control as screen readers see it (2026-10-22 view modes spec §6): its
+/// segments, none while it is hidden, and the mode that is checked.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ViewButtons {
+    pub(crate) segments: &'static [crate::preview::ViewMode],
+    pub(crate) current: crate::preview::ViewMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +76,7 @@ pub(crate) struct TabViewTab {
 struct TabViewState {
     revision: u64,
     tabs: Vec<TabViewTab>,
-    preview_buttons: bool,
+    view_buttons: ViewButtons,
 }
 
 impl TabView {
@@ -77,7 +85,7 @@ impl TabView {
             state: Arc::new(RwLock::new(TabViewState {
                 revision: 0,
                 tabs,
-                preview_buttons: false,
+                view_buttons: ViewButtons::default(),
             })),
         }
     }
@@ -87,7 +95,7 @@ impl TabView {
         TabViewSnapshot {
             revision: state.revision,
             tabs: state.tabs.clone(),
-            preview_buttons: state.preview_buttons,
+            view_buttons: state.view_buttons,
         }
     }
 
@@ -100,11 +108,11 @@ impl TabView {
         state.tabs = tabs;
     }
 
-    pub(crate) fn set_preview_buttons(&self, visible: bool) {
+    pub(crate) fn set_view_buttons(&self, buttons: ViewButtons) {
         self.state
             .write()
             .unwrap_or_else(|error| error.into_inner())
-            .preview_buttons = visible;
+            .view_buttons = buttons;
     }
 }
 
@@ -594,9 +602,9 @@ impl Tabs {
     }
 
     /// Whether `group`'s strip offers the preview buttons, for its accessibility provider.
-    pub(crate) fn set_preview_buttons_in(&self, group: GroupId, visible: bool) {
+    pub(crate) fn set_view_buttons_in(&self, group: GroupId, buttons: ViewButtons) {
         if let Some(group) = self.group(group) {
-            group.view.set_preview_buttons(visible);
+            group.view.set_view_buttons(buttons);
         }
     }
 

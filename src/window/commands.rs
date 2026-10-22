@@ -52,10 +52,10 @@ pub enum CommandId {
     ThemeCatppuccinFrappe,
     ThemeCatppuccinMacchiato,
     ThemeCatppuccinMocha,
-    MarkdownPreviewCycle,
-    MarkdownPreviewSide,
-    MarkdownPreviewFull,
-    MarkdownPreviewClose,
+    MarkdownViewCycle,
+    MarkdownViewSplit,
+    MarkdownViewPreview,
+    MarkdownViewSource,
     ToggleRestoreSession,
     ToggleNotesMode,
     OpenFolder,
@@ -180,8 +180,8 @@ pub enum CommandId {
     // Attachments in notes (second brain phase 1 spec §10.5).
     NotesPasteImage = 280,
     NotesInsertAttachment = 281,
-    // The Live Markdown view (2026-10-18 Live editor design spec §4).
-    MarkdownToggleLive = 282,
+    // The Live view mode (2026-10-18 Live editor design spec §4, 2026-10-22 view modes spec).
+    MarkdownViewLive = 282,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -269,7 +269,7 @@ pub const TEXT_COMMANDS: [CommandId; 63] = [
     CommandId::MarkdownItalic,
     CommandId::MarkdownCode,
     CommandId::MarkdownLink,
-    CommandId::MarkdownToggleLive,
+    CommandId::MarkdownViewLive,
 ];
 
 /// Where a command's key bindings apply (Markdown design spec §9): Markdown bindings are tried
@@ -291,10 +291,10 @@ impl CommandId {
         }
     }
 
-    /// Commands offered only for Markdown tabs (palette). The Live toggle is one, though its key
-    /// is global so it can say why it does nothing elsewhere.
+    /// Commands offered only for Markdown tabs (palette). The Live view mode is one, though its
+    /// key is global so it can say why it does nothing elsewhere.
     pub const fn is_markdown_edit(self) -> bool {
-        matches!(self.scope(), Scope::Markdown) || matches!(self, Self::MarkdownToggleLive)
+        matches!(self.scope(), Scope::Markdown) || matches!(self, Self::MarkdownViewLive)
     }
 
     /// Commands that need the active tab's text, and so do nothing on an image tab.
@@ -396,13 +396,15 @@ impl CommandId {
         )
     }
 
-    pub const fn is_markdown_preview(self) -> bool {
+    /// The view mode commands (2026-10-22 view modes spec §2), offered for Markdown and SVG tabs.
+    pub const fn is_markdown_view(self) -> bool {
         matches!(
             self,
-            Self::MarkdownPreviewCycle
-                | Self::MarkdownPreviewSide
-                | Self::MarkdownPreviewFull
-                | Self::MarkdownPreviewClose
+            Self::MarkdownViewCycle
+                | Self::MarkdownViewSource
+                | Self::MarkdownViewLive
+                | Self::MarkdownViewSplit
+                | Self::MarkdownViewPreview
         )
     }
 
@@ -595,10 +597,10 @@ impl TryFrom<u16> for CommandId {
             CommandId::ThemeCatppuccinFrappe,
             CommandId::ThemeCatppuccinMacchiato,
             CommandId::ThemeCatppuccinMocha,
-            CommandId::MarkdownPreviewCycle,
-            CommandId::MarkdownPreviewSide,
-            CommandId::MarkdownPreviewFull,
-            CommandId::MarkdownPreviewClose,
+            CommandId::MarkdownViewCycle,
+            CommandId::MarkdownViewSplit,
+            CommandId::MarkdownViewPreview,
+            CommandId::MarkdownViewSource,
             CommandId::ToggleRestoreSession,
             CommandId::ToggleNotesMode,
             CommandId::OpenFolder,
@@ -700,7 +702,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotesEditNotebookSettings,
             CommandId::NotesPasteImage,
             CommandId::NotesInsertAttachment,
-            CommandId::MarkdownToggleLive,
+            CommandId::MarkdownViewLive,
         ];
         COMMANDS
             .into_iter()
@@ -1001,19 +1003,13 @@ mod tests {
 
     #[test]
     fn markdown_preview_commands_have_stable_values() {
-        assert_eq!(
-            CommandId::try_from(152),
-            Ok(CommandId::MarkdownPreviewCycle)
-        );
-        assert_eq!(CommandId::try_from(153), Ok(CommandId::MarkdownPreviewSide));
-        assert_eq!(CommandId::try_from(154), Ok(CommandId::MarkdownPreviewFull));
-        assert_eq!(
-            CommandId::try_from(155),
-            Ok(CommandId::MarkdownPreviewClose)
-        );
-        assert!(CommandId::MarkdownPreviewSide.needs_document());
-        assert!(CommandId::MarkdownPreviewClose.is_markdown_preview());
-        assert!(!CommandId::Save.is_markdown_preview());
+        assert_eq!(CommandId::try_from(152), Ok(CommandId::MarkdownViewCycle));
+        assert_eq!(CommandId::try_from(153), Ok(CommandId::MarkdownViewSplit));
+        assert_eq!(CommandId::try_from(154), Ok(CommandId::MarkdownViewPreview));
+        assert_eq!(CommandId::try_from(155), Ok(CommandId::MarkdownViewSource));
+        assert!(CommandId::MarkdownViewSplit.needs_document());
+        assert!(CommandId::MarkdownViewSource.is_markdown_view());
+        assert!(!CommandId::Save.is_markdown_view());
     }
 
     #[test]
@@ -1053,9 +1049,9 @@ mod tests {
             Ok(CommandId::NotesInsertAttachment)
         );
         assert!(CommandId::NotesPasteImage.needs_document());
-        assert_eq!(CommandId::try_from(282), Ok(CommandId::MarkdownToggleLive));
-        assert_eq!(CommandId::MarkdownToggleLive.scope(), Scope::Global);
-        assert!(CommandId::MarkdownToggleLive.is_markdown_edit());
+        assert_eq!(CommandId::try_from(282), Ok(CommandId::MarkdownViewLive));
+        assert_eq!(CommandId::MarkdownViewLive.scope(), Scope::Global);
+        assert!(CommandId::MarkdownViewLive.is_markdown_edit());
         assert!(CommandId::try_from(283).is_err());
     }
 

@@ -525,7 +525,7 @@ fn an_svg_opens_as_text_and_the_preview_renders_and_follows_edits() {
     pump_pending();
     assert!(!main.with_app(|app| app.tabs.active().unwrap().is_image()));
     assert!(window::preview_host::buttons_visible(main.hwnd));
-    main.command(CommandId::MarkdownPreviewCycle);
+    main.command(CommandId::MarkdownViewCycle);
     let view = main
         .with_app(|app| app.active_group().unwrap().preview.svg_view)
         .expect("svg view");

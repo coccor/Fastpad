@@ -1,4 +1,5 @@
-//! The main window's half of the Markdown preview: the mode, the split layout and its divider,
+//! The main window's half of the Markdown preview: each tab's view mode (2026-10-22 view modes
+//! spec), the split layout and its divider,
 //! loading documents into the preview window, and (in later tasks) the debounced update pipeline,
 //! scroll sync, and link actions. Every entry point takes the main window handle. No function holds
 //! an `App` borrow while calling Win32 APIs that can send messages back to the main window
@@ -17,16 +18,16 @@ use crate::preview::layout::PreviewFonts;
 use crate::preview::links::{LinkAction, classify_link};
 use crate::preview::view::PreviewView;
 use crate::preview::{
-    LIVE_UPDATE_LIMIT, PREVIEW_UPDATE_DELAY_MS, PreviewMode, WORKER_PARSE_THRESHOLD,
+    LIVE_UPDATE_LIMIT, PREVIEW_UPDATE_DELAY_MS, ViewMode, WORKER_PARSE_THRESHOLD,
 };
 use crate::window::WM_FASTPAD_PREVIEW_PARSED;
 use crate::window::commands::CommandId;
 use crate::window::design::metrics::scale;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
-use crate::window::preview_buttons::PreviewButton;
 use crate::window::split_tree::GroupId;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -57,7 +58,10 @@ pub(crate) enum ScrollOrigin {
 }
 
 pub(crate) struct PreviewHost {
-    pub(crate) mode: PreviewMode,
+    /// The view mode chosen for each of the group's tabs; absent follows the default.
+    pub(crate) modes: HashMap<DocumentId, ViewMode>,
+    /// Each tab's last mode other than Preview, where Escape in Preview goes back to.
+    last_editing: HashMap<DocumentId, ViewMode>,
     pub(crate) view: Option<PreviewView>,
     /// The SVG preview (image preview spec §8): an image view in the preview slot of an SVG tab.
     pub(crate) svg_view: Option<ImageView>,
@@ -88,7 +92,8 @@ impl std::fmt::Debug for PreviewHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreviewHost")
-            .field("mode", &self.mode)
+            .field("modes", &self.modes)
+            .field("last_editing", &self.last_editing)
             .field("view", &self.view)
             .field("svg_view", &self.svg_view)
             .field("svg_document", &self.svg_document)
@@ -111,7 +116,8 @@ impl std::fmt::Debug for PreviewHost {
 impl Default for PreviewHost {
     fn default() -> Self {
         Self {
-            mode: PreviewMode::Off,
+            modes: HashMap::new(),
+            last_editing: HashMap::new(),
             view: None,
             svg_view: None,
             svg_document: None,
@@ -174,18 +180,18 @@ impl Eq for ContentRects {}
 
 pub(crate) fn content_rects(
     area: RECT,
-    mode: PreviewMode,
+    mode: ViewMode,
     shown: bool,
     ratio: f32,
     dpi: u32,
 ) -> ContentRects {
     match (mode, shown) {
-        (PreviewMode::Full, true) => ContentRects {
+        (ViewMode::Preview, true) => ContentRects {
             editor: None,
             divider: None,
             preview: Some(area),
         },
-        (PreviewMode::Split, true) => {
+        (ViewMode::Split, true) => {
             let divider = scale(DIVIDER_WIDTH_AT_96_DPI, dpi);
             let usable = (area.right - area.left - divider).max(0);
             let editor_right =
@@ -281,8 +287,111 @@ pub(crate) fn with_group_host<R>(
         .and_then(|mut app| Some(action(&mut unsafe { app.as_mut() }.group_mut(id)?.preview)))
 }
 
-pub(crate) fn mode(hwnd: HWND) -> PreviewMode {
-    with_host(hwnd, |host| host.mode).unwrap_or_default()
+/// The target group's active tab's view mode.
+pub(crate) fn mode(hwnd: HWND) -> ViewMode {
+    target_group(hwnd).map_or(ViewMode::Source, |id| group_mode(hwnd, id))
+}
+
+/// Group `id`'s active tab's view mode: its choice, else the default for its language, as far as
+/// the tab can show it. A tab that is neither Markdown nor SVG is always Source.
+pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
+    let Some((document, language, _)) = group_document(hwnd, id) else {
+        return ViewMode::Source;
+    };
+    let chosen = with_group_host(hwnd, id, |host| host.modes.get(&document).copied()).flatten();
+    let default = match language {
+        Language::Markdown => unsafe { host_window::app_ptr(hwnd) }.map_or(
+            ViewMode::Source,
+            |app| unsafe { app.as_ref() }.settings.markdown_view,
+        ),
+        _ => ViewMode::Source,
+    };
+    let mode = chosen.unwrap_or(default);
+    // The default skips a file over the Live limit silently; a choice was checked when made.
+    if available(hwnd, id, language, mode) {
+        mode
+    } else {
+        ViewMode::Source
+    }
+}
+
+/// Whether group `id`'s active tab, in `language`, can show `mode`.
+fn available(hwnd: HWND, id: GroupId, language: Language, mode: ViewMode) -> bool {
+    match language {
+        Language::Markdown => {
+            mode != ViewMode::Live
+                || host_window::group_editor(hwnd, id)
+                    .and_then(|editor| editor.length().ok())
+                    .unwrap_or(0)
+                    <= crate::live::LIVE_MAX_BYTES
+        }
+        Language::Svg => mode != ViewMode::Live,
+        _ => mode == ViewMode::Source,
+    }
+}
+
+/// Records `mode` for group `id`'s active tab without showing it: the caller syncs.
+pub(crate) fn choose(hwnd: HWND, id: GroupId, mode: ViewMode) {
+    let Some((document, ..)) = group_document(hwnd, id) else {
+        return;
+    };
+    with_group_host(hwnd, id, |host| {
+        host.modes.insert(document, mode);
+        if mode != ViewMode::Preview {
+            host.last_editing.insert(document, mode);
+        }
+    });
+}
+
+/// Group `id`'s active tab's last mode other than Preview; Source when it had none.
+fn last_editing(hwnd: HWND, id: GroupId) -> ViewMode {
+    group_document(hwnd, id)
+        .and_then(|(document, ..)| {
+            with_group_host(hwnd, id, |host| host.last_editing.get(&document).copied()).flatten()
+        })
+        .unwrap_or(ViewMode::Source)
+}
+
+/// Document `document` was moved or copied from group `from` to group `to`: its mode goes too
+/// (view modes spec §2).
+pub(crate) fn carry_mode(hwnd: HWND, from: GroupId, document: DocumentId, to: GroupId) {
+    let Some((mode, last)) = with_group_host(hwnd, from, |host| {
+        (
+            host.modes.get(&document).copied(),
+            host.last_editing.get(&document).copied(),
+        )
+    }) else {
+        return;
+    };
+    with_group_host(hwnd, to, |host| {
+        if let Some(mode) = mode {
+            host.modes.insert(document, mode);
+        }
+        if let Some(last) = last {
+            host.last_editing.insert(document, last);
+        }
+    });
+}
+
+/// Drops the modes of documents no longer among group `id`'s tabs.
+fn prune_modes(hwnd: HWND, id: GroupId) {
+    let Some(mut app) = (unsafe { host_window::app_ptr(hwnd) }) else {
+        return;
+    };
+    let app = unsafe { app.as_mut() };
+    let Some(open) = app.tabs.group(id).map(|tabs| tabs.document_ids()) else {
+        return;
+    };
+    if let Some(group) = app.group_mut(id) {
+        group
+            .preview
+            .modes
+            .retain(|document, _| open.contains(document));
+        group
+            .preview
+            .last_editing
+            .retain(|document, _| open.contains(document));
+    }
 }
 
 pub(crate) fn view(hwnd: HWND) -> Option<PreviewView> {
@@ -358,7 +467,7 @@ fn svg_view(hwnd: HWND) -> Option<ImageView> {
 }
 
 pub(crate) fn preview_shown(hwnd: HWND) -> bool {
-    mode(hwnd) != PreviewMode::Off
+    mode(hwnd).shows_preview()
         && buttons_visible(hwnd)
         && if active_is_svg(hwnd) {
             svg_view(hwnd).is_some()
@@ -368,7 +477,7 @@ pub(crate) fn preview_shown(hwnd: HWND) -> bool {
 }
 
 pub(crate) fn full_view_hwnd(hwnd: HWND) -> Option<HWND> {
-    if mode(hwnd) != PreviewMode::Full || !preview_shown(hwnd) {
+    if mode(hwnd) != ViewMode::Preview || !preview_shown(hwnd) {
         return None;
     }
     if active_is_svg(hwnd) {
@@ -422,9 +531,7 @@ pub(crate) fn owns_view(hwnd: HWND, window: HWND) -> bool {
 /// Zooms the SVG preview while it has the keyboard focus; false otherwise, so the editor zooms.
 pub(crate) fn zoom_svg(hwnd: HWND, command: CommandId) -> bool {
     let Some(view) = svg_view(hwnd).filter(|view| {
-        active_is_svg(hwnd)
-            && mode(hwnd) != PreviewMode::Off
-            && unsafe { GetFocus() } == view.hwnd()
+        active_is_svg(hwnd) && mode(hwnd).shows_preview() && unsafe { GetFocus() } == view.hwnd()
     }) else {
         return false;
     };
@@ -439,58 +546,75 @@ pub(crate) fn zoom_svg(hwnd: HWND, command: CommandId) -> bool {
 
 pub(crate) fn run_command(hwnd: HWND, command: CommandId) {
     let next = match command {
-        CommandId::MarkdownPreviewCycle => match mode(hwnd) {
-            PreviewMode::Off => PreviewMode::Split,
-            PreviewMode::Split => PreviewMode::Full,
-            PreviewMode::Full => PreviewMode::Off,
-        },
-        CommandId::MarkdownPreviewSide => PreviewMode::Split,
-        CommandId::MarkdownPreviewFull => PreviewMode::Full,
-        CommandId::MarkdownPreviewClose => PreviewMode::Off,
+        CommandId::MarkdownViewCycle => {
+            let (Some(id), Some((_, language, _))) = (target_group(hwnd), active_document(hwnd))
+            else {
+                return;
+            };
+            if !buttons_visible(hwnd) {
+                host_window::push_notice(hwnd, NOT_MARKDOWN_NOTICE.to_owned());
+                return;
+            }
+            mode(hwnd).next(|mode| available(hwnd, id, language, mode))
+        }
+        CommandId::MarkdownViewSource => ViewMode::Source,
+        CommandId::MarkdownViewLive => ViewMode::Live,
+        CommandId::MarkdownViewSplit => ViewMode::Split,
+        CommandId::MarkdownViewPreview => ViewMode::Preview,
         _ => return,
     };
     set_mode(hwnd, next);
 }
 
-/// The group strip's preview buttons toggle: the pressed button turns the preview off.
-pub(crate) fn click_button(hwnd: HWND, button: PreviewButton) {
-    let button_mode = match button {
-        PreviewButton::Side => PreviewMode::Split,
-        PreviewButton::Full => PreviewMode::Full,
-    };
-    set_mode(
-        hwnd,
-        if mode(hwnd) == button_mode {
-            PreviewMode::Off
-        } else {
-            button_mode
-        },
-    );
-}
-
-/// Escape in group `id`'s Full preview goes back to Split.
+/// Escape in group `id`'s Preview goes back to the tab's last editing mode.
 pub(crate) fn escape(hwnd: HWND, id: GroupId) {
     in_group(id, || {
-        if mode(hwnd) == PreviewMode::Full {
-            set_mode(hwnd, PreviewMode::Split);
+        if mode(hwnd) == ViewMode::Preview {
+            set_mode(hwnd, last_editing(hwnd, id));
         }
     });
 }
 
-pub(crate) fn set_mode(hwnd: HWND, next: PreviewMode) {
-    if next != PreviewMode::Off && !buttons_visible(hwnd) {
-        host_window::push_notice(hwnd, NOT_MARKDOWN_NOTICE.to_owned());
+/// `set_mode` for group `id`.
+pub(crate) fn set_group_mode(hwnd: HWND, id: GroupId, next: ViewMode) {
+    in_group(id, || set_mode(hwnd, next));
+}
+
+/// Shows the target group's active tab in `next` (a menu item, a key, a segment of the floating
+/// control), with a notice when it cannot be shown so.
+pub(crate) fn set_mode(hwnd: HWND, next: ViewMode) {
+    let (Some(id), Some((_, language, _))) = (target_group(hwnd), active_document(hwnd)) else {
         return;
+    };
+    match (next, language) {
+        (ViewMode::Source, _) => {}
+        (ViewMode::Live, Language::Markdown) if !available(hwnd, id, language, next) => {
+            host_window::push_notice(hwnd, crate::window::live_host::TOO_LARGE_NOTICE.to_owned());
+            return;
+        }
+        (ViewMode::Live, Language::Markdown) => {}
+        (ViewMode::Live, _) => {
+            host_window::push_notice(
+                hwnd,
+                crate::window::live_host::NOT_MARKDOWN_NOTICE.to_owned(),
+            );
+            return;
+        }
+        (_, Language::Markdown | Language::Svg) => {}
+        _ => {
+            host_window::push_notice(hwnd, NOT_MARKDOWN_NOTICE.to_owned());
+            return;
+        }
     }
     let previous = mode(hwnd);
-    with_host(hwnd, |host| host.mode = next);
-    if next == PreviewMode::Off {
+    choose(hwnd, id, next);
+    if !next.shows_preview() {
         close_view(hwnd);
     }
     sync_visibility(hwnd);
     let focus = match (previous, next) {
-        (_, PreviewMode::Full) => full_view_hwnd(hwnd),
-        (PreviewMode::Full, _) => text_hwnd(hwnd),
+        (_, ViewMode::Preview) => full_view_hwnd(hwnd),
+        (ViewMode::Preview, _) => text_hwnd(hwnd),
         _ => None,
     };
     if let Some(target) = focus {
@@ -620,18 +744,18 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
     let svg = active_is_svg(hwnd);
     let markdown = buttons_visible(hwnd) && !svg;
     let target = target_group(hwnd);
-    if let (Some(app), Some(id)) = (unsafe { host_window::app_ptr(hwnd) }, target) {
-        unsafe { app.as_ref() }
-            .tabs
-            .set_preview_buttons_in(id, markdown || svg);
+    if let Some(id) = target {
+        prune_modes(hwnd, id);
     }
     let wanted = mode(hwnd);
     let mut view = view(hwnd);
-    if wanted != PreviewMode::Off && markdown && view.is_none() {
+    if wanted.shows_preview() && markdown && view.is_none() {
         match ensure_view(hwnd) {
             Ok(created) => view = Some(created),
             Err(error) => {
-                with_host(hwnd, |host| host.mode = PreviewMode::Off);
+                if let Some(id) = target {
+                    choose(hwnd, id, last_editing(hwnd, id));
+                }
                 host_window::push_notice(
                     hwnd,
                     format!("FastPad could not open the Markdown preview: {error}"),
@@ -639,9 +763,9 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
             }
         }
     }
-    let shown = wanted != PreviewMode::Off && markdown && view.is_some();
+    let shown = wanted.shows_preview() && markdown && view.is_some();
     if let Some(view) = view {
-        view.set_centered(wanted == PreviewMode::Full);
+        view.set_centered(wanted == ViewMode::Preview);
         if !shown {
             with_host(hwnd, |host| {
                 host.document = None;
@@ -663,11 +787,13 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
         }
     }
     let mut shown_svg = None;
-    if wanted != PreviewMode::Off && svg {
+    if wanted.shows_preview() && svg {
         match ensure_svg_view(hwnd) {
             Ok(view) => shown_svg = Some(view),
             Err(error) => {
-                with_host(hwnd, |host| host.mode = PreviewMode::Off);
+                if let Some(id) = target {
+                    choose(hwnd, id, last_editing(hwnd, id));
+                }
                 host_window::push_notice(
                     hwnd,
                     format!("FastPad could not open the SVG preview: {error}"),
@@ -689,7 +815,7 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
         }
     }
     let editor_hwnd = editor_hwnd(hwnd);
-    let hide_editor = (shown || shown_svg.is_some()) && wanted == PreviewMode::Full;
+    let hide_editor = (shown || shown_svg.is_some()) && wanted.hides_text();
     let focus_view = shown_svg
         .map(|view| view.hwnd())
         .or(view.map(|view| view.hwnd()));
@@ -710,6 +836,15 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
     {
         crate::window::live_host::show_text(hwnd, id, !hide_editor);
     }
+    if let (Some(app), Some(id)) = (unsafe { host_window::app_ptr(hwnd) }, target) {
+        let buttons = crate::window::tabs::ViewButtons {
+            segments: crate::window::preview_buttons::segments_for(hwnd, id),
+            current: group_mode(hwnd, id),
+        };
+        unsafe { app.as_ref() }
+            .tabs
+            .set_view_buttons_in(id, buttons);
+    }
     host_window::layout_editor_and_find_bar(hwnd);
     let parent = content_parent(hwnd);
     if parent != hwnd {
@@ -725,21 +860,22 @@ pub(crate) fn load_active_document(hwnd: HWND, force: bool) {
         return;
     };
     let started = Instant::now();
-    let (previous, mode) = with_host(hwnd, |host| {
+    let mode = mode(hwnd);
+    let previous = with_host(hwnd, |host| {
         let previous = host.document.replace(id);
         host.edits = EditLog::default();
         host.flush_pending = false;
         // Any worker parse still running describes older text.
         host.parse_generation += 1;
         host.full_parse_pending = false;
-        (previous, host.mode)
+        previous
     })
-    .unwrap_or((None, PreviewMode::Off));
+    .flatten();
     stop_timer_when_idle(hwnd);
     let length = editor.length().unwrap_or(0);
     // Full mode hides the editor, so its top line is stale: reloading the document the preview
     // already shows keeps the preview's own position there.
-    let top_line = if mode == PreviewMode::Full && previous == Some(id) {
+    let top_line = if mode == ViewMode::Preview && previous == Some(id) {
         view.top_line()
     } else {
         editor_top_line(&editor)
@@ -865,7 +1001,7 @@ fn install_parse(hwnd: HWND, payload: ParsedPreview) {
         ..
     } = payload;
     // Split follows the editor; Full mode hides the editor, so the preview keeps its own position.
-    let line = if mode(hwnd) == PreviewMode::Full {
+    let line = if mode(hwnd) == ViewMode::Preview {
         Some(full_mode_line.unwrap_or_else(|| view.top_line()))
     } else {
         editor(hwnd).map(|editor| editor_top_line(&editor))
@@ -1233,7 +1369,7 @@ fn follow_editor(hwnd: HWND) {
         std::mem::take(&mut host.scroll_origin) == ScrollOrigin::Preview
     })
     .unwrap_or(false);
-    if echo || mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
+    if echo || mode(hwnd) != ViewMode::Split || !preview_shown(hwnd) {
         return;
     }
     let (Some(view), Some(editor)) = (view(hwnd), editor(hwnd)) else {
@@ -1254,14 +1390,8 @@ pub(crate) fn preview_scrolled(hwnd: HWND, id: GroupId, line: usize) {
 }
 
 fn follow_preview(hwnd: HWND, line: usize) {
-    if mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
+    if mode(hwnd) != ViewMode::Split || !preview_shown(hwnd) {
         return;
-    }
-    // Live shows every line, so it takes the document line as it is. The hidden editor still
-    // follows below, keeping the place for a switch back to source; its deferred scroll
-    // notification clears the guard as a shown editor's does.
-    if let Some(id) = target_group(hwnd) {
-        crate::window::live_host::follow_preview(hwnd, id, line);
     }
     let Some(editor) = editor(hwnd) else {
         return;
@@ -1293,9 +1423,10 @@ pub(crate) fn diagnostic(hwnd: HWND, selector: usize) -> isize {
     let stats = view.map(|view| view.stats()).unwrap_or_default();
     match selector {
         0 => match mode(hwnd) {
-            PreviewMode::Off => 0,
-            PreviewMode::Split => 1,
-            PreviewMode::Full => 2,
+            ViewMode::Source => 0,
+            ViewMode::Split => 1,
+            ViewMode::Preview => 2,
+            ViewMode::Live => 3,
         },
         1 => stats.block_count as isize,
         2 => stats.revision as isize,
@@ -1314,16 +1445,17 @@ pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT, dpi: u32) -> ContentRe
     let language = group_document(hwnd, id).map(|(_, language, _)| language);
     let previewable = matches!(language, Some(Language::Markdown | Language::Svg));
     let svg = language == Some(Language::Svg);
-    let (mode, ratio, slot) = with_group_host(hwnd, id, |host| {
+    let mode = group_mode(hwnd, id);
+    let (ratio, slot) = with_group_host(hwnd, id, |host| {
         let slot = if svg {
             host.svg_view.map(|view| view.hwnd())
         } else {
             host.view.map(|view| view.hwnd())
         };
-        (host.mode, host.ratio, slot)
+        (host.ratio, slot)
     })
-    .unwrap_or((PreviewMode::Off, 0.5, None));
-    let shown = mode != PreviewMode::Off && previewable && slot.is_some();
+    .unwrap_or((0.5, None));
+    let shown = mode.shows_preview() && previewable && slot.is_some();
     let rects = content_rects(area, mode, shown, ratio, dpi);
     with_group_host(hwnd, id, |host| {
         host.area = Some(area);
@@ -1345,11 +1477,6 @@ pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT, dpi: u32) -> ContentRe
 }
 
 impl PreviewHost {
-    #[cfg(test)]
-    pub(crate) fn mode(&self) -> PreviewMode {
-        self.mode
-    }
-
     /// The divider between the editor and a side preview, while one shows.
     pub(crate) fn divider_rect(&self) -> Option<RECT> {
         self.divider
@@ -1441,26 +1568,41 @@ pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
 
 /// The status bar's hint for a preview button, naming `cycle`, the key that cycles the preview
 /// modes, when there is one.
-fn button_hint(button: PreviewButton, cycle: Option<&str>) -> String {
-    let action = match button {
-        PreviewButton::Side => "Open preview to the side",
-        PreviewButton::Full => "Open preview",
+/// A segment's tooltip and status-bar text: the mode, and its own key or else the cycle key.
+fn button_hint(mode: ViewMode, own: Option<&str>, cycle: Option<&str>) -> String {
+    let action = match mode {
+        ViewMode::Source => "Source",
+        ViewMode::Live => "Live",
+        ViewMode::Split => "Split: source and preview",
+        ViewMode::Preview => "Preview",
     };
-    match cycle {
-        Some(key) => format!("{action} ({key} cycles preview modes)"),
-        None => action.to_owned(),
+    match (own, cycle) {
+        (Some(key), _) => format!("{action} ({key})"),
+        (None, Some(key)) => format!("{action} ({key} cycles views)"),
+        (None, None) => action.to_owned(),
     }
 }
 
-/// `button`'s tooltip and status-bar text. The cycle key comes from the keymap, so a rebound key
-/// shows here too.
-pub(crate) fn button_text(hwnd: HWND, button: PreviewButton) -> String {
-    let cycle = super::main_window::first_key_text(hwnd, CommandId::MarkdownPreviewCycle);
-    button_hint(button, cycle.as_deref())
+/// The command that shows `mode`.
+pub(crate) const fn mode_command(mode: ViewMode) -> CommandId {
+    match mode {
+        ViewMode::Source => CommandId::MarkdownViewSource,
+        ViewMode::Live => CommandId::MarkdownViewLive,
+        ViewMode::Split => CommandId::MarkdownViewSplit,
+        ViewMode::Preview => CommandId::MarkdownViewPreview,
+    }
 }
 
-pub(crate) fn button_hover(hwnd: HWND, button: Option<PreviewButton>) {
-    let hint = button.map(|button| button_text(hwnd, button));
+/// `mode`'s tooltip and status-bar text. The keys come from the keymap, so a rebound key shows
+/// here too.
+pub(crate) fn button_text(hwnd: HWND, mode: ViewMode) -> String {
+    let own = super::main_window::first_key_text(hwnd, mode_command(mode));
+    let cycle = super::main_window::first_key_text(hwnd, CommandId::MarkdownViewCycle);
+    button_hint(mode, own.as_deref(), cycle.as_deref())
+}
+
+pub(crate) fn button_hover(hwnd: HWND, mode: Option<ViewMode>) {
+    let hint = mode.map(|mode| button_text(hwnd, mode));
     let changed = with_host(hwnd, |host| {
         let changed = host.button_hint != hint;
         host.button_hint = hint;

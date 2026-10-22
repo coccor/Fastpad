@@ -30,7 +30,7 @@ fn fixture(text: &str) -> Fixture {
         .set_active_language(Language::Markdown);
     unsafe { SetFocus(editor.hwnd()) };
     let group = app_mut(window.hwnd).tabs.active_group();
-    crate::window::live_host::set_live(window.hwnd, group, true);
+    crate::window::preview_host::set_group_mode(window.hwnd, group, crate::preview::ViewMode::Live);
     let live = crate::window::live_host::view_hwnd(window.hwnd, group).expect("a shown Live view");
     Fixture {
         editor,
@@ -71,15 +71,21 @@ fn alt_up_moves_lines_in_live() {
 }
 
 #[test]
-fn ctrl_alt_v_toggles_live_through_the_accelerator() {
-    let f = fixture("# Toggle\n");
+fn ctrl_alt_v_shows_live_through_the_accelerator() {
+    let f = fixture("# Live\n");
     let group = app_mut(f.window.hwnd).tabs.active_group();
+    // Already Live: the key selects Live again, it does not toggle (view modes spec §2).
     let key = translate_key_with(f.window.hwnd, f.live, b'V', true, false, true);
-    assert_eq!(key, Some(CommandId::MarkdownToggleLive));
+    assert_eq!(key, Some(CommandId::MarkdownViewLive));
+    assert_eq!(
+        crate::window::live_host::view_hwnd(f.window.hwnd, group),
+        Some(f.live)
+    );
+    execute_command(f.window.hwnd, CommandId::MarkdownViewSource);
     assert!(crate::window::live_host::view_hwnd(f.window.hwnd, group).is_none());
     assert_eq!(focused(), f.editor.hwnd());
     let key = translate_key_with(f.window.hwnd, f.editor.hwnd(), b'V', true, false, true);
-    assert_eq!(key, Some(CommandId::MarkdownToggleLive));
+    assert_eq!(key, Some(CommandId::MarkdownViewLive));
     assert_eq!(
         crate::window::live_host::view_hwnd(f.window.hwnd, group),
         Some(f.live)
@@ -93,7 +99,7 @@ fn ctrl_alt_v_on_a_text_tab_shows_the_notice() {
     let editor = install_test_editor(&window);
     editor.populate_clean("plain").unwrap();
     let key = translate_key_with(window.hwnd, editor.hwnd(), b'V', true, false, true);
-    assert_eq!(key, Some(CommandId::MarkdownToggleLive));
+    assert_eq!(key, Some(CommandId::MarkdownViewLive));
     let group = app_mut(window.hwnd).tabs.active_group();
     assert!(crate::window::live_host::view_hwnd(window.hwnd, group).is_none());
     assert!(
@@ -109,13 +115,17 @@ fn ctrl_alt_v_on_a_text_tab_shows_the_notice() {
 }
 
 #[test]
-fn escape_from_full_preview_returns_focus_to_live() {
+fn escape_from_preview_returns_to_live_and_its_focus() {
     let f = fixture("# Title\n");
-    execute_command(f.window.hwnd, CommandId::MarkdownPreviewFull);
+    execute_command(f.window.hwnd, CommandId::MarkdownViewPreview);
     assert_ne!(focused(), f.live);
     let group = app_mut(f.window.hwnd).tabs.active_group();
     crate::window::preview_host::escape(f.window.hwnd, group);
+    assert_eq!(
+        crate::window::preview_host::group_mode(f.window.hwnd, group),
+        crate::preview::ViewMode::Live
+    );
     assert_eq!(focused(), f.live);
-    execute_command(f.window.hwnd, CommandId::MarkdownPreviewClose);
-    assert_eq!(focused(), f.live);
+    execute_command(f.window.hwnd, CommandId::MarkdownViewSource);
+    assert_eq!(focused(), f.editor.hwnd());
 }

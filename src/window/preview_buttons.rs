@@ -1,12 +1,14 @@
-//! The Markdown/SVG preview buttons, floating at the top-right of an editor group's content
-//! (split editors spec §4.1). A small child window of the group, above the editor and preview in
-//! z-order, shown only while the active tab can preview.
+//! The view mode control (2026-10-22 view modes spec §2): one segment per mode the active tab can
+//! show, floating at the top-right of an editor group's content (split editors spec §4.1). A small
+//! child window of the group, above the editor and preview in z-order, shown only while the active
+//! tab is Markdown or SVG.
 
 use crate::platform::wide_null;
+use crate::preview::ViewMode;
 use crate::window::design::metrics::scale;
 use crate::window::titlebar::{
-    GLYPH_PREVIEW_FULL, GLYPH_PREVIEW_SIDE, Point, Rect, create_ui_font, draw_text, fill,
-    restore_font, select_font,
+    GLYPH_VIEW_LIVE, GLYPH_VIEW_PREVIEW, GLYPH_VIEW_SOURCE, GLYPH_VIEW_SPLIT, Point, Rect,
+    create_ui_font, draw_text, fill, restore_font, select_font,
 };
 use crate::window::tooltip::Tooltip;
 use windows_sys::Win32::Foundation::{
@@ -31,20 +33,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const CLASS_NAME: &str = "FastPadPreviewButtons";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreviewButton {
-    /// "Open preview to the side".
-    Side,
-    /// "Open preview", which replaces the editor.
-    Full,
-}
-
-/// The floating pair's window, once created, and its pointer state; kept on its group.
+/// The floating control's window, once created, and its pointer state; kept on its group.
 #[derive(Debug)]
 pub(crate) struct PreviewButtons {
     pub(crate) hwnd: HWND,
-    hovered: Option<PreviewButton>,
-    pressed: Option<PreviewButton>,
+    /// The modes shown, in order: every mode for Markdown, no Live for SVG.
+    segments: &'static [ViewMode],
+    hovered: Option<ViewMode>,
+    pressed: Option<ViewMode>,
     /// Made on the first pointer move over the buttons; destroyed with the group.
     tooltip: Option<Tooltip>,
     /// The tooltip could not be made, and that is not tried again.
@@ -63,6 +59,7 @@ impl Default for PreviewButtons {
     fn default() -> Self {
         Self {
             hwnd: std::ptr::null_mut(),
+            segments: &ViewMode::ALL,
             hovered: None,
             pressed: None,
             tooltip: None,
@@ -82,19 +79,41 @@ pub(crate) fn hwnd(main: HWND) -> Option<HWND> {
         .filter(|hwnd| !hwnd.is_null())
 }
 
-/// `button`'s rectangle in the floating window's client coordinates.
-pub(crate) fn button_rect(buttons: HWND, button: PreviewButton) -> Rect {
-    let size = button_size(unsafe { GetDpiForWindow(buttons) }.max(96));
-    match button {
-        PreviewButton::Side => Rect::new(0, 0, size, size),
-        PreviewButton::Full => Rect::new(size, 0, 2 * size, size),
+/// The modes group `id`'s active tab can be shown in, in the control's order; empty for a tab that
+/// is neither Markdown nor SVG.
+pub(crate) fn segments_for(
+    main: HWND,
+    id: crate::window::split_tree::GroupId,
+) -> &'static [ViewMode] {
+    match crate::window::preview_host::group_document(main, id).map(|(_, language, _)| language) {
+        Some(crate::document::Language::Markdown) => &ViewMode::ALL,
+        Some(crate::document::Language::Svg) => &ViewMode::SVG,
+        _ => &[],
     }
 }
 
-fn button_at(buttons: HWND, x: i32, y: i32) -> Option<PreviewButton> {
-    [PreviewButton::Side, PreviewButton::Full]
-        .into_iter()
-        .find(|&button| button_rect(buttons, button).contains(Point::new(x, y)))
+/// The modes the control in `buttons` shows.
+fn segments(main: HWND, buttons: HWND) -> &'static [ViewMode] {
+    crate::window::main_window::with_group(main, |group| {
+        (group.preview_buttons.hwnd == buttons).then_some(group.preview_buttons.segments)
+    })
+    .flatten()
+    .unwrap_or(&[])
+}
+
+/// The rectangle of the segment at `index`, in the floating window's client coordinates.
+pub(crate) fn button_rect(buttons: HWND, index: usize) -> Rect {
+    let size = button_size(unsafe { GetDpiForWindow(buttons) }.max(96));
+    let left = index as i32 * size;
+    Rect::new(left, 0, left + size, size)
+}
+
+fn button_at(main: HWND, buttons: HWND, x: i32, y: i32) -> Option<ViewMode> {
+    segments(main, buttons)
+        .iter()
+        .enumerate()
+        .find(|(index, _)| button_rect(buttons, *index).contains(Point::new(x, y)))
+        .map(|(_, mode)| *mode)
 }
 
 /// The shown floating window inside `group`, for the group's accessibility provider, which has
@@ -112,12 +131,13 @@ pub(crate) fn find(group: HWND) -> Option<HWND> {
     (!buttons.is_null() && unsafe { IsWindowVisible(buttons) } != 0).then_some(buttons)
 }
 
-/// `button`'s rectangle in `group`'s client coordinates while the pair is shown.
-pub(crate) fn rect_in_group(group: HWND, button: PreviewButton) -> Option<Rect> {
+/// The rectangle of the segment at `index` in `group`'s client coordinates while the control is
+/// shown.
+pub(crate) fn rect_in_group(group: HWND, index: usize) -> Option<Rect> {
     let buttons = find(group)?;
     let mut origin = POINT { x: 0, y: 0 };
     unsafe { MapWindowPoints(buttons, group, &mut origin, 1) };
-    let rect = button_rect(buttons, button);
+    let rect = button_rect(buttons, index);
     Some(Rect::new(
         rect.left + origin.x,
         rect.top + origin.y,
@@ -126,9 +146,9 @@ pub(crate) fn rect_in_group(group: HWND, button: PreviewButton) -> Option<Rect> 
     ))
 }
 
-/// Shows `group`'s pair at the top-right of `area` (the group's content, in its client
+/// Shows `group`'s control at the top-right of `area` (the group's content, in its client
 /// coordinates), clear of a vertical scroll bar, while `group` is the active group and its active
-/// tab can preview; hides it otherwise.
+/// tab is Markdown or SVG; hides it otherwise.
 pub(crate) fn layout(main: HWND, group: HWND, area: RECT, dpi: u32) {
     let Some(id) = crate::window::main_window::group_id_of(main, group) else {
         return;
@@ -138,14 +158,8 @@ pub(crate) fn layout(main: HWND, group: HWND, area: RECT, dpi: u32) {
             .filter(|hwnd| !hwnd.is_null());
     let active = unsafe { crate::window::main_window::app_ptr(main) }
         .is_some_and(|app| unsafe { app.as_ref() }.tabs.active_group() == id);
-    let previewable = active
-        && crate::window::preview_host::group_document(main, id).is_some_and(|(_, language, _)| {
-            matches!(
-                language,
-                crate::document::Language::Markdown | crate::document::Language::Svg
-            )
-        });
-    if !previewable {
+    let segments = if active { segments_for(main, id) } else { &[] };
+    if segments.is_empty() {
         if let Some(buttons) = existing {
             unsafe { ShowWindow(buttons, SW_HIDE) };
         }
@@ -154,8 +168,24 @@ pub(crate) fn layout(main: HWND, group: HWND, area: RECT, dpi: u32) {
     let Some(buttons) = existing.or_else(|| create(main, id, group)) else {
         return;
     };
+    // Other segments mean other tooltip rectangles: the tooltip is made again on the next hover.
+    let stale = crate::window::main_window::with_group_id(main, id, |state| {
+        let control = &mut state.preview_buttons;
+        if control.segments == segments {
+            return None;
+        }
+        control.segments = segments;
+        control.hovered = None;
+        control.pressed = None;
+        control.tooltip_failed = false;
+        control.tooltip.take()
+    })
+    .flatten();
+    if let Some(tooltip) = stale {
+        tooltip.destroy();
+    }
     let size = button_size(dpi);
-    let width = 2 * size;
+    let width = segments.len() as i32 * size;
     let margin = scale(8, dpi);
     let scroll_bar = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
     let x = (area.right - scroll_bar - margin - width).max(area.left);
@@ -235,11 +265,8 @@ fn ensure_tooltip(main: HWND, buttons: HWND, message: u32, wparam: WPARAM, lpara
     .unwrap_or(false);
     match created {
         Some(tooltip) if stored => {
-            for (id, button) in [PreviewButton::Side, PreviewButton::Full]
-                .into_iter()
-                .enumerate()
-            {
-                let rect = button_rect(buttons, button);
+            for (id, mode) in segments(main, buttons).iter().enumerate() {
+                let rect = button_rect(buttons, id);
                 let rect = RECT {
                     left: rect.left,
                     top: rect.top,
@@ -249,7 +276,7 @@ fn ensure_tooltip(main: HWND, buttons: HWND, message: u32, wparam: WPARAM, lpara
                 tooltip.set_tool(
                     id,
                     rect,
-                    &crate::window::preview_host::button_text(main, button),
+                    &crate::window::preview_host::button_text(main, *mode),
                 );
             }
             tooltip.relay(message, wparam, lparam);
@@ -291,7 +318,7 @@ unsafe extern "system" fn buttons_proc(
                 dwHoverTime: 0,
             };
             unsafe { TrackMouseEvent(&mut track) };
-            let over = button_at(hwnd, x, y);
+            let over = button_at(main, hwnd, x, y);
             update(main, hwnd, |state| state.hovered = over);
             crate::window::preview_host::button_hover(main, over);
             0
@@ -305,7 +332,7 @@ unsafe extern "system" fn buttons_proc(
             0
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            let over = button_at(hwnd, x, y);
+            let over = button_at(main, hwnd, x, y);
             update(main, hwnd, |state| {
                 state.hovered = over;
                 state.pressed = over;
@@ -314,11 +341,11 @@ unsafe extern "system" fn buttons_proc(
         }
         // A click acts only when released over the button it was pressed on.
         WM_LBUTTONUP => {
-            let over = button_at(hwnd, x, y);
+            let over = button_at(main, hwnd, x, y);
             let mut pressed = None;
             update(main, hwnd, |state| pressed = state.pressed.take());
-            if let Some(button) = over.filter(|&button| pressed == Some(button)) {
-                crate::window::preview_host::click_button(main, button);
+            if let Some(mode) = over.filter(|&mode| pressed == Some(mode)) {
+                crate::window::preview_host::set_mode(main, mode);
             }
             0
         }
@@ -335,8 +362,9 @@ fn paint(main: HWND, buttons: HWND) {
     let dpi = unsafe { GetDpiForWindow(buttons) }.max(96);
     let (palette, _, _) = crate::window::main_window::title_chrome(main);
     let mode = crate::window::preview_host::mode(main);
-    let (hovered, pressed) = crate::window::main_window::with_group(main, |group| {
-        (group.preview_buttons.hovered, group.preview_buttons.pressed)
+    let (hovered, pressed, segments) = crate::window::main_window::with_group(main, |group| {
+        let control = &group.preview_buttons;
+        (control.hovered, control.pressed, control.segments)
     })
     .unwrap_or_default();
     let mut client = RECT::default();
@@ -358,19 +386,15 @@ fn paint(main: HWND, buttons: HWND) {
         false,
     );
     let previous = unsafe { select_font(dc, font) };
-    for (button, glyph, active) in [
-        (
-            PreviewButton::Side,
-            GLYPH_PREVIEW_SIDE,
-            mode == crate::preview::PreviewMode::Split,
-        ),
-        (
-            PreviewButton::Full,
-            GLYPH_PREVIEW_FULL,
-            mode == crate::preview::PreviewMode::Full,
-        ),
-    ] {
-        let rect = button_rect(buttons, button);
+    for (index, &button) in segments.iter().enumerate() {
+        let glyph = match button {
+            ViewMode::Source => GLYPH_VIEW_SOURCE,
+            ViewMode::Live => GLYPH_VIEW_LIVE,
+            ViewMode::Split => GLYPH_VIEW_SPLIT,
+            ViewMode::Preview => GLYPH_VIEW_PREVIEW,
+        };
+        let active = mode == button;
+        let rect = button_rect(buttons, index);
         let over = hovered == Some(button);
         let background = if (over && pressed == Some(button)) || active {
             Some(palette.pressed_background)
