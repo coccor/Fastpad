@@ -126,7 +126,7 @@ pub(super) fn open_menu(hwnd: HWND, mut index: usize) {
             {
                 menus::set_markdown_view(
                     menu,
-                    crate::window::preview_buttons::segments_for(hwnd, id),
+                    crate::window::editor_toolbar::segments_for(hwnd, id),
                     crate::window::preview_host::group_mode(hwnd, id),
                 );
             }

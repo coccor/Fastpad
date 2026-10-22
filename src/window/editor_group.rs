@@ -47,7 +47,7 @@ pub(crate) struct GroupWindow {
     /// The tab strip's accessibility provider, created on the first `WM_GETOBJECT`.
     pub(crate) accessibility: super::accessibility::AccessibilityState,
     /// The Markdown/SVG preview buttons floating over the content.
-    pub(crate) preview_buttons: super::preview_buttons::PreviewButtons,
+    pub(crate) toolbar: super::editor_toolbar::EditorToolbar,
 }
 
 impl GroupWindow {
@@ -70,7 +70,7 @@ impl GroupWindow {
             content: Default::default(),
             last_tab_click: None,
             accessibility: Default::default(),
-            preview_buttons: Default::default(),
+            toolbar: Default::default(),
         }
     }
 }

@@ -852,16 +852,16 @@ unsafe extern "system" fn accessible_do_default_action(
             PostMessageW(item.hwnd, WM_COMMAND, command as usize, 0)
         },
         Some(AccessibleDefaultAction::Click(target)) => {
-            // The view control is its own window, floating over the group's content.
+            // The view control is in the editor toolbar, its own window under the strip.
             let ClickTarget::View(mode) = target;
             let segments = item.view.snapshot().view_buttons.segments;
             let (Some(window), Some(index)) = (
-                crate::window::preview_buttons::find(item.hwnd),
+                crate::window::editor_toolbar::find(item.hwnd),
                 segments.iter().position(|segment| *segment == mode),
             ) else {
                 return E_INVALIDARG;
             };
-            let rect = crate::window::preview_buttons::button_rect(window, index);
+            let rect = crate::window::editor_toolbar::segment_rect(window, segments.len(), index);
             let center = rect.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
             // A whole click: the strip acts only on a release over the target it was pressed on.
@@ -986,13 +986,15 @@ fn child_client_rect(
                 tabs,
                 item.selection.scroll_offset(),
             );
-            // The view control floats over the group's content (spec §4.1); its segments follow
-            // the tabs.
+            // The view control is in the editor toolbar under the strip; its segments follow the
+            // tabs.
             match child {
                 AccessibleChild::Tab(_) => layout.tab(index),
-                AccessibleChild::Button(_) => {
-                    crate::window::preview_buttons::rect_in_group(item.hwnd, index - tabs)
-                }
+                AccessibleChild::Button(_) => crate::window::editor_toolbar::rect_in_group(
+                    item.hwnd,
+                    children.len() - tabs,
+                    index - tabs,
+                ),
             }
         }
     }

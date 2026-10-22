@@ -838,7 +838,7 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
     }
     if let (Some(app), Some(id)) = (unsafe { host_window::app_ptr(hwnd) }, target) {
         let buttons = crate::window::tabs::ViewButtons {
-            segments: crate::window::preview_buttons::segments_for(hwnd, id),
+            segments: crate::window::editor_toolbar::segments_for(hwnd, id),
             current: group_mode(hwnd, id),
         };
         unsafe { app.as_ref() }

@@ -29,10 +29,6 @@ const GLYPH_MINIMIZE: &str = "\u{E921}";
 const GLYPH_MAXIMIZE: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
 pub(crate) const GLYPH_CLOSE: &str = "\u{E8BB}";
-pub(crate) const GLYPH_VIEW_SOURCE: &str = "\u{E943}";
-pub(crate) const GLYPH_VIEW_LIVE: &str = "\u{E70F}";
-pub(crate) const GLYPH_VIEW_SPLIT: &str = "\u{F57C}";
-pub(crate) const GLYPH_VIEW_PREVIEW: &str = "\u{E7B3}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Point {
@@ -880,7 +876,7 @@ fn from_native(rect: RECT) -> Rect {
     Rect::new(rect.left, rect.top, rect.right, rect.bottom)
 }
 
-unsafe fn measure_text(dc: HDC, text: &str, format: u32) -> i32 {
+pub(crate) unsafe fn measure_text(dc: HDC, text: &str, format: u32) -> i32 {
     if text.is_empty() {
         return 0;
     }

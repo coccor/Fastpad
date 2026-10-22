@@ -91,8 +91,8 @@ typing. Both panes scroll together.
 
 - Each Markdown tab has a view: **Source**, **Live** (rendered as you type, below), **Split** (the
   source with the preview beside it; drag the divider to resize it) or **Preview** (full width).
-  Pick one from the buttons at the top-right of the editor or View → Markdown view, or press
-  `Ctrl+Shift+V` to cycle through them. Each tab keeps its own view, and Escape leaves Preview.
+  Pick one in the toolbar under the tabs (which also shows where the file lives) or View → Markdown
+  view, or press `Ctrl+Shift+V` to cycle through them. Each tab keeps its own view, and Escape leaves Preview.
   SVG files get Source, Split and Preview.
 - Select and copy text in the preview as in a browser: drag (it scrolls at the edges),
   double-click a word, triple-click a paragraph, Shift+click to extend, `Ctrl+A` for everything.

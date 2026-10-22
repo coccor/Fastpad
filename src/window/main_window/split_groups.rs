@@ -433,13 +433,17 @@ pub(crate) fn invalidate_title_strip(hwnd: HWND) {
             unsafe { app.as_ref() }
                 .groups
                 .iter()
-                .map(|group| group.hwnd)
+                .map(|group| (group.hwnd, group.toolbar.hwnd))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for group in groups {
+    for (group, toolbar) in groups {
         unsafe {
             InvalidateRect(group, std::ptr::null(), 0);
+            // The toolbar shows the tab's location, which a save as or a rename changes.
+            if !toolbar.is_null() {
+                InvalidateRect(toolbar, std::ptr::null(), 0);
+            }
         }
     }
     // The Open Editors rows show what the strip does.

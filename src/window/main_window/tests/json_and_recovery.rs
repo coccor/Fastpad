@@ -152,8 +152,9 @@ fn corrupt_settings_are_reported_on_the_bottom_bar_that_chrome_reserves() {
         GetClientRect(editor_hwnd, &mut shown);
     }
     let dpi = unsafe { GetDpiForWindow(window.hwnd) };
-    // The editor group's tab strip is the title row, so the editor starts right below it.
-    let title_height = super::super::title_layout(window.hwnd).height;
+    // The editor group's tab strip is the title row; the editor starts below it and the toolbar.
+    let title_height = super::super::title_layout(window.hwnd).height
+        + crate::window::editor_toolbar::row_height(dpi.max(96));
     assert_eq!(
         (client.bottom - client.top) - (shown.bottom - shown.top),
         title_height + crate::window::status::status_height(dpi),

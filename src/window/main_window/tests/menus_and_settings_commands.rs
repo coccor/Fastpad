@@ -47,12 +47,19 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
         unsafe { GetMenu(window.hwnd) }.is_null(),
         "no native menu bar"
     );
-    assert_eq!(editor_top(), title_height + band);
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+    assert_eq!(
+        editor_top(),
+        title_height + band + crate::window::editor_toolbar::row_height(dpi)
+    );
     assert_eq!(super::super::menu_headings(window.hwnd).len(), 5);
 
     key_menu(0);
     assert_eq!(app_mut(window.hwnd).menu_mode, None);
-    assert_eq!(editor_top(), title_height);
+    assert_eq!(
+        editor_top(),
+        title_height + crate::window::editor_toolbar::row_height(dpi)
+    );
 
     // Alt+E opens Edit; Right moves to Search, whose Escape leaves Search highlighted.
     answer_next_dropdown(|hwnd, heading| {
@@ -90,7 +97,9 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
     assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
     assert_eq!(
         editor_top(),
-        title_height + super::super::find_bar::find_bar_height(dpi)
+        title_height
+            + crate::window::editor_toolbar::row_height(dpi)
+            + super::super::find_bar::find_bar_height(dpi)
     );
 }
 
@@ -125,8 +134,10 @@ fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_chang
     let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
     assert!(visible(panel));
     let band = super::super::find_bar::find_bar_height(dpi);
-    assert_eq!(top_of(panel), (title_height, band));
-    assert_eq!(top_of(editor.hwnd()).0, title_height + band);
+    // The find bar goes under the editor toolbar.
+    let toolbar = crate::window::editor_toolbar::row_height(dpi);
+    assert_eq!(top_of(panel), (title_height + toolbar, band));
+    assert_eq!(top_of(editor.hwnd()).0, title_height + toolbar + band);
 
     let brush_before = {
         let bar = app_mut(window.hwnd).find_bar().unwrap();
@@ -164,7 +175,7 @@ fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_chang
         close_point,
     );
     assert!(!visible(panel));
-    assert_eq!(top_of(editor.hwnd()).0, title_height);
+    assert_eq!(top_of(editor.hwnd()).0, title_height + toolbar);
 }
 
 #[test]
