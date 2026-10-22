@@ -19,9 +19,11 @@ use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, EndPaint, InvalidateRect, MapWindowPoints, PAINTSTRUCT, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, EndPaint, FIXED,
+    GDI_ERROR, GGO_METRICS, GLYPHMETRICS, GetGlyphOutlineW, HDC, InvalidateRect, MAT2,
+    MapWindowPoints, PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, SetTextAlign, SetTextColor,
+    TA_BASELINE, TA_LEFT, TRANSPARENT, TextOutW,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -40,8 +42,25 @@ const CLASS_NAME: &str = "FastPadEditorToolbar";
 /// The row's height, a segment's size, the track's padding and its gap from the right edge, at
 /// 96 DPI and 100 % text size.
 const ROW_HEIGHT: i32 = 32;
-const SEGMENT_WIDTH: i32 = 72;
-const SEGMENT_HEIGHT: i32 = 24;
+const SEGMENT_WIDTH: i32 = 24;
+/// A segment's glyph size, and the glyphs: Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets
+/// before it (the same codepoints). Code, Edit, Split and Preview.
+const GLYPH_SIZE: i32 = 14;
+/// The height every glyph's ink is sized to, and the gap kept each side of it in its segment. The
+/// icon font fills its cells unevenly (Code and Edit run taller than Split and Preview), so each
+/// glyph is fitted by its ink, not by the font size.
+const GLYPH_INK: i32 = 11;
+const GLYPH_INSET: i32 = 4;
+
+const fn glyph(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Source => "\u{E943}",
+        ViewMode::Live => "\u{E70F}",
+        ViewMode::Split => "\u{F57C}",
+        ViewMode::Preview => "\u{E7B3}",
+    }
+}
+const SEGMENT_HEIGHT: i32 = 22;
 const TRACK_PADDING: i32 = 2;
 const RIGHT_MARGIN: i32 = 8;
 const LEFT_MARGIN: i32 = 16;
@@ -373,11 +392,21 @@ fn ensure_tooltip(main: HWND, toolbar: HWND, message: u32, wparam: WPARAM, lpara
     }
 }
 
+/// Applies `change` to the toolbar's pointer state, repainting only when it changed: every
+/// pointer move lands here.
 fn update(main: HWND, toolbar: HWND, change: impl FnOnce(&mut EditorToolbar)) {
-    if let (_, Some(id)) = segments(main, toolbar) {
-        with_toolbar(main, id, change);
+    let changed = match segments(main, toolbar) {
+        (_, Some(id)) => with_toolbar(main, id, |state| {
+            let before = (state.hovered, state.pressed);
+            change(state);
+            before != (state.hovered, state.pressed)
+        })
+        .unwrap_or(false),
+        _ => false,
+    };
+    if changed {
+        unsafe { InvalidateRect(toolbar, std::ptr::null(), 0) };
     }
-    unsafe { InvalidateRect(toolbar, std::ptr::null(), 0) };
 }
 
 unsafe extern "system" fn toolbar_proc(
@@ -454,12 +483,42 @@ unsafe extern "system" fn toolbar_proc(
     }
 }
 
+/// Paints the row through an off-screen bitmap, so a repaint never shows a half-drawn frame.
 fn paint(main: HWND, toolbar: HWND) {
     let mut paint = PAINTSTRUCT::default();
     let dc = unsafe { BeginPaint(toolbar, &mut paint) };
     if dc.is_null() {
         return;
     }
+    let mut client = RECT::default();
+    unsafe { GetClientRect(toolbar, &mut client) };
+    let (width, height) = (client.right, client.bottom);
+    if width > 0 && height > 0 {
+        let memory = unsafe { CreateCompatibleDC(dc) };
+        let bitmap = if memory.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { CreateCompatibleBitmap(dc, width, height) }
+        };
+        if bitmap.is_null() {
+            draw(main, toolbar, dc);
+        } else {
+            unsafe {
+                let previous = SelectObject(memory, bitmap);
+                draw(main, toolbar, memory);
+                BitBlt(dc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
+                SelectObject(memory, previous);
+                DeleteObject(bitmap);
+            }
+        }
+        if !memory.is_null() {
+            unsafe { DeleteDC(memory) };
+        }
+    }
+    unsafe { EndPaint(toolbar, &paint) };
+}
+
+fn draw(main: HWND, toolbar: HWND, dc: HDC) {
     let dpi = unsafe { GetDpiForWindow(toolbar) }.max(96);
     let (palette, _, _) = crate::window::main_window::title_chrome(main);
     let (segments, id) = segments(main, toolbar);
@@ -484,7 +543,6 @@ fn paint(main: HWND, toolbar: HWND) {
         SetBkMode(dc, TRANSPARENT as i32);
     }
     let font = type_ramp::create(TextStyle::Body, dpi);
-    let bold = type_ramp::create(TextStyle::PanelHeader, dpi);
     let previous = unsafe { select_font(dc, font) };
     let track = (!segments.is_empty())
         .then(|| track_rect(row.right, row.bottom - line, segments.len(), dpi));
@@ -529,7 +587,7 @@ fn paint(main: HWND, toolbar: HWND) {
             );
         }
     }
-    if let Some(track) = track {
+    if track.is_some() {
         let radius = radius_for(&palette, CONTROL_RADIUS, dpi);
         let native = |rect: Rect| RECT {
             left: rect.left,
@@ -537,66 +595,41 @@ fn paint(main: HWND, toolbar: HWND) {
             right: rect.right,
             bottom: rect.bottom,
         };
-        let track_color = if palette.high_contrast {
-            palette.editor_background
-        } else {
-            palette.strip_background
-        };
-        unsafe {
-            fill_rounded(
-                dc,
-                native(track),
-                radius,
-                Corners::ALL,
-                track_color,
-                palette.editor_background,
-            );
-        }
-        let centered = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
+        // No track is drawn: the icons sit on the row itself, quiet next to the text.
+        let ground = palette.editor_background;
         for (index, &segment) in segments.iter().enumerate() {
             let rect = segment_rect(toolbar, segments.len(), index);
             let current = segment == mode;
             let over = hovered == Some(segment);
             let held = over && pressed == Some(segment);
             unsafe {
-                if current {
-                    if palette.high_contrast {
+                if palette.high_contrast {
+                    if current {
                         fill(dc, rect, palette.selection_background);
-                    } else {
-                        crate::window::design::round::fill_bordered(
-                            dc,
-                            native(rect),
-                            radius,
-                            palette.editor_background,
-                            palette.stroke,
-                            track_color,
-                        );
-                    }
-                } else if over {
-                    if palette.high_contrast {
+                    } else if over {
                         crate::window::design::round::fill_bordered(
                             dc,
                             native(rect),
                             0,
-                            palette.editor_background,
+                            ground,
                             palette.editor_foreground,
-                            track_color,
-                        );
-                    } else {
-                        fill_rounded(
-                            dc,
-                            native(rect),
-                            radius,
-                            Corners::ALL,
-                            if held {
-                                palette.pressed_background
-                            } else {
-                                palette.hover_background
-                            },
-                            track_color,
+                            ground,
                         );
                     }
+                } else if current || held {
+                    // The current mode gets a soft fill and no border; pressing any segment shows
+                    // the same fill.
+                    fill_rounded(
+                        dc,
+                        native(rect),
+                        radius,
+                        Corners::ALL,
+                        palette.hover_background,
+                        ground,
+                    );
                 }
+                // Resting icons are muted; the one under the pointer and the current one are full
+                // strength.
                 let color = match (current, over) {
                     (true, _) if palette.high_contrast => palette
                         .selection_foreground
@@ -606,16 +639,99 @@ fn paint(main: HWND, toolbar: HWND) {
                     _ => palette.muted_foreground,
                 };
                 SetTextColor(dc, color);
-                select_font(dc, if current { bold } else { font });
-                draw_text(dc, segment.label(), rect, centered);
+                draw_glyph(dc, segment, rect, dpi);
             }
         }
     }
     unsafe {
         restore_font(dc, previous);
         DeleteObject(font as _);
-        DeleteObject(bold as _);
-        EndPaint(toolbar, &paint);
+    }
+}
+
+fn icon_font(pixel_height: i32) -> windows_sys::Win32::Graphics::Gdi::HFONT {
+    crate::window::titlebar::create_ui_font(
+        pixel_height,
+        crate::window::design::faces::current().icons,
+        windows_sys::Win32::Graphics::Gdi::FW_NORMAL as i32,
+        false,
+    )
+}
+
+/// The ink box of `glyph` in the font selected into `dc`, or `None` when the font can't say.
+unsafe fn ink(dc: HDC, glyph: &str) -> Option<GLYPHMETRICS> {
+    let code = glyph.chars().next()? as u32;
+    let identity = MAT2 {
+        eM11: FIXED { fract: 0, value: 1 },
+        eM12: FIXED { fract: 0, value: 0 },
+        eM21: FIXED { fract: 0, value: 0 },
+        eM22: FIXED { fract: 0, value: 1 },
+    };
+    let mut metrics = GLYPHMETRICS::default();
+    let result = unsafe {
+        GetGlyphOutlineW(
+            dc,
+            code,
+            GGO_METRICS,
+            &mut metrics,
+            0,
+            std::ptr::null_mut(),
+            &identity,
+        )
+    };
+    (result != GDI_ERROR as u32 && metrics.gmBlackBoxY > 0).then_some(metrics)
+}
+
+/// Draws `mode`'s glyph with its ink centred in `rect` and sized to `GLYPH_INK` tall (narrower if
+/// it would not fit the segment's width), so the four icons read as one size.
+unsafe fn draw_glyph(dc: HDC, mode: ViewMode, rect: Rect, dpi: u32) {
+    let text = glyph(mode);
+    let nominal = scale_text(GLYPH_SIZE, dpi);
+    let probe = icon_font(nominal);
+    let previous = unsafe { select_font(dc, probe) };
+    let measured = unsafe { ink(dc, text) };
+    unsafe {
+        restore_font(dc, previous);
+        DeleteObject(probe as _);
+    }
+    let Some(measured) = measured else {
+        let font = icon_font(nominal);
+        unsafe {
+            let previous = select_font(dc, font);
+            draw_text(
+                dc,
+                text,
+                rect,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+            );
+            restore_font(dc, previous);
+            DeleteObject(font as _);
+        }
+        return;
+    };
+    let tall = scale_text(GLYPH_INK, dpi);
+    let wide = (rect.right - rect.left - 2 * scale(GLYPH_INSET, dpi)).max(1);
+    let (black_x, black_y) = (
+        measured.gmBlackBoxX.max(1) as i32,
+        measured.gmBlackBoxY as i32,
+    );
+    let size = (nominal * tall / black_y)
+        .min(nominal * wide / black_x)
+        .max(1);
+    let font = icon_font(size);
+    unsafe {
+        let previous = select_font(dc, font);
+        if let Some(fitted) = ink(dc, text) {
+            let (black_x, black_y) = (fitted.gmBlackBoxX as i32, fitted.gmBlackBoxY as i32);
+            let x = (rect.left + rect.right - black_x) / 2 - fitted.gmptGlyphOrigin.x;
+            let baseline = (rect.top + rect.bottom - black_y) / 2 + fitted.gmptGlyphOrigin.y;
+            let align = SetTextAlign(dc, TA_LEFT | TA_BASELINE);
+            let wide = wide_null(text);
+            TextOutW(dc, x, baseline, wide.as_ptr(), (wide.len() - 1) as i32);
+            SetTextAlign(dc, align);
+        }
+        restore_font(dc, previous);
+        DeleteObject(font as _);
     }
 }
 

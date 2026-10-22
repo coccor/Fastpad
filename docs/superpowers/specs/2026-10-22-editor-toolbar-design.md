@@ -9,8 +9,7 @@ Replaces: the floating view control at the top-right of an editor group's conten
 
 The floating view control covers the end of the first line of text. It now has four segments, so
 it is twice as wide as the old preview buttons. A thin toolbar row under the tab strip takes its
-place. The row shows the file's location on the left and the view control, with text labels, on
-the right. Nothing floats over the text any more.
+place. The row shows the file's location on the left and the view control on the right. Nothing floats over the text any more.
 
 ## 2. Decisions
 
@@ -21,9 +20,10 @@ the right. Nothing floats over the text any more.
 | Size | 32px tall at 96 DPI, growing with the Windows text size (`scale_text`). |
 | Look | `editor-background`, with a 1px `stroke` line under it. |
 | Left: location | The file's place, its parts joined by `›`. A file inside the open notebook shows the notebook folder › its subfolders › the file. Any other file shows its folder › the file. An untitled tab shows its title. The file name is in `editor-foreground`, the rest in `muted-foreground`. Too long: the folders are cut with an ellipsis first, then the name. Read-only. |
-| Right: view control | On Markdown and SVG tabs only: a segmented control with text labels, Source · Live · Split · Preview (no Live on SVG). Each segment is 72 × 24px (text-scaled) on a `strip-background` track with a 4px corner and 2px padding, 8px from the row's right edge. The current mode is `editor-background` with a `stroke` border and semibold text. The others are `muted-foreground`, and get `hover-background` with `hover-foreground` under the pointer. |
-| High contrast | No track. The current mode is the `Highlight` pair; the segment under the pointer gets a 1px border in the text colour. Square corners. |
+| Right: view control | On Markdown and SVG tabs only: a segmented control of icons, Source (Code, E943) · Live (Edit, E70F) · Split (F57C) · Preview (E7B3), no Live on SVG; the tooltip names each and its key. (Text labels were tried first; icons were chosen for a quieter row.) Each segment is 24 × 22px. Each glyph is sized by its ink to 11px tall (text-scaled, narrower if it would not fit), and its ink is centred, since the icon font fills its cells unevenly; on the row itself with no track, 8px from the row's right edge. The current mode gets a soft `hover-background` fill (4px corner, no border) and an `editor-foreground` glyph. The others are `muted-foreground`, turning `hover-foreground` under the pointer, with the fill while pressed. |
+| High contrast | The current mode is the `Highlight` pair; the segment under the pointer gets a 1px border in the text colour. Square corners. |
 | Clicks | A segment selects its mode for that group's tab, activating the group first. Clicking the current one does nothing. |
+| Painting | Through an off-screen bitmap, and only when the hovered or pressed segment changes, so moving the pointer over the row never flickers. |
 | Tooltips | As before: the mode and its key, or the cycle key. |
 | Accessibility | Unchanged: the group strip's provider lists the segments as radio buttons, with the current one checked. Their rectangles come from the row's geometry, computed from the window alone (the provider may run on another thread). |
 | Keyboard | As before, the row is not a tab stop; every mode has a command and a key. |
