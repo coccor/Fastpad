@@ -1,31 +1,27 @@
-//! The main window's half of the Live Markdown view (2026-10-18 Live editor design spec §4): which
-//! tabs each group shows Live, creating and sizing each group's Live window, and choosing whether
-//! a group's text shows in the Live window or in its Scintilla. No function holds an `App` borrow
+//! The main window's half of the Live Markdown view (2026-10-18 Live editor design spec §4):
+//! creating and sizing each group's Live window, and showing a group's text in the Live window or
+//! in its Scintilla, as the active tab's view mode says (2026-10-22 view modes spec). No function holds an `App` borrow
 //! while calling Win32 APIs that can send messages back to the main window.
 
 use crate::document::{DocumentId, Language};
-use crate::live::LIVE_MAX_BYTES;
 use crate::live::layout::LiveFonts;
 use crate::live::view::{LiveColors, LiveView, MenuRequest};
 use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
 use crate::window::split_tree::GroupId;
-use std::collections::HashMap;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{MoveWindow, SW_HIDE, SW_SHOWNA, ShowWindow};
 
-const NOT_MARKDOWN_NOTICE: &str = "Live Markdown is available for Markdown documents. \
+pub(crate) const NOT_MARKDOWN_NOTICE: &str = "Live Markdown is available for Markdown documents. \
                                    Choose View > Markdown to treat this tab as Markdown.";
-const TOO_LARGE_NOTICE: &str = "Live Markdown is available for documents up to 4 MB. This one \
+pub(crate) const TOO_LARGE_NOTICE: &str = "Live Markdown is available for documents up to 4 MB. This one \
                                 stays in the source view.";
 
 /// One editor group's Live state.
 #[derive(Debug, Default)]
 pub(crate) struct LiveHost {
-    /// The Live choice made for each of the group's documents; absent follows the default.
-    choices: HashMap<DocumentId, bool>,
     /// Created the first time the group shows a tab Live.
     view: Option<LiveView>,
     /// The document the view showed when it was last shown; another one means a reload.
@@ -52,23 +48,10 @@ fn active_document(hwnd: HWND, id: GroupId) -> Option<(DocumentId, Language)> {
         .map(|(document, language, _)| (document, language))
 }
 
-fn document_length(hwnd: HWND, id: GroupId) -> usize {
-    host_window::group_editor(hwnd, id)
-        .and_then(|editor| editor.length().ok())
-        .unwrap_or(0)
-}
-
-/// Whether group `id`'s active tab should show Live: a Markdown tab chosen Live, or not chosen
-/// either way while the default is Live, that is not over the size limit.
+/// Whether group `id`'s active tab shows Live: its view mode is Live (which a tab over the size
+/// limit, or not in Markdown, never has).
 pub(crate) fn wants_live(hwnd: HWND, id: GroupId) -> bool {
-    let Some((document, Language::Markdown)) = active_document(hwnd, id) else {
-        return false;
-    };
-    let chosen = with_live(hwnd, id, |host| host.choices.get(&document).copied()).flatten();
-    let default = unsafe { host_window::app_ptr(hwnd) }
-        .is_some_and(|app| unsafe { app.as_ref() }.settings.markdown_live_default);
-    // The default skips a file over the limit silently; a choice was checked when it was made.
-    chosen.unwrap_or(default) && document_length(hwnd, id) <= LIVE_MAX_BYTES
+    crate::window::preview_host::group_mode(hwnd, id) == crate::preview::ViewMode::Live
 }
 
 /// Group `id`'s Live window while it is shown.
@@ -102,39 +85,10 @@ pub(crate) fn text_view_hwnd(hwnd: HWND, id: GroupId) -> Option<HWND> {
     view_hwnd(hwnd, id).or_else(|| host_window::group_editor(hwnd, id).map(|editor| editor.hwnd()))
 }
 
-/// `markdown.toggleLive` (Ctrl+Alt+V): the active tab switches between Live and the source view.
-pub(crate) fn toggle(hwnd: HWND) {
-    let Some(app) = (unsafe { host_window::app_ptr(hwnd) }) else {
-        return;
-    };
-    let id = unsafe { app.as_ref() }.tabs.active_group();
-    set_live(hwnd, id, view_hwnd(hwnd, id).is_none());
-}
-
-/// Turns Live on or off for group `id`'s active tab, with a notice when it cannot be on.
-pub(crate) fn set_live(hwnd: HWND, id: GroupId, on: bool) {
-    let Some((document, language)) = active_document(hwnd, id) else {
-        return;
-    };
-    if on && language != Language::Markdown {
-        host_window::push_notice(hwnd, NOT_MARKDOWN_NOTICE.to_owned());
-        return;
-    }
-    if on && document_length(hwnd, id) > LIVE_MAX_BYTES {
-        host_window::push_notice(hwnd, TOO_LARGE_NOTICE.to_owned());
-        return;
-    }
-    with_live(hwnd, id, |host| host.choices.insert(document, on));
-    crate::window::preview_host::in_group(id, || {
-        crate::window::preview_host::sync_visibility(hwnd)
-    });
-}
-
-/// Shows group `id`'s text in its Live window or its editor, as its active tab wants, or hides
+/// Shows group `id`'s text in its Live window or its editor/// Shows group `id`'s text in its Live window or its editor, as its active tab wants, or hides
 /// both when `shown` is false (an image tab, the Full preview). Focus on the window being hidden
 /// moves to the one being shown.
 pub(crate) fn show_text(hwnd: HWND, id: GroupId, shown: bool) {
-    prune_choices(hwnd, id);
     let Some(editor) = host_window::group_editor(hwnd, id) else {
         return;
     };
@@ -240,24 +194,7 @@ pub(crate) fn forget(hwnd: HWND, document: DocumentId) {
     }
 }
 
-/// Drops the choices for documents no longer among group `id`'s tabs.
-fn prune_choices(hwnd: HWND, id: GroupId) {
-    let Some(mut app) = (unsafe { host_window::app_ptr(hwnd) }) else {
-        return;
-    };
-    let app = unsafe { app.as_mut() };
-    let Some(open) = app.tabs.group(id).map(|tabs| tabs.document_ids()) else {
-        return;
-    };
-    if let Some(group) = app.group_mut(id) {
-        group
-            .live
-            .choices
-            .retain(|document, _| open.contains(document));
-    }
-}
-
-/// Group `id`'s Live window, created on first use. A failure turns Live off for the tab with a
+/// Group `id`'s Live window, created on first use./// Group `id`'s Live window, created on first use. A failure turns Live off for the tab with a
 /// notice.
 fn ensure_view(hwnd: HWND, id: GroupId) -> Option<LiveView> {
     if let Some(view) = with_live(hwnd, id, |host| host.view).flatten() {
@@ -288,9 +225,7 @@ fn ensure_view(hwnd: HWND, id: GroupId) -> Option<LiveView> {
             Some(view)
         }
         Err(error) => {
-            if let Some((document, _)) = active_document(hwnd, id) {
-                with_live(hwnd, id, |host| host.choices.insert(document, false));
-            }
+            crate::window::preview_host::choose(hwnd, id, crate::preview::ViewMode::Source);
             host_window::push_notice(
                 hwnd,
                 format!("FastPad could not open the Live Markdown view: {error}"),
@@ -449,18 +384,7 @@ pub(crate) fn document_moved(hwnd: HWND) {
     }
 }
 
-/// The Split preview beside group `id` was scrolled to document `line`: its shown Live view puts
-/// that line at its top, without reporting a scroll of its own (which would sync the preview
-/// back). False when the group shows no Live view.
-pub(crate) fn follow_preview(hwnd: HWND, id: GroupId, line: usize) -> bool {
-    let Some(view) = shown_view(hwnd, id) else {
-        return false;
-    };
-    view.set_top_line(line);
-    true
-}
-
-/// Group `id`'s Live view `view` asks for its context menu (phase 4 plan, Decision 5): the
+/// Group `id`'s Live view `view` asks for its context menu/// Group `id`'s Live view `view` asks for its context menu (phase 4 plan, Decision 5): the
 /// source view's items, greyed as they cannot run, and two more over a link. The menu-only
 /// items reuse command ids as local entries, as the sidebar menus do: Delete is
 /// `DeleteLines`, Select All `SelectAllOccurrences`, Open link `NotesFollowLink` and Copy link
@@ -579,8 +503,8 @@ pub(crate) const fn source_only(command: CommandId) -> Option<&'static str> {
     })
 }
 
-/// Before `command` runs: one that needs the source view switches the active group out of Live,
-/// with a notice, so it acts on the shown editor.
+/// Before `command` runs: one that needs the source view switches the active group out of Live or
+/// Preview, with a notice, so it acts on the shown editor.
 pub(crate) fn before_command(hwnd: HWND, command: CommandId) {
     let Some(name) = source_only(command) else {
         return;
@@ -589,7 +513,8 @@ pub(crate) fn before_command(hwnd: HWND, command: CommandId) {
         return;
     };
     let id = unsafe { app.as_ref() }.tabs.active_group();
-    if shown_view(hwnd, id).is_some() {
+    let mode = crate::window::preview_host::group_mode(hwnd, id);
+    if shown_view(hwnd, id).is_some() || mode == crate::preview::ViewMode::Preview {
         leave(
             hwnd,
             id,
@@ -600,13 +525,8 @@ pub(crate) fn before_command(hwnd: HWND, command: CommandId) {
 
 /// Switches group `id`'s active tab to the source view, saying why.
 fn leave(hwnd: HWND, id: GroupId, notice: String) {
-    if let Some((document, _)) = active_document(hwnd, id) {
-        with_live(hwnd, id, |host| host.choices.insert(document, false));
-    }
     host_window::push_notice(hwnd, notice);
-    crate::window::preview_host::in_group(id, || {
-        crate::window::preview_host::sync_visibility(hwnd)
-    });
+    crate::window::preview_host::set_group_mode(hwnd, id, crate::preview::ViewMode::Source);
 }
 
 /// Moves group `id`'s caret to the ATX heading whose slug is `anchor` (a `#heading` link
@@ -650,12 +570,9 @@ pub(crate) fn poll(hwnd: HWND, id: GroupId, scrolled: bool) {
     else {
         return;
     };
-    if scrolled
-        && let Ok(display) = editor.visible_from_doc_line(view.top_line())
-        && editor.set_first_visible_line(display).is_ok()
-    {
-        // Scintilla reports no scroll while hidden; a Split preview follows from here.
-        crate::window::preview_host::editor_scrolled(hwnd, id);
+    // The hidden editor keeps Live's place, for a switch to Source, Split or Preview.
+    if scrolled && let Ok(display) = editor.visible_from_doc_line(view.top_line()) {
+        let _ = editor.set_first_visible_line(display);
     }
     let (Ok((anchor, caret)), Ok(count)) = (editor.anchor_and_caret(), editor.selection_count())
     else {
@@ -735,10 +652,5 @@ impl LiveHost {
     /// The group's Live window, shown or not.
     pub(crate) fn view_for_test(&self) -> Option<LiveView> {
         self.view
-    }
-
-    /// How many of the group's documents have a Live choice.
-    pub(crate) fn choice_count(&self) -> usize {
-        self.choices.len()
     }
 }

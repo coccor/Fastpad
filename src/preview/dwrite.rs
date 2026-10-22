@@ -187,6 +187,56 @@ impl Graphics {
     }
 }
 
+/// The rectangles DirectWrite gives UTF-16 range `start..end` of `layout` drawn at (`x`, `y`): one
+/// per line the range covers.
+pub fn range_rects(
+    layout: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
+    start: u32,
+    end: u32,
+    x: f32,
+    y: f32,
+) -> Result<Vec<crate::preview::render::RectF>> {
+    use windows::Win32::Graphics::DirectWrite::DWRITE_HIT_TEST_METRICS;
+    let length = end.saturating_sub(start);
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let mut count = 0_u32;
+    // The first call only reports how many rectangles the range needs.
+    let _ = unsafe { layout.HitTestTextRange(start, length, x, y, None, &mut count) };
+    let mut hits = vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
+    unsafe { layout.HitTestTextRange(start, length, x, y, Some(&mut hits), &mut count) }
+        .map_err(hresult_error)?;
+    Ok(hits
+        .iter()
+        .take(count as usize)
+        .map(|hit| {
+            crate::preview::render::RectF::new(
+                hit.left,
+                hit.top,
+                hit.left + hit.width,
+                hit.top + hit.height,
+            )
+        })
+        .collect())
+}
+
+/// The UTF-16 position nearest point (`x`, `y`) of `layout`: before the character hit, or after
+/// it when the point is on its trailing half. Points outside the text snap to its nearest edge.
+pub fn hit_test_point(
+    layout: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
+    x: f32,
+    y: f32,
+) -> Result<u32> {
+    use windows::Win32::Graphics::DirectWrite::DWRITE_HIT_TEST_METRICS;
+    let mut trailing = BOOL::default();
+    let mut inside = BOOL::default();
+    let mut hit = DWRITE_HIT_TEST_METRICS::default();
+    unsafe { layout.HitTestPoint(x, y, &mut trailing, &mut inside, &mut hit) }
+        .map_err(hresult_error)?;
+    Ok(hit.textPosition + if trailing.as_bool() { hit.length } else { 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

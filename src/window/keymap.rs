@@ -230,10 +230,11 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::LanguageTypeScript, "language.typescript"),
     (CommandId::LanguageXml, "language.xml"),
     (CommandId::LanguageYaml, "language.yaml"),
-    (CommandId::MarkdownPreviewCycle, "markdown.cyclePreview"),
-    (CommandId::MarkdownPreviewSide, "markdown.previewSide"),
-    (CommandId::MarkdownPreviewFull, "markdown.previewFull"),
-    (CommandId::MarkdownPreviewClose, "markdown.closePreview"),
+    (CommandId::MarkdownViewCycle, "markdown.cycleView"),
+    (CommandId::MarkdownViewSource, "markdown.viewSource"),
+    (CommandId::MarkdownViewLive, "markdown.viewLive"),
+    (CommandId::MarkdownViewSplit, "markdown.viewSplit"),
+    (CommandId::MarkdownViewPreview, "markdown.viewPreview"),
     (CommandId::NextTab, "view.nextTab"),
     (CommandId::PreviousTab, "view.previousTab"),
     (CommandId::SelectTab1, "view.selectTab1"),
@@ -372,7 +373,16 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::MarkdownItalic, "markdown.italic"),
     (CommandId::MarkdownCode, "markdown.code"),
     (CommandId::MarkdownLink, "markdown.link"),
-    (CommandId::MarkdownToggleLive, "markdown.toggleLive"),
+];
+
+/// IDs the view mode commands had before the 2026-10-22 view modes spec: still read from
+/// `fastpad.ini`, never written.
+const RETIRED_COMMAND_IDS: [(CommandId, &str); 5] = [
+    (CommandId::MarkdownViewCycle, "markdown.cyclePreview"),
+    (CommandId::MarkdownViewSplit, "markdown.previewSide"),
+    (CommandId::MarkdownViewPreview, "markdown.previewFull"),
+    (CommandId::MarkdownViewSource, "markdown.closePreview"),
+    (CommandId::MarkdownViewLive, "markdown.toggleLive"),
 ];
 
 pub(crate) fn command_id(command: CommandId) -> Option<&'static str> {
@@ -385,6 +395,7 @@ pub(crate) fn command_id(command: CommandId) -> Option<&'static str> {
 pub(crate) fn command_for_id(id: &str) -> Option<CommandId> {
     COMMAND_IDS
         .iter()
+        .chain(RETIRED_COMMAND_IDS.iter())
         .find(|(_, candidate)| *candidate == id)
         .map(|(command, _)| *command)
 }
@@ -470,8 +481,8 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 89] = [
     (key(C, ch(b'P')), CommandId::QuickOpen),
     (key(C | S, ch(b'P')), CommandId::CommandPalette),
     (key(C, VK_OEM_COMMA), CommandId::OpenSettings),
-    (key(C | S, ch(b'V')), CommandId::MarkdownPreviewCycle),
-    (key(C | A, ch(b'V')), CommandId::MarkdownToggleLive),
+    (key(C | S, ch(b'V')), CommandId::MarkdownViewCycle),
+    (key(C | A, ch(b'V')), CommandId::MarkdownViewLive),
     (key(C, ch(b'B')), CommandId::ToggleSidebar),
     (key(C | S, ch(b'E')), CommandId::ShowNotebookView),
     (key(A, ch(b'Z')), CommandId::ToggleWordWrap),
@@ -906,6 +917,16 @@ mod tests {
         }
         assert_eq!(seen.len(), COMMAND_IDS.len());
         assert_eq!(command_for_id("File.Save"), None, "IDs are case-sensitive");
+    }
+
+    #[test]
+    fn retired_view_mode_ids_still_rebind_their_commands() {
+        // Break caught: a `key.markdown.toggleLive=` line from before the view modes warning as
+        // unknown and losing the user's key.
+        for (command, id) in RETIRED_COMMAND_IDS {
+            assert_eq!(command_for_id(id), Some(command));
+            assert_ne!(command_id(command), Some(id), "{id} is never written");
+        }
     }
 
     #[test]

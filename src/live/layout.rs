@@ -19,7 +19,7 @@ use crate::live::motion::{LineGeometry, Row};
 use crate::live::offsets::OffsetMap;
 use crate::live::spans::{Container, Marker};
 use crate::live::styles::{BodyStyle, Effect, ImageInfo, LineStyle, Paint, StyledLines, effects};
-use crate::preview::dwrite::{Graphics, hresult_error};
+use crate::preview::dwrite::{Graphics, hresult_error, range_rects};
 use crate::preview::heights::HeightIndex;
 use crate::preview::inline_object::inline_box;
 use crate::preview::layout::{CODE_SCALE, HEADING_SCALE};
@@ -1249,37 +1249,6 @@ fn hit_row(laid: &LineLayout, row: &RowMetrics, x: f32) -> Result<usize> {
     } else {
         laid.offsets.to_byte(position)
     })
-}
-
-fn range_rects(
-    layout: &IDWriteTextLayout,
-    start: u32,
-    end: u32,
-    x: f32,
-    y: f32,
-) -> Result<Vec<RectF>> {
-    let length = end.saturating_sub(start);
-    if length == 0 {
-        return Ok(Vec::new());
-    }
-    let mut count = 0_u32;
-    // The first call only reports how many rectangles the range needs.
-    let _ = unsafe { layout.HitTestTextRange(start, length, x, y, None, &mut count) };
-    let mut hits = vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
-    unsafe { layout.HitTestTextRange(start, length, x, y, Some(&mut hits), &mut count) }
-        .map_err(hresult_error)?;
-    Ok(hits
-        .iter()
-        .take(count as usize)
-        .map(|hit| {
-            RectF::new(
-                hit.left,
-                hit.top,
-                hit.left + hit.width,
-                hit.top + hit.height,
-            )
-        })
-        .collect())
 }
 
 mod tables;

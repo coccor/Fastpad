@@ -8,23 +8,21 @@ const AREA: RECT = RECT {
 };
 
 #[test]
-fn button_hints_name_the_keymaps_cycle_key() {
+fn button_hints_name_the_modes_own_key_or_the_keymaps_cycle_key() {
     // Break caught: the hint still saying Ctrl+Shift+V after the user rebound the cycle
-    // command, or naming a key when it has none.
+    // command, naming the cycle key where the mode has its own, or naming a key when it has none.
     assert_eq!(
-        button_hint(PreviewButton::Side, Some("F9")),
-        "Open preview to the side (F9 cycles preview modes)"
+        button_hint(ViewMode::Split, None, Some("F9")),
+        "Split: source and preview (F9 cycles views)"
     );
     assert_eq!(
-        button_hint(PreviewButton::Full, Some("Ctrl+Shift+V")),
-        "Open preview (Ctrl+Shift+V cycles preview modes)"
+        button_hint(ViewMode::Live, Some("Ctrl+Alt+V"), Some("Ctrl+Shift+V")),
+        "Live (Ctrl+Alt+V)"
     );
-    assert_eq!(button_hint(PreviewButton::Full, None), "Open preview");
+    assert_eq!(button_hint(ViewMode::Preview, None, None), "Preview");
     let keymap = crate::window::keymap::Keymap::defaults();
     assert_eq!(
-        keymap
-            .first_text(CommandId::MarkdownPreviewCycle)
-            .as_deref(),
+        keymap.first_text(CommandId::MarkdownViewCycle).as_deref(),
         Some("Ctrl+Shift+V")
     );
 }
@@ -36,16 +34,13 @@ fn off_or_hidden_previews_give_the_editor_the_whole_area() {
         divider: None,
         preview: None,
     };
-    assert_eq!(content_rects(AREA, PreviewMode::Off, true, 0.5, 96), whole);
-    assert_eq!(
-        content_rects(AREA, PreviewMode::Split, false, 0.5, 96),
-        whole
-    );
+    assert_eq!(content_rects(AREA, ViewMode::Source, true, 0.5, 96), whole);
+    assert_eq!(content_rects(AREA, ViewMode::Split, false, 0.5, 96), whole);
 }
 
 #[test]
 fn split_places_a_divider_between_editor_and_preview() {
-    let rects = content_rects(AREA, PreviewMode::Split, true, 0.5, 96);
+    let rects = content_rects(AREA, ViewMode::Split, true, 0.5, 96);
     let expected = ContentRects {
         editor: Some(RECT { right: 500, ..AREA }),
         divider: Some(RECT {
@@ -60,15 +55,15 @@ fn split_places_a_divider_between_editor_and_preview() {
 
 #[test]
 fn split_ratio_is_clamped() {
-    let wide = content_rects(AREA, PreviewMode::Split, true, 0.95, 96);
+    let wide = content_rects(AREA, ViewMode::Split, true, 0.95, 96);
     assert_eq!(wide.editor.unwrap().right, 800);
-    let narrow = content_rects(AREA, PreviewMode::Split, true, 0.01, 96);
+    let narrow = content_rects(AREA, ViewMode::Split, true, 0.01, 96);
     assert_eq!(narrow.editor.unwrap().right, 200);
 }
 
 #[test]
 fn full_mode_hides_the_editor() {
-    let rects = content_rects(AREA, PreviewMode::Full, true, 0.5, 96);
+    let rects = content_rects(AREA, ViewMode::Preview, true, 0.5, 96);
     assert_eq!(
         rects,
         ContentRects {

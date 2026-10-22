@@ -39,6 +39,14 @@ pub(crate) fn focus_group_number(hwnd: HWND, index: usize) {
             app.tabs.add_view(new, id, state);
         }
     }
+    if let Some(id) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .active()
+            .map(|document| document.id)
+    }) {
+        crate::window::preview_host::carry_mode(hwnd, source, id, new);
+    }
     activate_group(hwnd, new);
     show_group_view(hwnd, new);
     layout_editor_and_find_bar(hwnd);
@@ -62,6 +70,8 @@ pub(crate) fn place_view(
     copy: bool,
 ) -> bool {
     remember_view(hwnd, from);
+    // Before the move, while `from` still has the tab and its mode.
+    crate::window::preview_host::carry_mode(hwnd, from, id, to);
     let placed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let tabs = &mut unsafe { app.as_mut() }.tabs;
         if copy {
@@ -423,13 +433,17 @@ pub(crate) fn invalidate_title_strip(hwnd: HWND) {
             unsafe { app.as_ref() }
                 .groups
                 .iter()
-                .map(|group| group.hwnd)
+                .map(|group| (group.hwnd, group.toolbar.hwnd))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for group in groups {
+    for (group, toolbar) in groups {
         unsafe {
             InvalidateRect(group, std::ptr::null(), 0);
+            // The toolbar shows the tab's location, which a save as or a rename changes.
+            if !toolbar.is_null() {
+                InvalidateRect(toolbar, std::ptr::null(), 0);
+            }
         }
     }
     // The Open Editors rows show what the strip does.

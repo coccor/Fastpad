@@ -121,20 +121,17 @@ pub(super) fn open_menu(hwnd: HWND, mut index: usize) {
             return;
         };
         if index == crate::window::menu_band::VIEW_MENU_INDEX {
-            menus::set_markdown_preview_enabled(
-                menu,
-                crate::window::preview_host::buttons_visible(hwnd),
-            );
+            if let Some(id) =
+                unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active_group())
+            {
+                menus::set_markdown_view(
+                    menu,
+                    crate::window::editor_toolbar::segments_for(hwnd, id),
+                    crate::window::preview_host::group_mode(hwnd, id),
+                );
+            }
             menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
             menus::set_checked_language(menu, active_language(hwnd));
-            let live = unsafe { app_ptr(hwnd) }
-                .map(|app| unsafe { app.as_ref() }.tabs.active_group())
-                .is_some_and(|id| crate::window::live_host::view_hwnd(hwnd, id).is_some());
-            menus::set_markdown_live(
-                menu,
-                active_language(hwnd) == crate::document::Language::Markdown,
-                live,
-            );
         }
         menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
         set_menu_mode(

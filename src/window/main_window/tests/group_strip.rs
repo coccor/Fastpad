@@ -142,7 +142,12 @@ fn the_group_strip_is_the_title_row() {
     let title = super::super::title_layout(window.hwnd);
     let left = crate::window::side_panel::left_edge(window.hwnd);
     assert_eq!(origin_in(group, window.hwnd), (left, 0));
-    assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height);
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+    // The editor toolbar sits between the strip and the editor.
+    assert_eq!(
+        origin_in(editor.hwnd(), window.hwnd).1,
+        title.height + crate::window::editor_toolbar::row_height(dpi)
+    );
     let strip = super::super::strip_layout(window.hwnd).unwrap();
     assert_eq!(strip.height, title.height);
     assert_eq!(strip.bounds().right, title.minimize.left - left);
@@ -267,52 +272,60 @@ fn the_group_region_leaves_the_caption_buttons_and_the_menu_band_to_the_main_win
         (heading.top + heading.bottom) / 2
     ));
     assert!(covers(tab.x + left, tab.y));
-    assert_eq!(origin_in(editor.hwnd(), window.hwnd).1, title.height + band);
+    assert_eq!(
+        origin_in(editor.hwnd(), window.hwnd).1,
+        title.height + band + crate::window::editor_toolbar::row_height(dpi)
+    );
 }
 
 #[test]
-fn markdown_tabs_show_floating_preview_buttons_at_the_content_top_right() {
-    // Break caught: preview buttons left in the strip, shown for tabs that cannot preview,
-    // or drawn under the editor.
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, GetParent, GetWindow};
+fn every_tab_shows_the_editor_toolbar_under_the_strip_with_the_editor_below() {
+    // Break caught: the view control floating over the text again, the row missing on a plain
+    // tab (so switching tabs moves the text), or the editor drawn under the row.
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
-    let _editor = install_test_editor(&window);
+    let editor = install_test_editor(&window);
     let group = super::super::group_hwnd(window.hwnd).unwrap();
-    let buttons = || crate::window::preview_buttons::hwnd(window.hwnd);
     let visible = |hwnd: HWND| {
         (unsafe { GetWindowLongPtrW(hwnd, super::super::GWL_STYLE) }) as u32
             & super::super::WS_VISIBLE
             != 0
     };
-    assert!(buttons().is_none_or(|hwnd| !visible(hwnd)));
+    let check = || {
+        let hwnd = crate::window::editor_toolbar::hwnd(window.hwnd).expect("editor toolbar");
+        assert!(visible(hwnd));
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(hwnd) },
+            group
+        );
+        let dpi = unsafe { GetDpiForWindow(group) }.max(96);
+        let strip = super::super::strip_layout(window.hwnd).unwrap();
+        let (x, y) = origin_in(hwnd, group);
+        let (width, height) = client_size(hwnd);
+        assert_eq!((x, y), (0, strip.height), "directly under the strip");
+        assert_eq!(width, client_size(group).0, "across the whole group");
+        assert_eq!(height, crate::window::editor_toolbar::row_height(dpi));
+        assert_eq!(
+            origin_in(editor.hwnd(), group).1,
+            strip.height + height,
+            "the editor starts under the row"
+        );
+    };
+    // A plain text tab has the row, with no view control.
+    check();
+    let id = app_mut(window.hwnd).tabs.active_group();
+    assert!(crate::window::editor_toolbar::segments_for(window.hwnd, id).is_empty());
 
     // What a successful language switch does, without loading Lexilla.
     app_mut(window.hwnd)
         .tabs
         .set_active_language(crate::document::Language::Markdown);
     crate::window::preview_host::sync_visibility(window.hwnd);
-    let hwnd = buttons().expect("floating preview buttons");
-    assert!(visible(hwnd));
-    assert_eq!(unsafe { GetParent(hwnd) }, group);
-    let strip = super::super::strip_layout(window.hwnd).unwrap();
+    check();
     assert_eq!(
-        strip.tabs.right,
-        strip.bounds().right,
-        "the strip holds only tabs"
+        crate::window::editor_toolbar::segments_for(window.hwnd, id).len(),
+        4
     );
-    let dpi = unsafe { GetDpiForWindow(group) }.max(96);
-    let (group_width, _) = client_size(group);
-    let (x, y) = origin_in(hwnd, group);
-    let (width, _) = client_size(hwnd);
-    assert_eq!(
-        y,
-        strip.height + crate::window::design::metrics::scale(8, dpi)
-    );
-    assert!(x + width < group_width, "clear of the vertical scroll bar");
-    assert!(x + width >= group_width - crate::window::design::metrics::scale(48, dpi));
-    // Above the editor in z-order: no sibling before it.
-    assert!(unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_null());
 }
 
 #[test]
@@ -399,9 +412,8 @@ fn a_plain_launch_keeps_the_untitled_tab_once_it_has_text() {
 }
 
 #[test]
-fn only_the_active_group_shows_the_floating_preview_buttons() {
-    // Break caught: a Markdown document shown in two groups floats a pair of preview buttons
-    // over both, though only the selected one's act on the active tab.
+fn every_group_shows_its_own_toolbar() {
+    // Break caught: the row only in the active group, so focusing a group moved the other's text.
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
@@ -413,7 +425,7 @@ fn only_the_active_group_shows_the_floating_preview_buttons() {
     execute_command(window.hwnd, CommandId::SplitRight);
     let second = app_mut(window.hwnd).tabs.active_group();
     let shown = |id| {
-        super::super::with_group_id(window.hwnd, id, |state| state.preview_buttons.hwnd)
+        super::super::with_group_id(window.hwnd, id, |state| state.toolbar.hwnd)
             .filter(|hwnd| !hwnd.is_null())
             .is_some_and(|hwnd| {
                 (unsafe { GetWindowLongPtrW(hwnd, super::super::GWL_STYLE) }) as u32
@@ -421,18 +433,14 @@ fn only_the_active_group_shows_the_floating_preview_buttons() {
                     != 0
             })
     };
-    assert!(shown(second));
-    assert!(!shown(first));
-
+    assert!(shown(first) && shown(second));
     assert!(super::super::activate_group(window.hwnd, first));
-
-    assert!(shown(first));
-    assert!(!shown(second));
+    assert!(shown(first) && shown(second));
 }
 
 #[test]
-fn the_floating_side_button_opens_and_closes_the_side_preview() {
-    // Break caught: floating buttons that paint but do not act.
+fn the_toolbar_segments_switch_the_view_mode() {
+    // Break caught: segments that paint but do not act.
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
@@ -442,25 +450,28 @@ fn the_floating_side_button_opens_and_closes_the_side_preview() {
         .tabs
         .set_active_language(crate::document::Language::Markdown);
     crate::window::preview_host::sync_visibility(window.hwnd);
-    let hwnd = crate::window::preview_buttons::hwnd(window.hwnd).unwrap();
-    let side = crate::window::preview_buttons::button_rect(
-        hwnd,
-        crate::window::preview_buttons::PreviewButton::Side,
-    )
-    .center();
-    let click = || unsafe {
-        SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(side.x, side.y));
-        SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(side.x, side.y));
+    let hwnd = crate::window::editor_toolbar::hwnd(window.hwnd).unwrap();
+    // Segments: Source, Live, Split, Preview.
+    let click = |index| unsafe {
+        let at = crate::window::editor_toolbar::segment_rect(hwnd, 4, index).center();
+        SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(at.x, at.y));
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(at.x, at.y));
     };
-    click();
+    click(2);
     assert_eq!(
         crate::window::preview_host::mode(window.hwnd),
-        crate::preview::PreviewMode::Split
+        crate::preview::ViewMode::Split
     );
-    click();
+    // The current segment stays selected.
+    click(2);
     assert_eq!(
         crate::window::preview_host::mode(window.hwnd),
-        crate::preview::PreviewMode::Off
+        crate::preview::ViewMode::Split
+    );
+    click(0);
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        crate::preview::ViewMode::Source
     );
 }
 

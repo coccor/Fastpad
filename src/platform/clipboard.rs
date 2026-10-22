@@ -1,4 +1,5 @@
-//! Plain text onto the clipboard, for the Keyboard Shortcuts page's Copy command ID.
+//! Text onto the clipboard: plain, for the Keyboard Shortcuts page's Copy command ID, and plain
+//! with HTML beside it, for the preview's selection.
 
 use crate::Result;
 use crate::platform::{last_error, wide_null};
@@ -39,6 +40,60 @@ pub(crate) fn set_text(owner: HWND, text: &str) -> Result<()> {
     })();
     unsafe { CloseClipboard() };
     result
+}
+
+/// Replaces the clipboard's contents with `text` and, in the registered `HTML Format`, `html`:
+/// a complete CF_HTML document (`preview::selection::cf_html`). `owner` may be null.
+pub(crate) fn set_text_and_html(owner: HWND, text: &str, html: &str) -> Result<()> {
+    if !open(owner) {
+        return Err(last_error());
+    }
+    let wide = wide_null(text);
+    let mut utf8 = html.as_bytes().to_vec();
+    utf8.push(0);
+    let result = (|| unsafe {
+        EmptyClipboard();
+        put(
+            u32::from(CF_UNICODETEXT),
+            wide.as_ptr().cast(),
+            std::mem::size_of_val(wide.as_slice()),
+        )?;
+        put(html_format(), utf8.as_ptr(), utf8.len())
+    })();
+    unsafe { CloseClipboard() };
+    result
+}
+
+/// Copies `len` bytes at `data` into clipboard memory and hands it to the clipboard as `format`.
+/// The clipboard must be open and owned.
+unsafe fn put(format: u32, data: *const u8, len: usize) -> Result<()> {
+    unsafe {
+        let memory = GlobalAlloc(GMEM_MOVEABLE, len);
+        if memory.is_null() {
+            return Err(last_error());
+        }
+        let target = GlobalLock(memory).cast::<u8>();
+        if target.is_null() {
+            let error = last_error();
+            GlobalFree(memory);
+            return Err(error);
+        }
+        std::ptr::copy_nonoverlapping(data, target, len);
+        GlobalUnlock(memory);
+        // The clipboard owns the memory once SetClipboardData succeeds.
+        if SetClipboardData(format, memory).is_null() {
+            let error = last_error();
+            GlobalFree(memory);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+/// The registered `HTML Format` Word, Outlook and browsers read rich text from.
+fn html_format() -> u32 {
+    let name = wide_null("HTML Format");
+    unsafe { windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW(name.as_ptr()) }
 }
 
 /// Opens the clipboard, waiting briefly while another program holds it.
@@ -138,8 +193,10 @@ pub(crate) fn image_png(owner: HWND) -> Option<std::result::Result<Vec<u8>, Stri
     })
 }
 
+/// Saving and restoring the user's clipboard around tests that write to it, and reading back what
+/// they wrote.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, OpenClipboard,
         SetClipboardData,
@@ -149,7 +206,7 @@ mod tests {
     };
 
     /// Opens the clipboard, waiting out another program (a clipboard manager) holding it.
-    fn open() {
+    pub(crate) fn open() {
         for _ in 0..50 {
             if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
                 return;
@@ -162,10 +219,10 @@ mod tests {
     /// The user's clipboard, put back on drop: every format held in global memory. GDI-handle
     /// formats (bitmaps, metafiles, palettes) are left out; Windows synthesizes the bitmap from
     /// the DIB that is kept.
-    struct Backup(Vec<(u32, Vec<u8>)>);
+    pub(crate) struct Backup(Vec<(u32, Vec<u8>)>);
 
     impl Backup {
-        fn take() -> Self {
+        pub(crate) fn take() -> Self {
             const GDI_HANDLES: [u32; 7] = [2, 3, 9, 14, 0x80, 0x82, 0x8e];
             let mut formats = Vec::new();
             open();
@@ -215,6 +272,70 @@ mod tests {
                 CloseClipboard();
             }
         }
+    }
+
+    /// The bytes the clipboard holds in `format`, up to its first NUL unit for text.
+    pub(crate) fn read(format: u32) -> Vec<u8> {
+        open();
+        unsafe {
+            let data = GetClipboardData(format);
+            let size = if data.is_null() { 0 } else { GlobalSize(data) };
+            let pointer = if size == 0 {
+                std::ptr::null()
+            } else {
+                GlobalLock(data) as *const u8
+            };
+            let bytes = if pointer.is_null() {
+                Vec::new()
+            } else {
+                let bytes = std::slice::from_raw_parts(pointer, size).to_vec();
+                GlobalUnlock(data);
+                bytes
+            };
+            CloseClipboard();
+            bytes
+        }
+    }
+
+    /// The clipboard's Unicode text.
+    pub(crate) fn read_text() -> String {
+        let bytes = read(u32::from(windows_sys::Win32::System::Ole::CF_UNICODETEXT));
+        let units = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .take_while(|unit| *unit != 0)
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&units)
+    }
+
+    /// The clipboard's `HTML Format` document.
+    pub(crate) fn read_html() -> String {
+        let bytes = read(super::html_format());
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{Backup, open, read_html, read_text};
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+
+    #[test]
+    fn text_and_html_land_together() {
+        // Break caught: the HTML replacing the plain text (EmptyClipboard between them), or
+        // its bytes losing their NUL so Word reads past the end.
+        let _backup = Backup::take();
+        let html = crate::preview::selection::cf_html("<p><strong>é</strong></p>");
+        super::set_text_and_html(std::ptr::null_mut(), "é", &html).unwrap();
+        assert_eq!(read_text(), "é");
+        assert_eq!(read_html(), html);
     }
 
     #[test]

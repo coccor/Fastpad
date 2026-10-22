@@ -101,6 +101,9 @@ pub(super) fn toggle_details(state: &mut ViewState, key: &DetailsKey) {
         details_open_attribute(&state.document.blocks[block].kind, index).unwrap_or(false);
     let open = state.details_overrides.get(key).copied().unwrap_or(default);
     set_details_open(state, key, default, !open);
+    // Runs inside the section come and go, so selected points could name other text.
+    state.selection = None;
+    state.press = None;
     set_underline(state, state.hover, false);
     state.hover = None;
     state.pressed = None;

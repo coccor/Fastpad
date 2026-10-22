@@ -181,11 +181,10 @@ fn a_preview_opened_in_one_group_leaves_the_other_group_alone() {
         .set_active_language(crate::document::Language::Markdown);
     let (first, second) = second_group_showing_the_active_document(window.hwnd);
     super::super::activate_group(window.hwnd, second);
-    execute_command(window.hwnd, CommandId::MarkdownPreviewFull);
-    let mode =
-        |id| crate::window::preview_host::with_group_host(window.hwnd, id, |host| host.mode());
-    assert_eq!(mode(second), Some(crate::preview::PreviewMode::Full));
-    assert_eq!(mode(first), Some(crate::preview::PreviewMode::Off));
+    execute_command(window.hwnd, CommandId::MarkdownViewPreview);
+    let mode = |id| crate::window::preview_host::group_mode(window.hwnd, id);
+    assert_eq!(mode(second), crate::preview::ViewMode::Preview);
+    assert_eq!(mode(first), crate::preview::ViewMode::Source);
     // The test window is never shown, so the style says whether the editor would show.
     let style = unsafe { GetWindowLongPtrW(editor.hwnd(), GWL_STYLE) } as u32;
     assert!(style & WS_VISIBLE != 0, "group 1's editor still shows");

@@ -102,7 +102,12 @@ impl TestMain {
     }
 
     fn set_live(&self, on: bool) {
-        window::live_host::set_live(self.hwnd, self.group(), on);
+        let mode = if on {
+            crate::preview::ViewMode::Live
+        } else {
+            crate::preview::ViewMode::Source
+        };
+        window::preview_host::set_group_mode(self.hwnd, self.group(), mode);
         pump_pending();
     }
 
@@ -217,7 +222,7 @@ fn toggling_does_not_dirty_or_add_undo() {
 }
 
 #[test]
-fn switching_tabs_and_preview_modes_keeps_scintilla_hidden_in_live() {
+fn switching_tabs_and_view_modes_shows_one_text_view_at_a_time() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# Live\n");
@@ -231,15 +236,16 @@ fn switching_tabs_and_preview_modes_keeps_scintilla_hidden_in_live() {
     main.command(CommandId::PreviousTab);
     assert!(!visible(editor.hwnd()) && visible(view.hwnd()));
 
-    // Split keeps Live on the left; Full hides both; back to Split shows Live.
-    main.command(CommandId::MarkdownPreviewSide);
-    assert!(!visible(editor.hwnd()) && visible(view.hwnd()));
-    main.command(CommandId::MarkdownPreviewFull);
+    // Split shows the source beside the preview; Preview hides both; Live and Source show
+    // their own view (view modes spec §4).
+    main.command(CommandId::MarkdownViewSplit);
+    assert!(visible(editor.hwnd()) && !visible(view.hwnd()));
+    main.command(CommandId::MarkdownViewPreview);
     assert!(!visible(editor.hwnd()) && !visible(view.hwnd()));
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewLive);
     assert!(!visible(editor.hwnd()) && visible(view.hwnd()));
-    main.command(CommandId::MarkdownPreviewClose);
-    assert!(!visible(editor.hwnd()) && visible(view.hwnd()));
+    main.command(CommandId::MarkdownViewSource);
+    assert!(visible(editor.hwnd()) && !visible(view.hwnd()));
 }
 
 #[test]
@@ -273,13 +279,13 @@ fn a_note_over_the_size_limit_stays_in_source_with_a_notice() {
 }
 
 #[test]
-fn closing_the_tab_forgets_its_live_choice() {
+fn closing_the_tab_forgets_its_view_mode() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.command(CommandId::New);
     main.make_markdown("# Closing\n");
     main.set_live(true);
-    let choices = || main.with_app(|app| app.active_group().unwrap().live.choice_count());
+    let choices = || main.with_app(|app| app.active_group().unwrap().preview.modes.len());
     assert_eq!(choices(), 1);
     main.mark_clean();
     main.command(CommandId::CloseTab);
@@ -1128,7 +1134,7 @@ fn every_text_command_works_in_live_or_switches_to_source() {
         // Skipped, with why: these leave Live by design or need a dialog or a file.
         let skip = match command {
             CommandId::Save | CommandId::SaveAs => Some("opens the save dialog"),
-            CommandId::MarkdownToggleLive => Some("is the toggle itself"),
+            CommandId::MarkdownViewLive => Some("is the toggle itself"),
             CommandId::NoteReloadFromDisk
             | CommandId::NoteKeepMine
             | CommandId::NoteCompareWithDisk => Some("needs a file changed on disk"),
@@ -1203,9 +1209,8 @@ fn ctrl_wheel_zooms_live_and_source_together() {
 }
 
 #[test]
-fn scrolling_live_scrolls_the_hidden_editor_and_the_split_preview() {
+fn scrolling_live_scrolls_the_hidden_editor() {
     let (_scintilla, main, view) = live_tab(&long_document());
-    main.command(CommandId::MarkdownPreviewSide);
     unsafe {
         SendMessageW(
             view.hwnd(),
@@ -1259,17 +1264,6 @@ Some **text** for section {n}.
         .collect()
 }
 
-/// A shown Live tab holding `text`, with the preview beside it.
-fn live_split(text: &str) -> (support::win32::WindowHarness, TestMain, LiveView, HWND) {
-    let (scintilla, main, view) = live_tab(text);
-    main.command(CommandId::MarkdownPreviewSide);
-    let preview = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
-    pump_until("the preview to lay out", Duration::from_secs(5), || {
-        preview.stats().block_count > 1
-    });
-    (scintilla, main, view, preview.hwnd())
-}
-
 fn scroll_page_down(hwnd: HWND, pages: usize) {
     for _ in 0..pages {
         unsafe {
@@ -1284,81 +1278,29 @@ fn scroll_page_down(hwnd: HWND, pages: usize) {
     pump_pending();
 }
 
-fn sync_count(main: &TestMain) -> u64 {
-    main.with_app(|app| app.active_group().unwrap().preview.sync_count)
-}
-
 #[test]
-fn scrolling_the_split_preview_scrolls_live() {
-    let (_scintilla, main, view, preview) = live_split(&sectioned_document());
-    let preview_view = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
-    for pages in [3, 4, 5] {
-        scroll_page_down(preview, pages);
-        let target = preview_view.top_line();
-        pump_until("Live to follow the preview", Duration::from_secs(2), || {
-            view.top_line() == target
-        });
-        // The hidden editor keeps the place for a switch back to source.
-        let editor = main.editor();
-        assert_eq!(
-            editor
-                .doc_line_from_visible(editor.first_visible_line().unwrap())
-                .unwrap(),
-            target
-        );
-    }
-}
-
-#[test]
-fn split_sync_settles_after_scrolling_either_side() {
-    let (_scintilla, main, view, preview) = live_split(&sectioned_document());
-    let preview_view = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
-    let before = sync_count(&main);
-    scroll_page_down(view.hwnd(), 3);
-    pump_until("the preview to follow Live", Duration::from_secs(2), || {
-        sync_count(&main) > before
-    });
-    let after_live = sync_count(&main);
-    scroll_page_down(preview, 3);
-    pump_until("Live to follow the preview", Duration::from_secs(2), || {
-        view.top_line() == preview_view.top_line()
-    });
-    let after_preview = sync_count(&main);
-    assert!(after_preview > after_live);
-    // No echo left behind: Live's next scroll still moves the preview.
-    let preview_top = preview_view.top_line();
-    scroll_page_down(view.hwnd(), 2);
-    pump_until(
-        "the preview to follow Live again",
-        Duration::from_secs(2),
-        || preview_view.top_line() > preview_top,
-    );
-    // And everything settles.
-    let (live_top, preview_top, count) =
-        (view.top_line(), preview_view.top_line(), sync_count(&main));
-    pump_for(Duration::from_millis(300));
-    assert_eq!(
-        (view.top_line(), preview_view.top_line(), sync_count(&main)),
-        (live_top, preview_top, count)
-    );
-}
-
-#[test]
-fn toggling_to_source_after_a_preview_scroll_keeps_the_place() {
-    let (_scintilla, main, view, preview) = live_split(&sectioned_document());
-    let preview_view = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
-    scroll_page_down(preview, 4);
-    let target = preview_view.top_line();
-    pump_until("Live to follow the preview", Duration::from_secs(2), || {
-        view.top_line() == target
-    });
-    main.set_live(false);
+fn leaving_live_for_split_keeps_the_place() {
+    // Break caught: Split opening at the top of the note after Live was scrolled down it.
+    let (_scintilla, main, view) = live_tab(&sectioned_document());
+    scroll_page_down(view.hwnd(), 4);
+    let target = view.top_line();
+    assert!(target > 0);
+    main.command(CommandId::MarkdownViewSplit);
     let editor = main.editor();
     assert_eq!(
         editor
             .doc_line_from_visible(editor.first_visible_line().unwrap())
             .unwrap(),
         target
+    );
+    let preview = main.with_app(|app| app.active_group().unwrap().preview.view.unwrap());
+    pump_until("the preview to lay out", Duration::from_secs(5), || {
+        preview.stats().block_count > 1
+    });
+    let top = preview.top_line();
+    assert!(
+        top > 0 && top <= target,
+        "preview at {top}, Live was at {target}"
     );
 }
 
@@ -1918,13 +1860,13 @@ fn ime_result_inserts_one_undo_step() {
 fn the_default_setting_opens_markdown_in_live() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
-    main.with_app(|app| app.settings.markdown_live_default = true);
+    main.with_app(|app| app.settings.markdown_view = crate::preview::ViewMode::Live);
     main.make_markdown("# Opens Live\n");
     let view = main.live_view().expect("a Live window");
     assert!(visible(view.hwnd()));
     assert!(!visible(main.editor().hwnd()));
-    // Ctrl+Alt+V still turns it off for this tab, and the choice sticks.
-    main.command(CommandId::MarkdownToggleLive);
+    // Source turns it off for this tab, and the choice sticks.
+    main.command(CommandId::MarkdownViewSource);
     assert!(!visible(view.hwnd()));
     main.command(CommandId::New);
     main.command(CommandId::PreviousTab);
@@ -1936,7 +1878,7 @@ fn the_default_setting_opens_markdown_in_live() {
 fn the_default_setting_skips_files_over_the_limit_silently() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
-    main.with_app(|app| app.settings.markdown_live_default = true);
+    main.with_app(|app| app.settings.markdown_view = crate::preview::ViewMode::Live);
     main.make_markdown(&"x".repeat(live::LIVE_MAX_BYTES + 1));
     assert!(main.live_view().is_none());
     assert!(visible(main.editor().hwnd()));
@@ -2032,17 +1974,9 @@ fn live_against_source(text: &str, caret: usize) -> (u64, u64) {
 }
 
 fn live_against_source_typing(text: &str, caret: usize, typing: Typing) -> (u64, u64) {
-    measure_typing(text, caret, typing, false)
-}
-
-/// `live_against_source_typing`, with the preview open beside the text when `split`.
-fn measure_typing(text: &str, caret: usize, typing: Typing, split: bool) -> (u64, u64) {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown(text);
-    if split {
-        main.command(CommandId::MarkdownPreviewSide);
-    }
     let (mut source, mut live) = (u64::MAX, u64::MAX);
     for _ in 0..3 {
         main.set_live(false);
@@ -2138,15 +2072,6 @@ fn typing_in_live_inside_a_code_block_stays_in_budget() {
     let caret = text.find("let value_250 =").unwrap() + "let value_250".len();
     let (source, live) = live_against_source(&text, caret);
     report_typing("code_block", source, live);
-}
-
-#[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
-fn typing_in_live_with_split_preview_stays_in_budget() {
-    // The preview beside Live updates from the same edits; its work is debounced off the
-    // keystroke, so typing costs what it does without it.
-    let (source, live) = measure_typing(&sample_markdown(1_000_000), 500_000, Typing::Lines, true);
-    report_typing("split_preview_1mb", source, live);
 }
 
 #[test]

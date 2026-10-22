@@ -535,7 +535,7 @@ pub(super) fn refilter_command_palette(hwnd: HWND) {
         let entries = command_palette::filter_entries(&query, |command| {
             (has_tabs || !command.needs_document())
                 && (!image || !command.needs_text())
-                && (markdown || !command.is_markdown_preview())
+                && (markdown || !command.is_markdown_view())
                 && (markdown_document || !command.is_markdown_edit())
                 && (sidebar || !command.is_sidebar())
                 && (notebook || !matches!(command, CommandId::NoteNew | CommandId::NoteNewFolder))

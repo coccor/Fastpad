@@ -89,7 +89,16 @@ Write on the left, see it rendered on the right. FastPad draws GitHub-flavored M
 (tables, task lists, strikethrough, code blocks and local images) and updates moments after you stop
 typing. Both panes scroll together.
 
-- Show the preview side by side or full width, and drag the divider to resize it.
+- Each Markdown tab has a view: **Source**, **Live** (rendered as you type, below), **Split** (the
+  source with the preview beside it; drag the divider to resize it) or **Preview** (full width).
+  Pick one in the toolbar under the tabs (which also shows where the file lives) or View → Markdown
+  view, or press `Ctrl+Shift+V` to cycle through them. Each tab keeps its own view, and Escape leaves Preview.
+  SVG files get Source, Split and Preview.
+- Select and copy text in the preview as in a browser: drag (it scrolls at the edges),
+  double-click a word, triple-click a paragraph, Shift+click to extend, `Ctrl+A` for everything.
+  `Ctrl+C` or right-click → Copy puts plain text on the clipboard, without Markdown markers,
+  plus a formatted version, so pasting into Word or Outlook keeps headings, bold, links, lists
+  and tables.
 - Links just work: web links open in your browser, `#headings` jump inside the preview, and links to
   local files open in a new FastPad tab.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
@@ -98,8 +107,8 @@ typing. Both panes scroll together.
   bold, italic, code or a link. Enter continues a list (Enter on an empty item ends it), Tab and
   Shift+Tab nest list items and move between table cells, and a table lines up when you leave it.
   Each is a single undo step.
-- **Live Markdown (preview):** `Ctrl+Alt+V`, or View → Live Markdown, switches a Markdown tab to a
-  new view FastPad draws itself, in the preview's font with real wrapping. Typing, selecting, undo,
+- **Live Markdown (preview):** `Ctrl+Alt+V`, or View → Markdown view → Live, switches a Markdown
+  tab to a view FastPad draws itself, in the preview's font with real wrapping. Typing, selecting, undo,
   find, the writing helpers and Japanese, Chinese or Korean input work as in the source view, and the
   file is only ever changed by what you type or a task checkbox you click. Headings, bold, italic,
   strike-through, inline code, links and `[[wikilinks]]` render in place with their markup hidden,
@@ -108,12 +117,12 @@ typing. Both panes scroll together.
   images as thumbnails (anything else shows its alt text; nothing is fetched). The block you are in
   (from blank line to blank line, a whole table or code block) shows its Markdown source, keeping
   its formatting and highlighted; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click
-  follows a link. Find and go to line reveal the block they land on, and with the preview beside
-  it the two scroll together both ways. Right-click gives the usual edit menu plus Open link and
+  follows a link. Find and go to line reveal the block they land on, and switching to Split or
+  Preview keeps your place. Right-click gives the usual edit menu plus Open link and
   Copy link address; dropped text lands where you drop it, and a selection can be dragged to move
   it (Ctrl+drag copies). Screen readers see it as editable text. Commands that need the source
   view's own features (multiple cursors, column selection, folding) switch back to it with a
-  notice. Set `markdown_live_default=true` to open Markdown tabs in it.
+  notice. Set `markdown_view=live` to open Markdown tabs in it.
 
 ### Notes and notebooks
 
@@ -334,7 +343,7 @@ before closing again.
 | Action | Shortcut | | Action | Shortcut |
 |---|---|---|---|---|
 | New tab | `Ctrl+N` or `Ctrl+T` | | Command palette | `Ctrl+Shift+P` |
-| Open | `Ctrl+O` | | Markdown preview modes | `Ctrl+Shift+V` |
+| Open | `Ctrl+O` | | Markdown view (cycle) | `Ctrl+Shift+V` |
 | Save | `Ctrl+S` | | Format JSON | `Shift+Alt+F` |
 | Save as | `Ctrl+Shift+S` | | Word wrap | `Alt+Z` |
 | Find | `Ctrl+F` | | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
@@ -356,7 +365,7 @@ before closing again.
 | Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
 | Bold / italic (Markdown files) | `Ctrl+B` / `Ctrl+I` | | Code / link (Markdown files) | ``Ctrl+` `` / `Ctrl+K` |
 | Follow link at caret | `F12` or `Ctrl+Click` | | Today's note | `Ctrl+Alt+D` |
-| Live Markdown | `Ctrl+Alt+V` | | | |
+| Live Markdown view | `Ctrl+Alt+V` | | | |
 
 ## Make it yours
 
@@ -381,7 +390,7 @@ line in a notification and applies the rest.
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `capture_hotkey` | A key like `Ctrl+Alt+N`; empty turns it off | `Ctrl+Alt+N` |
 | `capture_source` | `true`/`false`: note the window you were in when you pressed the capture hotkey | `false` |
-| `markdown_live_default` | `true`/`false`: open Markdown tabs in the Live Markdown view | `false` |
+| `markdown_view` | `source`, `live`, `split`, `preview`: the view Markdown tabs open in | `source` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |

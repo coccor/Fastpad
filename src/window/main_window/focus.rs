@@ -153,7 +153,8 @@ pub(crate) fn ui_fonts(hwnd: HWND) -> crate::window::side_panel::UiFonts {
         .unwrap_or_default()
 }
 
-/// The height of the visible find bar or name box band above the editor, or 0.
+/// The height of the bands between the strip and the editor (the active group's toolbar, and the
+/// visible find bar or name box), or 0.
 pub(super) fn bar_band_height(hwnd: HWND) -> i32 {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     unsafe { app_ptr(hwnd) }.map_or(0, |app| {
@@ -167,7 +168,22 @@ pub(super) fn bar_band_height(hwnd: HWND) -> i32 {
             .as_ref()
             .filter(|name_box| name_box.is_visible())
             .map_or(0, |_| crate::window::name_box::name_box_height(dpi));
-        find + name
+        let toolbar = app
+            .active_group()
+            // Its own style, not IsWindowVisible: the row is laid out even before the window shows.
+            .filter(|group| {
+                !group.toolbar.hwnd.is_null()
+                    && unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                            group.toolbar.hwnd,
+                            windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                        )
+                    } as u32
+                        & windows_sys::Win32::UI::WindowsAndMessaging::WS_VISIBLE
+                        != 0
+            })
+            .map_or(0, |_| crate::window::editor_toolbar::row_height(dpi));
+        find + name + toolbar
     })
 }
 

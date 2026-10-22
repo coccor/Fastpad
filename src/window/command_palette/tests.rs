@@ -162,7 +162,7 @@ fn every_command_except_tab_positions_and_the_palette_is_listed_once() {
             command.tab_index().is_none()
                 && command.group_index().is_none()
                 && command != CommandId::CommandPalette
-                && command != CommandId::MarkdownPreviewCycle
+                && command != CommandId::MarkdownViewCycle
                 && command != CommandId::FocusNextPane
                 && command != CommandId::FocusPreviousPane,
         );
@@ -367,25 +367,24 @@ fn picker_rows_filter_items_like_commands_and_offer_to_create_a_new_name() {
 }
 
 #[test]
-fn markdown_preview_cycles_with_ctrl_shift_v_and_lists_three_palette_entries() {
+fn markdown_view_cycles_with_ctrl_shift_v_and_lists_four_palette_entries() {
     assert_eq!(
-        shortcut_text(CommandId::MarkdownPreviewCycle).as_deref(),
+        shortcut_text(CommandId::MarkdownViewCycle).as_deref(),
         Some("Ctrl+Shift+V")
     );
-    let labels = filter_entries("markdown preview", |_| true)
+    let labels = filter_entries("markdown view", |_| true)
         .into_iter()
         .map(|entry| entry.command)
         .collect::<Vec<_>>();
     for command in [
-        CommandId::MarkdownPreviewSide,
-        CommandId::MarkdownPreviewFull,
-        CommandId::MarkdownPreviewClose,
+        CommandId::MarkdownViewSource,
+        CommandId::MarkdownViewLive,
+        CommandId::MarkdownViewSplit,
+        CommandId::MarkdownViewPreview,
     ] {
         assert!(labels.contains(&command), "{command:?}");
     }
-    assert!(
-        filter_entries("markdown preview", |command| !command.is_markdown_preview()).is_empty()
-    );
+    assert!(filter_entries("markdown view", |command| !command.is_markdown_view()).is_empty());
 }
 
 mod painting {

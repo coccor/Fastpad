@@ -37,22 +37,27 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{SetScrollInfo, SetWindowTheme, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetCapture, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_A, VK_APPS, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME,
+    VK_INSERT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DLGC_WANTALLKEYS, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetScrollInfo, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_HAND, LoadCursorW, PostMessageW,
-    RegisterClassW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK,
-    SB_TOP, SB_VERT, SCROLLINFO, SIF_ALL, SIF_TRACKPOS, SetCursor, SetWindowLongPtrW,
+    GetCursorPos, GetMessageTime, GetScrollInfo, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_HAND,
+    IDC_IBEAM, KillTimer, LoadCursorW, PostMessageW, RegisterClassW, SB_BOTTOM, SB_LINEDOWN,
+    SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_ALL,
+    SIF_TRACKPOS, SetCursor, SetTimer, SetWindowLongPtrW, WM_CAPTURECHANGED, WM_CONTEXTMENU,
     WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
-    WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_TABSTOP, WS_VSCROLL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VSCROLL,
 };
 
 mod painting;
 use painting::*;
+mod selecting;
+pub use selecting::MenuRequest;
+use selecting::*;
 mod targets;
 use targets::*;
 mod window_proc;
@@ -63,6 +68,7 @@ const CLASS_NAME: &str = "FastPadPreview";
 pub const ACTIVATE_DISCLOSURE: usize = 1;
 /// `MK_SHIFT` from WinUser.h; its windows-sys home needs a feature FastPad does not enable.
 const MK_SHIFT: u32 = 0x0004;
+const MK_LBUTTON: u32 = 0x0001;
 const PADDING: f32 = 16.0;
 const MAX_CENTERED_WIDTH: f32 = 980.0;
 const PAUSED_BAR_HEIGHT: f32 = 32.0;
@@ -162,6 +168,14 @@ struct ViewState {
     hover: Option<(usize, usize)>,
     pressed: Option<(usize, usize)>,
     focus: Option<(usize, usize)>,
+    /// The text selection (2026-10-22 preview selection spec), kept while it is empty during a
+    /// press.
+    selection: Option<crate::preview::selection::Selection>,
+    /// A left-button press that may become a selection drag.
+    press: Option<Press>,
+    clicks: Clicks,
+    /// The pointer is over text, for the I-beam cursor.
+    over_text: bool,
     tracking_mouse: bool,
     images: ImageCache,
     centered: bool,
@@ -221,6 +235,10 @@ impl PreviewView {
             hover: None,
             pressed: None,
             focus: None,
+            selection: None,
+            press: None,
+            clicks: Clicks::default(),
+            over_text: false,
             tracking_mouse: false,
             images: ImageCache::new(hwnd, WM_FASTPAD_PREVIEW_IMAGE),
             centered: false,
@@ -454,6 +472,8 @@ impl PreviewView {
             state.hover = None;
             state.pressed = None;
             state.focus = None;
+            state.selection = None;
+            state.press = None;
             state.outline = None;
             state.details_overrides = HashMap::new();
             state.sectioned = Vec::new();
@@ -494,6 +514,60 @@ impl PreviewView {
                 .collect()
         })
         .unwrap_or_default()
+    }
+
+    /// Whether some text is selected.
+    pub fn has_selection(&self) -> bool {
+        self.with(|state| {
+            state
+                .selection
+                .is_some_and(|selection| !selection.is_empty())
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn selection(&self) -> Option<crate::preview::selection::Selection> {
+        self.with(|state| state.selection).flatten()
+    }
+
+    /// The selected text as plain text and HTML.
+    pub fn selected_text(&self) -> Option<crate::preview::selection::Clip> {
+        self.with(clip).flatten()
+    }
+
+    /// Puts the selected text on the clipboard as plain text and HTML; false with nothing
+    /// selected or when the clipboard could not be opened.
+    pub fn copy(&self) -> bool {
+        let Some(clip) = self.selected_text() else {
+            return false;
+        };
+        crate::platform::clipboard::set_text_and_html(
+            self.hwnd,
+            &clip.plain,
+            &crate::preview::selection::cf_html(&clip.html),
+        )
+        .is_ok()
+    }
+
+    pub fn select_all(&self) {
+        self.with(select_all);
+    }
+
+    pub fn clear_selection(&self) {
+        self.with(clear);
+    }
+
+    /// Client pixels of text point `point`, for tests that click on text.
+    #[cfg(test)]
+    pub fn client_of(&self, point: crate::preview::selection::TextPoint) -> Option<(i32, i32)> {
+        self.with(|state| client_of(state, point)).flatten()
+    }
+
+    /// How many blocks have a layout.
+    #[cfg(test)]
+    pub fn laid_count(&self) -> usize {
+        self.with(|state| state.layouts.iter().flatten().count())
+            .unwrap_or(0)
     }
 
     pub fn accessible_links(&self) -> Arc<RwLock<Vec<VisibleLink>>> {
@@ -622,6 +696,10 @@ fn drop_device_resources(state: &mut ViewState) {
 }
 
 fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
+    if update != Update::Unchanged {
+        state.selection = None;
+        state.press = None;
+    }
     let repaint = match update {
         Update::Unchanged => return,
         Update::Full => {

@@ -14,6 +14,7 @@ pub(crate) mod drag_label;
 pub(crate) mod drop_overlay;
 pub(crate) mod dropdown_list;
 pub(crate) mod editor_group;
+pub(crate) mod editor_toolbar;
 pub(crate) mod favorites_view;
 pub(crate) mod file_icons;
 pub mod find_bar;
@@ -42,7 +43,6 @@ pub mod palette;
 pub(crate) mod panel;
 pub(crate) mod panel_cursor;
 pub(crate) mod panel_drop;
-pub(crate) mod preview_buttons;
 pub(crate) mod preview_host;
 mod prompt;
 pub(crate) mod row_list;
@@ -107,10 +107,10 @@ pub use messages::{
     WM_FASTPAD_MARKDOWN_DEFERRED, WM_FASTPAD_NOTEBOOK_CHECKED, WM_FASTPAD_OPEN_LIBRARY,
     WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_PANEL_DROPPED, WM_FASTPAD_PREVIEW_ACTIVATE,
     WM_FASTPAD_PREVIEW_ESCAPE, WM_FASTPAD_PREVIEW_HOVER, WM_FASTPAD_PREVIEW_IMAGE,
-    WM_FASTPAD_PREVIEW_LINK, WM_FASTPAD_PREVIEW_PARSED, WM_FASTPAD_PREVIEW_REFRESH,
-    WM_FASTPAD_PREVIEW_SCROLLED, WM_FASTPAD_RECOVERY, WM_FASTPAD_REPLACE_COUNTED,
-    WM_FASTPAD_REPLACE_RELOADED, WM_FASTPAD_REPLACE_WRITTEN, WM_FASTPAD_RESTORE_SESSION,
-    WM_FASTPAD_START_IPC, WM_FASTPAD_TEXT_SEARCH_BATCH,
+    WM_FASTPAD_PREVIEW_LINK, WM_FASTPAD_PREVIEW_MENU, WM_FASTPAD_PREVIEW_PARSED,
+    WM_FASTPAD_PREVIEW_REFRESH, WM_FASTPAD_PREVIEW_SCROLLED, WM_FASTPAD_RECOVERY,
+    WM_FASTPAD_REPLACE_COUNTED, WM_FASTPAD_REPLACE_RELOADED, WM_FASTPAD_REPLACE_WRITTEN,
+    WM_FASTPAD_RESTORE_SESSION, WM_FASTPAD_START_IPC, WM_FASTPAD_TEXT_SEARCH_BATCH,
 };
 #[cfg(test)]
 #[allow(

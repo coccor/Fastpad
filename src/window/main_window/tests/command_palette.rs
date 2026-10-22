@@ -29,7 +29,7 @@ fn the_command_palette_filters_as_typed_and_runs_the_selection_on_enter() {
         palette(window.hwnd).shown().len(),
         crate::window::command_palette::ENTRIES
             .iter()
-            .filter(|entry| !entry.command.is_markdown_preview())
+            .filter(|entry| !entry.command.is_markdown_view())
             .filter(|entry| !entry.command.is_markdown_edit())
             .filter(|entry| !matches!(entry.command, CommandId::NoteNew | CommandId::NoteNewFolder))
             .count()

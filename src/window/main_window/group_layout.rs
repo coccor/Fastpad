@@ -436,8 +436,8 @@ pub(crate) fn content_parent(hwnd: HWND) -> HWND {
     group_hwnd(hwnd).unwrap_or(hwnd)
 }
 
-/// Lays out the tab strip, the find bar, then the preview and the editor below them, in `group`'s
-/// client area.
+/// Lays out the tab strip, the editor toolbar, the find bar, then the preview and the editor below
+/// them, in `group`'s client area.
 pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let Some(id) = group_id_of(hwnd, group) else {
         return;
@@ -459,7 +459,11 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     } else {
         0
     };
-    let find_top = strip_height + band;
+    // The toolbar belongs to the tab: directly under the strip, above the find bar.
+    let toolbar_top = strip_height + band;
+    let toolbar_height =
+        crate::window::editor_toolbar::layout(hwnd, group, id, toolbar_top, width, dpi);
+    let find_top = toolbar_top + toolbar_height;
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let bar = unsafe { app.as_ref() }.group(id)?.find_bar.as_ref()?;
@@ -481,7 +485,6 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     set_group_region(hwnd, group, &client, strip_height, band);
     let rects = crate::window::preview_host::layout(hwnd, id, area, dpi);
     crate::window::image_host::layout(hwnd, id, area);
-    crate::window::preview_buttons::layout(hwnd, group, area, dpi);
     if let Some(editor_rect) = rects.editor {
         unsafe {
             MoveWindow(

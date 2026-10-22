@@ -17,6 +17,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TPM_VERTICAL, TPMPARAMS, TrackPopupMenuEx, TranslateAcceleratorW, UnhookWindowsHookEx,
     WH_MSGFILTER, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MENUITEMINFOW, MFS_CHECKED, MFS_ENABLED, MFS_GRAYED, MFS_UNCHECKED, MFT_RADIOCHECK, MFT_STRING,
+    MIIM_FTYPE, MIIM_STATE, SetMenuItemInfoW,
+};
 
 #[derive(Debug)]
 pub(crate) struct AcceleratorTable(HACCEL);
@@ -97,6 +101,16 @@ impl Drop for AcceleratorTable {
 pub(crate) struct MenuBar(HMENU);
 
 /// View ▸ Editor layout (split editors spec §7).
+/// View → Markdown view: one radio item per view mode (2026-10-22 view modes spec §2).
+fn markdown_view() -> Vec<MenuEntry> {
+    vec![
+        MenuEntry::command("&Source", CommandId::MarkdownViewSource),
+        MenuEntry::command("&Live", CommandId::MarkdownViewLive),
+        MenuEntry::command("S&plit", CommandId::MarkdownViewSplit),
+        MenuEntry::command("P&review", CommandId::MarkdownViewPreview),
+    ]
+}
+
 fn editor_layout() -> Vec<MenuEntry> {
     vec![
         MenuEntry::command("Split &right", CommandId::SplitRight),
@@ -220,13 +234,7 @@ impl MenuBar {
                     MenuEntry::Separator,
                     MenuEntry::command("&Always on top", CommandId::ToggleAlwaysOnTop),
                     MenuEntry::Separator,
-                    MenuEntry::command(
-                        "Markdown preview &side by side",
-                        CommandId::MarkdownPreviewSide,
-                    ),
-                    MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
-                    MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
-                    MenuEntry::command("Li&ve Markdown", CommandId::MarkdownToggleLive),
+                    MenuEntry::Submenu("Markdown &view", markdown_view()),
                     MenuEntry::Separator,
                     MenuEntry::command("Command &palette...", CommandId::CommandPalette),
                 ],
@@ -260,26 +268,30 @@ pub(crate) fn translate_accelerator(handle: HACCEL, hwnd: HWND, message: &MSG) -
     unsafe { TranslateAcceleratorW(hwnd, handle, message) != 0 }
 }
 
-/// Grays the View menu's preview entries while the active tab is not Markdown.
-pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
-    let state = MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED };
-    for command in [
-        CommandId::MarkdownPreviewSide,
-        CommandId::MarkdownPreviewFull,
-        CommandId::MarkdownPreviewClose,
-    ] {
-        unsafe { EnableMenuItem(menu, command as u32, state) };
-    }
-}
-
-/// Grays Live Markdown off Markdown tabs and checks it while the active tab shows Live.
-pub(crate) fn set_markdown_live(menu: HMENU, enabled: bool, checked: bool) {
-    let command = CommandId::MarkdownToggleLive as u32;
-    let enable = if enabled { MF_ENABLED } else { MF_GRAYED };
-    let check = if checked { MF_CHECKED } else { MF_UNCHECKED };
-    unsafe {
-        EnableMenuItem(menu, command, MF_BYCOMMAND | enable);
-        CheckMenuItem(menu, command, MF_BYCOMMAND | check);
+/// View → Markdown view for the active tab: the modes it can show enabled, the others grayed, and
+/// `current` given the radio bullet.
+pub(crate) fn set_markdown_view(
+    menu: HMENU,
+    available: &[crate::preview::ViewMode],
+    current: crate::preview::ViewMode,
+) {
+    for mode in crate::preview::ViewMode::ALL {
+        let command = crate::window::preview_host::mode_command(mode) as u32;
+        let enable = if available.contains(&mode) {
+            MFS_ENABLED
+        } else {
+            MFS_GRAYED
+        };
+        let checked = !available.is_empty() && mode == current;
+        let info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE | MIIM_STATE,
+            fType: MFT_STRING | MFT_RADIOCHECK,
+            fState: enable | if checked { MFS_CHECKED } else { MFS_UNCHECKED },
+            ..Default::default()
+        };
+        // The item's own string stays: MIIM_STRING is not in the mask.
+        unsafe { SetMenuItemInfoW(menu, command, 0, &info) };
     }
 }
 
@@ -1260,36 +1272,30 @@ mod tests {
     }
 
     #[test]
-    fn preview_entries_gray_out_and_re_enable() {
-        use super::{MenuBar, set_markdown_preview_enabled};
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_GRAYED};
-        let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
-        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
-        set_markdown_preview_enabled(view, false);
-        let state =
-            unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
-        assert_ne!(state & MF_GRAYED, 0);
-        set_markdown_preview_enabled(view, true);
-        let state =
-            unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
-        assert_eq!(state & MF_GRAYED, 0);
-    }
-
-    #[test]
-    fn live_markdown_grays_off_markdown_and_checks_while_live() {
-        use super::{MenuBar, set_markdown_live};
+    fn markdown_view_grays_what_the_tab_cannot_show_and_checks_its_mode() {
+        // Break caught: Live offered on an SVG tab, or the radio bullet left on the old mode.
+        use super::{MenuBar, set_markdown_view};
+        use crate::preview::ViewMode;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED,
         };
         let bar = MenuBar::create(&crate::window::keymap::Keymap::defaults()).unwrap();
         let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
         let state =
-            || unsafe { GetMenuState(view, CommandId::MarkdownToggleLive as u32, MF_BYCOMMAND) };
-        set_markdown_live(view, false, false);
-        assert_ne!(state() & MF_GRAYED, 0);
-        assert_eq!(state() & MF_CHECKED, 0);
-        set_markdown_live(view, true, true);
-        assert_eq!(state() & MF_GRAYED, 0);
-        assert_ne!(state() & MF_CHECKED, 0);
+            |command: CommandId| unsafe { GetMenuState(view, command as u32, MF_BYCOMMAND) };
+        set_markdown_view(view, &[], ViewMode::Source);
+        for mode in ViewMode::ALL {
+            let command = crate::window::preview_host::mode_command(mode);
+            assert_ne!(state(command) & MF_GRAYED, 0, "{mode:?}");
+            assert_eq!(state(command) & MF_CHECKED, 0, "{mode:?}");
+        }
+        set_markdown_view(view, &ViewMode::SVG, ViewMode::Split);
+        assert_ne!(state(CommandId::MarkdownViewLive) & MF_GRAYED, 0);
+        assert_eq!(state(CommandId::MarkdownViewSplit) & MF_GRAYED, 0);
+        assert_ne!(state(CommandId::MarkdownViewSplit) & MF_CHECKED, 0);
+        set_markdown_view(view, &ViewMode::ALL, ViewMode::Live);
+        assert_eq!(state(CommandId::MarkdownViewLive) & MF_GRAYED, 0);
+        assert_ne!(state(CommandId::MarkdownViewLive) & MF_CHECKED, 0);
+        assert_eq!(state(CommandId::MarkdownViewSplit) & MF_CHECKED, 0);
     }
 }

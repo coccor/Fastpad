@@ -5,7 +5,7 @@ mod support;
 include!("../../src/lib.rs");
 
 use crate::document::Language;
-use crate::preview::PreviewMode;
+use crate::preview::ViewMode;
 use crate::window::commands::CommandId;
 use std::time::{Duration, Instant};
 use support::acceptance::AcceptanceHarness;
@@ -95,8 +95,8 @@ impl TestMain {
         window::preview_host::sync_visibility(self.hwnd);
     }
 
-    fn mode(&self) -> PreviewMode {
-        self.with_app(|app| app.active_group().unwrap().preview.mode)
+    fn mode(&self) -> ViewMode {
+        window::preview_host::mode(self.hwnd)
     }
 
     fn view(&self) -> Option<preview::view::PreviewView> {
@@ -179,27 +179,30 @@ fn visible(hwnd: HWND) -> bool {
 }
 
 #[test]
-fn side_full_and_pressed_full_move_through_split_full_and_off() {
+fn the_split_preview_and_source_segments_show_their_modes() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# Title\n\nBody\n");
     assert!(window::preview_host::buttons_visible(main.hwnd));
 
-    window::preview_host::click_button(main.hwnd, window::preview_buttons::PreviewButton::Side);
-    assert_eq!(main.mode(), PreviewMode::Split);
+    window::preview_host::set_mode(main.hwnd, ViewMode::Split);
+    assert_eq!(main.mode(), ViewMode::Split);
     let view = main.view().expect("preview window");
     assert!(visible(view.hwnd()) && visible(main.editor));
     pump_until("first preview frame", Duration::from_secs(3), || {
         view.stats().block_count == 2
     });
 
-    window::preview_host::click_button(main.hwnd, window::preview_buttons::PreviewButton::Full);
-    assert_eq!(main.mode(), PreviewMode::Full);
+    window::preview_host::set_mode(main.hwnd, ViewMode::Preview);
+    assert_eq!(main.mode(), ViewMode::Preview);
     assert!(!visible(main.editor));
     assert_eq!(unsafe { GetFocus() }, view.hwnd());
 
-    window::preview_host::click_button(main.hwnd, window::preview_buttons::PreviewButton::Full);
-    assert_eq!(main.mode(), PreviewMode::Off);
+    // Preview again changes nothing: Source is the way out.
+    window::preview_host::set_mode(main.hwnd, ViewMode::Preview);
+    assert_eq!(main.mode(), ViewMode::Preview);
+    window::preview_host::set_mode(main.hwnd, ViewMode::Source);
+    assert_eq!(main.mode(), ViewMode::Source);
     assert!(main.view().is_none());
     assert!(visible(main.editor));
     assert_eq!(unsafe { GetFocus() }, main.editor);
@@ -210,12 +213,17 @@ fn side_full_and_pressed_full_move_through_split_full_and_off() {
 }
 
 #[test]
-fn ctrl_shift_v_cycles_off_split_full_off() {
+fn ctrl_shift_v_cycles_source_live_split_preview() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("text\n");
-    for expected in [PreviewMode::Split, PreviewMode::Full, PreviewMode::Off] {
-        main.command(CommandId::MarkdownPreviewCycle);
+    for expected in [
+        ViewMode::Live,
+        ViewMode::Split,
+        ViewMode::Preview,
+        ViewMode::Source,
+    ] {
+        main.command(CommandId::MarkdownViewCycle);
         assert_eq!(main.mode(), expected);
     }
 }
@@ -224,8 +232,8 @@ fn ctrl_shift_v_cycles_off_split_full_off() {
 fn a_plain_text_tab_gets_a_notice_instead_of_a_preview() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
-    main.command(CommandId::MarkdownPreviewSide);
-    assert_eq!(main.mode(), PreviewMode::Off);
+    main.command(CommandId::MarkdownViewSplit);
+    assert_eq!(main.mode(), ViewMode::Source);
     assert!(
         main.notices()
             .iter()
@@ -234,27 +242,28 @@ fn a_plain_text_tab_gets_a_notice_instead_of_a_preview() {
 }
 
 #[test]
-fn a_non_markdown_tab_hides_the_preview_and_keeps_the_mode() {
+fn a_non_markdown_tab_hides_the_preview_and_the_markdown_tab_keeps_its_mode() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# One\n");
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("first render", Duration::from_secs(3), || {
         view.stats().block_count == 1
     });
     main.command(CommandId::New);
-    assert_eq!(main.mode(), PreviewMode::Split);
+    assert_eq!(main.mode(), ViewMode::Source);
     assert!(!visible(view.hwnd()));
-    assert!(!main.with_app(|app| app.tabs.view().snapshot().preview_buttons));
+    assert!(main.with_app(|app| app.tabs.view().snapshot().view_buttons.segments.is_empty()));
     assert_eq!(
         view.stats().block_count,
         0,
         "a hidden preview releases its document"
     );
     main.command(CommandId::SelectTab1);
+    assert_eq!(main.mode(), ViewMode::Split);
     assert!(visible(view.hwnd()));
-    assert!(main.with_app(|app| app.tabs.view().snapshot().preview_buttons));
+    assert!(!main.with_app(|app| app.tabs.view().snapshot().view_buttons.segments.is_empty()));
     pump_until("reloaded render", Duration::from_secs(3), || {
         view.stats().block_count == 1
     });
@@ -266,13 +275,15 @@ fn a_large_document_never_shows_the_previous_tabs_preview_while_it_parses() {
     let main = TestMain::new();
     let paragraph = "Paragraph text for the worker parse.\n\n";
     main.make_markdown(&paragraph.repeat(1_100_000 / paragraph.len()));
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("worker parse", Duration::from_secs(10), || {
         view.stats().block_count > 1000
     });
     main.command(CommandId::New);
     main.make_markdown("# Small\n\n[link](https://x.dev)\n");
+    // Each tab has its own mode: the new one opens in Source.
+    main.command(CommandId::MarkdownViewSplit);
     pump_until("small render", Duration::from_secs(3), || {
         view.stats().block_count == 2 && !view.accessible_links().read().unwrap().is_empty()
     });
@@ -295,7 +306,7 @@ fn full_mode_reloads_keep_the_preview_position() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown(&long_markdown());
-    main.command(CommandId::MarkdownPreviewFull);
+    main.command(CommandId::MarkdownViewPreview);
     let view = main.view().unwrap();
     pump_until("render", Duration::from_secs(3), || {
         view.stats().block_count == 400
@@ -353,16 +364,22 @@ fn full_mode_reloads_keep_the_preview_position() {
 }
 
 #[test]
-fn escape_in_full_mode_returns_to_split() {
+fn escape_in_preview_returns_to_the_tabs_last_editing_mode() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("text\n");
-    main.command(CommandId::MarkdownPreviewFull);
-    let view = main.view().unwrap();
-    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_ESCAPE as usize, 0) };
-    pump_until("Esc handling", Duration::from_secs(2), || {
-        main.mode() == PreviewMode::Split
-    });
+    let escape = |expected| {
+        main.command(CommandId::MarkdownViewPreview);
+        let view = main.view().unwrap();
+        unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+        pump_until("Esc handling", Duration::from_secs(2), || {
+            main.mode() == expected
+        });
+    };
+    // Never in another mode: Source.
+    escape(ViewMode::Source);
+    main.command(CommandId::MarkdownViewSplit);
+    escape(ViewMode::Split);
 }
 
 fn type_text(hwnd: HWND, text: &str) {
@@ -383,7 +400,7 @@ fn typing_updates_the_preview_only_after_the_pause() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# A\n");
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("initial render", Duration::from_secs(3), || {
         view.stats().block_count == 1
@@ -408,7 +425,7 @@ fn theme_changes_recolor_the_preview() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# A\n");
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     main.command(CommandId::ThemeCatppuccinMocha);
     let view = main.view().unwrap();
     assert_eq!(view.colors().link, crate::catppuccin::MOCHA.blue);
@@ -427,7 +444,7 @@ fn relative_markdown_links_open_in_a_tab() {
         !main.with_app(|app| app.populating_file)
     });
     main.with_app(|app| app.tabs.set_active_language(Language::Markdown));
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let payload = Box::into_raw(Box::new(String::from("b.md")));
     unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -449,7 +466,7 @@ fn unsupported_links_explain_themselves() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("[x](ftp://x.dev)\n");
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let payload = Box::into_raw(Box::new(String::from("ftp://x.dev")));
     unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -472,16 +489,16 @@ fn large_documents_parse_on_a_worker_and_huge_ones_pause() {
     let main = TestMain::new();
     let paragraph = "Paragraph text for the worker parse.\n\n";
     main.make_markdown(&paragraph.repeat(2_000_000 / paragraph.len()));
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("worker parse", Duration::from_secs(10), || {
         view.stats().block_count > 1000
     });
     assert!(!view.is_paused());
 
-    main.command(CommandId::MarkdownPreviewClose);
+    main.command(CommandId::MarkdownViewSource);
     main.make_markdown(&paragraph.repeat(11_000_000 / paragraph.len()));
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     assert!(view.is_paused());
     unsafe {
@@ -514,7 +531,7 @@ fn scrolling_the_editor_scrolls_the_preview() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown(&long_markdown());
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("render", Duration::from_secs(3), || {
         view.stats().block_count == 400
@@ -538,7 +555,7 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown(&long_markdown());
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("render", Duration::from_secs(3), || {
         view.stats().block_count == 400
@@ -582,7 +599,7 @@ fn closing_the_find_bar_in_full_mode_focuses_the_preview() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# A\n");
-    main.command(CommandId::MarkdownPreviewFull);
+    main.command(CommandId::MarkdownViewPreview);
     let view = main.view().unwrap();
     main.command(CommandId::Find);
     let query = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
@@ -596,7 +613,7 @@ fn losing_capture_ends_a_divider_drag() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# A\n");
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let divider = window::preview_host::divider_rect(main.hwnd).expect("divider");
     // The preview sits in the editor group, whose client area the divider is laid out in.
     let group = unsafe {
@@ -619,7 +636,7 @@ fn menu_mode_keeps_the_frame_focus_in_full_mode() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("# A\n");
-    main.command(CommandId::MarkdownPreviewFull);
+    main.command(CommandId::MarkdownViewPreview);
     // A tapped F10 enters menu mode, which parks the focus on the frame for the menu keys.
     unsafe {
         SendMessageW(
@@ -646,7 +663,7 @@ fn full_mode_keeps_the_editor_position() {
             0,
         )
     };
-    main.command(CommandId::MarkdownPreviewFull);
+    main.command(CommandId::MarkdownViewPreview);
     let view = main.view().unwrap();
     unsafe {
         SendMessageW(
@@ -657,7 +674,7 @@ fn full_mode_keeps_the_editor_position() {
         )
     };
     pump_for(Duration::from_millis(300));
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     assert_eq!(
         unsafe {
             SendMessageW(
@@ -689,20 +706,20 @@ fn preview_open_p95(main: &TestMain, text: &str) -> u64 {
     main.make_markdown(text);
     let mut samples = Vec::new();
     for _ in 0..30 {
-        main.command(CommandId::MarkdownPreviewSide);
+        main.command(CommandId::MarkdownViewSplit);
         let view = main.view().unwrap();
         pump_until("first frame", Duration::from_secs(5), || {
             view.stats().first_frame_micros > 0
         });
         samples.push(view.stats().first_frame_micros);
-        main.command(CommandId::MarkdownPreviewClose);
+        main.command(CommandId::MarkdownViewSource);
     }
     p95(samples)
 }
 
 fn one_paragraph_update_p95(main: &TestMain, text: &str) -> u64 {
     main.make_markdown(text);
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("initial render", Duration::from_secs(10), || {
         view.stats().block_count > 0
@@ -803,7 +820,7 @@ fn typing_with_split_open_costs_the_same_as_without_a_preview() {
         p95(samples)
     };
     let baseline = measure(&main);
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     pump_for(Duration::from_millis(500));
     let with_preview = measure(&main);
     println!("keystroke p95: off {baseline} us, split {with_preview} us");
@@ -991,14 +1008,14 @@ fn private_bytes_do_not_grow_across_open_close_cycles() {
     pump_for(Duration::from_millis(300));
     let never_opened = private_bytes();
     let cycle = || {
-        main.command(CommandId::MarkdownPreviewSide);
+        main.command(CommandId::MarkdownViewSplit);
         let view = main.view().unwrap();
         pump_until("render", Duration::from_secs(10), || {
             view.stats().block_count > 0
         });
         pump_for(Duration::from_millis(300));
         let open = private_bytes();
-        main.command(CommandId::MarkdownPreviewClose);
+        main.command(CommandId::MarkdownViewSource);
         pump_for(Duration::from_millis(500));
         (open, private_bytes())
     };
@@ -1071,7 +1088,7 @@ fn the_html_readme_fixture_renders_its_svg_and_toggles_its_section() {
     let fixture = include_str!("../fixtures/html-readme.md")
         .replace("assets/fastpad-icon.svg", icon.to_str().unwrap());
     main.make_markdown(&fixture);
-    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::MarkdownViewSplit);
     let view = main.view().unwrap();
     pump_until("the SVG icon decodes", Duration::from_secs(10), || {
         view.image_states()
@@ -1127,4 +1144,228 @@ fn one_paragraph_update_inside_a_div_spanning_1_mb_is_recorded() {
     let p95 = one_paragraph_update_p95(&main, &text);
     // No target: an element spanning the document reparses whole on every edit (spec §4.5).
     println!("update inside a 1 MB div p95: {p95} us");
+}
+
+// Text selection (2026-10-22 preview selection spec).
+
+use crate::preview::selection::{Selection, TextPoint};
+
+/// The active tab as `text` in Preview, painted, so its visible blocks have layouts.
+fn selectable_preview(main: &TestMain, text: &str) -> preview::view::PreviewView {
+    main.make_markdown(text);
+    main.command(CommandId::MarkdownViewPreview);
+    let view = main.view().expect("preview window");
+    pump_until("first render", Duration::from_secs(3), || {
+        view.stats().block_count > 0
+    });
+    unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(view.hwnd()) };
+    pump_pending();
+    view
+}
+
+fn mouse(view: HWND, message: u32, (x, y): (i32, i32), keys: usize) {
+    let lparam = (((y as u32) << 16) | (x as u32 & 0xFFFF)) as isize;
+    unsafe { SendMessageW(view, message, keys, lparam) };
+}
+
+fn click(view: HWND, at: (i32, i32), keys: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    mouse(view, WM_LBUTTONDOWN, at, 0x0001 | keys);
+    mouse(view, WM_LBUTTONUP, at, keys);
+}
+
+fn drag(view: HWND, from: (i32, i32), to: (i32, i32)) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    mouse(view, WM_LBUTTONDOWN, from, 0x0001);
+    mouse(view, WM_MOUSEMOVE, to, 0x0001);
+    mouse(view, WM_LBUTTONUP, to, 0);
+}
+
+fn ordered(view: &preview::view::PreviewView) -> Option<(TextPoint, TextPoint)> {
+    view.selection()
+        .map(|selection: Selection| selection.ordered())
+}
+
+#[test]
+fn dragging_selects_across_blocks_and_copies_the_rendered_text() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "First **para**\n\nSecond para\n\nThird\n");
+    let from = view.client_of(TextPoint::new(0, 0, 0)).unwrap();
+    let to = view.client_of(TextPoint::new(1, 0, 6)).unwrap();
+    drag(view.hwnd(), from, to);
+    assert_eq!(
+        ordered(&view),
+        Some((TextPoint::new(0, 0, 0), TextPoint::new(1, 0, 6)))
+    );
+    let clip = view.selected_text().unwrap();
+    assert_eq!(clip.plain, "First para\n\nSecond");
+    assert_eq!(clip.html, "<p>First <strong>para</strong></p><p>Second</p>");
+}
+
+#[test]
+fn a_plain_click_selects_nothing_and_shift_click_extends() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "One two\n\nThree four\n");
+    click(
+        view.hwnd(),
+        view.client_of(TextPoint::new(0, 0, 4)).unwrap(),
+        0,
+    );
+    assert_eq!(view.selection(), None);
+    // Shift+click extends from where the last selection began.
+    drag(
+        view.hwnd(),
+        view.client_of(TextPoint::new(0, 0, 0)).unwrap(),
+        view.client_of(TextPoint::new(0, 0, 3)).unwrap(),
+    );
+    click(
+        view.hwnd(),
+        view.client_of(TextPoint::new(1, 0, 5)).unwrap(),
+        0x0004,
+    );
+    assert_eq!(
+        ordered(&view),
+        Some((TextPoint::new(0, 0, 0), TextPoint::new(1, 0, 5)))
+    );
+    assert_eq!(view.selected_text().unwrap().plain, "One two\n\nThree");
+}
+
+#[test]
+fn double_click_selects_a_word_and_triple_click_the_paragraph() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "Hello brave world\n");
+    let at = view.client_of(TextPoint::new(0, 0, 8)).unwrap();
+    click(view.hwnd(), at, 0);
+    click(view.hwnd(), at, 0);
+    assert_eq!(view.selected_text().unwrap().plain, "brave");
+    click(view.hwnd(), at, 0);
+    assert_eq!(view.selected_text().unwrap().plain, "Hello brave world");
+}
+
+#[test]
+fn dragging_from_a_link_selects_text() {
+    // Break caught: a press on a link swallowing the drag, so link text could never be selected.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "See [the heading](#top) here\n\n# Top\n");
+    drag(
+        view.hwnd(),
+        view.client_of(TextPoint::new(0, 0, 4)).unwrap(),
+        view.client_of(TextPoint::new(0, 0, 15)).unwrap(),
+    );
+    assert_eq!(view.selected_text().unwrap().plain, "the heading");
+}
+
+#[test]
+fn select_all_on_a_large_note_lays_out_nothing_more() {
+    // Break caught: copying laying out every block of a long note to read its text.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let text = (0..3000)
+        .map(|n| format!("Paragraph {n} with **bold**.\n\n"))
+        .collect::<String>();
+    let view = selectable_preview(&main, &text);
+    let laid = view.laid_count();
+    assert!(laid < 3000, "only the visible blocks are laid out ({laid})");
+    view.select_all();
+    let clip = view.selected_text().unwrap();
+    assert_eq!(view.laid_count(), laid);
+    assert!(
+        clip.plain
+            .starts_with("Paragraph 0 with bold.\n\nParagraph 1 ")
+    );
+    assert!(clip.plain.ends_with("Paragraph 2999 with bold."));
+}
+
+#[test]
+fn ctrl_a_selects_all_and_escape_clears_it_before_leaving_preview() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_A, VK_CONTROL,
+    };
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "Alpha\n\nBeta\n");
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[usize::from(VK_CONTROL)] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, usize::from(VK_A), 0) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+    assert_eq!(view.selected_text().unwrap().plain, "Alpha\n\nBeta");
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    pump_pending();
+    assert_eq!(view.selection(), None);
+    assert_eq!(
+        main.mode(),
+        ViewMode::Preview,
+        "the first Escape only clears"
+    );
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    pump_until("Escape to leave Preview", Duration::from_secs(2), || {
+        main.mode() != ViewMode::Preview
+    });
+}
+
+#[test]
+fn copy_while_the_preview_has_focus_copies_the_preview_not_the_editor() {
+    // Break caught: Edit > Copy in Preview copying the hidden editor's selection.
+    use crate::platform::clipboard::test_support::{Backup, read_html, read_text};
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "Plain **rich** text\n");
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_SETSEL,
+            0,
+            5,
+        );
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(view.hwnd());
+    }
+    view.select_all();
+    let _backup = Backup::take();
+    main.command(CommandId::Copy);
+    assert_eq!(read_text(), "Plain rich text");
+    assert!(
+        read_html().contains(
+            "<!--StartFragment--><p>Plain <strong>rich</strong> text</p><!--EndFragment-->"
+        )
+    );
+}
+
+#[test]
+fn a_resize_keeps_the_selection_and_an_edit_clears_it() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(
+        &main,
+        "Some text that wraps when the window is narrow enough.\n\nMore\n",
+    );
+    view.select_all();
+    let before = view.selection();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            main.hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            500,
+            600,
+            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+        windows_sys::Win32::Graphics::Gdi::UpdateWindow(view.hwnd());
+    }
+    pump_pending();
+    assert_eq!(view.selection(), before);
+    main.set_text("Edited\n");
+    pump_until(
+        "the edit to reach the preview",
+        Duration::from_secs(3),
+        || view.selection().is_none(),
+    );
 }

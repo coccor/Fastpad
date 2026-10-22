@@ -203,8 +203,27 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows_numerics::Vector2;
 
+/// How a block's selected text is painted (2026-10-22 preview selection spec §2).
+pub struct SelectionPaint<'a> {
+    /// The selected UTF-16 range of each run, by run index.
+    pub range: &'a dyn Fn(u32) -> Option<(u32, u32)>,
+    /// `Selection` while the preview has the focus, `InactiveSelection` otherwise.
+    pub fill: ColorRole,
+    /// Draw the selected text again in `SelectionText` (high contrast's `HighlightText`).
+    pub recolor: bool,
+}
+
+impl SelectionPaint<'_> {
+    pub const NONE: SelectionPaint<'static> = SelectionPaint {
+        range: &|_| None,
+        fill: ColorRole::Selection,
+        recolor: false,
+    };
+}
+
 /// Paints `ops` with their block origin at (`x`, `y`). Scrollable groups draw clipped and shifted
-/// left by `h_offset`.
+/// left by `h_offset`. A run's selected text gets its fill behind it, after the run's own
+/// backgrounds.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_ops(
     target: &ID2D1RenderTarget,
@@ -215,6 +234,7 @@ pub fn draw_ops(
     x: f32,
     y: f32,
     h_offset: f32,
+    selection: &SelectionPaint<'_>,
 ) {
     for op in ops {
         unsafe {
@@ -224,15 +244,43 @@ pub fn draw_ops(
                     x: left,
                     y: top,
                     role,
-                } => target.DrawTextLayout(
-                    Vector2 {
+                    run,
+                } => {
+                    let origin = Vector2 {
                         X: x + left,
                         Y: y + top,
-                    },
-                    layout,
-                    brushes.get(*role),
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                ),
+                    };
+                    let rects = run
+                        .and_then(|run| (selection.range)(run))
+                        .and_then(|(start, end)| {
+                            crate::preview::dwrite::range_rects(
+                                layout, start, end, origin.X, origin.Y,
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default();
+                    for rect in &rects {
+                        target.FillRectangle(&rect.to_d2d(), brushes.get(selection.fill));
+                    }
+                    target.DrawTextLayout(
+                        origin,
+                        layout,
+                        brushes.get(*role),
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                    if selection.recolor {
+                        for rect in &rects {
+                            target.PushAxisAlignedClip(&rect.to_d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
+                            target.DrawTextLayout(
+                                origin,
+                                layout,
+                                brushes.get(ColorRole::SelectionText),
+                                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            );
+                            target.PopAxisAlignedClip();
+                        }
+                    }
+                }
                 DrawOp::Fill { rect, role } => {
                     target.FillRectangle(&rect.offset(x, y).to_d2d(), brushes.get(*role))
                 }
@@ -318,7 +366,17 @@ pub fn draw_ops(
                         &clip.offset(x, y).to_d2d(),
                         D2D1_ANTIALIAS_MODE_ALIASED,
                     );
-                    draw_ops(target, brushes, ops, slots, cache, x - h_offset, y, 0.0);
+                    draw_ops(
+                        target,
+                        brushes,
+                        ops,
+                        slots,
+                        cache,
+                        x - h_offset,
+                        y,
+                        0.0,
+                        selection,
+                    );
                     target.PopAxisAlignedClip();
                 }
             }

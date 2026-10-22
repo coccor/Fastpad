@@ -482,7 +482,9 @@ fn alerts_draw_a_link_coloured_bar_and_title_over_body_coloured_content() {
             .ops
             .iter()
             .filter_map(|op| match op {
-                DrawOp::Text { layout, x, y, role } => Some((layout.clone(), *x, *y, *role)),
+                DrawOp::Text {
+                    layout, x, y, role, ..
+                } => Some((layout.clone(), *x, *y, *role)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -663,4 +665,70 @@ fn the_line_height_spaces_body_lines_but_not_headings_or_code() {
     assert!((wide_body - wide_line).abs() < 0.01, "{wide_body}");
     assert_eq!(heading, wide_heading, "headings keep their font's spacing");
     assert_eq!(code, wide_code, "code blocks keep their font's spacing");
+}
+
+#[test]
+fn laid_runs_match_the_models_runs_for_every_block_kind() {
+    // Break caught: copying the wrong text after a layout change pushed a run out of step with
+    // `text_runs` (a decoration recorded as a run, or a table renumbered wrongly).
+    let source = concat!(
+        "# Heading\n\n",
+        "Para with **bold** and `code`.\n\n",
+        "- one\n- [x] two\n  1. nested\n\n",
+        "> quote\n>\n> > deeper\n\n",
+        "> [!TIP]\n> tip text\n\n",
+        "| a | b |\n|---|---|\n| 1 |\n| 3 | 4 |\n\n",
+        "```\nlet x = 1;\n```\n\n",
+        "<details open><summary>Sum</summary>\n\ninside\n\n</details>\n\n",
+        "<div align=\"center\">\n\ncentred\n\n</div>\n\n",
+        "---\n",
+    );
+    let (blocks, _) = parse_document(source);
+    let outline = outline::build(&blocks);
+    with_context(&no_images, None, |context| {
+        for (index, block) in blocks.iter().enumerate() {
+            let laid = layout_block(context, &block.kind, 300.0, &outline.details[index]).unwrap();
+            let model = crate::preview::selection::text_runs(&block.kind, &mut |_, open| open);
+            assert_eq!(
+                laid.runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+                model
+                    .iter()
+                    .map(|run| run.text.utf16_len())
+                    .collect::<Vec<_>>(),
+                "block {index}: {:?}",
+                block.kind
+            );
+            // Every run is drawn by exactly one text op that names it.
+            let named = flatten(&laid.ops)
+                .iter()
+                .filter_map(|op| match op {
+                    DrawOp::Text { run, .. } => *run,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                named,
+                (0..laid.runs.len() as u32).collect::<Vec<_>>(),
+                "block {index}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_wide_tables_runs_scroll_with_the_tables_clip() {
+    with_context(&no_images, None, |context| {
+        let block = laid(
+            context,
+            "| aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb |\n|---|---|\n| 1 | 2 |\n",
+            200.0,
+        );
+        assert_eq!(block.runs.len(), 4);
+        assert!(
+            block
+                .runs
+                .iter()
+                .all(|run| run.scrolls && run.clip.is_some())
+        );
+    });
 }
