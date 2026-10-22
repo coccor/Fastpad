@@ -94,6 +94,11 @@ typing. Both panes scroll together.
   Pick one from the buttons at the top-right of the editor or View → Markdown view, or press
   `Ctrl+Shift+V` to cycle through them. Each tab keeps its own view, and Escape leaves Preview.
   SVG files get Source, Split and Preview.
+- Select and copy text in the preview as in a browser: drag (it scrolls at the edges),
+  double-click a word, triple-click a paragraph, Shift+click to extend, `Ctrl+A` for everything.
+  `Ctrl+C` or right-click → Copy puts plain text on the clipboard, without Markdown markers,
+  plus a formatted version, so pasting into Word or Outlook keeps headings, bold, links, lists
+  and tables.
 - Links just work: web links open in your browser, `#headings` jump inside the preview, and links to
   local files open in a new FastPad tab.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.

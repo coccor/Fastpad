@@ -20,10 +20,16 @@ pub enum ColorRole {
     Focus,
     Mark,
     KbdBorder,
+    /// Selected text's background while the preview has the focus.
+    Selection,
+    /// Selected text's background while it does not.
+    InactiveSelection,
+    /// Selected text, in high contrast (`HighlightText`).
+    SelectionText,
 }
 
 impl ColorRole {
-    pub const ALL: [ColorRole; 12] = [
+    pub const ALL: [ColorRole; 15] = [
         Self::Background,
         Self::Text,
         Self::Muted,
@@ -36,6 +42,9 @@ impl ColorRole {
         Self::Focus,
         Self::Mark,
         Self::KbdBorder,
+        Self::Selection,
+        Self::InactiveSelection,
+        Self::SelectionText,
     ];
 }
 
@@ -53,6 +62,11 @@ pub struct PreviewColors {
     pub focus: u32,
     pub mark: u32,
     pub kbd_border: u32,
+    /// The selection colours are the editor's, so a selection looks the same in every view;
+    /// `preview_colors` takes them from the palette, and the theme tables leave them 0.
+    pub selection: u32,
+    pub inactive_selection: u32,
+    pub selection_text: u32,
 }
 
 impl PreviewColors {
@@ -70,6 +84,9 @@ impl PreviewColors {
             ColorRole::Focus => self.focus,
             ColorRole::Mark => self.mark,
             ColorRole::KbdBorder => self.kbd_border,
+            ColorRole::Selection => self.selection,
+            ColorRole::InactiveSelection => self.inactive_selection,
+            ColorRole::SelectionText => self.selection_text,
         }
     }
 
@@ -93,6 +110,9 @@ const GITHUB_LIGHT: PreviewColors = PreviewColors {
     focus: rgb(9, 105, 218),
     mark: rgb(255, 248, 197),
     kbd_border: rgb(209, 217, 224),
+    selection: 0,
+    inactive_selection: 0,
+    selection_text: 0,
 };
 
 const GITHUB_DARK: PreviewColors = PreviewColors {
@@ -108,6 +128,9 @@ const GITHUB_DARK: PreviewColors = PreviewColors {
     focus: rgb(68, 147, 248),
     mark: rgb(69, 56, 25),
     kbd_border: rgb(61, 68, 77),
+    selection: 0,
+    inactive_selection: 0,
+    selection_text: 0,
 };
 
 const PAPER_PREVIEW: PreviewColors = PreviewColors {
@@ -123,6 +146,9 @@ const PAPER_PREVIEW: PreviewColors = PreviewColors {
     focus: rgb(47, 111, 106),
     mark: rgb(240, 225, 170),
     kbd_border: rgb(217, 214, 203),
+    selection: 0,
+    inactive_selection: 0,
+    selection_text: 0,
 };
 
 const LAMP_PREVIEW: PreviewColors = PreviewColors {
@@ -138,6 +164,9 @@ const LAMP_PREVIEW: PreviewColors = PreviewColors {
     focus: rgb(127, 181, 172),
     mark: rgb(72, 60, 30),
     kbd_border: rgb(62, 60, 55),
+    selection: 0,
+    inactive_selection: 0,
+    selection_text: 0,
 };
 
 const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
@@ -154,6 +183,9 @@ const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
         focus: flavor.blue,
         mark: catppuccin::blend(flavor.yellow, flavor.base, 64),
         kbd_border: flavor.surface1,
+        selection: 0,
+        inactive_selection: 0,
+        selection_text: 0,
     }
 }
 
@@ -183,6 +215,11 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
             focus: palette.selection_background,
             mark: palette.editor_background,
             kbd_border: palette.editor_foreground,
+            selection: palette.selection_background,
+            inactive_selection: palette.inactive_selection_background,
+            selection_text: palette
+                .selection_foreground
+                .unwrap_or(palette.editor_foreground),
         };
     }
     let colors = match theme {
@@ -197,6 +234,9 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
     };
     PreviewColors {
         background: palette.editor_background,
+        selection: palette.selection_background,
+        inactive_selection: palette.inactive_selection_background,
+        selection_text: palette.selection_foreground.unwrap_or(colors.text),
         ..colors
     }
 }
@@ -257,6 +297,22 @@ mod tests {
             let colors = preview_colors(theme, false);
             assert_ne!(colors.mark, colors.background, "{theme:?}");
             assert_ne!(colors.kbd_border, colors.background, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn the_selection_is_the_editors_on_every_theme() {
+        // Break caught: a theme table's zero placeholder painting selections black.
+        for theme in Theme::ALL {
+            for high_contrast in [false, true] {
+                let colors = preview_colors(theme, high_contrast);
+                let palette = Palette::for_theme(theme, high_contrast);
+                assert_eq!(colors.selection, palette.selection_background, "{theme:?}");
+                assert_eq!(
+                    colors.inactive_selection, palette.inactive_selection_background,
+                    "{theme:?}"
+                );
+            }
         }
     }
 

@@ -1568,6 +1568,84 @@ pub(crate) fn cursor_over_divider(hwnd: HWND, group: HWND) -> bool {
 
 /// The status bar's hint for a preview button, naming `cycle`, the key that cycles the preview
 /// modes, when there is one.
+/// Copy while a preview has the keyboard focus copies its selection, not the hidden or neighbouring
+/// editor's (2026-10-22 preview selection spec §2). True when a preview had the focus, whether or
+/// not it had anything selected.
+pub(crate) fn copy_focused(hwnd: HWND) -> bool {
+    let focus = unsafe { GetFocus() };
+    let Some(view) = focused_view(hwnd, focus) else {
+        return false;
+    };
+    view.copy();
+    true
+}
+
+/// The Markdown preview with the keyboard focus, in any group.
+fn focused_view(hwnd: HWND, focus: HWND) -> Option<PreviewView> {
+    if focus.is_null() {
+        return None;
+    }
+    let app = unsafe { host_window::app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .groups
+        .iter()
+        .filter_map(|group| group.preview.view)
+        .find(|view| view.hwnd() == focus)
+}
+
+/// A preview's context menu (preview selection spec §2): Copy and Select all, and over a link
+/// Open link and Copy link address. Menu-only entries reuse command ids, as Live's menu does:
+/// Select all is `SelectAllOccurrences`, Open link `NotesFollowLink` and Copy link address
+/// `MarkdownLink`.
+pub(crate) fn context_menu(
+    hwnd: HWND,
+    id: GroupId,
+    window: HWND,
+    request: &crate::preview::view::MenuRequest,
+) {
+    use crate::window::menus::{self, MenuEntry};
+    let Some(view) = with_group_host(hwnd, id, |host| host.view)
+        .flatten()
+        .filter(|view| view.hwnd() == window)
+    else {
+        return;
+    };
+    let mut entries = vec![
+        MenuEntry::local("&Copy\tCtrl+C", CommandId::Copy).enabled(view.has_selection()),
+        MenuEntry::local("Select &All\tCtrl+A", CommandId::SelectAllOccurrences),
+    ];
+    if request.link.is_some() {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::local("&Open link", CommandId::NotesFollowLink),
+            MenuEntry::local("Copy link &address", CommandId::MarkdownLink),
+        ]);
+    }
+    // `track_popup` takes main-window client coordinates.
+    let mut at = POINT {
+        x: request.screen.0,
+        y: request.screen.1,
+    };
+    unsafe { ScreenToClient(hwnd, &mut at) };
+    match menus::track_popup(hwnd, &entries, at) {
+        Some(CommandId::Copy) => {
+            view.copy();
+        }
+        Some(CommandId::SelectAllOccurrences) => view.select_all(),
+        Some(CommandId::NotesFollowLink) => {
+            if let Some(dest) = request.link.clone() {
+                in_group(id, || follow(hwnd, dest));
+            }
+        }
+        Some(CommandId::MarkdownLink) => {
+            if let Some(dest) = &request.link {
+                let _ = crate::platform::clipboard::set_text(hwnd, dest);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A segment's tooltip and status-bar text: the mode, and its own key or else the cycle key.
 fn button_hint(mode: ViewMode, own: Option<&str>, cycle: Option<&str>) -> String {
     let action = match mode {

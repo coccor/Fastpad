@@ -1145,3 +1145,227 @@ fn one_paragraph_update_inside_a_div_spanning_1_mb_is_recorded() {
     // No target: an element spanning the document reparses whole on every edit (spec §4.5).
     println!("update inside a 1 MB div p95: {p95} us");
 }
+
+// Text selection (2026-10-22 preview selection spec).
+
+use crate::preview::selection::{Selection, TextPoint};
+
+/// The active tab as `text` in Preview, painted, so its visible blocks have layouts.
+fn selectable_preview(main: &TestMain, text: &str) -> preview::view::PreviewView {
+    main.make_markdown(text);
+    main.command(CommandId::MarkdownViewPreview);
+    let view = main.view().expect("preview window");
+    pump_until("first render", Duration::from_secs(3), || {
+        view.stats().block_count > 0
+    });
+    unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(view.hwnd()) };
+    pump_pending();
+    view
+}
+
+fn mouse(view: HWND, message: u32, (x, y): (i32, i32), keys: usize) {
+    let lparam = (((y as u32) << 16) | (x as u32 & 0xFFFF)) as isize;
+    unsafe { SendMessageW(view, message, keys, lparam) };
+}
+
+fn click(view: HWND, at: (i32, i32), keys: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    mouse(view, WM_LBUTTONDOWN, at, 0x0001 | keys);
+    mouse(view, WM_LBUTTONUP, at, keys);
+}
+
+fn drag(view: HWND, from: (i32, i32), to: (i32, i32)) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    mouse(view, WM_LBUTTONDOWN, from, 0x0001);
+    mouse(view, WM_MOUSEMOVE, to, 0x0001);
+    mouse(view, WM_LBUTTONUP, to, 0);
+}
+
+fn ordered(view: &preview::view::PreviewView) -> Option<(TextPoint, TextPoint)> {
+    view.selection()
+        .map(|selection: Selection| selection.ordered())
+}
+
+#[test]
+fn dragging_selects_across_blocks_and_copies_the_rendered_text() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "First **para**\n\nSecond para\n\nThird\n");
+    let from = view.client_of(TextPoint::new(0, 0, 0)).unwrap();
+    let to = view.client_of(TextPoint::new(1, 0, 6)).unwrap();
+    drag(view.hwnd(), from, to);
+    assert_eq!(
+        ordered(&view),
+        Some((TextPoint::new(0, 0, 0), TextPoint::new(1, 0, 6)))
+    );
+    let clip = view.selected_text().unwrap();
+    assert_eq!(clip.plain, "First para\n\nSecond");
+    assert_eq!(clip.html, "<p>First <strong>para</strong></p><p>Second</p>");
+}
+
+#[test]
+fn a_plain_click_selects_nothing_and_shift_click_extends() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "One two\n\nThree four\n");
+    click(
+        view.hwnd(),
+        view.client_of(TextPoint::new(0, 0, 4)).unwrap(),
+        0,
+    );
+    assert_eq!(view.selection(), None);
+    // Shift+click extends from where the last selection began.
+    drag(
+        view.hwnd(),
+        view.client_of(TextPoint::new(0, 0, 0)).unwrap(),
+        view.client_of(TextPoint::new(0, 0, 3)).unwrap(),
+    );
+    click(
+        view.hwnd(),
+        view.client_of(TextPoint::new(1, 0, 5)).unwrap(),
+        0x0004,
+    );
+    assert_eq!(
+        ordered(&view),
+        Some((TextPoint::new(0, 0, 0), TextPoint::new(1, 0, 5)))
+    );
+    assert_eq!(view.selected_text().unwrap().plain, "One two\n\nThree");
+}
+
+#[test]
+fn double_click_selects_a_word_and_triple_click_the_paragraph() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "Hello brave world\n");
+    let at = view.client_of(TextPoint::new(0, 0, 8)).unwrap();
+    click(view.hwnd(), at, 0);
+    click(view.hwnd(), at, 0);
+    assert_eq!(view.selected_text().unwrap().plain, "brave");
+    click(view.hwnd(), at, 0);
+    assert_eq!(view.selected_text().unwrap().plain, "Hello brave world");
+}
+
+#[test]
+fn dragging_from_a_link_selects_text() {
+    // Break caught: a press on a link swallowing the drag, so link text could never be selected.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "See [the heading](#top) here\n\n# Top\n");
+    drag(
+        view.hwnd(),
+        view.client_of(TextPoint::new(0, 0, 4)).unwrap(),
+        view.client_of(TextPoint::new(0, 0, 15)).unwrap(),
+    );
+    assert_eq!(view.selected_text().unwrap().plain, "the heading");
+}
+
+#[test]
+fn select_all_on_a_large_note_lays_out_nothing_more() {
+    // Break caught: copying laying out every block of a long note to read its text.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let text = (0..3000)
+        .map(|n| format!("Paragraph {n} with **bold**.\n\n"))
+        .collect::<String>();
+    let view = selectable_preview(&main, &text);
+    let laid = view.laid_count();
+    assert!(laid < 3000, "only the visible blocks are laid out ({laid})");
+    view.select_all();
+    let clip = view.selected_text().unwrap();
+    assert_eq!(view.laid_count(), laid);
+    assert!(
+        clip.plain
+            .starts_with("Paragraph 0 with bold.\n\nParagraph 1 ")
+    );
+    assert!(clip.plain.ends_with("Paragraph 2999 with bold."));
+}
+
+#[test]
+fn ctrl_a_selects_all_and_escape_clears_it_before_leaving_preview() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_A, VK_CONTROL,
+    };
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "Alpha\n\nBeta\n");
+    let mut keys = [0u8; 256];
+    unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+    let original = keys;
+    keys[usize::from(VK_CONTROL)] = 0x80;
+    unsafe { SetKeyboardState(keys.as_ptr()) };
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, usize::from(VK_A), 0) };
+    unsafe { SetKeyboardState(original.as_ptr()) };
+    assert_eq!(view.selected_text().unwrap().plain, "Alpha\n\nBeta");
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    pump_pending();
+    assert_eq!(view.selection(), None);
+    assert_eq!(
+        main.mode(),
+        ViewMode::Preview,
+        "the first Escape only clears"
+    );
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    pump_until("Escape to leave Preview", Duration::from_secs(2), || {
+        main.mode() != ViewMode::Preview
+    });
+}
+
+#[test]
+fn copy_while_the_preview_has_focus_copies_the_preview_not_the_editor() {
+    // Break caught: Edit > Copy in Preview copying the hidden editor's selection.
+    use crate::platform::clipboard::test_support::{Backup, read_html, read_text};
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(&main, "Plain **rich** text\n");
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_SETSEL,
+            0,
+            5,
+        );
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(view.hwnd());
+    }
+    view.select_all();
+    let _backup = Backup::take();
+    main.command(CommandId::Copy);
+    assert_eq!(read_text(), "Plain rich text");
+    assert!(
+        read_html().contains(
+            "<!--StartFragment--><p>Plain <strong>rich</strong> text</p><!--EndFragment-->"
+        )
+    );
+}
+
+#[test]
+fn a_resize_keeps_the_selection_and_an_edit_clears_it() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = selectable_preview(
+        &main,
+        "Some text that wraps when the window is narrow enough.\n\nMore\n",
+    );
+    view.select_all();
+    let before = view.selection();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            main.hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            500,
+            600,
+            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+        windows_sys::Win32::Graphics::Gdi::UpdateWindow(view.hwnd());
+    }
+    pump_pending();
+    assert_eq!(view.selection(), before);
+    main.set_text("Edited\n");
+    pump_until(
+        "the edit to reach the preview",
+        Duration::from_secs(3),
+        || view.selection().is_none(),
+    );
+}

@@ -15,6 +15,7 @@ pub mod links;
 pub mod model;
 pub mod outline;
 pub mod render;
+pub mod selection;
 pub mod svg;
 pub mod view;
 

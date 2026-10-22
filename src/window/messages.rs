@@ -91,6 +91,10 @@ pub const WM_FASTPAD_LIVE_IMAGE: u32 = WM_APP + 0x5E;
 /// `live::view::MenuRequest` that lives for the call. Sent to the main window, which shows the
 /// menu and runs the choice. Not part of the deferred chain.
 pub const WM_FASTPAD_LIVE_MENU: u32 = WM_APP + 0x5F;
+/// A preview's context menu; wparam is its window and lparam points to a
+/// `preview::view::MenuRequest` that lives for the call. Sent to the main window, which shows the
+/// menu and runs the choice. Not part of the deferred chain.
+pub const WM_FASTPAD_PREVIEW_MENU: u32 = WM_APP + 0x60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

@@ -148,9 +148,13 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         CommandId::Cut => with_editor(hwnd, |editor| {
             let _ = editor.cut();
         }),
-        CommandId::Copy => with_editor(hwnd, |editor| {
-            let _ = editor.copy();
-        }),
+        CommandId::Copy => {
+            if !crate::window::preview_host::copy_focused(hwnd) {
+                with_editor(hwnd, |editor| {
+                    let _ = editor.copy();
+                });
+            }
+        }
         CommandId::Paste => {
             let document = unsafe { app_ptr(hwnd) }
                 .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id));

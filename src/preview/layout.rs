@@ -5,7 +5,7 @@
 
 use crate::Result;
 use crate::preview::colors::ColorRole;
-use crate::preview::dwrite::{Graphics, ResolvedFamily, hresult_error};
+use crate::preview::dwrite::{Graphics, ResolvedFamily, hresult_error, range_rects};
 use crate::preview::inline_object::inline_box;
 use crate::preview::links::resolve_image_path;
 use crate::preview::model::{
@@ -84,6 +84,9 @@ pub enum DrawOp {
         x: f32,
         y: f32,
         role: ColorRole,
+        /// The block's selectable run this text is (`LaidBlock::runs`); `None` for decoration
+        /// (list markers, alert titles, the disclosure triangle).
+        run: Option<u32>,
     },
     Fill {
         rect: RectF,
@@ -214,8 +217,39 @@ pub struct ImageSlot {
     pub alt_origin: (f32, f32),
 }
 
+/// A run of the block's text as laid out (2026-10-22 preview selection spec §4), in the order of
+/// `selection::text_runs`.
+pub struct LaidRun {
+    pub layout: IDWriteTextLayout,
+    /// Where the layout is drawn, in block coordinates.
+    pub x: f32,
+    pub y: f32,
+    /// The area the run's text can occupy, in block coordinates, for finding the run nearest a
+    /// point.
+    pub bounds: RectF,
+    /// The run's length in UTF-16 units.
+    pub len: u32,
+    /// Whether the run moves with the block's horizontal scroll offset.
+    pub scrolls: bool,
+    /// For scrolling runs, the block-coordinate area they are drawn clipped to.
+    pub clip: Option<RectF>,
+}
+
+impl LaidRun {
+    /// `bounds` as currently shown, shifted by the block's horizontal scroll offset.
+    pub fn visible_bounds(&self, h_offset: f32) -> RectF {
+        if self.scrolls {
+            self.bounds.offset(-h_offset, 0.0)
+        } else {
+            self.bounds
+        }
+    }
+}
+
 pub struct LaidBlock {
     pub height: f32,
+    /// The block's selectable text, in reading order.
+    pub runs: Vec<LaidRun>,
     pub ops: Vec<DrawOp>,
     pub targets: Vec<Target>,
     pub images: Vec<ImageSlot>,
@@ -520,6 +554,7 @@ impl<'a> LayoutContext<'a> {
 /// keep heading and section indices in step with `outline::build`.
 struct Output<'k> {
     ops: Vec<DrawOp>,
+    runs: Vec<LaidRun>,
     targets: Vec<Target>,
     images: Vec<ImageSlot>,
     scroll_width: f32,
@@ -533,6 +568,7 @@ impl<'k> Output<'k> {
     fn new(keys: &'k [DetailsKey]) -> Self {
         Self {
             ops: Vec::new(),
+            runs: Vec::new(),
             targets: Vec::new(),
             images: Vec::new(),
             scroll_width: 0.0,
@@ -578,6 +614,7 @@ pub fn layout_block(
     let extent = layout_kind(context, kind, 0.0, 0.0, width, style, &mut output)?;
     Ok(LaidBlock {
         height: extent.content + extent.margin,
+        runs: output.runs,
         ops: output.ops,
         targets: output.targets,
         images: output.images,
@@ -858,8 +895,45 @@ fn push_laid_text(
             push_image_slot(context, &layout, &lines, image, x, y, output)?;
         }
     }
-    output.ops.push(DrawOp::Text { layout, x, y, role });
+    let run = push_run(&layout, text.utf16_len, x, y, scrolls, output)?;
+    output.ops.push(DrawOp::Text {
+        layout,
+        x,
+        y,
+        role,
+        run: Some(run),
+    });
     Ok(height)
+}
+
+/// Records `layout`, drawn at (`x`, `y`), as the block's next run and returns its index.
+fn push_run(
+    layout: &IDWriteTextLayout,
+    len: u32,
+    x: f32,
+    y: f32,
+    scrolls: bool,
+    output: &mut Output<'_>,
+) -> Result<u32> {
+    let text = metrics(layout)?;
+    let max_width = unsafe { layout.GetMaxWidth() };
+    let width = text
+        .widthIncludingTrailingWhitespace
+        .max(if max_width < 100_000.0 {
+            max_width
+        } else {
+            text.width
+        });
+    output.runs.push(LaidRun {
+        layout: layout.clone(),
+        x,
+        y,
+        bounds: RectF::new(x, y, x + width, y + text.height),
+        len,
+        scrolls,
+        clip: None,
+    });
+    Ok(output.runs.len() as u32 - 1)
 }
 
 /// A link's accessible name: its visible text, else its images' alt text, else their title, else
@@ -1005,13 +1079,20 @@ fn push_code(
         role: ColorRole::CodeBackground,
     });
     let content_width = text_metrics.widthIncludingTrailingWhitespace + 2.0 * padding;
+    let scrolls = content_width > width;
+    let len = text.encode_utf16().count() as u32;
+    let run = push_run(&layout, len, x + padding, y + padding, scrolls, output)?;
+    if scrolls {
+        output.runs[run as usize].clip = Some(rect);
+    }
     let text_op = DrawOp::Text {
         layout,
         x: x + padding,
         y: y + padding,
         role: ColorRole::Text,
+        run: Some(run),
     };
-    if content_width > width {
+    if scrolls {
         output.scroll_width = output.scroll_width.max(content_width);
         output.ops.push(DrawOp::Scrollable {
             clip: rect,
@@ -1075,6 +1156,7 @@ fn push_list(
                 x,
                 y: cursor,
                 role: style.role,
+                run: None,
             });
         }
         let inner = Style {
@@ -1203,12 +1285,21 @@ fn push_table(
         }
     }
     output.targets.append(&mut table_output.targets);
-    // Cell images are numbered within the table; renumber them into the block's slots.
+    // Cell images and runs are numbered within the table; renumber them into the block's.
     let base = output.images.len();
     output.images.append(&mut table_output.images);
+    let run_base = output.runs.len() as u32;
+    for run in &mut table_output.runs {
+        if scrolls {
+            run.clip = Some(clip);
+        }
+    }
+    output.runs.append(&mut table_output.runs);
     for op in &mut table_output.ops {
-        if let DrawOp::Image { slot } = op {
-            *slot += base;
+        match op {
+            DrawOp::Image { slot } => *slot += base,
+            DrawOp::Text { run: Some(run), .. } => *run += run_base,
+            _ => {}
         }
     }
     if scrolls {
@@ -1296,6 +1387,7 @@ fn push_details(
         x,
         y,
         role: style.role,
+        run: None,
     });
     let mut content = row_height;
     if open {
@@ -1351,6 +1443,7 @@ fn push_alert(
         x: x + indent,
         y,
         role: ColorRole::Link,
+        run: None,
     });
     let mut content = title_height;
     if !blocks.is_empty() {
@@ -1413,37 +1506,6 @@ fn metrics(layout: &IDWriteTextLayout) -> Result<DWRITE_TEXT_METRICS> {
     let mut value = DWRITE_TEXT_METRICS::default();
     unsafe { layout.GetMetrics(&mut value) }.map_err(hresult_error)?;
     Ok(value)
-}
-
-fn range_rects(
-    layout: &IDWriteTextLayout,
-    start: u32,
-    end: u32,
-    x: f32,
-    y: f32,
-) -> Result<Vec<RectF>> {
-    let length = end.saturating_sub(start);
-    if length == 0 {
-        return Ok(Vec::new());
-    }
-    let mut count = 0_u32;
-    // The first call only reports how many rectangles the range needs.
-    let _ = unsafe { layout.HitTestTextRange(start, length, x, y, None, &mut count) };
-    let mut hits = vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
-    unsafe { layout.HitTestTextRange(start, length, x, y, Some(&mut hits), &mut count) }
-        .map_err(hresult_error)?;
-    Ok(hits
-        .iter()
-        .take(count as usize)
-        .map(|hit| {
-            RectF::new(
-                hit.left,
-                hit.top,
-                hit.left + hit.width,
-                hit.top + hit.height,
-            )
-        })
-        .collect())
 }
 
 #[cfg(test)]

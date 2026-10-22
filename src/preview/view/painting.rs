@@ -79,6 +79,11 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         .iter()
         .map(|index| state.heights.top(*index))
         .collect::<Vec<_>>();
+    let fill = if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == hwnd {
+        ColorRole::Selection
+    } else {
+        ColorRole::InactiveSelection
+    };
     let ViewState {
         target,
         brushes,
@@ -91,8 +96,10 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         graphics,
         fonts,
         paused,
+        selection,
         ..
     } = state;
+    let recolor = colors.selection_text != colors.text;
     let target = target.as_ref().expect("created above");
     let brushes = brushes.as_ref().expect("created above");
     let result = unsafe {
@@ -105,6 +112,10 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             };
             let y = top - *scroll_y + bar;
             let offset = h_scroll.get(index).copied().unwrap_or(0.0);
+            let range = |run: u32| {
+                let len = laid.runs.get(run as usize)?.len;
+                selection.as_ref()?.run_range(*index, run, len)
+            };
             draw_ops(
                 target,
                 brushes,
@@ -114,6 +125,11 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 content_left,
                 y,
                 offset,
+                &crate::preview::render::SelectionPaint {
+                    range: &range,
+                    fill,
+                    recolor,
+                },
             );
             if let Some((focus_block, focus_link)) = *focus
                 && focus_block == *index
