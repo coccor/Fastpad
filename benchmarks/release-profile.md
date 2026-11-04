@@ -51,6 +51,20 @@ confirm. No configuration meets the 25 ms p50 / 40 ms p95 warm TTI or 20 ms firs
 this host. Idle private working set (about 2 MB) is well under 20 MB. Roughly 10-12 ms elapses
 before `process_start`, and about 28 ms between `editor_created` and `first_paint`.
 
+### SVG stack optimized for size (2026-11-04)
+
+`[profile.release.package]` in `Cargo.toml` builds the crates only `resvg` pulls in at `opt-level = "s"`;
+`fastpad` and every other dependency stay at the profile's level. The SVG stack runs on the image worker
+thread, never on the startup path. Development host, static CRT, fat LTO:
+
+| | `fastpad.exe` bytes | 256 px icon SVG decode, median of 2 runs |
+|---|---:|---:|
+| Before | 8,289,792 | 473 us |
+| After | 7,780,352 | 550 us |
+
+For reference, the whole binary at `opt-level = "s"` measured 6,743,552 bytes; it was not adopted because
+it changes the startup-critical code and needs the reference-machine TTI run below.
+
 ## Outstanding owner and reference-hardware gates
 
 - [ ] Sign the package with `FASTPAD_SIGNING_CERTIFICATE` set, then run

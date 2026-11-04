@@ -67,6 +67,63 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# The SVG stack, which only resvg pulls in, optimizes for size: it runs on the image worker
+# thread, off the startup path. Measured 2026-11-04 (static CRT, fat LTO): fastpad.exe
+# 8,289,792 -> 7,780,352 bytes; a 256 px icon decode 473 -> 550 us median.
+# Re-list the crates when resvg's dependencies change: `cargo tree -p resvg -e normal`.
+[profile.release.package]
+adler2 = { opt-level = "s" }
+arrayref = { opt-level = "s" }
+arrayvec = { opt-level = "s" }
+base64 = { opt-level = "s" }
+bytemuck = { opt-level = "s" }
+byteorder-lite = { opt-level = "s" }
+color_quant = { opt-level = "s" }
+crc32fast = { opt-level = "s" }
+data-url = { opt-level = "s" }
+fdeflate = { opt-level = "s" }
+flate2 = { opt-level = "s" }
+float-cmp = { opt-level = "s" }
+font-types = { opt-level = "s" }
+fontdb = { opt-level = "s" }
+gif = { opt-level = "s" }
+harfrust = { opt-level = "s" }
+image-webp = { opt-level = "s" }
+imagesize = { opt-level = "s" }
+kurbo = { opt-level = "s" }
+memmap2 = { opt-level = "s" }
+miniz_oxide = { opt-level = "s" }
+png = { opt-level = "s" }
+polycool = { opt-level = "s" }
+read-fonts = { opt-level = "s" }
+resvg = { opt-level = "s" }
+rgb = { opt-level = "s" }
+roxmltree = { opt-level = "s" }
+simd-adler32 = { opt-level = "s" }
+simplecss = { opt-level = "s" }
+siphasher = { opt-level = "s" }
+skrifa = { opt-level = "s" }
+slotmap = { opt-level = "s" }
+smallvec = { opt-level = "s" }
+strict-num = { opt-level = "s" }
+svgtypes = { opt-level = "s" }
+tiny-skia = { opt-level = "s" }
+tiny-skia-path = { opt-level = "s" }
+tinyvec = { opt-level = "s" }
+unicode-bidi = { opt-level = "s" }
+unicode-script = { opt-level = "s" }
+unicode-vo = { opt-level = "s" }
+usvg = { opt-level = "s" }
+weezl = { opt-level = "s" }
+xmlwriter = { opt-level = "s" }
+zune-core = { opt-level = "s" }
+zune-jpeg = { opt-level = "s" }
+
+# Dependencies keep line tables (backtraces, breakpoints by line) but not full debug info,
+# which shrinks what every dev and test binary links.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [profile.release-size]
 inherits = "release"
 opt-level = "z"
@@ -98,24 +155,8 @@ name = "tabs"
 path = "tests/windows/tabs.rs"
 
 [[test]]
-name = "open_file"
-path = "tests/windows/open_file.rs"
-
-[[test]]
-name = "save_file"
-path = "tests/windows/save_file.rs"
-
-[[test]]
-name = "editing"
-path = "tests/windows/editing.rs"
-
-[[test]]
 name = "highlighting"
 path = "tests/windows/highlighting.rs"
-
-[[test]]
-name = "json_commands"
-path = "tests/windows/json_commands.rs"
 
 [[test]]
 name = "recovery"
@@ -130,17 +171,14 @@ name = "session"
 path = "tests/windows/session.rs"
 
 [[test]]
-name = "markdown_preview"
-path = "tests/windows/markdown_preview.rs"
-
-[[test]]
 name = "library"
 path = "tests/windows/library.rs"
 
 [[test]]
-name = "image_preview"
-path = "tests/windows/image_preview.rs"
-
-[[test]]
 name = "markdown_live"
 path = "tests/windows/markdown_live.rs"
+
+# The other tests that build the crate in-process with cfg(test), in one target so it compiles once.
+[[test]]
+name = "in_process"
+path = "tests/windows/in_process.rs"

@@ -29,7 +29,7 @@ confidence interval for the p95 delta excludes zero.
 Preview costs are measured in-process with ignored tests:
 
 ```powershell
-cargo test --release --test markdown_preview -- --ignored --test-threads=1 --nocapture
+cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1 --nocapture
 ```
 
 Targets: preview open on 100 KB < 50 ms p95; one-paragraph update in a 1 MB document < 2 ms p95;

@@ -1,8 +1,6 @@
 #![cfg(windows)]
-mod support;
-
-// Build the crate in-process with cfg(test), as json_commands.rs does, so tests can reach App.
-include!("../../src/lib.rs");
+// In-process: compiled into tests/windows/in_process.rs with the crate under cfg(test).
+use super::*;
 
 use crate::window::commands::CommandId;
 use std::time::{Duration, Instant};

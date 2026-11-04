@@ -1,10 +1,6 @@
 #![cfg(windows)]
-mod support;
-
-// Build exact native sources with cfg(test); test seams remain absent from production. This also
-// means `show_json_issue`/`show_json_valid` compile to their `#[cfg(test)]` thread-local-recording
-// variants here, so a real (blocking, modal) MessageBoxW is never shown by this target.
-include!("../../src/lib.rs");
+// In-process: compiled into tests/windows/in_process.rs with the crate under cfg(test).
+use super::*;
 
 use fastpad::window::commands::CommandId;
 use std::time::{Duration, Instant};
