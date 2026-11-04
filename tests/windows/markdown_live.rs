@@ -1,6 +1,8 @@
 #![cfg(windows)]
-// In-process: compiled into tests/windows/in_process.rs with the crate under cfg(test).
-use super::*;
+mod support;
+
+// Build the crate in-process with cfg(test), as markdown_preview.rs does, so tests can reach App.
+include!("../../src/lib.rs");
 
 use crate::document::Language;
 use crate::editor::scintilla_constants::{SCI_SETSAVEPOINT, SCI_SETTEXT};
@@ -2010,14 +2012,14 @@ fn live_against_source_typing(text: &str, caret: usize, typing: Typing) -> (u64,
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test in_process markdown_live::typing_in_live -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_costs_the_same_as_typing_in_source() {
     let (source, live) = live_against_source(&sample_markdown(1_000_000), 500_000);
     report_typing("sample_1mb", source, live);
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test in_process markdown_live::typing_in_live -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_inside_a_long_paragraph_stays_in_budget() {
     // Every keystroke reparses this 40-line block and restyles its lines.
     let paragraph = (0..40)
@@ -2030,7 +2032,7 @@ fn typing_in_live_inside_a_long_paragraph_stays_in_budget() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test in_process markdown_live::typing_in_live -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_inside_a_long_list_stays_in_budget() {
     // Every keystroke reparses the whole 300-item list (one block) and restyles its lines.
     let list = (0..300)
@@ -2043,7 +2045,7 @@ fn typing_in_live_inside_a_long_list_stays_in_budget() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test in_process markdown_live::typing_in_live -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_inside_a_table_stays_in_budget() {
     let mut table = String::from("| one | two | three | four | five |\n|---|---|---|---|---|\n");
     for row in 0..60 {
@@ -2058,7 +2060,7 @@ fn typing_in_live_inside_a_table_stays_in_budget() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test in_process markdown_live::typing_in_live -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_inside_a_code_block_stays_in_budget() {
     let code = (0..500)
         .map(|n| format!("let value_{n} = compute({n});\n"))
@@ -2073,7 +2075,7 @@ fn typing_in_live_inside_a_code_block_stays_in_budget() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test in_process markdown_live::typing_in_live -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_entering_live_on_a_1_mb_note_is_quick() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
@@ -2103,7 +2105,7 @@ fn typing_in_live_entering_live_on_a_1_mb_note_is_quick() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test in_process markdown_live::typing_in_live -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test markdown_live typing_in_live -- --ignored --test-threads=1"]
 fn typing_in_live_on_a_10k_line_note_costs_the_same_as_typing_in_source() {
     let text = (0..10_000)
         .map(|n| format!("Line {n} of a long note, with some words to wrap.\n"))

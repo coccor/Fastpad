@@ -174,7 +174,11 @@ path = "tests/windows/session.rs"
 name = "library"
 path = "tests/windows/library.rs"
 
-# The tests that build the crate in-process with cfg(test), in one target so it compiles once.
+[[test]]
+name = "markdown_live"
+path = "tests/windows/markdown_live.rs"
+
+# The other tests that build the crate in-process with cfg(test), in one target so it compiles once.
 [[test]]
 name = "in_process"
 path = "tests/windows/in_process.rs"

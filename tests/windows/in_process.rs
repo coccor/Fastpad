@@ -5,7 +5,10 @@
 //!
 //! They share one target so the crate (and its unit tests) is compiled once for all of them,
 //! instead of once per file. Run one file's tests with its module path as the filter, e.g.
-//! `cargo test --test in_process markdown_live::`.
+//! `cargo test --test in_process markdown_preview::`.
+//!
+//! `markdown_live.rs` stays a target of its own: in this shared process its click tests failed
+//! intermittently (the caret did not move) while they pass reliably in their own binary.
 #![cfg(windows)]
 
 include!("../../src/lib.rs");
@@ -18,8 +21,6 @@ mod editing;
 mod image_preview;
 #[path = "json_commands.rs"]
 mod json_commands;
-#[path = "markdown_live.rs"]
-mod markdown_live;
 #[path = "markdown_preview.rs"]
 mod markdown_preview;
 #[path = "open_file.rs"]
