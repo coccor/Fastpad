@@ -1,8 +1,6 @@
 #![cfg(windows)]
-mod support;
-
-// Build the crate in-process with cfg(test), as json_commands.rs does, so tests can reach App.
-include!("../../src/lib.rs");
+// In-process: compiled into tests/windows/in_process.rs with the crate under cfg(test).
+use super::*;
 
 use crate::document::Language;
 use crate::preview::ViewMode;
@@ -769,7 +767,7 @@ fn p95(mut samples: Vec<u64>) -> u64 {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1"]
 fn opening_a_100_kb_preview_renders_within_50_ms_p95() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
@@ -779,7 +777,7 @@ fn opening_a_100_kb_preview_renders_within_50_ms_p95() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1"]
 fn one_paragraph_updates_in_a_1_mb_document_within_2_ms_p95() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
@@ -789,7 +787,7 @@ fn one_paragraph_updates_in_a_1_mb_document_within_2_ms_p95() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1"]
 fn typing_with_split_open_costs_the_same_as_without_a_preview() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
@@ -952,7 +950,7 @@ fn writing_samples(main: &TestMain, language: Language) -> Vec<u64> {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1"]
 fn typing_with_the_writing_helpers_costs_the_same_as_plain_text() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
@@ -975,7 +973,7 @@ fn typing_with_the_writing_helpers_costs_the_same_as_plain_text() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1"]
 fn private_bytes_do_not_grow_across_open_close_cycles() {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
@@ -1126,7 +1124,7 @@ fn the_html_readme_fixture_renders_its_svg_and_toggles_its_section() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1"]
 fn opening_a_100_kb_html_heavy_preview_renders_within_50_ms_p95() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
@@ -1136,7 +1134,7 @@ fn opening_a_100_kb_html_heavy_preview_renders_within_50_ms_p95() {
 }
 
 #[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+#[ignore = "performance measurement: cargo test --release --test in_process markdown_preview:: -- --ignored --test-threads=1"]
 fn one_paragraph_update_inside_a_div_spanning_1_mb_is_recorded() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();

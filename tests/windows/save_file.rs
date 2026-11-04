@@ -1,8 +1,6 @@
 #![cfg(windows)]
-mod support;
-
-// Build exact native sources with cfg(test); test seams remain absent from production.
-include!("../../src/lib.rs");
+// In-process: compiled into tests/windows/in_process.rs with the crate under cfg(test).
+use super::*;
 
 use fastpad::editor::scintilla_constants::SCI_GETMODIFY;
 use fastpad::window::commands::CommandId;

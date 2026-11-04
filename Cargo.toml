@@ -98,24 +98,8 @@ name = "tabs"
 path = "tests/windows/tabs.rs"
 
 [[test]]
-name = "open_file"
-path = "tests/windows/open_file.rs"
-
-[[test]]
-name = "save_file"
-path = "tests/windows/save_file.rs"
-
-[[test]]
-name = "editing"
-path = "tests/windows/editing.rs"
-
-[[test]]
 name = "highlighting"
 path = "tests/windows/highlighting.rs"
-
-[[test]]
-name = "json_commands"
-path = "tests/windows/json_commands.rs"
 
 [[test]]
 name = "recovery"
@@ -130,17 +114,10 @@ name = "session"
 path = "tests/windows/session.rs"
 
 [[test]]
-name = "markdown_preview"
-path = "tests/windows/markdown_preview.rs"
-
-[[test]]
 name = "library"
 path = "tests/windows/library.rs"
 
+# The tests that build the crate in-process with cfg(test), in one target so it compiles once.
 [[test]]
-name = "image_preview"
-path = "tests/windows/image_preview.rs"
-
-[[test]]
-name = "markdown_live"
-path = "tests/windows/markdown_live.rs"
+name = "in_process"
+path = "tests/windows/in_process.rs"
