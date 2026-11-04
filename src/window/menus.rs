@@ -138,6 +138,7 @@ impl MenuBar {
                     MenuEntry::command("&Go to note\u{2026}", CommandId::QuickOpen),
                     MenuEntry::command("&Save", CommandId::Save),
                     MenuEntry::command("Save &as...", CommandId::SaveAs),
+                    MenuEntry::command("Rea&d-only", CommandId::ToggleReadOnly),
                     MenuEntry::command("&Close tab", CommandId::CloseTab),
                     MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
                     MenuEntry::command("Close &group", CommandId::CloseGroup),
@@ -319,6 +320,12 @@ pub(crate) fn set_checked_language(menu: HMENU, active: crate::document::Languag
             )
         };
     }
+}
+
+/// Checks File → Read-only while the active tab is read-only.
+pub(crate) fn set_read_only_checked(menu: HMENU, read_only: bool) {
+    let check = if read_only { MF_CHECKED } else { MF_UNCHECKED };
+    unsafe { CheckMenuItem(menu, CommandId::ToggleReadOnly as u32, MF_BYCOMMAND | check) };
 }
 
 /// Grays the View menu's Sidebar entry while notes mode is off and there is no sidebar.

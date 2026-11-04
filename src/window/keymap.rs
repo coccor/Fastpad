@@ -184,6 +184,7 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::QuickOpen, "file.goToNote"),
     (CommandId::Save, "file.save"),
     (CommandId::SaveAs, "file.saveAs"),
+    (CommandId::ToggleReadOnly, "file.toggleReadOnly"),
     (CommandId::CloseTab, "file.closeTab"),
     (CommandId::CloseAllTabs, "file.closeAllTabs"),
     (CommandId::ToggleRestoreSession, "file.toggleRestoreSession"),

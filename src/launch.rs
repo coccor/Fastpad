@@ -4,6 +4,8 @@ use std::ffi::OsString;
 pub struct LaunchOptions {
     pub new_window: bool,
     pub diagnostic: bool,
+    /// `--read-only`: the file named opens for viewing only.
+    pub read_only: bool,
     pub request: LaunchRequest,
 }
 
@@ -59,6 +61,7 @@ pub fn parse(
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--new-window") => options.new_window = true,
+            Some("--read-only") => options.read_only = true,
             Some("--diagnostic") => options.diagnostic = true,
             Some("--capture") if capture.is_none() => capture = Some(CaptureRequest::default()),
             Some("--attach") => match args.next() {
@@ -128,9 +131,22 @@ mod tests {
             Ok(LaunchOptions {
                 new_window: true,
                 diagnostic: true,
+                read_only: false,
                 request: LaunchRequest::Open(OsString::from("notes.md")),
             })
         );
+    }
+
+    #[test]
+    fn read_only_flag_parses() {
+        // Break caught: `--read-only` rejected as an unknown flag, or set without being given.
+        let options = parse(os(&["--read-only", "notes.md"])).unwrap();
+        assert!(options.read_only);
+        assert_eq!(
+            options.request,
+            LaunchRequest::Open(OsString::from("notes.md"))
+        );
+        assert!(!parse(os(&["notes.md"])).unwrap().read_only);
     }
 
     #[test]

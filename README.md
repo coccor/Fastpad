@@ -406,13 +406,17 @@ Hand edits keep your comments and other lines; the palette and Settings rewrite 
 ## Command line
 
 ```text
-FastPad.exe [--new-window] [path]
+FastPad.exe [--new-window] [--read-only] [path]
 FastPad.exe --capture ["text" | -] [--attach <file>]...
 ```
 
 - `FastPad.exe notes.md` opens the file in your running FastPad window, or starts FastPad if none is
   open.
 - `--new-window` always starts a separate, independent window.
+- `--read-only` opens the file for viewing only: typing, pasting and Save do nothing to it, while
+  changes made to it outside FastPad still show. **File → Read-only** (or *File: Toggle read-only*
+  in the command palette) switches any tab either way; the status bar says *Read-only* while it
+  is on. A tab with unsaved changes can't be made read-only until they are saved or undone.
 - `--capture` opens the quick capture box. With text (or `-` to read it from standard input) and
   any `--attach` files, it files them into the inbox with no window and exits: `0` when filed, `1`
   when the write failed, `2` when the request was refused (a missing file, or one over 20 MB). It

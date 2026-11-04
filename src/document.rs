@@ -131,6 +131,10 @@ pub struct Document {
     /// Where this untitled note's first save goes (spec §6.7): the folder selected in the
     /// sidebar when it was created. `None` means the notebook root.
     pub save_folder: Option<PathBuf>,
+    /// Opened for viewing only (`--read-only` or "File: Toggle read-only"): Scintilla refuses
+    /// edits and Save leaves the file alone. Changes made outside FastPad still reload into it.
+    /// Never set while the tab has unsaved edits.
+    pub read_only: bool,
 }
 
 impl PartialEq for Document {
@@ -188,6 +192,7 @@ impl Document {
             compare: None,
             preview: false,
             save_folder: None,
+            read_only: false,
         }
     }
 

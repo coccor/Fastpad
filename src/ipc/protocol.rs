@@ -12,12 +12,16 @@ const COMMAND_NEW: u8 = 2;
 const COMMAND_ACTIVATE: u8 = 3;
 const COMMAND_OPEN_FOLDER: u8 = 4;
 const COMMAND_CAPTURE: u8 = 5;
+const COMMAND_OPEN_READ_ONLY: u8 = 6;
 /// The text field's length when a capture has no text.
 const NO_TEXT: u32 = u32::MAX;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IpcRequest {
     Open(PathBuf),
+    /// `--read-only`: open the file for viewing only. Its own command, so a FastPad too old to
+    /// know it refuses the frame and the launch opens its own window rather than an editable tab.
+    OpenReadOnly(PathBuf),
     New,
     Activate,
     OpenFolder(PathBuf),
@@ -32,6 +36,7 @@ pub enum IpcRequest {
 pub fn encode_frame(request: &IpcRequest) -> Result<Vec<u8>> {
     let (command, payload) = match request {
         IpcRequest::Open(path) => (COMMAND_OPEN, encode_path(path)?),
+        IpcRequest::OpenReadOnly(path) => (COMMAND_OPEN_READ_ONLY, encode_path(path)?),
         IpcRequest::New => (COMMAND_NEW, Vec::new()),
         IpcRequest::Activate => (COMMAND_ACTIVATE, Vec::new()),
         IpcRequest::OpenFolder(path) => (COMMAND_OPEN_FOLDER, encode_path(path)?),
@@ -70,6 +75,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<IpcRequest> {
     }
     match command {
         COMMAND_OPEN => decode_path(payload).map(IpcRequest::Open),
+        COMMAND_OPEN_READ_ONLY => decode_path(payload).map(IpcRequest::OpenReadOnly),
         COMMAND_NEW | COMMAND_ACTIVATE if !payload.is_empty() => {
             Err(FastPadError::Ipc("command does not accept a payload"))
         }
@@ -183,6 +189,16 @@ mod tests {
             decode_frame(&encode_frame(&request).unwrap()).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn a_read_only_open_round_trips_as_its_own_command() {
+        // Break caught: `--read-only` forwarded as a plain open, so the running window opens the
+        // file editable.
+        let request = IpcRequest::OpenReadOnly(PathBuf::from(r"C:\notes\plan.md"));
+        let frame = encode_frame(&request).unwrap();
+        assert_eq!(frame[FRAME_MAGIC.len()], COMMAND_OPEN_READ_ONLY);
+        assert_eq!(decode_frame(&frame).unwrap(), request);
     }
 
     #[test]

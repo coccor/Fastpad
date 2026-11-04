@@ -41,7 +41,7 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
     let instance_mutex = if options.new_window {
         None
     } else {
-        match crate::ipc::client::claim_or_forward(&options.request) {
+        match crate::ipc::client::claim_or_forward(&options.request, options.read_only) {
             InstanceClaim::Primary(mutex) => Some(mutex),
             InstanceClaim::Forwarded => return Ok(0),
             InstanceClaim::Independent => None,

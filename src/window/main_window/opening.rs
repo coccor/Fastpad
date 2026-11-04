@@ -42,7 +42,14 @@ pub(super) fn handle_open_request(hwnd: HWND) -> LRESULT {
                     let _ = record_milestone(hwnd, Milestone::FileLoaded);
                 }
             } else {
-                match App::open_path(hwnd, path) {
+                let read_only = unsafe { app_ptr(hwnd) }
+                    .is_some_and(|app| unsafe { app.as_ref() }.launch.read_only);
+                let opened = if read_only {
+                    open_path_read_only(hwnd, path)
+                } else {
+                    App::open_path(hwnd, path)
+                };
+                match opened {
                     Ok(()) => return 0,
                     Err(error) => {
                         report_open_failure(hwnd, path, &error);

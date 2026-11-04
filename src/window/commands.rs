@@ -182,6 +182,8 @@ pub enum CommandId {
     NotesInsertAttachment = 281,
     // The Live view mode (2026-10-18 Live editor design spec §4, 2026-10-22 view modes spec).
     MarkdownViewLive = 282,
+    // Read-only mode (issue #80).
+    ToggleReadOnly = 283,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -206,7 +208,8 @@ pub const EDITING_COMMANDS: [CommandId; 16] = [
 ];
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 63] = [
+pub const TEXT_COMMANDS: [CommandId; 64] = [
+    CommandId::ToggleReadOnly,
     CommandId::MoveLinesUp,
     CommandId::MoveLinesDown,
     CommandId::CopyLinesUp,
@@ -530,7 +533,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 172] = [
+        const COMMANDS: [CommandId; 173] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -703,6 +706,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotesPasteImage,
             CommandId::NotesInsertAttachment,
             CommandId::MarkdownViewLive,
+            CommandId::ToggleReadOnly,
         ];
         COMMANDS
             .into_iter()
@@ -1050,9 +1054,13 @@ mod tests {
         );
         assert!(CommandId::NotesPasteImage.needs_document());
         assert_eq!(CommandId::try_from(282), Ok(CommandId::MarkdownViewLive));
+        // Break caught: read-only renumbered, or offered on an image tab, which has no text.
+        assert_eq!(CommandId::try_from(283), Ok(CommandId::ToggleReadOnly));
+        assert!(CommandId::ToggleReadOnly.needs_document());
+        assert!(CommandId::ToggleReadOnly.needs_text());
         assert_eq!(CommandId::MarkdownViewLive.scope(), Scope::Global);
         assert!(CommandId::MarkdownViewLive.is_markdown_edit());
-        assert!(CommandId::try_from(283).is_err());
+        assert!(CommandId::try_from(284).is_err());
     }
 
     #[test]

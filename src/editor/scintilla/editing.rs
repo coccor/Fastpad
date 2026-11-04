@@ -2,7 +2,9 @@
 //! clipboard, the selection, save points and undo action groups.
 
 use super::*;
-use crate::editor::scintilla_constants::{SC_EOL_CR, SC_EOL_CRLF, SC_EOL_LF, SCI_SETEOLMODE};
+use crate::editor::scintilla_constants::{
+    SC_EOL_CR, SC_EOL_CRLF, SC_EOL_LF, SCI_GETREADONLY, SCI_SETEOLMODE,
+};
 
 impl Editor {
     /// Searches `range` for `needle` with `search_flags`. A backward search passes a range whose
@@ -314,7 +316,13 @@ impl Editor {
         Ok(())
     }
 
+    /// Loads `text` as the shown document's whole, clean text with no undo history. A read-only
+    /// document takes it too: it is FastPad's own load or reload, not an edit.
     pub(crate) fn populate_clean(&self, text: &str) -> Result<()> {
+        self.while_writable(|editor| editor.populate_clean_now(text))
+    }
+
+    fn populate_clean_now(&self, text: &str) -> Result<()> {
         self.endpoint
             .send_direct_checked(SCI_SETUNDOCOLLECTION, 0, 0)?;
         let result = self.set_text(text);
@@ -336,6 +344,29 @@ impl Editor {
         self.endpoint
             .send_direct_checked(SCI_SETREADONLY, usize::from(read_only), 0)?;
         Ok(())
+    }
+
+    /// Whether the shown document refuses edits.
+    pub(crate) fn is_read_only(&self) -> Result<bool> {
+        Ok(self.endpoint.send_direct_checked(SCI_GETREADONLY, 0, 0)? != 0)
+    }
+
+    /// Runs `f` with the shown document writable, then makes it read-only again if it was: for
+    /// text FastPad itself puts in (a load, or a change taken in from disk), which a read-only
+    /// document still follows.
+    pub(crate) fn while_writable<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let read_only = self.is_read_only()?;
+        if read_only {
+            self.set_read_only(false)?;
+        }
+        let result = f(self);
+        if read_only {
+            let restored = self.set_read_only(true);
+            if result.is_ok() {
+                restored?;
+            }
+        }
+        result
     }
 
     pub fn begin_undo_action(&self) {
