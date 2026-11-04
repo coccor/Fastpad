@@ -495,7 +495,21 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         CommandId::MarkdownBold
         | CommandId::MarkdownItalic
         | CommandId::MarkdownCode
-        | CommandId::MarkdownLink => crate::window::markdown_host::format(hwnd, command),
+        | CommandId::MarkdownLink
+        | CommandId::MarkdownStrikethrough
+        | CommandId::MarkdownHeading1
+        | CommandId::MarkdownHeading2
+        | CommandId::MarkdownHeading3
+        | CommandId::MarkdownHeading4
+        | CommandId::MarkdownHeading5
+        | CommandId::MarkdownHeading6
+        | CommandId::MarkdownParagraph
+        | CommandId::MarkdownBulletList
+        | CommandId::MarkdownNumberedList
+        | CommandId::MarkdownTaskList
+        | CommandId::MarkdownInsertTable
+        | CommandId::MarkdownAddTableColumn
+        | CommandId::MarkdownDeleteTableColumn => crate::window::markdown_host::format(hwnd, command),
         CommandId::ToggleSidebar => crate::window::side_panel::toggle(hwnd),
         CommandId::FocusNextPane => cycle_focus(hwnd, false),
         CommandId::FocusPreviousPane => cycle_focus(hwnd, true),

@@ -61,7 +61,9 @@ pub(super) fn handle(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> 
     }
     match message {
         WM_KEYDOWN => {
-            if let Some(movement) = row_move(wparam as u16) {
+            // While the completion list is open its own keys move through it.
+            let listing = editor.completion_active();
+            if let Some(movement) = row_move(wparam as u16).filter(|_| !listing) {
                 with_state(hwnd, |state| {
                     move_caret(state, movement, key_down(VK_SHIFT))
                 });

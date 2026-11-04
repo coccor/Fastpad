@@ -373,6 +373,23 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::MarkdownItalic, "markdown.italic"),
     (CommandId::MarkdownCode, "markdown.code"),
     (CommandId::MarkdownLink, "markdown.link"),
+    (CommandId::MarkdownStrikethrough, "markdown.strikethrough"),
+    (CommandId::MarkdownHeading1, "markdown.heading1"),
+    (CommandId::MarkdownHeading2, "markdown.heading2"),
+    (CommandId::MarkdownHeading3, "markdown.heading3"),
+    (CommandId::MarkdownHeading4, "markdown.heading4"),
+    (CommandId::MarkdownHeading5, "markdown.heading5"),
+    (CommandId::MarkdownHeading6, "markdown.heading6"),
+    (CommandId::MarkdownParagraph, "markdown.paragraph"),
+    (CommandId::MarkdownBulletList, "markdown.bulletList"),
+    (CommandId::MarkdownNumberedList, "markdown.numberedList"),
+    (CommandId::MarkdownTaskList, "markdown.toggleTask"),
+    (CommandId::MarkdownInsertTable, "markdown.insertTable"),
+    (CommandId::MarkdownAddTableColumn, "markdown.addTableColumn"),
+    (
+        CommandId::MarkdownDeleteTableColumn,
+        "markdown.deleteTableColumn",
+    ),
 ];
 
 /// IDs the view mode commands had before the 2026-10-22 view modes spec: still read from
@@ -418,7 +435,7 @@ const fn ch(byte: u8) -> u16 {
 }
 
 /// FastPad's shortcuts before any override, in precedence order (spec §3.3).
-pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 89] = [
+pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 100] = [
     (key(C, ch(b'N')), CommandId::New),
     (key(C, ch(b'T')), CommandId::New),
     (key(C, ch(b'O')), CommandId::Open),
@@ -513,6 +530,17 @@ pub(crate) const DEFAULT_BINDINGS: [(KeyStroke, CommandId); 89] = [
     (key(C, ch(b'I')), CommandId::MarkdownItalic),
     (key(C, VK_OEM_3), CommandId::MarkdownCode),
     (key(C, ch(b'K')), CommandId::MarkdownLink),
+    (key(C | S, ch(b'X')), CommandId::MarkdownStrikethrough),
+    (key(C | S, ch(b'1')), CommandId::MarkdownHeading1),
+    (key(C | S, ch(b'2')), CommandId::MarkdownHeading2),
+    (key(C | S, ch(b'3')), CommandId::MarkdownHeading3),
+    (key(C | S, ch(b'4')), CommandId::MarkdownHeading4),
+    (key(C | S, ch(b'5')), CommandId::MarkdownHeading5),
+    (key(C | S, ch(b'6')), CommandId::MarkdownHeading6),
+    (key(C | S, ch(b'0')), CommandId::MarkdownParagraph),
+    (key(C | S, ch(b'8')), CommandId::MarkdownBulletList),
+    (key(C | S, ch(b'7')), CommandId::MarkdownNumberedList),
+    (key(C | S, ch(b'9')), CommandId::MarkdownTaskList),
 ];
 
 pub(crate) fn default_keys(command: CommandId) -> Vec<KeyStroke> {

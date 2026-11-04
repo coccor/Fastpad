@@ -35,7 +35,7 @@ const EXTRA_TITLES: [(CommandId, &str); 22] = [
 
 /// Names for the Markdown-scoped commands: their keys work only in Markdown files, so the page
 /// says so (Markdown design spec §9).
-const MARKDOWN_SCOPED_TITLES: [(CommandId, &str); 4] = [
+const MARKDOWN_SCOPED_TITLES: [(CommandId, &str); 18] = [
     (CommandId::MarkdownBold, "Markdown: Bold (Markdown files)"),
     (
         CommandId::MarkdownItalic,
@@ -46,6 +46,62 @@ const MARKDOWN_SCOPED_TITLES: [(CommandId, &str); 4] = [
         "Markdown: Inline code (Markdown files)",
     ),
     (CommandId::MarkdownLink, "Markdown: Link (Markdown files)"),
+    (
+        CommandId::MarkdownStrikethrough,
+        "Markdown: Strikethrough (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownHeading1,
+        "Markdown: Heading 1 (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownHeading2,
+        "Markdown: Heading 2 (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownHeading3,
+        "Markdown: Heading 3 (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownHeading4,
+        "Markdown: Heading 4 (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownHeading5,
+        "Markdown: Heading 5 (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownHeading6,
+        "Markdown: Heading 6 (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownParagraph,
+        "Markdown: Paragraph (remove heading) (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownBulletList,
+        "Markdown: Bulleted list (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownNumberedList,
+        "Markdown: Numbered list (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownTaskList,
+        "Markdown: Task list / toggle task (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownInsertTable,
+        "Markdown: Insert table (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownAddTableColumn,
+        "Markdown: Add table column (Markdown files)",
+    ),
+    (
+        CommandId::MarkdownDeleteTableColumn,
+        "Markdown: Delete table column (Markdown files)",
+    ),
 ];
 
 /// What the page calls `command`: its Markdown-scoped name, its palette label, or its name from
