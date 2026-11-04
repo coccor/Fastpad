@@ -58,8 +58,8 @@ There is no single trick. FastPad is fast because of everything it doesn't do be
   the queue and runs later. Session restore reopens one tab per step, so a long session never
   freezes the window. The message loop also handles pending input before anything else.
 - **Heavy work stays off the UI thread, or doesn't happen.** Scanning the notebook, full-text
-  search, full Markdown preview parses, and decoding images and SVGs all run on worker threads that post their results
-  back. Direct2D, DirectWrite and the GPU driver load the first time you open the Markdown preview,
+  search, full Markdown preview parses, and decoding images and SVGs all run on worker threads
+  that post their results back. Direct2D, DirectWrite and the GPU driver load the first time you open the Markdown preview,
   and not before, which is a big part of why idle memory stays around 2 MB. Recovery snapshots are
   written on a timer, only once you've paused typing for two seconds.
 - **A small, pinned dependency tree.** Seven direct crates (`windows-sys`, `windows`, `serde_json`,
