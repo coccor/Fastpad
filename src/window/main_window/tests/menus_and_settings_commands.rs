@@ -95,19 +95,21 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
     ));
     assert_eq!(app_mut(window.hwnd).menu_mode, None);
     assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());
+    // The find widget floats over the editor, so the editor stays put.
     assert_eq!(
         editor_top(),
-        title_height
-            + crate::window::editor_toolbar::row_height(dpi)
-            + super::super::find_bar::find_bar_height(dpi)
+        title_height + crate::window::editor_toolbar::row_height(dpi)
     );
 }
 
 #[test]
-fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_changes() {
-    // Break caught: a find bar whose painted band is not reserved (the editor draws over it),
-    // or that keeps the old colors after the theme changes while it is open.
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+fn the_find_widget_floats_over_the_editor_and_follows_theme_changes() {
+    // Break caught: a find widget that pushes the editor down instead of floating over its
+    // top-right corner, one that sits under the editor in z-order (the editor draws over it), a
+    // chevron that doesn't add the Replace row, or one that keeps the old colors after the theme
+    // changes while it is open.
+    use crate::window::find_bar::{BarButton, FindBarMode};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetWindow, GetWindowRect};
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let editor = install_test_editor(&window);
@@ -133,11 +135,57 @@ fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_chang
     execute_command(window.hwnd, CommandId::Find);
     let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
     assert!(visible(panel));
-    let band = super::super::find_bar::find_bar_height(dpi);
-    // The find bar goes under the editor toolbar.
+    let band = super::super::find_bar::find_bar_height(dpi, FindBarMode::Find);
+    // The widget sits at the editor's top, under the editor toolbar, and the editor stays put.
     let toolbar = crate::window::editor_toolbar::row_height(dpi);
     assert_eq!(top_of(panel), (title_height + toolbar, band));
-    assert_eq!(top_of(editor.hwnd()).0, title_height + toolbar + band);
+    assert_eq!(top_of(editor.hwnd()).0, title_height + toolbar);
+    let screen_rect = |child| {
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(child, &mut rect) };
+        rect
+    };
+    let (widget, view) = (screen_rect(panel), screen_rect(editor.hwnd()));
+    assert!(widget.right < view.right, "left of the editor's scrollbar");
+    assert!(
+        widget.left > view.left,
+        "a floating widget, not a full-width band"
+    );
+    // Above the editor in z-order, so the editor never paints over it.
+    let mut below = unsafe { GetWindow(panel, GW_HWNDNEXT) };
+    while !below.is_null() && below != editor.hwnd() {
+        below = unsafe { GetWindow(below, GW_HWNDNEXT) };
+    }
+    assert_eq!(below, editor.hwnd());
+
+    // The chevron adds the Replace row below, and takes it away again.
+    let center = |rect: RECT| {
+        let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        ((y as u32) << 16 | (x as u32 & 0xffff)) as super::super::LPARAM
+    };
+    let chevron = app_mut(window.hwnd)
+        .find_bar()
+        .unwrap()
+        .button_rect(BarButton::ToggleReplace)
+        .unwrap();
+    let release = windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP;
+    super::super::panel_pointer(window.hwnd, panel, release, 0, center(chevron));
+    assert_eq!(
+        app_mut(window.hwnd).find_bar().unwrap().mode(),
+        FindBarMode::Replace
+    );
+    let replace_band = super::super::find_bar::find_bar_height(dpi, FindBarMode::Replace);
+    assert_eq!(top_of(panel).1, replace_band);
+    assert!(visible(
+        app_mut(window.hwnd).find_bar().unwrap().replace_hwnd()
+    ));
+    assert_eq!(top_of(editor.hwnd()).0, title_height + toolbar);
+    super::super::panel_pointer(window.hwnd, panel, release, 0, center(chevron));
+    assert_eq!(
+        app_mut(window.hwnd).find_bar().unwrap().mode(),
+        FindBarMode::Find
+    );
+    assert_eq!(top_of(panel).1, band);
 
     let brush_before = {
         let bar = app_mut(window.hwnd).find_bar().unwrap();

@@ -188,6 +188,33 @@ fn replace_current_replaces_a_selection_that_matches_under_the_options() {
 }
 
 #[test]
+fn replace_current_moves_on_past_the_text_it_inserted() {
+    // Break caught: a replacement that contains the query ("bb" -> "{bb}") being found again
+    // inside itself, so a second Enter gives "{{bb}}" instead of replacing the next "bb".
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("aa bb cc bb cc").unwrap();
+    execute_command(window.hwnd, CommandId::Replace);
+    set_find_query(window.hwnd, "bb");
+    set_replace_text(window.hwnd, "{bb}");
+    editor.set_selection(0..0).unwrap();
+
+    // The first Enter only selects the first match; the next two replace both.
+    super::super::replace_current(window.hwnd);
+    assert_eq!(editor.selection().unwrap(), 3..5);
+    super::super::replace_current(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "aa {bb} cc bb cc");
+    assert_eq!(
+        editor.selection().unwrap(),
+        11..13,
+        "the next bb, not the inserted one"
+    );
+    super::super::replace_current(window.hwnd);
+    assert_eq!(editor.text().unwrap(), "aa {bb} cc {bb} cc");
+}
+
+#[test]
 fn opening_a_result_seeds_the_find_bar_with_search_options_and_f3_steps_on() {
     // Break caught: the find bar keeping its own options (so match case is lost), the first
     // match not selected, or F3 and Shift+F3 not reaching the next and previous matches.

@@ -139,12 +139,42 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
             .filter(|bar| bar.owns(panel))
             .and_then(|bar| bar.pointer(message, lparam))
     });
+    use find_bar::{BarButton, BarClick};
     match click {
-        Some(find_bar::BarClick::Close) => close_find_bar(hwnd),
-        Some(find_bar::BarClick::Toggle(option)) => toggle_find_option(hwnd, option),
-        Some(find_bar::BarClick::Nav(find_bar::NavButton::Previous)) => find_previous(hwnd),
-        Some(find_bar::BarClick::Nav(find_bar::NavButton::Next)) => find_next(hwnd),
+        Some(BarClick::Toggle(option)) => toggle_find_option(hwnd, option),
+        Some(BarClick::Button(BarButton::Close)) => close_find_bar(hwnd),
+        Some(BarClick::Button(BarButton::Previous)) => find_previous(hwnd),
+        Some(BarClick::Button(BarButton::Next)) => find_next(hwnd),
+        Some(BarClick::Button(BarButton::ToggleReplace)) => toggle_replace_mode(hwnd),
+        Some(BarClick::Button(BarButton::ReplaceOne)) => replace_current(hwnd),
+        Some(BarClick::Button(BarButton::ReplaceAll)) => replace_all_matches(hwnd),
         None => {}
+    }
+}
+
+/// The chevron at the widget's left edge shows or hides the Replace row. Hiding it while the
+/// replacement field has the focus hands the focus to the query field.
+pub(crate) fn toggle_replace_mode(hwnd: HWND) {
+    let refocus = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
+        let collapsing = bar.mode() == find_bar::FindBarMode::Replace;
+        let refocus = collapsing && bar.replace_focused();
+        bar.set_mode(if collapsing {
+            find_bar::FindBarMode::Find
+        } else {
+            find_bar::FindBarMode::Replace
+        });
+        Some(refocus)
+    });
+    let Some(refocus) = refocus else {
+        return;
+    };
+    layout_editor_and_find_bar(hwnd);
+    if refocus
+        && let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
+    {
+        bar.focus_query();
     }
 }
 
@@ -365,11 +395,61 @@ pub(super) fn select_match(
         return;
     }
     if let Some(found) = found.clone() {
-        let _ = editor.set_selection(found);
+        let _ = editor.set_selection(found.clone());
         editor.scroll_caret_into_view();
+        reveal_past_find_bar(hwnd, editor, found);
     }
     set_find_no_match(hwnd, found.is_none());
     schedule_find_count(hwnd);
+}
+
+/// The find widget floats over the editor's top-right corner, so a match scrolled to the top
+/// line can land under it. Scrolls the editor down by enough lines to bring `found` out from
+/// under the widget; near the top of the document Scintilla stops at the first line.
+fn reveal_past_find_bar(hwnd: HWND, editor: &Editor, found: std::ops::Range<usize>) {
+    use crate::editor::scintilla_constants::{
+        SCI_LINEFROMPOSITION, SCI_LINESCROLL, SCI_POINTXFROMPOSITION, SCI_POINTYFROMPOSITION,
+        SCI_TEXTHEIGHT,
+    };
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindowVisible};
+    let Some(panel) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let bar = unsafe { app.as_ref() }.find_bar()?;
+        bar.is_visible().then(|| bar.panel_hwnd())
+    }) else {
+        return;
+    };
+    let view = editor.hwnd();
+    if unsafe { IsWindowVisible(panel) } == 0 || unsafe { IsWindowVisible(view) } == 0 {
+        return;
+    }
+    let mut widget = RECT::default();
+    unsafe {
+        GetWindowRect(panel, &mut widget);
+        MapWindowPoints(
+            std::ptr::null_mut(),
+            view,
+            &mut widget as *mut RECT as *mut POINT,
+            2,
+        );
+    }
+    let send = |message: u32, wparam: usize, lparam: isize| unsafe {
+        SendMessageW(view, message, wparam, lparam)
+    };
+    let left = send(SCI_POINTXFROMPOSITION, 0, found.start as isize) as i32;
+    let right = send(SCI_POINTXFROMPOSITION, 0, found.end as isize) as i32;
+    let top = send(SCI_POINTYFROMPOSITION, 0, found.start as isize) as i32;
+    let line = send(SCI_LINEFROMPOSITION, found.start, 0) as usize;
+    let height = (send(SCI_TEXTHEIGHT, line, 0) as i32).max(1);
+    let covered = left.max(right) > widget.left
+        && left.min(right) < widget.right
+        && top < widget.bottom
+        && top + height > widget.top;
+    if covered {
+        let lines = (widget.bottom - top + height - 1) / height;
+        send(SCI_LINESCROLL, 0, -(lines as isize));
+    }
 }
 
 fn set_find_no_match(hwnd: HWND, no_match: bool) {
@@ -403,8 +483,23 @@ pub(crate) fn replace_current(hwnd: HWND) {
         && let Some(text) =
             find_bar::replacement_for(&editor, &query, &replacement, options, selection.clone())
     {
-        let _ = editor.replace_target(selection, &text);
+        let replaced = editor.replace_target(selection, &text);
         if !identity.is_live_for(hwnd) {
+            return;
+        }
+        // The next match is searched for after the inserted text, never inside it: replacing
+        // "bb" with "{bb}" twice must reach the second "bb", not the one just inserted.
+        if let Ok(replaced) = replaced {
+            let _ = editor.set_selection(replaced.end..replaced.end);
+            select_match(
+                hwnd,
+                &identity,
+                &editor,
+                &query,
+                options,
+                replaced.end,
+                find_bar::SearchDirection::Forward,
+            );
             return;
         }
     }

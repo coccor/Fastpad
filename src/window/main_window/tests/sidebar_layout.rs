@@ -174,8 +174,9 @@ fn the_sidebar_takes_the_left_edge_and_everything_else_starts_right_of_it() {
 
     execute_command(window.hwnd, CommandId::Find);
     let find = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
-    assert_eq!(left_of(find, window.hwnd), left);
-    assert_eq!(client_size(find).0, width - left);
+    // The find widget floats at the editor's right, clear of the sidebar.
+    assert!(left_of(find, window.hwnd) > left);
+    assert!(left_of(find, window.hwnd) + client_size(find).0 < width);
     super::super::close_find_bar(window.hwnd);
 
     execute_command(window.hwnd, CommandId::CommandPalette);
