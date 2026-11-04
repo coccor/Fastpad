@@ -162,7 +162,7 @@ pub(super) fn bar_band_height(hwnd: HWND) -> i32 {
         let find = app
             .find_bar()
             .filter(|bar| bar.is_visible())
-            .map_or(0, |_| find_bar::find_bar_height(dpi));
+            .map_or(0, |bar| find_bar::find_bar_height(dpi, bar.mode()));
         let name = app
             .name_box
             .as_ref()

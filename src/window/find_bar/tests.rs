@@ -7,32 +7,54 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 #[test]
-fn find_fields_center_their_text_and_replace_mode_splits_the_bar_without_overlap() {
-    // Break caught: field text stuck to the top of its box, or a replacement field that
-    // overlaps the query field or runs past the bar.
+fn find_fields_center_their_text_and_replace_mode_adds_a_second_row_below() {
+    // Break caught: field text stuck to the top of its box, a replacement field beside the query
+    // field instead of under it (VS Code's layout), or a Replace row that overflows the widget.
     use super::{FindBarMode, bar_layout, find_bar_height};
     for dpi in [96, 144] {
-        let height = find_bar_height(dpi);
-        let layout = bar_layout(800, dpi, 16, FindBarMode::Find);
+        let width = 460 * dpi as i32 / 96;
+        let height = find_bar_height(dpi, FindBarMode::Find);
+        let layout = bar_layout(width, dpi, 16, FindBarMode::Find, 0);
         let (query, replace, close) = (layout.query, layout.replace, layout.close);
         assert!(replace.is_none());
-        // Break caught: a close button overlapping the field or hanging off the bar.
-        assert!(query.field.right < close.left && close.right < 800);
-        assert_eq!(close.right - close.left, close.bottom - close.top);
-        assert!(query.field.top > 0 && query.field.bottom < height - 1);
+        assert!(layout.replace_one.is_none() && layout.replace_all.is_none());
+        // Break caught: a close button overlapping the field or hanging off the widget.
+        assert!(query.field.right < close.left && close.right < width);
+        assert!(query.field.top > 0 && query.field.bottom < height);
         let field_middle = (query.field.top + query.field.bottom) / 2;
         let edit_middle = (query.edit.top + query.edit.bottom) / 2;
         assert!((field_middle - edit_middle).abs() <= 1);
+        // The chevron runs down the left edge, left of the fields.
+        assert!(layout.chevron.right <= query.field.left);
+        assert!(layout.chevron.left >= 0 && layout.chevron.bottom <= height);
 
-        let layout = bar_layout(800, dpi, 16, FindBarMode::Replace);
+        let replace_height = find_bar_height(dpi, FindBarMode::Replace);
+        assert!(replace_height > height);
+        let layout = bar_layout(width, dpi, 16, FindBarMode::Replace, 0);
         let (query, replace) = (layout.query, layout.replace.unwrap());
-        assert!(query.field.right < replace.field.left);
-        assert!(replace.field.right < layout.close.left);
-        assert_eq!(
-            query.field.right - query.field.left,
-            replace.field.right - replace.field.left
-        );
+        assert!(query.field.bottom < replace.field.top, "{dpi}: second row");
+        assert!(replace.field.bottom < replace_height);
+        assert_eq!(query.field.left, replace.field.left);
+        assert_eq!(query.field.right, replace.field.right);
+        let (one, all) = (layout.replace_one.unwrap(), layout.replace_all.unwrap());
+        assert!(replace.field.right < one.left && one.right <= all.left);
+        assert!(all.right < width);
+        assert_eq!(one.top, replace.field.top);
+        assert!(layout.chevron.bottom > replace.field.top, "spans both rows");
     }
+}
+
+#[test]
+fn the_widget_keeps_its_width_and_narrows_only_for_a_small_editor() {
+    use super::find_bar_width;
+    assert_eq!(find_bar_width(2000, 96), 460);
+    assert_eq!(find_bar_width(400, 96), 392);
+    assert_eq!(
+        find_bar_width(100, 96),
+        260,
+        "never narrower than the minimum"
+    );
+    assert_eq!(find_bar_width(3000, 144), 690);
 }
 
 #[test]
@@ -58,7 +80,7 @@ fn the_find_bar_and_its_fields_hold_the_body_text_at_every_text_size() {
             DeleteObject(font);
             (
                 scale_text(FIELD_HEIGHT_AT_96_DPI, 96),
-                find_bar_height(96),
+                find_bar_height(96, super::FindBarMode::Find),
                 metrics.tmHeight,
             )
         };
@@ -251,7 +273,7 @@ fn the_query_field_leaves_room_for_the_three_toggles() {
     use crate::window::option_toggles::toggle_rects;
     for dpi in [96, 144] {
         for mode in [FindBarMode::Find, FindBarMode::Replace] {
-            let query = bar_layout(800, dpi, 16, mode).query;
+            let query = bar_layout(800, dpi, 16, mode, 0).query;
             let rects = toggle_rects(query.field, dpi);
             assert!(query.edit.right <= rects[0].left, "{dpi} {mode:?}");
             assert!(rects[2].right <= query.field.right, "{dpi} {mode:?}");
@@ -273,25 +295,26 @@ fn next_editor_match_with_an_empty_query_never_calls_scintilla() {
 }
 
 #[test]
-fn the_counter_and_nav_buttons_fit_between_the_text_toggles_and_close_button() {
-    // Break caught: typed text running under the counter, the counter under the toggles, nav
-    // buttons overlapping the fields or each other, or the row not scaling on a 150% monitor.
+fn the_counter_and_nav_buttons_fit_between_the_query_field_and_close_button() {
+    // Break caught: typed text running under the toggles, the counter over the field (VS Code
+    // keeps it outside, right of the field), nav buttons overlapping the counter or each other,
+    // or the row not scaling on a 150% monitor.
     use super::{FindBarMode, bar_layout};
     use crate::window::option_toggles::toggle_rects;
     for dpi in [96, 144] {
+        let width = 460 * dpi as i32 / 96;
         for mode in [FindBarMode::Find, FindBarMode::Replace] {
-            let layout = bar_layout(900, dpi, 16, mode);
+            let layout = bar_layout(width, dpi, 16, mode, 0);
             let rects = toggle_rects(layout.query.field, dpi);
             let label = format!("{dpi} {mode:?}");
-            assert!(layout.query.edit.right <= layout.counter.left, "{label}");
+            assert!(layout.query.edit.right <= rects[0].left, "{label}");
+            assert!(layout.query.field.right < layout.counter.left, "{label}");
             assert!(layout.counter.left < layout.counter.right, "{label}: room");
-            assert!(layout.counter.right <= rects[0].left, "{label}");
             assert_eq!(layout.counter.top, layout.query.field.top);
-            let far_field = layout.replace.map_or(layout.query.field, |r| r.field);
-            assert!(far_field.right < layout.previous.left, "{label}");
+            assert!(layout.counter.right <= layout.previous.left, "{label}");
             assert!(layout.previous.right <= layout.next.left, "{label}");
             assert!(layout.next.right <= layout.close.left, "{label}");
-            assert!(layout.close.right < 900, "{label}");
+            assert!(layout.close.right < width, "{label}");
             for rect in [layout.previous, layout.next] {
                 assert_eq!(
                     rect.bottom - rect.top,
@@ -301,7 +324,7 @@ fn the_counter_and_nav_buttons_fit_between_the_text_toggles_and_close_button() {
             }
         }
     }
-    let narrow = bar_layout(100, 96, 16, FindBarMode::Find);
+    let narrow = bar_layout(100, 96, 16, FindBarMode::Find, 0);
     assert!(
         narrow.counter.right >= narrow.counter.left,
         "never inverted"
@@ -309,15 +332,17 @@ fn the_counter_and_nav_buttons_fit_between_the_text_toggles_and_close_button() {
 }
 
 #[test]
-fn nav_buttons_name_their_keys_in_the_tooltips() {
-    // Break caught: tips that name keys the field doesn't take (Enter is next, Shift+Enter
-    // previous).
-    use super::NavButton;
+fn buttons_name_their_keys_in_the_tooltips() {
+    // Break caught: tips that name keys the fields don't take (in the Find field Enter is next and
+    // Shift+Enter previous; in the Replace field Enter replaces and Shift+Enter replaces all).
+    use super::BarButton;
     assert_eq!(
-        NavButton::Previous.tooltip(),
+        BarButton::Previous.tooltip(),
         "Previous match (Shift+Enter)"
     );
-    assert_eq!(NavButton::Next.tooltip(), "Next match (Enter)");
+    assert_eq!(BarButton::Next.tooltip(), "Next match (Enter)");
+    assert_eq!(BarButton::ReplaceOne.tooltip(), "Replace (Enter)");
+    assert_eq!(BarButton::ReplaceAll.tooltip(), "Replace All (Shift+Enter)");
 }
 
 #[test]
@@ -414,4 +439,24 @@ fn regex_counting_stops_scanning_at_the_limit() {
     assert_eq!(matcher.find_up_to(&text, 1001).len(), 1001);
     assert_eq!(matcher.find_up_to(&text, 0).len(), 0);
     assert_eq!(matcher.find_up_to("1 2", 1001), vec![0..1, 2..3]);
+}
+
+#[test]
+fn the_counter_fits_its_label_so_the_field_reaches_close_to_the_arrows() {
+    // Break caught: a fixed-width counter leaving a wide gap between "1 of 3" and the arrows, or
+    // a long label running under the arrows.
+    use super::{FindBarMode, bar_layout};
+    let short = bar_layout(460, 96, 16, FindBarMode::Find, 30);
+    let long = bar_layout(460, 96, 16, FindBarMode::Find, 80);
+    assert_eq!(short.counter.right, long.counter.right);
+    assert!(short.counter.right <= short.previous.left);
+    assert!(short.previous.left - short.counter.right <= 4);
+    assert!(long.counter.right - long.counter.left >= 80);
+    assert!(
+        short.query.field.right > long.query.field.right,
+        "the field takes the room"
+    );
+    // A short count keeps a minimum, so the field doesn't jump as counts come and go.
+    let none = bar_layout(460, 96, 16, FindBarMode::Find, 0);
+    assert_eq!(none.counter.left, short.counter.left);
 }

@@ -463,12 +463,15 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let toolbar_top = strip_height + band;
     let toolbar_height =
         crate::window::editor_toolbar::layout(hwnd, group, id, toolbar_top, width, dpi);
+    // The find widget takes a band above the editor and pushes it down, as VS Code makes room
+    // for its find widget; the widget box sits at the band's right end.
     let find_top = toolbar_top + toolbar_height;
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let bar = unsafe { app.as_ref() }.group(id)?.find_bar.as_ref()?;
             bar.layout(0, width, find_top, dpi, font);
-            bar.is_visible().then(|| find_bar::find_bar_height(dpi))
+            bar.is_visible()
+                .then(|| find_bar::find_bar_height(dpi, bar.mode()))
         })
         .unwrap_or(0);
     let top = find_top + find_bar_height;

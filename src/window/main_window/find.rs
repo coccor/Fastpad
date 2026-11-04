@@ -139,12 +139,52 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
             .filter(|bar| bar.owns(panel))
             .and_then(|bar| bar.pointer(message, lparam))
     });
+    use find_bar::{BarButton, BarClick};
     match click {
-        Some(find_bar::BarClick::Close) => close_find_bar(hwnd),
-        Some(find_bar::BarClick::Toggle(option)) => toggle_find_option(hwnd, option),
-        Some(find_bar::BarClick::Nav(find_bar::NavButton::Previous)) => find_previous(hwnd),
-        Some(find_bar::BarClick::Nav(find_bar::NavButton::Next)) => find_next(hwnd),
+        Some(BarClick::Toggle(option)) => toggle_find_option(hwnd, option),
+        Some(BarClick::Button(BarButton::Close)) => close_find_bar(hwnd),
+        Some(BarClick::Button(BarButton::Previous)) => find_previous(hwnd),
+        Some(BarClick::Button(BarButton::Next)) => find_next(hwnd),
+        Some(BarClick::Button(BarButton::ToggleReplace)) => toggle_replace_mode(hwnd),
+        Some(BarClick::Button(BarButton::ReplaceOne)) => replace_current(hwnd),
+        Some(BarClick::Button(BarButton::ReplaceAll)) => replace_all_matches(hwnd),
         None => {}
+    }
+}
+
+/// Tab or Shift+Tab in a find field: the focus moves to the other field while the Replace row
+/// shows.
+pub(crate) fn focus_other_find_field(hwnd: HWND) {
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
+    {
+        bar.focus_other_field();
+    }
+}
+
+/// The chevron at the widget's left edge shows or hides the Replace row. Hiding it while the
+/// replacement field has the focus hands the focus to the query field.
+pub(crate) fn toggle_replace_mode(hwnd: HWND) {
+    let refocus = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let bar = unsafe { app.as_mut() }.find_bar_mut()?;
+        let collapsing = bar.mode() == find_bar::FindBarMode::Replace;
+        let refocus = collapsing && bar.replace_focused();
+        bar.set_mode(if collapsing {
+            find_bar::FindBarMode::Find
+        } else {
+            find_bar::FindBarMode::Replace
+        });
+        Some(refocus)
+    });
+    let Some(refocus) = refocus else {
+        return;
+    };
+    layout_editor_and_find_bar(hwnd);
+    if refocus
+        && let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
+    {
+        bar.focus_query();
     }
 }
 
@@ -365,7 +405,7 @@ pub(super) fn select_match(
         return;
     }
     if let Some(found) = found.clone() {
-        let _ = editor.set_selection(found);
+        let _ = editor.set_selection(found.clone());
         editor.scroll_caret_into_view();
     }
     set_find_no_match(hwnd, found.is_none());
@@ -403,8 +443,23 @@ pub(crate) fn replace_current(hwnd: HWND) {
         && let Some(text) =
             find_bar::replacement_for(&editor, &query, &replacement, options, selection.clone())
     {
-        let _ = editor.replace_target(selection, &text);
+        let replaced = editor.replace_target(selection, &text);
         if !identity.is_live_for(hwnd) {
+            return;
+        }
+        // The next match is searched for after the inserted text, never inside it: replacing
+        // "bb" with "{bb}" twice must reach the second "bb", not the one just inserted.
+        if let Ok(replaced) = replaced {
+            let _ = editor.set_selection(replaced.end..replaced.end);
+            select_match(
+                hwnd,
+                &identity,
+                &editor,
+                &query,
+                options,
+                replaced.end,
+                find_bar::SearchDirection::Forward,
+            );
             return;
         }
     }

@@ -99,7 +99,10 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
         editor_top(),
         title_height
             + crate::window::editor_toolbar::row_height(dpi)
-            + super::super::find_bar::find_bar_height(dpi)
+            + super::super::find_bar::find_bar_height(
+                dpi,
+                super::super::find_bar::FindBarMode::Find
+            )
     );
 }
 
@@ -133,7 +136,8 @@ fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_chang
     execute_command(window.hwnd, CommandId::Find);
     let panel = app_mut(window.hwnd).find_bar().unwrap().panel_hwnd();
     assert!(visible(panel));
-    let band = super::super::find_bar::find_bar_height(dpi);
+    let band =
+        super::super::find_bar::find_bar_height(dpi, super::super::find_bar::FindBarMode::Find);
     // The find bar goes under the editor toolbar.
     let toolbar = crate::window::editor_toolbar::row_height(dpi);
     assert_eq!(top_of(panel), (title_height + toolbar, band));
@@ -151,11 +155,18 @@ fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_chang
     assert_eq!(bar.placeholder(bar.query_hwnd()), Some("Find"));
     assert_eq!(bar.placeholder(bar.replace_hwnd()), Some("Replace"));
 
-    // A click released on the close button at the bar's right end closes it.
+    // A click released on the close button at the widget's right end closes it.
     let mut client = RECT::default();
     unsafe { GetClientRect(panel, &mut client) };
     let point = |x: i32, y: i32| ((y as u32) << 16 | (x as u32 & 0xffff)) as super::super::LPARAM;
-    let close_point = point(client.right - band / 2, band / 2);
+    let close = bar
+        .button_rect(crate::window::find_bar::BarButton::Close)
+        .unwrap();
+    assert!(close.right < client.right, "left of the editor's scrollbar");
+    let close_point = point(
+        (close.left + close.right) / 2,
+        (close.top + close.bottom) / 2,
+    );
     super::super::panel_pointer(
         window.hwnd,
         panel,
