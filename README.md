@@ -74,6 +74,12 @@ plus `README.md`, `LICENSE`, `LICENSES.md` and `licenses\`.
 Settings and recovery snapshots live in `%LocalAppData%\FastPad` whichever way you install, so you
 can switch methods without losing them, and uninstalling keeps them.
 
+**Portable mode** keeps them beside `FastPad.exe` instead, for a copy on a USB stick or in a tools
+folder: put an empty file named `portable` (no extension) next to `FastPad.exe`, and FastPad keeps
+its settings, session and recovery snapshots in a `data` folder there. The folder must be
+writable, so don't do this in an installed copy under Program Files. A portable FastPad runs
+separately from an installed one: files opened from either go to its own window.
+
 </details>
 
 > **"Windows protected your PC"?** Current releases aren't code-signed yet, so SmartScreen may warn
@@ -406,7 +412,7 @@ Hand edits keep your comments and other lines; the palette and Settings rewrite 
 ## Command line
 
 ```text
-FastPad.exe [--new-window] [--read-only] [path]
+FastPad.exe [--new-window] [--read-only] [--portable] [path]
 FastPad.exe --capture ["text" | -] [--attach <file>]...
 ```
 
@@ -417,6 +423,8 @@ FastPad.exe --capture ["text" | -] [--attach <file>]...
   changes made to it outside FastPad still show. **File → Read-only** (or *File: Toggle read-only*
   in the command palette) switches any tab either way; the status bar says *Read-only* while it
   is on. A tab with unsaved changes can't be made read-only until they are saved or undone.
+- `--portable` runs this launch in [portable mode](#install-in-10-seconds), as a `portable` file next to
+  `FastPad.exe` does for every launch.
 - `--capture` opens the quick capture box. With text (or `-` to read it from standard input) and
   any `--attach` files, it files them into the inbox with no window and exits: `0` when filed, `1`
   when the write failed, `2` when the request was refused (a missing file, or one over 20 MB). It

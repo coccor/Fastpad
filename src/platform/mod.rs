@@ -13,5 +13,5 @@ pub mod theme;
 pub mod win32;
 
 pub use handles::{OwnedHandle, OwnedModule};
-pub use paths::fastpad_data_dir;
+pub use paths::{enable_portable, fastpad_data_dir, portable_dir};
 pub use win32::{last_error, wide_null};
