@@ -1,0 +1,4 @@
+# rust-lld (shipped with the toolchain) links much faster than link.exe, most of all for the
+# debug-info-heavy dev and test binaries. It also links the release package.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
