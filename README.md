@@ -6,8 +6,8 @@
 
 **The text editor that's ready before you are.**
 
-Rust straight on Win32, with the Scintilla editing engine underneath.
-No Electron, no .NET, no webview: one small native executable that opens the window first and loads everything else behind it.
+A native Windows editor written in Rust on Win32, built on the Scintilla editing engine.
+It shows the window first and loads everything else while you type.
 
 [![Latest release](https://img.shields.io/github/v/release/coccor/FastPad?label=release)](https://github.com/coccor/FastPad/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
