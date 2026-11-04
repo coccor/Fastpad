@@ -71,6 +71,7 @@ pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
             kind: PickerKind::MoveToNotebook,
             items,
             create: None,
+            initial: None,
         },
     );
 }

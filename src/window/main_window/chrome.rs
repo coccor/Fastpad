@@ -394,6 +394,51 @@ pub(super) fn notice_contains(hwnd: HWND, y: i32) -> bool {
     current_status_text(hwnd).is_some() && status_bar_rect(hwnd).is_some_and(|rect| y >= rect.top)
 }
 
+/// The language or encoding shown in the bottom bar at client point (`x`, `y`), which a click
+/// changes. `None` off the bar, for an image tab, and while no tab is open.
+pub(super) fn status_detail_at(
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+) -> Option<crate::window::status::StatusTarget> {
+    if !status_bar_rect(hwnd).is_some_and(|rect| y >= rect.top && y < rect.bottom) {
+        return None;
+    }
+    if crate::window::image_host::active_is_image(hwnd) {
+        return None;
+    }
+    let (language, encoding) = {
+        let app = unsafe { app_ptr(hwnd) }?;
+        let document = unsafe { app.as_ref() }.tabs.active()?;
+        (document.language, document.encoding)
+    };
+    let fonts = title_chrome(hwnd).1;
+    crate::window::titlebar::status_detail_at(
+        hwnd,
+        fonts,
+        x,
+        crate::window::status::language_name(language),
+        crate::window::status::encoding_name(encoding),
+    )
+}
+
+/// Shows the hand over the bar's language and encoding, which open a picker when clicked.
+pub(super) fn set_status_detail_cursor(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, IDC_HAND, LoadCursorW, SetCursor,
+    };
+    let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe {
+        GetCursorPos(&mut point);
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+    }
+    if status_detail_at(hwnd, point.x, point.y).is_none() {
+        return false;
+    }
+    unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND)) };
+    true
+}
+
 /// Repaints just the bottom bar, for caret, selection and language changes.
 pub(crate) fn invalidate_status_bar(hwnd: HWND) {
     if let Some(rect) = status_bar_rect(hwnd) {

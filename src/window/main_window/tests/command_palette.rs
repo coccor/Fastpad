@@ -85,6 +85,7 @@ fn a_picker_lists_its_items_and_enter_reports_the_choice() {
             kind: crate::window::command_palette::PickerKind::RecentFolder,
             items: vec![r"D:\A".into(), r"D:\B".into()],
             create: None,
+            initial: None,
         },
     );
     super::super::move_command_palette_selection(window.hwnd, 1);
@@ -99,6 +100,48 @@ fn a_picker_lists_its_items_and_enter_reports_the_choice() {
     // The palette went back to command mode.
     execute_command(window.hwnd, CommandId::CommandPalette);
     assert!(with_command_palette(window.hwnd, |p| p.picker().is_none()).unwrap());
+}
+
+#[test]
+fn the_status_bar_pickers_start_on_the_current_value_and_save_with_an_encoding() {
+    // Break caught: a language or encoding picker that opens on its first row instead of the
+    // tab's current value or without saying what it picks, or an encoding pick that does not
+    // save the file in that encoding there and then (Save with Encoding).
+    use crate::file::encoding::Encoding;
+    use crate::window::command_palette::{
+        ENCODING_PLACEHOLDER, LANGUAGE_PLACEHOLDER, PickerChoice,
+    };
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("save-with-encoding");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let path = scratch.note("a.txt", "hi");
+    super::super::open_path(window.hwnd, &path).unwrap();
+    pump_posted_messages(window.hwnd);
+    let selected = || with_command_palette(window.hwnd, |p| p.selected_choice()).flatten();
+    let placeholder = || with_command_palette(window.hwnd, |p| p.placeholder()).flatten();
+
+    super::super::open_language_picker(window.hwnd);
+    let plain_text = crate::languages::LANGUAGES
+        .iter()
+        .position(|spec| spec.language == crate::document::Language::PlainText)
+        .unwrap();
+    assert_eq!(selected(), Some(PickerChoice::Item(plain_text)));
+    assert_eq!(placeholder(), Some(LANGUAGE_PLACEHOLDER));
+    super::super::close_command_palette(window.hwnd, true);
+
+    super::super::open_encoding_picker(window.hwnd);
+    assert_eq!(selected(), Some(PickerChoice::Item(0)), "UTF-8, as read");
+    assert_eq!(placeholder(), Some(ENCODING_PLACEHOLDER));
+    super::super::move_command_palette_selection(window.hwnd, 2);
+    super::super::run_command_palette_selection(window.hwnd);
+    let document = app_mut(window.hwnd).tabs.active().unwrap();
+    assert_eq!(document.encoding, Encoding::Utf16Le);
+    assert!(!document.dirty, "saved at once");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        [0xFF, 0xFE, b'h', 0, b'i', 0]
+    );
 }
 
 #[test]
@@ -121,6 +164,7 @@ fn another_picker_opened_over_quick_open_repaints_the_field_without_its_hint() {
             kind: crate::window::command_palette::PickerKind::RecentFolder,
             items: vec![r"D:\A".into()],
             create: None,
+            initial: None,
         },
     );
 

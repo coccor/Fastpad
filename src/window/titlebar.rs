@@ -529,7 +529,7 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
             client.right,
             client.bottom,
         );
-        let margin = scale(10, dpi);
+        let margin = status_margin(dpi);
         let gap = scale(24, dpi);
         let text = Rect::new(
             bar.left + margin,
@@ -583,6 +583,55 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
     unsafe {
         EndPaint(hwnd, &paint);
     }
+}
+
+/// The bottom bar's inset from each side, which its text keeps clear of.
+fn status_margin(dpi: u32) -> i32 {
+    scale(10, dpi)
+}
+
+/// Which of the bottom bar's document details (painted by `paint` as `language`,
+/// `DETAILS_SEPARATOR`, `encoding`) is under client `x`, measured in the bar's font.
+pub(crate) fn status_detail_at(
+    hwnd: HWND,
+    fonts: TitleFontHandles,
+    x: i32,
+    language: &str,
+    encoding: &str,
+) -> Option<crate::window::status::StatusTarget> {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut client);
+    }
+    let full = format!(
+        "{language}{}{encoding}",
+        crate::window::status::DETAILS_SEPARATOR
+    );
+    let format = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+    let dc = unsafe { windows_sys::Win32::Graphics::Gdi::GetDC(hwnd) };
+    if dc.is_null() {
+        return None;
+    }
+    let (full_width, language_width, encoding_width) = unsafe {
+        let previous = select_font(dc, fonts.text);
+        let widths = (
+            measure_text(dc, &full, format),
+            measure_text(dc, language, format),
+            measure_text(dc, encoding, format),
+        );
+        restore_font(dc, previous);
+        windows_sys::Win32::Graphics::Gdi::ReleaseDC(hwnd, dc);
+        widths
+    };
+    crate::window::status::status_target_at(
+        x,
+        client.right - status_margin(dpi),
+        full_width,
+        language_width,
+        encoding_width,
+        scale(4, dpi),
+    )
 }
 
 /// Fills an editor group's `content` and centers `hint` in it, shown in place of the hidden editor

@@ -345,6 +345,10 @@ pub(crate) enum PickerKind {
     QuickOpen,
     /// Notes: New note from template… (second brain phase 1 spec §9.4).
     Template,
+    /// The active tab's language, from a click on it in the status bar.
+    Language,
+    /// Save with encoding: a click on the status bar's encoding. The pick saves the tab in it.
+    Encoding,
 }
 
 /// The most rows quick open lists (spec §3.3).
@@ -353,6 +357,10 @@ pub(crate) const QUICK_OPEN_ROWS: usize = 50;
 pub(crate) const NO_NOTEBOOK: &str = "No notebook is open";
 /// What quick open's empty field shows (spec §3.1).
 pub(crate) const QUICK_OPEN_PLACEHOLDER: &str = "Go to note by name";
+/// What the language picker's empty field shows.
+pub(crate) const LANGUAGE_PLACEHOLDER: &str = "Select language mode";
+/// What the encoding picker's empty field shows: picking one saves the file in it.
+pub(crate) const ENCODING_PLACEHOLDER: &str = "Select file encoding to save with";
 
 /// A list of runtime items shown in the palette instead of commands.
 #[derive(Clone, Debug)]
@@ -361,6 +369,8 @@ pub(crate) struct Picker {
     pub items: Vec<String>,
     /// When set, a typed name that matches no item exactly is offered as "<create> "<name>"".
     pub create: Option<&'static str>,
+    /// The item selected while the query is empty, such as the current value; else the first.
+    pub initial: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1216,12 +1226,15 @@ impl CommandPalette {
         bold
     }
 
-    /// What the empty query field shows: the quick-open hint, nothing in other modes.
+    /// What the empty query field shows: what quick open and the status bar's pickers choose,
+    /// nothing in other modes.
     pub(crate) fn placeholder(&self) -> Option<&'static str> {
-        self.picker
-            .as_ref()
-            .filter(|picker| picker.kind == PickerKind::QuickOpen)
-            .map(|_| QUICK_OPEN_PLACEHOLDER)
+        match self.picker.as_ref()?.kind {
+            PickerKind::QuickOpen => Some(QUICK_OPEN_PLACEHOLDER),
+            PickerKind::Language => Some(LANGUAGE_PLACEHOLDER),
+            PickerKind::Encoding => Some(ENCODING_PLACEHOLDER),
+            PickerKind::RecentFolder | PickerKind::MoveToNotebook | PickerKind::Template => None,
+        }
     }
 
     /// `WM_PAINT` for the empty query field while it has a placeholder: the hint in the muted

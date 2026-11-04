@@ -324,6 +324,7 @@ pub(crate) fn new_note_from_template(hwnd: HWND, parent: Option<PathBuf>) {
             kind: PickerKind::Template,
             items,
             create: None,
+            initial: None,
         },
     );
 }
