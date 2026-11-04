@@ -240,6 +240,7 @@ pub(crate) fn open_quick_open(hwnd: HWND) {
             kind: command_palette::PickerKind::QuickOpen,
             items: Vec::new(),
             create: None,
+            initial: None,
         }));
         Some(())
     });
@@ -515,7 +516,15 @@ pub(super) fn refilter_command_palette(hwnd: HWND) {
                 None => {
                     if let Some(picker) = palette.picker() {
                         let rows = command_palette::picker_rows(picker, &query);
-                        let selected = (!rows.is_empty()).then_some(0);
+                        // An empty query starts on the picker's current value, if it has one.
+                        let initial = picker.initial.filter(|_| query.trim().is_empty()).and_then(
+                            |initial| {
+                                rows.iter().position(|row| {
+                                    *row == command_palette::PickerRow::Item(initial)
+                                })
+                            },
+                        );
+                        let selected = initial.or((!rows.is_empty()).then_some(0));
                         palette.set_picker_rows(rows, selected);
                     }
                 }

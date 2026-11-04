@@ -239,6 +239,14 @@ pub(super) unsafe extern "system" fn main_window_proc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR if set_sash_cursor(hwnd) => 1,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR
+            if (lparam as u32 & 0xffff)
+                == windows_sys::Win32::UI::WindowsAndMessaging::HTCLIENT
+                && wparam as HWND == hwnd
+                && set_status_detail_cursor(hwnd) =>
+        {
+            1
+        }
         WM_LBUTTONDOWN => {
             let (x, y) = (
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
@@ -321,8 +329,15 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
-            if notice_contains(hwnd, point.y) {
-                dismiss_notifications(hwnd);
+            match status_detail_at(hwnd, point.x, point.y) {
+                Some(crate::window::status::StatusTarget::Language) => {
+                    open_language_picker(hwnd);
+                }
+                Some(crate::window::status::StatusTarget::Encoding) => {
+                    open_encoding_picker(hwnd);
+                }
+                None if notice_contains(hwnd, point.y) => dismiss_notifications(hwnd),
+                None => {}
             }
             0
         }

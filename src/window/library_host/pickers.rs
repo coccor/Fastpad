@@ -23,6 +23,12 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
     LAST_PICK.with(|last| *last.borrow_mut() = Some((kind, choice.clone())));
     match (kind, choice) {
         (PickerKind::Template, PickerChoice::Item(index)) => template_picked(hwnd, index),
+        (PickerKind::Language, PickerChoice::Item(index)) => {
+            crate::window::main_window::language_picked(hwnd, index);
+        }
+        (PickerKind::Encoding, PickerChoice::Item(index)) => {
+            crate::window::main_window::encoding_picked(hwnd, index);
+        }
         (PickerKind::RecentFolder, PickerChoice::Item(index)) => {
             let shown = host(hwnd, |host| std::mem::take(&mut host.shown_recent_folders));
             if let Some(folder) = shown.unwrap_or_default().get(index) {

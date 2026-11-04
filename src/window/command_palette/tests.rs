@@ -341,6 +341,7 @@ fn picker(create: Option<&'static str>) -> Picker {
         kind: PickerKind::RecentFolder,
         items: vec!["idea".into(), "reference".into(), "todo".into()],
         create,
+        initial: None,
     }
 }
 

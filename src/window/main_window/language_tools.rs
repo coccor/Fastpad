@@ -79,6 +79,105 @@ fn set_active_language(hwnd: HWND, language: crate::document::Language) {
     }
 }
 
+/// A click on the status bar's language: every language in a picker, the current one selected.
+pub(crate) fn open_language_picker(hwnd: HWND) {
+    if tab_count(hwnd) == 0 || crate::window::image_host::active_is_image(hwnd) {
+        return;
+    }
+    let current = active_language(hwnd);
+    open_picker(
+        hwnd,
+        command_palette::Picker {
+            kind: command_palette::PickerKind::Language,
+            items: crate::languages::LANGUAGES
+                .iter()
+                .map(|spec| spec.name.to_owned())
+                .collect(),
+            create: None,
+            initial: crate::languages::LANGUAGES
+                .iter()
+                .position(|spec| spec.language == current),
+        },
+    );
+}
+
+/// The language picker's row `index` was chosen: the same as its View → Language command.
+pub(crate) fn language_picked(hwnd: HWND, index: usize) {
+    if let Some(spec) = crate::languages::LANGUAGES.get(index) {
+        apply_language(hwnd, spec.language);
+    }
+}
+
+/// A click on the status bar's encoding: every encoding FastPad saves in, the current one
+/// selected.
+pub(crate) fn open_encoding_picker(hwnd: HWND) {
+    let Some(current) = active_encoding(hwnd) else {
+        return;
+    };
+    if crate::window::image_host::active_is_image(hwnd) {
+        return;
+    }
+    let encodings = crate::window::status::ENCODINGS;
+    open_picker(
+        hwnd,
+        command_palette::Picker {
+            kind: command_palette::PickerKind::Encoding,
+            items: encodings
+                .iter()
+                .map(|&encoding| crate::window::status::encoding_name(encoding).to_owned())
+                .collect(),
+            create: None,
+            initial: encodings.iter().position(|&encoding| encoding == current),
+        },
+    );
+}
+
+/// The encoding picker's row `index` was chosen: Save with encoding. The active tab takes the
+/// encoding and is saved at once, as Ctrl+S would (an untitled tab asks where first). The text is
+/// unchanged, as every encoding FastPad reads holds all of Unicode. A save that fails or is
+/// cancelled leaves the tab modified in the new encoding, for the next save to write.
+pub(crate) fn encoding_picked(hwnd: HWND, index: usize) {
+    let Some(&encoding) = crate::window::status::ENCODINGS.get(index) else {
+        return;
+    };
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let picked = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let tabs = &mut unsafe { app.as_mut() }.tabs;
+        let document = tabs.active_mut()?;
+        if document.is_image() || document.compare.is_some() {
+            return None;
+        }
+        if document.encoding == encoding {
+            return Some(false);
+        }
+        document.encoding = encoding;
+        let id = document.id;
+        // Recorded like an edit: modified, a new generation for recovery, a preview tab kept.
+        Some(tabs.note_background_edit(id))
+    });
+    let Some(strip_changed) = picked else {
+        return;
+    };
+    if strip_changed {
+        invalidate_title_strip(hwnd);
+    }
+    invalidate_status_bar(hwnd);
+    if identity.is_live_for(hwnd) {
+        crate::window::library_host::save_command(hwnd);
+    }
+}
+
+/// The active tab's encoding; `None` while no tab is open.
+fn active_encoding(hwnd: HWND) -> Option<crate::file::encoding::Encoding> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .tabs
+        .active()
+        .map(|document| document.encoding)
+}
+
 /// The active tab's language; plain text while no tab is open.
 pub(crate) fn active_language(hwnd: HWND) -> crate::document::Language {
     unsafe { app_ptr(hwnd) }

@@ -1,7 +1,7 @@
 //! Painted bottom bar: no child HWND. It appears once deferred chrome is built and then stays, so
 //! the first paint keeps the editor at full height. The left side shows the caret position, or the
 //! oldest pending notification while there is one; the right side names the active document's
-//! language and encoding.
+//! language and encoding, each of which opens a picker when clicked.
 
 use crate::document::Language;
 use crate::editor::CaretStatus;
@@ -42,6 +42,49 @@ pub struct ActiveDocumentStatus {
     pub encoding: Encoding,
 }
 
+/// What sits between the language and the encoding on the right of the bar.
+pub const DETAILS_SEPARATOR: &str = "    ";
+
+/// Every encoding FastPad can save in, in the order the encoding picker lists them.
+pub const ENCODINGS: [Encoding; 4] = [
+    Encoding::Utf8,
+    Encoding::Utf8Bom,
+    Encoding::Utf16Le,
+    Encoding::Utf16Be,
+];
+
+/// A clickable part of the bar's document details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusTarget {
+    Language,
+    Encoding,
+}
+
+/// Which detail `x` falls on, for "language SEPARATOR encoding" drawn right-aligned to
+/// `right_edge`. Widths are measured in the bar's font; `slop` widens each span on both sides so
+/// a click just beside the text still counts, without the two spans overlapping.
+pub fn status_target_at(
+    x: i32,
+    right_edge: i32,
+    full_width: i32,
+    language_width: i32,
+    encoding_width: i32,
+    slop: i32,
+) -> Option<StatusTarget> {
+    let encoding_left = right_edge - encoding_width;
+    let language_left = right_edge - full_width;
+    let language_right = language_left + language_width;
+    // Split the gap between the two evenly so slop never makes them overlap.
+    let middle = (language_right + encoding_left) / 2;
+    if x >= (encoding_left - slop).max(middle) && x < right_edge + slop {
+        Some(StatusTarget::Encoding)
+    } else if x >= language_left - slop && x < (language_right + slop).min(middle) {
+        Some(StatusTarget::Language)
+    } else {
+        None
+    }
+}
+
 pub fn status_bar_text(
     notifications: &NotificationCenter,
     active: Option<ActiveDocumentStatus>,
@@ -52,7 +95,7 @@ pub fn status_bar_text(
     let right = active
         .map(|active| {
             format!(
-                "{}    {}",
+                "{}{DETAILS_SEPARATOR}{}",
                 language_name(active.language),
                 encoding_name(active.encoding)
             )
@@ -130,8 +173,8 @@ pub fn encoding_name(encoding: Encoding) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveDocumentStatus, StatusBarText, file_size_text, image_status_bar_text,
-        status_bar_text, status_text,
+        ActiveDocumentStatus, StatusBarText, StatusTarget, file_size_text, image_status_bar_text,
+        status_bar_text, status_target_at, status_text,
     };
     use crate::document::Language;
     use crate::editor::CaretStatus;
@@ -154,6 +197,26 @@ mod tests {
         assert_eq!(at_96, expected);
         assert_eq!(at_96, 50); // 49.5 rounds up
         assert_eq!(at_192, 99);
+    }
+
+    #[test]
+    fn clicks_on_the_language_and_encoding_find_their_detail() {
+        // Break caught: a click on the encoding opening the language picker (or the reverse), or
+        // a click on the empty bar left of the details opening either.
+        // "Markdown____UTF-8" right-aligned to 1000: language 800..880, gap, encoding 950..1000.
+        let at = |x| status_target_at(x, 1000, 200, 80, 50, 4);
+        assert_eq!(at(700), None);
+        assert_eq!(at(797), Some(StatusTarget::Language));
+        assert_eq!(at(840), Some(StatusTarget::Language));
+        assert_eq!(at(883), Some(StatusTarget::Language));
+        assert_eq!(at(900), None);
+        assert_eq!(at(947), Some(StatusTarget::Encoding));
+        assert_eq!(at(999), Some(StatusTarget::Encoding));
+        assert_eq!(at(1004), None);
+        // A gap narrower than the slop is split between the two, never shared.
+        let tight = |x| status_target_at(x, 1000, 132, 80, 50, 10);
+        assert_eq!(tight(949), Some(StatusTarget::Encoding));
+        assert_eq!(tight(948), Some(StatusTarget::Language));
     }
 
     #[test]

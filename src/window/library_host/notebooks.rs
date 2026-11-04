@@ -342,6 +342,7 @@ pub(crate) fn open_recent_folder_picker(hwnd: HWND) {
             kind: PickerKind::RecentFolder,
             items,
             create: None,
+            initial: None,
         },
     );
 }
