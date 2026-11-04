@@ -152,6 +152,16 @@ pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, wparam: WPARA
     }
 }
 
+/// Tab or Shift+Tab in a find field: the focus moves to the other field while the Replace row
+/// shows.
+pub(crate) fn focus_other_find_field(hwnd: HWND) {
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar()
+    {
+        bar.focus_other_field();
+    }
+}
+
 /// The chevron at the widget's left edge shows or hides the Replace row. Hiding it while the
 /// replacement field has the focus hands the focus to the query field.
 pub(crate) fn toggle_replace_mode(hwnd: HWND) {
@@ -397,59 +407,9 @@ pub(super) fn select_match(
     if let Some(found) = found.clone() {
         let _ = editor.set_selection(found.clone());
         editor.scroll_caret_into_view();
-        reveal_past_find_bar(hwnd, editor, found);
     }
     set_find_no_match(hwnd, found.is_none());
     schedule_find_count(hwnd);
-}
-
-/// The find widget floats over the editor's top-right corner, so a match scrolled to the top
-/// line can land under it. Scrolls the editor down by enough lines to bring `found` out from
-/// under the widget; near the top of the document Scintilla stops at the first line.
-fn reveal_past_find_bar(hwnd: HWND, editor: &Editor, found: std::ops::Range<usize>) {
-    use crate::editor::scintilla_constants::{
-        SCI_LINEFROMPOSITION, SCI_LINESCROLL, SCI_POINTXFROMPOSITION, SCI_POINTYFROMPOSITION,
-        SCI_TEXTHEIGHT,
-    };
-    use windows_sys::Win32::Foundation::POINT;
-    use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindowVisible};
-    let Some(panel) = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let bar = unsafe { app.as_ref() }.find_bar()?;
-        bar.is_visible().then(|| bar.panel_hwnd())
-    }) else {
-        return;
-    };
-    let view = editor.hwnd();
-    if unsafe { IsWindowVisible(panel) } == 0 || unsafe { IsWindowVisible(view) } == 0 {
-        return;
-    }
-    let mut widget = RECT::default();
-    unsafe {
-        GetWindowRect(panel, &mut widget);
-        MapWindowPoints(
-            std::ptr::null_mut(),
-            view,
-            &mut widget as *mut RECT as *mut POINT,
-            2,
-        );
-    }
-    let send = |message: u32, wparam: usize, lparam: isize| unsafe {
-        SendMessageW(view, message, wparam, lparam)
-    };
-    let left = send(SCI_POINTXFROMPOSITION, 0, found.start as isize) as i32;
-    let right = send(SCI_POINTXFROMPOSITION, 0, found.end as isize) as i32;
-    let top = send(SCI_POINTYFROMPOSITION, 0, found.start as isize) as i32;
-    let line = send(SCI_LINEFROMPOSITION, found.start, 0) as usize;
-    let height = (send(SCI_TEXTHEIGHT, line, 0) as i32).max(1);
-    let covered = left.max(right) > widget.left
-        && left.min(right) < widget.right
-        && top < widget.bottom
-        && top + height > widget.top;
-    if covered {
-        let lines = (widget.bottom - top + height - 1) / height;
-        send(SCI_LINESCROLL, 0, -(lines as isize));
-    }
 }
 
 fn set_find_no_match(hwnd: HWND, no_match: bool) {

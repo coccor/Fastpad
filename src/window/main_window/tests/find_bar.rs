@@ -541,3 +541,65 @@ fn a_whole_word_regex_skips_longer_words_forward_backward_and_in_replace() {
     super::super::replace_current(window.hwnd);
     assert_eq!(editor.text().unwrap(), "X foobar");
 }
+
+#[test]
+fn the_chevron_adds_the_replace_row_pushing_the_editor_down_and_tab_moves_between_fields() {
+    // Break caught: a chevron that doesn't add the Replace row, a Replace row that covers the
+    // editor's first line instead of pushing it down (VS Code makes room), or Tab in the Find
+    // field not reaching the Replace field (and Shift+Tab not coming back).
+    use crate::window::find_bar::{BarButton, FindBarMode, find_bar_height};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, WM_KEYDOWN, WM_LBUTTONUP};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::Find);
+    let bar = || app_mut(window.hwnd).find_bar().unwrap();
+    let (panel, query, replace) = (bar().panel_hwnd(), bar().query_hwnd(), bar().replace_hwnd());
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+    let rect = |hwnd| {
+        let mut rect = windows_sys::Win32::Foundation::RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut rect) };
+        rect
+    };
+    let editor_below_bar = || rect(editor.hwnd()).top == rect(panel).bottom;
+    assert!(editor_below_bar());
+    assert_eq!(
+        rect(panel).bottom - rect(panel).top,
+        find_bar_height(dpi, FindBarMode::Find)
+    );
+
+    // Tab in Find mode has nowhere to go.
+    unsafe { SetFocus(query) };
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_TAB as usize, 0) };
+    assert_eq!(unsafe { GetFocus() }, query);
+
+    let chevron = bar().button_rect(BarButton::ToggleReplace).unwrap();
+    let center = {
+        let (x, y) = (
+            (chevron.left + chevron.right) / 2,
+            (chevron.top + chevron.bottom) / 2,
+        );
+        ((y as u32) << 16 | (x as u32 & 0xffff)) as super::super::LPARAM
+    };
+    super::super::panel_pointer(window.hwnd, panel, WM_LBUTTONUP, 0, center);
+    assert_eq!(bar().mode(), FindBarMode::Replace);
+    assert_eq!(
+        rect(panel).bottom - rect(panel).top,
+        find_bar_height(dpi, FindBarMode::Replace)
+    );
+    assert!(editor_below_bar(), "the Replace row pushes the editor down");
+    assert!(bar().button_rect(BarButton::ReplaceAll).is_some());
+
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_TAB as usize, 0) };
+    assert_eq!(unsafe { GetFocus() }, replace, "Tab goes to Replace");
+    unsafe { SendMessageW(replace, WM_KEYDOWN, VK_TAB as usize, 0) };
+    assert_eq!(unsafe { GetFocus() }, query, "and back to Find");
+
+    // Collapsing while Replace has the focus hands it back to Find.
+    unsafe { SetFocus(replace) };
+    super::super::panel_pointer(window.hwnd, panel, WM_LBUTTONUP, 0, center);
+    assert_eq!(bar().mode(), FindBarMode::Find);
+    assert_eq!(unsafe { GetFocus() }, query);
+    assert!(editor_below_bar());
+}

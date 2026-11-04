@@ -292,12 +292,12 @@ use crate::window::sidebar_accessibility::{self, AccessibleItem, AccessibleSourc
 use crate::window::tooltip::Tooltip;
 use std::cell::Cell;
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow, SelectObject, SetBkColor, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, GetDC, GetTextExtentPoint32W, HBRUSH, HDC,
+    HFONT, InvalidateRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow,
+    ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Accessibility::ROLE_SYSTEM_TOOLBAR;
 use windows_sys::Win32::UI::Controls::{
@@ -306,7 +306,7 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetFocus, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
-    VK_RETURN, VK_SHIFT,
+    VK_RETURN, VK_SHIFT, VK_TAB,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -332,8 +332,11 @@ const CHEVRON_WIDTH_AT_96_DPI: i32 = 18;
 const CHEVRON_INSET_AT_96_DPI: i32 = 2;
 /// A glyph button's width; its height is the field's.
 const BUTTON_WIDTH_AT_96_DPI: i32 = 26;
-/// The match counter's room right of the query field: "3 of 1000+" fits.
-const COUNTER_WIDTH_AT_96_DPI: i32 = 80;
+/// The match counter right of the query field is as wide as its label plus this each side, and
+/// never narrower than the minimum, so "1 of 3" doesn't leave a gap before the arrows and the
+/// field doesn't jump as short counts come and go.
+const COUNTER_PADDING_AT_96_DPI: i32 = 4;
+const COUNTER_MIN_WIDTH_AT_96_DPI: i32 = 44;
 /// The buttons' glyphs (Segoe MDL2 Assets / Segoe Fluent Icons, as the close button's).
 const GLYPH_PREVIOUS: &str = "\u{E74A}";
 const GLYPH_NEXT: &str = "\u{E74B}";
@@ -349,6 +352,20 @@ pub(crate) fn find_bar_height(dpi: u32, mode: FindBarMode) -> i32 {
     match mode {
         FindBarMode::Find => field + 2 * padding,
         FindBarMode::Replace => 2 * field + 3 * padding,
+    }
+}
+
+/// The widget box inside a band `band_width` pixels wide: at the band's right end, left of the
+/// editor's vertical scrollbar below it, as VS Code's find widget sits.
+fn widget_rect(band_width: i32, dpi: u32, mode: FindBarMode) -> RECT {
+    let scrollbar = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
+    let width = find_bar_width(band_width - scrollbar, dpi);
+    let right = band_width - scrollbar - scale(RIGHT_MARGIN_AT_96_DPI, dpi);
+    RECT {
+        left: right - width,
+        top: 0,
+        right,
+        bottom: find_bar_height(dpi, mode),
     }
 }
 
@@ -456,9 +473,41 @@ impl BarLayout {
         }
         buttons
     }
+
+    /// The same layout moved `dx` pixels right: from widget to band coordinates.
+    fn offset(self, dx: i32) -> Self {
+        let move_rect = |rect: RECT| RECT {
+            left: rect.left + dx,
+            right: rect.right + dx,
+            ..rect
+        };
+        let move_field = |field: FieldLayout| FieldLayout {
+            field: move_rect(field.field),
+            edit: move_rect(field.edit),
+        };
+        Self {
+            chevron: move_rect(self.chevron),
+            query: move_field(self.query),
+            replace: self.replace.map(move_field),
+            counter: move_rect(self.counter),
+            previous: move_rect(self.previous),
+            next: move_rect(self.next),
+            close: move_rect(self.close),
+            replace_one: self.replace_one.map(move_rect),
+            replace_all: self.replace_all.map(move_rect),
+        }
+    }
 }
 
-fn bar_layout(width: i32, dpi: u32, text_height: i32, mode: FindBarMode) -> BarLayout {
+/// The widget's parts across a widget `width` pixels wide. `counter_text` is the width of the
+/// counter's label in pixels (0 with nothing to show).
+fn bar_layout(
+    width: i32,
+    dpi: u32,
+    text_height: i32,
+    mode: FindBarMode,
+    counter_text: i32,
+) -> BarLayout {
     let padding = scale(PADDING_AT_96_DPI, dpi);
     let field_height = scale_text(FIELD_HEIGHT_AT_96_DPI, dpi);
     let button_width = scale(BUTTON_WIDTH_AT_96_DPI, dpi);
@@ -483,8 +532,10 @@ fn bar_layout(width: i32, dpi: u32, text_height: i32, mode: FindBarMode) -> BarL
     let next = button(close.left - button_width, top);
     let previous = button(next.left - button_width, top);
     let counter_right = (previous.left - padding).max(fields_left);
+    let counter_width = (counter_text + 2 * scale(COUNTER_PADDING_AT_96_DPI, dpi))
+        .max(scale(COUNTER_MIN_WIDTH_AT_96_DPI, dpi));
     let counter = RECT {
-        left: (counter_right - scale(COUNTER_WIDTH_AT_96_DPI, dpi)).max(fields_left),
+        left: (counter_right - counter_width).max(fields_left),
         top,
         right: counter_right,
         bottom: top + field_height,
@@ -577,6 +628,11 @@ pub(crate) struct FindBar {
     /// The counter's last count, `None` while there is nothing to show (no query, or not counted
     /// yet). Set by the main window's debounced recount.
     count: Cell<Option<MatchCount>>,
+    /// The fields' and counter's font, its line height, and the shown count label's width in
+    /// it: kept at `layout` and `set_count` so the counter can be sized to its label.
+    font: Cell<HFONT>,
+    text_height: Cell<i32>,
+    counter_text: Cell<i32>,
     /// The toggles' and buttons' tooltip, made the first time the pointer moves over the bar.
     tooltip: Cell<Option<Tooltip>>,
     tooltip_failed: Cell<bool>,
@@ -653,6 +709,9 @@ impl FindBar {
             no_match: Cell::new(false),
             hovered_toggle: Cell::new(None),
             count: Cell::new(None),
+            font: Cell::new(std::ptr::null_mut()),
+            text_height: Cell::new(0),
+            counter_text: Cell::new(0),
             tooltip: Cell::new(None),
             tooltip_failed: Cell::new(false),
             query_value: String::new(),
@@ -831,8 +890,15 @@ impl FindBar {
     }
 
     /// Shows `count` in the counter, or nothing for `None`.
+    /// The counter is sized to its label, so a label of another width moves the fields too.
     pub(crate) fn set_count(&self, count: Option<MatchCount>) {
-        if self.count.replace(count) != count {
+        if self.count.replace(count) == count {
+            return;
+        }
+        let width = count.map_or(0, |count| self.label_width(&count.label()));
+        if self.counter_text.replace(width) != width {
+            self.place_fields();
+        } else {
             let (layout, _) = self.current_layout();
             unsafe {
                 InvalidateRect(self.panel, &layout.counter, 0);
@@ -946,10 +1012,10 @@ impl FindBar {
         }
     }
 
-    /// Floats the bar over the top-right corner of `over` (the editor's rect, in the parent's
-    /// coordinates), left of its vertical scrollbar, on top of its siblings, and places its fields
-    /// inside it.
-    pub(crate) fn layout(&self, over: RECT, dpi: u32, font: HFONT) {
+    /// Places the bar as a band across `width` from `left`, at `top`, above the editor (which
+    /// it pushes down, as VS Code makes room for its find widget), with the widget box at the
+    /// band's right end and its fields inside it.
+    pub(crate) fn layout(&self, left: i32, width: i32, top: i32, dpi: u32, font: HFONT) {
         if !self.visible {
             return;
         }
@@ -959,12 +1025,27 @@ impl FindBar {
                 SendMessageW(self.replace_edit, WM_SETFONT, font as WPARAM, 0);
             }
         }
-        let scrollbar = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
-        let available = over.right - over.left - scrollbar;
-        let width = find_bar_width(available, dpi);
-        let right = over.right - scrollbar - scale(RIGHT_MARGIN_AT_96_DPI, dpi);
-        let BarLayout { query, replace, .. } =
-            bar_layout(width, dpi, text_height(self.query_edit, font), self.mode);
+        self.font.set(font);
+        self.text_height.set(text_height(self.query_edit, font));
+        unsafe {
+            SetWindowPos(
+                self.panel,
+                HWND_TOP,
+                left,
+                top,
+                width.max(0),
+                find_bar_height(dpi, self.mode),
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        self.place_fields();
+    }
+
+    /// Moves the fields' `Edit`s to the current layout, repaints the bar, and keeps the tooltip's
+    /// tools on the toggles and buttons. The tooltip is a control of this thread, and setting its
+    /// tools calls nothing back in the main window.
+    fn place_fields(&self) {
+        let (layout, _) = self.current_layout();
         let move_to = |hwnd, rect: RECT| unsafe {
             MoveWindow(
                 hwnd,
@@ -975,28 +1056,38 @@ impl FindBar {
                 1,
             );
         };
-        move_to(self.query_edit, query.edit);
-        if let Some(replace) = replace {
+        move_to(self.query_edit, layout.query.edit);
+        if let Some(replace) = layout.replace {
             move_to(self.replace_edit, replace.edit);
         }
         unsafe {
-            SetWindowPos(
-                self.panel,
-                HWND_TOP,
-                right - width,
-                over.top,
-                width.max(0),
-                find_bar_height(dpi, self.mode),
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
             InvalidateRect(self.panel, std::ptr::null(), 0);
         }
-        // Keeps the tooltip's tools on the toggles and buttons. The tooltip is a control of this
-        // thread, and setting its tools calls nothing back in the main window.
         if let Some((tooltip, tools)) = self.tooltip_tools() {
             for (index, (rect, text)) in tools.into_iter().enumerate() {
                 tooltip.set_tool(index, rect, text);
             }
+        }
+    }
+
+    /// The width of `label` in the fields' font, 0 before the bar has a font.
+    fn label_width(&self, label: &str) -> i32 {
+        let font = self.font.get();
+        if font.is_null() || label.is_empty() {
+            return 0;
+        }
+        unsafe {
+            let dc = GetDC(self.panel);
+            if dc.is_null() {
+                return 0;
+            }
+            let previous = SelectObject(dc, font as _);
+            let wide = label.encode_utf16().collect::<Vec<_>>();
+            let mut size = SIZE::default();
+            GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size);
+            SelectObject(dc, previous);
+            ReleaseDC(self.panel, dc);
+            size.cx
         }
     }
 
@@ -1005,6 +1096,23 @@ impl FindBar {
             SetFocus(self.query_edit);
             select_all(self.query_edit);
         }
+    }
+
+    /// Moves the focus from the field that has it to the other one, selecting its text, while
+    /// the Replace row shows; does nothing in Find mode.
+    pub(crate) fn focus_other_field(&self) {
+        if self.mode != FindBarMode::Replace {
+            return;
+        }
+        let target = if unsafe { GetFocus() } == self.replace_edit {
+            self.query_edit
+        } else {
+            self.replace_edit
+        };
+        unsafe {
+            SetFocus(target);
+        }
+        select_all(target);
     }
 
     /// Whether the replacement field has the focus.
@@ -1087,7 +1195,15 @@ impl FindBar {
             GetClientRect(self.panel, &mut client);
         }
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(self.panel) }.max(96);
-        (bar_layout(client.right, dpi, 0, self.mode), dpi)
+        let widget = widget_rect(client.right, dpi, self.mode);
+        let layout = bar_layout(
+            widget.right - widget.left,
+            dpi,
+            self.text_height.get(),
+            self.mode,
+            self.counter_text.get(),
+        );
+        (layout.offset(widget.left), dpi)
     }
 
     /// `WM_PAINT` for an empty field: its placeholder in the muted color where typed text starts.
@@ -1153,11 +1269,18 @@ impl FindBar {
         }
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(panel) }.max(96);
         let colors = self.colors;
-        let layout = bar_layout(client.right, dpi, 0, self.mode);
+        let (layout, _) = self.current_layout();
+        let widget = RECT {
+            top: client.top,
+            bottom: client.bottom,
+            ..widget_rect(client.right, dpi, self.mode)
+        };
         let focus = unsafe { GetFocus() };
         unsafe {
-            fill(dc, client, colors.stroke);
-            fill(dc, inset(client, 1), colors.strip_background);
+            // Beside the widget the band is the editor's, so the widget reads as a box on it.
+            fill(dc, client, colors.editor_background);
+            fill(dc, widget, colors.stroke);
+            fill(dc, inset(widget, 1), colors.strip_background);
             for (field, edit) in [
                 (Some(layout.query), self.query_edit),
                 (layout.replace, self.replace_edit),
@@ -1201,7 +1324,7 @@ impl FindBar {
                     layout.counter,
                     text_font,
                     color,
-                    DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+                    DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
                 );
             }
             let hovered = self.hovered_button.get();
@@ -1413,8 +1536,8 @@ unsafe extern "system" fn find_field_proc(
             Rc::decrement_strong_count(raw);
         }
     }
-    // A single-line Edit beeps at Enter and Escape characters; both are handled on key down.
-    if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b) {
+    // A single-line Edit beeps at Enter, Escape and Tab characters; all are handled on key down.
+    if message == WM_CHAR && matches!(wparam as u16, 0x09 | 0x0d | 0x1b) {
         return 0;
     }
     // Alt+C, Alt+W and Alt+R flip the options while a field has the focus (spec §8). The key
@@ -1467,6 +1590,9 @@ unsafe extern "system" fn find_field_proc(
                 }
             } else if key == VK_ESCAPE {
                 super::main_window::close_find_bar(hook.parent);
+            } else if key == VK_TAB {
+                // Tab and Shift+Tab move between the Find and Replace fields.
+                super::main_window::focus_other_find_field(hook.parent);
             }
         }
         // The focused field carries the accent outline the bar paints.

@@ -14,7 +14,7 @@ fn find_fields_center_their_text_and_replace_mode_adds_a_second_row_below() {
     for dpi in [96, 144] {
         let width = 460 * dpi as i32 / 96;
         let height = find_bar_height(dpi, FindBarMode::Find);
-        let layout = bar_layout(width, dpi, 16, FindBarMode::Find);
+        let layout = bar_layout(width, dpi, 16, FindBarMode::Find, 0);
         let (query, replace, close) = (layout.query, layout.replace, layout.close);
         assert!(replace.is_none());
         assert!(layout.replace_one.is_none() && layout.replace_all.is_none());
@@ -30,7 +30,7 @@ fn find_fields_center_their_text_and_replace_mode_adds_a_second_row_below() {
 
         let replace_height = find_bar_height(dpi, FindBarMode::Replace);
         assert!(replace_height > height);
-        let layout = bar_layout(width, dpi, 16, FindBarMode::Replace);
+        let layout = bar_layout(width, dpi, 16, FindBarMode::Replace, 0);
         let (query, replace) = (layout.query, layout.replace.unwrap());
         assert!(query.field.bottom < replace.field.top, "{dpi}: second row");
         assert!(replace.field.bottom < replace_height);
@@ -273,7 +273,7 @@ fn the_query_field_leaves_room_for_the_three_toggles() {
     use crate::window::option_toggles::toggle_rects;
     for dpi in [96, 144] {
         for mode in [FindBarMode::Find, FindBarMode::Replace] {
-            let query = bar_layout(800, dpi, 16, mode).query;
+            let query = bar_layout(800, dpi, 16, mode, 0).query;
             let rects = toggle_rects(query.field, dpi);
             assert!(query.edit.right <= rects[0].left, "{dpi} {mode:?}");
             assert!(rects[2].right <= query.field.right, "{dpi} {mode:?}");
@@ -304,7 +304,7 @@ fn the_counter_and_nav_buttons_fit_between_the_query_field_and_close_button() {
     for dpi in [96, 144] {
         let width = 460 * dpi as i32 / 96;
         for mode in [FindBarMode::Find, FindBarMode::Replace] {
-            let layout = bar_layout(width, dpi, 16, mode);
+            let layout = bar_layout(width, dpi, 16, mode, 0);
             let rects = toggle_rects(layout.query.field, dpi);
             let label = format!("{dpi} {mode:?}");
             assert!(layout.query.edit.right <= rects[0].left, "{label}");
@@ -324,7 +324,7 @@ fn the_counter_and_nav_buttons_fit_between_the_query_field_and_close_button() {
             }
         }
     }
-    let narrow = bar_layout(100, 96, 16, FindBarMode::Find);
+    let narrow = bar_layout(100, 96, 16, FindBarMode::Find, 0);
     assert!(
         narrow.counter.right >= narrow.counter.left,
         "never inverted"
@@ -439,4 +439,24 @@ fn regex_counting_stops_scanning_at_the_limit() {
     assert_eq!(matcher.find_up_to(&text, 1001).len(), 1001);
     assert_eq!(matcher.find_up_to(&text, 0).len(), 0);
     assert_eq!(matcher.find_up_to("1 2", 1001), vec![0..1, 2..3]);
+}
+
+#[test]
+fn the_counter_fits_its_label_so_the_field_reaches_close_to_the_arrows() {
+    // Break caught: a fixed-width counter leaving a wide gap between "1 of 3" and the arrows, or
+    // a long label running under the arrows.
+    use super::{FindBarMode, bar_layout};
+    let short = bar_layout(460, 96, 16, FindBarMode::Find, 30);
+    let long = bar_layout(460, 96, 16, FindBarMode::Find, 80);
+    assert_eq!(short.counter.right, long.counter.right);
+    assert!(short.counter.right <= short.previous.left);
+    assert!(short.previous.left - short.counter.right <= 4);
+    assert!(long.counter.right - long.counter.left >= 80);
+    assert!(
+        short.query.field.right > long.query.field.right,
+        "the field takes the room"
+    );
+    // A short count keeps a minimum, so the field doesn't jump as counts come and go.
+    let none = bar_layout(460, 96, 16, FindBarMode::Find, 0);
+    assert_eq!(none.counter.left, short.counter.left);
 }

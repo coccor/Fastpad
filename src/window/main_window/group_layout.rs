@@ -463,8 +463,18 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let toolbar_top = strip_height + band;
     let toolbar_height =
         crate::window::editor_toolbar::layout(hwnd, group, id, toolbar_top, width, dpi);
-    // The find widget floats over the editor (laid out last, below), so it takes no band.
-    let top = toolbar_top + toolbar_height;
+    // The find widget takes a band above the editor and pushes it down, as VS Code makes room
+    // for its find widget; the widget box sits at the band's right end.
+    let find_top = toolbar_top + toolbar_height;
+    let find_bar_height = unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            let bar = unsafe { app.as_ref() }.group(id)?.find_bar.as_ref()?;
+            bar.layout(0, width, find_top, dpi, font);
+            bar.is_visible()
+                .then(|| find_bar::find_bar_height(dpi, bar.mode()))
+        })
+        .unwrap_or(0);
+    let top = find_top + find_bar_height;
     let area = RECT {
         left: 0,
         top,
@@ -491,15 +501,6 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
         }
     }
     crate::window::live_host::layout(hwnd, id, rects.editor);
-    // Last, so it goes on top of the editor and the views just placed: over the editor's
-    // top-right corner, or the whole content area while no editor shows.
-    if let Some(app) = unsafe { app_ptr(hwnd) }
-        && let Some(bar) = unsafe { app.as_ref() }
-            .group(id)
-            .and_then(|group| group.find_bar.as_ref())
-    {
-        bar.layout(rects.editor.unwrap_or(area), dpi, font);
-    }
     unsafe {
         InvalidateRect(group, std::ptr::null(), 0);
     }

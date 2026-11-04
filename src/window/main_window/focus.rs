@@ -154,11 +154,15 @@ pub(crate) fn ui_fonts(hwnd: HWND) -> crate::window::side_panel::UiFonts {
 }
 
 /// The height of the bands between the strip and the editor (the active group's toolbar, and the
-/// visible name box), or 0. The find widget floats over the editor, so it is no band.
+/// visible find bar or name box), or 0.
 pub(super) fn bar_band_height(hwnd: HWND) -> i32 {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     unsafe { app_ptr(hwnd) }.map_or(0, |app| {
         let app = unsafe { app.as_ref() };
+        let find = app
+            .find_bar()
+            .filter(|bar| bar.is_visible())
+            .map_or(0, |bar| find_bar::find_bar_height(dpi, bar.mode()));
         let name = app
             .name_box
             .as_ref()
@@ -179,7 +183,7 @@ pub(super) fn bar_band_height(hwnd: HWND) -> i32 {
                         != 0
             })
             .map_or(0, |_| crate::window::editor_toolbar::row_height(dpi));
-        name + toolbar
+        find + name + toolbar
     })
 }
 

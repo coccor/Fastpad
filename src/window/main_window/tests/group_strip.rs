@@ -502,10 +502,9 @@ fn clicking_a_tab_in_menu_mode_leaves_menu_mode() {
 }
 
 #[test]
-fn the_command_palette_opens_below_the_tab_strip_over_the_find_widget() {
+fn the_command_palette_opens_below_the_tab_strip_and_the_find_bar() {
     // Break caught: the palette's top still summing only the title and bar heights, so once
-    // the strip moved into the group it covers the strip. The find widget floats over the
-    // editor, and the palette overlays it as it does the editor (as in VS Code).
+    // the strip and find bar moved into the group it covers the strip and the find bar.
     use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
@@ -521,10 +520,10 @@ fn the_command_palette_opens_below_the_tab_strip_over_the_find_widget() {
     let find = rect(app.find_bar().unwrap().panel_hwnd());
     let palette = rect(app.command_palette.as_ref().unwrap().panel_hwnd());
     assert!(
-        palette.top >= find.top,
-        "palette top {} reaches above the editor top {}",
+        palette.top >= find.bottom,
+        "palette top {} overlaps the find bar ending at {}",
         palette.top,
-        find.top
+        find.bottom
     );
 }
 
