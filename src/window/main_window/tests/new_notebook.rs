@@ -5,8 +5,9 @@ use crate::window::modal::{answer_next_new_notebook_dialog, take_last_new_notebo
 
 #[test]
 fn a_new_notebook_is_created_opened_and_left_empty() {
-    // Break caught: the folder not created, the old notebook still open, the new one missing
-    // from recents, or FastPad writing files into a notebook nobody has used yet.
+    // Break caught: the folder not created, the new notebook not added beside the open one (or
+    // replacing it), the new one missing from recents, or FastPad writing files into a notebook
+    // nobody has used yet (multi-root notebooks spec §3.3: opening adds a root).
     let _scintilla = load_native_scintilla();
     let scratch = LibraryScratch::new("new-notebook");
     let window = ProductionWindow::new(make_app());
@@ -30,14 +31,23 @@ fn a_new_notebook_is_created_opened_and_left_empty() {
         "the dialog starts beside the open notebook"
     );
     assert!(created.is_dir());
+    let open: Vec<_> = crate::window::library_host::notebooks(window.hwnd)
+        .into_iter()
+        .map(|(_, folder)| folder)
+        .collect();
+    assert_eq!(open, vec![scratch.folder(), created.clone()]);
     assert_eq!(
         crate::window::library_host::folder(window.hwnd),
-        Some(created.clone())
+        Some(scratch.folder()),
+        "the open notebook stays the default"
     );
     let recent =
         crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
     assert_eq!(recent.folders.first(), Some(&created));
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    let created_id = crate::window::library_host::notebooks(window.hwnd)[1].0;
+    pump_until(window.hwnd, || {
+        crate::window::library_host::with_notebook(window.hwnd, created_id, |_| ()).is_some()
+    });
     assert_eq!(std::fs::read_dir(&created).unwrap().count(), 0);
 }
 
@@ -78,7 +88,9 @@ fn naming_an_existing_folder_asks_before_opening_it() {
         crate::window::library_host::folder(window.hwnd),
         Some(existing)
     );
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
 
 #[test]
@@ -191,5 +203,7 @@ fn the_no_notebook_panel_offers_new_notebook_under_open_notebook() {
         crate::window::library_host::folder(window.hwnd),
         Some(created)
     );
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
