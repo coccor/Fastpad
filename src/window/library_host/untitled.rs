@@ -22,22 +22,24 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     close_name_box(hwnd);
     // The setting change applies either way: the user asked for it. The pending operations are
     // tried twice, and a loss is said out loud.
-    let flushed = (0..2).any(|_| {
-        matches!(
-            try_flush(hwnd, false),
-            Ok(library::Flushed::Wrote | library::Flushed::Nothing)
-        )
-    });
-    let folder = folder(hwnd);
-    let lost = !flushed && with_state(hwnd, |state| !state.pending.is_empty()).unwrap_or(false);
-    if lost && let Some(folder) = folder {
-        push_notice(
-            hwnd,
-            format!(
-                "Metadata changes could not be written to {}",
-                crate::library::store::library_file(&folder).display()
-            ),
-        );
+    for (id, folder) in notebooks(hwnd) {
+        let flushed = (0..2).any(|_| {
+            matches!(
+                try_flush_of(hwnd, id, false),
+                Ok(library::Flushed::Wrote | library::Flushed::Nothing)
+            )
+        });
+        let lost =
+            !flushed && with_notebook(hwnd, id, |state| !state.pending.is_empty()).unwrap_or(false);
+        if lost {
+            push_notice(
+                hwnd,
+                format!(
+                    "Metadata changes could not be written to {}",
+                    crate::library::store::library_file(&folder).display()
+                ),
+            );
+        }
     }
     unsafe {
         KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);

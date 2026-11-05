@@ -312,11 +312,13 @@ pub(crate) fn flush_before_close(hwnd: HWND) {
     }
     // Each notebook has its own retries: one held open does not use up another's.
     for (id, _) in notebooks(hwnd) {
-        for _ in 0..CLOSE_BUSY_RETRIES {
+        for attempt in 0..CLOSE_BUSY_RETRIES {
             if !matches!(try_flush_of(hwnd, id, true), Ok(library::Flushed::Busy)) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            if attempt + 1 < CLOSE_BUSY_RETRIES {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
     flush_reporting(hwnd, true);
@@ -357,29 +359,6 @@ pub(super) fn flush_reporting(hwnd: HWND, wait: bool) {
                 format!("FastPad could not save this notebook's pins: {error}"),
             ),
         }
-    }
-}
-
-/// Writes every open notebook's pending metadata once: `Busy` when any was, else the first
-/// error, else `Wrote` when any was written.
-pub(super) fn try_flush(hwnd: HWND, wait: bool) -> crate::Result<library::Flushed> {
-    unsafe {
-        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
-    }
-    let (mut busy, mut wrote, mut failed) = (false, false, None);
-    for (id, _) in notebooks(hwnd) {
-        match try_flush_of(hwnd, id, wait) {
-            Ok(library::Flushed::Busy) => busy = true,
-            Ok(library::Flushed::Wrote) => wrote = true,
-            Ok(_) => {}
-            Err(error) => failed = failed.or(Some(error)),
-        }
-    }
-    match failed {
-        Some(error) => Err(error),
-        None if busy => Ok(library::Flushed::Busy),
-        None if wrote => Ok(library::Flushed::Wrote),
-        None => Ok(library::Flushed::Nothing),
     }
 }
 

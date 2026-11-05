@@ -1895,3 +1895,37 @@ fn a_watcher_batch_marks_changes_in_its_own_notebook() {
     assert_ne!(load_after, load_before, "B was rescanned");
     assert_eq!(a_load_after, a_load_before, "A was not");
 }
+
+#[test]
+fn turning_notes_mode_off_reports_a_failed_write_for_a_non_default_notebook() {
+    // Break caught: notes mode going off checking only the default notebook pending pins, so
+    // another notebook lost pins are dropped without a word (spec 3.4).
+    use std::os::windows::fs::OpenOptionsExt;
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("modeoff-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("modeoff-b");
+    let b_note = b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let b_id = open_and_load(&window, &b);
+    pin_in(&window, b_id, &b_note);
+    let ini = crate::library::store::library_file(&b.folder());
+    crate::library::store::write(&ini, &crate::library::model::Library::default()).unwrap();
+    let _lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&ini)
+        .unwrap();
+
+    crate::window::library_host::notes_mode_changed(window.hwnd, false);
+
+    let wanted = format!("Metadata changes could not be written to {}", ini.display());
+    assert!(
+        notices(window.hwnd).contains(&wanted),
+        "no notice names B library.ini: {:?}",
+        notices(window.hwnd)
+    );
+}
