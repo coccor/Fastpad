@@ -450,7 +450,7 @@ fn write_notebooks(
         &crate::library::local::RecentFolders {
             folders,
             favorites,
-            closed: false,
+            ..Default::default()
         },
     )
     .unwrap();

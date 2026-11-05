@@ -312,6 +312,10 @@ pub struct RecentFolders {
     pub favorites: Vec<PathBuf>,
     /// `open=none`: the last session closed its notebook, so startup opens none.
     pub closed: bool,
+    /// The `open=` lines: every notebook the last session had open, in sidebar order.
+    pub open: Vec<PathBuf>,
+    /// The `default=` line: the notebook quick capture targets.
+    pub default: Option<PathBuf>,
 }
 
 impl RecentFolders {
@@ -323,6 +327,12 @@ impl RecentFolders {
             match line.split_once('=') {
                 Some(("version", value)) => version = Some(value),
                 Some(("open", "none")) => parsed.closed = true,
+                Some(("open", value)) if !value.is_empty() => {
+                    parsed.open.push(PathBuf::from(value));
+                }
+                Some(("default", value)) if !value.is_empty() => {
+                    parsed.default = Some(PathBuf::from(value));
+                }
                 Some(("folder", value)) if !value.is_empty() => {
                     parsed.folders.push(PathBuf::from(value));
                 }
@@ -336,6 +346,7 @@ impl RecentFolders {
             return Self::default();
         }
         parsed.folders.truncate(FOLDER_LIMIT);
+        parsed.open.truncate(FOLDER_LIMIT);
         parsed.favorites.truncate(FAVORITE_LIMIT);
         parsed
     }
@@ -344,6 +355,12 @@ impl RecentFolders {
         let mut output = format!("version={VERSION}\r\n");
         if self.closed {
             output.push_str("open=none\r\n");
+        }
+        for open in &self.open {
+            output.push_str(&format!("open={}\r\n", open.to_string_lossy()));
+        }
+        if let Some(default) = &self.default {
+            output.push_str(&format!("default={}\r\n", default.to_string_lossy()));
         }
         for folder in &self.folders {
             output.push_str(&format!("folder={}\r\n", folder.to_string_lossy()));
@@ -389,6 +406,47 @@ impl RecentFolders {
 
     pub fn set_closed(&mut self, closed: bool) {
         self.closed = closed;
+    }
+
+    /// Records the notebooks open now and the default one. An empty list records a close
+    /// (`open=none`) and forgets the default. The recent list is left alone.
+    pub fn set_open(&mut self, open: &[PathBuf], default: Option<&Path>) {
+        self.open.clear();
+        for folder in open {
+            let folder = super::normalize_folder(folder);
+            if !self.open.iter().any(|kept| same_path(kept, &folder)) {
+                self.open.push(folder);
+            }
+        }
+        self.open.truncate(FOLDER_LIMIT);
+        self.closed = self.open.is_empty();
+        self.default = if self.closed {
+            None
+        } else {
+            default.map(super::normalize_folder)
+        };
+    }
+
+    /// The notebooks to open at startup and the default one. `open=none` wins; with no `open=`
+    /// lines the most recent folder opens alone; a `default=` that is not open falls back to
+    /// the first root.
+    pub fn startup_roots(&self) -> (Vec<PathBuf>, Option<PathBuf>) {
+        if self.closed {
+            return (Vec::new(), None);
+        }
+        if self.open.is_empty() {
+            return match self.folders.first() {
+                Some(folder) => (vec![folder.clone()], Some(folder.clone())),
+                None => (Vec::new(), None),
+            };
+        }
+        let default = self
+            .default
+            .as_ref()
+            .and_then(|wanted| self.open.iter().find(|root| same_path(root, wanted)))
+            .unwrap_or(&self.open[0])
+            .clone();
+        (self.open.clone(), Some(default))
     }
 }
 
@@ -692,5 +750,57 @@ mod tests {
         std::fs::write(&path, [0xff, 0x00]).unwrap();
         assert_eq!(read(&path, folder), LocalState::new(folder.to_path_buf()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_and_default_round_trip_in_order() {
+        // Break caught: reopening in a different order, or losing the default, after a restart.
+        let work = PathBuf::from(r"D:\Work");
+        let home = PathBuf::from(r"E:\Home");
+        let mut folders = RecentFolders::default();
+        folders.push(PathBuf::from(r"C:\Old"));
+        folders.set_open(&[work.clone(), home.clone()], Some(&home));
+        let encoded = folders.encode();
+        let open = encoded.find("open=D:\\Work\r\nopen=E:\\Home\r\ndefault=E:\\Home\r\n");
+        let folder = encoded.find("folder=");
+        assert!(open.is_some() && open < folder, "{encoded:?}");
+        assert_eq!(RecentFolders::parse(&encoded), folders);
+    }
+
+    #[test]
+    fn a_file_without_open_lines_starts_with_its_most_recent_folder() {
+        // Break caught: an older folders.ini opening nothing after an upgrade.
+        let parsed = RecentFolders::parse("version=1\r\nfolder=D:\\Work\r\nfolder=E:\\Old\r\n");
+        let work = PathBuf::from(r"D:\Work");
+        assert_eq!(parsed.startup_roots(), (vec![work.clone()], Some(work)));
+    }
+
+    #[test]
+    fn open_none_wins_over_open_paths() {
+        // Break caught: a closed session reopening notebooks listed beside open=none.
+        let parsed = RecentFolders::parse("version=1\r\nopen=none\r\nopen=D:\\Work\r\n");
+        assert_eq!(parsed.startup_roots(), (vec![], None));
+    }
+
+    #[test]
+    fn a_default_that_is_not_open_falls_back_to_the_first_root() {
+        // Break caught: a default= naming a closed notebook becoming the capture target.
+        let parsed =
+            RecentFolders::parse("version=1\r\nopen=D:\\A\r\nopen=D:\\B\r\ndefault=D:\\C\r\n");
+        let a = PathBuf::from(r"D:\A");
+        let b = PathBuf::from(r"D:\B");
+        assert_eq!(parsed.startup_roots(), (vec![a.clone(), b], Some(a)));
+    }
+
+    #[test]
+    fn setting_no_open_roots_records_a_close() {
+        // Break caught: closing the last notebook still reopening it at the next start.
+        let mut folders = RecentFolders::default();
+        folders.set_open(&[PathBuf::from(r"D:\Work")], Some(Path::new(r"D:\Work")));
+        folders.set_open(&[], None);
+        assert!(folders.closed);
+        let encoded = folders.encode();
+        assert!(encoded.contains("open=none"));
+        assert!(!encoded.contains("default="));
     }
 }
