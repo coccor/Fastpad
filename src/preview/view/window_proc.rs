@@ -404,7 +404,10 @@ pub(super) unsafe extern "system" fn preview_proc(
             with_state(hwnd, |state| {
                 if state.images.drain() {
                     for layout in &mut state.layouts {
-                        if layout.as_ref().is_some_and(|laid| !laid.images.is_empty()) {
+                        if layout
+                            .as_ref()
+                            .is_some_and(|laid| laid.diagrams || !laid.images.is_empty())
+                        {
                             *layout = None;
                         }
                     }

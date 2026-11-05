@@ -54,6 +54,8 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# Mermaid diagrams in the preview: parsed, laid out and written as SVG in Rust, which resvg draws.
+mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
 resvg = { version = "=0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 
 [features]
@@ -71,7 +73,17 @@ strip = true
 # thread, off the startup path. Measured 2026-11-04 (static CRT, fat LTO): fastpad.exe
 # 8,289,792 -> 7,780,352 bytes; a 256 px icon decode 473 -> 550 us median.
 # Re-list the crates when resvg's dependencies change: `cargo tree -p resvg -e normal`.
+# Mermaid diagrams render on the same worker thread, so the crates only mermaid-rs-renderer pulls
+# in optimize for size as well (`cargo tree -p mermaid-rs-renderer -e normal`). Measured 2026-11-05:
+# adding Mermaid took fastpad.exe 7,780,352 -> 10,130,432 bytes at opt-level 3, 9,390,592 with these.
 [profile.release.package]
+anyhow = { opt-level = "s" }
+core_maths = { opt-level = "s" }
+json5 = { opt-level = "s" }
+libm = { opt-level = "s" }
+mermaid-rs-renderer = { opt-level = "s" }
+ttf-parser = { opt-level = "s" }
+ucd-trie = { opt-level = "s" }
 adler2 = { opt-level = "s" }
 arrayref = { opt-level = "s" }
 arrayvec = { opt-level = "s" }

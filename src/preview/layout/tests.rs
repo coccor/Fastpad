@@ -732,3 +732,128 @@ fn a_wide_tables_runs_scroll_with_the_tables_clip() {
         );
     });
 }
+
+fn with_diagrams<R>(
+    resolve: &dyn Fn(&str) -> DiagramView,
+    test: impl FnOnce(&LayoutContext<'_>) -> R,
+) -> R {
+    let graphics = Graphics::load().unwrap();
+    let window = TestWindow::new(400, 300);
+    let target = create_hwnd_target(&graphics, window.0, 400, 300, 96).unwrap();
+    let colors = preview_colors(Theme::Light, false);
+    let brushes = Brushes::create(&target, &colors).unwrap();
+    let fonts = PreviewFonts::from_settings("Segoe UI", "Consolas", 16, 16);
+    let details = HashMap::new();
+    let context = LayoutContext::new(
+        &graphics, &brushes, &fonts, None, &no_images, false, &details,
+    )
+    .unwrap()
+    .with_diagrams(resolve);
+    test(&context)
+}
+
+const MERMAID: &str = "```mermaid\nflowchart LR\n  A --> B\n```\n";
+
+fn diagram_key() -> DiagramKey {
+    let colors = preview_colors(Theme::Light, false);
+    DiagramKey::new(
+        "flowchart LR\n  A --> B\n",
+        &crate::preview::mermaid::DiagramStyle::new(colors, "Segoe UI", 16.0),
+    )
+}
+
+fn texts(block: &LaidBlock) -> Vec<(ColorRole, Option<u32>)> {
+    flatten(&block.ops)
+        .into_iter()
+        .filter_map(|op| match op {
+            DrawOp::Text { role, run, .. } => Some((*role, *run)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_ready_mermaid_block_draws_its_diagram_centred_over_its_hidden_source() {
+    let ready = |source: &str| {
+        assert_eq!(source, "flowchart LR\n  A --> B");
+        DiagramView::Ready {
+            key: diagram_key(),
+            width: 200.0,
+            height: 100.0,
+            error: None,
+        }
+    };
+    with_diagrams(&ready, |context| {
+        let block = laid(context, MERMAID, 400.0);
+        assert!(block.diagrams);
+        assert_eq!(block.images.len(), 1);
+        let slot = &block.images[0];
+        assert_eq!(slot.diagram, Some(diagram_key()));
+        assert_eq!(slot.path, None);
+        assert_eq!((slot.rect.left, slot.rect.width()), (100.0, 200.0));
+        assert_eq!(slot.rect.height(), 100.0);
+        // One run, as `selection::text_runs` reports for a code block, drawn by the image only.
+        assert_eq!(block.runs.len(), 1);
+        assert_eq!(block.runs[0].clip, Some(slot.rect));
+        assert!(texts(&block).is_empty());
+        assert!(block.ops.iter().any(|op| matches!(
+            op,
+            DrawOp::Image {
+                slot: 0,
+                run: Some(0)
+            }
+        )));
+        assert!(block.height > 100.0);
+        // A diagram wider than the pane scales down to fit.
+        let narrow = laid(context, MERMAID, 100.0);
+        assert_eq!(narrow.images[0].rect.width(), 100.0);
+        assert_eq!(narrow.images[0].rect.height(), 50.0);
+    });
+}
+
+#[test]
+fn a_mermaid_block_is_code_until_its_diagram_is_ready_and_says_why_it_failed() {
+    let pending = |_: &str| DiagramView::Pending;
+    let code = with_diagrams(&pending, |context| {
+        let block = laid(context, MERMAID, 400.0);
+        assert!(block.diagrams && block.images.is_empty());
+        assert_eq!(texts(&block), vec![(ColorRole::Text, Some(0))]);
+        block.height
+    });
+    let failed = |_: &str| DiagramView::Failed("unexpected token".to_owned());
+    with_diagrams(&failed, |context| {
+        let block = laid(context, MERMAID, 400.0);
+        // The reason is decoration above the code, which stays the only run.
+        assert_eq!(
+            texts(&block),
+            vec![(ColorRole::Muted, None), (ColorRole::Text, Some(0))]
+        );
+        assert_eq!(block.runs.len(), 1);
+        assert!(block.height > code);
+    });
+    let stale = |_: &str| DiagramView::Ready {
+        key: diagram_key(),
+        width: 200.0,
+        height: 100.0,
+        error: Some("unexpected token".to_owned()),
+    };
+    with_diagrams(&stale, |context| {
+        let block = laid(context, MERMAID, 400.0);
+        assert_eq!(texts(&block), vec![(ColorRole::Muted, None)]);
+        assert_eq!(block.images.len(), 1);
+        assert!(block.images[0].rect.top > 0.0);
+    });
+}
+
+#[test]
+fn without_a_resolver_mermaid_blocks_are_code_and_other_languages_always_are() {
+    with_context(&no_images, None, |context| {
+        let block = laid(context, MERMAID, 400.0);
+        assert!(!block.diagrams && block.images.is_empty());
+    });
+    let ready = |_: &str| -> DiagramView { panic!("only mermaid blocks resolve") };
+    with_diagrams(&ready, |context| {
+        let block = laid(context, "```rust\nfn main() {}\n```\n", 400.0);
+        assert!(!block.diagrams);
+    });
+}

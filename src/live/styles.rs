@@ -8,11 +8,12 @@
 //! its formatting: a heading keeps its size, bold stays bold, code keeps its font (phase 3
 //! review). Only the margin and the block decorations give way to the source.
 
-use super::blocks::LiveDocument;
+use super::blocks::{LiveDocument, MermaidBlock};
 use super::offsets::Show;
 use super::spans::{Align, Body, Container, LineBlock, Span, SpanKind};
 use super::text::LiveText;
 use crate::preview::incremental::SourceText;
+use crate::preview::mermaid::DiagramKey;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -95,6 +96,18 @@ pub enum BodyStyle {
         dest: String,
         alt: Range<usize>,
         size: (Option<u32>, Option<u32>),
+    },
+    /// A Mermaid block's opening fence while its block is rendered: the diagram of `source`, the
+    /// lines between the fences. Its text is hidden.
+    Diagram {
+        source: Rc<str>,
+    },
+    /// A rendered Mermaid block's other lines: hidden, and no height, under its diagram.
+    Collapsed,
+    /// A Mermaid block's opening fence when its source cannot be drawn: the reason, in place of
+    /// the fence, over the block's code.
+    DiagramError {
+        message: Rc<str>,
     },
 }
 
@@ -462,6 +475,35 @@ pub fn no_images(_: &str) -> ImageInfo {
     ImageInfo::Unavailable
 }
 
+/// What the view knows about the diagram of a Mermaid block's source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiagramInfo {
+    /// Rendered: its natural size in DIPs.
+    Ready { key: DiagramKey, size: (u32, u32) },
+    /// Not rendered yet; the view asks for it when the block is on screen.
+    Pending(DiagramKey),
+    /// The source cannot be drawn: why, in one line.
+    Failed(String),
+    /// Diagrams are not drawn here: the block stays code.
+    Unavailable,
+}
+
+/// What a line's pictures show: image lines' images and Mermaid blocks' diagrams.
+pub trait LinePictures {
+    fn image(&self, dest: &str) -> ImageInfo;
+
+    fn diagram(&self, _source: &str) -> DiagramInfo {
+        DiagramInfo::Unavailable
+    }
+}
+
+/// An image resolver alone: diagrams stay code.
+impl<F: Fn(&str) -> ImageInfo> LinePictures for F {
+    fn image(&self, dest: &str) -> ImageInfo {
+        self(dest)
+    }
+}
+
 /// What `dest` (an image line's destination) shows as, for a document in `document_dir`.
 /// Remote, `#`, UNC and device destinations are `Unavailable` without asking `size` or `failed`
 /// anything, so they never reach the disk or the network; a local path is `Ready` once `size`
@@ -501,14 +543,19 @@ pub trait StyledLines: LiveText {
     fn image(&self, _dest: &str) -> ImageInfo {
         ImageInfo::Unavailable
     }
+
+    /// What the opening fence of a Mermaid block whose source is `source` shows.
+    fn diagram(&self, _source: &str) -> DiagramInfo {
+        DiagramInfo::Unavailable
+    }
 }
 
-/// The document text, its spans, the revealed lines and the images it can show.
+/// The document text, its spans, the revealed lines and the pictures it can show.
 pub struct Styled<'a, T: LiveText> {
     pub text: &'a T,
     pub document: &'a LiveDocument,
     pub revealed: Range<usize>,
-    pub images: &'a dyn Fn(&str) -> ImageInfo,
+    pub images: &'a dyn LinePictures,
 }
 
 impl<T: LiveText> LiveText for Styled<'_, T> {
@@ -554,7 +601,15 @@ impl<T: LiveText + SourceText> StyledLines for Styled<'_, T> {
         let bytes = self.text.line_start(line)..self.text.line_end(line);
         let spans = self.document.spans_in(self.text, bytes.clone());
         let block = self.document.line_block(self.text, bytes.clone());
-        line_style(&spans, block.as_ref(), bytes, self.revealed.contains(&line))
+        let revealed = self.revealed.contains(&line);
+        let style = line_style(&spans, block.as_ref(), bytes.clone(), revealed);
+        if revealed || !matches!(style.block.body, BodyStyle::Code { .. }) {
+            return style;
+        }
+        match self.document.mermaid_block(self.text, bytes.clone()) {
+            Some(mermaid) => diagram_style(style, &mermaid, bytes, self.images),
+            None => style,
+        }
     }
 
     fn rendered_style(&self, line: usize) -> LineStyle {
@@ -573,7 +628,45 @@ impl<T: LiveText + SourceText> StyledLines for Styled<'_, T> {
     }
 
     fn image(&self, dest: &str) -> ImageInfo {
-        (self.images)(dest)
+        self.images.image(dest)
+    }
+
+    fn diagram(&self, source: &str) -> DiagramInfo {
+        self.images.diagram(source)
+    }
+}
+
+/// A rendered line of the Mermaid block `mermaid`, styled `style` as code: its opening fence
+/// shows the diagram (or why it cannot be drawn) and its other lines collapse under it, unless
+/// the source fails, when the block stays code.
+fn diagram_style(
+    style: LineStyle,
+    mermaid: &MermaidBlock,
+    bytes: Range<usize>,
+    pictures: &dyn LinePictures,
+) -> LineStyle {
+    let opening = bytes.start == mermaid.first;
+    let body = match pictures.diagram(&mermaid.source) {
+        DiagramInfo::Unavailable => return style,
+        DiagramInfo::Failed(_) if !opening => return style,
+        DiagramInfo::Failed(message) => BodyStyle::DiagramError {
+            message: Rc::from(message),
+        },
+        DiagramInfo::Ready { .. } | DiagramInfo::Pending(_) if opening => BodyStyle::Diagram {
+            source: Rc::from(mermaid.source.as_str()),
+        },
+        DiagramInfo::Ready { .. } | DiagramInfo::Pending(_) => BodyStyle::Collapsed,
+    };
+    let len = bytes.end - bytes.start;
+    LineStyle {
+        revealed: false,
+        heading: None,
+        pieces: pieces_of(len, vec![(0..len, Show::Hidden)]),
+        runs: Vec::new(),
+        block: BlockStyle {
+            containers: style.block.containers,
+            body,
+        },
     }
 }
 

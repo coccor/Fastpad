@@ -25,6 +25,17 @@ pub struct LiveDocument {
     updates: usize,
 }
 
+/// A fenced Mermaid code block, as `LiveDocument::mermaid_block` finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MermaidBlock {
+    /// The absolute start of its opening fence's line.
+    pub first: usize,
+    /// The absolute start of its last line: the closing fence's, or the last code line's.
+    pub last: usize,
+    /// The diagram source: the lines between the fences, without their containers' prefixes.
+    pub source: String,
+}
+
 /// The end of a YAML front matter block (`---` … `---` or `...` lines at the very start),
 /// excluding the closing line's terminator, or 0.
 fn front_matter(source: &(impl SourceText + ?Sized)) -> usize {
@@ -261,6 +272,79 @@ impl LiveDocument {
             }
             .shifted(delta),
         )
+    }
+
+    /// The fenced Mermaid code block (```` ```mermaid ````) holding the line whose bytes (line
+    /// ending excluded) are `line`, or `None` when the line is in no such block.
+    pub fn mermaid_block(
+        &self,
+        source: &(impl SourceText + ?Sized),
+        line: Range<usize>,
+    ) -> Option<MermaidBlock> {
+        let (index, start) = self
+            .blocks_in(line.start..line.end.max(line.start + 1))
+            .into_iter()
+            .next()?;
+        let spans = self.block_spans(source, index);
+        let lines = &spans.lines;
+        let here = lines
+            .binary_search_by_key(&line.start.saturating_sub(start), |block| block.start)
+            .ok()?;
+        // Back over code lines to the opening fence. A closing fence is `Fence { info: None }`
+        // and only ever the line itself: before it, any fence closes an earlier block.
+        let mut opening = here;
+        if matches!(lines[here].body, Body::Fence { info: None }) {
+            opening = opening.checked_sub(1)?;
+        }
+        while matches!(lines[opening].body, Body::Code) {
+            opening = opening.checked_sub(1)?;
+        }
+        let Body::Fence { info: Some(info) } = &lines[opening].body else {
+            return None;
+        };
+        let fence_start = start + lines[opening].start;
+        let language = source.slice(fence_start + info.start..fence_start + info.end);
+        if !language
+            .split_whitespace()
+            .next()
+            .is_some_and(crate::preview::mermaid::is_mermaid)
+        {
+            return None;
+        }
+        // Forward over the code lines to the closing fence, or the block's end.
+        let mut last = opening;
+        while lines
+            .get(last + 1)
+            .is_some_and(|block| matches!(block.body, Body::Code))
+        {
+            last += 1;
+        }
+        let content_end = last;
+        if lines
+            .get(last + 1)
+            .is_some_and(|block| matches!(block.body, Body::Fence { info: None }))
+        {
+            last += 1;
+        }
+        if here > last {
+            return None;
+        }
+        let block_end = self.index.blocks[index].end;
+        let mut text = String::new();
+        for at in opening + 1..=content_end {
+            let line_start = start + lines[at].start;
+            let end = lines
+                .get(at + 1)
+                .map_or(block_end, |next| start + next.start);
+            let body = source.slice(line_start + lines[at].prefix.end.min(end - line_start)..end);
+            text.push_str(body.trim_end_matches(['\r', '\n']));
+            text.push('\n');
+        }
+        Some(MermaidBlock {
+            first: fence_start,
+            last: start + lines[last].start,
+            source: text,
+        })
     }
 
     /// The bytes of the top-level block holding `at` (the front matter counts as one), or `None`
@@ -710,5 +794,74 @@ mod tests {
             edit_at(&mut text, &mut doc, at, removed, insert);
             assert_matches_full_parse(&text, &doc);
         }
+    }
+
+    /// The Mermaid block of each line of `text`, as (first line, last line, source).
+    fn mermaid_blocks(text: &str) -> Vec<Option<(usize, usize, String)>> {
+        let doc = LiveDocument::parse(text);
+        let line_of_byte = |at: usize| text[..at].matches('\n').count();
+        line_ranges(text, 0..text.len())
+            .into_iter()
+            .map(|line| {
+                doc.mermaid_block(&StrSource(text), line).map(|block| {
+                    (
+                        line_of_byte(block.first),
+                        line_of_byte(block.last),
+                        block.source,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_line_of_a_mermaid_fence_finds_its_block_and_source() {
+        let text = "intro\n\n```mermaid\ngraph LR\n  A --> B\n```\nafter\n";
+        let block = Some((2, 5, "graph LR\n  A --> B\n".to_owned()));
+        assert_eq!(
+            mermaid_blocks(text),
+            vec![
+                None,
+                None,
+                block.clone(),
+                block.clone(),
+                block.clone(),
+                block,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn other_languages_unclosed_and_back_to_back_fences_are_told_apart() {
+        // Break caught: a fence without info right after a Mermaid block's closing fence looked
+        // like that block's closing fence.
+        let text = "```mermaid\nA\n```\n```\nB\n```\n";
+        let first = Some((0, 2, "A\n".to_owned()));
+        assert_eq!(
+            mermaid_blocks(text),
+            vec![first.clone(), first.clone(), first, None, None, None]
+        );
+        assert!(
+            mermaid_blocks("```rust\nfn main() {}\n```\n")
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(mermaid_blocks("    graph LR\n").iter().all(Option::is_none));
+        // Unclosed: it runs to the end of the document.
+        let open = Some((0, 2, "graph TD\nA-->B\n".to_owned()));
+        assert_eq!(
+            mermaid_blocks("```Mermaid\ngraph TD\nA-->B\n"),
+            vec![open.clone(), open.clone(), open]
+        );
+    }
+
+    #[test]
+    fn a_mermaid_block_in_a_list_item_drops_the_item_indent_from_its_source() {
+        let text = "- item\n\n  ```mermaid\n  graph LR\n    A --> B\n  ```\n";
+        let blocks = mermaid_blocks(text);
+        assert_eq!(blocks[0], None);
+        assert_eq!(blocks[2], Some((2, 5, "graph LR\n  A --> B\n".to_owned())));
+        assert_eq!(blocks[5], blocks[2]);
     }
 }

@@ -48,7 +48,7 @@ impl ColorRole {
     ];
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct PreviewColors {
     pub background: u32,
     pub text: u32,

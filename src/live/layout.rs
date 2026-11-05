@@ -18,11 +18,14 @@ use crate::live::lines::LineCache;
 use crate::live::motion::{LineGeometry, Row};
 use crate::live::offsets::OffsetMap;
 use crate::live::spans::{Container, Marker};
-use crate::live::styles::{BodyStyle, Effect, ImageInfo, LineStyle, Paint, StyledLines, effects};
+use crate::live::styles::{
+    BodyStyle, DiagramInfo, Effect, ImageInfo, LineStyle, Paint, StyledLines, effects,
+};
 use crate::preview::dwrite::{Graphics, hresult_error, range_rects};
 use crate::preview::heights::HeightIndex;
 use crate::preview::inline_object::inline_box;
 use crate::preview::layout::{CODE_SCALE, HEADING_SCALE};
+use crate::preview::mermaid::DiagramKey;
 use crate::preview::render::RectF;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -123,6 +126,11 @@ pub enum Decoration {
     },
     /// A decoded image, drawn scaled into `rect`.
     Image { rect: RectF, path: PathBuf },
+    /// A rendered Mermaid diagram, drawn scaled into `rect`.
+    Diagram { rect: RectF, key: DiagramKey },
+    /// Dimmed prose text, leading-aligned in `rect` on its first row: a Mermaid block's
+    /// placeholder or error.
+    Label { rect: RectF, text: String },
 }
 
 /// One laid-out source line.
@@ -278,6 +286,19 @@ impl LiveLayout {
         .map_err(hresult_error)?;
         unsafe { layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING) }
             .map_err(hresult_error)?;
+        Ok(layout)
+    }
+
+    /// `text` on one row in the prose font, leading-aligned: a `Decoration::Label`.
+    pub fn note_layout(&self, text: &str, width: f32) -> Result<IDWriteTextLayout> {
+        let wide = text.encode_utf16().collect::<Vec<_>>();
+        let layout = unsafe {
+            self.graphics
+                .dwrite
+                .CreateTextLayout(&wide, &self.format, width.max(1.0), f32::MAX)
+        }
+        .map_err(hresult_error)?;
+        unsafe { layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP) }.map_err(hresult_error)?;
         Ok(layout)
     }
 
@@ -466,7 +487,7 @@ impl LiveLayout {
                     let (laid, measured) = self.counts.get();
                     self.counts.set((laid, measured + 1));
                 }
-                let laid = self.lay_out(&source, style, None, Table::Measure)?;
+                let laid = self.lay_out(&source, style, None, None, Table::Measure)?;
                 tables::measure_row(&laid.layout, &laid.offsets)?.into()
             } else {
                 // The delimiter row: no cells.
@@ -486,13 +507,17 @@ impl LiveLayout {
     }
 
     /// Drops the layout of every laid-out image line, whether it showed its picture or its alt
-    /// text: a decode finished. Returns the lines dropped.
+    /// text, and of every rendered Mermaid block's lines: a decode or a diagram finished. Returns
+    /// the lines dropped.
     pub fn drop_image_lines(&mut self) -> Vec<usize> {
         let dropped = (0..self.lines.len())
             .filter(|&line| {
-                self.lines
-                    .get(line)
-                    .is_some_and(|laid| matches!(laid.style.block.body, BodyStyle::Image { .. }))
+                self.lines.get(line).is_some_and(|laid| {
+                    matches!(
+                        laid.style.block.body,
+                        BodyStyle::Image { .. } | BodyStyle::Diagram { .. } | BodyStyle::Collapsed
+                    )
+                })
             })
             .collect::<Vec<_>>();
         for &line in &dropped {
@@ -655,7 +680,7 @@ impl LiveLayout {
                 columns: &columns,
                 cells: &cells,
             };
-            return self.lay_out(&source, style, None, table);
+            return self.lay_out(&source, style, None, None, table);
         }
         let image = match &style.block.body {
             BodyStyle::Image { dest, .. } => match text.image(dest) {
@@ -664,7 +689,14 @@ impl LiveLayout {
             },
             _ => None,
         };
-        self.lay_out(&source, style, image, Table::No)
+        let diagram = match &style.block.body {
+            BodyStyle::Diagram { source } => match text.diagram(source) {
+                DiagramInfo::Ready { key, size } => Some((key, size)),
+                _ => None,
+            },
+            _ => None,
+        };
+        self.lay_out(&source, style, image, diagram, Table::No)
     }
 
     /// The indent of a line inside `containers`, and where each container's margin starts.
@@ -679,12 +711,14 @@ impl LiveLayout {
     }
 
     /// Lays out `line` as `style` says; `image` is an image line's decoded picture (its file and
-    /// natural size), without which the line shows its alt text.
+    /// natural size), without which the line shows its alt text, and `diagram` a Mermaid block's
+    /// rendered diagram (its natural size in DIPs), without which it shows a placeholder.
     fn lay_out(
         &self,
         line: &str,
         style: LineStyle,
         image: Option<(PathBuf, (u32, u32))>,
+        diagram: Option<(DiagramKey, (u32, u32))>,
         table: Table<'_>,
     ) -> Result<LineLayout> {
         let mut shown = if image.is_none() && matches!(style.block.body, BodyStyle::Image { .. }) {
@@ -880,6 +914,43 @@ impl LiveLayout {
                         path,
                     });
                 }
+            }
+            BodyStyle::Diagram { .. } => {
+                let pad = em * 0.25;
+                match diagram {
+                    Some((key, (natural_width, natural_height))) => {
+                        // Natural DIPs at the view's font size already: no zoom on top.
+                        let (natural_width, natural_height) = (
+                            (natural_width as f32).max(1.0),
+                            (natural_height as f32).max(1.0),
+                        );
+                        let room = text_width.max(1.0);
+                        let width = natural_width.min(room);
+                        let image_height = natural_height * width / natural_width;
+                        let left = indent + (room - width) / 2.0;
+                        height = image_height + 2.0 * pad;
+                        decorations.push(Decoration::Diagram {
+                            rect: RectF::new(left, pad, left + width, pad + image_height),
+                            key,
+                        });
+                    }
+                    // Rendering: a moment, on the worker thread.
+                    None => decorations.push(Decoration::Label {
+                        rect: RectF::new(indent, 0.0, f32::MAX, height),
+                        text: "Mermaid diagram".to_owned(),
+                    }),
+                }
+            }
+            BodyStyle::Collapsed => height = 0.0,
+            BodyStyle::DiagramError { message } => {
+                decorations.push(Decoration::Fill {
+                    rect: RectF::new(indent, 0.0, f32::MAX, height),
+                    paint: Paint::CodeBackground,
+                });
+                decorations.push(Decoration::Label {
+                    rect: RectF::new(indent + em * 0.5, 0.0, f32::MAX, height),
+                    text: format!("Mermaid diagram error: {message}"),
+                });
             }
             BodyStyle::Text | BodyStyle::TableRow { .. } => {}
         }

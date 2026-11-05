@@ -20,7 +20,8 @@ text is in `LICENSE`.
 ## Rust crates
 
 FastPad depends directly on windows-sys 0.61.2, serde_json 1.0.151, pulldown-cmark 0.13.4, regex
-1.13.1, windows 0.62.2, windows-numerics 0.3.1, and resvg 0.48.1. The complete locked dependency
+1.13.1, windows 0.62.2, windows-numerics 0.3.1, resvg 0.48.1, and mermaid-rs-renderer 0.3.1. The
+complete locked dependency
 closure, with the license expressions reported by `cargo metadata --locked`, is:
 
 | Crate | Version | License | Role |
@@ -28,7 +29,7 @@ closure, with the license expressions reported by `cargo metadata --locked`, is:
 | `windows-sys` | 0.61.2 | MIT OR Apache-2.0 | Win32 bindings (linked) |
 | `windows-link` | 0.2.1 | MIT OR Apache-2.0 | Import linking for `windows-sys` (linked) |
 | `serde_json` | 1.0.151 | MIT OR Apache-2.0 | Explicit JSON commands (linked) |
-| `serde` | 1.0.229 | MIT OR Apache-2.0 | Locked but not linked (no normal dependency edge for this target) |
+| `serde` | 1.0.229 | MIT OR Apache-2.0 | `mermaid-rs-renderer` dependency (linked) |
 | `serde_core` | 1.0.229 | MIT OR Apache-2.0 | `serde_json` dependency (linked) |
 | `itoa` | 1.0.18 | MIT OR Apache-2.0 | `serde_json` dependency (linked) |
 | `memchr` | 2.8.3 | Unlicense OR MIT | `serde_json`, `regex`, and `resvg` dependency (linked) |
@@ -114,6 +115,16 @@ closure, with the license expressions reported by `cargo metadata --locked`, is:
 | `zlib-rs` | 0.6.8 | Zlib | `resvg` dependency (linked) |
 | `zune-core` | 0.5.3 | MIT OR Apache-2.0 OR Zlib | `resvg` dependency (linked) |
 | `zune-jpeg` | 0.5.15 | MIT OR Apache-2.0 OR Zlib | `resvg` dependency (linked) |
+| `mermaid-rs-renderer` | 0.3.1 | MIT | Mermaid diagrams in the preview (linked) |
+| `anyhow` | 1.0.104 | MIT OR Apache-2.0 | `mermaid-rs-renderer` dependency (linked) |
+| `fontdb` | 0.23.0 | MIT | `mermaid-rs-renderer` dependency (linked) |
+| `ttf-parser` | 0.25.1 | MIT OR Apache-2.0 | `mermaid-rs-renderer` dependency (linked) |
+| `core_maths` | 0.1.1 | MIT | `mermaid-rs-renderer` dependency (linked) |
+| `libm` | 0.2.16 | MIT | `mermaid-rs-renderer` dependency (linked) |
+| `json5` | 1.3.7 | MIT | `mermaid-rs-renderer` dependency (linked) |
+| `ucd-trie` | 0.1.7 | MIT OR Apache-2.0 | `mermaid-rs-renderer` dependency (linked) |
+| `thiserror` | 2.0.21 | MIT OR Apache-2.0 | `mermaid-rs-renderer` dependency (linked) |
+| `thiserror-impl` | 2.0.21 | MIT OR Apache-2.0 | Build-time procedural macro |
 
 FastPad uses these crates under the MIT license option where a choice is offered; `unicode-ident`
 additionally carries the Unicode-3.0 license for its Unicode data tables. Without an MIT option,
