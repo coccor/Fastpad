@@ -31,6 +31,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 pub fn run(options: LaunchOptions) -> Result<i32> {
+    // Before anything reads settings, the session or recovery files.
+    crate::platform::enable_portable(options.portable);
     // `--capture` forwards, or files on its own with at most the capture box: nothing else of
     // FastPad starts (second brain phase 1 spec §10.1).
     if let crate::launch::LaunchRequest::Capture(capture) = options.request {
@@ -41,7 +43,7 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
     let instance_mutex = if options.new_window {
         None
     } else {
-        match crate::ipc::client::claim_or_forward(&options.request) {
+        match crate::ipc::client::claim_or_forward(&options.request, options.read_only) {
             InstanceClaim::Primary(mutex) => Some(mutex),
             InstanceClaim::Forwarded => return Ok(0),
             InstanceClaim::Independent => None,

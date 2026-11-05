@@ -67,6 +67,7 @@ pub(crate) fn compare_with_disk(hwnd: HWND) {
                 |name| name.to_string_lossy().into_owned(),
             );
             document.compare = Some(format!("{name} (on disk)"));
+            document.read_only = true;
         }
         tabs.refresh_views();
     }

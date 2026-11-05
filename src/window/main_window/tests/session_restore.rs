@@ -217,6 +217,7 @@ fn session_restore_reopens_files_and_unsaved_text_in_order() {
                 caret: 3,
                 anchor: 1,
                 first_line: 0,
+                read_only: false,
             },
             SessionEntry::new(SessionSource::File(notes.clone())),
             SessionEntry::new(SessionSource::Snapshot(scratch_id)),

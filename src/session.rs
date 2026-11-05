@@ -8,7 +8,9 @@
 //! `group=<number>|active=<zero-based entry index>` line followed by that group's tabs in strip
 //! order, one `file=<caret>|<anchor>|<first visible line>|<path>` or
 //! `snapshot=<caret>|<anchor>|<first visible line>|<recovery id as 32 hex digits>` each. The
-//! target is always the last field, so a path containing `|` still parses. The split tree is
+//! target is always the last field, so a path containing `|` still parses. A file opened
+//! read-only is written as `view=` in place of `file=`, with the same fields; a FastPad that
+//! predates read-only mode skips the line as an unknown key. The split tree is
 //! `row(<child>:<ratio>,...)`, `column(...)`, or a bare group number.
 //!
 //! Version 1 (0.2.0) had no groups: `active=<index>` and the entry lines. It is read as one group.
@@ -33,6 +35,8 @@ pub struct SessionEntry {
     pub caret: usize,
     pub anchor: usize,
     pub first_line: usize,
+    /// A file tab open for viewing only: written as `view=`.
+    pub read_only: bool,
 }
 
 impl SessionEntry {
@@ -42,6 +46,7 @@ impl SessionEntry {
             caret: 0,
             anchor: 0,
             first_line: 0,
+            read_only: false,
         }
     }
 }
@@ -114,7 +119,10 @@ impl Session {
             ));
             for entry in &group.entries {
                 let (key, target) = match &entry.source {
-                    SessionSource::File(path) => ("file", path.to_string_lossy().into_owned()),
+                    SessionSource::File(path) => (
+                        if entry.read_only { "view" } else { "file" },
+                        path.to_string_lossy().into_owned(),
+                    ),
                     SessionSource::Snapshot(id) => ("snapshot", format!("{:032x}", id.0)),
                 };
                 output.push_str(&format!(
@@ -156,7 +164,7 @@ impl Session {
                     }
                     None => in_group = false,
                 },
-                "file" | "snapshot" => {
+                "file" | "view" | "snapshot" => {
                     if let Some(entry) = parse_entry(key, value) {
                         match groups.last_mut() {
                             Some(group) if in_group => group.entries.push(entry),
@@ -401,7 +409,7 @@ fn parse_entry(key: &str, value: &str) -> Option<SessionEntry> {
     let anchor = fields.next()?.parse().ok()?;
     let first_line = fields.next()?.parse().ok()?;
     let target = fields.next()?;
-    let source = if key == "file" {
+    let source = if key == "file" || key == "view" {
         if target.is_empty() {
             return None;
         }
@@ -419,6 +427,7 @@ fn parse_entry(key: &str, value: &str) -> Option<SessionEntry> {
         caret,
         anchor,
         first_line,
+        read_only: key == "view",
     })
 }
 
@@ -610,6 +619,7 @@ mod tests {
                         caret: 12,
                         anchor: 4,
                         first_line: 3,
+                        read_only: false,
                     }],
                 },
                 SessionGroup {
@@ -636,6 +646,16 @@ mod tests {
             )
         );
         assert_eq!(Session::parse(&text), Some(sample()));
+    }
+
+    #[test]
+    fn a_read_only_file_round_trips_as_a_view_line() {
+        // Break caught: a tab opened with `--read-only` coming back editable after a restart.
+        let mut session = sample();
+        session.groups[2].entries[0].read_only = true;
+        let text = session.encode();
+        assert!(text.contains("group=3|active=0\r\nview=0|0|0|C:\\x.md\r\n"));
+        assert_eq!(Session::parse(&text), Some(session));
     }
 
     #[test]
@@ -728,6 +748,7 @@ mod tests {
                 caret: 1,
                 anchor: 2,
                 first_line: 3,
+                read_only: false,
             }]
         );
     }

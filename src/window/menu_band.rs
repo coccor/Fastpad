@@ -17,6 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 /// Headings in dropdown order; `&` marks each mnemonic, as in a native menu bar.
 pub(crate) const MENU_TITLES: [&str; 5] = ["&File", "&Edit", "&Search", "&View", "&Help"];
 /// The index of the View heading, whose dropdown holds the Markdown preview commands.
+pub(crate) const FILE_MENU_INDEX: usize = 0;
 pub(crate) const VIEW_MENU_INDEX: usize = 3;
 /// The index of the Help heading, whose dropdown holds About.
 pub(crate) const HELP_MENU_INDEX: usize = 4;

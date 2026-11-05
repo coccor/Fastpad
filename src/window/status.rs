@@ -40,7 +40,12 @@ pub struct ActiveDocumentStatus {
     pub caret: CaretStatus,
     pub language: Language,
     pub encoding: Encoding,
+    /// The tab is open for viewing only; the bar says so after the caret.
+    pub read_only: bool,
 }
+
+/// What the bar shows after the caret of a read-only tab.
+pub const READ_ONLY_LABEL: &str = "Read-only";
 
 /// What sits between the language and the encoding on the right of the bar.
 pub const DETAILS_SEPARATOR: &str = "    ";
@@ -90,7 +95,16 @@ pub fn status_bar_text(
     active: Option<ActiveDocumentStatus>,
 ) -> StatusBarText {
     let left = status_text(notifications)
-        .or_else(|| active.map(|active| caret_text(active.caret)))
+        .or_else(|| {
+            active.map(|active| {
+                let caret = caret_text(active.caret);
+                if active.read_only {
+                    format!("{caret}{DETAILS_SEPARATOR}{READ_ONLY_LABEL}")
+                } else {
+                    caret
+                }
+            })
+        })
         .unwrap_or_default();
     let right = active
         .map(|active| {
@@ -269,6 +283,7 @@ mod tests {
             },
             language: Language::Markdown,
             encoding: Encoding::Utf8Bom,
+            read_only: false,
         };
         assert_eq!(
             status_bar_text(&center, Some(active)),
@@ -288,6 +303,15 @@ mod tests {
         assert_eq!(
             status_bar_text(&center, Some(selecting)).left,
             "Ln 12, Col 5 (8 selected)"
+        );
+
+        let viewing = ActiveDocumentStatus {
+            read_only: true,
+            ..active
+        };
+        assert_eq!(
+            status_bar_text(&center, Some(viewing)).left,
+            "Ln 12, Col 5    Read-only"
         );
 
         center.push("disk full");

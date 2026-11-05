@@ -133,6 +133,9 @@ pub(super) fn open_menu(hwnd: HWND, mut index: usize) {
             menus::set_sidebar_enabled(menu, notes_mode_enabled(hwnd));
             menus::set_checked_language(menu, active_language(hwnd));
         }
+        if index == crate::window::menu_band::FILE_MENU_INDEX {
+            menus::set_read_only_checked(menu, active_is_read_only(hwnd));
+        }
         menus::set_text_commands_enabled(menu, !crate::window::image_host::active_is_image(hwnd));
         set_menu_mode(
             hwnd,
