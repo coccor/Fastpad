@@ -421,6 +421,8 @@ fn notices(main: &TestMain) -> Vec<String> {
 
 /// Drives a Save/Save As command and immediately cancels the native dialog.
 fn cancel_save_dialog(owner: HWND, command: CommandId) {
+    // This helper deliberately drives the real Save As dialog; other tests must queue an answer.
+    let _real_dialogs = window::allow_real_dialogs();
     let pid = std::process::id();
     let driver = std::thread::spawn(move || {
         let dialog = wait_dialog(pid);
