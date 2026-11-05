@@ -12,20 +12,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 /// The open notebook's autosave switch, or `None` while no notebook is open or its state is still
 /// loading. The Settings dialog greys its row out then (settings dialog spec §3.2).
 pub(crate) fn notebook_autosave(hwnd: HWND) -> Option<bool> {
-    host(hwnd, |host| {
-        host.state.as_ref().map(|state| state.local.autosave)
-    })
-    .flatten()
+    with_state(hwnd, |state| state.local.autosave)
 }
 
 pub(super) fn folder_autosave(hwnd: HWND) -> bool {
-    host(hwnd, |host| {
-        // Until the folder's state has loaded, its autosave setting is unknown: do not save.
-        host.state
-            .as_ref()
-            .is_some_and(|state| state.local.autosave)
-    })
-    .unwrap_or(false)
+    // Until the folder's state has loaded, its autosave setting is unknown: do not save.
+    with_state(hwnd, |state| state.local.autosave).unwrap_or(false)
 }
 
 /// The active tab's path, if autosave applies to it right now.
@@ -283,9 +275,13 @@ pub(crate) fn document_saved(hwnd: HWND) {
 
 #[cfg(test)]
 pub(crate) fn install_for_test(hwnd: HWND, state: LibraryState) {
+    // As if a load had just landed: the default notebook (opened now if none is) takes it.
     host(hwnd, |host| {
-        host.folder = Some(state.folder.clone());
-        host.generation = host.generation.wrapping_add(1);
+        let id = host.assume_folder(state.folder.clone());
+        let generation = host.fresh_generation();
+        if let Some(slot) = host.slot_mut(id) {
+            slot.generation = generation;
+        }
     });
     install(hwnd, state);
 }

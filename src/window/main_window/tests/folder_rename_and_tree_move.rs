@@ -439,7 +439,7 @@ fn tree_move_a_drop_into_a_folder_deleted_outside_fastpad_says_so_not_that_the_n
         "{notices:?}"
     );
     assert!(
-        app_mut(window.hwnd).library.scanning,
+        app_mut(window.hwnd).library.scanning(),
         "a rescan catches the vanished folder up"
     );
 }

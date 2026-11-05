@@ -112,7 +112,11 @@ fn the_links_view_shows_backlinks_with_their_lines_and_what_the_note_links_to() 
 
 fn index_settled(hwnd: HWND) {
     pump_until(hwnd, || {
-        crate::window::library_host::index_loaded(hwnd) && !app_mut(hwnd).library.index_running
+        crate::window::library_host::index_loaded(hwnd)
+            && !app_mut(hwnd)
+                .library
+                .default_slot()
+                .is_some_and(|slot| slot.index_running)
     });
 }
 
@@ -243,7 +247,12 @@ fn a_note_renamed_outside_fastpad_is_named_and_its_links_can_be_updated() {
         "See [[Roadmap]].\n"
     );
     assert!(
-        app_mut(window.hwnd).library.renamed_outside.is_empty(),
+        app_mut(window.hwnd)
+            .library
+            .default_slot()
+            .unwrap()
+            .renamed_outside
+            .is_empty(),
         "forgotten once handled"
     );
 }

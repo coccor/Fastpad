@@ -254,7 +254,9 @@ fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_ta
         1,
         "open tabs stay open"
     );
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
 
 #[test]
@@ -304,7 +306,7 @@ fn a_failed_flush_keeps_the_current_folder_open() {
         crate::window::library_host::folder(window.hwnd),
         Some(first.folder())
     );
-    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(app_mut(window.hwnd).library.default_state().is_some());
     assert!(
         notices(window.hwnd)
             .iter()
@@ -351,7 +353,9 @@ fn a_recent_folder_pick_opens_the_row_that_was_shown() {
     pump_until(window.hwnd, || {
         crate::window::library_host::folder(window.hwnd) == Some(first.folder())
     });
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
 
 #[test]
@@ -419,12 +423,13 @@ fn the_library_step_loads_the_remembered_folder_on_a_worker_thread() {
         crate::window::library_host::folder(window.hwnd),
         Some(scratch.folder())
     );
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
     assert_eq!(
         app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .notes
             .len(),
@@ -441,7 +446,7 @@ fn with_notes_mode_off_the_library_step_does_nothing() {
     app_mut(window.hwnd).library.data_dir = Some(scratch.data());
     crate::window::library_host::open_library_step(window.hwnd);
     assert_eq!(crate::window::library_host::folder(window.hwnd), None);
-    assert!(!app_mut(window.hwnd).library.scanning);
+    assert!(!app_mut(window.hwnd).library.scanning());
 }
 
 #[test]
@@ -454,11 +459,16 @@ fn a_stale_ready_message_is_dropped_and_writes_are_flushed_on_demand() {
     let _editor = install_test_editor(&window);
     scratch.install(window.hwnd);
     let stale = crate::window::library_host::test_ready_payload(
-        app_mut(window.hwnd).library.generation.wrapping_sub(1),
+        app_mut(window.hwnd)
+            .library
+            .default_slot()
+            .unwrap()
+            .generation
+            .wrapping_sub(1),
         Err("old".into()),
     );
     crate::window::library_host::library_ready(window.hwnd, stale);
-    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(app_mut(window.hwnd).library.default_state().is_some());
     assert!(notices(window.hwnd).iter().all(|n| !n.contains("old")));
 
     crate::window::library_host::with_state(window.hwnd, |state| {

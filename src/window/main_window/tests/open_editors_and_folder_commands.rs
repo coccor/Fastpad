@@ -393,7 +393,7 @@ fn a_folder_renamed_while_a_rescan_runs_keeps_its_new_name_once_the_rescan_lands
     app_mut(window.hwnd).library.data_dir = Some(scratch.data());
     scratch.install(window.hwnd);
     crate::window::library_host::request_rescan(window.hwnd);
-    assert!(app_mut(window.hwnd).library.scanning);
+    assert!(app_mut(window.hwnd).library.scanning());
 
     crate::window::notebook_view::rebuild(window.hwnd);
     crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
@@ -402,7 +402,7 @@ fn a_folder_renamed_while_a_rescan_runs_keeps_its_new_name_once_the_rescan_lands
         window.hwnd,
         windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
     );
-    pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning);
+    pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning());
 
     crate::window::library_host::with_state(window.hwnd, |state| {
         assert!(state.is_folder(std::path::Path::new("Moved")));

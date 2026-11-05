@@ -49,8 +49,7 @@ fn the_index_is_cached_for_the_next_start() {
     pump_until(window.hwnd, || tags_of(window.hwnd, "a.md") == ["alpha"]);
     let local = app_mut(window.hwnd)
         .library
-        .state
-        .as_ref()
+        .default_state()
         .unwrap()
         .local_path
         .clone();

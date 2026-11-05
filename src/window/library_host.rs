@@ -20,6 +20,7 @@ mod note_actions;
 mod notebooks;
 mod pickers;
 mod pins;
+mod slots;
 mod untitled;
 mod watch;
 
@@ -36,6 +37,7 @@ pub(crate) use note_actions::*;
 pub(crate) use notebooks::*;
 pub(crate) use pickers::*;
 pub(crate) use pins::*;
+pub(crate) use slots::*;
 pub(crate) use untitled::*;
 pub(crate) use watch::*;
 
@@ -63,21 +65,24 @@ pub(crate) enum Autosave {
 
 #[derive(Debug)]
 pub(crate) struct LibraryHost {
-    /// The open folder. Set as soon as the step runs, before its state has loaded.
-    pub(crate) folder: Option<PathBuf>,
-    pub(crate) state: Option<LibraryState>,
+    /// The open notebooks, in sidebar order (multi-root notebooks spec §3.1). For now there is
+    /// at most one.
+    pub(crate) notebooks: Vec<NotebookSlot>,
+    /// The notebook capture and the single-notebook commands go to.
+    pub(crate) default_notebook: Option<NotebookId>,
+    /// The last `NotebookId` handed out.
+    next_id: u32,
+    /// The last generation `fresh_generation` handed out.
+    next_generation: u64,
+    /// The generation of a startup load that has no slot yet: the UI thread could not assume a
+    /// folder (a command-line path after a session that closed its notebook), so the worker's
+    /// answer opens one. `None` once it lands or the user moves on.
+    startup_load: Option<u64>,
     /// `%LOCALAPPDATA%\FastPad`, resolved lazily. Under `cfg(test)` it is only ever pre-seeded.
     pub(crate) data_dir: Option<PathBuf>,
-    pub(crate) generation: u64,
-    pub(crate) scanning: bool,
-    pub(crate) rescan_requested: bool,
-    /// The UI thread wrote the local file while a scan ran, possibly with the old scan cache, so
-    /// the merge that follows writes it again.
-    local_written_during_scan: bool,
     pub(crate) inactive_since: Option<Instant>,
     /// IDs for new note records.
     pub(crate) ids: IdSource,
-    notified: Option<PathBuf>,
     /// The folders the open recent-folder picker lists, in its row order.
     shown_recent_folders: Vec<PathBuf>,
     /// `folders.ini` as last read or written, so the sidebar lists recent and favorite notebooks
@@ -94,43 +99,14 @@ pub(crate) struct LibraryHost {
     /// The note an open Move to notebook picker moves, and the notebooks it lists, in row order.
     /// The row after the last is "Browse…".
     pub(crate) shown_move: Option<(PathBuf, Vec<PathBuf>)>,
-    /// The last load of the open notebook failed, so the sidebar offers Retry instead of saying
-    /// "Loading…" forever. Starting a load clears it.
-    pub(crate) load_failed: bool,
     /// Copies into the tree, queued on one worker thread (open editors spec §4.5).
     pub(crate) copy_worker: super::copy_host::CopyWorker,
-    /// Watches the open notebook for outside changes (second brain phase 1 spec §5.1). `None`
-    /// before its first scan, with notes mode off, or after watching failed.
-    pub(crate) watcher: Option<library::watch::Watcher>,
-    /// Bumped whenever a watcher starts or stops: a batch from an older one is dropped.
-    pub(crate) watch_generation: u64,
-    /// Watching this notebook failed: FastPad rescans on activation instead, until the next
-    /// notebook opens.
-    pub(crate) watch_failed: bool,
     /// Files FastPad itself is writing on a worker (replace across notes, copies), by lowercase
     /// path: the watcher's report of them is not an outside change. `None` while the write runs,
     /// then until when a late report is still FastPad's own.
     pub(crate) own_writes: std::collections::HashMap<String, Option<Instant>>,
     /// The Notebook view shows only notes changed outside FastPad ("Notes: Show changed notes").
     pub(crate) changed_only: bool,
-    /// The open notebook's note index (second brain phase 1 spec §6): replaced whole when a build
-    /// lands, so a worker can read the previous one while the UI keeps using it.
-    pub(crate) index: std::sync::Arc<library::index::NoteIndex>,
-    /// Bumped whenever the index is reset: a build for an older notebook is dropped.
-    pub(crate) index_generation: u64,
-    /// The index has loaded for the open notebook (its first build landed).
-    pub(crate) index_loaded: bool,
-    pub(crate) index_running: bool,
-    /// A request arrived while a build ran: one more runs after it.
-    pub(crate) index_again: bool,
-    /// Notes the scans found renamed outside FastPad (relative old and new paths) whose links
-    /// were not updated yet (second brain phase 1 spec §7.6), and whether a notice said so.
-    pub(crate) renamed_outside: Vec<(PathBuf, PathBuf)>,
-    pub(crate) renamed_outside_told: bool,
-    /// The open notebook's `notebook.ini` (second brain phase 1 spec §9.1), and its text as last
-    /// read, so a reload reports bad lines only when the file changed.
-    pub(crate) notebook: library::notebook_ini::NotebookSettings,
-    pub(crate) notebook_text: Option<String>,
     /// The folder an open template picker makes its note in, and the templates it lists.
     pub(crate) shown_templates: Option<(Option<PathBuf>, Vec<PathBuf>)>,
 }
@@ -138,38 +114,23 @@ pub(crate) struct LibraryHost {
 impl LibraryHost {
     pub(crate) fn new(process_start: u64) -> Self {
         Self {
-            folder: None,
-            state: None,
+            notebooks: Vec::new(),
+            default_notebook: None,
+            next_id: 0,
+            next_generation: 0,
+            startup_load: None,
             data_dir: None,
-            generation: 0,
-            scanning: false,
-            rescan_requested: false,
-            local_written_during_scan: false,
             inactive_since: None,
             ids: IdSource::new(process_start, std::process::id()),
-            notified: None,
             shown_recent_folders: Vec::new(),
             folders: None,
             folders_edited: false,
             check_request: 0,
             expansion_revision: 0,
             shown_move: None,
-            load_failed: false,
             copy_worker: super::copy_host::CopyWorker::default(),
-            watcher: None,
-            watch_generation: 0,
-            watch_failed: false,
             own_writes: std::collections::HashMap::new(),
             changed_only: false,
-            index: std::sync::Arc::default(),
-            index_generation: 0,
-            index_loaded: false,
-            index_running: false,
-            index_again: false,
-            renamed_outside: Vec::new(),
-            renamed_outside_told: false,
-            notebook: library::notebook_ini::NotebookSettings::default(),
-            notebook_text: None,
             shown_templates: None,
         }
     }
@@ -207,12 +168,15 @@ fn notes_mode(hwnd: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode)
 }
 
+/// The default notebook's folder (a shim until every caller names its notebook).
 pub(crate) fn folder(hwnd: HWND) -> Option<PathBuf> {
-    host(hwnd, |host| host.folder.clone()).flatten()
+    notebook_folder(hwnd, default_notebook(hwnd)?)
 }
 
+/// Runs `f` on the default notebook's loaded state (a shim until every caller names its
+/// notebook).
 pub(crate) fn with_state<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryState) -> R) -> Option<R> {
-    host(hwnd, |host| host.state.as_mut().map(f)).flatten()
+    with_notebook(hwnd, default_notebook(hwnd)?, f)
 }
 
 /// Runs `f` on the window's copy worker.

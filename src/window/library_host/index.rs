@@ -12,20 +12,39 @@ struct IndexReady {
     index: NoteIndex,
 }
 
-/// The open notebook's index as it stands (empty until the first build lands).
+/// The default notebook's index as it stands (empty until the first build lands).
 pub(crate) fn note_index(hwnd: HWND) -> Arc<NoteIndex> {
-    host(hwnd, |host| Arc::clone(&host.index)).unwrap_or_default()
+    default_notebook(hwnd)
+        .map(|id| note_index_of(hwnd, id))
+        .unwrap_or_default()
 }
 
-/// Whether the open notebook's first index build has landed.
+/// The notebook `id`'s index as it stands (empty until the first build lands).
+pub(crate) fn note_index_of(hwnd: HWND, id: NotebookId) -> Arc<NoteIndex> {
+    slot(hwnd, id, |slot| Arc::clone(&slot.index)).unwrap_or_default()
+}
+
+/// Whether the default notebook's first index build has landed.
 pub(crate) fn index_loaded(hwnd: HWND) -> bool {
-    host(hwnd, |host| host.index_loaded).unwrap_or(false)
+    default_notebook(hwnd).is_some_and(|id| index_loaded_of(hwnd, id))
 }
 
-/// Builds the index from the current note list, reading only the notes whose size or write time
-/// changed. A request while a build runs makes one more run after it.
+/// Whether the notebook `id`'s first index build has landed.
+pub(crate) fn index_loaded_of(hwnd: HWND, id: NotebookId) -> bool {
+    slot(hwnd, id, |slot| slot.index_loaded).unwrap_or(false)
+}
+
+/// Builds the default notebook's index (a shim until every caller names its notebook).
 pub(crate) fn request_index(hwnd: HWND) {
-    let Some(job) = with_state(hwnd, |state| {
+    if let Some(id) = default_notebook(hwnd) {
+        request_index_of(hwnd, id);
+    }
+}
+
+/// Builds the notebook `id`'s index from its current note list, reading only the notes whose
+/// size or write time changed. A request while a build runs makes one more run after it.
+pub(crate) fn request_index_of(hwnd: HWND, id: NotebookId) {
+    let Some(job) = with_notebook(hwnd, id, |state| {
         let listed = state
             .notes
             .iter()
@@ -40,13 +59,13 @@ pub(crate) fn request_index(hwnd: HWND) {
     }) else {
         return;
     };
-    let Some((generation, previous)) = host(hwnd, |host| {
-        if host.index_running {
-            host.index_again = true;
+    let Some((generation, previous)) = slot(hwnd, id, |slot| {
+        if slot.index_running {
+            slot.index_again = true;
             return None;
         }
-        host.index_running = true;
-        Some((host.index_generation, Arc::clone(&host.index)))
+        slot.index_running = true;
+        Some((slot.index_generation, Arc::clone(&slot.index)))
     })
     .flatten() else {
         return;
@@ -97,40 +116,53 @@ pub(crate) fn index_ready(hwnd: HWND, lparam: isize) {
         return;
     }
     let ready = unsafe { Box::from_raw(lparam as *mut IndexReady) };
-    let open = folder(hwnd);
-    let again = host(hwnd, |host| {
-        if host.index_generation != ready.generation {
-            // A reset while it ran also cleared `index_running`: its own build is the one now.
-            return false;
+    // A build for an index since reset (its notebook closed or switched) names no slot. A reset
+    // while it ran also cleared `index_running`: its own build is the one now.
+    let Some(id) = host(hwnd, |host| host.slot_by_index_generation(ready.generation)).flatten()
+    else {
+        return;
+    };
+    let again = slot(hwnd, id, |slot| {
+        slot.index_running = false;
+        if library::model::same_path(&slot.folder, &ready.folder) {
+            slot.index = Arc::new(ready.index);
+            slot.index_loaded = true;
         }
-        host.index_running = false;
-        if open
-            .as_deref()
-            .is_some_and(|open| library::model::same_path(open, &ready.folder))
-        {
-            host.index = Arc::new(ready.index);
-            host.index_loaded = true;
-        }
-        std::mem::take(&mut host.index_again)
+        std::mem::take(&mut slot.index_again)
     })
     .unwrap_or(false);
     outside_renames_check(hwnd);
     crate::window::side_panel::index_changed(hwnd);
     if again {
-        request_index(hwnd);
+        request_index_of(hwnd, id);
     }
 }
 
-/// Forgets the index: the notebook closed or switched, or notes mode went off. A build still
-/// running is dropped when it lands.
+/// Forgets the default notebook's index (a shim until every caller names its notebook).
+#[allow(
+    dead_code,
+    reason = "single-notebook shim; stopping a watcher resets its own slot"
+)]
 pub(crate) fn reset_index(hwnd: HWND) {
+    if let Some(id) = default_notebook(hwnd) {
+        reset_index_of(hwnd, id);
+    }
+}
+
+/// Forgets the notebook `id`'s index: it closed or switched, or notes mode went off. A build
+/// still running is dropped when it lands.
+pub(crate) fn reset_index_of(hwnd: HWND, id: NotebookId) {
     host(hwnd, |host| {
-        host.index = Arc::default();
-        host.index_generation += 1;
-        host.index_loaded = false;
-        host.index_running = false;
-        host.index_again = false;
-        host.renamed_outside.clear();
-        host.renamed_outside_told = false;
+        let generation = host.fresh_generation();
+        let Some(slot) = host.slot_mut(id) else {
+            return;
+        };
+        slot.index = Arc::default();
+        slot.index_generation = generation;
+        slot.index_loaded = false;
+        slot.index_running = false;
+        slot.index_again = false;
+        slot.renamed_outside.clear();
+        slot.renamed_outside_told = false;
     });
 }

@@ -65,7 +65,7 @@ pub(crate) fn open_library_step(hwnd: HWND) {
     let recent = library::local::read_folders(&library::local::folders_file(&data));
     host(hwnd, |host| host.folders = Some(recent.clone()));
     if recent.closed && launch.is_none() {
-        host(hwnd, |host| host.folder = None);
+        host(hwnd, |host| host.startup_load = None);
         crate::window::side_panel::refresh(hwnd);
         return;
     }
@@ -87,12 +87,24 @@ pub(crate) fn open_library_step(hwnd: HWND) {
                 .map(|folder| library::normalize_folder(&folder))
         })
     };
-    host(hwnd, |host| host.folder = assumed);
+    // The assumed notebook gets its slot now; with none assumed, the worker's answer opens one.
+    let target = host(hwnd, |host| match (host.default_notebook, assumed) {
+        (Some(id), Some(assumed)) => {
+            if let Some(slot) = host.slot_mut(id) {
+                slot.folder = assumed;
+            }
+            Some(id)
+        }
+        (_, Some(assumed)) => Some(host.add_notebook(assumed)),
+        (id, None) => id,
+    })
+    .flatten();
     // The sidebar says "Loading…" for the assumed notebook until the worker answers, not "Open a
     // notebook" (a refresh earlier in startup saw no folder). No flattening: nothing is loaded.
     crate::window::side_panel::refresh(hwnd);
     spawn_load(
         hwnd,
+        target,
         Some(Startup {
             launch,
             remembered,
@@ -102,52 +114,78 @@ pub(crate) fn open_library_step(hwnd: HWND) {
     );
 }
 
+/// Loads (or rescans) the default notebook.
 pub(crate) fn start_load(hwnd: HWND) {
-    spawn_load(hwnd, None);
+    if let Some(id) = default_notebook(hwnd) {
+        start_load_of(hwnd, id);
+    }
 }
 
-/// Whether the open notebook failed to load and has no state to show: the sidebar says so and
-/// offers Retry. A rescan that fails keeps the state it had, so this stays false then.
+/// Loads (or rescans) the notebook `id`.
+pub(crate) fn start_load_of(hwnd: HWND, id: NotebookId) {
+    spawn_load(hwnd, Some(id), None);
+}
+
+/// Whether the default notebook failed to load and has no state to show.
 pub(crate) fn load_failed(hwnd: HWND) -> bool {
-    host(hwnd, |host| {
-        host.load_failed && host.folder.is_some() && host.state.is_none()
-    })
-    .unwrap_or(false)
+    default_notebook(hwnd).is_some_and(|id| load_failed_of(hwnd, id))
+}
+
+/// Whether the notebook `id` failed to load and has no state to show: the sidebar says so and
+/// offers Retry. A rescan that fails keeps the state it had, so this stays false then.
+pub(crate) fn load_failed_of(hwnd: HWND, id: NotebookId) -> bool {
+    slot(hwnd, id, |slot| slot.load_failed && slot.state.is_none()).unwrap_or(false)
+}
+
+/// The sidebar's Retry for the default notebook.
+pub(crate) fn retry_load(hwnd: HWND) {
+    if let Some(id) = default_notebook(hwnd) {
+        retry_load_of(hwnd, id);
+    }
 }
 
 /// The sidebar's Retry after a failed load: loads the same notebook again, showing "Loading…"
 /// meanwhile.
-pub(crate) fn retry_load(hwnd: HWND) {
-    if folder(hwnd).is_none() {
+pub(crate) fn retry_load_of(hwnd: HWND, id: NotebookId) {
+    if slot(hwnd, id, |slot| slot.scanning).unwrap_or(true) {
         return;
     }
-    if host(hwnd, |host| host.scanning).unwrap_or(true) {
-        return;
-    }
-    start_load(hwnd);
+    start_load_of(hwnd, id);
     crate::window::side_panel::refresh(hwnd);
 }
 
-pub(super) fn spawn_load(hwnd: HWND, startup: Option<Startup>) {
+/// Starts the load worker for the notebook `id`, or, at startup with no notebook assumed, for
+/// whichever folder the worker settles on.
+pub(super) fn spawn_load(hwnd: HWND, id: Option<NotebookId>, startup: Option<Startup>) {
     let Some(data) = data_dir(hwnd) else {
         return;
     };
     let Some((folder, generation)) = host(hwnd, |host| {
-        let folder = host.folder.clone();
-        if folder.is_none() && startup.is_none() {
-            return None;
+        let is_startup = startup.is_some();
+        if id.is_none_or(|id| host.slot_mut(id).is_none()) {
+            if !is_startup {
+                return None;
+            }
+            let generation = host.fresh_generation();
+            host.startup_load = Some(generation);
+            return Some((None, generation));
         }
-        host.generation = host.generation.wrapping_add(1);
-        host.scanning = true;
-        host.rescan_requested = false;
-        host.load_failed = false;
-        host.local_written_during_scan = false;
+        let generation = host.fresh_generation();
+        if is_startup {
+            host.startup_load = None;
+        }
+        let slot = host.slot_mut(id?)?;
+        slot.generation = generation;
+        slot.scanning = true;
+        slot.rescan_requested = false;
+        slot.load_failed = false;
+        slot.local_written_during_scan = false;
         // The merge re-checks only what FastPad changes in the index from here on.
-        if let Some(state) = host.state.as_mut() {
+        if let Some(state) = slot.state.as_mut() {
             state.touched.clear();
             state.folder_changes.clear();
         }
-        Some((folder, host.generation))
+        Some((Some(slot.folder.clone()), generation))
     })
     .flatten() else {
         return;
@@ -215,17 +253,24 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
         return;
     }
     let loaded = unsafe { Box::from_raw(lparam as *mut Loaded) };
-    let current = host(hwnd, |host| {
-        if host.generation != loaded.generation {
-            return false;
+    // The slot the load was for, or `None` for a startup load that opened no slot yet. A result
+    // for a notebook since closed or reloaded matches neither and is dropped.
+    let Some(mut id) = host(hwnd, |host| {
+        if let Some(id) = host.slot_by_load_generation(loaded.generation) {
+            if let Some(slot) = host.slot_mut(id) {
+                slot.scanning = false;
+            }
+            return Some(Some(id));
         }
-        host.scanning = false;
-        true
+        if host.startup_load == Some(loaded.generation) {
+            host.startup_load = None;
+            return Some(None);
+        }
+        None
     })
-    .unwrap_or(false);
-    if !current {
+    .flatten() else {
         return;
-    }
+    };
     let Loaded {
         folder,
         result,
@@ -248,31 +293,43 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
     if closed {
         // The path on the command line was not a folder, and the last session closed its
         // notebook: none is open.
-        host(hwnd, |host| host.folder = None);
+        if let Some(id) = id {
+            host(hwnd, |host| host.remove_notebook(id));
+        }
         crate::window::main_window::invalidate_title_strip(hwnd);
         crate::window::side_panel::refresh(hwnd);
         return;
     }
     // At startup the worker decides which folder exists; the UI thread only assumed one.
     let moved = !folder.as_os_str().is_empty()
-        && host(hwnd, |host| {
-            let moved = !host
-                .folder
-                .as_ref()
-                .is_some_and(|f| library::model::same_path(f, &folder));
-            if moved {
-                host.folder = Some(folder.clone());
+        && host(hwnd, |host| match id.and_then(|id| host.slot_mut(id)) {
+            Some(slot) => {
+                let moved = !library::model::same_path(&slot.folder, &folder);
+                if moved {
+                    slot.folder = folder.clone();
+                }
+                moved
             }
-            moved
+            // Nothing was assumed: the worker's folder opens now.
+            None => {
+                id = Some(host.add_notebook(folder.clone()));
+                true
+            }
         })
         .unwrap_or(false);
     if moved {
         crate::window::main_window::invalidate_title_strip(hwnd);
     }
     match result {
-        Ok(fresh) => install(hwnd, fresh),
+        Ok(fresh) => {
+            if let Some(id) = id {
+                install_of(hwnd, id, fresh);
+            }
+        }
         Err(error) => {
-            host(hwnd, |host| host.load_failed = true);
+            if let Some(id) = id {
+                slot(hwnd, id, |slot| slot.load_failed = true);
+            }
             push_notice(
                 hwnd,
                 format!(
@@ -283,41 +340,57 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
             crate::window::side_panel::refresh(hwnd);
         }
     }
-    if host(hwnd, |host| std::mem::take(&mut host.rescan_requested)).unwrap_or(false) {
-        start_load(hwnd);
+    if let Some(id) = id
+        && slot(hwnd, id, |slot| std::mem::take(&mut slot.rescan_requested)).unwrap_or(false)
+    {
+        start_load_of(hwnd, id);
     }
 }
 
+/// Installs a loaded state into the default notebook.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "loads install into the slot they were for")
+)]
 pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
-    let Some((relocated, first_time, truncated, unreadable, has_pending)) = host(hwnd, |host| {
-        let mut state = match host.state.take() {
-            Some(previous) if library::model::same_path(&previous.folder, &fresh.folder) => {
-                library::merge_rescan(previous, fresh)
+    if let Some(id) = default_notebook(hwnd) {
+        install_of(hwnd, id, fresh);
+    }
+}
+
+/// Installs a loaded state into the notebook `id`, merging it into the state it had.
+pub(super) fn install_of(hwnd: HWND, id: NotebookId, fresh: LibraryState) {
+    let Some((relocated, first_time, truncated, unreadable, has_pending)) =
+        slot(hwnd, id, |slot| {
+            let mut state = match slot.state.take() {
+                Some(previous) if library::model::same_path(&previous.folder, &fresh.folder) => {
+                    library::merge_rescan(previous, fresh)
+                }
+                _ => fresh,
+            };
+            let first_time = !slot
+                .notified
+                .as_ref()
+                .is_some_and(|f| library::model::same_path(f, &state.folder));
+            slot.notified = Some(state.folder.clone());
+            if !state.renamed_outside.is_empty() {
+                let found = std::mem::take(&mut state.renamed_outside);
+                slot.renamed_outside.extend(found);
+                slot.renamed_outside_told = false;
             }
-            _ => fresh,
-        };
-        let first_time = !host
-            .notified
-            .as_ref()
-            .is_some_and(|f| library::model::same_path(f, &state.folder));
-        host.notified = Some(state.folder.clone());
-        if !state.renamed_outside.is_empty() {
-            let found = std::mem::take(&mut state.renamed_outside);
-            host.renamed_outside.extend(found);
-            host.renamed_outside_told = false;
-        }
-        let state = host.state.insert(state);
-        (
-            std::mem::take(&mut state.relocated),
-            first_time,
-            state.truncated,
-            state.metadata == Metadata::Unreadable,
-            !state.pending.is_empty(),
-        )
-    }) else {
+            let state = slot.state.insert(state);
+            (
+                std::mem::take(&mut state.relocated),
+                first_time,
+                state.truncated,
+                state.metadata == Metadata::Unreadable,
+                !state.pending.is_empty(),
+            )
+        })
+    else {
         return;
     };
-    let folder = folder(hwnd).unwrap_or_default();
+    let folder = notebook_folder(hwnd, id).unwrap_or_default();
     for (old, new) in relocated {
         let (old_path, new_path) = (folder.join(old), folder.join(new));
         if rebind_open_tab(hwnd, &old_path, new_path.clone()).is_err() {
@@ -337,12 +410,13 @@ pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
     if has_pending {
         schedule_write(hwnd);
     }
-    let rewrite = host(hwnd, |host| {
-        std::mem::take(&mut host.local_written_during_scan)
+    let rewrite = slot(hwnd, id, |slot| {
+        std::mem::take(&mut slot.local_written_during_scan)
     })
     .unwrap_or(false);
-    save_local(
+    save_local_of(
         hwnd,
+        id,
         LocalWrite {
             wait: false,
             force: rewrite,
@@ -364,9 +438,9 @@ pub(super) fn install(hwnd: HWND, fresh: LibraryState) {
         crate::window::side_panel::active_tab_changed(hwnd);
     }
     // From now on outside changes are reported as they happen (second brain phase 1 §5.1).
-    ensure_watcher(hwnd);
+    ensure_watcher_of(hwnd, id);
     // The notebook's conventions may have changed with it (second brain phase 1 §9.1).
-    reload_notebook_settings(hwnd);
+    reload_notebook_settings_of(hwnd, id);
     // The note list may have changed: the index reads what did (§6.4).
-    request_index(hwnd);
+    request_index_of(hwnd, id);
 }

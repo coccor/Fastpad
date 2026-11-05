@@ -34,8 +34,7 @@ fn the_first_save_of_an_untitled_note_asks_for_a_name_in_the_folder_prefilled_fr
     assert!(
         app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .notes
             .iter()
@@ -284,7 +283,7 @@ fn closing_the_notebook_saves_its_notes_keeps_the_tabs_and_is_remembered_as_clos
         Some(path.as_path())
     );
     assert_eq!(crate::window::library_host::folder(window.hwnd), None);
-    assert!(app_mut(window.hwnd).library.state.is_none());
+    assert!(app_mut(window.hwnd).library.default_state().is_none());
     let folders =
         crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
     assert!(folders.closed);
@@ -408,7 +407,7 @@ fn opening_a_listed_notebook_that_is_missing_says_so_and_changes_nothing() {
         crate::window::library_host::folder(window.hwnd),
         Some(scratch.folder())
     );
-    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(app_mut(window.hwnd).library.default_state().is_some());
     let folders =
         crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
     assert!(!folders.folders.contains(&missing));
@@ -435,7 +434,9 @@ fn opening_a_listed_notebook_switches_once_the_worker_finds_it() {
     pump_until(window.hwnd, || {
         crate::window::library_host::folder(window.hwnd) == Some(second.folder())
     });
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
     assert_eq!(
         crate::window::library_host::recent_notebooks(window.hwnd).first(),
         Some(&second.folder())
@@ -567,8 +568,7 @@ fn files_outside_the_folder_and_folders_with_autosave_off_are_not_autosaved() {
     assert!(
         !app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .local
             .autosave
@@ -672,13 +672,12 @@ fn a_folder_whose_state_has_not_loaded_is_not_autosaved() {
     assert!(
         !app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .local
             .autosave
     );
-    app_mut(window.hwnd).library.state = None;
+    app_mut(window.hwnd).library.default_slot().unwrap().state = None;
     editor.set_text("two").unwrap();
     assert_eq!(
         crate::window::library_host::autosave_active(window.hwnd),
@@ -697,7 +696,7 @@ fn an_edit_made_while_the_folder_loads_autosaves_once_it_has_loaded() {
     let window = ProductionWindow::new(make_app());
     let editor = install_test_editor(&window);
     let path = open_note(&window, &scratch, "a.md", "one");
-    app_mut(window.hwnd).library.state = None;
+    app_mut(window.hwnd).library.default_slot().unwrap().state = None;
     editor.replace_target(0..0, "x").unwrap();
     let waited = std::time::Instant::now();
     while waited.elapsed() < std::time::Duration::from_millis(1_300) {

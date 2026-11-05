@@ -13,24 +13,35 @@ const OWN_WRITE_GRACE: Duration = Duration::from_secs(2);
 /// changes counted as FastPad's own.
 const OWN_WRITE_LIMIT: Duration = Duration::from_secs(60);
 
-/// Starts watching the open notebook, once its state has loaded, unless notes mode is off, one
-/// is already running, or watching it failed before.
+/// Starts watching the default notebook (a shim until every caller names its notebook).
+#[allow(
+    dead_code,
+    reason = "single-notebook shim; loads start the watcher of their own slot"
+)]
 pub(super) fn ensure_watcher(hwnd: HWND) {
+    if let Some(id) = default_notebook(hwnd) {
+        ensure_watcher_of(hwnd, id);
+    }
+}
+
+/// Starts watching the notebook `id`, once its state has loaded, unless notes mode is off, one
+/// is already running, or watching it failed before.
+pub(super) fn ensure_watcher_of(hwnd: HWND, id: NotebookId) {
     if !notes_mode(hwnd) {
         return;
     }
-    let Some(folder) = folder(hwnd) else {
-        return;
-    };
     let start = host(hwnd, |host| {
-        if host.watcher.is_some() || host.watch_failed {
+        let slot = host.slot_mut(id)?;
+        if slot.watcher.is_some() || slot.watch_failed {
             return None;
         }
-        host.watch_generation += 1;
-        Some(host.watch_generation)
+        let generation = host.fresh_generation();
+        let slot = host.slot_mut(id)?;
+        slot.watch_generation = generation;
+        Some((slot.folder.clone(), generation))
     })
     .flatten();
-    let Some(generation) = start else {
+    let Some((folder, generation)) = start else {
         return;
     };
     match Watcher::start(
@@ -40,37 +51,55 @@ pub(super) fn ensure_watcher(hwnd: HWND) {
         generation,
     ) {
         Ok(watcher) => {
-            host(hwnd, |host| host.watcher = Some(watcher));
+            slot(hwnd, id, |slot| slot.watcher = Some(watcher));
         }
         // A folder Windows can't watch (some network shares): rescans on activation stand in.
         Err(_) => {
-            host(hwnd, |host| host.watch_failed = true);
+            slot(hwnd, id, |slot| slot.watch_failed = true);
         }
     }
 }
 
-/// Stops the watcher and waits for its thread: the notebook is closing or switching, notes mode
-/// is going off, or the window is going away. The next notebook gets a fresh chance to be
-/// watched.
+/// Stops the default notebook's watcher: the notebook is closing or switching, notes mode is
+/// going off, or the window is going away. FastPad's own writes and the changed-notes filter
+/// are forgotten with it.
 pub(crate) fn stop_watcher(hwnd: HWND) {
-    let watcher = host(hwnd, |host| {
-        host.watch_generation += 1;
-        host.watch_failed = false;
+    host(hwnd, |host| {
         host.own_writes.clear();
         // The next notebook opens showing all its notes.
         host.changed_only = false;
-        host.watcher.take()
+        host.shown_templates = None;
+    });
+    if let Some(id) = default_notebook(hwnd) {
+        stop_watcher_of(hwnd, id);
+    }
+}
+
+/// Stops the notebook `id`'s watcher and waits for its thread. The notebook gets a fresh chance
+/// to be watched.
+pub(crate) fn stop_watcher_of(hwnd: HWND, id: NotebookId) {
+    let watcher = host(hwnd, |host| {
+        let generation = host.fresh_generation();
+        let slot = host.slot_mut(id)?;
+        slot.watch_generation = generation;
+        slot.watch_failed = false;
+        slot.watcher.take()
     })
     .flatten();
     drop(watcher);
     // The index and the conventions belong to the notebook that is going too.
-    reset_index(hwnd);
-    forget_notebook_settings(hwnd);
+    reset_index_of(hwnd, id);
+    forget_notebook_settings_of(hwnd, id);
 }
 
-/// Whether a watcher is watching the open notebook right now.
+/// Whether a watcher is watching the default notebook right now.
 pub(crate) fn watching(hwnd: HWND) -> bool {
-    host(hwnd, |host| host.watcher.is_some()).unwrap_or(false)
+    default_notebook(hwnd).is_some_and(|id| watching_of(hwnd, id))
+}
+
+/// Whether a watcher is watching the notebook `id` right now.
+pub(crate) fn watching_of(hwnd: HWND, id: NotebookId) -> bool {
+    slot(hwnd, id, |slot| slot.watcher.is_some()).unwrap_or(false)
 }
 
 fn own_write_key(path: &Path) -> String {
@@ -128,14 +157,17 @@ pub(crate) fn files_changed(hwnd: HWND, lparam: isize) -> bool {
         return false;
     }
     let changes = unsafe { Box::from_raw(lparam as *mut FileChanges) };
-    let current = host(hwnd, |host| host.watch_generation == changes.generation).unwrap_or(false);
-    if !current {
+    // A batch from a watcher since stopped names no slot.
+    let Some(id) = host(hwnd, |host| {
+        host.slot_by_watch_generation(changes.generation)
+    })
+    .flatten() else {
         return true;
-    }
+    };
     if changes.failed {
-        let watcher = host(hwnd, |host| {
-            host.watch_failed = true;
-            host.watcher.take()
+        let watcher = slot(hwnd, id, |slot| {
+            slot.watch_failed = true;
+            slot.watcher.take()
         })
         .flatten();
         drop(watcher);
@@ -143,7 +175,7 @@ pub(crate) fn files_changed(hwnd: HWND, lparam: isize) -> bool {
     }
     if changes.overflow {
         // Windows dropped changes: everything is checked again.
-        request_rescan(hwnd);
+        request_rescan_of(hwnd, id);
         check_all_tabs(hwnd);
         return true;
     }
@@ -157,13 +189,13 @@ pub(crate) fn files_changed(hwnd: HWND, lparam: isize) -> bool {
         path.file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case(library::notebook_ini::NOTEBOOK_FILE))
     }) {
-        reload_notebook_settings(hwnd);
+        reload_notebook_settings_of(hwnd, id);
     }
     if changes.names_changed {
         // The rescan's result asks for the index itself.
-        request_rescan(hwnd);
+        request_rescan_of(hwnd, id);
     } else if paths.iter().any(|path| library::index::is_indexed(path)) {
-        request_index(hwnd);
+        request_index_of(hwnd, id);
     }
     true
 }

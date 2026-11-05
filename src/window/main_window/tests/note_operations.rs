@@ -17,8 +17,7 @@ fn toggling_a_pin_applies_to_the_active_note_and_persists() {
     assert!(
         app_mut(hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .is_pinned(&path)
     );
@@ -58,7 +57,7 @@ fn pinning_a_file_outside_the_open_notebook_is_refused() {
             .iter()
             .any(|n| n == "Only notes in the open notebook can be pinned.")
     );
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert!(state.pending.is_empty());
     assert!(state.library.notes.is_empty());
 }
@@ -123,7 +122,7 @@ fn renaming_a_note_renames_its_file_and_keeps_its_metadata() {
         app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
         Some(new.as_path())
     );
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert!(state.is_pinned(&new));
 }
 
@@ -204,7 +203,7 @@ fn deleting_a_note_asks_then_recycles_it_and_keeps_its_record_hidden() {
     execute_command(window.hwnd, CommandId::NoteDelete);
     assert!(!path.exists());
     assert_eq!(super::super::tab_count(window.hwnd), 0);
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     let record = state.record_for(&path).unwrap();
     assert!(record.deleted);
     assert!(state.local.missing_since(record.id).is_some());
@@ -243,7 +242,7 @@ fn a_note_renamed_outside_fastpad_moves_its_open_tab_and_autosave_resumes() {
     );
     assert_eq!(std::fs::read_to_string(&new).unwrap(), "edited");
     assert!(!old.exists(), "the old name is not re-created");
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert!(state.record_for(&new).unwrap().pinned);
 }
 
@@ -489,7 +488,9 @@ fn the_library_step_checks_no_folder_on_the_ui_thread_and_the_worker_falls_back(
     assert_eq!(crate::library::folder_checks(), before, "no stat here");
     assert_eq!(crate::window::library_host::folder(window.hwnd), Some(gone));
 
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
     let fallback =
         crate::library::normalize_folder(&crate::platform::paths::default_notes_folder().unwrap());
     assert_eq!(
@@ -527,7 +528,7 @@ fn a_session_that_ended_with_no_notebook_open_opens_none_at_startup() {
     crate::window::library_host::open_library_step(window.hwnd);
     assert_eq!(crate::library::folder_checks(), before);
     assert_eq!(crate::window::library_host::folder(window.hwnd), None);
-    assert!(!app_mut(window.hwnd).library.scanning, "no worker starts");
+    assert!(!app_mut(window.hwnd).library.scanning(), "no worker starts");
 }
 
 #[test]
@@ -554,7 +555,7 @@ fn turning_notes_mode_off_says_so_when_metadata_cannot_be_written_and_closes_the
 
     assert!(!name_box_visible(window.hwnd));
     assert!(
-        app_mut(window.hwnd).library.state.is_none(),
+        app_mut(window.hwnd).library.default_state().is_none(),
         "the setting applies"
     );
     let expected = format!(
@@ -631,7 +632,9 @@ fn opening_another_folder_autosaves_the_old_folders_notes_and_normalizes_the_new
     let recent =
         crate::library::local::read_folders(&crate::library::local::folders_file(&first.data()));
     assert_eq!(recent.folders.first(), Some(&second.folder()));
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
 
 #[test]
@@ -661,7 +664,7 @@ fn a_library_file_held_open_by_a_sync_keeps_the_operations_and_retries_without_a
         before,
         "no notice for a brief sync"
     );
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert_eq!(state.metadata, crate::library::Metadata::Ready);
     assert_eq!(state.pending.len(), 1);
 

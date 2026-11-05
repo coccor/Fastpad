@@ -201,7 +201,7 @@ fn the_view_says_loading_then_shows_the_tree_and_recent_notebooks_once_closed() 
     )
     .unwrap();
 
-    app_mut(window.hwnd).library.folder = Some(scratch.folder());
+    app_mut(window.hwnd).library.assume_folder(scratch.folder());
     crate::window::notebook_view::rebuild(window.hwnd);
     assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
 
@@ -226,8 +226,12 @@ fn a_failed_load_offers_retry_and_open_instead_of_loading_forever() {
     let _editor = install_test_editor(&window);
     ensure_sidebar(window.hwnd);
     app_mut(window.hwnd).library.data_dir = Some(scratch.data());
-    app_mut(window.hwnd).library.folder = Some(scratch.folder());
-    let generation = app_mut(window.hwnd).library.generation;
+    app_mut(window.hwnd).library.assume_folder(scratch.folder());
+    let generation = app_mut(window.hwnd)
+        .library
+        .default_slot()
+        .unwrap()
+        .generation;
     crate::window::library_host::library_ready(
         window.hwnd,
         crate::window::library_host::test_ready_payload(generation, Err("boom".to_owned())),
@@ -262,7 +266,9 @@ fn a_failed_load_offers_retry_and_open_instead_of_loading_forever() {
         Mode::Loading,
         "Retry clears the failure and loads the same notebook again"
     );
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
     assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
 }
 
@@ -290,7 +296,9 @@ fn at_startup_both_views_say_loading_for_the_notebook_being_opened() {
         Some(crate::window::search_view::LOADING)
     );
     assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
     assert_eq!(crate::window::search_view::status(window.hwnd), None);
 }
 
@@ -342,7 +350,7 @@ fn the_header_star_favorites_the_notebook_and_every_state_paints() {
     paint(window.hwnd);
     execute_command(window.hwnd, CommandId::CloseNotebook);
     paint(window.hwnd);
-    app_mut(window.hwnd).library.folder = Some(scratch.folder());
+    app_mut(window.hwnd).library.assume_folder(scratch.folder());
     crate::window::notebook_view::rebuild(window.hwnd);
     paint(window.hwnd);
     unsafe { windows_sys::Win32::Graphics::Gdi::ReleaseDC(panel, dc) };
@@ -1227,4 +1235,58 @@ fn a_palette_rename_and_a_move_turn_the_preview_into_a_normal_tab() {
     );
     assert!(second.folder().join("b.md").exists());
     assert_eq!(app_mut(window.hwnd).tabs.preview_id(), None, "move");
+}
+
+#[test]
+fn a_load_result_for_a_replaced_notebook_is_dropped() {
+    // Break caught: a load that finishes for a notebook the user has since replaced landing in
+    // the notebook that took its place, because the result is matched to the window rather than
+    // to the notebook it was for (multi-root notebooks spec §3.2).
+    use crate::window::library_host::{
+        default_notebook, generations_of, library_ready, notebooks, test_ready_payload, with_state,
+    };
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("replaced-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("replaced-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = default_notebook(window.hwnd).unwrap();
+    let (old_generation, _, _) = generations_of(window.hwnd, a_id);
+    let local = crate::library::local::local_file(&a.data(), &a.folder());
+    let state_of_a = crate::library::load(&a.folder(), &local, crate::library::now_unix()).unwrap();
+    let stale = test_ready_payload(old_generation, Ok(state_of_a));
+
+    crate::window::library_host::open_folder(window.hwnd, &b.folder());
+    let loaded_b = || {
+        with_state(window.hwnd, |state| {
+            crate::library::model::same_path(&state.folder, &b.folder())
+        })
+        .unwrap_or(false)
+    };
+    pump_until(window.hwnd, loaded_b);
+    let note_paths = || {
+        with_state(window.hwnd, |state| {
+            state
+                .notes
+                .iter()
+                .map(|note| note.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+    };
+    let before = note_paths();
+
+    library_ready(window.hwnd, stale);
+
+    let open: Vec<std::path::PathBuf> = notebooks(window.hwnd)
+        .into_iter()
+        .map(|(_, folder)| folder)
+        .collect();
+    assert_eq!(open, [b.folder()]);
+    assert!(loaded_b(), "B is still the loaded notebook");
+    assert_eq!(note_paths(), before, "B's notes are unchanged");
 }

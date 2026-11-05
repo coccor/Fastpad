@@ -346,7 +346,7 @@ fn add_alias_to(hwnd: HWND, path: &Path, alias: &str) {
 
 /// The edits that would point links in other notes at the notes renamed outside FastPad.
 fn outside_rename_edits(hwnd: HWND) -> Vec<NoteEdits> {
-    let moves = host(hwnd, |host| host.renamed_outside.clone()).unwrap_or_default();
+    let moves = default_slot(hwnd, |slot| slot.renamed_outside.clone()).unwrap_or_default();
     if moves.is_empty() || !index_loaded(hwnd) {
         return Vec::new();
     }
@@ -363,21 +363,21 @@ fn outside_rename_edits(hwnd: HWND) -> Vec<NoteEdits> {
 /// An index build landed: notes renamed outside FastPad that links still point to are named in
 /// a notice, once (spec §7.6). Renames that break no link are forgotten.
 pub(crate) fn outside_renames_check(hwnd: HWND) {
-    let told = host(hwnd, |host| {
-        host.renamed_outside.is_empty() || host.renamed_outside_told
+    let told = default_slot(hwnd, |slot| {
+        slot.renamed_outside.is_empty() || slot.renamed_outside_told
     })
     .unwrap_or(true);
     if told || !index_loaded(hwnd) {
         return;
     }
     let edits = outside_rename_edits(hwnd);
-    let moves = host(hwnd, |host| {
+    let moves = default_slot(hwnd, |slot| {
         if edits.is_empty() {
-            host.renamed_outside.clear();
+            slot.renamed_outside.clear();
         } else {
-            host.renamed_outside_told = true;
+            slot.renamed_outside_told = true;
         }
-        host.renamed_outside.clone()
+        slot.renamed_outside.clone()
     })
     .unwrap_or_default();
     if edits.is_empty() {
@@ -412,7 +412,7 @@ pub(crate) fn outside_renames_notice(moves: &[(PathBuf, PathBuf)], edits: &[Note
 pub(crate) fn update_renamed_links(hwnd: HWND) {
     let edits = outside_rename_edits(hwnd);
     if edits.is_empty() {
-        host(hwnd, |host| host.renamed_outside.clear());
+        default_slot(hwnd, |slot| slot.renamed_outside.clear());
         push_notice(
             hwnd,
             "No links point to notes renamed outside FastPad.".to_owned(),
@@ -427,7 +427,7 @@ pub(crate) fn update_renamed_links(hwnd: HWND) {
         if edits.len() == 1 { "note" } else { "notes" },
     );
     let choice = crate::window::modal::choose(hwnd, &question, &["Update links", "Leave them"]);
-    host(hwnd, |host| host.renamed_outside.clear());
+    default_slot(hwnd, |slot| slot.renamed_outside.clear());
     if choice == 0 {
         let written = write_link_edits(hwnd, &edits);
         push_notice(hwnd, links_written_notice(&written));

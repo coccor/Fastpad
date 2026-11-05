@@ -22,7 +22,7 @@ pub(super) const BUSY: &str = "This notebook's .fastpad\\library.ini is in use b
 
 /// True when organizing can proceed; otherwise explains why not.
 pub(crate) fn ready_library(hwnd: HWND) -> bool {
-    match host(hwnd, |host| host.state.as_ref().map(|state| state.metadata)).flatten() {
+    match with_state(hwnd, |state| state.metadata) {
         Some(Metadata::Ready) => true,
         Some(Metadata::Unreadable) => {
             push_notice(hwnd, READ_ONLY.to_owned());
@@ -61,8 +61,15 @@ pub(super) fn apply_op(
     build: impl FnOnce(&mut LibraryState, &mut IdSource) -> Option<PendingOp>,
 ) -> Result<(), LibraryError> {
     let result = host(hwnd, |host| {
-        let LibraryHost { state, ids, .. } = host;
-        let state = state.as_mut()?;
+        let LibraryHost {
+            notebooks,
+            default_notebook,
+            ids,
+            ..
+        } = host;
+        let id = (*default_notebook)?;
+        let slot = notebooks.iter_mut().find(|slot| slot.id == id)?;
+        let state = slot.state.as_mut()?;
         let op = build(state, ids)?;
         Some(state.apply(op))
     })

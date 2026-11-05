@@ -398,7 +398,7 @@ pub(super) fn open_note(
 }
 
 pub(super) fn library(hwnd: HWND) -> &'static crate::library::model::Library {
-    &app_mut(hwnd).library.state.as_ref().unwrap().library
+    &app_mut(hwnd).library.default_state().unwrap().library
 }
 
 /// Task 6 creates the sidebar with the window when notes mode is on; this makes sure of it.
@@ -524,7 +524,7 @@ pub(super) fn row_lparam(hwnd: HWND, kind: &RowKind) -> super::LPARAM {
 
 pub(super) fn rescan_and_wait(hwnd: HWND) {
     crate::window::library_host::request_rescan(hwnd);
-    pump_until(hwnd, || !app_mut(hwnd).library.scanning);
+    pump_until(hwnd, || !app_mut(hwnd).library.scanning());
 }
 
 pub(super) fn sidebar_panel(hwnd: HWND) -> HWND {

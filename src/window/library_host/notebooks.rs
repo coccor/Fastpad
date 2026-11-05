@@ -66,9 +66,19 @@ pub(super) fn open_checked_folder(hwnd: HWND, path: PathBuf) {
     }
     // The old notebook's watcher goes; the new one starts once its first scan lands.
     stop_watcher(hwnd);
+    // One notebook at a time for now: the new one replaces the default, and becomes it.
     host(hwnd, |host| {
-        host.state = None;
-        host.folder = Some(path.clone());
+        let notified = host
+            .default_notebook
+            .and_then(|id| host.remove_notebook(id))
+            .and_then(|slot| slot.notified);
+        let id = host.add_notebook(path.clone());
+        if let Some(slot) = host.slot_mut(id) {
+            // Reopening the same notebook does not repeat its first-load notices.
+            slot.notified = notified;
+        }
+        // A startup load still running is for a notebook the user moved on from.
+        host.startup_load = None;
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);
     });
@@ -307,12 +317,11 @@ pub(crate) fn close_notebook(hwnd: HWND) {
     }
     stop_watcher(hwnd);
     host(hwnd, |host| {
-        host.state = None;
-        host.folder = None;
-        // A load or rescan still running for the closed notebook is ignored when it lands.
-        host.generation = host.generation.wrapping_add(1);
-        host.scanning = false;
-        host.rescan_requested = false;
+        // A load or rescan still running for the closed notebook names no slot when it lands.
+        if let Some(id) = host.default_notebook {
+            host.remove_notebook(id);
+        }
+        host.startup_load = None;
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);
     });
