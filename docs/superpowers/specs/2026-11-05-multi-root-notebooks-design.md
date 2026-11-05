@@ -163,7 +163,7 @@ Call sites that act on the target notebook use `target_notebook` (§5.1). Phase 
 
 The fixed header area in `notebook_layout.rs` goes away. Each root is a row in the scrolling list:
 
-- **Label.** The notebook's name in small caps, in the style of today's header.
+- **Label.** The notebook's name, in the style of today's header (bold, as the folder is spelled).
 - **Chevron.** Collapses or expands the root. The state is stored in that notebook's local `root_collapsed`, so it survives restarts.
 - **Default marker.** The default notebook shows a small marker after its name. The tooltip says "Default notebook".
 - **Buttons.** When the row is hovered or selected, it shows today's header buttons:
