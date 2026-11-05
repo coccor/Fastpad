@@ -15,9 +15,13 @@ pub(crate) fn notebook_autosave(hwnd: HWND) -> Option<bool> {
     with_state(hwnd, |state| state.local.autosave)
 }
 
-/// The active tab's path, if autosave applies to it right now.
+/// The active tab's path, if autosave applies to it right now: it is a note of an open notebook
+/// whose own switch is on (multi-root notebooks spec §5.2). A file no open notebook owns is a
+/// plain file and is never autosaved.
 pub(super) fn autosave_target(hwnd: HWND) -> Option<PathBuf> {
-    autosave_target_of(hwnd, default_notebook(hwnd)?)
+    let path = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())?;
+    autosave_target_of(hwnd, notebook_of(hwnd, &path)?)
 }
 
 /// The active tab's path, if autosave applies to it right now as a note of the notebook `id`.
@@ -111,9 +115,10 @@ fn autosave_active_with(hwnd: HWND, target: impl Fn(HWND) -> Option<PathBuf>) ->
     }
 }
 
-/// Before the window closes: save every eligible dirty tab. Failures fall back to the prompt.
+/// Before the window closes: save every eligible dirty tab of every open notebook, each by its
+/// own notebook's switch. Failures fall back to the prompt.
 pub(crate) fn autosave_all(hwnd: HWND) {
-    if let Some(id) = default_notebook(hwnd) {
+    for (id, _) in notebooks(hwnd) {
         autosave_all_of(hwnd, id);
     }
 }
@@ -267,12 +272,15 @@ pub(crate) fn document_saved(hwnd: HWND) {
     });
     let (path, promoted) = saved.unwrap_or((None, false));
     // A saved Markdown note's tags and front matter go into the index (spec §6.4).
+    // The note goes into the notebook that owns it; a file no open notebook owns is a plain file.
     let indexed = path.as_deref().is_some_and(library::index::is_indexed);
+    let owner = path.as_deref().and_then(|path| notebook_of(hwnd, path));
     let inserted = path
-        .and_then(|path| with_state(hwnd, |state| state.add_note(&path)))
+        .zip(owner)
+        .and_then(|(path, id)| with_notebook(hwnd, id, |state| state.add_note(&path)))
         .unwrap_or(false);
-    if indexed {
-        request_index(hwnd);
+    if indexed && let Some(id) = owner {
+        request_index_of(hwnd, id);
     }
     close_stale_name_box(hwnd);
     if inserted || crate::window::notebook_view::stale(hwnd) {

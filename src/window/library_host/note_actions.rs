@@ -9,10 +9,10 @@ use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::HWND;
 
-/// The Move to notebook picker's notebooks: favorites by name, then recent ones, never the open
-/// notebook and never twice.
-pub(super) fn move_destinations(hwnd: HWND) -> Vec<PathBuf> {
-    let open = folder(hwnd);
+/// The Move to notebook picker's notebooks: favorites by name, then recent ones, never the
+/// notebook the note is in (`source`) and never twice.
+pub(super) fn move_destinations(hwnd: HWND, source: &Path) -> Vec<PathBuf> {
+    let open = Some(source.to_path_buf());
     let known = known_folders(hwnd, true);
     let elsewhere = |candidate: &PathBuf| {
         !open
@@ -46,14 +46,14 @@ pub(super) fn move_destinations(hwnd: HWND) -> Vec<PathBuf> {
 
 /// Note: Move to notebook… (spec §6.6): picks another notebook, whose root receives the file.
 pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
-    if !folder(hwnd).is_some_and(|root| library::is_inside(&root, path)) {
+    let Some(source) = note_root(hwnd, path) else {
         push_notice(
             hwnd,
             "Only notes in the open notebook can be moved to another notebook.".to_owned(),
         );
         return;
-    }
-    let destinations = move_destinations(hwnd);
+    };
+    let destinations = move_destinations(hwnd, &source.1);
     let mut items: Vec<String> = library::local::display_names(&destinations)
         .into_iter()
         .map(|(name, hint)| match hint {
@@ -74,6 +74,14 @@ pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
             initial: None,
         },
     );
+}
+
+/// The open notebook a note at `path` (absolute) is inside, and that notebook's folder. `None`
+/// for a file no open notebook owns, or a notebook's folder itself.
+pub(super) fn note_root(hwnd: HWND, path: &Path) -> Option<(NotebookId, PathBuf)> {
+    let id = notebook_of(hwnd, path)?;
+    let root = notebook_folder(hwnd, id)?;
+    library::is_inside(&root, path).then_some((id, root))
 }
 
 /// Whether some open tab already has `path`, by its stored path (which may no longer exist on
@@ -167,16 +175,37 @@ pub(super) fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
         );
         return;
     }
-    let stays_inside = folder(hwnd).is_some_and(|root| library::is_inside(&root, &target));
-    if stays_inside {
-        with_state(hwnd, |state| state.rename_note(note, &target));
-        schedule_write(hwnd);
-    } else {
-        let record = with_state(hwnd, |state| state.record_for(note).map(|r| r.id)).flatten();
-        if let Some(id) = record {
-            report(hwnd, apply_op(hwnd, |_, _| Some(PendingOp::Drop { id })));
+    // The note leaves the notebook it was in (`source`) unless the target is in it too; an open
+    // destination notebook lists it at once (multi-root notebooks spec §5.3).
+    let source = note_root(hwnd, note);
+    let stays_inside = source
+        .as_ref()
+        .is_some_and(|(_, root)| library::is_inside(root, &target));
+    if let Some((source, _)) = source {
+        if stays_inside {
+            with_notebook(hwnd, source, |state| state.rename_note(note, &target));
+            schedule_write(hwnd);
+        } else {
+            let record = with_notebook(hwnd, source, |state| {
+                state.record_for(note).map(|record| record.id)
+            })
+            .flatten();
+            if let Some(id) = record {
+                report(
+                    hwnd,
+                    apply_op_of(hwnd, source, |_, _| Some(PendingOp::Drop { id })),
+                );
+            }
+            with_notebook(hwnd, source, |state| state.remove_note(note));
         }
-        with_state(hwnd, |state| state.remove_note(note));
+    }
+    let arrived = (!stays_inside)
+        .then(|| note_root(hwnd, &target))
+        .flatten()
+        .map(|(destination, _)| destination);
+    if let Some(destination) = arrived {
+        with_notebook(hwnd, destination, |state| state.add_note(&target));
+        request_index_of(hwnd, destination);
     }
     match rebind_open_tab(hwnd, note, target.clone()) {
         // The tab followed the note out of the notebook: a preview would be replaced by the
@@ -191,12 +220,12 @@ pub(super) fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
     );
     crate::window::side_panel::refresh(hwnd);
     // Links that would no longer reach the moved note (second brain phase 1 spec §7.6).
-    if stays_inside && let Some(root) = folder(hwnd) {
+    if stays_inside && let Some((source, root)) = note_root(hwnd, &target) {
         let moved = (
             library::record_path(&root, note),
             library::record_path(&root, &target),
         );
-        notes_moved(hwnd, &[moved]);
+        notes_moved_of(hwnd, source, &[moved]);
     }
 }
 
@@ -308,6 +337,12 @@ pub(crate) fn delete_note(hwnd: HWND) {
 /// After a confirm, sends `path` to the Recycle Bin and closes its tab if it has one. Any record
 /// stays, flagged deleted and marked missing, so the 30-day purge removes it.
 pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
+    // The callers checked the default notebook; a note of another one needs its own file.
+    if let Some((owner, _)) = note_root(hwnd, path)
+        && !ready_library_of(hwnd, Some(owner))
+    {
+        return;
+    }
     let tab = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let tabs = &unsafe { app.as_ref() }.tabs;
         let id = tabs.find_stored_path(path)?;
@@ -338,21 +373,27 @@ pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
         );
         return;
     }
-    let now = library::now_unix();
-    let record = with_state(hwnd, |state| state.record_for(path).map(|r| r.id)).flatten();
-    if let Some(note_id) = record {
-        report(
-            hwnd,
-            apply_op(hwnd, |state, ids| {
-                Some(PendingOp::SetDeleted {
-                    note: state.note_ref(ids, path),
-                    value: true,
-                })
-            }),
-        );
-        with_state(hwnd, |state| state.local.set_missing(note_id, now));
+    // The record is the one in the notebook that owns the file (multi-root notebooks spec §5.2).
+    if let Some((owner, _)) = note_root(hwnd, path) {
+        let now = library::now_unix();
+        let record = with_notebook(hwnd, owner, |state| {
+            state.record_for(path).map(|record| record.id)
+        })
+        .flatten();
+        if let Some(note_id) = record {
+            report(
+                hwnd,
+                apply_op_of(hwnd, owner, |state, ids| {
+                    Some(PendingOp::SetDeleted {
+                        note: state.note_ref(ids, path),
+                        value: true,
+                    })
+                }),
+            );
+            with_notebook(hwnd, owner, |state| state.local.set_missing(note_id, now));
+        }
+        with_notebook(hwnd, owner, |state| state.remove_note(path));
     }
-    with_state(hwnd, |state| state.remove_note(path));
     if let Some((id, _)) = tab {
         crate::window::main_window::close_document_without_prompt(hwnd, id);
     }

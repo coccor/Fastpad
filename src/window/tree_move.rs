@@ -78,7 +78,10 @@ pub(crate) fn move_note(
             false
         }
     };
-    with_state(hwnd, |state| state.rename_note(&old_path, &new_path));
+    // The library of the notebook `root` follows, whichever notebook is the default.
+    if let Some(id) = library_host::notebook_of(hwnd, root) {
+        library_host::with_notebook(hwnd, id, |state| state.rename_note(&old_path, &new_path));
+    }
     library_host::schedule_write(hwnd);
     Ok(Moved { rebound, stuck })
 }
@@ -126,8 +129,10 @@ pub(crate) fn move_folder(
         return Err(MoveError::TabCantFollow);
     }
     library_host::reroot_save_folders(hwnd, &old_path, &new_path);
-    with_state(hwnd, |state| state.rename_folder(old, new));
-    library_host::save_local_soon(hwnd);
+    if let Some(id) = library_host::notebook_of(hwnd, root) {
+        library_host::with_notebook(hwnd, id, |state| state.rename_folder(old, new));
+        library_host::save_local_soon_of(hwnd, id);
+    }
     library_host::schedule_write(hwnd);
     Ok(Moved {
         rebound: false,

@@ -134,7 +134,7 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
                 }
             }
         }
-        CommandId::New => crate::window::library_host::new_note_in(hwnd),
+        CommandId::New => crate::window::library_host::new_note(hwnd),
         CommandId::CloseTab => close_active_document(hwnd),
         CommandId::CloseAllTabs => close_all_documents(hwnd),
         CommandId::Save => crate::window::library_host::save_command(hwnd),

@@ -1286,21 +1286,6 @@ fn a_load_result_for_a_closed_notebook_is_dropped() {
     assert_eq!(note_paths(), before, "B's notes are unchanged");
 }
 
-/// Opens `scratch`'s notebook with `open_folder` and waits until it has loaded and is watched.
-fn open_and_load(window: &ProductionWindow, scratch: &LibraryScratch) -> NotebookId {
-    crate::window::library_host::open_folder(window.hwnd, &scratch.folder());
-    let id = crate::window::library_host::notebooks(window.hwnd)
-        .into_iter()
-        .find(|(_, folder)| crate::library::model::same_path(folder, &scratch.folder()))
-        .map(|(id, _)| id)
-        .expect("the notebook was added");
-    pump_until(window.hwnd, || {
-        crate::window::library_host::with_notebook(window.hwnd, id, |_| ()).is_some()
-            && crate::window::library_host::watching_of(window.hwnd, id)
-    });
-    id
-}
-
 use crate::window::library_host::NotebookId;
 
 fn open_folders(window: &ProductionWindow) -> Vec<std::path::PathBuf> {

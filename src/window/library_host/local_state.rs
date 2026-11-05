@@ -65,6 +65,18 @@ pub(crate) fn save_local_soon(hwnd: HWND) {
     );
 }
 
+/// `save_local_soon` for the notebook `id`.
+pub(crate) fn save_local_soon_of(hwnd: HWND, id: NotebookId) {
+    save_local_of(
+        hwnd,
+        id,
+        LocalWrite {
+            wait: false,
+            force: false,
+        },
+    );
+}
+
 /// Expands or collapses `path`, a folder relative to the open notebook, and remembers it in the
 /// per-PC file. The write happens on a writer thread, and only when the set changed.
 pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {

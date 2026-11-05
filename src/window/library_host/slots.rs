@@ -181,11 +181,6 @@ pub(super) fn slot<R>(
     host(hwnd, |host| host.slot_mut(id).map(f)).flatten()
 }
 
-/// Runs `f` on the default notebook's slot (a shim until every caller names its notebook).
-pub(super) fn default_slot<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookSlot) -> R) -> Option<R> {
-    slot(hwnd, default_notebook(hwnd)?, f)
-}
-
 /// The open notebooks and their folders, in sidebar order.
 pub(crate) fn notebooks(hwnd: HWND) -> Vec<(NotebookId, PathBuf)> {
     host(hwnd, |host| {

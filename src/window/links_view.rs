@@ -479,24 +479,35 @@ fn invalidate(panel: HWND) {
     }
 }
 
+/// The notebook the view shows, and its folder: the active note's own notebook (multi-root
+/// notebooks spec §5.2), else the default one.
+fn shown_notebook(hwnd: HWND) -> Option<(library_host::NotebookId, PathBuf)> {
+    let active = unsafe { super::main_window::app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
+    let id = active
+        .and_then(|path| library_host::notebook_of(hwnd, &path))
+        .or_else(|| library_host::default_notebook(hwnd))?;
+    Some((id, library_host::notebook_folder(hwnd, id)?))
+}
+
 /// Builds what the view shows now. Reads the linking lines of the active note's backlinks
 /// from their files; the notebook-wide sections are computed only while expanded.
 fn model(hwnd: HWND, expanded: [bool; 4]) -> LinksModel {
-    let Some(root) = library_host::folder(hwnd) else {
+    let Some((id, root)) = shown_notebook(hwnd) else {
         return LinksModel {
             note: Err(NO_NOTEBOOK),
             ..LinksModel::default()
         };
     };
-    if !library_host::index_loaded(hwnd) {
+    if !library_host::index_loaded_of(hwnd, id) {
         return LinksModel {
             note: Err(INDEXING),
             ..LinksModel::default()
         };
     }
-    let settings = library_host::notebook_settings(hwnd);
-    let index = library_host::note_index(hwnd);
-    let Some(resolver) = library_host::resolver(hwnd) else {
+    let settings = library_host::notebook_settings_of(hwnd, id);
+    let index = library_host::note_index_of(hwnd, id);
+    let Some(resolver) = library_host::resolver_of(hwnd, id) else {
         return LinksModel {
             note: Err(INDEXING),
             ..LinksModel::default()
@@ -631,7 +642,7 @@ fn run(hwnd: HWND, panel: HWND, action: LinkAction) {
             refresh(hwnd, panel);
         }
         LinkAction::Open { path, line, keep } => {
-            let Some(root) = library_host::folder(hwnd) else {
+            let Some((_, root)) = shown_notebook(hwnd) else {
                 return;
             };
             let path = root.join(path);
@@ -653,7 +664,11 @@ fn run(hwnd: HWND, panel: HWND, action: LinkAction) {
                 editor.scroll_caret_into_view();
             }
         }
-        LinkAction::Create(target) => library_host::create_linked_note(hwnd, &target),
+        LinkAction::Create(target) => {
+            if let Some((id, _)) = shown_notebook(hwnd) {
+                library_host::create_linked_note_in(hwnd, id, &target);
+            }
+        }
     }
 }
 

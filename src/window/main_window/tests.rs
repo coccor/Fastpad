@@ -346,6 +346,32 @@ pub(super) fn pump_until(hwnd: HWND, done: impl Fn() -> bool) {
     }
 }
 
+/// Opens `scratch`'s notebook with `open_folder` and waits until it has loaded and is watched.
+pub(super) fn open_and_load(
+    window: &ProductionWindow,
+    scratch: &LibraryScratch,
+) -> crate::window::library_host::NotebookId {
+    open_and_load_folder(window, &scratch.folder())
+}
+
+/// Opens the notebook `folder` with `open_folder` and waits until it has loaded and is watched.
+pub(super) fn open_and_load_folder(
+    window: &ProductionWindow,
+    folder: &std::path::Path,
+) -> crate::window::library_host::NotebookId {
+    crate::window::library_host::open_folder(window.hwnd, folder);
+    let id = crate::window::library_host::notebooks(window.hwnd)
+        .into_iter()
+        .find(|(_, open)| crate::library::model::same_path(open, folder))
+        .map(|(id, _)| id)
+        .expect("the notebook was added");
+    pump_until(window.hwnd, || {
+        crate::window::library_host::with_notebook(window.hwnd, id, |_| ()).is_some()
+            && crate::window::library_host::watching_of(window.hwnd, id)
+    });
+    id
+}
+
 pub(super) fn tab_paths(hwnd: HWND) -> Vec<Option<std::path::PathBuf>> {
     app_mut(hwnd)
         .tabs

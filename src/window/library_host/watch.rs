@@ -278,8 +278,11 @@ fn mark_outside_changes_of(hwnd: HWND, id: NotebookId, paths: &[PathBuf]) {
 /// The user has seen the note at `path`: it opened in a tab, or a tab showing it came to the
 /// front. Its "changed outside FastPad" mark goes.
 pub(crate) fn note_seen(hwnd: HWND, path: &Path) {
-    if with_state(hwnd, |state| state.clear_changed(path)).unwrap_or(false) {
-        save_local_soon(hwnd);
+    let Some(id) = notebook_of(hwnd, path) else {
+        return;
+    };
+    if with_notebook(hwnd, id, |state| state.clear_changed(path)).unwrap_or(false) {
+        save_local_soon_of(hwnd, id);
         crate::window::side_panel::refresh(hwnd);
     }
 }

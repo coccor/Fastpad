@@ -17,18 +17,19 @@ pub(crate) const SAVE_FIRST: &str = "Save the note first, so the image has a pla
 struct Place {
     directory: PathBuf,
     note: PathBuf,
-    /// The notebook it lives in, when it is in the open one.
-    root: Option<PathBuf>,
+    /// The open notebook it lives in, when one owns it.
+    notebook: Option<super::library_host::NotebookId>,
 }
 
-/// The attachments folder for the note at `note` (absolute): the open notebook's (from
-/// `notebook.ini`, else Obsidian's setting, else `attachments`), or `attachments` beside a
-/// Markdown file outside it.
+/// The attachments folder for the note at `note` (absolute): that of the open notebook that owns
+/// it (from its `notebook.ini`, else Obsidian's setting, else `attachments`), or `attachments`
+/// beside a Markdown file no open notebook owns.
 fn place_for(hwnd: HWND, note: &Path) -> Place {
-    if let Some(root) = super::library_host::folder(hwnd)
+    if let Some(id) = super::library_host::notebook_of(hwnd, note)
+        && let Some(root) = super::library_host::notebook_folder(hwnd, id)
         && crate::library::is_inside(&root, note)
     {
-        let settings = super::library_host::notebook_settings(hwnd);
+        let settings = super::library_host::notebook_settings_of(hwnd, id);
         let obsidian = capture_file::obsidian_attachments_of(&root);
         let relative = crate::library::record_path(&root, note);
         let folder = capture::attachments_folder(
@@ -39,13 +40,13 @@ fn place_for(hwnd: HWND, note: &Path) -> Place {
         return Place {
             directory: root.join(folder),
             note: note.to_path_buf(),
-            root: Some(root),
+            notebook: Some(id),
         };
     }
     Place {
         directory: note.parent().unwrap_or(Path::new("")).join("attachments"),
         note: note.to_path_buf(),
-        root: None,
+        notebook: None,
     }
 }
 
@@ -128,9 +129,9 @@ pub(crate) fn attach(
     if saved.is_empty() {
         return false;
     }
-    if place.root.is_some() {
+    if let Some(id) = place.notebook {
         for attachment in &saved {
-            super::library_host::with_state(hwnd, |state| state.add_note(&attachment.path));
+            super::library_host::with_notebook(hwnd, id, |state| state.add_note(&attachment.path));
         }
         super::side_panel::refresh(hwnd);
     }

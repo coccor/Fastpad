@@ -113,7 +113,11 @@ pub(crate) fn open(hwnd: HWND, editor: &Editor, kind: Kind) {
                 .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
             crate::window::library_host::completion_items(hwnd, from.as_deref())
         }
-        Kind::Tag => tag_names(hwnd),
+        Kind::Tag => {
+            let from = unsafe { host_window::app_ptr(hwnd) }
+                .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
+            tag_names(hwnd, from.as_deref())
+        }
         Kind::Slash => Vec::new(),
     };
     with_state(hwnd, |state| {
@@ -126,8 +130,9 @@ pub(crate) fn open(hwnd: HWND, editor: &Editor, kind: Kind) {
     refresh(hwnd, editor, kind);
 }
 
-/// Every tag in the notebook's index, by its full name (`project/fastpad`), sorted.
-fn tag_names(hwnd: HWND) -> Vec<String> {
+/// Every tag in the index of the notebook that owns the note at `from` (the default notebook
+/// for an untitled tab), by its full name (`project/fastpad`), sorted.
+fn tag_names(hwnd: HWND, from: Option<&std::path::Path>) -> Vec<String> {
     fn walk(nodes: &[crate::library::index::TagNode], names: &mut Vec<String>) {
         for node in nodes {
             names.push(node.full.clone());
@@ -135,10 +140,11 @@ fn tag_names(hwnd: HWND) -> Vec<String> {
         }
     }
     let mut names = Vec::new();
-    walk(
-        &crate::window::library_host::note_index(hwnd).tags(),
-        &mut names,
-    );
+    let index = match from {
+        Some(from) => crate::window::library_host::note_index_for(hwnd, from),
+        None => crate::window::library_host::note_index(hwnd),
+    };
+    walk(&index.tags(), &mut names);
     names.sort_by(|a, b| crate::library::tree::natural_cmp(a, b));
     names.dedup();
     names

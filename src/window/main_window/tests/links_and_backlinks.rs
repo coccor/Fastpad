@@ -256,3 +256,35 @@ fn a_note_renamed_outside_fastpad_is_named_and_its_links_can_be_updated() {
         "forgotten once handled"
     );
 }
+
+#[test]
+fn a_wikilink_resolves_inside_its_own_notebook_only() {
+    // Break caught: a link in one notebook's note opening the same-named note of the default
+    // notebook, or completion offering another notebook's notes.
+    let _scintilla = load_native_scintilla();
+    let (a, window, _editor) = notebook("ms-links-a");
+    a.note("Plan.md", "A's plan\n");
+    a.note("Alpha.md", "");
+    a.install(window.hwnd);
+    let b = LibraryScratch::new("ms-links-b");
+    let b_plan = b.note("Plan.md", "B's plan\n");
+    b.note("Other.md", "");
+    let from = b.note("from.md", "[[Plan]]\n");
+    let b_id = open_and_load(&window, &b);
+    pump_until(window.hwnd, || {
+        crate::window::library_host::index_loaded_of(window.hwnd, b_id)
+    });
+
+    let items = crate::window::library_host::completion_items(window.hwnd, Some(&from));
+    assert_eq!(items, ["Other", "Plan"]);
+
+    crate::window::library_host::follow_wiki(window.hwnd, Some(&from), "Plan", None);
+    pump_posted_messages(window.hwnd);
+    assert_eq!(active_path(window.hwnd), Some(b_plan));
+
+    crate::window::library_host::follow_wiki(window.hwnd, Some(&from), "Alpha", None);
+    assert!(
+        b.folder().join("Alpha.md").is_file(),
+        "a missing link creates its note in B"
+    );
+}

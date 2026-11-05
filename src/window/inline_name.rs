@@ -353,6 +353,9 @@ pub(crate) enum How {
 #[derive(Debug)]
 struct Edit {
     purpose: Purpose,
+    /// The folder of the notebook the edit acts in, when it started: the commit makes its
+    /// changes there and nowhere else, and does nothing once that notebook has closed.
+    root: Option<PathBuf>,
     /// The field's text as `EN_CHANGE` last reported it.
     text: String,
     /// The lowercased names listed beside the edited name (`sibling_names`), from the rows last
@@ -416,9 +419,10 @@ impl InlineName {
         }
     }
 
-    fn begin(&mut self, purpose: Purpose, text: String, accessible: String) {
+    fn begin(&mut self, purpose: Purpose, root: Option<PathBuf>, text: String, accessible: String) {
         self.edit = Some(Edit {
             purpose,
+            root,
             text,
             siblings: HashSet::new(),
             problem: None,
@@ -709,12 +713,15 @@ fn start(hwnd: HWND, purpose: Purpose) {
     };
     let text = purpose.current_name().unwrap_or_default();
     let (select_from, select_to) = rename_selection(&text, purpose.is_folder());
-    let notebook = library_host::folder(hwnd)
-        .map(|root| library_host::notebook_name(&root))
+    // The notebook whose rows the tree shows: the edit stays bound to it.
+    let root = library_host::folder(hwnd);
+    let notebook = root
+        .as_deref()
+        .map(library_host::notebook_name)
         .unwrap_or_default();
     let accessible = accessible_name(&purpose, &notebook);
     with_inline(hwnd, |inline| {
-        inline.begin(purpose, text.clone(), accessible.clone())
+        inline.begin(purpose, root, text.clone(), accessible.clone())
     });
     side_panel::with_accessible_events(hwnd, || notebook_view::rebuild(hwnd));
     // The rebuild found no folder or row for it.
@@ -1065,9 +1072,14 @@ fn fail(hwnd: HWND, how: How, message: String) {
 /// Commits the open edit, if any (spec §5.2): refused while a problem shows, else the one disk
 /// call its purpose makes.
 pub(crate) fn commit(hwnd: HWND, how: How) {
-    let Some((purpose, problem, field)) = with_inline(hwnd, |inline| {
+    let Some((purpose, problem, field, root)) = with_inline(hwnd, |inline| {
         let edit = inline.edit.as_ref()?;
-        Some((edit.purpose.clone(), edit.problem.clone(), inline.field?))
+        Some((
+            edit.purpose.clone(),
+            edit.problem.clone(),
+            inline.field?,
+            edit.root.clone(),
+        ))
     })
     .flatten() else {
         return;
@@ -1078,15 +1090,32 @@ pub(crate) fn commit(hwnd: HWND, how: How) {
     }
     // Read with nothing of the App borrowed.
     let text = field_text(field);
+    let Some(notebook) = edit_notebook(hwnd, root.as_deref()) else {
+        cancel(hwnd);
+        return;
+    };
     match purpose {
-        Purpose::NewNote(parent) => commit_new_note(hwnd, how, &parent, &text, None),
+        Purpose::NewNote(parent) => commit_new_note(hwnd, &notebook, how, &parent, &text, None),
         Purpose::NewNoteFrom { parent, template } => {
-            commit_new_note(hwnd, how, &parent, &text, Some(&template));
+            commit_new_note(hwnd, &notebook, how, &parent, &text, Some(&template));
         }
-        Purpose::NewFolder(parent) => commit_new_folder(hwnd, how, &parent, &text),
-        Purpose::RenameNote(relative) => commit_rename_note(hwnd, how, &relative, &text),
-        Purpose::RenameFolder(relative) => commit_rename_folder(hwnd, how, &relative, &text),
+        Purpose::NewFolder(parent) => commit_new_folder(hwnd, &notebook, how, &parent, &text),
+        Purpose::RenameNote(relative) => {
+            commit_rename_note(hwnd, &notebook, how, &relative, &text);
+        }
+        Purpose::RenameFolder(relative) => {
+            commit_rename_folder(hwnd, &notebook, how, &relative, &text);
+        }
     }
+}
+
+/// The open notebook an edit acts in, found by the folder it started in, and that folder.
+/// `None` once that notebook has closed: its changes must not land in another one.
+fn edit_notebook(hwnd: HWND, root: Option<&Path>) -> Option<(library_host::NotebookId, PathBuf)> {
+    let root = root?;
+    let id = library_host::notebook_of(hwnd, root)?;
+    let folder = library_host::notebook_folder(hwnd, id)?;
+    library::model::same_path(&folder, root).then_some((id, folder))
 }
 
 /// Opens an edit for `purpose` with `text` typed, skipping `start`'s checks and its row, and
@@ -1096,8 +1125,9 @@ pub(crate) fn commit_unchecked(hwnd: HWND, purpose: Purpose, text: &str) {
     let Some(field) = ensure_field(hwnd) else {
         return;
     };
+    let root = library_host::folder(hwnd);
     with_inline(hwnd, |inline| {
-        inline.begin(purpose, String::new(), String::new())
+        inline.begin(purpose, root, String::new(), String::new())
     });
     set_field_text(field, text);
     commit(hwnd, How::Enter);
@@ -1105,11 +1135,14 @@ pub(crate) fn commit_unchecked(hwnd: HWND, purpose: Purpose, text: &str) {
 
 /// New folder (spec §5.2): the folder is made with the one disk call, listed, and its row
 /// selected. After Enter the focus stays in the tree.
-fn commit_new_folder(hwnd: HWND, how: How, parent: &Path, text: &str) {
-    let Some(root) = library_host::folder(hwnd) else {
-        cancel(hwnd);
-        return;
-    };
+fn commit_new_folder(
+    hwnd: HWND,
+    (id, root): &(library_host::NotebookId, PathBuf),
+    how: How,
+    parent: &Path,
+    text: &str,
+) {
+    let id = *id;
     let Some(name) = title::folder_name(text) else {
         cancelled(hwnd, how);
         return;
@@ -1130,9 +1163,9 @@ fn commit_new_folder(hwnd: HWND, how: How, parent: &Path, text: &str) {
         fail(hwnd, how, error);
         return;
     }
-    with_state(hwnd, |state| state.add_folder(&relative));
+    library_host::with_notebook(hwnd, id, |state| state.add_folder(&relative));
     for ancestor in tree::ancestors(&relative) {
-        library_host::set_expanded(hwnd, &ancestor, true);
+        library_host::set_expanded_of(hwnd, id, &ancestor, true);
     }
     end(hwnd);
     side_panel::with_accessible_events(hwnd, || {
@@ -1147,11 +1180,15 @@ fn commit_new_folder(hwnd: HWND, how: How, parent: &Path, text: &str) {
 /// New note (spec §4.1, §5.2): the file is made with the one disk call, never over an existing
 /// file, listed, and opened as a normal tab. It is empty, or `template` filled in (second brain
 /// phase 1 spec §9.4) with the caret at its `{{cursor}}`. After Enter the focus goes to the editor.
-fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str, template: Option<&Path>) {
-    let Some(root) = library_host::folder(hwnd) else {
-        cancel(hwnd);
-        return;
-    };
+fn commit_new_note(
+    hwnd: HWND,
+    (id, root): &(library_host::NotebookId, PathBuf),
+    how: How,
+    parent: &Path,
+    text: &str,
+    template: Option<&Path>,
+) {
+    let id = *id;
     let Some(name) = title::new_note_name(text) else {
         cancelled(hwnd, how);
         return;
@@ -1195,7 +1232,7 @@ fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str, template: Op
         fail(hwnd, how, error);
         return;
     }
-    with_state(hwnd, |state| state.add_note(&path));
+    library_host::with_notebook(hwnd, id, |state| state.add_note(&path));
     end(hwnd);
     side_panel::refresh(hwnd);
     let mode = super::main_window::OpenMode::Permanent;
@@ -1211,11 +1248,14 @@ fn commit_new_note(hwnd: HWND, how: How, parent: &Path, text: &str, template: Op
 /// A note rename (spec §4.3, §5.2): the one disk call, never over another file, then the tab
 /// that has it open follows (dirty or preview alike) and the library follows it. A tab that
 /// cannot follow undoes the rename. No tab is opened. After Enter the focus stays in the tree.
-fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
-    let Some(root) = library_host::folder(hwnd) else {
-        cancel(hwnd);
-        return;
-    };
+fn commit_rename_note(
+    hwnd: HWND,
+    (id, root): &(library_host::NotebookId, PathBuf),
+    how: How,
+    relative: &Path,
+    text: &str,
+) {
+    let id = *id;
     let current = relative
         .extension()
         .map(|extension| extension.to_string_lossy().into_owned());
@@ -1228,7 +1268,7 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
         cancelled(hwnd, how);
         return;
     }
-    let moved = match tree_move::move_note(hwnd, &root, relative, &new) {
+    let moved = match tree_move::move_note(hwnd, root, relative, &new) {
         Ok(moved) => moved,
         Err(error) => {
             let message = match error {
@@ -1253,7 +1293,7 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
         }
     };
     end(hwnd);
-    let row = library::record_path(&root, &root.join(&new));
+    let row = library::record_path(root, &root.join(&new));
     side_panel::with_accessible_events(hwnd, || {
         side_panel::refresh(hwnd);
         notebook_view::select_row(hwnd, &RowKind::Note(row.clone()));
@@ -1280,18 +1320,21 @@ fn commit_rename_note(hwnd: HWND, how: How, relative: &Path, text: &str) {
         }
     }
     // Links that would no longer reach the renamed note (second brain phase 1 spec §7.6).
-    library_host::notes_moved(hwnd, &[(relative.to_path_buf(), row)]);
+    library_host::notes_moved_of(hwnd, id, &[(relative.to_path_buf(), row)]);
 }
 
 /// A folder rename (spec §4.3, §5.2): the one disk call, never onto another name, then the open
 /// tabs under it follow and the library follows it. A tab that cannot follow undoes the whole
 /// rename; if the undo fails, the rename stands and a notice names the tabs left on their old
 /// paths. After Enter the focus stays in the tree.
-fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
-    let Some(root) = library_host::folder(hwnd) else {
-        cancel(hwnd);
-        return;
-    };
+fn commit_rename_folder(
+    hwnd: HWND,
+    (id, root): &(library_host::NotebookId, PathBuf),
+    how: How,
+    old: &Path,
+    text: &str,
+) {
+    let id = *id;
     // Defence in depth: an empty or escaping path would rename the notebook root or a folder
     // outside it.
     if !tree::is_plain_relative_folder(old) {
@@ -1308,7 +1351,7 @@ fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
         cancelled(hwnd, how);
         return;
     }
-    let moved = match tree_move::move_folder(hwnd, &root, old, &new) {
+    let moved = match tree_move::move_folder(hwnd, root, old, &new) {
         Ok(moved) => moved,
         Err(error) => {
             let message = match error {
@@ -1341,8 +1384,8 @@ fn commit_rename_folder(hwnd: HWND, how: How, old: &Path, text: &str) {
         );
     }
     // Links that would no longer reach the notes under it (second brain phase 1 spec §7.6).
-    let moves = library_host::folder_moves(hwnd, old, &new);
-    library_host::notes_moved(hwnd, &moves);
+    let moves = library_host::folder_moves_of(hwnd, id, old, &new);
+    library_host::notes_moved_of(hwnd, id, &moves);
 }
 
 #[cfg(test)]

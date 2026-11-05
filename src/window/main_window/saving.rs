@@ -62,7 +62,7 @@ pub(in crate::window) fn save_active_document_as(hwnd: HWND) -> bool {
     let (suggested, folder) = match named {
         Some(name) => (name, None),
         // With no notebook open this is notes mode off's Save As.
-        None if notes_mode && crate::window::library_host::folder(hwnd).is_some() => (
+        None if notes_mode && crate::window::library_host::default_notebook(hwnd).is_some() => (
             crate::window::library_host::suggested_file_name(hwnd),
             crate::window::library_host::first_save_folder(hwnd),
         ),

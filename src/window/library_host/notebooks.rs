@@ -455,7 +455,7 @@ pub(crate) fn close_notebook_of(hwnd: HWND, id: NotebookId) -> bool {
         return false;
     }
     // A name box that would save into, or rename a note of, the notebook that is going away.
-    if name_box_targets(hwnd, id, &closing) {
+    if name_box_targets(hwnd, &closing) {
         close_name_box(hwnd);
     }
     let last = notebooks(hwnd).len() <= 1;
@@ -472,6 +472,10 @@ pub(crate) fn close_notebook_of(hwnd: HWND, id: NotebookId) -> bool {
         host.remove_notebook(id);
         if last {
             host.startup_load = None;
+            // The user closed every notebook: ones that were not available at startup are not
+            // brought back either, so `open=none` is recorded (multi-root notebooks spec §3.4).
+            host.unavailable.clear();
+            host.open_order.clear();
         }
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);
@@ -486,14 +490,19 @@ pub(crate) fn close_notebook_of(hwnd: HWND, id: NotebookId) -> bool {
     true
 }
 
-/// Whether the open name box acts on the notebook `id` (folder `notebook`): a first save goes to
-/// the default notebook, a rename to the folder of the note's own path.
-fn name_box_targets(hwnd: HWND, id: NotebookId, notebook: &Path) -> bool {
+/// Whether the open name box acts on the notebook folder `notebook`: a first save into the
+/// folder it would save to, a rename to the folder of the note's own path.
+fn name_box_targets(hwnd: HWND, notebook: &Path) -> bool {
     let Some(purpose) = name_box_purpose(hwnd) else {
         return false;
     };
     match purpose {
-        crate::window::name_box::NamePurpose::FirstSave(_) => default_notebook(hwnd) == Some(id),
+        crate::window::name_box::NamePurpose::FirstSave(document) => {
+            save_folder_for(hwnd, document).is_some_and(|folder| {
+                library::model::same_path(&folder, notebook)
+                    || library::is_inside(notebook, &folder)
+            })
+        }
         crate::window::name_box::NamePurpose::RenameNote(document) => unsafe { app_ptr(hwnd) }
             .is_some_and(|app| {
                 unsafe { app.as_ref() }

@@ -342,3 +342,60 @@ fn a_session_with_no_notebook_open_clears_any_slot_and_starts_no_worker() {
     assert!(open_folders(&window).is_empty());
     assert!(!app_mut(window.hwnd).library.scanning());
 }
+
+#[test]
+fn closing_the_last_open_notebook_records_open_none_even_with_one_unavailable() {
+    // Break caught: closing the last open notebook writing the unavailable one back on its
+    // open= line, so the next start brings a notebook back after the user closed them all.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("startup14-a");
+    a.note("a.md", "a");
+    let gone = a.root.join("gone");
+    write_open(&a.data(), &[gone, a.folder()], None);
+    let (window, _editor) = start(&a);
+    crate::window::library_host::open_library_step(window.hwnd);
+    pump_until(window.hwnd, || all_loaded(&window, 1));
+    let a_id = notebooks(window.hwnd)[0].0;
+
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        a_id
+    ));
+
+    let file = crate::library::local::folders_file(&a.data());
+    let recorded = crate::library::local::read_folders(&file);
+    assert!(recorded.closed, "open=none");
+    assert!(recorded.open.is_empty());
+    let text = std::fs::read_to_string(&file).unwrap();
+    let open_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("open="))
+        .collect();
+    assert_eq!(open_lines, ["open=none"], "{text}");
+}
+
+#[test]
+fn a_first_run_opens_the_documents_notebook_unless_a_folder_was_named() {
+    // Break caught: a first run with nothing remembered opening no notebook, or a folder named
+    // on the command line opening beside Documents\FastPad instead of alone.
+    let _scintilla = load_native_scintilla();
+    let documents =
+        crate::library::normalize_folder(&crate::platform::paths::default_notes_folder().unwrap());
+    let a = LibraryScratch::new("startup15-a");
+    {
+        let (window, _editor) = start(&a);
+        crate::window::library_host::open_library_step(window.hwnd);
+        pump_until(window.hwnd, || all_loaded(&window, 1));
+        assert_eq!(open_folders(&window), std::slice::from_ref(&documents));
+    }
+
+    let b = LibraryScratch::new("startup15-b");
+    b.note("b.md", "b");
+    let fresh = LibraryScratch::new("startup15-data");
+    let (window, _editor) = start(&fresh);
+    launch_with(&window, &b.folder());
+    crate::window::library_host::open_library_step(window.hwnd);
+    pump_until(window.hwnd, || all_loaded(&window, 1));
+    pump_for_a_moment(&window);
+    assert_eq!(open_folders(&window), [b.folder()]);
+}

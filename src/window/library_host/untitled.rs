@@ -189,16 +189,32 @@ pub(crate) fn suggested_file_name(hwnd: HWND) -> String {
 }
 
 /// Ctrl+N and File → New tab. The new untitled tab remembers where its first save goes: the
-/// folder of the sidebar's selected row, else the notebook root. With no notebook open it is a
-/// plain new tab.
-pub(crate) fn new_note_in(hwnd: HWND) {
-    let destination = self::folder(hwnd).filter(|_| notes_mode(hwnd)).map(|root| {
+/// folder of the sidebar's selected row, else the default notebook's root (multi-root notebooks
+/// spec §5.2). With no notebook open it is a plain new tab.
+pub(crate) fn new_note(hwnd: HWND) {
+    let root = default_notebook(hwnd).and_then(|id| notebook_folder(hwnd, id));
+    let context = root.map(|root| {
         crate::window::notebook_view::selected_folder(hwnd)
             .filter(|candidate| {
                 library::model::same_path(candidate, &root) || library::is_inside(&root, candidate)
             })
             .unwrap_or(root)
     });
+    match context {
+        Some(context) => new_note_in(hwnd, &context),
+        None => new_untitled(hwnd, None),
+    }
+}
+
+/// A new untitled tab whose first save goes to `context`, a notebook's root or a folder inside
+/// it. It saves into that notebook whatever notebook is the default. A folder no open notebook
+/// owns gives a plain new tab.
+pub(crate) fn new_note_in(hwnd: HWND, context: &std::path::Path) {
+    let owned = notes_mode(hwnd) && notebook_of(hwnd, context).is_some();
+    new_untitled(hwnd, owned.then(|| context.to_path_buf()));
+}
+
+fn new_untitled(hwnd: HWND, destination: Option<PathBuf>) {
     if let Err(error) = crate::window::main_window::create_new_document(hwnd) {
         push_notice(hwnd, format!("FastPad could not create a new tab: {error}"));
         return;
@@ -215,10 +231,11 @@ pub(crate) fn new_note_in(hwnd: HWND) {
     // Notebook view's rows and selected it (`side_panel::active_tab_changed`).
 }
 
-/// Where tab `id`'s first save goes: its remembered folder while that is still a folder of the
-/// open notebook, else the notebook root (spec §6.7).
+/// Where tab `id`'s first save goes (spec §6.7; multi-root notebooks spec §5.2): its remembered
+/// folder while that is still a folder, in whichever notebook it was created (a plain folder
+/// once that notebook closed); else the root of the open notebook that owned it; else, for a tab
+/// created with no notebook context, the default notebook's root.
 pub(super) fn save_folder_for(hwnd: HWND, id: crate::document::DocumentId) -> Option<PathBuf> {
-    let root = folder(hwnd)?;
     let remembered = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .tabs
@@ -226,11 +243,17 @@ pub(super) fn save_folder_for(hwnd: HWND, id: crate::document::DocumentId) -> Op
             .save_folder
             .clone()
     });
-    Some(
-        remembered
-            .filter(|folder| library::is_inside(&root, folder) && folder.is_dir())
-            .unwrap_or(root),
-    )
+    if let Some(remembered) = remembered {
+        if remembered.is_dir() {
+            return Some(remembered);
+        }
+        if let Some(root) =
+            notebook_of(hwnd, &remembered).and_then(|owner| notebook_folder(hwnd, owner))
+        {
+            return Some(root);
+        }
+    }
+    default_notebook(hwnd).and_then(|owner| notebook_folder(hwnd, owner))
 }
 
 /// The active tab's first-save folder, for the name box and the Save As dialog.
@@ -246,7 +269,7 @@ pub(crate) fn save_command(hwnd: HWND) {
         return;
     }
     if notes_mode(hwnd)
-        && folder(hwnd).is_some()
+        && default_notebook(hwnd).is_some()
         && let Some(id) = active_untitled(hwnd)
     {
         // Ctrl+S again while the box is open for this tab keeps what was typed.
@@ -277,7 +300,7 @@ pub(crate) fn save_as_command(hwnd: HWND) {
     if crate::window::image_host::active_is_image(hwnd) {
         return;
     }
-    if notes_mode(hwnd) && folder(hwnd).is_some() && active_untitled(hwnd).is_some() {
+    if notes_mode(hwnd) && default_notebook(hwnd).is_some() && active_untitled(hwnd).is_some() {
         save_command(hwnd);
         return;
     }

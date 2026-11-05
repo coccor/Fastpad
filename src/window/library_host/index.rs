@@ -24,6 +24,14 @@ pub(crate) fn note_index_of(hwnd: HWND, id: NotebookId) -> Arc<NoteIndex> {
     slot(hwnd, id, |slot| Arc::clone(&slot.index)).unwrap_or_default()
 }
 
+/// The index of the notebook that owns `path` (a note, or a notebook folder), or an empty index
+/// when no open notebook does.
+pub(crate) fn note_index_for(hwnd: HWND, path: &std::path::Path) -> Arc<NoteIndex> {
+    notebook_of(hwnd, path)
+        .map(|id| note_index_of(hwnd, id))
+        .unwrap_or_default()
+}
+
 /// Whether the default notebook's first index build has landed.
 pub(crate) fn index_loaded(hwnd: HWND) -> bool {
     default_notebook(hwnd).is_some_and(|id| index_loaded_of(hwnd, id))
