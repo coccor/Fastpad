@@ -147,7 +147,7 @@ typing. Both panes scroll together.
   class, state, ER, pie, Gantt, journey, mindmap, timeline, Git graphs and more) in the preview's
   own colors and font. It renders in Rust on a worker thread, with no browser or JavaScript. While you
   edit, the last good diagram stays up, and a mistake shows its error above it. Copying a selection
-  across a diagram copies its source.
+  across a diagram copies its source. Live draws them too, and shows the source when you click in.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
 - Writing helpers in Markdown files: `Ctrl+B`, `Ctrl+I`, ``Ctrl+` `` and `Ctrl+K` make the selection
@@ -172,7 +172,8 @@ typing. Both panes scroll together.
   file is only ever changed by what you type or a task checkbox you click. Headings, bold, italic,
   strike-through, inline code, links and `[[wikilinks]]` render in place with their markup hidden,
   and so do block elements: lists with bullets, numbers and clickable task checkboxes, quotes with
-  their bars, rules, code blocks on a full-width background, tables as aligned grids and local
+  their bars, rules, code blocks on a full-width background, tables as aligned grids, Mermaid
+  blocks as their diagrams (or their code under the error, when one cannot be drawn) and local
   images as thumbnails (anything else shows its alt text; nothing is fetched). The block you are in
   (from blank line to blank line, a whole table or code block) shows its Markdown source, keeping
   its formatting and highlighted; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click

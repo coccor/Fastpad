@@ -2707,6 +2707,55 @@ fn a_local_image_renders_as_a_thumbnail() {
 }
 
 #[test]
+fn a_mermaid_block_shows_its_diagram_until_the_caret_enters_it() {
+    let text = "top\n\n```mermaid\ngraph LR\n  A --> B\n```\n\nend\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 0);
+    pump_until("the diagram to be drawn", Duration::from_secs(10), || {
+        full_frame(view);
+        view.painted_decorations().diagrams > 0
+    });
+    let (shown, revealed, height) = view.debug_line(2).unwrap();
+    assert_eq!(shown, "");
+    assert!(!revealed);
+    assert!(
+        height > 30.0,
+        "the fence line is as tall as the diagram: {height}"
+    );
+    for line in 3..6 {
+        assert_eq!(
+            view.debug_line(line).unwrap().2,
+            0.0,
+            "line {line} collapses"
+        );
+    }
+    // The caret in the block shows its source, every line of it.
+    caret_to(&main, text.find("A -->").unwrap());
+    full_frame(view);
+    assert_eq!(view.painted_decorations().diagrams, 0);
+    for line in 2..6 {
+        let (_, revealed, height) = view.debug_line(line).unwrap();
+        assert!(revealed && height > 0.0, "line {line}");
+    }
+    assert_eq!(view.debug_line(3).unwrap().0, "graph LR");
+}
+
+#[test]
+fn a_broken_mermaid_block_shows_its_code_under_the_reason() {
+    let text = "top\n\n```mermaid\nflowchart LR\n  A -->\n```\n";
+    let (_scintilla, main, view) = live_tab(text);
+    caret_to(&main, 0);
+    pump_until("the error to be shown", Duration::from_secs(10), || {
+        full_frame(view);
+        view.debug_line(3)
+            .is_some_and(|(_, _, height)| height > 0.0)
+            && view.painted_decorations().labels > 0
+    });
+    assert_eq!(view.painted_decorations().diagrams, 0);
+    assert_eq!(view.debug_line(3).unwrap().0, "flowchart LR");
+}
+
+#[test]
 fn a_missing_image_shows_its_alt_text() {
     let missing = std::env::temp_dir().join("fastpad-live-no-such-image.png");
     let text = format!("top\n\n![cat]({})\n", missing.display());

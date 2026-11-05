@@ -126,7 +126,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &|dest: &str| pictures.resolve(dest),
+        images: &*pictures,
     };
     let scroll_before = *scroll_y;
     if (layout.width() - width).abs() > 0.5 {
@@ -177,9 +177,25 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             _ => None,
         })
         .collect::<Vec<_>>();
+    // Mermaid blocks on screen whose diagrams are not rendered yet.
+    let diagrams = visible
+        .clone()
+        .filter_map(|line| match &layout.laid_line(line)?.style.block.body {
+            BodyStyle::Diagram { source } => match pictures.diagram(source) {
+                DiagramInfo::Pending(key) => Some(key),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let pixel_text_width = (layout.width() * dpi as f32 / 96.0).ceil() as u32;
     for path in pending {
         pictures.cache.request(&path, pixel_text_width);
+    }
+    for key in diagrams {
+        pictures
+            .cache
+            .request_diagram(&key, pixel_text_width, dpi as f32 / 96.0);
     }
     // Where a decoration reaching the right edge (`f32::MAX`) ends, in line coordinates.
     let text_right = layout.width();
@@ -289,6 +305,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         }
         // Pictures are drawn last: an image line has no text to cover them.
         let mut images: Vec<(D2D_RECT_F, &std::path::Path)> = Vec::new();
+        let mut diagrams: Vec<(D2D_RECT_F, &crate::preview::mermaid::DiagramKey)> = Vec::new();
         for (line, (top, bottom)) in visible.clone().zip(spans) {
             let on_screen = (top - scroll_y)..(bottom - scroll_y);
             if on_screen.end < clip_top || on_screen.start > clip_bottom {
@@ -409,10 +426,42 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                         Decoration::Image { rect: area, path } => {
                             images.push((at(area), path.as_path()));
                         }
+                        Decoration::Diagram { rect: area, key } => {
+                            diagrams.push((at(area), key));
+                        }
+                        Decoration::Label { rect: area, text } => {
+                            let area = at(area);
+                            if let Ok(note) = state
+                                .layout
+                                .note_layout(text, (area.right - area.left).max(1.0))
+                            {
+                                target.PushAxisAlignedClip(&area, D2D1_ANTIALIAS_MODE_ALIASED);
+                                target.DrawTextLayout(
+                                    Vector2 {
+                                        X: area.left,
+                                        Y: area.top,
+                                    },
+                                    &note,
+                                    &brushes.dim,
+                                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                                );
+                                target.PopAxisAlignedClip();
+                            }
+                            #[cfg(test)]
+                            {
+                                painted.labels += 1;
+                            }
+                        }
                     }
                 }
             }
+            // A Mermaid block's collapsed lines have no row to number.
+            let collapsed = state
+                .layout
+                .laid_line(line)
+                .is_some_and(|laid| matches!(laid.style.block.body, BodyStyle::Collapsed));
             if gutter > 0.0
+                && !collapsed
                 && let Ok(number) = state.layout.number_layout(line + 1, gutter - GUTTER_GAP)
             {
                 target.DrawTextLayout(
@@ -436,6 +485,21 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                     &brushes.text,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
+            }
+        }
+        for (area, key) in diagrams {
+            if let Some(bitmap) = state.pictures.cache.diagram_bitmap(target, key) {
+                target.DrawBitmap(
+                    &bitmap,
+                    Some(&area),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+                #[cfg(test)]
+                {
+                    painted.diagrams += 1;
+                }
             }
         }
         for (area, path) in images {
