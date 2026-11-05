@@ -9,10 +9,11 @@ use std::path::PathBuf;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
-/// The open notebook's autosave switch, or `None` while no notebook is open or its state is still
-/// loading. The Settings dialog greys its row out then (settings dialog spec §3.2).
+/// The target notebook's autosave switch (multi-root notebooks spec §5.1), or `None` while no
+/// notebook is open or its state is still loading. The Settings dialog greys its row out then
+/// (settings dialog spec §3.2).
 pub(crate) fn notebook_autosave(hwnd: HWND) -> Option<bool> {
-    with_state(hwnd, |state| state.local.autosave)
+    with_notebook(hwnd, target_notebook(hwnd)?, |state| state.local.autosave)
 }
 
 /// The active tab's path, if autosave applies to it right now: it is a note of an open notebook
@@ -169,16 +170,22 @@ pub(crate) fn autosave_all_of(hwnd: HWND, id: NotebookId) {
     }
 }
 
+/// Notes: Toggle autosave, on the target notebook (multi-root notebooks spec §5.1).
 pub(crate) fn toggle_folder_autosave(hwnd: HWND) {
-    let Some(enabled) = with_state(hwnd, |state| {
+    let Some(id) = target_notebook(hwnd) else {
+        push_notice(hwnd, "Loading notebook…".to_owned());
+        return;
+    };
+    let Some(enabled) = with_notebook(hwnd, id, |state| {
         state.local.autosave = !state.local.autosave;
         state.local.autosave
     }) else {
         push_notice(hwnd, "Loading notebook…".to_owned());
         return;
     };
-    save_local(
+    save_local_of(
         hwnd,
+        id,
         LocalWrite {
             wait: false,
             force: false,

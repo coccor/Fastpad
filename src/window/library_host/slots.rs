@@ -249,3 +249,34 @@ pub(crate) fn set_watch_failed_of(hwnd: HWND, id: NotebookId) {
     .flatten();
     drop(watcher);
 }
+
+/// The notebook a command that acts on "the notebook" works on (multi-root notebooks spec §5.1):
+/// the Notebook view's notebook while it has the focus or a selected row, else the active tab's
+/// notebook, else the default notebook.
+pub(crate) fn target_notebook(hwnd: HWND) -> Option<NotebookId> {
+    if let Some(id) = crate::window::notebook_view::selected_notebook(hwnd) {
+        return Some(id);
+    }
+    let active = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
+    active
+        .and_then(|path| notebook_of(hwnd, &path))
+        .or_else(|| default_notebook(hwnd))
+}
+
+/// The notebook quick capture files into: always the default notebook (spec §5.3).
+pub(crate) fn capture_notebook(hwnd: HWND) -> Option<NotebookId> {
+    default_notebook(hwnd)
+}
+
+/// The open notebook `id`'s display name among the open roots: its folder's name, the same one
+/// the sidebar shows.
+pub(crate) fn notebook_display_name(hwnd: HWND, id: NotebookId) -> Option<String> {
+    let open = notebooks(hwnd);
+    let index = open.iter().position(|(open, _)| *open == id)?;
+    let folders: Vec<PathBuf> = open.into_iter().map(|(_, folder)| folder).collect();
+    crate::library::local::display_names(&folders)
+        .into_iter()
+        .nth(index)
+        .map(|(name, _)| name)
+}

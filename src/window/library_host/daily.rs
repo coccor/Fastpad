@@ -35,13 +35,6 @@ pub(crate) fn now() -> (Date, Time) {
     crate::platform::clock::local_now()
 }
 
-/// The default notebook's conventions: its `notebook.ini`, or the defaults.
-pub(crate) fn notebook_settings(hwnd: HWND) -> NotebookSettings {
-    default_notebook(hwnd)
-        .map(|id| notebook_settings_of(hwnd, id))
-        .unwrap_or_default()
-}
-
 /// The notebook `id`'s conventions: its `notebook.ini`, or the defaults.
 pub(crate) fn notebook_settings_of(hwnd: HWND, id: NotebookId) -> NotebookSettings {
     slot(hwnd, id, |slot| slot.notebook.clone()).unwrap_or_default()
@@ -111,10 +104,16 @@ pub(crate) fn forget_notebook_settings_of(hwnd: HWND, id: NotebookId) {
     });
 }
 
-/// Notes: Edit notebook settings: opens `.fastpad\notebook.ini`, made first with every setting
-/// commented out at its default when the notebook has none.
+/// The target notebook (multi-root notebooks spec §5.1) and its folder.
+fn target_root(hwnd: HWND) -> Option<(NotebookId, PathBuf)> {
+    let id = target_notebook(hwnd)?;
+    Some((id, notebook_folder(hwnd, id)?))
+}
+
+/// Notes: Edit notebook settings: opens the target notebook's `.fastpad\notebook.ini`, made
+/// first with every setting commented out at its default when the notebook has none.
 pub(crate) fn edit_notebook_settings(hwnd: HWND) {
-    let Some(root) = folder(hwnd) else {
+    let Some((_, root)) = target_root(hwnd) else {
         push_notice(hwnd, "Open a notebook first.".to_owned());
         return;
     };
@@ -157,7 +156,8 @@ pub(crate) fn place_caret(hwnd: HWND, position: usize) {
     }
 }
 
-/// `template` (an absolute path) filled in for a new note named `title`.
+/// `template` (an absolute path) filled in for a new note named `title`, with the conventions
+/// of the notebook the template is in.
 pub(crate) fn fill_template(hwnd: HWND, template: &Path, title: &str) -> Result<Filled, String> {
     let file = crate::file::loader::load(template).map_err(|error| {
         format!(
@@ -165,7 +165,9 @@ pub(crate) fn fill_template(hwnd: HWND, template: &Path, title: &str) -> Result<
             template.display()
         )
     })?;
-    let settings = notebook_settings(hwnd);
+    let settings = notebook_of(hwnd, template)
+        .map(|id| notebook_settings_of(hwnd, id))
+        .unwrap_or_default();
     let (date, time) = now();
     Ok(template::fill(
         &file.text,
@@ -178,9 +180,9 @@ pub(crate) fn fill_template(hwnd: HWND, template: &Path, title: &str) -> Result<
     ))
 }
 
-/// Writes `filled` as the new note at `path` (never over a file), lists it and opens it with
-/// the caret in place. The error is for a notice.
-fn create_note(hwnd: HWND, path: &Path, filled: &Filled) -> Result<(), String> {
+/// Writes `filled` as the new note at `path` (never over a file), lists it in the notebook `id`
+/// and opens it with the caret in place. The error is for a notice.
+fn create_note(hwnd: HWND, id: NotebookId, path: &Path, filled: &Filled) -> Result<(), String> {
     let made = path
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
@@ -192,7 +194,7 @@ fn create_note(hwnd: HWND, path: &Path, filled: &Filled) -> Result<(), String> {
             path.display()
         ));
     }
-    with_state(hwnd, |state| state.add_note(path));
+    with_notebook(hwnd, id, |state| state.add_note(path));
     crate::window::side_panel::refresh(hwnd);
     if let Err(error) = crate::window::main_window::open_note(
         hwnd,
@@ -207,13 +209,14 @@ fn create_note(hwnd: HWND, path: &Path, filled: &Filled) -> Result<(), String> {
     Ok(())
 }
 
-/// Notes: Open today's note (spec §9.2): opens it, or makes it from the daily template.
+/// Notes: Open today's note (spec §9.2) of the target notebook: opens it, or makes it from the
+/// daily template.
 pub(crate) fn open_today(hwnd: HWND) {
-    let Some(root) = folder(hwnd) else {
+    let Some((id, root)) = target_root(hwnd) else {
         push_notice(hwnd, NO_NOTEBOOK_DAILY.to_owned());
         return;
     };
-    let settings = notebook_settings(hwnd);
+    let settings = notebook_settings_of(hwnd, id);
     let (date, time) = now();
     let path = root.join(crate::library::capture_file::daily_note(&settings, date));
     if path.exists() {
@@ -224,14 +227,14 @@ pub(crate) fn open_today(hwnd: HWND) {
     if let Some(problem) = problem {
         push_notice(hwnd, problem);
     }
-    if let Err(error) = create_note(hwnd, &path, &filled) {
+    if let Err(error) = create_note(hwnd, id, &path, &filled) {
         push_notice(hwnd, error);
     }
 }
 
-/// The daily notes the notebook lists, by date.
-fn daily_notes(hwnd: HWND, settings: &NotebookSettings) -> Vec<(Date, PathBuf)> {
-    let mut found: Vec<(Date, PathBuf)> = with_state(hwnd, |state| {
+/// The daily notes the notebook `id` lists, by date.
+fn daily_notes(hwnd: HWND, id: NotebookId, settings: &NotebookSettings) -> Vec<(Date, PathBuf)> {
+    let mut found: Vec<(Date, PathBuf)> = with_notebook(hwnd, id, |state| {
         state
             .notes
             .iter()
@@ -257,14 +260,14 @@ fn daily_notes(hwnd: HWND, settings: &NotebookSettings) -> Vec<(Date, PathBuf)> 
 }
 
 /// Notes: Previous daily note / Next daily note (spec §9.2): the nearest daily note before or
-/// after the active one, or today when the active tab isn't a daily note.
+/// after the active one, or today when the active tab isn't a daily note, in the target notebook.
 pub(crate) fn step_daily(hwnd: HWND, forward: bool) {
-    let Some(root) = folder(hwnd) else {
+    let Some((id, root)) = target_root(hwnd) else {
         push_notice(hwnd, NO_NOTEBOOK_DAILY.to_owned());
         return;
     };
-    let settings = notebook_settings(hwnd);
-    let notes = daily_notes(hwnd, &settings);
+    let settings = notebook_settings_of(hwnd, id);
+    let notes = daily_notes(hwnd, id, &settings);
     let active = unsafe { crate::window::main_window::app_ptr(hwnd) }
         .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
     let from = active
@@ -319,15 +322,18 @@ fn templates(root: &Path, settings: &NotebookSettings) -> Vec<PathBuf> {
 }
 
 /// Notes: New note from template… (spec §9.4): a picker of the templates, for a new note in
-/// `parent` (relative), or the selected folder when `None`.
+/// `parent` (relative), or the selected folder when `None`. The note is named inline in the
+/// tree, so the templates are those of the notebook the tree's rows belong to: the default
+/// notebook until rows name theirs (multi-root notebooks Task 9).
 pub(crate) fn new_note_from_template(hwnd: HWND, parent: Option<PathBuf>) {
-    if !ready_library(hwnd) {
+    let id = default_notebook(hwnd);
+    if !ready_library_of(hwnd, id) {
         return;
     }
-    let Some(root) = folder(hwnd) else {
+    let Some((id, root)) = id.and_then(|id| Some((id, notebook_folder(hwnd, id)?))) else {
         return;
     };
-    let settings = notebook_settings(hwnd);
+    let settings = notebook_settings_of(hwnd, id);
     let found = templates(&root, &settings);
     if found.is_empty() {
         push_notice(

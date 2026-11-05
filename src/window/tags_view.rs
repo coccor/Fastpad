@@ -4,7 +4,7 @@
 
 use crate::library::index::TagNode;
 use crate::window::design::metrics::{panel_header, scale, sidebar_row};
-use crate::window::library_host;
+use crate::window::library_host::{self, NotebookId};
 use crate::window::main_window::OpenMode;
 use crate::window::panel::fill;
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
@@ -40,6 +40,13 @@ const TAG_GLYPH: &str = "\u{E8EC}";
 const NOTE_GLYPH: &str = "\u{E8A5}";
 
 pub(crate) const HEADER_TEXT: &str = "Tags";
+
+/// The header: "Tags in <name>" for the notebook the view lists (multi-root notebooks spec
+/// §5.3), else "Tags".
+pub(crate) fn header_text(notebook_name: Option<&str>) -> String {
+    notebook_name.map_or_else(|| HEADER_TEXT.to_owned(), |name| format!("Tags in {name}"))
+}
+
 pub(crate) const NO_NOTEBOOK: &str = "No notebook open.";
 pub(crate) const INDEXING: &str = "Indexing notes\u{2026}";
 pub(crate) const EMPTY_TEXT: &str =
@@ -123,6 +130,10 @@ pub(crate) struct TagsView {
     thumb_grab: Option<i32>,
     /// Bumped whenever the rows change order (`AccessibleView::accessible_generation`).
     order: u64,
+    /// The notebook whose tags the view lists: the target notebook when it last refreshed
+    /// (multi-root notebooks spec §5.3), its folder, and its display name for the header.
+    notebook: Option<(NotebookId, PathBuf)>,
+    notebook_name: Option<String>,
 }
 
 fn inside(rect: RECT, point: POINT) -> bool {
@@ -151,7 +162,14 @@ impl TagsView {
             expanded: HashSet::new(),
             thumb_grab: None,
             order: 0,
+            notebook: None,
+            notebook_name: None,
         }
+    }
+
+    /// The header's text: "Tags in <name>" for the notebook the view lists, else "Tags".
+    pub(crate) fn header(&self) -> String {
+        header_text(self.notebook_name.as_deref())
     }
 
     /// Replaces the rows, keeping the selection on the same tag or note.
@@ -208,7 +226,7 @@ impl TagsView {
             fill(paint.hdc, client, paint.background);
             draw_text(
                 paint.hdc,
-                HEADER_TEXT,
+                &self.header(),
                 RECT {
                     left: header.left + pad,
                     ..header
@@ -456,16 +474,23 @@ fn point(lparam: LPARAM) -> POINT {
     POINT { x, y }
 }
 
-/// Re-reads the tags from the index. Part of `side_panel::refresh`.
+/// Re-reads the target notebook's tags from its index (multi-root notebooks spec §5.3). Part of
+/// `side_panel::refresh`.
 pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
-    let mode = if library_host::folder(hwnd).is_none() {
-        Mode::NoNotebook
-    } else if !library_host::index_loaded(hwnd) {
-        Mode::Loading
-    } else {
-        Mode::Tree
+    let target = library_host::target_notebook(hwnd)
+        .and_then(|id| Some((id, library_host::notebook_folder(hwnd, id)?)));
+    let name = target
+        .as_ref()
+        .and_then(|(id, _)| library_host::notebook_display_name(hwnd, *id));
+    let mode = match &target {
+        None => Mode::NoNotebook,
+        Some((id, _)) if !library_host::index_loaded_of(hwnd, *id) => Mode::Loading,
+        Some(_) => Mode::Tree,
     };
-    let nodes = library_host::note_index(hwnd).tags();
+    let nodes = target
+        .as_ref()
+        .map(|(id, _)| library_host::note_index_of(hwnd, *id).tags())
+        .unwrap_or_default();
     let mode = if mode == Mode::Tree && nodes.is_empty() {
         Mode::Empty
     } else {
@@ -473,6 +498,8 @@ pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
     };
     let (client, dpi) = geometry(panel);
     with_view(hwnd, |view| {
+        view.notebook = target;
+        view.notebook_name = name;
         let rows = if mode == Mode::Tree {
             tag_rows(&nodes, &view.expanded)
         } else {
@@ -482,6 +509,18 @@ pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
         view.set_rows(mode, rows, dpi, height(area));
     });
     invalidate(panel);
+}
+
+/// The target notebook may have changed (another tab came to the front): the view refreshes
+/// only when it now lists another notebook.
+pub(crate) fn target_changed(hwnd: HWND, panel: HWND) {
+    let target = library_host::target_notebook(hwnd);
+    let Some(shown) = with_view(hwnd, |view| view.notebook.as_ref().map(|(id, _)| *id)) else {
+        return;
+    };
+    if shown != target {
+        refresh(hwnd, panel);
+    }
 }
 
 pub(crate) fn refresh_metrics(hwnd: HWND, panel: HWND) {
@@ -540,7 +579,11 @@ fn run(hwnd: HWND, panel: HWND, action: TagAction) {
             refresh(hwnd, panel);
         }
         TagAction::Open { note, keep } => {
-            let Some(folder) = library_host::folder(hwnd) else {
+            // Relative to the notebook the view lists.
+            let Some(folder) = with_view(hwnd, |view| view.notebook.clone())
+                .flatten()
+                .map(|(_, folder)| folder)
+            else {
                 return;
             };
             let path = folder.join(note);
@@ -652,6 +695,12 @@ pub(crate) fn handle(
     }
 }
 
+/// The header's text, for in-process tests.
+#[cfg(test)]
+pub(crate) fn shown_header(hwnd: HWND) -> String {
+    with_view(hwnd, |view| view.header()).unwrap_or_default()
+}
+
 /// The rows the view lists, for in-process tests.
 #[cfg(test)]
 pub(crate) fn shown_rows(hwnd: HWND) -> Vec<TagRow> {
@@ -745,6 +794,13 @@ impl crate::window::sidebar_accessibility::AccessibleView for TagsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_header_names_the_notebook_whose_tags_it_lists() {
+        // Break caught: with several notebooks open, nothing saying whose tags these are.
+        assert_eq!(header_text(Some("Work")), "Tags in Work");
+        assert_eq!(header_text(None), "Tags");
+    }
 
     fn node(name: &str, full: &str, notes: &[&str], children: Vec<TagNode>) -> TagNode {
         TagNode {

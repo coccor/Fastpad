@@ -440,17 +440,11 @@ pub(crate) fn outside_renames_notice(moves: &[(PathBuf, PathBuf)], edits: &[Note
     )
 }
 
-/// Notes: Update links to renamed notes: offers to point the links in other notes at the notes
-/// renamed outside FastPad, then forgets those renames either way.
+/// Notes: Update links to renamed notes: offers to point the links in the target notebook's
+/// other notes (multi-root notebooks spec §5.1) at its notes renamed outside FastPad, then
+/// forgets those renames either way.
 pub(crate) fn update_renamed_links(hwnd: HWND) {
-    // Until the target notebook exists (multi-root notebooks spec §5.1): the active tab's
-    // notebook, else the default one.
-    let active = unsafe { crate::window::main_window::app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
-    let Some(id) = active
-        .and_then(|path| notebook_of(hwnd, &path))
-        .or_else(|| default_notebook(hwnd))
-    else {
+    let Some(id) = target_notebook(hwnd) else {
         push_notice(
             hwnd,
             "No links point to notes renamed outside FastPad.".to_owned(),

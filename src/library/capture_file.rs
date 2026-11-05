@@ -64,16 +64,31 @@ impl OpenTabs for NoTabs {
     }
 }
 
-/// The notebook a capture goes to when no FastPad window has one open (spec §10.3): the most
-/// recent notebook in `folders.ini` that still exists, else `fallback` (`Documents\FastPad`).
+/// The notebook a capture goes to when no FastPad window has one open (spec §10.3): the default
+/// notebook `folders.ini` records (only while it is also on an `open=` line), else the most
+/// recent notebook that still exists, else `fallback` (`Documents\FastPad`).
 pub fn capture_root(data_dir: Option<&Path>, fallback: Option<PathBuf>) -> Option<PathBuf> {
     let recent = data_dir
         .map(|data| super::local::read_folders(&super::local::folders_file(data)))
         .unwrap_or_default();
-    recent
-        .folders
-        .iter()
-        .find(|folder| super::folder_exists(folder))
+    let default = recent
+        .default
+        .as_ref()
+        .filter(|default| {
+            !recent.closed
+                && recent
+                    .open
+                    .iter()
+                    .any(|open| super::model::same_path(open, default))
+        })
+        .filter(|default| super::folder_exists(default));
+    default
+        .or_else(|| {
+            recent
+                .folders
+                .iter()
+                .find(|folder| super::folder_exists(folder))
+        })
         .cloned()
         .or(fallback)
         .map(|folder| super::normalize_folder(&folder))
@@ -442,6 +457,42 @@ mod tests {
             attachments,
             source: None,
         }
+    }
+
+    #[test]
+    fn capture_with_no_window_goes_to_the_default_notebook_then_the_most_recent() {
+        // Break caught: a capture-only process filing into the most recently opened notebook
+        // rather than the default one (multi-root notebooks spec §5.3).
+        let scratch = Scratch::new("root-default");
+        let (work, home) = (scratch.0.join("Work"), scratch.0.join("Home"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let data = scratch.0.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let write = |folders: &super::super::local::RecentFolders| {
+            super::super::local::write_folders(&super::super::local::folders_file(&data), folders)
+                .unwrap();
+        };
+        let mut folders = super::super::local::RecentFolders {
+            folders: vec![home.clone(), work.clone()],
+            ..Default::default()
+        };
+        folders.set_open(&[work.clone(), home.clone()], Some(&work));
+        write(&folders);
+        let root = capture_root(Some(&data), None).unwrap();
+        assert!(super::super::model::same_path(&root, &work), "{root:?}");
+
+        // A default that is not available falls back to the most recent notebook.
+        std::fs::remove_dir_all(&work).unwrap();
+        let root = capture_root(Some(&data), None).unwrap();
+        assert!(super::super::model::same_path(&root, &home), "{root:?}");
+
+        // After open=none, the default line is gone: the most recent notebook.
+        std::fs::create_dir_all(&work).unwrap();
+        folders.set_open(&[], None);
+        write(&folders);
+        let root = capture_root(Some(&data), None).unwrap();
+        assert!(super::super::model::same_path(&root, &home), "{root:?}");
     }
 
     #[test]

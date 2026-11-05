@@ -673,3 +673,38 @@ fn a_library_file_held_open_by_a_sync_keeps_the_operations_and_retries_without_a
     let reloaded = crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
     assert!(reloaded.is_pinned(&a));
 }
+
+#[test]
+fn move_to_notebook_lists_open_notebooks_first_and_updates_an_open_destination() {
+    // Break caught: the other open notebooks buried under the recent ones, or an open
+    // destination not listing the moved note until its watcher reports it (spec §5.3).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("move-open-first", "a", "b");
+    let hwnd = ab.window.hwnd;
+    let c = ab.scratch.root.join("C");
+    std::fs::create_dir_all(&c).unwrap();
+    let c_id = open_and_load_folder(&ab.window, &c);
+    assert!(crate::window::library_host::close_notebook_of(hwnd, c_id));
+    // C is now the most recent notebook, and not open.
+
+    let note = ab.a.join("a.md");
+    crate::window::library_host::move_to_notebook(hwnd, &note);
+    let items = with_command_palette(hwnd, |p| p.picker().map(|picker| picker.items.clone()))
+        .flatten()
+        .unwrap();
+    assert_eq!(items, ["B", "C", "Browse…"]);
+
+    crate::window::library_host::picked(
+        hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+    assert!(ab.b.join("a.md").exists());
+    let listed = |id| {
+        crate::window::library_host::with_notebook(hwnd, id, |state| {
+            state.is_listed(std::path::Path::new("a.md"))
+        })
+    };
+    assert_eq!(listed(ab.b_id), Some(true), "listed in B without a rescan");
+    assert_eq!(listed(ab.a_id), Some(false));
+}

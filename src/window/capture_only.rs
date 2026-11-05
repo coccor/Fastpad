@@ -80,6 +80,10 @@ impl Sink for OnlySink {
         capture_file::target_name(&self.settings, target)
     }
 
+    fn notebook_name(&self) -> Option<String> {
+        Some(crate::window::library_host::notebook_name(&self.root))
+    }
+
     fn file(&mut self, capture: &Submitted) -> Result<(), String> {
         let (path, _) = file_now(
             &self.root,

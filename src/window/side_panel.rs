@@ -637,6 +637,10 @@ fn active_tab_changed_now(hwnd: HWND) {
     if current_view(hwnd) == SidebarView::Links {
         crate::window::links_view::refresh(hwnd, panel);
     }
+    // Search and Tags cover the target notebook, which may be another one now (multi-root
+    // notebooks spec §5.3).
+    crate::window::search_view::target_changed(hwnd);
+    crate::window::tags_view::target_changed(hwnd, panel);
     unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
 }
 

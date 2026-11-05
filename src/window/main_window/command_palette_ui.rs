@@ -233,9 +233,12 @@ pub(crate) fn open_quick_open(hwnd: HWND) {
         capture_palette_focus(hwnd);
     }
     let colors = title_chrome(hwnd).0;
+    let notebook = quick_open_notebook(hwnd)
+        .and_then(|(id, _)| crate::window::library_host::notebook_display_name(hwnd, id));
     let shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let palette = unsafe { app.as_mut() }.command_palette.as_mut()?;
         palette.mark_shown(colors);
+        palette.set_quick_open_notebook(notebook.as_deref());
         palette.set_picker(Some(command_palette::Picker {
             kind: command_palette::PickerKind::QuickOpen,
             items: Vec::new(),
@@ -256,8 +259,17 @@ pub(crate) fn open_quick_open(hwnd: HWND) {
     with_command_palette(hwnd, CommandPalette::focus_query);
 }
 
+/// The notebook Quick Open lists and opens from: the target notebook (multi-root notebooks spec
+/// §5.3), and its folder.
+pub(crate) fn quick_open_notebook(
+    hwnd: HWND,
+) -> Option<(crate::window::library_host::NotebookId, std::path::PathBuf)> {
+    let id = crate::window::library_host::target_notebook(hwnd)?;
+    Some((id, crate::window::library_host::notebook_folder(hwnd, id)?))
+}
+
 /// The quick-open rows for `query` and the row to select (spec §3.1–3.4). Only reads what is
-/// in memory: the tabs and `LibraryState.notes`.
+/// in memory: the tabs and the target notebook's `LibraryState.notes`.
 pub(super) fn quick_open_rows(
     hwnd: HWND,
     query: &str,
@@ -270,11 +282,11 @@ pub(super) fn quick_open_rows(
     if let Some(line) = line.filter(|_| !typed) {
         return (vec![PickerRow::GoToLine(line)], Some(0));
     }
-    let Some(folder) = crate::window::library_host::folder(hwnd) else {
+    let Some((notebook, folder)) = quick_open_notebook(hwnd) else {
         return (vec![PickerRow::Notice(command_palette::NO_NOTEBOOK)], None);
     };
     if typed {
-        let rows = crate::window::library_host::with_state(hwnd, |state| {
+        let rows = crate::window::library_host::with_notebook(hwnd, notebook, |state| {
             quick_open::search(
                 state.notes.iter().map(|note| &note.path),
                 text,
@@ -328,39 +340,40 @@ pub(super) fn quick_open_rows(
         return (Vec::new(), None);
     }
     // Then only the notes the library lists, spelled as it spells them.
-    let (rows, first_active) = crate::window::library_host::with_state(hwnd, |state| {
-        let wanted = open
-            .iter()
-            .map(|(key, ..)| key.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut listed = std::collections::HashMap::new();
-        for note in &state.notes {
-            let key = crate::library::path_key(&note.path);
-            if wanted.contains(key.as_str()) {
-                listed.insert(key, note.path.clone());
+    let (rows, first_active) =
+        crate::window::library_host::with_notebook(hwnd, notebook, |state| {
+            let wanted = open
+                .iter()
+                .map(|(key, ..)| key.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let mut listed = std::collections::HashMap::new();
+            for note in &state.notes {
+                let key = crate::library::path_key(&note.path);
+                if wanted.contains(key.as_str()) {
+                    listed.insert(key, note.path.clone());
+                }
             }
-        }
-        let mut rows = Vec::new();
-        let mut first_active = false;
-        for (key, active, group) in &open {
-            let Some(path) = listed.get(key) else {
-                continue;
-            };
-            let Some(found) = QuickMatch::plain(path) else {
-                continue;
-            };
-            if rows.is_empty() {
-                first_active = *active;
+            let mut rows = Vec::new();
+            let mut first_active = false;
+            for (key, active, group) in &open {
+                let Some(path) = listed.get(key) else {
+                    continue;
+                };
+                let Some(found) = QuickMatch::plain(path) else {
+                    continue;
+                };
+                if rows.is_empty() {
+                    first_active = *active;
+                }
+                rows.push(PickerRow::View {
+                    found,
+                    group: *group,
+                    number: number(*group),
+                });
             }
-            rows.push(PickerRow::View {
-                found,
-                group: *group,
-                number: number(*group),
-            });
-        }
-        (rows, first_active)
-    })
-    .unwrap_or_default();
+            (rows, first_active)
+        })
+        .unwrap_or_default();
     // The current note leads, so the selection starts on the one before it: Ctrl+P then Enter
     // goes back to the previous note.
     let selected = match rows.len() {
@@ -399,12 +412,12 @@ pub(crate) fn open_quick_open_choice(hwnd: HWND, relative: &std::path::Path, lin
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let Some(folder) = crate::window::library_host::folder(hwnd) else {
+    let Some((notebook, folder)) = quick_open_notebook(hwnd) else {
         return;
     };
     let path = folder.join(relative);
     let key = crate::library::path_key(relative);
-    let listed = crate::window::library_host::with_state(hwnd, |state| {
+    let listed = crate::window::library_host::with_notebook(hwnd, notebook, |state| {
         state
             .notes
             .iter()
@@ -539,7 +552,7 @@ pub(super) fn refilter_command_palette(hwnd: HWND) {
         let sidebar = notes_mode_enabled(hwnd);
         // New note and New folder need a notebook, open or loading, to put the item in (inline
         // naming spec §3.1).
-        let notebook = crate::window::library_host::folder(hwnd).is_some();
+        let notebook = crate::window::library_host::default_notebook(hwnd).is_some();
         let groups = unsafe { app_ptr(hwnd) }.map_or(1, |app| unsafe { app.as_ref() }.groups.len());
         let entries = command_palette::filter_entries(&query, |command| {
             (has_tabs || !command.needs_document())

@@ -33,6 +33,11 @@ pub(crate) fn note_index_for(hwnd: HWND, path: &std::path::Path) -> Arc<NoteInde
 }
 
 /// Whether the default notebook's first index build has landed.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
 pub(crate) fn index_loaded(hwnd: HWND) -> bool {
     default_notebook(hwnd).is_some_and(|id| index_loaded_of(hwnd, id))
 }
@@ -42,7 +47,12 @@ pub(crate) fn index_loaded_of(hwnd: HWND, id: NotebookId) -> bool {
     slot(hwnd, id, |slot| slot.index_loaded).unwrap_or(false)
 }
 
-/// Builds the default notebook's index (a shim until every caller names its notebook).
+/// Builds the default notebook's index.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
 pub(crate) fn request_index(hwnd: HWND) {
     if let Some(id) = default_notebook(hwnd) {
         request_index_of(hwnd, id);

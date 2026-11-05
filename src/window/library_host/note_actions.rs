@@ -9,20 +9,28 @@ use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::HWND;
 
-/// The Move to notebook picker's notebooks: favorites by name, then recent ones, never the
-/// notebook the note is in (`source`) and never twice.
+/// The Move to notebook picker's notebooks (multi-root notebooks spec §5.3): the other open
+/// notebooks in sidebar order, then favorites by name, then recent ones; never the notebook the
+/// note is in (`source`) and never twice.
 pub(super) fn move_destinations(hwnd: HWND, source: &Path) -> Vec<PathBuf> {
-    let open = Some(source.to_path_buf());
     let known = known_folders(hwnd, true);
-    let elsewhere = |candidate: &PathBuf| {
-        !open
-            .as_ref()
-            .is_some_and(|open| library::model::same_path(open, candidate))
+    let open: Vec<PathBuf> = notebooks(hwnd)
+        .into_iter()
+        .map(|(_, folder)| folder)
+        .collect();
+    let is_open = |candidate: &PathBuf| {
+        open.iter()
+            .any(|folder| library::model::same_path(folder, candidate))
     };
+    let mut destinations: Vec<PathBuf> = open
+        .iter()
+        .filter(|folder| !library::model::same_path(folder, source))
+        .cloned()
+        .collect();
     let favorites: Vec<PathBuf> = known
         .favorites
         .iter()
-        .filter(|f| elsewhere(f))
+        .filter(|f| !is_open(f) && !library::model::same_path(f, source))
         .cloned()
         .collect();
     let mut named: Vec<(String, PathBuf)> = library::local::display_names(&favorites)
@@ -31,14 +39,13 @@ pub(super) fn move_destinations(hwnd: HWND, source: &Path) -> Vec<PathBuf> {
         .zip(favorites)
         .collect();
     named.sort_by(|a, b| library::tree::natural_cmp(&a.0, &b.0));
-    let mut destinations: Vec<PathBuf> = named.into_iter().map(|(_, path)| path).collect();
-    for recent in known.folders {
-        if elsewhere(&recent)
+    for candidate in named.into_iter().map(|(_, path)| path).chain(known.folders) {
+        if !library::model::same_path(&candidate, source)
             && !destinations
                 .iter()
-                .any(|listed| library::model::same_path(listed, &recent))
+                .any(|listed| library::model::same_path(listed, &candidate))
         {
-            destinations.push(recent);
+            destinations.push(candidate);
         }
     }
     destinations

@@ -372,6 +372,49 @@ pub(super) fn open_and_load_folder(
     id
 }
 
+/// Two open notebooks with the sidebar shown: A (folder "A", the default, opened first) holding
+/// `a.md`, and B (folder "B") holding `b.md`. Nothing is open in a tab and no row is selected.
+pub(super) struct NotebooksAB {
+    pub(super) scratch: LibraryScratch,
+    pub(super) window: ProductionWindow,
+    /// Kept so the window keeps its test editor.
+    pub(super) _editor: crate::editor::Editor,
+    pub(super) a: std::path::PathBuf,
+    pub(super) b: std::path::PathBuf,
+    pub(super) a_id: crate::window::library_host::NotebookId,
+    pub(super) b_id: crate::window::library_host::NotebookId,
+}
+
+pub(super) fn notebooks_a_and_b(label: &str, a_note: &str, b_note: &str) -> NotebooksAB {
+    let scratch = LibraryScratch::new(label);
+    let (a, b) = (scratch.root.join("A"), scratch.root.join("B"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("a.md"), a_note).unwrap();
+    std::fs::write(b.join("b.md"), b_note).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    ensure_sidebar(window.hwnd);
+    let a_id = open_and_load_folder(&window, &a);
+    let b_id = open_and_load_folder(&window, &b);
+    assert_eq!(
+        crate::window::library_host::default_notebook(window.hwnd),
+        Some(a_id),
+        "A is the default"
+    );
+    app_mut(window.hwnd).notifications.dismiss_all();
+    NotebooksAB {
+        scratch,
+        window,
+        _editor: editor,
+        a,
+        b,
+        a_id,
+        b_id,
+    }
+}
+
 pub(super) fn tab_paths(hwnd: HWND) -> Vec<Option<std::path::PathBuf>> {
     app_mut(hwnd)
         .tabs

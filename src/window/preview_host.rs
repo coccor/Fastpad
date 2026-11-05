@@ -1300,7 +1300,7 @@ fn follow(hwnd: HWND, dest: String) {
             }
         }
         LinkAction::Tag(tag) => {
-            if crate::window::library_host::folder(hwnd).is_some() {
+            if crate::window::library_host::default_notebook(hwnd).is_some() {
                 crate::window::tags_view::reveal(hwnd, &tag);
             } else {
                 host_window::push_notice(hwnd, "Open a notebook to browse its tags.".to_owned());

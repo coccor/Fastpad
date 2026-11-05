@@ -115,3 +115,32 @@ fn the_tags_view_says_so_when_there_are_no_tags() {
     let mode = app_mut(window.hwnd).sidebar.as_ref().unwrap().tags.mode;
     assert_eq!(mode, crate::window::tags_view::Mode::Empty);
 }
+
+#[test]
+fn the_tags_view_shows_the_target_notebooks_tags() {
+    // Break caught: the Tags view listing the default notebook's tags while a note of another
+    // notebook is in front, or not saying whose tags they are (multi-root notebooks spec §5.3).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("tags-target", "a #alpha\n", "b #beta\n");
+    let hwnd = ab.window.hwnd;
+    let tagged = |id, path: &str| {
+        crate::window::library_host::note_index_of(hwnd, id)
+            .facts(std::path::Path::new(path))
+            .is_some_and(|facts| !facts.tags.is_empty())
+    };
+    pump_until(hwnd, || tagged(ab.a_id, "a.md") && tagged(ab.b_id, "b.md"));
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, false);
+
+    let rows = crate::window::tags_view::shown_rows(hwnd);
+    let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
+    assert_eq!(names, ["#beta"]);
+    assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in B");
+
+    // Another notebook's note in front: the view follows it.
+    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+    let rows = crate::window::tags_view::shown_rows(hwnd);
+    let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
+    assert_eq!(names, ["#alpha"]);
+    assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in A");
+}

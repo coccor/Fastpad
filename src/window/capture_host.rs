@@ -13,11 +13,13 @@ use windows_sys::Win32::Foundation::HWND;
 /// The id the capture hotkey is registered under.
 const HOTKEY_ID: i32 = 0x4350;
 
-/// The notebook a capture goes to, and its conventions: the open notebook, else the most recent
-/// one, else `Documents\FastPad`.
+/// The notebook a capture goes to, and its conventions: the default notebook (multi-root
+/// notebooks spec §5.3), else the most recent one, else `Documents\FastPad`.
 fn capture_root(hwnd: HWND) -> Option<(PathBuf, NotebookSettings)> {
-    if let Some(root) = super::library_host::folder(hwnd) {
-        return Some((root, super::library_host::notebook_settings(hwnd)));
+    if let Some(id) = super::library_host::capture_notebook(hwnd)
+        && let Some(root) = super::library_host::notebook_folder(hwnd, id)
+    {
+        return Some((root, super::library_host::notebook_settings_of(hwnd, id)));
     }
     let data = crate::platform::fastpad_data_dir().ok();
     let fallback = crate::platform::paths::default_notes_folder().ok();
@@ -104,7 +106,12 @@ fn file(hwnd: HWND, capture: &Submitted, source: Option<&str>) -> Result<(PathBu
     };
     let filed = capture_file::file_capture(&request, &mut tabs)?;
     let path = root.join(&filed.note);
-    let autosave = super::library_host::notebook_autosave(hwnd).unwrap_or(false);
+    // The note's own notebook decides (spec §5.2): a notebook open in this window lists it at
+    // once, and its autosave switch says whether a dirty tab that took the capture is saved.
+    let owner = super::library_host::notebook_of(hwnd, &path);
+    let autosave = owner
+        .and_then(|id| super::library_host::with_notebook(hwnd, id, |state| state.local.autosave))
+        .unwrap_or(false);
     for (id, dirty) in std::mem::take(&mut tabs.appended) {
         if (!dirty || autosave) && save_tab(hwnd, id) {
             continue;
@@ -117,11 +124,9 @@ fn file(hwnd: HWND, capture: &Submitted, source: Option<&str>) -> Result<(PathBu
             ),
         );
     }
-    let open = super::library_host::folder(hwnd)
-        .is_some_and(|folder| crate::library::model::same_path(&folder, &root));
-    if open {
-        super::library_host::with_state(hwnd, |state| state.add_note(&path));
-        super::library_host::request_index(hwnd);
+    if let Some(id) = owner {
+        super::library_host::with_notebook(hwnd, id, |state| state.add_note(&path));
+        super::library_host::request_index_of(hwnd, id);
         super::side_panel::refresh(hwnd);
     }
     Ok((path, filed.line))
@@ -151,6 +156,13 @@ impl Sink for MainSink {
             .map(|(_, settings)| settings)
             .unwrap_or_default();
         capture_file::target_name(&settings, target)
+    }
+
+    fn notebook_name(&self) -> Option<String> {
+        if let Some(id) = super::library_host::capture_notebook(self.hwnd) {
+            return super::library_host::notebook_display_name(self.hwnd, id);
+        }
+        capture_root(self.hwnd).map(|(root, _)| super::library_host::notebook_name(&root))
     }
 
     fn file(&mut self, capture: &Submitted) -> Result<(), String> {

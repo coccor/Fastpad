@@ -1,8 +1,8 @@
 use super::{
     CLEAR_TOOL, FocusStop, HeaderButton, LOADING, NO_MATCH, NO_NOTEBOOK, PADDING_AT_96_DPI,
     REPLACE_ROW_AT_96_DPI, ROW_AT_96_DPI, ROW_INSET_AT_96_DPI, ROW_LINE_AT_96_DPI, SearchState,
-    SearchView, TOO_SHORT, fit_before, next_stop, notice_text, placeholder, skipped_tooltip,
-    status_text, summary_text,
+    SearchView, TOO_SHORT, fit_before, header_text, next_stop, notice_text, placeholder,
+    skipped_tooltip, status_text, summary_text,
 };
 use crate::library::text_search::{Progress, RunEnd, TextHit};
 use crate::search::{MatchOptions, SearchOption, Snippet};
@@ -31,6 +31,14 @@ fn the_placeholder_says_it_searches_text_in_the_open_notebook() {
         "Search text in Work"
     );
     assert_eq!(placeholder(None), "Search text");
+}
+
+#[test]
+fn the_header_names_the_notebook_it_searches() {
+    // Break caught: with several notebooks open, nothing saying which one Search covers
+    // (multi-root notebooks spec §5.3).
+    assert_eq!(header_text(Some("Work")), "Searching Work");
+    assert_eq!(header_text(None), "Search");
 }
 
 #[test]

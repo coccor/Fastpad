@@ -319,7 +319,12 @@ pub(crate) fn toggle_changed_only(hwnd: HWND) {
     }) else {
         return;
     };
-    if on && with_state(hwnd, |state| state.local.changed.is_empty()).unwrap_or(true) {
+    // One filter for the whole window (multi-root notebooks spec §3.1): it says so only when no
+    // open notebook has a changed note.
+    let none_changed = notebooks(hwnd).into_iter().all(|(id, _)| {
+        with_notebook(hwnd, id, |state| state.local.changed.is_empty()).unwrap_or(true)
+    });
+    if on && none_changed {
         push_notice(
             hwnd,
             "No notes changed outside FastPad since you last opened them.".to_owned(),
@@ -328,10 +333,17 @@ pub(crate) fn toggle_changed_only(hwnd: HWND) {
     crate::window::side_panel::refresh(hwnd);
 }
 
-/// Notes: Clear changed marks.
+/// Notes: Clear changed marks, in every open notebook: the changed-notes filter they feed is
+/// one for the whole window.
 pub(crate) fn clear_all_marks(hwnd: HWND) {
-    if with_state(hwnd, LibraryState::clear_all_changed).unwrap_or(false) {
-        save_local_soon(hwnd);
+    let mut cleared = false;
+    for (id, _) in notebooks(hwnd) {
+        if with_notebook(hwnd, id, LibraryState::clear_all_changed).unwrap_or(false) {
+            save_local_soon_of(hwnd, id);
+            cleared = true;
+        }
+    }
+    if cleared {
         crate::window::side_panel::refresh(hwnd);
     }
 }

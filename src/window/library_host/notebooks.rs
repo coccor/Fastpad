@@ -296,7 +296,8 @@ pub(crate) fn create_and_open_notebook(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let start = folder(hwnd)
+    let start = target_notebook(hwnd)
+        .and_then(|id| notebook_folder(hwnd, id))
         .and_then(|open| open.parent().map(Path::to_path_buf))
         .filter(|parent| parent.is_dir())
         .or_else(|| crate::platform::paths::documents_dir().ok());
@@ -399,10 +400,26 @@ pub(crate) fn is_favorite(hwnd: HWND) -> bool {
     folder(hwnd).is_some_and(|open| known_folders(hwnd, false).is_favorite(&open))
 }
 
-/// Notebook: Toggle favorite, and the Notebook view's star.
+/// The Notebook view's star, on the default notebook (a shim until the tree's roots name their
+/// notebook).
 pub(crate) fn toggle_notebook_favorite(hwnd: HWND) {
-    let Some(open) = folder(hwnd) else {
-        push_notice(hwnd, "Open a notebook first.".to_owned());
+    match default_notebook(hwnd) {
+        Some(id) => toggle_notebook_favorite_of(hwnd, id),
+        None => push_notice(hwnd, "Open a notebook first.".to_owned()),
+    }
+}
+
+/// Notebook: Toggle favorite, on the target notebook (multi-root notebooks spec §5.1).
+pub(crate) fn toggle_target_favorite(hwnd: HWND) {
+    match target_notebook(hwnd) {
+        Some(id) => toggle_notebook_favorite_of(hwnd, id),
+        None => push_notice(hwnd, "Open a notebook first.".to_owned()),
+    }
+}
+
+/// Adds the open notebook `id` to the favorites, or removes it.
+pub(crate) fn toggle_notebook_favorite_of(hwnd: HWND, id: NotebookId) {
+    let Some(open) = notebook_folder(hwnd, id) else {
         return;
     };
     let Some((was, now)) = update_folders(hwnd, |folders| {
@@ -433,9 +450,9 @@ pub(crate) fn remove_favorite(hwnd: HWND, folder: &Path) {
     }
 }
 
-/// Notebook: Close, on the default notebook.
+/// Notebook: Close, on the target notebook (multi-root notebooks spec §5.3).
 pub(crate) fn close_notebook(hwnd: HWND) {
-    match default_notebook(hwnd) {
+    match target_notebook(hwnd) {
         Some(id) => {
             close_notebook_of(hwnd, id);
         }

@@ -163,6 +163,15 @@ fn narrows(previous: &Narrowing, query: &str, options: MatchOptions, overlays: u
         && previous.overlays == overlays
 }
 
+/// The notebook the Search view searches (multi-root notebooks spec §5.3), and its folder: the
+/// view's notebook, while it is still open.
+fn searched(hwnd: HWND) -> Option<(library_host::NotebookId, PathBuf)> {
+    let folder = search_view::notebook(hwnd)?;
+    let id = library_host::notebook_of(hwnd, &folder)?;
+    let root = library_host::notebook_folder(hwnd, id)?;
+    same_path(&root, &folder).then_some((id, root))
+}
+
 /// A keystroke in the box: cancels any running search and restarts the debounce.
 pub(crate) fn schedule(hwnd: HWND) {
     cancel(hwnd);
@@ -213,10 +222,10 @@ pub(crate) fn run_now(hwnd: HWND) {
             return;
         }
     };
-    let Some(notebook) = library_host::folder(hwnd) else {
+    let Some((id, notebook)) = searched(hwnd) else {
         return;
     };
-    if library_host::with_state(hwnd, |_| ()).is_none() {
+    if library_host::with_notebook(hwnd, id, |_| ()).is_none() {
         return;
     }
     // Read with nothing of the App borrowed: a background dirty tab is swapped into the editor.
@@ -225,7 +234,7 @@ pub(crate) fn run_now(hwnd: HWND) {
     let candidate = with_host(hwnd, |host| host.previous.clone())
         .flatten()
         .filter(|previous| narrows(previous, &query, options, overlays_mark));
-    let Some((notes, list, marked)) = library_host::with_state(hwnd, |state| {
+    let Some((notes, list, marked)) = library_host::with_notebook(hwnd, id, |state| {
         let list = list_mark(&state.notes);
         let marked = note_mark(&state.notes);
         let keep: Option<HashSet<String>> = candidate
@@ -441,7 +450,9 @@ pub(crate) fn library_changed(hwnd: HWND) {
     if !searchable(&query) {
         return;
     }
-    let Some(list) = library_host::with_state(hwnd, |state| list_mark(&state.notes)) else {
+    let Some(list) = searched(hwnd)
+        .and_then(|(id, _)| library_host::with_notebook(hwnd, id, |state| list_mark(&state.notes)))
+    else {
         return;
     };
     if with_host(hwnd, |host| host.list) == Some(Some(list)) {
@@ -614,7 +625,7 @@ fn prepare(
     // The results' query and options, not the box's text, which may be newer.
     let (query, options) = search_view::run_query(hwnd)?;
     let matcher = Matcher::new(&query, options).ok()?;
-    let notebook = library_host::folder(hwnd)?;
+    let (_, notebook) = searched(hwnd)?;
     let template = search_view::replace_text(hwnd);
     // Read with nothing of the App borrowed: a background tab is swapped into the editor.
     let overlays = target_overlays(hwnd, &notebook, &candidates);
@@ -993,7 +1004,8 @@ pub(crate) fn replace_written(hwnd: HWND, lparam: LPARAM) {
 /// outside FastPad. Then the report is pushed and the query runs again, so the results show
 /// what still matches.
 fn report_written(hwnd: HWND, report: ReplaceReport, tab_matches: usize, tab_notes: usize) {
-    if let Some(notebook) = library_host::folder(hwnd) {
+    let searched = searched(hwnd);
+    if let Some((_, notebook)) = &searched {
         let done = report
             .written
             .iter()
@@ -1004,13 +1016,13 @@ fn report_written(hwnd: HWND, report: ReplaceReport, tab_matches: usize, tab_not
             .collect::<Vec<_>>();
         library_host::end_own_writes(hwnd, done.iter().map(PathBuf::as_path));
     }
-    if !report.written.is_empty() {
-        library_host::with_state(hwnd, |state| state.record_written_all(&report.written));
-        if let Some(notebook) = library_host::folder(hwnd) {
-            let reloads = clean_tabs_on(hwnd, &notebook, &report.written);
-            if !reloads.is_empty() {
-                spawn_reload(hwnd, reloads);
-            }
+    if !report.written.is_empty()
+        && let Some((id, notebook)) = &searched
+    {
+        library_host::with_notebook(hwnd, *id, |state| state.record_written_all(&report.written));
+        let reloads = clean_tabs_on(hwnd, notebook, &report.written);
+        if !reloads.is_empty() {
+            spawn_reload(hwnd, reloads);
         }
     }
     let changed = report

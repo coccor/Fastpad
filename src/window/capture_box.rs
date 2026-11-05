@@ -222,6 +222,23 @@ pub(crate) fn accessible_name(target_name: &str) -> String {
     format!("Quick capture to {target_name}")
 }
 
+/// Where the capture goes, as the title and the accessible name say it: the target, and the
+/// notebook it is in when the sink names one ("inbox.md in Work").
+pub(crate) fn destination(target_name: &str, notebook: Option<&str>) -> String {
+    match notebook {
+        Some(notebook) => format!("{target_name} in {notebook}"),
+        None => target_name.to_owned(),
+    }
+}
+
+/// The box's destination, from its sink.
+fn destination_of(capture: &CaptureBox) -> String {
+    destination(
+        &capture.sink.target_name(capture.target),
+        capture.sink.notebook_name().as_deref(),
+    )
+}
+
 /// An attachment's label in the strip.
 pub(crate) fn chip_label(source: &Source, index: usize) -> String {
     match source {
@@ -248,6 +265,10 @@ pub(crate) struct Submitted {
 pub(crate) trait Sink {
     /// What the title shows for `target` ("inbox.md", "today's note", "inbox\").
     fn target_name(&self, target: CaptureTarget) -> String;
+    /// The display name of the notebook the capture goes to, if the sink knows one.
+    fn notebook_name(&self) -> Option<String> {
+        None
+    }
     /// Files the capture; the error is shown in the box, which stays open.
     fn file(&mut self, capture: &Submitted) -> Result<(), String>;
     /// The box closed (saved or not).
@@ -630,7 +651,7 @@ fn relayout(hwnd: HWND) {
     capture.selected = capture.selected.min(capture.items.len());
     let edit = capture.layout.edit;
     let (width, height) = (capture.layout.width, capture.layout.height);
-    let name = capture.sink.target_name(capture.target);
+    let name = destination_of(capture);
     unsafe {
         SetWindowPos(
             capture.edit,
@@ -995,7 +1016,7 @@ fn paint(hwnd: HWND) {
     let pad = scale(PAD_AT_96_DPI, capture.dpi);
     let old = unsafe { SelectObject(dc, capture.title_font) };
     unsafe { SetTextColor(dc, colors.editor_foreground) };
-    let name = capture.sink.target_name(capture.target);
+    let name = destination_of(capture);
     draw_text(
         dc,
         &title_text(&name),
@@ -1298,6 +1319,16 @@ pub(crate) fn attach_for_test(hwnd: HWND, source: Source) {
     attach(hwnd, source);
 }
 
+/// The notebook the box names, for in-process tests.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn shown_notebook(hwnd: HWND) -> Option<String> {
+    state(hwnd)?.sink.notebook_name()
+}
+
 #[cfg(test)]
 #[allow(
     dead_code,
@@ -1426,6 +1457,8 @@ mod tests {
     fn the_title_and_name_say_where_the_capture_goes() {
         assert_eq!(title_text("inbox.md"), "Capture \u{2192} inbox.md");
         assert_eq!(accessible_name("inbox.md"), "Quick capture to inbox.md");
+        assert_eq!(destination("inbox.md", Some("Work")), "inbox.md in Work");
+        assert_eq!(destination("inbox.md", None), "inbox.md");
         assert_eq!(chip_label(&Source::Png(Vec::new()), 1), "Image 2");
         assert_eq!(
             chip_label(&Source::File(PathBuf::from(r"C:\logs\ledger.log")), 0),

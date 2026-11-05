@@ -243,6 +243,28 @@ pub(super) fn run(hwnd: HWND, command: CommandId) {
     }
 }
 
+/// The notebook the Notebook view puts first for `target_notebook` (multi-root notebooks spec
+/// §5.1): while the view shows and has the focus or a selected tree row, that row's notebook.
+/// Until rows carry their notebook, every row is the default notebook's.
+pub(crate) fn selected_notebook(hwnd: HWND) -> Option<crate::window::library_host::NotebookId> {
+    if crate::window::side_panel::current_view(hwnd) != crate::config::SidebarView::Notebook {
+        return None;
+    }
+    let engaged = with_view(hwnd, |view| {
+        let focused = unsafe { GetFocus() } == view.panel;
+        let selected = view.cursor == Cursor::Tree
+            && view
+                .list
+                .selected
+                .is_some_and(|index| matches!(view.target(index), Target::Row(_)));
+        focused || selected
+    })
+    .unwrap_or(false);
+    engaged
+        .then(|| crate::window::library_host::default_notebook(hwnd))
+        .flatten()
+}
+
 /// The selected note's absolute path while the panel has the keyboard focus on the tree, so
 /// palette and accelerator commands act on it rather than on the active tab (spec §6.3).
 pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {

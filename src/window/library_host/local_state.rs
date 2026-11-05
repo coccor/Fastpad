@@ -54,18 +54,8 @@ pub(super) fn save_local_of(hwnd: HWND, id: NotebookId, how: LocalWrite) {
     }
 }
 
-/// `save_local` on a writer thread, for a change the user just made (a folder rename).
-pub(crate) fn save_local_soon(hwnd: HWND) {
-    save_local(
-        hwnd,
-        LocalWrite {
-            wait: false,
-            force: false,
-        },
-    );
-}
-
-/// `save_local_soon` for the notebook `id`.
+/// `save_local` for the notebook `id` on a writer thread, for a change the user just made (a
+/// folder rename).
 pub(crate) fn save_local_soon_of(hwnd: HWND, id: NotebookId) {
     save_local_of(
         hwnd,
