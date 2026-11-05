@@ -159,7 +159,6 @@ pub(crate) fn notebook_opened(hwnd: HWND, _id: NotebookId) {
 
 /// Makes the open notebook `id` the default one: where capture and the single-notebook commands
 /// go.
-#[cfg_attr(not(test), expect(dead_code, reason = "the root menu offers it"))]
 pub(crate) fn set_default_notebook(hwnd: HWND, id: NotebookId) {
     let changed = host(hwnd, |host| {
         let known = host.notebooks.iter().any(|slot| slot.id == id);
@@ -396,12 +395,19 @@ pub(crate) fn recent_notebooks(hwnd: HWND) -> Vec<PathBuf> {
 }
 
 /// Whether the open notebook is a favorite.
+#[cfg(test)]
 pub(crate) fn is_favorite(hwnd: HWND) -> bool {
-    folder(hwnd).is_some_and(|open| known_folders(hwnd, false).is_favorite(&open))
+    folder(hwnd).is_some_and(|open| is_favorite_folder(hwnd, &open))
+}
+
+/// Whether the notebook at `folder` is a favorite.
+pub(crate) fn is_favorite_folder(hwnd: HWND, folder: &Path) -> bool {
+    known_folders(hwnd, false).is_favorite(folder)
 }
 
 /// The Notebook view's star, on the default notebook (a shim until the tree's roots name their
 /// notebook).
+#[cfg(test)]
 pub(crate) fn toggle_notebook_favorite(hwnd: HWND) {
     match default_notebook(hwnd) {
         Some(id) => toggle_notebook_favorite_of(hwnd, id),

@@ -193,11 +193,10 @@ pub(crate) fn suggested_file_name(hwnd: HWND) -> String {
 /// spec §5.2). With no notebook open it is a plain new tab.
 pub(crate) fn new_note(hwnd: HWND) {
     let root = default_notebook(hwnd).and_then(|id| notebook_folder(hwnd, id));
+    // The selected row may be any open notebook's: its folder is that notebook's.
     let context = root.map(|root| {
         crate::window::notebook_view::selected_folder(hwnd)
-            .filter(|candidate| {
-                library::model::same_path(candidate, &root) || library::is_inside(&root, candidate)
-            })
+            .filter(|candidate| notebook_of(hwnd, candidate).is_some())
             .unwrap_or(root)
     });
     match context {

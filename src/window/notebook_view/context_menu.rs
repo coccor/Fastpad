@@ -41,10 +41,10 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
     .flatten() else {
         return;
     };
-    let Target::Row(row) = target else {
+    let Target::Row(id, row) = target else {
         return;
     };
-    let Some(root) = crate::window::library_host::folder(hwnd) else {
+    let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
         return;
     };
     match &row.kind {
@@ -80,11 +80,16 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 Some(CommandId::NoteMoveToNotebook) => {
                     crate::window::library_host::move_to_notebook(hwnd, &path);
                 }
-                Some(CommandId::NoteRename) => crate::window::inline_name::rename(hwnd, &row.kind),
+                Some(CommandId::NoteRename) => {
+                    crate::window::inline_name::rename(hwnd, id, &row.kind);
+                }
                 Some(CommandId::NoteRevealInExplorer) => {
                     crate::window::library_host::reveal(hwnd, &path)
                 }
-                Some(CommandId::NoteDelete) if crate::window::library_host::ready_library(hwnd) => {
+                // The row's own notebook must be ready, not the default one.
+                Some(CommandId::NoteDelete)
+                    if crate::window::library_host::ready_library_of(hwnd, Some(id)) =>
+                {
                     crate::window::library_host::delete_file(hwnd, &path);
                 }
                 _ => {}
@@ -107,28 +112,33 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
             ];
             match crate::window::menus::track_popup(hwnd, &entries, point) {
                 Some(CommandId::NoteNew) => {
-                    crate::window::inline_name::new_note(hwnd, Some(relative.clone()));
+                    crate::window::inline_name::new_note(hwnd, Some((id, relative.clone())));
                 }
                 Some(CommandId::NoteNewFolder) => {
-                    crate::window::inline_name::new_folder(hwnd, Some(relative.clone()));
+                    crate::window::inline_name::new_folder(hwnd, Some((id, relative.clone())));
                 }
                 Some(CommandId::NotesNewFromTemplate) => {
                     crate::window::library_host::new_note_from_template(
                         hwnd,
-                        Some(relative.clone()),
+                        Some((id, relative.clone())),
                     );
                 }
-                Some(CommandId::NoteRename) => crate::window::inline_name::rename(hwnd, &row.kind),
+                Some(CommandId::NoteRename) => {
+                    crate::window::inline_name::rename(hwnd, id, &row.kind);
+                }
                 Some(CommandId::NoteRevealInExplorer) => {
                     crate::window::library_host::reveal(hwnd, &path)
                 }
-                Some(CommandId::NoteDelete) if crate::window::library_host::ready_library(hwnd) => {
-                    crate::window::library_host::delete_folder(hwnd, relative);
+                Some(CommandId::NoteDelete)
+                    if crate::window::library_host::ready_library_of(hwnd, Some(id)) =>
+                {
+                    crate::window::library_host::delete_folder_of(hwnd, id, relative);
                 }
                 _ => {}
             }
         }
-        RowKind::Draft => {}
+        RowKind::Root => root_menu(hwnd, id, Some(point)),
+        RowKind::Draft | RowKind::Placeholder(_) => {}
     }
 }
 
@@ -151,6 +161,9 @@ pub(super) fn context_menu(hwnd: HWND, lparam: LPARAM) {
         }
         match view.hit_test(client.x, client.y) {
             Hit::Row { index, .. } => Some((index, Some(view.to_main(client)))),
+            // A root row's menu is its "…" menu (multi-root notebooks spec §4.2).
+            Hit::Root(id) | Hit::Header(id, _) => view_row_index(&view.rows, id, &RowKind::Root)
+                .map(|index| (index, Some(view.to_main(client)))),
             _ => None,
         }
     })

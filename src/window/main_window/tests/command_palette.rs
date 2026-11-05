@@ -720,7 +720,11 @@ fn the_target_is_the_selected_row_then_the_active_tab_then_the_default() {
     );
 
     super::super::create_new_document(hwnd).unwrap();
+    // Opening b.md selected its row, which still stands for B while the Notebook view shows.
+    assert_eq!(target(), Some(ab.b_id), "the selected B row comes first");
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
     assert_eq!(target(), Some(ab.a_id), "an untitled tab: the default");
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
 
     // The palette's Favorite and Close act on the target.
     super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();

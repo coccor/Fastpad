@@ -21,13 +21,6 @@ pub(super) struct LocalWrite {
 /// It also carries the scan cache (about 1 MB for 10,000 notes), so it is encoded and written on
 /// a one-off writer thread from a snapshot: cloning the state is cheap next to encoding it and
 /// syncing the write. `local::write_in_order` keeps an older snapshot from landing last.
-pub(super) fn save_local(hwnd: HWND, how: LocalWrite) {
-    if let Some(id) = default_notebook(hwnd) {
-        save_local_of(hwnd, id, how);
-    }
-}
-
-/// `save_local` for the notebook `id`.
 pub(super) fn save_local_of(hwnd: HWND, id: NotebookId, how: LocalWrite) {
     let job = with_notebook(hwnd, id, |state| {
         let local = library::take_local_changes(state)
@@ -69,6 +62,7 @@ pub(crate) fn save_local_soon_of(hwnd: HWND, id: NotebookId) {
 
 /// Expands or collapses `path`, a folder relative to the open notebook, and remembers it in the
 /// per-PC file. The write happens on a writer thread, and only when the set changed.
+#[cfg(test)]
 pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
     if let Some(id) = default_notebook(hwnd) {
         set_expanded_of(hwnd, id, path, expanded);
@@ -98,15 +92,8 @@ pub(crate) fn set_expanded_of(hwnd: HWND, id: NotebookId, path: &Path, expanded:
     }
 }
 
-/// Collapses every folder (the root row stays as it is), or expands all of them, and remembers
-/// it in the per-PC file, the way `set_expanded` does for one folder.
-pub(crate) fn set_all_expanded(hwnd: HWND, expanded: bool) {
-    if let Some(id) = default_notebook(hwnd) {
-        set_all_expanded_of(hwnd, id, expanded);
-    }
-}
-
-/// `set_all_expanded` for the notebook `id`.
+/// Collapses every folder of the notebook `id` (its root row stays as it is), or expands all of
+/// them, and remembers it in the per-PC file, the way `set_expanded_of` does for one folder.
 pub(crate) fn set_all_expanded_of(hwnd: HWND, id: NotebookId, expanded: bool) {
     let changed = with_notebook(hwnd, id, |state| {
         let folders = if expanded {
@@ -132,13 +119,8 @@ pub(crate) fn set_all_expanded_of(hwnd: HWND, id: NotebookId, expanded: bool) {
     }
 }
 
-/// Whether any folder of the default notebook is expanded: what the Collapse all / Expand all
+/// Whether any folder of the notebook `id` is expanded: what its Collapse all / Expand all
 /// button offers.
-pub(crate) fn any_folder_expanded(hwnd: HWND) -> bool {
-    default_notebook(hwnd).is_some_and(|id| any_folder_expanded_of(hwnd, id))
-}
-
-/// Whether any folder of the notebook `id` is expanded.
 pub(crate) fn any_folder_expanded_of(hwnd: HWND, id: NotebookId) -> bool {
     with_notebook(hwnd, id, |state| !state.local.expanded.is_empty()).unwrap_or(false)
 }
@@ -150,6 +132,7 @@ pub(crate) fn expansion_revision(hwnd: HWND) -> u64 {
 
 /// Whether the open notebook's root row is expanded (open editors spec §3.3). True while no
 /// notebook state is loaded, so the loading and failed states show under it.
+#[cfg(test)]
 pub(crate) fn root_expanded(hwnd: HWND) -> bool {
     match default_notebook(hwnd) {
         Some(id) => root_expanded_of(hwnd, id),
@@ -164,6 +147,7 @@ pub(crate) fn root_expanded_of(hwnd: HWND, id: NotebookId) -> bool {
 
 /// Expands or collapses the notebook's root row and remembers it in the per-PC file, the way
 /// `set_expanded` does for a folder.
+#[cfg(test)]
 pub(crate) fn set_root_expanded(hwnd: HWND, expanded: bool) {
     if let Some(id) = default_notebook(hwnd) {
         set_root_expanded_of(hwnd, id, expanded);
@@ -252,6 +236,7 @@ pub(crate) fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) -> Result<bo
 }
 
 /// Rescans the default notebook (a shim until every caller names its notebook).
+#[cfg(test)]
 pub(crate) fn request_rescan(hwnd: HWND) {
     if let Some(id) = default_notebook(hwnd) {
         request_rescan_of(hwnd, id);

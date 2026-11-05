@@ -24,18 +24,18 @@ fn note_target(hwnd: HWND, tree: Option<&std::path::Path>) -> Option<std::path::
         .or_else(|| crate::window::library_host::active_file(hwnd))
 }
 
-/// Rename and Delete's ready check. A folder row is checked against the tree's notebook (the
-/// default one until rows name theirs). A note, the recorded or focused one or else the active
-/// tab's file, is checked against its own notebook, or the default one for a file no open
-/// notebook owns (multi-root notebooks spec §5.2).
+/// Rename and Delete's ready check. A folder row is checked against its own notebook. A note,
+/// the recorded or focused one or else the active tab's file, is checked against its own
+/// notebook, or the default one for a file no open notebook owns (multi-root notebooks spec
+/// §5.2).
 fn note_command_ready(
     hwnd: HWND,
     note: Option<&std::path::Path>,
-    folder: Option<&std::path::Path>,
+    folder: Option<crate::window::library_host::NotebookId>,
 ) -> bool {
     use crate::window::library_host;
     if note.is_none() && folder.is_some() {
-        return library_host::ready_library(hwnd);
+        return library_host::ready_library_of(hwnd, folder);
     }
     let path = note.map(std::path::Path::to_path_buf).or_else(|| {
         unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())
@@ -397,11 +397,13 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
             }
         }
         CommandId::NoteRename => {
-            if note_command_ready(hwnd, tree_note.as_deref(), tree_folder.as_deref()) {
+            let folder_notebook = tree_folder.as_ref().map(|(id, _)| *id);
+            if note_command_ready(hwnd, tree_note.as_deref(), folder_notebook) {
                 match (&tree_note, &tree_folder) {
                     (Some(path), _) => crate::window::inline_name::rename_note_at(hwnd, path),
-                    (None, Some(folder)) => crate::window::inline_name::rename(
+                    (None, Some((id, folder))) => crate::window::inline_name::rename(
                         hwnd,
+                        *id,
                         &crate::library::tree::RowKind::Folder(folder.clone()),
                     ),
                     (None, None) => crate::window::inline_name::rename_active(hwnd),
@@ -409,11 +411,12 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
             }
         }
         CommandId::NoteDelete => {
-            if note_command_ready(hwnd, tree_note.as_deref(), tree_folder.as_deref()) {
+            let folder_notebook = tree_folder.as_ref().map(|(id, _)| *id);
+            if note_command_ready(hwnd, tree_note.as_deref(), folder_notebook) {
                 match (&tree_note, &tree_folder) {
                     (Some(path), _) => crate::window::library_host::delete_file(hwnd, path),
-                    (None, Some(folder)) => {
-                        crate::window::library_host::delete_folder(hwnd, folder);
+                    (None, Some((id, folder))) => {
+                        crate::window::library_host::delete_folder_of(hwnd, *id, folder);
                     }
                     (None, None) => crate::window::library_host::delete_note(hwnd),
                 }

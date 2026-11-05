@@ -86,9 +86,9 @@ impl Drag {
     /// The pointer moved to `point`, over `hover`: the target and the resting folder follow.
     /// `root` is the notebook's folder on disk. True when the target changed, so the highlight
     /// repaints.
-    pub(crate) fn hover(
+    pub(crate) fn hover<R: AsRef<TreeRow>>(
         &mut self,
-        rows: &[TreeRow],
+        rows: &[R],
         root: &Path,
         point: (i32, i32),
         hover: Hover,
@@ -119,7 +119,7 @@ pub(crate) fn past_threshold(origin: (i32, i32), point: (i32, i32), cx: i32, cy:
 pub(crate) fn source_path(kind: &RowKind) -> Option<&Path> {
     match kind {
         RowKind::Note(path) | RowKind::Folder(path) => Some(path),
-        RowKind::Draft => None,
+        RowKind::Draft | RowKind::Root | RowKind::Placeholder(_) => None,
     }
 }
 
@@ -130,12 +130,12 @@ fn parent_of(path: &Path) -> PathBuf {
 /// The folder a drop over `hover` goes into (spec §3.2): a folder row's folder, a note row's
 /// folder, the root for the truncated row, the space below the rows and the root row; `None`
 /// outside the panel and on the draft row.
-pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
+pub(crate) fn drop_folder<R: AsRef<TreeRow>>(rows: &[R], hover: Hover) -> Option<PathBuf> {
     match hover {
-        Hover::Row(index) => match rows.get(index).map(|row| &row.kind) {
+        Hover::Row(index) => match rows.get(index).map(|row| &row.as_ref().kind) {
             Some(RowKind::Folder(path)) => Some(path.clone()),
             Some(RowKind::Note(path)) => Some(parent_of(path)),
-            None => Some(PathBuf::new()),
+            None | Some(RowKind::Root | RowKind::Placeholder(_)) => Some(PathBuf::new()),
             Some(RowKind::Draft) => None,
         },
         Hover::Below | Hover::Header => Some(PathBuf::new()),
@@ -187,15 +187,15 @@ pub(crate) enum Highlight {
 }
 
 /// What dropping into `folder` highlights; `None` when the folder has no row now.
-pub(crate) fn highlight(rows: &[TreeRow], folder: &Path) -> Option<Highlight> {
+pub(crate) fn highlight<R: AsRef<TreeRow>>(rows: &[R], folder: &Path) -> Option<Highlight> {
     if folder.as_os_str().is_empty() {
         return Some(Highlight::Root);
     }
     let start = tree::row_index(rows, &RowKind::Folder(folder.to_path_buf()))?;
-    let depth = rows[start].depth;
+    let depth = rows[start].as_ref().depth;
     let end = rows[start + 1..]
         .iter()
-        .position(|row| row.depth <= depth)
+        .position(|row| row.as_ref().depth <= depth)
         .map_or(rows.len(), |offset| start + 1 + offset);
     Some(Highlight::Rows { start, end })
 }
@@ -225,9 +225,9 @@ pub(crate) fn scroll_step(y: i32, top: i32, bottom: i32, row_height: i32) -> i32
 
 /// The collapsed folder the pointer rests on, keeping its first time while it stays the same
 /// row. Only a folder that takes the drag rests: expanding a refused one would help nothing.
-fn rest_on(
+fn rest_on<R: AsRef<TreeRow>>(
     resting: Option<(PathBuf, Instant)>,
-    rows: &[TreeRow],
+    rows: &[R],
     hover: Hover,
     target: Option<&Path>,
     now: Instant,
@@ -235,7 +235,7 @@ fn rest_on(
     let Hover::Row(index) = hover else {
         return None;
     };
-    let row = rows.get(index)?;
+    let row = rows.get(index)?.as_ref();
     let RowKind::Folder(path) = &row.kind else {
         return None;
     };

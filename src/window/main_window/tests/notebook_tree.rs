@@ -203,10 +203,17 @@ fn the_view_says_loading_then_shows_the_tree_and_recent_notebooks_once_closed() 
 
     app_mut(window.hwnd).library.assume_folder(scratch.folder());
     crate::window::notebook_view::rebuild(window.hwnd);
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
+    assert!(shows_placeholder(
+        window.hwnd,
+        crate::library::tree::Placeholder::Loading
+    ));
 
     scratch.install(window.hwnd);
     assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+    assert_eq!(
+        view_rows(window.hwnd)[1..],
+        [(first_id(window.hwnd), RowKind::Note("a.md".into()))]
+    );
 
     execute_command(window.hwnd, CommandId::CloseNotebook);
     assert_eq!(notebook_view(window.hwnd).mode, Mode::NoNotebook);
@@ -214,11 +221,10 @@ fn the_view_says_loading_then_shows_the_tree_and_recent_notebooks_once_closed() 
 }
 
 #[test]
-fn a_failed_load_offers_retry_and_open_instead_of_loading_forever() {
+fn a_failed_load_offers_retry_instead_of_loading_forever() {
     // Break caught: a notebook whose load failed showing "Loading…" in both views for good,
     // with no way to try again but reopening it.
-    use windows_sys::Win32::Foundation::LPARAM;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
+    use crate::library::tree::Placeholder;
     let _scintilla = load_native_scintilla();
     let scratch = LibraryScratch::new("view-failed");
     scratch.note("a.md", "a");
@@ -236,16 +242,13 @@ fn a_failed_load_offers_retry_and_open_instead_of_loading_forever() {
         window.hwnd,
         crate::window::library_host::test_ready_payload(generation, Err("boom".to_owned())),
     );
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Failed);
+    assert!(shows_placeholder(window.hwnd, Placeholder::Failed));
     let panel = notebook_view(window.hwnd).panel;
-    let mut client = RECT::default();
-    unsafe { GetClientRect(panel, &mut client) };
-    let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
-    let buttons = notebook_view(window.hwnd).buttons(client, dpi);
-    let names: Vec<&str> = buttons.iter().map(|(name, _)| name.as_str()).collect();
-    assert!(
-        names.ends_with(&["Retry", "Open notebook…"]),
-        "exposed to screen readers like the empty-state buttons: {names:?}"
+    // Screen readers read the placeholder row as they read any row.
+    let failed = row_of(window.hwnd, &RowKind::Placeholder(Placeholder::Failed));
+    assert_eq!(
+        notebook_view(window.hwnd).rows()[failed].name,
+        "Couldn't load. Retry"
     );
     crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Search, false);
     assert_eq!(
@@ -254,22 +257,23 @@ fn a_failed_load_offers_retry_and_open_instead_of_loading_forever() {
     );
 
     crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
-    let retry = buttons[buttons.len() - 2].1;
-    let lparam = ((((retry.top + retry.bottom) / 2) as u32) << 16
-        | ((retry.left + retry.right) / 2) as u32) as LPARAM;
-    unsafe {
-        SendMessageW(panel, WM_LBUTTONDOWN, 0, lparam);
-        SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
-    }
-    assert_eq!(
-        notebook_view(window.hwnd).mode,
-        Mode::Loading,
+    let retry = notebook_view(window.hwnd).row_rect_at(failed).unwrap();
+    click(
+        panel,
+        (retry.left + retry.right) / 2,
+        (retry.top + retry.bottom) / 2,
+    );
+    assert!(
+        shows_placeholder(window.hwnd, Placeholder::Loading),
         "Retry clears the failure and loads the same notebook again"
     );
     pump_until(window.hwnd, || {
         app_mut(window.hwnd).library.default_state().is_some()
     });
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
+    assert_eq!(
+        view_rows(window.hwnd)[1..],
+        [(first_id(window.hwnd), RowKind::Note("a.md".into()))]
+    );
 }
 
 #[test]
@@ -295,7 +299,10 @@ fn at_startup_both_views_say_loading_for_the_notebook_being_opened() {
         crate::window::search_view::status(window.hwnd),
         Some(crate::window::search_view::LOADING)
     );
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Loading);
+    assert!(shows_placeholder(
+        window.hwnd,
+        crate::library::tree::Placeholder::Loading
+    ));
     pump_until(window.hwnd, || {
         app_mut(window.hwnd).library.default_state().is_some()
     });
@@ -311,15 +318,13 @@ fn an_empty_notebook_stays_empty_with_untitled_tabs_open() {
     let (window, _editor) = notebook_window(&scratch);
     execute_command(window.hwnd, CommandId::New);
     crate::window::notebook_view::rebuild(window.hwnd);
-    let view = notebook_view(window.hwnd);
-    assert_eq!(view.mode, crate::window::notebook_view::Mode::Empty);
-    assert!(view.rows.is_empty());
+    assert!(shows_empty(window.hwnd), "{:?}", view_rows(window.hwnd));
 }
 
 #[test]
-fn the_header_star_favorites_the_notebook_and_every_state_paints() {
-    // Break caught: a star that does nothing, or a paint path that panics on an empty tree,
-    // the loading state or the no-notebook state.
+fn the_root_menu_favorites_the_notebook_and_every_state_paints() {
+    // Break caught: a favorite entry that does nothing, or a paint path that panics on an
+    // empty tree, a root row showing its buttons, the loading state or the no-notebook state.
     let _scintilla = load_native_scintilla();
     let scratch = LibraryScratch::new("view-star");
     scratch.note("a.md", "a");
@@ -329,11 +334,17 @@ fn the_header_star_favorites_the_notebook_and_every_state_paints() {
     app_mut(window.hwnd).library.data_dir = Some(scratch.data());
     scratch.install(window.hwnd);
 
+    answer_next_popup_menu(|_| Some(CommandId::ToggleNotebookFavorite));
     crate::window::notebook_view::header_clicked(
         window.hwnd,
-        crate::window::notebook_view::HeaderButton::Favorite,
+        first_id(window.hwnd),
+        crate::window::notebook_view::HeaderButton::More,
     );
     assert!(crate::window::library_host::is_favorite(window.hwnd));
+    assert!(
+        notebook_view(window.hwnd).roots[0].favorite,
+        "the root row's menu says so next time"
+    );
 
     let panel = notebook_view(window.hwnd).panel;
     let area = RECT {
@@ -788,11 +799,19 @@ fn a_case_only_rename_in_the_tree_renames_the_note_and_the_folder() {
         names
     };
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("plan.md".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Note("plan.md".into()),
+    );
     type_into_field(window.hwnd, "Plan.md");
     assert_eq!(crate::window::inline_name::problem(window.hwnd), None);
     field_key(window.hwnd, VK_RETURN);
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "Sub");
     field_key(window.hwnd, VK_RETURN);
 
@@ -931,7 +950,11 @@ fn a_note_rename_whose_tab_cannot_follow_and_cannot_be_undone_stands() {
         Some(scratch.folder().join("c.md"));
     crate::window::library_host::fail_next_note_rename_back();
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Note("a.md".into()),
+    );
     type_into_field(window.hwnd, "c");
     field_key(window.hwnd, VK_RETURN);
 

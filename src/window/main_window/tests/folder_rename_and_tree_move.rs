@@ -78,7 +78,11 @@ fn renaming_a_folder_moves_its_preview_and_dirty_tabs_without_saving_them() {
     let b_id = app_mut(window.hwnd).tabs.find_stored_path(&b).unwrap();
     crate::window::notebook_view::rebuild(window.hwnd);
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "Moved");
     field_key(
         window.hwnd,
@@ -111,7 +115,11 @@ fn a_case_only_folder_rename_renames_it_on_disk_and_in_tabs_and_expansion() {
     open_note(&window, &scratch, r"sub\a.md", "a");
     crate::window::notebook_view::rebuild(window.hwnd);
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "Sub");
     field_key(
         window.hwnd,
@@ -159,7 +167,11 @@ fn a_folder_rename_an_open_tab_cannot_follow_is_undone() {
         Some(scratch.folder().join(r"Moved\a.md"));
     crate::window::notebook_view::rebuild(window.hwnd);
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "Moved");
     field_key(
         window.hwnd,

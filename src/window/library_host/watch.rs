@@ -87,8 +87,9 @@ pub(super) fn forget_closed_notebook(hwnd: HWND, folder: &Path, last: bool) {
                     .is_some_and(|rest| rest.starts_with(['\\', '/'])))
         });
         let templates_inside = match &host.shown_templates {
-            Some((Some(parent), _)) => crate::library::is_inside(folder, parent),
-            Some((None, _)) => last,
+            Some(((id, _), _)) => host.notebooks.iter().any(|slot| {
+                slot.id == *id && crate::library::model::same_path(&slot.folder, folder)
+            }),
             None => false,
         };
         if templates_inside || last {

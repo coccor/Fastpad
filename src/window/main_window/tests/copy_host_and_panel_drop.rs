@@ -313,7 +313,7 @@ fn open_editors_a_tab_and_an_explorer_file_copy_into_an_empty_notebook() {
         std::fs::write(&outside, "t").unwrap();
         let (window, _editor) = notebook_window(&scratch);
         super::super::open_path(window.hwnd, &outside).unwrap();
-        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+        assert!(shows_empty(window.hwnd));
         let panel = sidebar_windows(window.hwnd).1;
 
         let tab = notebook_view(window.hwnd)
@@ -345,7 +345,7 @@ fn open_editors_a_tab_and_an_explorer_file_copy_into_an_empty_notebook() {
     let dropped = scratch.root.join("dropped.md");
     std::fs::write(&dropped, "d").unwrap();
     let (window, _editor) = notebook_window(&scratch);
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    assert!(shows_empty(window.hwnd));
     let panel = sidebar_windows(window.hwnd).1;
     crate::window::side_panel::accept_file_drops(window.hwnd);
     let root = notebook_view(window.hwnd).root_rect();
@@ -368,7 +368,10 @@ fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows
     let collapse = || {
         crate::window::library_host::set_root_expanded(window.hwnd, false);
         crate::window::notebook_view::rebuild(window.hwnd);
-        assert!(!notebook_view(window.hwnd).tree_shown());
+        assert_eq!(
+            view_rows(window.hwnd),
+            [(first_id(window.hwnd), RowKind::Root)]
+        );
     };
     collapse();
     let panel = sidebar_windows(window.hwnd).1;
@@ -382,14 +385,18 @@ fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows
     mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
     assert!(inline_open(window.hwnd));
     assert!(crate::window::library_host::root_expanded(window.hwnd));
-    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(view_rows(window.hwnd).len() > 1, "the root shows its rows");
     assert!(is_shown(inline_field(window.hwnd)), "the name field shows");
     field_key(window.hwnd, VK_ESCAPE);
 
     collapse();
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Note("a.md".into()),
+    );
     assert!(inline_open(window.hwnd));
-    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(view_rows(window.hwnd).len() > 1, "the root shows its rows");
     assert!(
         is_shown(inline_field(window.hwnd)),
         "the rename field shows"
@@ -399,7 +406,7 @@ fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows
     collapse();
     crate::window::inline_name::rename_note_at(window.hwnd, &scratch.folder().join("a.md"));
     assert!(inline_open(window.hwnd));
-    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(view_rows(window.hwnd).len() > 1, "the root shows its rows");
     assert!(
         is_shown(inline_field(window.hwnd)),
         "the revealed row's field shows"
@@ -424,15 +431,15 @@ fn open_editors_a_collapsed_root_takes_the_keyboard_off_the_hidden_tree() {
 
     crate::window::library_host::set_root_expanded(window.hwnd, false);
     crate::window::notebook_view::rebuild(window.hwnd);
-    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Root);
+    // The hidden rows are gone from the list: the selection moved to their root row.
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+    assert_eq!(selected_kind(window.hwnd), Some(RowKind::Root));
 
-    // Even a selection left in the tree some other way acts on nothing hidden.
-    notebook_view(window.hwnd).cursor = Cursor::Tree;
     let panel = sidebar_windows(window.hwnd).1;
     unsafe { SendMessageW(panel, WM_CHAR, 'b' as usize, 0) };
     assert_eq!(
         selected_kind(window.hwnd),
-        Some(RowKind::Note("a.md".into())),
+        Some(RowKind::Root),
         "type-ahead selects no hidden row"
     );
     let _ = crate::window::modal::take_last_confirm();

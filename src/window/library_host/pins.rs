@@ -20,12 +20,8 @@ pub(crate) fn notes_mode_notice(enabled: bool) -> &'static str {
 pub(super) const READ_ONLY: &str = "This notebook's .fastpad\\library.ini can't be read, so pins are off until it is fixed or removed.";
 pub(super) const BUSY: &str = "This notebook's .fastpad\\library.ini is in use by another program. FastPad reads it again when you come back to the window.";
 
-/// True when organizing the default notebook can proceed; otherwise explains why not.
-pub(crate) fn ready_library(hwnd: HWND) -> bool {
-    ready_library_of(hwnd, default_notebook(hwnd))
-}
-
-/// `ready_library` for the notebook `id`; `None` names no open notebook.
+/// True when organizing the notebook `id` can proceed; otherwise explains why not. `None` names
+/// no open notebook.
 pub(crate) fn ready_library_of(hwnd: HWND, id: Option<NotebookId>) -> bool {
     let metadata = id.and_then(|id| with_notebook(hwnd, id, |state| state.metadata));
     match metadata {

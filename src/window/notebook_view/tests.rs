@@ -13,6 +13,19 @@ fn edges(rect: RECT) -> (i32, i32, i32, i32) {
     (rect.left, rect.top, rect.right, rect.bottom)
 }
 
+/// The notebook the unit tests' rows belong to.
+const ID: NotebookId = NotebookId(1);
+
+/// `rows` as the view's rows of notebook `ID`.
+fn view(rows: &[TreeRow]) -> Vec<ViewRow> {
+    rows.iter()
+        .map(|row| ViewRow {
+            notebook: ID,
+            row: row.clone(),
+        })
+        .collect()
+}
+
 fn row(kind: RowKind, depth: u16) -> TreeRow {
     TreeRow {
         kind,
@@ -95,16 +108,16 @@ fn a_vanished_selection_moves_to_the_row_that_took_its_place() {
     ];
     let a = RowKind::Note(r"sub\a.md".into());
     assert_eq!(
-        follow(&rows, Some(&a), Some(7)),
+        follow(&view(&rows), Some((ID, &a)), Some(7)),
         Some(1),
         "found by path first"
     );
     let gone = RowKind::Note(r"sub\b.md".into());
-    assert_eq!(follow(&rows, Some(&gone), Some(2)), Some(2));
-    assert_eq!(follow(&rows, Some(&gone), Some(9)), Some(2));
-    assert_eq!(follow(&[], Some(&gone), Some(1)), None);
+    assert_eq!(follow(&view(&rows), Some((ID, &gone)), Some(2)), Some(2));
+    assert_eq!(follow(&view(&rows), Some((ID, &gone)), Some(9)), Some(2));
+    assert_eq!(follow(&[], Some((ID, &gone)), Some(1)), None);
     assert_eq!(
-        follow(&rows, None, Some(1)),
+        follow(&view(&rows), None, Some(1)),
         None,
         "nothing selected stays so"
     );
@@ -697,13 +710,13 @@ fn collapse_all_keeps_the_selected_row_when_it_is_still_listed() {
     let index = tree::row_index(&before, &selected);
     let after = flatten(&tree, &[]);
     assert_eq!(
-        follow(&after, Some(&selected), index),
+        follow(&view(&after), Some((ID, &selected)), index),
         tree::row_index(&after, &selected)
     );
     // A row inside a collapsed folder is gone: the selection stays in range.
     let hidden = RowKind::Note(r"a\b\two.md".into());
     let index = tree::row_index(&before, &hidden);
-    assert!(follow(&after, Some(&hidden), index).is_some_and(|row| row < after.len()));
+    assert!(follow(&view(&after), Some((ID, &hidden)), index).is_some_and(|row| row < after.len()));
 }
 
 #[test]
@@ -737,7 +750,9 @@ fn the_color_under_a_row_is_the_band_inside_the_highlight_and_the_panel_elsewher
 }
 
 #[test]
-fn a_focused_root_row_draws_the_accent_focus_ring() {
+fn a_focused_open_editors_header_draws_the_accent_focus_ring() {
+    // Root rows are tree rows now (multi-root notebooks spec §4.2) and take the tree's bar;
+    // the section header is the row the ring outlines.
     use crate::window::icon_sets::images::TestTarget;
     use crate::window::panel_cursor::Cursor;
     let palette = Palette::neutral();
@@ -749,13 +764,14 @@ fn a_focused_root_row_draws_the_accent_focus_ring() {
     };
     let mut view = NotebookView::new(std::ptr::null_mut());
     view.mode = Mode::Tree;
-    view.cursor = Cursor::Root;
+    view.cursor = Cursor::EditorsHeader;
     let layout = view.layout(client, 96);
+    let header = layout.editors_header;
     let probe = RECT {
-        left: layout.root.left + (layout.root.right - layout.root.left) / 2,
-        top: layout.root.top + 1,
-        right: layout.root.left + (layout.root.right - layout.root.left) / 2 + 1,
-        bottom: layout.root.top + 2,
+        left: header.left + (header.right - header.left) / 2,
+        top: header.top + 1,
+        right: header.left + (header.right - header.left) / 2 + 1,
+        bottom: header.top + 2,
     };
     let mut ring_pixel = |focused: bool| {
         let target = TestTarget::new(240, 300);
@@ -819,7 +835,6 @@ fn the_selection_bar_is_only_where_the_keyboard_is() {
     };
     let mut view = NotebookView::new(std::ptr::null_mut());
     view.mode = Mode::Tree;
-    view.root_expanded = true;
     view.editors_expanded = true;
     view.list.set_count(3);
     view.list.selected = Some(0);
@@ -874,7 +889,7 @@ fn the_selection_bar_is_only_where_the_keyboard_is() {
     assert_eq!(bars(Cursor::Tree), (true, false));
     assert_eq!(bars(Cursor::Editor(1)), (false, true));
     assert_eq!(bars(Cursor::Editor(2)), (false, false));
-    assert_eq!(bars(Cursor::Root), (false, false));
+    assert_eq!(bars(Cursor::EditorsHeader), (false, false));
 }
 
 #[test]
@@ -984,5 +999,34 @@ fn changed_notes_and_the_collapsed_folders_holding_them_are_marked() {
             ("c.md".to_owned(), true),
             ("b.md".to_owned(), true)
         ]
+    );
+}
+
+#[test]
+fn a_root_label_carries_its_hint_and_the_marker_follows_it() {
+    // Break caught: a parent hint drawn over the name, or the default marker drawn on top of
+    // the label or past the room the buttons leave it.
+    let label = RootLabel {
+        name: "Notes".to_owned(),
+        hint: Some("X".to_owned()),
+        marker: Some(DEFAULT_MARKER_TIP),
+    };
+    assert_eq!(paint::root_label_text(&label), "Notes  X");
+    let name = RECT {
+        left: 20,
+        top: 0,
+        right: 150,
+        bottom: 26,
+    };
+    let marker = paint::marker_rect(name, 40, 96);
+    assert_eq!((marker.left, marker.right), (20 + 40 + 6, 20 + 40 + 6 + 16));
+    let cut = paint::marker_rect(name, 200, 96);
+    assert!(
+        cut.left <= cut.right && cut.right <= name.right,
+        "kept inside the name's room"
+    );
+    assert_eq!(
+        placeholder_text(tree::Placeholder::Failed),
+        "Couldn't load. Retry"
     );
 }

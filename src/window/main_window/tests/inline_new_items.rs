@@ -12,7 +12,8 @@ fn new_folder_from_the_header_names_it_in_an_empty_draft_row_and_selects_the_new
     let scratch = LibraryScratch::new("inline-new-folder");
     scratch.note("top.md", "t");
     let (window, _editor) = notebook_window(&scratch);
-    select_row(window.hwnd, &RowKind::Note("top.md".into()));
+    // A root row shows its buttons, to screen readers too, while it is selected.
+    select_row(window.hwnd, &RowKind::Root);
     let panel = sidebar_windows(window.hwnd).1;
     let count = crate::window::side_panel::accessible_item_count(panel);
     assert!(
@@ -21,15 +22,17 @@ fn new_folder_from_the_header_names_it_in_an_empty_draft_row_and_selects_the_new
             .any(|item| item.name == "New folder"),
         "the header button has its accessible name"
     );
+    select_row(window.hwnd, &RowKind::Note("top.md".into()));
     let press = || {
         crate::window::notebook_view::header_clicked(
             window.hwnd,
+            first_id(window.hwnd),
             crate::window::notebook_view::HeaderButton::NewFolder,
         );
     };
 
     press();
-    assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
+    assert_eq!(draft_row(window.hwnd), Some((1, 1)), "first at the root");
     assert_eq!(
         crate::window::inline_name::purpose(window.hwnd),
         Some(crate::window::inline_name::Purpose::NewFolder(
@@ -96,7 +99,7 @@ fn new_folder_here_drafts_inside_that_folder_and_a_taken_name_keeps_the_field_op
 
     assert_eq!(
         draft_row(window.hwnd),
-        Some((index + 1, 1)),
+        Some((index + 1, 2)),
         "its first child"
     );
     assert!(
@@ -150,7 +153,10 @@ fn a_typed_folder_name_is_sanitized_hidden_names_are_refused_and_an_empty_one_ca
     scratch.note("top.md", "t");
     let (window, _editor) = notebook_window(&scratch);
     let create = |typed: &str| {
-        crate::window::inline_name::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
+        crate::window::inline_name::new_folder(
+            window.hwnd,
+            in_first(window.hwnd, std::path::PathBuf::new()),
+        );
         type_into_field(window.hwnd, typed);
         field_key(window.hwnd, VK_RETURN);
     };
@@ -196,14 +202,14 @@ fn a_new_folder_draft_survives_a_rescan_but_goes_with_its_folder_or_notebook() {
     app_mut(window.hwnd).library.data_dir = Some(scratch.data());
     scratch.install(window.hwnd);
     crate::window::notebook_view::rebuild(window.hwnd);
-    crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+    crate::window::inline_name::new_folder(window.hwnd, in_first(window.hwnd, "sub".into()));
     type_into_field(window.hwnd, "Typed");
 
     rescan_and_wait(window.hwnd);
     assert!(inline_open(window.hwnd));
     assert_eq!(field_text(window.hwnd), "Typed");
     let sub = row_of(window.hwnd, &RowKind::Folder("sub".into()));
-    assert_eq!(draft_row(window.hwnd), Some((sub + 1, 1)));
+    assert_eq!(draft_row(window.hwnd), Some((sub + 1, 2)));
 
     std::fs::remove_dir_all(scratch.folder().join("sub")).unwrap();
     rescan_and_wait(window.hwnd);
@@ -300,7 +306,7 @@ fn the_name_field_is_named_for_screen_readers_and_its_problem_is_its_description
     let scratch = LibraryScratch::new("inline-accessible");
     std::fs::create_dir_all(scratch.folder().join(r"sub\Taken")).unwrap();
     let (window, _editor) = notebook_window(&scratch);
-    crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+    crate::window::inline_name::new_folder(window.hwnd, in_first(window.hwnd, "sub".into()));
     let field = inline_field(window.hwnd);
     let read = |description: bool| -> String {
         let com = unsafe {
@@ -461,13 +467,14 @@ fn plus_new_note_here_and_the_palette_each_draft_a_note_in_the_right_folder() {
 
     crate::window::notebook_view::header_clicked(
         window.hwnd,
+        first_id(window.hwnd),
         crate::window::notebook_view::HeaderButton::NewNote,
     );
     assert_eq!(
         crate::window::inline_name::purpose(window.hwnd),
         Some(Purpose::NewNote(std::path::PathBuf::new()))
     );
-    assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+    assert_eq!(draft_row(window.hwnd), Some((1, 1)));
     assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
     assert_eq!(
         super::super::tab_count(window.hwnd),
@@ -486,7 +493,7 @@ fn plus_new_note_here_and_the_palette_each_draft_a_note_in_the_right_folder() {
         crate::window::inline_name::purpose(window.hwnd),
         Some(Purpose::NewNote("sub".into()))
     );
-    assert_eq!(draft_row(window.hwnd), Some((sub + 1, 1)), "sub expanded");
+    assert_eq!(draft_row(window.hwnd), Some((sub + 1, 2)), "sub expanded");
     field_key(window.hwnd, VK_ESCAPE);
 
     select_row(window.hwnd, &RowKind::Note(r"sub\b.md".into()));
@@ -532,7 +539,10 @@ fn enter_on_a_new_note_creates_the_file_and_opens_it_with_focus_in_the_editor() 
     assert_eq!(unsafe { GetFocus() }, editor.hwnd());
     row_of(window.hwnd, &RowKind::Note("todo.md".into()));
 
-    crate::window::inline_name::new_note(window.hwnd, Some(std::path::PathBuf::new()));
+    crate::window::inline_name::new_note(
+        window.hwnd,
+        in_first(window.hwnd, std::path::PathBuf::new()),
+    );
     type_into_field(window.hwnd, "data.json");
     field_key(window.hwnd, VK_RETURN);
     assert!(
@@ -600,7 +610,7 @@ fn a_new_note_clashing_with_an_unlisted_file_or_a_vanished_folder_says_so_after_
     );
     crate::window::inline_name::cancel(window.hwnd);
 
-    crate::window::inline_name::new_note(window.hwnd, Some("sub".into()));
+    crate::window::inline_name::new_note(window.hwnd, in_first(window.hwnd, "sub".into()));
     std::fs::remove_dir(scratch.folder().join("sub")).unwrap();
     type_into_field(window.hwnd, "x");
     field_key(window.hwnd, VK_RETURN);
@@ -648,16 +658,17 @@ fn the_first_note_of_an_empty_notebook_gets_a_draft_row() {
     let _scintilla = load_native_scintilla();
     let scratch = LibraryScratch::new("inline-new-note-empty");
     let (window, _editor) = notebook_window(&scratch);
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    assert!(shows_empty(window.hwnd));
 
     crate::window::notebook_view::header_clicked(
         window.hwnd,
+        first_id(window.hwnd),
         crate::window::notebook_view::HeaderButton::NewNote,
     );
     assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
-    assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+    assert_eq!(draft_row(window.hwnd), Some((1, 1)));
     field_key(window.hwnd, VK_ESCAPE);
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    assert!(shows_empty(window.hwnd));
 }
 
 #[test]
@@ -669,7 +680,7 @@ fn a_draft_whose_folder_goes_in_a_notebook_left_empty_shows_the_empty_state() {
     let scratch = LibraryScratch::new("inline-draft-empty-gone");
     std::fs::create_dir(scratch.folder().join("Fresh")).unwrap();
     let (window, _editor) = notebook_window(&scratch);
-    crate::window::inline_name::new_note(window.hwnd, Some("Fresh".into()));
+    crate::window::inline_name::new_note(window.hwnd, in_first(window.hwnd, "Fresh".into()));
     assert!(inline_open(window.hwnd));
     assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
 
@@ -681,25 +692,39 @@ fn a_draft_whose_folder_goes_in_a_notebook_left_empty_shows_the_empty_state() {
     crate::window::notebook_view::rebuild(window.hwnd);
 
     assert!(!inline_open(window.hwnd));
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    assert!(shows_empty(window.hwnd));
 }
 
 #[test]
 fn the_empty_notebooks_new_note_button_drafts_a_note_instead_of_opening_a_tab() {
-    // Break caught: the empty state's own "New note" button opening an untitled tab
-    // (`CommandId::New`) instead of drafting a note in the tree, which is the only way an
-    // empty notebook can name its own first note (inline naming spec §3.1).
+    // Break caught: an empty notebook's "New note" button, clicked on its root row, opening an
+    // untitled tab (`CommandId::New`) instead of drafting a note in the tree, which is the only
+    // way an empty notebook can name its own first note (inline naming spec §3.1).
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
     let _scintilla = load_native_scintilla();
     let scratch = LibraryScratch::new("inline-empty-state-button");
     let (window, _editor) = notebook_window(&scratch);
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    assert!(shows_empty(window.hwnd));
     let tabs = super::super::tab_count(window.hwnd);
+    let panel = sidebar_windows(window.hwnd).1;
 
-    crate::window::notebook_view::state_button(window.hwnd);
+    mouse(
+        panel,
+        WM_MOUSEMOVE,
+        0,
+        centre(notebook_view(window.hwnd).root_rect()),
+    );
+    let button = notebook_view(window.hwnd)
+        .root_button_rect(
+            first_id(window.hwnd),
+            crate::window::notebook_view::HeaderButton::NewNote,
+        )
+        .unwrap();
+    click(panel, button.left + 4, (button.top + button.bottom) / 2);
 
     assert_eq!(notebook_view(window.hwnd).mode, Mode::Tree);
-    assert_eq!(draft_row(window.hwnd), Some((0, 0)));
+    assert_eq!(draft_row(window.hwnd), Some((1, 1)));
     assert_eq!(unsafe { GetFocus() }, inline_field(window.hwnd));
     assert_eq!(
         super::super::tab_count(window.hwnd),

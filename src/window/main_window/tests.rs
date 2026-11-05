@@ -59,6 +59,7 @@ mod new_notebook;
 mod note_attachments;
 mod note_operations;
 mod notebook_tree;
+mod notebook_tree_roots;
 mod open_editors_and_folder_commands;
 mod preview_tabs_and_folders;
 mod quick_capture;
@@ -483,17 +484,83 @@ pub(super) fn notebook_view<'a>(hwnd: HWND) -> &'a mut NotebookView {
     &mut app_mut(hwnd).sidebar.as_mut().unwrap().notebook
 }
 
-pub(super) fn row_of(hwnd: HWND, kind: &RowKind) -> usize {
-    crate::library::tree::row_index(&notebook_view(hwnd).rows, kind)
-        .unwrap_or_else(|| panic!("{kind:?} is not in {:?}", notebook_view(hwnd).rows))
+/// The first open notebook in sidebar order: the one the single-notebook tests open.
+pub(super) fn first_id(hwnd: HWND) -> crate::window::library_host::NotebookId {
+    crate::window::library_host::notebooks(hwnd)
+        .first()
+        .map(|(id, _)| *id)
+        .expect("a notebook is open")
 }
 
-pub(super) fn selected_kind(hwnd: HWND) -> Option<RowKind> {
+/// `folder` (relative) of the first open notebook, as a new item's place.
+pub(super) fn in_first(
+    hwnd: HWND,
+    folder: std::path::PathBuf,
+) -> Option<(crate::window::library_host::NotebookId, std::path::PathBuf)> {
+    Some((first_id(hwnd), folder))
+}
+
+/// The index of the row of the notebook `id` showing `kind`.
+pub(super) fn row_in(
+    hwnd: HWND,
+    id: crate::window::library_host::NotebookId,
+    kind: &RowKind,
+) -> usize {
+    crate::window::notebook_view::view_row_index(&notebook_view(hwnd).rows, id, kind)
+        .unwrap_or_else(|| {
+            panic!(
+                "{kind:?} of {id:?} is not in {:?}",
+                notebook_view(hwnd).rows
+            )
+        })
+}
+
+/// `row_in` for the first open notebook.
+pub(super) fn row_of(hwnd: HWND, kind: &RowKind) -> usize {
+    row_in(hwnd, first_id(hwnd), kind)
+}
+
+/// The view's rows as their notebooks and kinds.
+pub(super) fn view_rows(hwnd: HWND) -> Vec<(crate::window::library_host::NotebookId, RowKind)> {
+    notebook_view(hwnd)
+        .rows
+        .iter()
+        .map(|row| (row.notebook, row.kind.clone()))
+        .collect()
+}
+
+/// The selected row's notebook and kind.
+pub(super) fn selected_row_of(
+    hwnd: HWND,
+) -> Option<(crate::window::library_host::NotebookId, RowKind)> {
     let view = notebook_view(hwnd);
     view.list
         .selected
         .and_then(|index| view.rows.get(index))
-        .map(|row| row.kind.clone())
+        .map(|row| (row.notebook, row.kind.clone()))
+}
+
+/// The first notebook's root row shows only the placeholder `placeholder` under it.
+pub(super) fn shows_placeholder(
+    hwnd: HWND,
+    placeholder: crate::library::tree::Placeholder,
+) -> bool {
+    let id = first_id(hwnd);
+    let rows: Vec<RowKind> = view_rows(hwnd)
+        .into_iter()
+        .filter(|(notebook, _)| *notebook == id)
+        .map(|(_, kind)| kind)
+        .collect();
+    rows == [RowKind::Root, RowKind::Placeholder(placeholder)]
+}
+
+/// The first notebook is listed with no notes: "No notes yet" under its root row.
+pub(super) fn shows_empty(hwnd: HWND) -> bool {
+    shows_placeholder(hwnd, crate::library::tree::Placeholder::Empty)
+}
+
+pub(super) fn selected_kind(hwnd: HWND) -> Option<RowKind> {
+    selected_row_of(hwnd).map(|(_, kind)| kind)
 }
 
 pub(super) fn select_row(hwnd: HWND, kind: &RowKind) {

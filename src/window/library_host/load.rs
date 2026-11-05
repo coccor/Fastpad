@@ -136,22 +136,10 @@ pub(crate) fn start_load_of(hwnd: HWND, id: NotebookId) {
     spawn_load(hwnd, id);
 }
 
-/// Whether the default notebook failed to load and has no state to show.
-pub(crate) fn load_failed(hwnd: HWND) -> bool {
-    default_notebook(hwnd).is_some_and(|id| load_failed_of(hwnd, id))
-}
-
 /// Whether the notebook `id` failed to load and has no state to show: the sidebar says so and
 /// offers Retry. A rescan that fails keeps the state it had, so this stays false then.
 pub(crate) fn load_failed_of(hwnd: HWND, id: NotebookId) -> bool {
     slot(hwnd, id, |slot| slot.load_failed && slot.state.is_none()).unwrap_or(false)
-}
-
-/// The sidebar's Retry for the default notebook.
-pub(crate) fn retry_load(hwnd: HWND) {
-    if let Some(id) = default_notebook(hwnd) {
-        retry_load_of(hwnd, id);
-    }
 }
 
 /// The sidebar's Retry after a failed load: loads the same notebook again, showing "Loading…"

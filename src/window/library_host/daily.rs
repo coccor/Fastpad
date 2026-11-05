@@ -322,15 +322,19 @@ fn templates(root: &Path, settings: &NotebookSettings) -> Vec<PathBuf> {
 }
 
 /// Notes: New note from template… (spec §9.4): a picker of the templates, for a new note in
-/// `parent` (relative), or the selected folder when `None`. The note is named inline in the
-/// tree, so the templates are those of the notebook the tree's rows belong to: the default
-/// notebook until rows name theirs (multi-root notebooks Task 9).
-pub(crate) fn new_note_from_template(hwnd: HWND, parent: Option<PathBuf>) {
-    let id = default_notebook(hwnd);
-    if !ready_library_of(hwnd, id) {
+/// `place` (a notebook and a folder relative to it), or in the target notebook's selected folder
+/// or root when `None` (multi-root notebooks spec §5.1). The templates are that notebook's, and
+/// the note is named inline under its root.
+pub(crate) fn new_note_from_template(hwnd: HWND, place: Option<(NotebookId, PathBuf)>) {
+    let Some(place) = crate::window::inline_name::place_for(hwnd, place) else {
+        return;
+    };
+    let id = place.0;
+    if !ready_library_of(hwnd, Some(id)) {
         return;
     }
-    let Some((id, root)) = id.and_then(|id| Some((id, notebook_folder(hwnd, id)?))) else {
+    let parent = place;
+    let Some(root) = notebook_folder(hwnd, id) else {
         return;
     };
     let settings = notebook_settings_of(hwnd, id);
@@ -372,6 +376,6 @@ pub(super) fn template_picked(hwnd: HWND, index: usize) {
         return;
     };
     if let Some(template) = found.get(index) {
-        crate::window::inline_name::new_note_from(hwnd, parent, template.clone());
+        crate::window::inline_name::new_note_from(hwnd, Some(parent), template.clone());
     }
 }

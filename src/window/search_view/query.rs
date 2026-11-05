@@ -146,7 +146,12 @@ pub(crate) fn target_changed(hwnd: HWND) {
 /// the view keeps the notebook it started in (while that is still open) so the replace is not
 /// cancelled by a tab switch; `text_search_host::finish_replace` catches the view up.
 fn shown_target(hwnd: HWND) -> Option<library_host::NotebookId> {
-    if text_search_host::replacing(hwnd)
+    // A hidden view keeps its notebook, and its query, while that notebook is open: a refresh
+    // while another view shows (where a stale tree row can move the target) must not clear
+    // it. `shown` catches the view up when it shows again.
+    let hidden =
+        crate::window::side_panel::current_view(hwnd) != crate::config::SidebarView::Search;
+    if (hidden || text_search_host::replacing(hwnd))
         && let Some(kept) = notebook(hwnd)
         && let Some(id) = library_host::notebook_of(hwnd, &kept)
         && library_host::notebook_folder(hwnd, id).is_some_and(|open| same_path(&open, &kept))

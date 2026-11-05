@@ -399,15 +399,20 @@ fn tree_rows(panel: HWND) -> Vec<String> {
         .filter(|&id| accessible.role(id) == Some(ROLE_SYSTEM_OUTLINEITEM))
         .filter_map(|id| Some((accessible.name(id)?, accessible.value(id))))
         .collect();
-    let Some(root) = outline.iter().position(|(name, level)| {
-        level.as_deref() == Some("0") && !name.starts_with("Open editors, ")
+    // The first notebook's root row is a level 1 tree item (multi-root notebooks spec §4.4)
+    // with its rows, one level deeper, after it; Open Editors' tab rows are level 1 too, but
+    // hold nothing.
+    let level = |index: usize| outline.get(index).and_then(|(_, level)| level.clone());
+    let Some(root) = (0..outline.len()).position(|index| {
+        level(index).as_deref() == Some("1") && level(index + 1).as_deref() == Some("2")
     }) else {
         return Vec::new();
     };
     outline
-        .into_iter()
+        .iter()
         .skip(root + 1)
-        .map(|(name, _)| name)
+        .take_while(|(_, level)| level.as_deref() != Some("1"))
+        .map(|(name, _)| name.clone())
         .collect()
 }
 

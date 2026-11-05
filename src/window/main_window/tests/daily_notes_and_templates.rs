@@ -203,7 +203,10 @@ fn a_new_note_from_a_template_fills_it_in_where_the_folder_menu_asked() {
     });
     friday(&window);
 
-    crate::window::library_host::new_note_from_template(window.hwnd, Some("people".into()));
+    crate::window::library_host::new_note_from_template(
+        window.hwnd,
+        in_first(window.hwnd, "people".into()),
+    );
     let shown = app_mut(window.hwnd)
         .library
         .shown_templates

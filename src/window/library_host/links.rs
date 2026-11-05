@@ -263,6 +263,7 @@ fn rewrite(path: &Path, edit: &NoteEdits) -> Result<(), &'static str> {
 /// lists every note under it): a moved note's own relative links are fixed at once, and links
 /// in other notes that would no longer reach it are offered for updating (spec §7.6, §10.5).
 /// A single Markdown note renamed to another name may keep its old name as an alias.
+#[cfg(test)]
 pub(crate) fn notes_moved(hwnd: HWND, moves: &[(PathBuf, PathBuf)]) {
     if let Some(id) = default_notebook(hwnd) {
         notes_moved_of(hwnd, id, moves);
@@ -473,14 +474,6 @@ pub(crate) fn update_renamed_links(hwnd: HWND) {
         let written = write_link_edits_of(hwnd, id, &edits);
         push_notice(hwnd, links_written_notice(&written));
     }
-}
-
-/// The moves a folder rename made in the default notebook (a shim for the tree, which shows
-/// only that notebook until it shows every root).
-pub(crate) fn folder_moves(hwnd: HWND, old: &Path, new: &Path) -> Vec<(PathBuf, PathBuf)> {
-    default_notebook(hwnd)
-        .map(|id| folder_moves_of(hwnd, id, old, new))
-        .unwrap_or_default()
 }
 
 /// The moves a folder rename made in the notebook `id`: every note under `old` (relative) now

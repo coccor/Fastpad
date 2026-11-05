@@ -520,15 +520,15 @@ fn show_in_tree(
     if rescan {
         library_host::request_rescan_of(hwnd, id);
     }
-    // The tree shows the default notebook's rows: only a copy into it has a row to select.
+    // One item copied: its row, in the notebook it went to, is selected.
     let single = match (done.items.as_slice(), listed) {
-        ([_], [row]) if library_host::default_notebook(hwnd) == Some(id) => Some(row),
+        ([_], [row]) => Some(row),
         _ => None,
     };
     super::side_panel::with_accessible_events(hwnd, || {
         super::side_panel::refresh(hwnd);
         if let Some(row) = single {
-            super::notebook_view::select_row(hwnd, row);
+            super::notebook_view::select_row(hwnd, id, row);
         }
     });
 }

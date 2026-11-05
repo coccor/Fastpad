@@ -114,8 +114,9 @@ pub(crate) struct LibraryHost {
     pub(crate) own_writes: std::collections::HashMap<String, Option<Instant>>,
     /// The Notebook view shows only notes changed outside FastPad ("Notes: Show changed notes").
     pub(crate) changed_only: bool,
-    /// The folder an open template picker makes its note in, and the templates it lists.
-    pub(crate) shown_templates: Option<(Option<PathBuf>, Vec<PathBuf>)>,
+    /// The notebook and folder an open template picker makes its note in, and the templates it
+    /// lists.
+    pub(crate) shown_templates: Option<((NotebookId, PathBuf), Vec<PathBuf>)>,
 }
 
 impl LibraryHost {

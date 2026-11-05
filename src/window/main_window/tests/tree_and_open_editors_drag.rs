@@ -695,7 +695,11 @@ fn tree_drag_a_press_during_a_refused_edit_ends_the_edit_before_the_drag() {
     let (window, _editor) = notebook_window(&scratch);
     let panel = sidebar_windows(window.hwnd).1;
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "other");
     assert_eq!(
         crate::window::inline_name::problem(window.hwnd).as_deref(),

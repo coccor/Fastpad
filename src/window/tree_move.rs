@@ -6,7 +6,6 @@
 use super::main_window::{app_ptr, push_notice};
 use super::{library_host, notebook_view, side_panel, tree_drag};
 use crate::library::{self, tree, tree::RowKind};
-use crate::window::library_host::with_state;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::HWND;
 
@@ -154,9 +153,9 @@ fn folder_label(root: &Path, folder: &Path) -> String {
 }
 
 /// The source is gone: say so, and let a rescan catch the tree up.
-fn gone(hwnd: HWND, name: &str) {
+fn gone(hwnd: HWND, id: library_host::NotebookId, name: &str) {
     push_notice(hwnd, format!("{name} no longer exists."));
-    library_host::request_rescan(hwnd);
+    library_host::request_rescan_of(hwnd, id);
 }
 
 /// A drop in the tree (tree drag spec §3.4, §4, §5): moves `source` into `folder` (relative to
@@ -164,8 +163,21 @@ fn gone(hwnd: HWND, name: &str) {
 /// taken name, a vanished source, a refusal from Windows or a tab that cannot follow moves
 /// nothing and says so. After a move the target folder and the folders above it expand, and
 /// the moved row is selected. The focus stays where it is.
+#[cfg(test)]
 pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
-    let Some(root) = library_host::folder(hwnd) else {
+    if let Some(id) = library_host::default_notebook(hwnd) {
+        drop_into_of(hwnd, id, source, folder);
+    }
+}
+
+/// `drop_into` for a row of the notebook `id`: the move stays inside that notebook.
+pub(crate) fn drop_into_of(
+    hwnd: HWND,
+    id: library_host::NotebookId,
+    source: &RowKind,
+    folder: &Path,
+) {
+    let Some(root) = library_host::notebook_folder(hwnd, id) else {
         return;
     };
     let (Some(old), Some(new)) = (
@@ -183,7 +195,7 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
         .to_string_lossy()
         .into_owned();
     let is_folder = matches!(source, RowKind::Folder(_));
-    let (listed, taken) = with_state(hwnd, |state| {
+    let (listed, taken) = library_host::with_notebook(hwnd, id, |state| {
         let listed = if is_folder {
             state.is_folder(old)
         } else {
@@ -193,7 +205,7 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
     })
     .unwrap_or((false, false));
     if !listed {
-        gone(hwnd, &name);
+        gone(hwnd, id, &name);
         return;
     }
     if taken {
@@ -212,12 +224,12 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
             return;
         }
         Err(MoveError::Missing(_)) => {
-            gone(hwnd, &name);
+            gone(hwnd, id, &name);
             return;
         }
         Err(MoveError::TargetGone(error)) => {
             push_notice(hwnd, format!("Couldn't move {name}: {error}"));
-            library_host::request_rescan(hwnd);
+            library_host::request_rescan_of(hwnd, id);
             return;
         }
         Err(MoveError::Failed(error)) => {
@@ -233,7 +245,7 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
         }
     };
     for ancestor in tree::ancestors(&new) {
-        library_host::set_expanded(hwnd, &ancestor, true);
+        library_host::set_expanded_of(hwnd, id, &ancestor, true);
     }
     super::main_window::invalidate_title_strip(hwnd);
     let row = if is_folder {
@@ -243,7 +255,7 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
     };
     side_panel::with_accessible_events(hwnd, || {
         side_panel::refresh(hwnd);
-        notebook_view::select_row(hwnd, &row);
+        notebook_view::select_row(hwnd, id, &row);
     });
     if !moved.stuck.is_empty() {
         push_notice(
@@ -253,9 +265,9 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
     }
     // Links that would no longer reach what moved (second brain phase 1 spec §7.6).
     let moves = if is_folder {
-        library_host::folder_moves(hwnd, old, &new)
+        library_host::folder_moves_of(hwnd, id, old, &new)
     } else {
         vec![(old.to_path_buf(), new.clone())]
     };
-    library_host::notes_moved(hwnd, &moves);
+    library_host::notes_moved_of(hwnd, id, &moves);
 }
