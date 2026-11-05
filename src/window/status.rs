@@ -1,7 +1,7 @@
 //! Painted bottom bar: no child HWND. It appears once deferred chrome is built and then stays, so
 //! the first paint keeps the editor at full height. The left side shows the caret position, or the
-//! oldest pending notification while there is one; the right side names the active document's
-//! language and encoding, each of which opens a picker when clicked.
+//! oldest pending notification while there is one; the right side shows the editor's zoom and
+//! names the active document's language and encoding, each of which opens a picker when clicked.
 
 use crate::document::Language;
 use crate::editor::CaretStatus;
@@ -42,6 +42,8 @@ pub struct ActiveDocumentStatus {
     pub encoding: Encoding,
     /// The tab is open for viewing only; the bar says so after the caret.
     pub read_only: bool,
+    /// The editor's zoom as a percentage of the configured font size (100 = none).
+    pub zoom_percent: u32,
 }
 
 /// What the bar shows after the caret of a read-only tab.
@@ -49,6 +51,14 @@ pub const READ_ONLY_LABEL: &str = "Read-only";
 
 /// What sits between the language and the encoding on the right of the bar.
 pub const DETAILS_SEPARATOR: &str = "    ";
+
+/// The editor's zoom as a percentage: Scintilla adds `zoom` points to every style's
+/// `font_size`, and never draws text smaller than 2 points.
+pub fn editor_zoom_percent(font_size: u16, zoom: i32) -> u32 {
+    let base = i32::from(font_size.max(1));
+    let zoomed = (base + zoom).max(2);
+    ((zoomed * 100 + base / 2) / base) as u32
+}
 
 /// Every encoding FastPad can save in, in the order the encoding picker lists them.
 pub const ENCODINGS: [Encoding; 4] = [
@@ -65,7 +75,7 @@ pub enum StatusTarget {
     Encoding,
 }
 
-/// Which detail `x` falls on, for "language SEPARATOR encoding" drawn right-aligned to
+/// Which detail `x` falls on, for "[zoom SEPARATOR] language SEPARATOR encoding" drawn right-aligned to
 /// `right_edge`. Widths are measured in the bar's font; `slop` widens each span on both sides so
 /// a click just beside the text still counts, without the two spans overlapping.
 pub fn status_target_at(
@@ -109,7 +119,8 @@ pub fn status_bar_text(
     let right = active
         .map(|active| {
             format!(
-                "{}{DETAILS_SEPARATOR}{}",
+                "{}%{DETAILS_SEPARATOR}{}{DETAILS_SEPARATOR}{}",
+                active.zoom_percent,
                 language_name(active.language),
                 encoding_name(active.encoding)
             )
@@ -187,8 +198,8 @@ pub fn encoding_name(encoding: Encoding) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveDocumentStatus, StatusBarText, StatusTarget, file_size_text, image_status_bar_text,
-        status_bar_text, status_target_at, status_text,
+        ActiveDocumentStatus, StatusBarText, StatusTarget, editor_zoom_percent, file_size_text,
+        image_status_bar_text, status_bar_text, status_target_at, status_text,
     };
     use crate::document::Language;
     use crate::editor::CaretStatus;
@@ -284,12 +295,13 @@ mod tests {
             language: Language::Markdown,
             encoding: Encoding::Utf8Bom,
             read_only: false,
+            zoom_percent: 100,
         };
         assert_eq!(
             status_bar_text(&center, Some(active)),
             StatusBarText {
                 left: "Ln 12, Col 5".to_owned(),
-                right: "Markdown    UTF-8 with BOM".to_owned(),
+                right: "100%    Markdown    UTF-8 with BOM".to_owned(),
             }
         );
 
@@ -317,9 +329,30 @@ mod tests {
         center.push("disk full");
         let noticed = status_bar_text(&center, Some(active));
         assert_eq!(noticed.left, "disk full (click to dismiss)");
-        assert_eq!(noticed.right, "Markdown    UTF-8 with BOM");
+        assert_eq!(noticed.right, "100%    Markdown    UTF-8 with BOM");
 
         center.dismiss_all();
         assert_eq!(status_bar_text(&center, None), StatusBarText::default());
+
+        let zoomed = ActiveDocumentStatus {
+            zoom_percent: 145,
+            ..active
+        };
+        assert_eq!(
+            status_bar_text(&center, Some(zoomed)).right,
+            "145%    Markdown    UTF-8 with BOM"
+        );
+    }
+
+    #[test]
+    fn editor_zoom_is_a_percentage_of_the_font_size() {
+        // Break caught: a bar that shows Scintilla's raw point offset ("+2") or a percentage that
+        // ignores the font size, or one that keeps shrinking past Scintilla's 2-point floor.
+        assert_eq!(editor_zoom_percent(11, 0), 100);
+        assert_eq!(editor_zoom_percent(11, 1), 109);
+        assert_eq!(editor_zoom_percent(11, 11), 200);
+        assert_eq!(editor_zoom_percent(10, -5), 50);
+        assert_eq!(editor_zoom_percent(11, -10), 18);
+        assert_eq!(editor_zoom_percent(0, 0), 200);
     }
 }

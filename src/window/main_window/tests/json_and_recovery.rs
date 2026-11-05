@@ -166,7 +166,14 @@ fn corrupt_settings_are_reported_on_the_bottom_bar_that_chrome_reserves() {
     assert_eq!(super::super::current_status_text(window.hwnd), None);
     let bar = super::super::current_status_bar(window.hwnd).unwrap();
     assert_eq!(bar.left, "Ln 1, Col 1");
-    assert_eq!(bar.right, "Plain text    UTF-8");
+    assert_eq!(bar.right, "100%    Plain text    UTF-8");
+    // The editor's zoom shows as a percentage of the font size, before the language.
+    let font_size = super::app_mut(window.hwnd).settings.font_size;
+    let editor = super::app_mut(window.hwnd).editor().unwrap();
+    editor.set_zoom(i32::from(font_size)).unwrap();
+    let zoomed = super::super::current_status_bar(window.hwnd).unwrap();
+    assert_eq!(zoomed.right, "200%    Plain text    UTF-8");
+    editor.reset_zoom().unwrap();
     let mut dismissed = RECT::default();
     unsafe {
         GetClientRect(editor_hwnd, &mut dismissed);

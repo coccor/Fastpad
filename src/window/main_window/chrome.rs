@@ -315,11 +315,16 @@ pub(super) fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::St
     let app = unsafe { app.as_ref() };
     app.status.as_ref()?;
     let active = app.tabs.active().and_then(|document| {
+        let editor = app.editor()?;
         Some(crate::window::status::ActiveDocumentStatus {
-            caret: app.editor()?.caret_status().ok()?,
+            caret: editor.caret_status().ok()?,
             language: document.language,
             encoding: document.encoding,
             read_only: document.read_only,
+            zoom_percent: crate::window::status::editor_zoom_percent(
+                app.settings.font_size,
+                editor.zoom().unwrap_or(0),
+            ),
         })
     });
     let mut bar = crate::window::status::status_bar_text(&app.notifications, active);
