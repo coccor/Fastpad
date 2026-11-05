@@ -1,12 +1,12 @@
 {
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Ultra fast note taking app.",
   "homepage": "https://github.com/coccor/FastPad",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/coccor/FastPad/releases/download/v0.4.4/FastPad-0.4.4-windows-x64.zip",
-      "hash": "c8778b973323e77b3b117c2ccb525276b501d89aae0106625e0998b61997467b"
+      "url": "https://github.com/coccor/FastPad/releases/download/v0.5.0/FastPad-0.5.0-windows-x64.zip",
+      "hash": "93781d1279680a96a0590f65ec64b3c9c61238c410c910e79cb5800750d2214c"
     }
   },
   "bin": "FastPad.exe",
