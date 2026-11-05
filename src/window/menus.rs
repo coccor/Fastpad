@@ -135,6 +135,7 @@ impl MenuBar {
                     MenuEntry::command("&New", CommandId::New),
                     MenuEntry::command("&Open...", CommandId::Open),
                     MenuEntry::command("Open &notebook...", CommandId::OpenFolder),
+                    MenuEntry::command("New noteboo&k...", CommandId::NewNotebook),
                     MenuEntry::command("&Go to note\u{2026}", CommandId::QuickOpen),
                     MenuEntry::command("&Save", CommandId::Save),
                     MenuEntry::command("Save &as...", CommandId::SaveAs),

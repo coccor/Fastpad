@@ -254,7 +254,7 @@ impl NotebookView {
                 if contains(layout.button, x, y) {
                     return Hit::StateButton;
                 }
-                if self.mode == Mode::Failed && contains(layout.second, x, y) {
+                if self.mode != Mode::Empty && contains(layout.second, x, y) {
                     return Hit::SecondButton;
                 }
                 if self.mode == Mode::NoNotebook

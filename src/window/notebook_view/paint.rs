@@ -727,6 +727,14 @@ impl NotebookView {
                     palette,
                     fonts,
                 );
+                self.paint_button(
+                    dc,
+                    layout.second,
+                    "New notebook…",
+                    Hit::SecondButton,
+                    palette,
+                    fonts,
+                );
                 if !self.recent.is_empty() {
                     unsafe {
                         draw_text(

@@ -182,7 +182,8 @@ typing. Both panes scroll together.
 <img src="docs/images/notebook.png" alt="The notebook sidebar with folders and notes, and a note open in the editor" width="800">
 
 Open any folder and it becomes your notebook: a tree in the sidebar, folders as they are on disk,
-pinned notes first. Notes are plain files, so nothing is locked in.
+pinned notes first. Notes are plain files, so nothing is locked in. **File → New notebook…** names
+a new folder and opens it as your notebook in one step.
 
 - **Write fast.** New notes are named inline and save themselves once they're in the notebook.
   Create, rename, move (drag and drop) and delete notes and folders right in the tree.

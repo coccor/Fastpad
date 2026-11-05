@@ -350,6 +350,7 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
             );
         }
         CommandId::OpenFolder => crate::window::library_host::choose_and_open_folder(hwnd),
+        CommandId::NewNotebook => crate::window::library_host::create_and_open_notebook(hwnd),
         CommandId::OpenRecentFolder => crate::window::library_host::open_recent_folder_picker(hwnd),
         CommandId::ToggleFolderAutosave => {
             crate::window::library_host::toggle_folder_autosave(hwnd);

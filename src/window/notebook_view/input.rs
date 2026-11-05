@@ -397,7 +397,7 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         }
         Hit::Header(button) => header_clicked(hwnd, button),
         Hit::StateButton => state_button(hwnd),
-        Hit::SecondButton => crate::window::library_host::choose_and_open_folder(hwnd),
+        Hit::SecondButton => second_button(hwnd),
         Hit::Thumb(grab) => {
             // Captured after the borrow ends: SetCapture sends WM_CAPTURECHANGED to the window
             // that held the capture before.
@@ -633,6 +633,15 @@ pub(crate) fn state_button(hwnd: HWND) {
         // (inline naming spec §3.1): there is no tree yet, but `apply` makes one for a draft.
         Some(Mode::Empty) => run(hwnd, CommandId::NoteNew),
         Some(Mode::Failed) => crate::window::library_host::retry_load(hwnd),
+        _ => {}
+    }
+}
+
+/// "New notebook…" with no notebook open, "Open notebook…" after a failed load.
+pub(crate) fn second_button(hwnd: HWND) {
+    match with_view(hwnd, |view| view.mode) {
+        Some(Mode::NoNotebook) => crate::window::library_host::create_and_open_notebook(hwnd),
+        Some(Mode::Failed) => crate::window::library_host::choose_and_open_folder(hwnd),
         _ => {}
     }
 }
