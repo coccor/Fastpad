@@ -323,20 +323,27 @@ pub(crate) fn flush_before_close(hwnd: HWND) {
     }
 }
 
+/// Writes every open notebook's pending metadata. A failure in one is reported for it and does
+/// not stop the others.
 pub(super) fn flush_reporting(hwnd: HWND, wait: bool) {
-    match try_flush(hwnd, wait) {
-        Ok(library::Flushed::Busy) => {
-            // OneDrive (or another PC's FastPad) has library.ini open: keep the operations and
-            // try again shortly, without a notice for what is usually a brief sync.
-            unsafe {
-                SetTimer(hwnd, LIBRARY_WRITE_TIMER_ID, BUSY_RETRY_MS, None);
+    unsafe {
+        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
+    }
+    for (id, _) in notebooks(hwnd) {
+        match try_flush_of(hwnd, id, wait) {
+            Ok(library::Flushed::Busy) => {
+                // OneDrive (or another PC's FastPad) has library.ini open: keep the operations
+                // and try again shortly, without a notice for what is usually a brief sync.
+                unsafe {
+                    SetTimer(hwnd, LIBRARY_WRITE_TIMER_ID, BUSY_RETRY_MS, None);
+                }
             }
+            Ok(_) => {}
+            Err(error) => push_notice(
+                hwnd,
+                format!("FastPad could not save this notebook's pins: {error}"),
+            ),
         }
-        Ok(_) => {}
-        Err(error) => push_notice(
-            hwnd,
-            format!("FastPad could not save this notebook's pins: {error}"),
-        ),
     }
 }
 

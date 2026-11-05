@@ -15,20 +15,18 @@ pub(crate) fn notebook_autosave(hwnd: HWND) -> Option<bool> {
     with_state(hwnd, |state| state.local.autosave)
 }
 
-pub(super) fn folder_autosave(hwnd: HWND) -> bool {
-    // Until the folder's state has loaded, its autosave setting is unknown: do not save.
-    with_state(hwnd, |state| state.local.autosave).unwrap_or(false)
-}
-
 /// The active tab's path, if autosave applies to it right now.
 pub(super) fn autosave_target(hwnd: HWND) -> Option<PathBuf> {
-    if !notes_mode(hwnd)
-        || !folder_autosave(hwnd)
-        || crate::window::main_window::file_population_active(hwnd)
-    {
+    autosave_target_of(hwnd, default_notebook(hwnd)?)
+}
+
+/// The active tab's path, if autosave applies to it right now as a note of the notebook `id`.
+pub(super) fn autosave_target_of(hwnd: HWND, id: NotebookId) -> Option<PathBuf> {
+    let enabled = with_notebook(hwnd, id, |state| state.local.autosave).unwrap_or(false);
+    if !notes_mode(hwnd) || !enabled || crate::window::main_window::file_population_active(hwnd) {
         return None;
     }
-    let folder = folder(hwnd)?;
+    let folder = notebook_folder(hwnd, id)?;
     unsafe { app_ptr(hwnd) }.and_then(|app| {
         let active = unsafe { app.as_ref() }.tabs.active()?;
         let path = active.path.clone()?;
@@ -56,10 +54,15 @@ pub(crate) fn schedule_autosave(hwnd: HWND) {
 /// and autosave pauses for that tab until the user reloads or keeps theirs. Only a successful
 /// write marks the tab clean.
 pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
+    autosave_active_with(hwnd, autosave_target)
+}
+
+/// `autosave_active`, with `target` deciding whether the active tab is eligible and its path.
+fn autosave_active_with(hwnd: HWND, target: impl Fn(HWND) -> Option<PathBuf>) -> Autosave {
     unsafe {
         KillTimer(hwnd, AUTOSAVE_TIMER_ID);
     }
-    let Some(path) = autosave_target(hwnd) else {
+    let Some(path) = target(hwnd) else {
         return Autosave::NotEligible;
     };
     // The guard runs right before the write: nothing between here and `complete_save` yields.
@@ -84,7 +87,7 @@ pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
         // After an append (or a rewrite with the same text) the tab knows the file again.
         let caught_up = active(hwnd)
             .is_some_and(|(_, known)| known.is_some() && known == library::disk_stamp(&path));
-        if !settled || !caught_up || autosave_target(hwnd).is_none() {
+        if !settled || !caught_up || target(hwnd).is_none() {
             return Autosave::Paused;
         }
     }
@@ -151,7 +154,7 @@ pub(crate) fn autosave_all_of(hwnd: HWND, id: NotebookId) {
         {
             return;
         }
-        autosave_active(hwnd);
+        autosave_active_with(hwnd, |hwnd| autosave_target_of(hwnd, id));
     }
     // The session records the tab the user had active, not the last one saved.
     if let Some(active) = active
