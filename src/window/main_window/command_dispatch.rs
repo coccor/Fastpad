@@ -357,6 +357,7 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         CommandId::NoteReloadFromDisk => crate::window::library_host::reload_from_disk(hwnd),
         CommandId::NoteKeepMine => crate::window::library_host::keep_mine(hwnd),
         CommandId::NoteCompareWithDisk => compare_with_disk(hwnd),
+        CommandId::ToggleReadOnly => toggle_read_only(hwnd),
         CommandId::NotesShowChanged => crate::window::library_host::toggle_changed_only(hwnd),
         CommandId::NotesClearChanged => crate::window::library_host::clear_all_marks(hwnd),
         CommandId::NoteTogglePin => {

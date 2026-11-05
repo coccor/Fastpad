@@ -110,6 +110,11 @@ fn open_ipc_requests(hwnd: HWND) -> LRESULT {
                     report_open_failure(hwnd, &path, &error);
                 }
             }
+            crate::ipc::IpcRequest::OpenReadOnly(path) => {
+                if let Err(error) = open_path_read_only(hwnd, &path) {
+                    report_open_failure(hwnd, &path, &error);
+                }
+            }
             crate::ipc::IpcRequest::New => execute_command(hwnd, CommandId::New),
             crate::ipc::IpcRequest::Activate => {}
             crate::ipc::IpcRequest::OpenFolder(path) => {

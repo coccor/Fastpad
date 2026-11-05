@@ -725,3 +725,16 @@ fn a_slash_at_a_line_start_offers_commands_and_writes_the_pick() {
     assert_eq!(f.editor.selection().unwrap(), 2..10);
     assert_one_undo_restores(&f.editor, "/tab");
 }
+
+#[test]
+fn a_read_only_note_ignores_the_typing_helpers() {
+    // Break caught: a helper editing (or moving the caret as if it had) in a read-only tab.
+    let f = fixture("- a", Language::Markdown);
+    f.editor.set_read_only(true).unwrap();
+    f.editor.set_selection(3..3).unwrap();
+    type_char(&f, '(');
+    press(&f, VK_RETURN, false);
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'2', true, true, false);
+    assert_eq!(f.editor.text().unwrap(), "- a");
+    assert_eq!(f.editor.selection().unwrap(), 3..3);
+}

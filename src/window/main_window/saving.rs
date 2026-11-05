@@ -165,6 +165,18 @@ fn save_active_to(
         return SaveOutcome::Failed;
     }
     let is_save_as = new_path.is_some();
+    // A read-only tab never writes over its file; Save As to a new file still makes a copy.
+    if !is_save_as
+        && let Some(title) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+            let document = unsafe { app.as_ref() }.tabs.active()?;
+            document.read_only.then(|| document.title())
+        })
+    {
+        if report_failure {
+            push_notice(hwnd, read_only_notice(&title, "save it"));
+        }
+        return SaveOutcome::Failed;
+    }
     let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
         original_path = unsafe { app_ptr(hwnd) }

@@ -173,7 +173,12 @@ pub(super) fn restore_session_entry(
 ) -> Option<DocumentId> {
     match &entry.source {
         // An open file gets a view in the active group (split editors spec §5.3).
-        crate::session::SessionSource::File(path) => open_path(hwnd, path).ok()?,
+        crate::session::SessionSource::File(path) => {
+            open_path(hwnd, path).ok()?;
+            if entry.read_only {
+                set_active_read_only(hwnd, true);
+            }
+        }
         crate::session::SessionSource::Snapshot(id) => {
             let reopened = unsafe { app_ptr(hwnd) }.and_then(|app| {
                 let app = unsafe { app.as_ref() };

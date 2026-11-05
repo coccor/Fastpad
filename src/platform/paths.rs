@@ -12,9 +12,54 @@ use std::path::PathBuf;
 ///
 /// In-process tests (`cfg(test)`) get a per-process scratch directory instead; see
 /// `test_profile_dir`.
+///
+/// In portable mode (`enable_portable`) it is the `data` folder next to `FastPad.exe` instead.
 #[cfg(all(windows, not(test)))]
 pub fn fastpad_data_dir() -> Result<PathBuf> {
+    if let Some(dir) = PORTABLE_DATA_DIR.get() {
+        return Ok(dir.clone());
+    }
     data_dir_under(std::env::var_os("LOCALAPPDATA"))
+}
+
+/// The file whose presence next to `FastPad.exe` makes every launch portable. Its contents are
+/// never read, so an empty file does.
+pub const PORTABLE_MARKER: &str = "portable";
+
+/// The folder next to `FastPad.exe` that holds a portable FastPad's settings, session and
+/// recovery files.
+pub const PORTABLE_DATA_FOLDER: &str = "data";
+
+static PORTABLE_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Where a portable FastPad keeps its data, or `None` for the per-user folder: `<exe dir>\data`
+/// when `flag` (`--portable`) is given or `exists` finds the marker file beside the exe.
+pub fn portable_data_dir(
+    exe: &std::path::Path,
+    flag: bool,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    let folder = exe.parent()?;
+    (flag || exists(&folder.join(PORTABLE_MARKER))).then(|| folder.join(PORTABLE_DATA_FOLDER))
+}
+
+/// Turns portable mode on for this process when `--portable` was given or the marker sits next to
+/// the running exe. Call it once, before anything reads the data directory. Returns the portable
+/// data directory, if any.
+pub fn enable_portable(flag: bool) -> Option<&'static std::path::Path> {
+    if PORTABLE_DATA_DIR.get().is_none()
+        && let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| portable_data_dir(&exe, flag, std::path::Path::is_file))
+    {
+        let _ = PORTABLE_DATA_DIR.set(dir);
+    }
+    portable_dir()
+}
+
+/// The portable data directory this process uses, or `None` when it is not portable.
+pub fn portable_dir() -> Option<&'static std::path::Path> {
+    PORTABLE_DATA_DIR.get().map(PathBuf::as_path)
 }
 
 #[cfg(all(windows, test))]
@@ -130,5 +175,18 @@ mod tests {
         assert_eq!(data, scratch.join("FastPad"));
         assert_eq!(notes, scratch.join("Notes"));
         assert!(data.is_dir() && notes.is_dir());
+    }
+
+    #[test]
+    fn a_marker_or_the_flag_puts_the_data_beside_the_exe() {
+        // Break caught: a portable copy still writing to %LocalAppData%, or an installed copy
+        // turning portable with no marker and no flag.
+        use std::path::Path;
+        let exe = Path::new(r"D:\Tools\FastPad\FastPad.exe");
+        let data = Some(std::path::PathBuf::from(r"D:\Tools\FastPad\data"));
+        let marker = |path: &Path| path == Path::new(r"D:\Tools\FastPad\portable");
+        assert_eq!(super::portable_data_dir(exe, false, |_| false), None);
+        assert_eq!(super::portable_data_dir(exe, false, marker), data);
+        assert_eq!(super::portable_data_dir(exe, true, |_| false), data);
     }
 }

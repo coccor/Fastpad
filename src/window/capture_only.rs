@@ -91,7 +91,12 @@ impl Sink for OnlySink {
         if capture.open {
             // Ctrl+Shift+Enter: FastPad starts normally with the note.
             if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).arg(&path).spawn();
+                let mut command = std::process::Command::new(exe);
+                // A `--portable` launch's note opens in the same portable FastPad.
+                if crate::platform::portable_dir().is_some() {
+                    command.arg("--portable");
+                }
+                let _ = command.arg(&path).spawn();
             }
         }
         Ok(())

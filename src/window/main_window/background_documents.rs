@@ -76,6 +76,16 @@ pub(crate) fn replace_in_document(
     template: &str,
 ) -> Option<usize> {
     let identity = unsafe { window_identity(hwnd) }?;
+    // A read-only tab is left as it is: none of its matches are replaced.
+    let read_only = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .document(id)
+            .is_some_and(|document| document.read_only)
+    });
+    if read_only {
+        return Some(0);
+    }
     let (editor, inactive) = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         // While a file is populated the editor may show a document that is not the active tab's.
@@ -259,7 +269,7 @@ pub(crate) fn apply_disk_edit(hwnd: HWND, id: DocumentId, edit: DiskEdit<'_>) ->
     }) else {
         return false;
     };
-    let run = |editor: &Editor| -> Result<()> {
+    let apply = |editor: &Editor| -> Result<()> {
         match edit {
             DiskEdit::Reload(text) => {
                 let replacement = editor.with_document_text(|old| {
@@ -288,6 +298,8 @@ pub(crate) fn apply_disk_edit(hwnd: HWND, id: DocumentId, edit: DiskEdit<'_>) ->
         }
         Ok(())
     };
+    // A read-only tab still follows its file: the change from disk is FastPad's, not an edit.
+    let run = |editor: &Editor| -> Result<()> { editor.while_writable(|editor| apply(editor)) };
     let result = match &inactive {
         None => run(&editor),
         Some(target) => with_background_document(hwnd, target, run),

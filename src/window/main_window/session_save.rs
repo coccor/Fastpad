@@ -164,6 +164,7 @@ pub(crate) fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate:
                 entry.anchor = state.anchor;
                 entry.first_line = state.first_line;
             }
+            entry.read_only = document.read_only && matches!(entry.source, SessionSource::File(_));
             entries.push(entry);
         }
         if entries.is_empty() {

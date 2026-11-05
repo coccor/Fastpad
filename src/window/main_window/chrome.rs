@@ -319,6 +319,7 @@ pub(super) fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::St
             caret: app.editor()?.caret_status().ok()?,
             language: document.language,
             encoding: document.encoding,
+            read_only: document.read_only,
         })
     });
     let mut bar = crate::window::status::status_bar_text(&app.notifications, active);

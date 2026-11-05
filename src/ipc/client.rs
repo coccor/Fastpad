@@ -29,8 +29,9 @@ pub enum InstanceClaim {
     Independent,
 }
 
-/// Creates the session mutex, or forwards `request` to the instance that already owns it.
-pub fn claim_or_forward(request: &LaunchRequest) -> InstanceClaim {
+/// Creates the session mutex, or forwards `request` to the instance that already owns it;
+/// `read_only` forwards a file to open for viewing only.
+pub fn claim_or_forward(request: &LaunchRequest, read_only: bool) -> InstanceClaim {
     let Ok(names) = InstanceNames::for_current_session() else {
         return InstanceClaim::Independent;
     };
@@ -40,6 +41,10 @@ pub fn claim_or_forward(request: &LaunchRequest) -> InstanceClaim {
         Err(_) => return InstanceClaim::Independent,
     }
     let forwarded = ipc_request_for(request)
+        .map(|request| match request {
+            IpcRequest::Open(path) if read_only => IpcRequest::OpenReadOnly(path),
+            request => request,
+        })
         .and_then(|request| encode_frame(&request))
         .and_then(|frame| send_frame(&names, &frame, FORWARD_BUDGET));
     if forwarded.is_ok() {

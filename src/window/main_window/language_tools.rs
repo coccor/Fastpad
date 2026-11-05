@@ -117,6 +117,14 @@ pub(crate) fn open_encoding_picker(hwnd: HWND) {
     if crate::window::image_host::active_is_image(hwnd) {
         return;
     }
+    // Picking an encoding saves the file in it.
+    if let Some(title) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let document = unsafe { app.as_ref() }.tabs.active()?;
+        (document.read_only && document.compare.is_none()).then(|| document.title())
+    }) {
+        push_notice(hwnd, read_only_notice(&title, "change its encoding"));
+        return;
+    }
     let encodings = crate::window::status::ENCODINGS;
     open_picker(
         hwnd,
@@ -146,7 +154,7 @@ pub(crate) fn encoding_picked(hwnd: HWND, index: usize) {
     let picked = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let tabs = &mut unsafe { app.as_mut() }.tabs;
         let document = tabs.active_mut()?;
-        if document.is_image() || document.compare.is_some() {
+        if document.is_image() || document.compare.is_some() || document.read_only {
             return None;
         }
         if document.encoding == encoding {

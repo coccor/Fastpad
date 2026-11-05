@@ -79,6 +79,7 @@ mod language_tools;
 mod menu_keys;
 mod opening;
 mod placement;
+mod read_only;
 mod saving;
 mod session_restore;
 mod session_save;
@@ -105,6 +106,7 @@ pub(crate) use menu_keys::*;
 pub(crate) use opening::*;
 pub(crate) use placement::restore_placement;
 use placement::save_placement;
+pub(crate) use read_only::*;
 #[cfg(test)]
 pub(crate) use saving::save_path_as;
 pub(in crate::window) use saving::*;
