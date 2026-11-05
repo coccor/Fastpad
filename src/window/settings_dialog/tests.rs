@@ -14,8 +14,9 @@ fn center(rect: RECT) -> (i32, i32) {
 #[test]
 fn cards_stack_under_their_headings_with_gaps_and_everything_fits_at_96_dpi() {
     // Break caught: cards touching or overlapping, a heading painted under its first card,
-    // cards flush with the dialog's edges, or a dialog over about 810 px tall at 96 DPI
-    // (soft-look addendum).
+    // cards flush with the dialog's edges, or a dialog over about 840 px tall at 96 DPI
+    // (soft-look addendum's 810, raised by one row for Markdown view; a shorter work area
+    // scrolls the cards).
     let layout = Layout::calculate(96, 4000, 2000, 100);
     assert_eq!(layout.width, 860);
     assert_eq!(layout.max_scroll(), 0);
@@ -33,7 +34,7 @@ fn cards_stack_under_their_headings_with_gaps_and_everything_fits_at_96_dpi() {
     }
     assert_eq!(layout.content_height, expected_top);
     assert_eq!(layout.height, 44 + layout.content_height + 56);
-    assert!(layout.height <= 810, "{}", layout.height);
+    assert!(layout.height <= 840, "{}", layout.height);
     assert!(layout.edit_ini.right <= layout.close.left);
 }
 
