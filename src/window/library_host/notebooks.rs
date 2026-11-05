@@ -71,16 +71,27 @@ pub(super) fn open_checked_folder(hwnd: HWND, path: PathBuf) {
         push_notice(hwnd, NOTES_MODE_OFF.to_owned());
         return;
     }
+    let Some(id) = add_root(hwnd, &path) else {
+        return;
+    };
+    start_load_of(hwnd, id);
+    notebook_opened(hwnd, id);
+}
+
+/// Adds the notebook `path`, which exists, as a root without loading it, and records it in
+/// `folders.ini`. An open notebook is revealed instead, and one nested with an open notebook is
+/// refused with a notice; both give `None`.
+pub(super) fn add_root(hwnd: HWND, path: &Path) -> Option<NotebookId> {
     let open = notebooks(hwnd);
     if let Some((id, _)) = open
         .iter()
-        .find(|(_, folder)| library::model::same_path(folder, &path))
+        .find(|(_, folder)| library::model::same_path(folder, path))
     {
         crate::window::notebook_view::reveal_notebook(hwnd, *id);
-        return;
+        return None;
     }
     let roots: Vec<PathBuf> = open.into_iter().map(|(_, folder)| folder).collect();
-    if let Some(nesting) = library::roots::nesting(&roots, &path) {
+    if let Some(nesting) = library::roots::nesting(&roots, path) {
         let names = library::local::display_names(&roots);
         let notice = match nesting {
             library::roots::Nesting::Inside(index) => format!(
@@ -95,22 +106,17 @@ pub(super) fn open_checked_folder(hwnd: HWND, path: PathBuf) {
             ),
         };
         push_notice(hwnd, notice);
-        return;
+        return None;
     }
-    let Some(id) = host(hwnd, |host| {
-        let id = host.add_notebook(path.clone());
-        // A startup load still running is for a notebook the user moved on from.
-        host.startup_load = None;
+    let id = host(hwnd, |host| {
+        let id = host.add_notebook(path.to_path_buf());
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);
         id
-    }) else {
-        return;
-    };
-    update_folders(hwnd, |folders| folders.push(path.clone()));
+    })?;
+    update_folders(hwnd, |folders| folders.push(path.to_path_buf()));
     record_open_notebooks(hwnd);
-    start_load_of(hwnd, id);
-    notebook_opened(hwnd, id);
+    Some(id)
 }
 
 /// A notebook was added: the title strip and the sidebar show it.

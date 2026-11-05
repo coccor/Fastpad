@@ -74,9 +74,9 @@ pub(crate) struct LibraryHost {
     next_id: u32,
     /// The last generation `fresh_generation` handed out.
     next_generation: u64,
-    /// The generation of a startup load that has no slot yet: the UI thread could not assume a
-    /// folder (a command-line path after a session that closed its notebook), so the worker's
-    /// answer opens one. `None` once it lands or the user moves on.
+    /// The generation of the load of the folder named on the command line, which has no slot
+    /// yet: the UI thread adds the root when the worker's answer lands, after checking it
+    /// against the open notebooks. `None` once it lands or notes mode goes off.
     startup_load: Option<u64>,
     /// `%LOCALAPPDATA%\FastPad`, resolved lazily. Under `cfg(test)` it is only ever pre-seeded.
     pub(crate) data_dir: Option<PathBuf>,
@@ -145,19 +145,21 @@ struct Loaded {
     /// The last session closed its notebook and the command line named no folder: nothing was
     /// opened, on purpose.
     closed: bool,
-    /// `folders.ini` as the startup worker read it, after any change it made itself.
-    folders: Option<library::local::RecentFolders>,
+    /// At startup, the notebook that is the default once the worker has checked which exist.
+    default: Option<PathBuf>,
 }
 
 /// The startup candidates, checked on the worker so an offline drive cannot stall the UI thread.
 struct Startup {
     /// A path named on the command line, which may be a file.
     launch: Option<PathBuf>,
-    /// The most recent folder from `folders.ini`, unless the last session closed its notebook.
-    remembered: Option<PathBuf>,
+    /// The notebooks the last session had open, in order, from `folders.ini`; empty when it
+    /// closed its notebook.
+    remembered: Vec<PathBuf>,
+    /// The remembered default notebook.
+    default: Option<PathBuf>,
     /// `open=none`: the last session ended with no notebook open.
     closed: bool,
-    data: PathBuf,
 }
 
 fn host<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryHost) -> R) -> Option<R> {
@@ -226,38 +228,116 @@ mod tests {
     fn a_session_that_closed_its_notebook_opens_none_and_checks_no_folder() {
         // Break caught: startup reopening the last notebook, or falling back to
         // Documents\FastPad, after the user closed it.
-        let scratch = Scratch::new("closed");
         let before = library::folder_checks();
         let resolved = resolve_startup(Startup {
             launch: None,
-            remembered: None,
+            remembered: Vec::new(),
+            default: None,
             closed: true,
-            data: scratch.0.join("data"),
         });
-        assert_eq!(resolved, (None, None));
+        assert_eq!(
+            (resolved.roots, resolved.default, resolved.notice),
+            (Vec::new(), None, None)
+        );
         assert_eq!(library::folder_checks(), before);
     }
 
+    fn folder(scratch: &Scratch, name: &str) -> PathBuf {
+        let folder = scratch.0.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        library::normalize_folder(&folder)
+    }
+
     #[test]
-    fn a_folder_on_the_command_line_opens_after_a_close_and_clears_it() {
-        // Break caught: `fastpad.exe D:\Notes` refused after a close, or leaving open=none so the
-        // next plain start opens nothing again.
-        let scratch = Scratch::new("closed-launch");
+    fn startup_restores_every_open_root_in_order_and_keeps_missing_ones() {
+        // Break caught: startup opening only the first remembered root, opening a missing one,
+        // a notice per root, or the worker rewriting open= so a notebook on an offline drive is
+        // forgotten.
+        let scratch = Scratch::new("restore");
+        let (a, b) = (folder(&scratch, "a"), folder(&scratch, "b"));
+        let missing = library::normalize_folder(&scratch.0.join("Missing"));
         let data = scratch.0.join("data");
         let mut folders = library::local::RecentFolders::default();
-        folders.set_closed(true);
+        folders.set_open(&[a.clone(), missing.clone(), b.clone()], Some(&b));
         library::local::write_folders(&library::local::folders_file(&data), &folders).unwrap();
-        let notes = library::normalize_folder(&scratch.0.join("notes"));
-        let (folder, notice) = resolve_startup(Startup {
-            launch: Some(notes.clone()),
-            remembered: None,
-            closed: true,
-            data: data.clone(),
+
+        let resolved = resolve_startup(Startup {
+            launch: None,
+            remembered: vec![a.clone(), missing.clone(), b.clone()],
+            default: Some(b.clone()),
+            closed: false,
         });
-        assert_eq!((folder, notice), (Some(notes.clone()), None));
+
+        assert_eq!(resolved.roots, [a, b.clone()]);
+        assert_eq!(resolved.default, Some(b));
+        assert_eq!(
+            resolved.notice,
+            Some(format!("{} is not available.", missing.display()))
+        );
         let saved = library::local::read_folders(&library::local::folders_file(&data));
-        assert!(!saved.closed);
-        assert_eq!(saved.folders, [notes]);
+        assert_eq!(saved.open[1], missing, "open= still lists the missing one");
+    }
+
+    #[test]
+    fn a_missing_default_hands_over_to_the_first_root_that_opened() {
+        // Break caught: a default naming a notebook that is not there, so capture has no target.
+        let scratch = Scratch::new("default-gone");
+        let (a, b) = (folder(&scratch, "a"), folder(&scratch, "b"));
+        let missing = library::normalize_folder(&scratch.0.join("Missing"));
+        let resolved = resolve_startup(Startup {
+            launch: None,
+            remembered: vec![missing.clone(), a.clone(), b],
+            default: Some(missing),
+            closed: false,
+        });
+        assert_eq!(resolved.default, Some(a));
+    }
+
+    #[test]
+    fn a_launch_folder_is_added_after_the_restored_roots() {
+        // Break caught: `fastpad.exe D:\Notes` replacing the restored notebooks, opening before
+        // them, or opening a second time when it is already one of them.
+        let scratch = Scratch::new("launch");
+        let (a, b) = (folder(&scratch, "a"), folder(&scratch, "b"));
+        let launch = folder(&scratch, "launch");
+        let resolved = resolve_startup(Startup {
+            launch: Some(launch.clone()),
+            remembered: vec![a.clone(), b.clone()],
+            default: Some(a.clone()),
+            closed: false,
+        });
+        assert_eq!(resolved.roots, [a.clone(), b.clone(), launch]);
+        assert_eq!(resolved.default, Some(a.clone()));
+
+        let listed = resolve_startup(Startup {
+            launch: Some(b.clone()),
+            remembered: vec![a.clone(), b.clone()],
+            default: None,
+            closed: false,
+        });
+        assert_eq!(listed.roots, [a, b]);
+    }
+
+    #[test]
+    fn the_documents_fallback_is_only_for_a_first_run_without_a_launch_folder() {
+        // Break caught: Documents\FastPad opening beside notebooks the user chose, or when a
+        // folder on the command line was named.
+        let scratch = Scratch::new("fallback");
+        let a = folder(&scratch, "a");
+        let first_run = resolve_startup(Startup {
+            launch: None,
+            remembered: Vec::new(),
+            default: None,
+            closed: false,
+        });
+        assert_eq!(first_run.roots.len(), 1);
+        let launched = resolve_startup(Startup {
+            launch: Some(a.clone()),
+            remembered: Vec::new(),
+            default: None,
+            closed: false,
+        });
+        assert_eq!(launched.roots, [a]);
     }
 
     #[test]

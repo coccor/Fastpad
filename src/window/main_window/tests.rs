@@ -70,6 +70,7 @@ mod session_restore;
 mod settings_shortcuts_page;
 mod sidebar_layout;
 mod split_groups;
+mod startup_notebooks;
 mod tab_drag;
 mod tree_and_open_editors_drag;
 mod window_basics;

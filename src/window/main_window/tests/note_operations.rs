@@ -466,7 +466,7 @@ fn a_metadata_flush_leaves_the_local_file_alone_and_an_expansion_change_writes_i
 }
 
 #[test]
-fn the_library_step_checks_no_folder_on_the_ui_thread_and_the_worker_falls_back() {
+fn the_library_step_checks_no_folder_on_the_ui_thread_and_a_missing_one_is_skipped() {
     // Break caught: the startup existence check on a remembered folder on an offline mapped
     // drive stalling the UI thread for an SMB timeout.
     let _scintilla = load_native_scintilla();
@@ -489,18 +489,12 @@ fn the_library_step_checks_no_folder_on_the_ui_thread_and_the_worker_falls_back(
     assert_eq!(crate::window::library_host::folder(window.hwnd), Some(gone));
 
     pump_until(window.hwnd, || {
-        app_mut(window.hwnd).library.default_state().is_some()
+        crate::window::library_host::folder(window.hwnd).is_none()
     });
-    let fallback =
-        crate::library::normalize_folder(&crate::platform::paths::default_notes_folder().unwrap());
-    assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
-        Some(fallback)
-    );
     assert!(
         notices(window.hwnd)
             .iter()
-            .any(|n| n.contains("could not find the notebook")),
+            .any(|n| n.contains("is not available")),
         "{:?}",
         notices(window.hwnd)
     );

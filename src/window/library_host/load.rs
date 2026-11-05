@@ -8,40 +8,99 @@ use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-/// On the worker: the folder to open at startup, a directory named on the command line, else
-/// nothing when the last session closed its notebook, else the most recent folder if it still
-/// exists, else `Documents\FastPad`; and a notice when the most recent folder is gone.
-pub(super) fn resolve_startup(startup: Startup) -> (Option<PathBuf>, Option<String>) {
-    if let Some(launch) = startup.launch
-        && library::folder_exists(&launch)
-    {
-        remember_folder(&startup.data, &launch);
-        return (Some(launch), None);
-    }
-    if startup.closed {
-        return (None, None);
-    }
-    let mut notice = None;
-    if let Some(remembered) = startup.remembered {
-        if library::folder_exists(&remembered) {
-            return (Some(remembered), None);
-        }
-        notice = Some(format!(
-            "FastPad could not find the notebook {}. Using Documents\\FastPad instead.",
-            remembered.display()
-        ));
-    }
-    let fallback = crate::platform::paths::default_notes_folder()
-        .ok()
-        .map(|folder| library::normalize_folder(&folder));
-    (fallback, notice)
+/// What the startup worker found.
+pub(super) struct StartupRoots {
+    /// The notebooks to open, in order: the remembered ones that exist, then the folder named on
+    /// the command line if it exists and is not one of them. A remembered notebook that is
+    /// missing is left out here, but stays on its `open=` line: nothing rewrites it.
+    pub(super) roots: Vec<PathBuf>,
+    /// The default notebook: the remembered one if it opened, else the first root that did.
+    pub(super) default: Option<PathBuf>,
+    /// "X is not available." for the remembered notebooks that are missing.
+    pub(super) notice: Option<String>,
 }
 
-pub(crate) fn remember_folder(data: &Path, folder: &Path) {
-    let path = library::local::folders_file(data);
-    let mut recent = library::local::read_folders(&path);
-    recent.push(folder.to_path_buf());
-    let _ = library::local::write_folders(&path, &recent);
+/// On the worker: checks every remembered notebook (each on its own thread, so one offline drive
+/// delays only itself) and the folder named on the command line. `Documents\FastPad` opens only
+/// when nothing is remembered, the last session did not close its notebook and no folder was
+/// named.
+pub(super) fn resolve_startup(startup: Startup) -> StartupRoots {
+    let Startup {
+        launch,
+        remembered,
+        default,
+        closed,
+    } = startup;
+    let (exists, launch_exists) = std::thread::scope(|scope| {
+        let checks: Vec<_> = remembered
+            .iter()
+            .map(|folder| scope.spawn(|| library::folder_exists(folder)))
+            .collect();
+        let launch_check = launch
+            .as_ref()
+            .map(|folder| scope.spawn(|| library::folder_exists(folder)));
+        (
+            checks
+                .into_iter()
+                .map(|check| check.join().unwrap_or(false))
+                .collect::<Vec<_>>(),
+            launch_check.is_some_and(|check| check.join().unwrap_or(false)),
+        )
+    });
+    let mut roots = Vec::new();
+    let mut missing = Vec::new();
+    for (folder, exists) in remembered.iter().zip(exists) {
+        if exists {
+            roots.push(folder.clone());
+        } else {
+            missing.push(folder.clone());
+        }
+    }
+    if let Some(launch) = &launch
+        && launch_exists
+        && !roots
+            .iter()
+            .any(|root| library::model::same_path(root, launch))
+    {
+        roots.push(launch.clone());
+    }
+    if remembered.is_empty()
+        && !closed
+        && launch.is_none()
+        && let Ok(folder) = crate::platform::paths::default_notes_folder()
+    {
+        roots.push(library::normalize_folder(&folder));
+    }
+    let default = default
+        .filter(|wanted| {
+            roots
+                .iter()
+                .any(|root| library::model::same_path(root, wanted))
+        })
+        .or_else(|| roots.first().cloned());
+    StartupRoots {
+        roots,
+        default,
+        notice: library::roots::missing_notice(&missing),
+    }
+}
+
+/// The remembered notebooks FastPad can open together: a duplicate of an earlier one, or one
+/// nested inside or around an earlier one, only comes from editing `folders.ini` by hand, and
+/// is left out without a word. The file is not rewritten.
+fn restorable_roots(remembered: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for folder in remembered {
+        let folder = library::normalize_folder(&folder);
+        let clashes = kept
+            .iter()
+            .any(|root| library::model::same_path(root, &folder))
+            || library::roots::nesting(&kept, &folder).is_some();
+        if !clashes {
+            kept.push(folder);
+        }
+    }
+    kept
 }
 
 /// `WM_FASTPAD_OPEN_LIBRARY`: starts the worker on the startup folder. Reads only `folders.ini`:
@@ -64,59 +123,81 @@ pub(crate) fn open_library_step(hwnd: HWND) {
         });
     let recent = library::local::read_folders(&library::local::folders_file(&data));
     host(hwnd, |host| host.folders = Some(recent.clone()));
-    if recent.closed && launch.is_none() {
-        host(hwnd, |host| host.startup_load = None);
+    let (remembered, default) = recent.startup_roots();
+    let remembered = restorable_roots(remembered);
+    let default = default.map(|folder| library::normalize_folder(&folder));
+    // With nothing remembered, no closed notebook and no folder named, the notebook that usually
+    // opens is `Documents\FastPad`.
+    let fallback = if remembered.is_empty() && !recent.closed && launch.is_none() {
+        crate::platform::paths::default_notes_folder()
+            .ok()
+            .map(|folder| library::normalize_folder(&folder))
+    } else {
+        None
+    };
+    let wanted: Vec<PathBuf> = remembered.iter().cloned().chain(fallback).collect();
+    if wanted.is_empty() && launch.is_none() {
+        // Nothing to open (`open=none`, or no Documents folder): no notebook, and no worker.
+        host(hwnd, |host| {
+            host.notebooks.clear();
+            host.default_notebook = None;
+            host.startup_load = None;
+        });
+        crate::window::main_window::invalidate_title_strip(hwnd);
         crate::window::side_panel::refresh(hwnd);
         return;
     }
-    let remembered = if recent.closed {
-        None
-    } else {
-        recent
-            .folders
-            .first()
-            .map(|folder| library::normalize_folder(folder))
-    };
-    // Until the worker has checked, the name box saves into the folder that usually wins.
-    let assumed = if recent.closed {
-        None
-    } else {
-        remembered.clone().or_else(|| {
-            crate::platform::paths::default_notes_folder()
-                .ok()
-                .map(|folder| library::normalize_folder(&folder))
-        })
-    };
-    // The assumed notebook gets its slot now; with none assumed, the worker's answer opens one.
-    let target = host(hwnd, |host| match (host.default_notebook, assumed) {
-        (Some(id), Some(assumed)) => {
-            if let Some(slot) = host.slot_mut(id) {
-                slot.folder = assumed;
+    // Every notebook gets its slot now, so the sidebar says "Loading…" under each until its
+    // own worker answers. The worker removes the slots of the notebooks that are missing.
+    let Some((slots, launch_generation)) = host(hwnd, |host| {
+        let mut slots = Vec::new();
+        for folder in &wanted {
+            let existing = host
+                .notebooks
+                .iter()
+                .find(|slot| library::model::same_path(&slot.folder, folder))
+                .map(|slot| slot.id);
+            let id = existing.unwrap_or_else(|| host.add_notebook(folder.clone()));
+            if let Some(load) = begin_load(host, id) {
+                slots.push(load);
             }
-            Some(id)
         }
-        (_, Some(assumed)) => Some(host.add_notebook(assumed)),
-        (id, None) => id,
-    })
-    .flatten();
-    // The sidebar says "Loading…" for the assumed notebook until the worker answers, not "Open a
-    // notebook" (a refresh earlier in startup saw no folder). No flattening: nothing is loaded.
+        let wanted_default = default
+            .as_ref()
+            .and_then(|wanted| {
+                host.notebooks
+                    .iter()
+                    .find(|slot| library::model::same_path(&slot.folder, wanted))
+            })
+            .map(|slot| slot.id);
+        if let Some(id) = wanted_default {
+            host.default_notebook = Some(id);
+        }
+        let launch_generation = launch.as_ref().map(|_| host.fresh_generation());
+        host.startup_load = launch_generation;
+        (slots, launch_generation)
+    }) else {
+        return;
+    };
+    crate::window::main_window::invalidate_title_strip(hwnd);
     crate::window::side_panel::refresh(hwnd);
-    spawn_load(
+    spawn_startup(
         hwnd,
-        target,
-        Some(Startup {
+        data,
+        Startup {
             launch,
             remembered,
+            default,
             closed: recent.closed,
-            data,
-        }),
+        },
+        slots,
+        launch_generation,
     );
 }
 
 /// Loads (or rescans) the notebook `id`.
 pub(crate) fn start_load_of(hwnd: HWND, id: NotebookId) {
-    spawn_load(hwnd, Some(id), None);
+    spawn_load(hwnd, id);
 }
 
 /// Whether the default notebook failed to load and has no state to show.
@@ -147,84 +228,167 @@ pub(crate) fn retry_load_of(hwnd: HWND, id: NotebookId) {
     crate::window::side_panel::refresh(hwnd);
 }
 
-/// Starts the load worker for the notebook `id`, or, at startup with no notebook assumed, for
-/// whichever folder the worker settles on.
-pub(super) fn spawn_load(hwnd: HWND, id: Option<NotebookId>, startup: Option<Startup>) {
+/// Marks the notebook `id` as loading under a fresh generation and returns its folder and that
+/// generation, so only the answer to this load is installed.
+fn begin_load(host: &mut LibraryHost, id: NotebookId) -> Option<(PathBuf, u64)> {
+    let generation = host.fresh_generation();
+    let slot = host.slot_mut(id)?;
+    slot.generation = generation;
+    slot.scanning = true;
+    slot.rescan_requested = false;
+    slot.load_failed = false;
+    slot.local_written_during_scan = false;
+    // The merge re-checks only what FastPad changes in the index from here on.
+    if let Some(state) = slot.state.as_mut() {
+        state.touched.clear();
+        state.folder_changes.clear();
+    }
+    Some((slot.folder.clone(), generation))
+}
+
+fn post_loaded(target: isize, loaded: Loaded) {
+    let payload = Box::into_raw(Box::new(loaded));
+    if unsafe {
+        PostMessageW(
+            target as HWND,
+            crate::window::WM_FASTPAD_LIBRARY_READY,
+            0,
+            payload as isize,
+        )
+    } == 0
+    {
+        drop(unsafe { Box::from_raw(payload) });
+    }
+}
+
+fn load_folder(data: &Path, folder: &Path) -> Result<LibraryState, String> {
+    let local_path = library::local::local_file(data, folder);
+    library::load(folder, &local_path, library::now_unix()).map_err(|error| error.to_string())
+}
+
+/// Starts the load worker for the notebook `id`.
+pub(super) fn spawn_load(hwnd: HWND, id: NotebookId) {
     let Some(data) = data_dir(hwnd) else {
         return;
     };
-    let Some((folder, generation)) = host(hwnd, |host| {
-        let is_startup = startup.is_some();
-        if id.is_none_or(|id| host.slot_mut(id).is_none()) {
-            if !is_startup {
-                return None;
-            }
-            let generation = host.fresh_generation();
-            host.startup_load = Some(generation);
-            return Some((None, generation));
-        }
-        let generation = host.fresh_generation();
-        if is_startup {
-            host.startup_load = None;
-        }
-        let slot = host.slot_mut(id?)?;
-        slot.generation = generation;
-        slot.scanning = true;
-        slot.rescan_requested = false;
-        slot.load_failed = false;
-        slot.local_written_during_scan = false;
-        // The merge re-checks only what FastPad changes in the index from here on.
-        if let Some(state) = slot.state.as_mut() {
-            state.touched.clear();
-            state.folder_changes.clear();
-        }
-        Some((Some(slot.folder.clone()), generation))
-    })
-    .flatten() else {
+    let Some((folder, generation)) = host(hwnd, |host| begin_load(host, id)).flatten() else {
         return;
     };
     let target = hwnd as isize;
     std::thread::spawn(move || {
-        let read_folders = startup.is_some();
-        let closed = startup.as_ref().is_some_and(|startup| startup.closed);
-        let (folder, notice) = match startup {
-            Some(startup) => resolve_startup(startup),
-            None => (folder, None),
-        };
-        let opens_nothing = closed && folder.is_none();
-        let folders = read_folders
-            .then(|| library::local::read_folders(&library::local::folders_file(&data)));
-        let (folder, result) = match folder {
-            Some(folder) => {
-                let local_path = library::local::local_file(&data, &folder);
-                let result = library::load(&folder, &local_path, library::now_unix())
-                    .map_err(|error| error.to_string());
-                (folder, result)
-            }
-            None => (
-                PathBuf::new(),
-                Err("the Documents folder could not be found".to_owned()),
-            ),
-        };
-        let payload = Box::into_raw(Box::new(Loaded {
-            generation,
-            folder,
-            result,
+        let result = load_folder(&data, &folder);
+        post_loaded(
+            target,
+            Loaded {
+                generation,
+                folder,
+                result,
+                notice: None,
+                closed: false,
+                default: None,
+            },
+        );
+    });
+}
+
+/// Starts the startup worker. `slots` are the notebooks the UI thread opened a slot for, with the
+/// generation of each one's load; `launch_generation` is the load of the folder named on the
+/// command line. The worker checks which folders exist, then loads each notebook on its own
+/// thread and answers for each as it finishes: a missing notebook's slot is removed by its
+/// answer, which carries the one notice and the default.
+fn spawn_startup(
+    hwnd: HWND,
+    data: PathBuf,
+    startup: Startup,
+    slots: Vec<(PathBuf, u64)>,
+    launch_generation: Option<u64>,
+) {
+    let target = hwnd as isize;
+    std::thread::spawn(move || {
+        let launch = startup.launch.clone();
+        let StartupRoots {
+            roots,
+            default,
             notice,
-            closed: opens_nothing,
-            folders,
-        }));
-        if unsafe {
-            PostMessageW(
-                target as HWND,
-                crate::window::WM_FASTPAD_LIBRARY_READY,
-                0,
-                payload as isize,
-            )
-        } == 0
-        {
-            drop(unsafe { Box::from_raw(payload) });
+        } = resolve_startup(startup);
+        let generation_of = |folder: &Path| {
+            slots
+                .iter()
+                .find(|(slot, _)| library::model::same_path(slot, folder))
+                .map(|(_, generation)| *generation)
+        };
+        let nothing = |generation: u64| Loaded {
+            generation,
+            folder: PathBuf::new(),
+            result: Err(String::new()),
+            notice: None,
+            closed: true,
+            default: None,
+        };
+        let mut carried = Some((notice, default));
+        for (folder, generation) in &slots {
+            if roots
+                .iter()
+                .any(|root| library::model::same_path(root, folder))
+            {
+                continue;
+            }
+            let (notice, default) = carried.take().unwrap_or_default();
+            post_loaded(
+                target,
+                Loaded {
+                    notice,
+                    default,
+                    ..nothing(*generation)
+                },
+            );
         }
+        if let (Some(launch), Some(generation)) = (&launch, launch_generation) {
+            let exists = roots
+                .iter()
+                .any(|root| library::model::same_path(root, launch));
+            if !exists {
+                // Not a folder: nothing to add.
+                post_loaded(target, nothing(generation));
+            } else if generation_of(launch).is_some() {
+                // Also a remembered notebook: it is revealed, not loaded again.
+                post_loaded(
+                    target,
+                    Loaded {
+                        folder: launch.clone(),
+                        closed: false,
+                        ..nothing(generation)
+                    },
+                );
+            }
+        }
+        std::thread::scope(|scope| {
+            for root in &roots {
+                let generation = match generation_of(root) {
+                    Some(generation) => generation,
+                    // The folder named on the command line, which is not a remembered one.
+                    None => match launch_generation {
+                        Some(generation) => generation,
+                        None => continue,
+                    },
+                };
+                let data = &data;
+                scope.spawn(move || {
+                    let result = load_folder(data, root);
+                    post_loaded(
+                        target,
+                        Loaded {
+                            generation,
+                            folder: root.clone(),
+                            result,
+                            notice: None,
+                            closed: false,
+                            default: None,
+                        },
+                    );
+                });
+            }
+        });
     });
 }
 
@@ -236,7 +400,7 @@ pub(crate) fn test_ready_payload(generation: u64, result: Result<LibraryState, S
         result,
         notice: None,
         closed: false,
-        folders: None,
+        default: None,
     })) as LPARAM
 }
 
@@ -248,7 +412,7 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
     let loaded = unsafe { Box::from_raw(lparam as *mut Loaded) };
     // The slot the load was for, or `None` for a startup load that opened no slot yet. A result
     // for a notebook since closed or reloaded matches neither and is dropped.
-    let Some(mut id) = host(hwnd, |host| {
+    let Some(id) = host(hwnd, |host| {
         if let Some(id) = host.slot_by_load_generation(loaded.generation) {
             if let Some(slot) = host.slot_mut(id) {
                 slot.scanning = false;
@@ -269,23 +433,28 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
         result,
         notice,
         closed,
-        folders,
+        default,
         ..
     } = *loaded;
     if let Some(notice) = notice {
         push_notice(hwnd, notice);
     }
-    // A change the user made while the worker ran is newer than what the worker read.
-    if let Some(folders) = folders {
+    // A missing default hands over to the first notebook that opened (in memory only: `open=`
+    // and `default=` are rewritten when the open set next changes).
+    if let Some(default) = default {
         host(hwnd, |host| {
-            if !host.folders_edited {
-                host.folders = Some(folders);
+            let slot = host
+                .notebooks
+                .iter()
+                .find(|slot| library::model::same_path(&slot.folder, &default));
+            if let Some(slot) = slot {
+                host.default_notebook = Some(slot.id);
             }
         });
     }
     if closed {
-        // The path on the command line was not a folder, and the last session closed its
-        // notebook: none is open.
+        // The notebook is missing, or the path on the command line was not a folder: its slot,
+        // if it had one, goes. `open=` keeps remembering it.
         if let Some(id) = id {
             host(hwnd, |host| host.remove_notebook(id));
         }
@@ -293,36 +462,22 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
         crate::window::side_panel::refresh(hwnd);
         return;
     }
-    // At startup the worker decides which folder exists; the UI thread only assumed one.
-    let moved = !folder.as_os_str().is_empty()
-        && host(hwnd, |host| match id.and_then(|id| host.slot_mut(id)) {
-            Some(slot) => {
-                let moved = !library::model::same_path(&slot.folder, &folder);
-                if moved {
-                    slot.folder = folder.clone();
-                }
-                moved
-            }
-            // Nothing was assumed: the worker's folder opens now.
-            None => {
-                id = Some(host.add_notebook(folder.clone()));
-                true
-            }
-        })
-        .unwrap_or(false);
-    if moved {
-        crate::window::main_window::invalidate_title_strip(hwnd);
-    }
-    match result {
-        Ok(fresh) => {
-            if let Some(id) = id {
-                install_of(hwnd, id, fresh);
-            }
+    // The folder named on the command line has no slot yet: it opens like any other folder, so
+    // it is revealed when already open and refused when nested in an open notebook.
+    let id = match id {
+        Some(id) => id,
+        None => {
+            let Some(id) = add_root(hwnd, &folder) else {
+                return;
+            };
+            notebook_opened(hwnd, id);
+            id
         }
+    };
+    match result {
+        Ok(fresh) => install_of(hwnd, id, fresh),
         Err(error) => {
-            if let Some(id) = id {
-                slot(hwnd, id, |slot| slot.load_failed = true);
-            }
+            slot(hwnd, id, |slot| slot.load_failed = true);
             push_notice(
                 hwnd,
                 format!(
@@ -333,9 +488,7 @@ pub(crate) fn library_ready(hwnd: HWND, lparam: LPARAM) {
             crate::window::side_panel::refresh(hwnd);
         }
     }
-    if let Some(id) = id
-        && slot(hwnd, id, |slot| std::mem::take(&mut slot.rescan_requested)).unwrap_or(false)
-    {
+    if slot(hwnd, id, |slot| std::mem::take(&mut slot.rescan_requested)).unwrap_or(false) {
         start_load_of(hwnd, id);
     }
 }
