@@ -771,6 +771,16 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
         if crate::editor::input_filter::should_ignore_char(wparam as u16, ctrl_down) {
             return 0;
         }
+        // The Markdown typing helpers see the characters they act on (ASCII punctuation only, so
+        // IME text and surrogate halves pass straight through). Cloned out, as for keys.
+        let typed = char::from_u32(wparam as u32)
+            .filter(|c| matches!(c, '(' | '[' | ')' | ']' | '`' | '*' | '_' | '~'));
+        if let Some(typed) = typed {
+            let hooks = endpoint.hooks.borrow().clone();
+            if hooks.is_some_and(|hooks| hooks.char_typed(typed)) {
+                return 0;
+            }
+        }
     }
     if message == WM_KEYDOWN && wparam == usize::from(VK_ESCAPE) {
         // Scintilla's Cancel drops extra carets; with one selection it keeps it, where VS Code

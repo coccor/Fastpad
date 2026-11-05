@@ -124,6 +124,31 @@ pub(crate) fn has_text() -> bool {
     available(u32::from(CF_UNICODETEXT))
 }
 
+/// The clipboard's text, or `None` when it holds none.
+pub(crate) fn text(owner: HWND) -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardData;
+    if !has_text() || !open(owner) {
+        return None;
+    }
+    let handle = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT)) };
+    let data = if handle.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { GlobalLock(handle) }.cast::<u16>()
+    };
+    let text = (!data.is_null()).then(|| {
+        let mut length = 0;
+        while unsafe { *data.add(length) } != 0 {
+            length += 1;
+        }
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(data, length) });
+        unsafe { GlobalUnlock(handle) };
+        text
+    });
+    unsafe { CloseClipboard() };
+    text
+}
+
 /// Whether the clipboard holds an image a capture can attach.
 pub(crate) fn has_image() -> bool {
     use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5};

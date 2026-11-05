@@ -12,6 +12,12 @@ pub trait EditorHooks: std::fmt::Debug {
         false
     }
 
+    /// A `WM_CHAR` of a printable character, before the editor types it; true consumes it (the
+    /// hook made its own edit: a bracket closed, a selection wrapped).
+    fn char_typed(&self, _ch: char) -> bool {
+        false
+    }
+
     /// A Ctrl+click at client point `x`, `y`; true consumes it (a link was followed).
     fn ctrl_click(&self, _x: i32, _y: i32) -> bool {
         false

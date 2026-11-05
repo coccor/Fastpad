@@ -3,10 +3,12 @@
 
 use super::*;
 use crate::editor::scintilla_constants::{
-    INDIC_PLAIN, SC_ORDER_PERFORMSORT, SCI_AUTOCACTIVE, SCI_AUTOCSETCANCELATSTART,
-    SCI_AUTOCSETIGNORECASE, SCI_AUTOCSETORDER, SCI_AUTOCSETSEPARATOR, SCI_AUTOCSHOW,
-    SCI_INDICATORCLEARRANGE, SCI_INDICATORFILLRANGE, SCI_INDICSETFORE, SCI_INDICSETSTYLE,
-    SCI_INDICSETUNDER, SCI_LINESONSCREEN, SCI_POSITIONFROMPOINT, SCI_SETINDICATORCURRENT,
+    INDIC_PLAIN, SC_AUTOCOMPLETE_SELECT_FIRST_ITEM, SC_ORDER_CUSTOM, SCI_AUTOCACTIVE,
+    SCI_AUTOCCANCEL, SCI_AUTOCSETAUTOHIDE, SCI_AUTOCSETCANCELATSTART, SCI_AUTOCSETIGNORECASE,
+    SCI_AUTOCSETMAXHEIGHT, SCI_AUTOCSETOPTIONS, SCI_AUTOCSETORDER, SCI_AUTOCSETSEPARATOR,
+    SCI_AUTOCSHOW, SCI_INDICATORCLEARRANGE, SCI_INDICATORFILLRANGE, SCI_INDICSETFORE,
+    SCI_INDICSETSTYLE, SCI_INDICSETUNDER, SCI_LINESONSCREEN, SCI_POINTYFROMPOSITION,
+    SCI_POSITIONFROMPOINT, SCI_SETINDICATORCURRENT,
 };
 use std::ops::Range;
 
@@ -63,12 +65,13 @@ impl Editor {
         (position >= 0).then_some(position as usize)
     }
 
-    /// Opens the completion list with `items`, as if `typed` bytes before the caret were already
-    /// part of the choice. Scintilla filters it as the user types, ignoring case, and replaces the
-    /// typed text with the choice.
+    /// Opens the completion list with `items`, shown in the order given and the first one
+    /// selected, as if `typed` bytes before the caret were already part of the choice: picking an
+    /// item replaces them. The list doesn't filter itself; the caller ranks the items again as
+    /// the user types and shows the list anew (Markdown typing speed, 2026-11-04).
     pub(crate) fn show_completion(&self, typed: usize, items: &[String]) -> Result<()> {
         if items.is_empty() {
-            return Ok(());
+            return self.cancel_completion();
         }
         let separator = char::from(COMPLETION_SEPARATOR);
         let list: String = items
@@ -80,11 +83,33 @@ impl Editor {
             .map_err(|_| FastPadError::Invariant("a completion item holds a NUL"))?;
         self.link_send(SCI_AUTOCSETSEPARATOR, usize::from(COMPLETION_SEPARATOR), 0)?;
         self.link_send(SCI_AUTOCSETIGNORECASE, 1, 0)?;
-        self.link_send(SCI_AUTOCSETORDER, SC_ORDER_PERFORMSORT as usize, 0)?;
-        // Backspacing over the `[[` closes the list.
-        self.link_send(SCI_AUTOCSETCANCELATSTART, 1, 0)?;
+        self.link_send(SCI_AUTOCSETORDER, SC_ORDER_CUSTOM as usize, 0)?;
+        self.link_send(
+            SCI_AUTOCSETOPTIONS,
+            SC_AUTOCOMPLETE_SELECT_FIRST_ITEM as usize,
+            0,
+        )?;
+        // Items that don't start with the typed text stay listed: they matched another way.
+        self.link_send(SCI_AUTOCSETAUTOHIDE, 0, 0)?;
+        // Backspace within the typed text keeps the list; past its start Scintilla closes it.
+        self.link_send(SCI_AUTOCSETCANCELATSTART, 0, 0)?;
+        self.link_send(SCI_AUTOCSETMAXHEIGHT, 8, 0)?;
         self.link_send(SCI_AUTOCSHOW, typed, list.as_ptr() as isize)?;
         Ok(())
+    }
+
+    /// Closes the completion list, if open.
+    pub(crate) fn cancel_completion(&self) -> Result<()> {
+        if self.completion_active() {
+            self.link_send(SCI_AUTOCCANCEL, 0, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Whether text positions `a` and `b` are drawn on the same row (a wrapped line has several).
+    pub(crate) fn same_row(&self, a: usize, b: usize) -> bool {
+        let y = |at: usize| self.link_send(SCI_POINTYFROMPOSITION, 0, at as isize).ok();
+        y(a).is_some() && y(a) == y(b)
     }
 
     /// Whether the completion list is open.

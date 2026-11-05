@@ -544,6 +544,39 @@ impl LiveView {
         .flatten()
     }
 
+    /// Where the caret at `position` is drawn, in client pixels: its x, and its row's top and
+    /// bottom. The completion list opens under it (Markdown typing speed, 2026-11-04).
+    pub fn caret_client_rect(&self, position: usize) -> Option<(i32, i32, i32)> {
+        self.with(|state| {
+            prepare(state);
+            let scale = dpi_scale(state.hwnd);
+            let left = text_left(state);
+            let ViewState {
+                editor,
+                layout,
+                document,
+                revealed,
+                scroll_y,
+                pictures,
+                ..
+            } = state;
+            let source = EditorText(editor);
+            let text = Styled {
+                text: &source,
+                document,
+                revealed: revealed.clone(),
+                images: &|dest: &str| pictures.resolve(dest),
+            };
+            let rect = layout.caret_rect(&text, position).ok()?;
+            Some((
+                ((left + rect.left) * scale).round() as i32,
+                ((rect.top - *scroll_y) * scale).round() as i32,
+                ((rect.bottom - *scroll_y) * scale).round() as i32,
+            ))
+        })
+        .flatten()
+    }
+
     /// The client point at the centre of the first checkbox drawn for `line`.
     #[cfg(test)]
     pub fn checkbox_point(&self, line: usize) -> Option<(i32, i32)> {

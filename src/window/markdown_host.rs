@@ -1,11 +1,17 @@
-//! The Markdown writing helpers in the window layer (Markdown design spec §8): the format
-//! commands, Enter and Tab in Markdown documents, and tables formatted when the caret leaves them.
+//! The Markdown writing helpers in the window layer (Markdown design spec §8, Markdown typing
+//! speed 2026-11-04): the format, heading, list and table commands; Enter, Tab, Backspace and Home
+//! in Markdown documents; brackets and markers as they are typed; a URL pasted over text; and
+//! tables formatted when the caret leaves them.
 
 use crate::document::{DocumentId, Language};
 use crate::editor::markdown_edit::{
-    EditPlan, FenceCache, MARKDOWN_HELPER_MAX_BYTES, enter_in_list, format_table,
+    EditPlan, FenceCache, MARKDOWN_HELPER_MAX_BYTES, enter_in_list, fence_line, format_table,
     in_literal_block_cached, indent_list_item, insert_link, is_list_item, line_bounds, next_cell,
     table_at, toggle_marker,
+};
+use crate::editor::markdown_typing::{
+    ListKind, append_row, backspace_pair, enter_after_fence, enter_in_quote, home_target,
+    insert_table, link_from_paste, quote_prefix, set_heading, table_column, toggle_list, type_char,
 };
 use crate::editor::scintilla_constants::{SC_MOD_DELETETEXT, SC_PERFORMED_REDO, SC_PERFORMED_UNDO};
 use crate::editor::{Editor, EditorHooks, ScintillaNotification};
@@ -14,29 +20,71 @@ use crate::window::main_window as host_window;
 use crate::window::split_tree::GroupId;
 use std::collections::HashMap;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_RETURN, VK_TAB};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, VK_BACK, VK_HOME, VK_RETURN, VK_TAB,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-/// The format commands (spec §8.1): toggle a marker around each selection, or insert
-/// a link, as one undo step.
+/// The format commands (spec §8.1, Markdown typing speed): toggle a marker around each
+/// selection, insert a link, set the touched lines' heading level or list kind, or edit the
+/// table at the caret, as one undo step.
 pub(crate) fn format(hwnd: HWND, command: CommandId) {
     if host_window::active_language(hwnd) != Language::Markdown {
         return;
     }
+    let mut notice = None;
     host_window::with_editor(hwnd, |editor| {
-        let Ok(selections) = editor.selections() else {
+        let (Ok(selections), Ok(caret)) = (editor.selections(), editor.caret()) else {
             return;
         };
-        let plan = editor.with_document_text(|text| match command {
-            CommandId::MarkdownBold => toggle_marker(text, &selections, "**"),
-            CommandId::MarkdownItalic => toggle_marker(text, &selections, "*"),
-            CommandId::MarkdownCode => toggle_marker(text, &selections, "`"),
-            _ => insert_link(text, &selections),
+        let eol = editor.eol().unwrap_or("\r\n");
+        let plan = editor.with_document_text(|text| {
+            // The line commands split lines on LF: a CR-only document would read as one line.
+            let lines = eol != "\r";
+            Some(match command {
+                CommandId::MarkdownBold => toggle_marker(text, &selections, "**"),
+                CommandId::MarkdownItalic => toggle_marker(text, &selections, "*"),
+                CommandId::MarkdownCode => toggle_marker(text, &selections, "`"),
+                CommandId::MarkdownStrikethrough => toggle_marker(text, &selections, "~~"),
+                CommandId::MarkdownLink => insert_link(text, &selections),
+                _ if !lines => return None,
+                CommandId::MarkdownHeading1 => set_heading(text, &selections, 1),
+                CommandId::MarkdownHeading2 => set_heading(text, &selections, 2),
+                CommandId::MarkdownHeading3 => set_heading(text, &selections, 3),
+                CommandId::MarkdownHeading4 => set_heading(text, &selections, 4),
+                CommandId::MarkdownHeading5 => set_heading(text, &selections, 5),
+                CommandId::MarkdownHeading6 => set_heading(text, &selections, 6),
+                CommandId::MarkdownParagraph => set_heading(text, &selections, 0),
+                CommandId::MarkdownBulletList => toggle_list(text, &selections, ListKind::Bullet),
+                CommandId::MarkdownNumberedList => {
+                    toggle_list(text, &selections, ListKind::Numbered)
+                }
+                CommandId::MarkdownTaskList => toggle_list(text, &selections, ListKind::Task),
+                CommandId::MarkdownInsertTable => insert_table(text, caret, eol),
+                CommandId::MarkdownAddTableColumn | CommandId::MarkdownDeleteTableColumn => {
+                    let add = command == CommandId::MarkdownAddTableColumn;
+                    match table_column(text, caret, add) {
+                        Some(plan) => plan,
+                        None => {
+                            notice = Some(if table_at(text, caret).is_some() {
+                                "A table keeps at least one column."
+                            } else {
+                                "Put the caret in a table first."
+                            });
+                            return None;
+                        }
+                    }
+                }
+                _ => return None,
+            })
         });
-        if let Ok(plan) = plan {
+        if let Ok(Some(plan)) = plan {
             let _ = editor.apply_plan(&plan);
         }
     });
+    if let Some(notice) = notice {
+        host_window::push_notice(hwnd, notice.to_owned());
+    }
 }
 
 /// The helpers' per-document state, and the groups waiting for deferred work.
@@ -46,6 +94,8 @@ pub(crate) struct MarkdownRegistry {
     /// Groups whose selection changed since the deferred message was posted.
     pending: Vec<GroupId>,
     posted: bool,
+    /// The `[[`, `#` or `/` list open in an editor, if any.
+    pub(crate) completion: Option<crate::window::markdown_completion::Completion>,
 }
 
 impl std::fmt::Debug for MarkdownRegistry {
@@ -54,6 +104,7 @@ impl std::fmt::Debug for MarkdownRegistry {
             .field("docs", &self.docs)
             .field("pending", &self.pending)
             .field("posted", &self.posted)
+            .field("completion", &self.completion)
             .finish()
     }
 }
@@ -104,7 +155,10 @@ pub(crate) fn forget(hwnd: HWND, document: DocumentId) {
     crate::window::live_host::forget(hwnd, document);
 }
 
-fn with_registry<R>(hwnd: HWND, run: impl FnOnce(&mut MarkdownRegistry) -> R) -> Option<R> {
+pub(crate) fn with_registry<R>(
+    hwnd: HWND,
+    run: impl FnOnce(&mut MarkdownRegistry) -> R,
+) -> Option<R> {
     // SAFETY: the App pointer is used only inside `run`, which makes no Win32 call.
     unsafe { host_window::app_ptr(hwnd) }.map(|mut app| run(&mut unsafe { app.as_mut() }.markdown))
 }
@@ -303,43 +357,144 @@ pub(crate) fn refresh_link_marks(editor: &Editor) {
     let _ = editor.mark_links(area_start..area_end.max(area_start), &links);
 }
 
-/// `SCN_CHARADDED` in a Markdown editor: a second `[` opens the list of notes to link to
-/// (spec §7.4).
-pub(crate) fn char_added(hwnd: HWND, editor: &Editor, character: i32) {
-    if character != i32::from(b'[') || editor.completion_active() {
-        return;
+impl GroupHooks {
+    /// The Markdown editor and document, when it holds the helpers' size and its lines end in
+    /// LF or CRLF (the helpers split lines on LF).
+    fn helper_editor(&self) -> Option<(Editor, DocumentId, &'static str)> {
+        let (editor, document) = self.markdown_editor()?;
+        if editor
+            .length()
+            .map_or(true, |length| length > MARKDOWN_HELPER_MAX_BYTES)
+        {
+            return None;
+        }
+        let eol = editor.eol().unwrap_or("\r\n");
+        (eol != "\r").then_some((editor, document, eol))
     }
-    // Scintilla's list would open at the hidden editor's caret (phase 1 plan, deviation 4).
-    let live = group_of_editor(hwnd, editor.hwnd())
-        .is_some_and(|(id, ..)| crate::window::live_host::view_hwnd(hwnd, id).is_some());
-    if live {
-        return;
-    }
-    let Ok(caret) = editor.caret() else {
-        return;
-    };
-    if caret < 2 || editor.range_bytes(caret - 2..caret).ok() != Some(b"[[".as_slice()) {
-        return;
-    }
-    let from = unsafe { host_window::app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
-    let items = crate::window::library_host::completion_items(hwnd, from.as_deref());
-    let _ = editor.show_completion(0, &items);
-}
 
-/// `SCN_AUTOCCOMPLETED`: a note was picked; the link closes after it unless it already does.
-pub(crate) fn completion_done(editor: &Editor) {
-    let Ok(caret) = editor.caret() else {
-        return;
-    };
-    let closed = editor.range_bytes(caret..caret + 2).ok() == Some(b"]]".as_slice());
-    if !closed {
-        let _ = editor.replace_target(caret..caret, "]]");
-        let _ = editor.set_selection(caret + 2..caret + 2);
+    /// The one selection (start..end) and its caret; `None` with several carets.
+    fn single_selection(editor: &Editor) -> Option<(std::ops::Range<usize>, usize)> {
+        let (Ok(selections), Ok(carets)) = (editor.selections(), editor.carets()) else {
+            return None;
+        };
+        match (selections.as_slice(), carets.as_slice()) {
+            ([selection], [caret]) => Some((selection.clone(), *caret)),
+            _ => None,
+        }
+    }
+
+    /// Runs `plan_for` over the document and applies the plan it makes outside fenced code and
+    /// front matter (at `at`). True when a plan was applied.
+    fn apply_outside_literal(
+        &self,
+        editor: &Editor,
+        document: DocumentId,
+        at: usize,
+        plan_for: impl FnOnce(&str) -> Option<EditPlan>,
+    ) -> bool {
+        let plan = editor.with_document_text(|text| {
+            if splits_on_cr(text, at) {
+                return None;
+            }
+            plan_for(text).filter(|_| !in_literal_block(self.main, document, text, at))
+        });
+        matches!(plan, Ok(Some(plan)) if editor.apply_plan(&plan).is_ok())
+    }
+
+    /// Ctrl+V of a URL over a one-line selection in a Markdown tab links the selection.
+    fn paste_link(&self) -> bool {
+        let Some((editor, _, _)) = self.helper_editor() else {
+            return false;
+        };
+        let Some((selection, _)) = Self::single_selection(&editor) else {
+            return false;
+        };
+        if selection.is_empty() {
+            return false;
+        }
+        let Some(clip) = crate::platform::clipboard::text(self.main) else {
+            return false;
+        };
+        let plan = editor.with_document_text(|text| link_from_paste(text, selection, &clip));
+        matches!(plan, Ok(Some(plan)) if editor.apply_plan(&plan).is_ok())
+    }
+
+    /// Backspace between an empty pair removes both.
+    fn backspace(&self) -> bool {
+        let Some((editor, document, _)) = self.helper_editor() else {
+            return false;
+        };
+        if editor.completion_active() {
+            return false;
+        }
+        let Some((selection, caret)) = Self::single_selection(&editor) else {
+            return false;
+        };
+        selection.is_empty()
+            && self
+                .apply_outside_literal(&editor, document, caret, |text| backspace_pair(text, caret))
+    }
+
+    /// Home (Shift+Home) on a list, quote or heading line goes to its text first.
+    fn home(&self, shift: bool) -> bool {
+        let Some((editor, _, _)) = self.helper_editor() else {
+            return false;
+        };
+        if editor.completion_active() {
+            return false;
+        }
+        let Some((selection, caret)) = Self::single_selection(&editor) else {
+            return false;
+        };
+        let Ok(line) = editor.line_from_position(caret) else {
+            return false;
+        };
+        let (Ok(start), Ok(text)) = (editor.line_start(line), editor.line_text(line)) else {
+            return false;
+        };
+        // On a wrapped line's later rows Home stays the editor's: the start of that row.
+        if !editor.same_row(caret, start) {
+            return false;
+        }
+        let text = text.trim_end_matches(['\r', '\n']);
+        let Some(target) = home_target(text, caret - start).map(|at| start + at) else {
+            return false;
+        };
+        let anchor = if caret == selection.start {
+            selection.end
+        } else {
+            selection.start
+        };
+        let range = if shift {
+            anchor..target
+        } else {
+            target..target
+        };
+        editor.set_selection(range).is_ok()
     }
 }
 
 impl EditorHooks for GroupHooks {
+    fn char_typed(&self, ch: char) -> bool {
+        let Some((editor, document, _)) = self.helper_editor() else {
+            return false;
+        };
+        if editor.completion_active() {
+            return false;
+        }
+        let Some((selection, _)) = Self::single_selection(&editor) else {
+            return false;
+        };
+        let at = selection.start;
+        let applied = self
+            .apply_outside_literal(&editor, document, at, |text| type_char(text, selection, ch));
+        // The pair took the `[` from Scintilla, so its `[[` list opens from here.
+        if applied && ch == '[' {
+            crate::window::markdown_completion::char_added(self.main, &editor, i32::from(b'['));
+        }
+        applied
+    }
+
     fn ctrl_click(&self, x: i32, y: i32) -> bool {
         let Some((_, editor, document, _)) = group_of_editor(self.main, self.editor) else {
             return false;
@@ -363,18 +518,32 @@ impl EditorHooks for GroupHooks {
                 && !ctrl
                 && !alt);
         if paste {
-            return group_of_editor(self.main, self.editor).is_some_and(
-                |(_, editor, document, _)| {
+            let attached =
+                group_of_editor(self.main, self.editor).is_some_and(|(_, editor, document, _)| {
                     crate::window::attachments::paste(self.main, &editor, document, false)
-                },
-            );
+                });
+            // Otherwise a URL pasted over text links it (Markdown typing speed).
+            return attached || self.paste_link();
         }
-        if ctrl || alt || !(vk == VK_RETURN || vk == VK_TAB) {
+        if ctrl || alt {
+            return false;
+        }
+        if vk == VK_BACK && !shift {
+            return self.backspace();
+        }
+        if vk == VK_HOME {
+            return self.home(shift);
+        }
+        if !(vk == VK_RETURN || vk == VK_TAB) {
             return false;
         }
         let Some((editor, document)) = self.markdown_editor() else {
             return false;
         };
+        // An open completion list takes Enter and Tab to pick its item.
+        if editor.completion_active() {
+            return false;
+        }
         if editor
             .length()
             .map_or(true, |length| length > MARKDOWN_HELPER_MAX_BYTES)
@@ -395,8 +564,11 @@ impl EditorHooks for GroupHooks {
             return false;
         };
         let list = is_list_item(&line_text);
+        let content = line_text.trim_end_matches(['\r', '\n']);
+        let quote = quote_prefix(content).1 > 0;
+        let fence = fence_line(content).is_some();
         if vk == VK_RETURN {
-            if shift || !selection.is_empty() || !list {
+            if shift || !selection.is_empty() || !(list || quote || fence) {
                 return false;
             }
         } else if line_of(selection.start) != line_of(selection.end) {
@@ -414,7 +586,13 @@ impl EditorHooks for GroupHooks {
                 return None;
             }
             let plan = if vk == VK_RETURN {
-                enter_in_list(text, caret, fallback)
+                enter_after_fence(text, caret, fallback).or_else(|| {
+                    if quote {
+                        enter_in_quote(text, caret, fallback)
+                    } else {
+                        enter_in_list(text, caret, fallback)
+                    }
+                })
             } else if let Some(cell) = next_cell(text, caret, shift) {
                 Some(EditPlan {
                     edits: Vec::new(),
@@ -422,20 +600,27 @@ impl EditorHooks for GroupHooks {
                 })
             } else {
                 // A caret or a selection on one list item's line nests the item (spec §8.2).
-                indent_list_item(text, caret, shift).or_else(|| {
-                    // No cell to move to (the last one, or the delimiter row): Tab never puts a
-                    // tab character into a table.
-                    // The selection is kept as it was, its caret end included.
-                    let kept = if caret == selection.start {
-                        selection.end..selection.start
-                    } else {
-                        selection.clone()
-                    };
-                    table_at(text, caret).map(|_| EditPlan {
-                        edits: Vec::new(),
-                        selections: vec![kept],
+                indent_list_item(text, caret, shift)
+                    // Tab in a table's last cell adds a row (Markdown typing speed).
+                    .or_else(|| {
+                        (!shift)
+                            .then(|| append_row(text, caret, fallback))
+                            .flatten()
                     })
-                })
+                    .or_else(|| {
+                        // No cell to move to (the last one, or the delimiter row): Tab never puts a
+                        // tab character into a table.
+                        // The selection is kept as it was, its caret end included.
+                        let kept = if caret == selection.start {
+                            selection.end..selection.start
+                        } else {
+                            selection.clone()
+                        };
+                        table_at(text, caret).map(|_| EditPlan {
+                            edits: Vec::new(),
+                            selections: vec![kept],
+                        })
+                    })
             };
             // Fenced code and front matter keep the default keys; checked only with a plan.
             plan.filter(|_| !in_literal_block(self.main, document, text, caret))

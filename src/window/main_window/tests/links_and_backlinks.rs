@@ -63,7 +63,7 @@ fn typing_two_brackets_offers_the_notebooks_notes() {
     assert_eq!(items, ["Atlas", "Plan", "work/Plan"]);
 
     editor.set_selection(2..2).unwrap();
-    crate::window::markdown_host::char_added(window.hwnd, &editor, i32::from(b'['));
+    crate::window::markdown_completion::char_added(window.hwnd, &editor, i32::from(b'['));
     assert!(editor.completion_active());
 }
 

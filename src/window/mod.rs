@@ -28,6 +28,7 @@ pub(crate) mod library_host;
 pub(crate) mod links_view;
 pub(crate) mod live_host;
 mod main_window;
+pub(crate) mod markdown_completion;
 pub(crate) mod markdown_host;
 pub(crate) mod menu_band;
 pub(crate) mod menus;

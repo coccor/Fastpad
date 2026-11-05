@@ -26,7 +26,12 @@ impl Editor {
     }
 
     /// Applies a Markdown helper's plan as one undo step (spec §8).
+    /// A read-only document (issue #80) refuses the plan whole: Scintilla would drop its edits
+    /// but not its selections, and the caller's key goes on to Scintilla, which ignores it.
     pub fn apply_plan(&self, plan: &crate::editor::markdown_edit::EditPlan) -> Result<()> {
+        if self.is_read_only()? {
+            return Err(FastPadError::Invariant("the document is read-only"));
+        }
         self.begin_undo_action();
         let result = plan
             .edits

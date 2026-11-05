@@ -36,7 +36,7 @@ impl EditPlan {
     }
 }
 
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
@@ -77,11 +77,11 @@ fn run_matches(run: usize, width: usize) -> bool {
     run == width || (run == 3 && width < 3)
 }
 
-fn normalized(selection: &Range<usize>) -> Range<usize> {
+pub(crate) fn normalized(selection: &Range<usize>) -> Range<usize> {
     selection.start.min(selection.end)..selection.start.max(selection.end)
 }
 
-fn shift(position: usize, delta: isize) -> usize {
+pub(crate) fn shift(position: usize, delta: isize) -> usize {
     (position as isize + delta) as usize
 }
 
@@ -250,7 +250,7 @@ pub fn toggle_marker(text: &str, selections: &[Range<usize>], marker: &str) -> E
 
 /// Where a pre-edit position lands: shifted by the edits wholly before it; an insertion at the
 /// position itself stays after it, and a position inside a removal moves to its start.
-fn map_position(edits: &[TextEdit], position: usize) -> usize {
+pub(crate) fn map_position(edits: &[TextEdit], position: usize) -> usize {
     let mut mapped = position as isize;
     for edit in edits {
         let before = if edit.range.is_empty() {
@@ -353,7 +353,7 @@ pub(crate) fn line_ending(text: &str, line_end: usize, fallback: &'static str) -
 }
 
 /// The visual width of leading whitespace: a tab advances to the next multiple of 4.
-fn columns(whitespace: &str) -> usize {
+pub(crate) fn columns(whitespace: &str) -> usize {
     whitespace.bytes().fold(0, |column, byte| {
         if byte == 9 {
             column + 4 - column % 4
@@ -363,23 +363,23 @@ fn columns(whitespace: &str) -> usize {
     })
 }
 
-struct ListPrefix {
+pub(crate) struct ListPrefix {
     /// Visual columns of the leading whitespace.
-    indent: usize,
+    pub(crate) indent: usize,
     /// Bytes of the leading whitespace.
-    indent_len: usize,
-    bullet: Option<u8>,
-    number: Option<(u64, u8)>,
-    task: bool,
+    pub(crate) indent_len: usize,
+    pub(crate) bullet: Option<u8>,
+    pub(crate) number: Option<(u64, u8)>,
+    pub(crate) task: bool,
     /// Bytes from the line start to the item text.
-    len: usize,
+    pub(crate) len: usize,
     /// The visual column where the item's content starts (CommonMark: 1-4 spaces after the
     /// marker count, otherwise one); a child item is indented to at least this column.
-    content: usize,
+    pub(crate) content: usize,
 }
 
 /// Three or more of the same `-`, `*` or `_`, spaces and tabs between them allowed.
-fn is_thematic_break(line: &str) -> bool {
+pub(crate) fn is_thematic_break(line: &str) -> bool {
     let mut marks = line.bytes().filter(|b| !matches!(b, b' ' | b'\t'));
     let Some(first @ (b'-' | b'*' | b'_')) = marks.next() else {
         return false;
@@ -394,7 +394,7 @@ fn is_thematic_break(line: &str) -> bool {
     count >= 3
 }
 
-fn list_prefix(line: &str) -> Option<ListPrefix> {
+pub(crate) fn list_prefix(line: &str) -> Option<ListPrefix> {
     if is_thematic_break(line) {
         return None;
     }
@@ -498,13 +498,71 @@ pub fn enter_in_list(text: &str, caret: usize, fallback: &'static str) -> Option
         if prefix.task { "[ ] " } else { "" }
     );
     let after = caret + inserted.len();
+    let mut edits = vec![TextEdit {
+        range: caret..caret,
+        text: inserted,
+    }];
+    if let Some((value, delimiter)) = prefix.number {
+        renumber_after(text, line.end, &prefix, value + 2, delimiter, &mut edits);
+    }
     Some(EditPlan {
-        edits: vec![TextEdit {
-            range: caret..caret,
-            text: inserted,
-        }],
+        edits,
         selections: vec![after..after],
     })
+}
+
+/// The ordered siblings after the item on the line ending at `line_end`, renumbered from `next`
+/// on, when they count up from that item (a list of all `1.` is left alone). Their children and
+/// continuation lines are skipped; the list ends at a less indented line or another kind.
+pub(crate) fn renumber_after(
+    text: &str,
+    mut line_end: usize,
+    item: &ListPrefix,
+    next: u64,
+    delimiter: u8,
+    edits: &mut Vec<TextEdit>,
+) {
+    let mut expected = next;
+    let mut first = true;
+    while let Some(newline) = text[line_end..].find('\n') {
+        let below = line_bounds(text, line_end + newline + 1);
+        line_end = below.end;
+        let content = &text[below.clone()];
+        if content.trim().is_empty() {
+            continue;
+        }
+        let Some(sibling) = list_prefix(content) else {
+            if leading(content).1 > item.indent {
+                continue; // the item's continuation text
+            }
+            break;
+        };
+        if sibling.indent > item.indent {
+            continue; // a child item
+        }
+        let Some((value, sibling_delimiter)) = sibling.number else {
+            break;
+        };
+        if sibling.indent < item.indent || sibling_delimiter != delimiter {
+            break;
+        }
+        if first && value + 1 != expected {
+            break; // not counting up from the item: leave the numbers as written
+        }
+        first = false;
+        if value != expected {
+            let digits_start = below.start + sibling.indent_len;
+            let digits = text[digits_start..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            edits.push(TextEdit {
+                range: digits_start..digits_start + digits,
+                text: expected.to_string(),
+            });
+        }
+        expected += 1;
+    }
 }
 
 /// An item as CommonMark nests it: indent and content start in visual columns, plus the marker
@@ -795,7 +853,7 @@ fn shift_lines(
 }
 
 /// A line's leading whitespace: its length in bytes and its width in visual columns.
-fn leading(line: &str) -> (usize, usize) {
+pub(crate) fn leading(line: &str) -> (usize, usize) {
     let len = line.len() - line.trim_start_matches([' ', '\t']).len();
     (len, columns(&line[..len]))
 }
@@ -824,7 +882,7 @@ fn is_delimiter_row(line: &str) -> bool {
 }
 
 /// A table line's cells: (range within the line, raw text), the outer pipes optional.
-fn split_cells(line: &str) -> Vec<(Range<usize>, &str)> {
+pub(crate) fn split_cells(line: &str) -> Vec<(Range<usize>, &str)> {
     let pipes = pipe_positions(line);
     if pipes.is_empty() {
         return Vec::new();
@@ -885,7 +943,7 @@ fn pipe_positions(line: &str) -> Vec<usize> {
 }
 
 /// The lines overlapping `range`, each without its line ending.
-fn line_ranges(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+pub(crate) fn line_ranges(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
     let mut lines = Vec::new();
     let mut start = line_bounds(text, range.start).start;
     while start <= text.len() && (start < range.end || lines.is_empty()) {
@@ -1099,7 +1157,7 @@ fn front_matter_end(text: &str) -> Option<usize> {
 
 /// A fence line: its character, run length, and whether nothing follows the run (so it can
 /// close a block). Indented four columns or more it is indented code, not a fence.
-fn fence_line(line: &str) -> Option<(u8, usize, bool)> {
+pub(crate) fn fence_line(line: &str) -> Option<(u8, usize, bool)> {
     let indent_len = line
         .bytes()
         .take_while(|b| matches!(b, b' ' | b'\t'))

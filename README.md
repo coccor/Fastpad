@@ -145,9 +145,21 @@ typing. Both panes scroll together.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
 - Writing helpers in Markdown files: `Ctrl+B`, `Ctrl+I`, ``Ctrl+` `` and `Ctrl+K` make the selection
-  bold, italic, code or a link. Enter continues a list (Enter on an empty item ends it), Tab and
-  Shift+Tab nest list items and move between table cells, and a table lines up when you leave it.
-  Each is a single undo step.
+  bold, italic, code or a link, and `Ctrl+Shift+X` strikes it through. `Ctrl+Shift+1`–`6` make the
+  line a heading (`Ctrl+Shift+0` a paragraph again), `Ctrl+Shift+8` / `7` a bulleted / numbered list,
+  and `Ctrl+Shift+9` a task, or ticks and unticks it. Enter continues a list or block quote (Enter on
+  an empty item ends it) and renumbers the numbered items after it, and Enter after an opening code
+  fence closes it. Tab and Shift+Tab nest list items and move between table cells, Tab in a table's
+  last cell adds a row, a table lines up when you leave it, and Markdown: Insert table / Add table
+  column / Delete table column build one from the command palette. Each is a single undo step.
+- Typing in Markdown files: `(`, `[` and `` ` `` close themselves (and the closer is stepped over),
+  Backspace in an empty pair removes both, and typing `*`, `_`, `~`, `` ` ``, `[` or `(` over a
+  selection wraps it. A URL pasted over selected text makes it a link, and Home on a list item,
+  quote or heading goes to its text first.
+- Completion as you type: `[[` lists notes to link to, ranked like `Ctrl+P`; `#` and a letter lists
+  the notebook's tags; and `/` at the start of a line lists commands (headings, lists, tasks, quote,
+  code block, table, divider, link, image, callouts, date, time). The lists work in the Live view
+  too.
 - **Live Markdown (preview):** `Ctrl+Alt+V`, or View → Markdown view → Live, switches a Markdown
   tab to a view FastPad draws itself, in the preview's font with real wrapping. Typing, selecting, undo,
   find, the writing helpers and Japanese, Chinese or Korean input work as in the source view, and the
@@ -405,6 +417,8 @@ before closing again.
 | Add next occurrence | `Ctrl+D` | | Select all occurrences | `Ctrl+Shift+L` |
 | Add cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | | Add cursor | `Alt+Click` |
 | Bold / italic (Markdown files) | `Ctrl+B` / `Ctrl+I` | | Code / link (Markdown files) | ``Ctrl+` `` / `Ctrl+K` |
+| Strikethrough (Markdown files) | `Ctrl+Shift+X` | | Heading 1–6 / paragraph (Markdown files) | `Ctrl+Shift+1`–`6` / `Ctrl+Shift+0` |
+| Bulleted / numbered list (Markdown files) | `Ctrl+Shift+8` / `Ctrl+Shift+7` | | Task / tick task (Markdown files) | `Ctrl+Shift+9` |
 | Follow link at caret | `F12` or `Ctrl+Click` | | Today's note | `Ctrl+Alt+D` |
 | Live Markdown view | `Ctrl+Alt+V` | | | |
 

@@ -161,6 +161,10 @@ fn toggle_checkbox(hwnd: HWND, inner: usize, checked: bool) {
 /// `WM_LBUTTONDOWN`.
 pub(super) fn press(hwnd: HWND, lparam: isize) {
     unsafe { SetFocus(hwnd) };
+    // A click in the text closes an open completion list, as it does in the source view.
+    if let Some(editor) = with_state(hwnd, |state| state.editor.clone()) {
+        let _ = editor.cancel_completion();
+    }
     let at = point(lparam);
     if !down(VK_CONTROL)
         && !down(VK_SHIFT)

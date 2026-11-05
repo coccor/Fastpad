@@ -55,7 +55,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 151] = [
+pub(crate) const ENTRIES: [PaletteEntry; 165] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
@@ -167,6 +167,32 @@ pub(crate) const ENTRIES: [PaletteEntry; 151] = [
     entry("Markdown: Italic", CommandId::MarkdownItalic),
     entry("Markdown: Inline code", CommandId::MarkdownCode),
     entry("Markdown: Link", CommandId::MarkdownLink),
+    entry("Markdown: Strikethrough", CommandId::MarkdownStrikethrough),
+    entry("Markdown: Heading 1", CommandId::MarkdownHeading1),
+    entry("Markdown: Heading 2", CommandId::MarkdownHeading2),
+    entry("Markdown: Heading 3", CommandId::MarkdownHeading3),
+    entry("Markdown: Heading 4", CommandId::MarkdownHeading4),
+    entry("Markdown: Heading 5", CommandId::MarkdownHeading5),
+    entry("Markdown: Heading 6", CommandId::MarkdownHeading6),
+    entry(
+        "Markdown: Paragraph (remove heading)",
+        CommandId::MarkdownParagraph,
+    ),
+    entry("Markdown: Bulleted list", CommandId::MarkdownBulletList),
+    entry("Markdown: Numbered list", CommandId::MarkdownNumberedList),
+    entry(
+        "Markdown: Task list / toggle task",
+        CommandId::MarkdownTaskList,
+    ),
+    entry("Markdown: Insert table", CommandId::MarkdownInsertTable),
+    entry(
+        "Markdown: Add table column",
+        CommandId::MarkdownAddTableColumn,
+    ),
+    entry(
+        "Markdown: Delete table column",
+        CommandId::MarkdownDeleteTableColumn,
+    ),
     entry("View: Next tab", CommandId::NextTab),
     entry("View: Previous tab", CommandId::PreviousTab),
     entry("View: Toggle sidebar", CommandId::ToggleSidebar),

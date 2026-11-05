@@ -562,15 +562,18 @@ fn enter_and_tab_in_a_cr_only_document_keep_their_default() {
 }
 
 #[test]
-fn tab_on_the_last_cell_or_the_delimiter_row_is_consumed_without_an_edit() {
-    // Break caught: a literal tab inserted into the table where no next cell exists.
-    let text = "| a | b |\r\n| - | - |\r\n| c | d |";
+fn tab_on_the_delimiter_row_or_shift_tab_on_the_first_cell_is_consumed_without_an_edit() {
+    // Break caught: a literal tab inserted into the table where no next cell exists. (Tab in the
+    // last cell adds a row: `tab_in_the_last_cell_adds_a_table_row`.)
+    let text = "| a | b |
+| - | - |
+| c | d |";
     let f = fixture(text, Language::Markdown);
-    let d = text.find('d').unwrap();
-    f.editor.set_selection(d..d).unwrap();
-    press(&f, VK_TAB, false);
+    let a = text.find('a').unwrap();
+    f.editor.set_selection(a..a).unwrap();
+    press(&f, VK_TAB, true);
     assert_eq!(f.editor.text().unwrap(), text);
-    assert_eq!(f.editor.selection().unwrap(), d..d);
+    assert_eq!(f.editor.selection().unwrap(), a..a);
     let delimiter = text.find("| -").unwrap() + 3;
     f.editor.set_selection(delimiter..delimiter).unwrap();
     press(&f, VK_TAB, false);
@@ -588,16 +591,150 @@ fn a_cr_only_table_is_not_formatted_when_the_caret_leaves_it() {
 }
 
 #[test]
-fn tab_on_the_last_cell_keeps_a_backward_selection() {
-    let text = "| a | b |\r\n| - | - |\r\n| c | dd |";
+fn shift_tab_on_the_first_cell_keeps_a_backward_selection() {
+    let text = "| aa | b |
+| - | - |
+| c | d |";
     let f = fixture(text, Language::Markdown);
-    let d = text.find("dd").unwrap();
-    let backward = d + 2..d;
+    let a = text.find("aa").unwrap();
+    let backward = a + 2..a;
     f.editor
         .set_selections(std::slice::from_ref(&backward))
         .unwrap();
-    press(&f, VK_TAB, false);
+    press(&f, VK_TAB, true);
     assert_eq!(f.editor.text().unwrap(), text);
-    assert_eq!(f.editor.selections().unwrap(), vec![d..d + 2]);
-    assert_eq!(f.editor.carets().unwrap(), vec![d]);
+    assert_eq!(f.editor.selections().unwrap(), vec![a..a + 2]);
+    assert_eq!(f.editor.carets().unwrap(), vec![a]);
+}
+
+// Markdown typing speed (2026-11-04), through the real key and character paths.
+
+/// Types `ch` as the message loop delivers it: a WM_CHAR through FastPad's editor subclass.
+fn type_char(f: &Fixture, ch: char) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR};
+    unsafe { SendMessageW(f.editor.hwnd(), WM_CHAR, ch as usize, 0) };
+    drain_messages();
+}
+
+#[test]
+fn typed_brackets_pair_and_markers_wrap_a_selection() {
+    let f = fixture("a word", Language::Markdown);
+    f.editor.set_selection(2..6).unwrap();
+    type_char(&f, '*');
+    type_char(&f, '*');
+    assert_eq!(f.editor.text().unwrap(), "a **word**");
+    assert_eq!(f.editor.selection().unwrap(), 4..8);
+    f.editor.set_selection(10..10).unwrap();
+    type_char(&f, ' ');
+    type_char(&f, '(');
+    assert_eq!(f.editor.text().unwrap(), "a **word** ()");
+    type_char(&f, 'x');
+    type_char(&f, ')');
+    assert_eq!(f.editor.text().unwrap(), "a **word** (x)");
+    assert_eq!(f.editor.selection().unwrap(), 14..14);
+    drop(f);
+    // A text file types each character as it is.
+    let plain = fixture("", Language::PlainText);
+    type_char(&plain, '(');
+    assert_eq!(plain.editor.text().unwrap(), "(");
+}
+
+#[test]
+fn backspace_removes_an_empty_pair() {
+    let f = fixture("()", Language::Markdown);
+    f.editor.set_selection(1..1).unwrap();
+    press(
+        &f,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_BACK,
+        false,
+    );
+    assert_eq!(f.editor.text().unwrap(), "");
+}
+
+#[test]
+fn enter_continues_a_quote_and_closes_a_fence() {
+    let f = fixture("> a", Language::Markdown);
+    f.editor.set_selection(3..3).unwrap();
+    press(&f, VK_RETURN, false);
+    assert_eq!(f.editor.text().unwrap(), "> a\r\n> ");
+    drop(f);
+    let f = fixture("```rust", Language::Markdown);
+    f.editor.set_selection(7..7).unwrap();
+    press(&f, VK_RETURN, false);
+    assert_eq!(f.editor.text().unwrap(), "```rust\r\n\r\n```");
+    assert_eq!(f.editor.selection().unwrap(), 9..9);
+}
+
+#[test]
+fn home_on_a_list_item_goes_to_its_text_first() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_HOME;
+    let f = fixture("- [ ] task", Language::Markdown);
+    f.editor.set_selection(9..9).unwrap();
+    press(&f, VK_HOME, false);
+    assert_eq!(f.editor.selection().unwrap(), 6..6);
+    press(&f, VK_HOME, false);
+    assert_eq!(f.editor.selection().unwrap(), 0..0);
+}
+
+#[test]
+fn tab_in_the_last_cell_adds_a_table_row() {
+    let table = "| a | b |\r\n| - | - |\r\n| 1 | 2 |";
+    let f = fixture(table, Language::Markdown);
+    f.editor
+        .set_selection(table.len() - 2..table.len() - 2)
+        .unwrap();
+    press(&f, VK_TAB, false);
+    assert_eq!(f.editor.text().unwrap(), format!("{table}\r\n|  |  |"));
+    assert_eq!(
+        f.editor.selection().unwrap(),
+        table.len() + 4..table.len() + 4
+    );
+}
+
+#[test]
+fn heading_and_list_keys_change_the_line_in_one_undo_step() {
+    let f = fixture("title", Language::Markdown);
+    f.editor.set_selection(2..2).unwrap();
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'2', true, true, false);
+    assert_eq!(f.editor.text().unwrap(), "## title");
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'0', true, true, false);
+    assert_eq!(f.editor.text().unwrap(), "title");
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'9', true, true, false);
+    assert_eq!(f.editor.text().unwrap(), "- [ ] title");
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'9', true, true, false);
+    assert_eq!(f.editor.text().unwrap(), "- [x] title");
+    assert_one_undo_restores(&f.editor, "- [ ] title");
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'X', true, true, false);
+    assert!(f.editor.text().unwrap().contains("~~"));
+}
+
+#[test]
+fn a_slash_at_a_line_start_offers_commands_and_writes_the_pick() {
+    let f = fixture("", Language::Markdown);
+    type_char(&f, '/');
+    crate::window::markdown_completion::char_added(f.window.hwnd, &f.editor, i32::from(b'/'));
+    assert!(f.editor.completion_active());
+    for ch in "tab".chars() {
+        type_char(&f, ch);
+    }
+    assert!(f.editor.completion_active());
+    press(&f, VK_RETURN, false);
+    assert!(!f.editor.completion_active());
+    let text = f.editor.text().unwrap();
+    assert!(text.starts_with("| Column 1 |"), "{text}");
+    assert_eq!(f.editor.selection().unwrap(), 2..10);
+    assert_one_undo_restores(&f.editor, "/tab");
+}
+
+#[test]
+fn a_read_only_note_ignores_the_typing_helpers() {
+    // Break caught: a helper editing (or moving the caret as if it had) in a read-only tab.
+    let f = fixture("- a", Language::Markdown);
+    f.editor.set_read_only(true).unwrap();
+    f.editor.set_selection(3..3).unwrap();
+    type_char(&f, '(');
+    press(&f, VK_RETURN, false);
+    translate_key_with(f.window.hwnd, f.editor.hwnd(), b'2', true, true, false);
+    assert_eq!(f.editor.text().unwrap(), "- a");
+    assert_eq!(f.editor.selection().unwrap(), 3..3);
 }

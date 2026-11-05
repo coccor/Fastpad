@@ -780,12 +780,25 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         if document.is_some_and(|document| crate::window::markdown_host::has_links(hwnd, document))
         {
             let added = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
-            crate::window::markdown_host::char_added(hwnd, &editor, added.ch);
+            crate::window::markdown_completion::char_added(hwnd, &editor, added.ch);
         }
         return;
     }
+    if notification.code == crate::editor::scintilla_constants::SCN_AUTOCSELECTION {
+        let picked = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
+        crate::window::markdown_completion::selected(hwnd, &editor, picked.text);
+        return;
+    }
     if notification.code == crate::editor::scintilla_constants::SCN_AUTOCCOMPLETED {
-        crate::window::markdown_host::completion_done(&editor);
+        crate::window::markdown_completion::completed(hwnd, &editor);
+        return;
+    }
+    if notification.code == crate::editor::scintilla_constants::SCN_AUTOCCHARDELETED {
+        crate::window::markdown_completion::char_deleted(hwnd, &editor);
+        return;
+    }
+    if notification.code == crate::editor::scintilla_constants::SCN_AUTOCCANCELLED {
+        crate::window::markdown_completion::cancelled(hwnd, &editor);
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {

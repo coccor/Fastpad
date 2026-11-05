@@ -184,6 +184,21 @@ pub enum CommandId {
     MarkdownViewLive = 282,
     // Read-only mode (issue #80).
     ToggleReadOnly = 283,
+    // Markdown typing speed (2026-11-04): more format commands and table edits.
+    MarkdownStrikethrough = 284,
+    MarkdownHeading1 = 285,
+    MarkdownHeading2 = 286,
+    MarkdownHeading3 = 287,
+    MarkdownHeading4 = 288,
+    MarkdownHeading5 = 289,
+    MarkdownHeading6 = 290,
+    MarkdownParagraph = 291,
+    MarkdownBulletList = 292,
+    MarkdownNumberedList = 293,
+    MarkdownTaskList = 294,
+    MarkdownInsertTable = 295,
+    MarkdownAddTableColumn = 296,
+    MarkdownDeleteTableColumn = 297,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -208,7 +223,7 @@ pub const EDITING_COMMANDS: [CommandId; 16] = [
 ];
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 64] = [
+pub const TEXT_COMMANDS: [CommandId; 78] = [
     CommandId::ToggleReadOnly,
     CommandId::MoveLinesUp,
     CommandId::MoveLinesDown,
@@ -272,6 +287,20 @@ pub const TEXT_COMMANDS: [CommandId; 64] = [
     CommandId::MarkdownItalic,
     CommandId::MarkdownCode,
     CommandId::MarkdownLink,
+    CommandId::MarkdownStrikethrough,
+    CommandId::MarkdownHeading1,
+    CommandId::MarkdownHeading2,
+    CommandId::MarkdownHeading3,
+    CommandId::MarkdownHeading4,
+    CommandId::MarkdownHeading5,
+    CommandId::MarkdownHeading6,
+    CommandId::MarkdownParagraph,
+    CommandId::MarkdownBulletList,
+    CommandId::MarkdownNumberedList,
+    CommandId::MarkdownTaskList,
+    CommandId::MarkdownInsertTable,
+    CommandId::MarkdownAddTableColumn,
+    CommandId::MarkdownDeleteTableColumn,
     CommandId::MarkdownViewLive,
 ];
 
@@ -287,9 +316,24 @@ impl CommandId {
     /// Where this command's key bindings apply (Markdown design spec §9).
     pub const fn scope(self) -> Scope {
         match self {
-            Self::MarkdownBold | Self::MarkdownItalic | Self::MarkdownCode | Self::MarkdownLink => {
-                Scope::Markdown
-            }
+            Self::MarkdownBold
+            | Self::MarkdownItalic
+            | Self::MarkdownCode
+            | Self::MarkdownLink
+            | Self::MarkdownStrikethrough
+            | Self::MarkdownHeading1
+            | Self::MarkdownHeading2
+            | Self::MarkdownHeading3
+            | Self::MarkdownHeading4
+            | Self::MarkdownHeading5
+            | Self::MarkdownHeading6
+            | Self::MarkdownParagraph
+            | Self::MarkdownBulletList
+            | Self::MarkdownNumberedList
+            | Self::MarkdownTaskList
+            | Self::MarkdownInsertTable
+            | Self::MarkdownAddTableColumn
+            | Self::MarkdownDeleteTableColumn => Scope::Markdown,
             _ => Scope::Global,
         }
     }
@@ -533,7 +577,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 173] = [
+        const COMMANDS: [CommandId; 187] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -707,6 +751,20 @@ impl TryFrom<u16> for CommandId {
             CommandId::NotesInsertAttachment,
             CommandId::MarkdownViewLive,
             CommandId::ToggleReadOnly,
+            CommandId::MarkdownStrikethrough,
+            CommandId::MarkdownHeading1,
+            CommandId::MarkdownHeading2,
+            CommandId::MarkdownHeading3,
+            CommandId::MarkdownHeading4,
+            CommandId::MarkdownHeading5,
+            CommandId::MarkdownHeading6,
+            CommandId::MarkdownParagraph,
+            CommandId::MarkdownBulletList,
+            CommandId::MarkdownNumberedList,
+            CommandId::MarkdownTaskList,
+            CommandId::MarkdownInsertTable,
+            CommandId::MarkdownAddTableColumn,
+            CommandId::MarkdownDeleteTableColumn,
         ];
         COMMANDS
             .into_iter()
@@ -1060,7 +1118,7 @@ mod tests {
         assert!(CommandId::ToggleReadOnly.needs_text());
         assert_eq!(CommandId::MarkdownViewLive.scope(), Scope::Global);
         assert!(CommandId::MarkdownViewLive.is_markdown_edit());
-        assert!(CommandId::try_from(284).is_err());
+        assert!(CommandId::try_from(298).is_err());
     }
 
     #[test]
@@ -1070,6 +1128,20 @@ mod tests {
             (262, CommandId::MarkdownItalic),
             (263, CommandId::MarkdownCode),
             (264, CommandId::MarkdownLink),
+            (284, CommandId::MarkdownStrikethrough),
+            (285, CommandId::MarkdownHeading1),
+            (286, CommandId::MarkdownHeading2),
+            (287, CommandId::MarkdownHeading3),
+            (288, CommandId::MarkdownHeading4),
+            (289, CommandId::MarkdownHeading5),
+            (290, CommandId::MarkdownHeading6),
+            (291, CommandId::MarkdownParagraph),
+            (292, CommandId::MarkdownBulletList),
+            (293, CommandId::MarkdownNumberedList),
+            (294, CommandId::MarkdownTaskList),
+            (295, CommandId::MarkdownInsertTable),
+            (296, CommandId::MarkdownAddTableColumn),
+            (297, CommandId::MarkdownDeleteTableColumn),
         ] {
             assert_eq!(CommandId::try_from(value), Ok(command));
             assert!(command.is_markdown_edit());

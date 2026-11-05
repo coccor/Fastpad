@@ -421,9 +421,11 @@ fn current_focus() -> Option<HWND> {
         cbSize: size_of::<GUITHREADINFO>() as u32,
         ..unsafe { std::mem::zeroed() }
     };
-    // Thread ID 0 asks for the calling thread's own focus info, which is all these
-    // single-threaded, in-process tests need.
-    let ok = unsafe { GetGUIThreadInfo(0, &mut info) };
+    // The test thread's own focus, which is all these single-threaded, in-process tests need.
+    // Thread ID 0 would mean the foreground thread: another program's focus whenever the test
+    // window isn't in front (a background run, or the user working in another window).
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let ok = unsafe { GetGUIThreadInfo(thread, &mut info) };
     if ok == 0 {
         return None;
     }

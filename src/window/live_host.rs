@@ -62,6 +62,17 @@ pub(crate) fn view_hwnd(hwnd: HWND, id: GroupId) -> Option<HWND> {
     .flatten()
 }
 
+/// Group `id`'s shown Live window, and where it draws the caret at `position`: x, row top and row
+/// bottom, in its client pixels.
+pub(crate) fn caret_client_rect(
+    hwnd: HWND,
+    id: GroupId,
+    position: usize,
+) -> Option<(HWND, (i32, i32, i32))> {
+    let view = with_live(hwnd, id, |host| host.view.filter(|_| host.shown)).flatten()?;
+    Some((view.hwnd(), view.caret_client_rect(position)?))
+}
+
 impl LiveHost {
     /// Whether `window` is this group's Live window and it is shown.
     pub(crate) fn shows(&self, window: HWND) -> bool {
