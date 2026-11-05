@@ -39,6 +39,10 @@ impl DiagramStyle {
         }
     }
 
+    pub fn colors(&self) -> PreviewColors {
+        self.colors
+    }
+
     fn font_size(&self) -> f32 {
         f32::from_bits(self.font_size)
     }
@@ -142,7 +146,7 @@ fn hex(color: u32) -> String {
 }
 
 /// `from` moved `amount` (0 to 1) of the way to `to`, per channel.
-pub(crate) fn mix(from: u32, to: u32, amount: f32) -> u32 {
+fn mix(from: u32, to: u32, amount: f32) -> u32 {
     let channel = |shift: u32| {
         let a = ((from >> shift) & 0xFF) as f32;
         let b = ((to >> shift) & 0xFF) as f32;

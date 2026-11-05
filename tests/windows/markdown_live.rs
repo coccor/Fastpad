@@ -2741,6 +2741,21 @@ fn a_mermaid_block_shows_its_diagram_until_the_caret_enters_it() {
 }
 
 #[test]
+fn live_draws_diagrams_in_the_previews_colours_not_the_syntax_colours() {
+    // Break caught: Live drew arrows and borders in the comment colour, green in the Light and
+    // Dark themes the System theme follows, while the preview drew them grey.
+    let (_scintilla, _main, view) = live_tab("top\n");
+    let colors = view.diagram_colors().unwrap();
+    // Exactly a theme's preview palette: a mix of syntax colours matches none.
+    assert!(
+        crate::platform::theme::Theme::ALL
+            .into_iter()
+            .any(|theme| crate::preview::colors::preview_colors(theme, false) == colors),
+        "{colors:?}"
+    );
+}
+
+#[test]
 fn a_broken_mermaid_block_shows_its_code_under_the_reason() {
     let text = "top\n\n```mermaid\nflowchart LR\n  A -->\n```\n";
     let (_scintilla, main, view) = live_tab(text);

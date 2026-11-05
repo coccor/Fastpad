@@ -77,6 +77,9 @@ pub struct LiveColors {
     pub dim: u32,
     /// Behind the block being edited (the revealed lines): the editor's current-line colour.
     pub active_block: u32,
+    /// The preview's colours for the same theme: what Mermaid diagrams are drawn in, so a
+    /// diagram looks the same in Live as in the preview.
+    pub diagram: crate::preview::colors::PreviewColors,
 }
 
 struct Brushes {
@@ -149,28 +152,10 @@ impl LinePictures for Pictures {
     }
 }
 
-/// How diagrams look in a Live view: the editor's colors in the preview's roles (nodes on the
-/// code background, lines in the comment colour), labels in the prose font.
+/// How diagrams look in a Live view: the preview's colours for the theme, so a diagram looks the
+/// same in both, with labels in the prose font at Live's size (zoom included).
 fn diagram_style(colors: &LiveColors, fonts: &LiveFonts) -> DiagramStyle {
-    use crate::preview::mermaid::mix;
-    let preview = crate::preview::colors::PreviewColors {
-        background: colors.background,
-        text: colors.text,
-        muted: colors.dim,
-        heading: colors.heading,
-        link: colors.link,
-        code_background: colors.code_background,
-        border: mix(colors.dim, colors.background, 0.5),
-        quote_bar: colors.dim,
-        table_stripe: colors.code_background,
-        focus: colors.link,
-        mark: mix(colors.code_background, colors.link, 0.15),
-        kbd_border: colors.dim,
-        selection: colors.selection,
-        inactive_selection: colors.inactive_selection,
-        selection_text: colors.text,
-    };
-    DiagramStyle::new(preview, &fonts.family, fonts.size)
+    DiagramStyle::new(colors.diagram, &fonts.family, fonts.size)
 }
 
 struct ViewState {
@@ -654,6 +639,12 @@ impl LiveView {
                 })
         })
         .flatten()
+    }
+
+    /// The colours diagrams are drawn in.
+    #[cfg(test)]
+    pub fn diagram_colors(&self) -> Option<crate::preview::colors::PreviewColors> {
+        self.with(|state| state.pictures.diagram_style.colors())
     }
 
     /// What the last frame drew besides text.
