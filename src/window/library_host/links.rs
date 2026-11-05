@@ -346,14 +346,27 @@ fn add_alias_to(hwnd: HWND, path: &Path, alias: &str) {
 
 /// The edits that would point links in other notes at the notes renamed outside FastPad.
 fn outside_rename_edits(hwnd: HWND) -> Vec<NoteEdits> {
-    let moves = default_slot(hwnd, |slot| slot.renamed_outside.clone()).unwrap_or_default();
-    if moves.is_empty() || !index_loaded(hwnd) {
+    default_notebook(hwnd).map_or_else(Vec::new, |id| outside_rename_edits_of(hwnd, id))
+}
+
+/// `outside_rename_edits` for the notebook `id`.
+fn outside_rename_edits_of(hwnd: HWND, id: NotebookId) -> Vec<NoteEdits> {
+    let moves = slot(hwnd, id, |slot| slot.renamed_outside.clone()).unwrap_or_default();
+    if moves.is_empty() || !index_loaded_of(hwnd, id) {
         return Vec::new();
     }
-    let index = note_index(hwnd);
-    let notes = note_paths(hwnd);
+    let index = note_index_of(hwnd, id);
+    let notes = with_notebook(hwnd, id, |state| {
+        state
+            .notes
+            .iter()
+            .map(|note| note.path.clone())
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    let root = notebook_folder(hwnd, id);
     crate::library::links::edits_for_moves_with(&index, &notes, &moves, &|path| {
-        root_file_exists(hwnd, path)
+        root.as_ref().is_some_and(|root| root.join(path).is_file())
     })
     .into_iter()
     .filter(|edit| !edit.own)
@@ -362,16 +375,16 @@ fn outside_rename_edits(hwnd: HWND) -> Vec<NoteEdits> {
 
 /// An index build landed: notes renamed outside FastPad that links still point to are named in
 /// a notice, once (spec §7.6). Renames that break no link are forgotten.
-pub(crate) fn outside_renames_check(hwnd: HWND) {
-    let told = default_slot(hwnd, |slot| {
+pub(crate) fn outside_renames_check_of(hwnd: HWND, id: NotebookId) {
+    let told = slot(hwnd, id, |slot| {
         slot.renamed_outside.is_empty() || slot.renamed_outside_told
     })
     .unwrap_or(true);
-    if told || !index_loaded(hwnd) {
+    if told || !index_loaded_of(hwnd, id) {
         return;
     }
-    let edits = outside_rename_edits(hwnd);
-    let moves = default_slot(hwnd, |slot| {
+    let edits = outside_rename_edits_of(hwnd, id);
+    let moves = slot(hwnd, id, |slot| {
         if edits.is_empty() {
             slot.renamed_outside.clear();
         } else {

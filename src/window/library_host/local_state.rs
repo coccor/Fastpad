@@ -284,8 +284,12 @@ pub(crate) fn activation_changed(hwnd: HWND, active: bool) {
             .is_some_and(|since| since.elapsed() >= RESCAN_AFTER)
     })
     .unwrap_or(false);
-    if long_enough && notes_mode(hwnd) && !watching(hwnd) {
-        request_rescan(hwnd);
+    if long_enough && notes_mode(hwnd) {
+        for (id, _) in notebooks(hwnd) {
+            if !watching_of(hwnd, id) {
+                request_rescan_of(hwnd, id);
+            }
+        }
     }
 }
 
@@ -303,23 +307,32 @@ pub(crate) fn flush_now(hwnd: HWND) {
 /// Writes pending metadata and the local file on this thread, before the window closes. A
 /// `library.ini` held open by a sync gets a few short retries, since there is no later.
 pub(crate) fn flush_before_close(hwnd: HWND) {
-    for _ in 0..CLOSE_BUSY_RETRIES {
-        if !matches!(try_flush(hwnd, true), Ok(library::Flushed::Busy)) {
-            break;
+    unsafe {
+        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
+    }
+    // Each notebook has its own retries: one held open does not use up another's.
+    for (id, _) in notebooks(hwnd) {
+        for _ in 0..CLOSE_BUSY_RETRIES {
+            if !matches!(try_flush_of(hwnd, id, true), Ok(library::Flushed::Busy)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
     flush_reporting(hwnd, true);
     // FastPad's own saves since the last scan, so the next start doesn't mark them as changed
     // outside FastPad (second brain phase 1 spec §5.5).
-    if with_state(hwnd, LibraryState::sync_cache_from_notes).unwrap_or(false) {
-        save_local(
-            hwnd,
-            LocalWrite {
-                wait: true,
-                force: true,
-            },
-        );
+    for (id, _) in notebooks(hwnd) {
+        if with_notebook(hwnd, id, LibraryState::sync_cache_from_notes).unwrap_or(false) {
+            save_local_of(
+                hwnd,
+                id,
+                LocalWrite {
+                    wait: true,
+                    force: true,
+                },
+            );
+        }
     }
 }
 
@@ -347,12 +360,25 @@ pub(super) fn flush_reporting(hwnd: HWND, wait: bool) {
     }
 }
 
+/// Writes every open notebook's pending metadata once: `Busy` when any was, else the first
+/// error, else `Wrote` when any was written.
 pub(super) fn try_flush(hwnd: HWND, wait: bool) -> crate::Result<library::Flushed> {
     unsafe {
         KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
     }
-    match default_notebook(hwnd) {
-        Some(id) => try_flush_of(hwnd, id, wait),
+    let (mut busy, mut wrote, mut failed) = (false, false, None);
+    for (id, _) in notebooks(hwnd) {
+        match try_flush_of(hwnd, id, wait) {
+            Ok(library::Flushed::Busy) => busy = true,
+            Ok(library::Flushed::Wrote) => wrote = true,
+            Ok(_) => {}
+            Err(error) => failed = failed.or(Some(error)),
+        }
+    }
+    match failed {
+        Some(error) => Err(error),
+        None if busy => Ok(library::Flushed::Busy),
+        None if wrote => Ok(library::Flushed::Wrote),
         None => Ok(library::Flushed::Nothing),
     }
 }

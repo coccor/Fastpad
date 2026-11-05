@@ -423,7 +423,7 @@ pub(super) fn install_of(hwnd: HWND, id: NotebookId, fresh: LibraryState) {
     // A folder box whose folder the rescan no longer finds closes.
     close_stale_name_box(hwnd);
     // A note the rescan found changed is no news when a tab shows it.
-    clear_visible_marks(hwnd);
+    clear_visible_marks_of(hwnd, id);
     crate::window::side_panel::refresh(hwnd);
     // A notebook's first load reveals the (restored) active note: its row is selected and its
     // folders expand (spec §6.1). A rescan leaves the user's selection where it was.

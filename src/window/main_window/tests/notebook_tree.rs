@@ -1586,3 +1586,312 @@ fn a_pin_write_that_failed_on_close_of_a_non_default_notebook_is_retried_by_the_
     let reloaded = crate::library::load(&b.folder(), &b.root.join("x.ini"), 0).unwrap();
     assert!(reloaded.is_pinned(&note));
 }
+
+#[test]
+fn results_for_a_closed_notebook_are_dropped() {
+    // Break caught: a watcher batch, index build or copy for a notebook the user closed acting
+    // on another notebook (or adding a root back) because it was matched to the window.
+    use crate::library::watch::FileChanges;
+    use crate::window::library_host::{
+        close_notebook_of, default_notebook, files_changed, generations_of, index_ready,
+        library_ready, note_index_of, notebooks, test_index_ready_payload, test_ready_payload,
+        with_notebook,
+    };
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("dropped-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("dropped-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = default_notebook(window.hwnd).unwrap();
+    let b_id = open_and_load(&window, &b);
+    pump_until(window.hwnd, || {
+        crate::window::library_host::index_loaded_of(window.hwnd, b_id)
+    });
+    let (load, watch, index) = generations_of(window.hwnd, a_id);
+    let local = crate::library::local::local_file(&a.data(), &a.folder());
+    let state_of_a = crate::library::load(&a.folder(), &local, crate::library::now_unix()).unwrap();
+    let note_count = || with_notebook(window.hwnd, b_id, |state| state.notes.len()).unwrap();
+    let (count, pointer) = (
+        note_count(),
+        std::sync::Arc::as_ptr(&note_index_of(window.hwnd, b_id)),
+    );
+    assert!(close_notebook_of(window.hwnd, a_id));
+
+    let changes = Box::new(FileChanges {
+        generation: watch,
+        paths: vec![a.folder().join("a.md")],
+        names_changed: true,
+        overflow: false,
+        failed: false,
+    });
+    files_changed(window.hwnd, Box::into_raw(changes) as isize);
+    index_ready(window.hwnd, test_index_ready_payload(index, a.folder()));
+    library_ready(window.hwnd, test_ready_payload(load, Ok(state_of_a)));
+    crate::window::copy_host::copy_done(
+        window.hwnd,
+        crate::window::copy_host::test_done_payload(a.folder(), vec![a.folder().join("a.md")]),
+    );
+    pump_posted_messages(window.hwnd);
+
+    assert_eq!(open_folders(&window), [b.folder()], "no root came back");
+    assert_eq!(note_count(), count);
+    assert_eq!(
+        std::sync::Arc::as_ptr(&note_index_of(window.hwnd, b_id)),
+        pointer,
+        "B's index is the one it had"
+    );
+    assert_eq!(notebooks(window.hwnd).len(), 1);
+}
+
+#[test]
+fn a_copy_lands_in_the_notebook_that_owns_its_root() {
+    // Break caught: a copy into a second notebook being listed in the default notebook (or
+    // skipped), because the result was applied to whichever notebook is the default.
+    use crate::window::library_host::{default_notebook, with_notebook};
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("copy-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("copy-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = default_notebook(window.hwnd).unwrap();
+    let b_id = open_and_load(&window, &b);
+    let copied = b.note("copied.md", "copied");
+    let listed = |id| {
+        with_notebook(window.hwnd, id, |state| {
+            state
+                .notes
+                .iter()
+                .any(|note| note.path == std::path::Path::new("copied.md"))
+        })
+        .unwrap()
+    };
+
+    crate::window::copy_host::copy_done(
+        window.hwnd,
+        crate::window::copy_host::test_done_payload(b.folder(), vec![copied.clone()]),
+    );
+
+    assert!(listed(b_id), "B lists the copied note");
+    assert!(!listed(a_id), "A does not");
+}
+
+#[test]
+fn one_failed_load_shows_retry_on_that_root_only() {
+    // Break caught: one notebook failing to load putting the whole sidebar into the failed
+    // state, or emptying the notebook that loaded fine.
+    use crate::window::library_host::{
+        default_notebook, generations_of, library_ready, load_failed_of, test_ready_payload,
+        with_notebook,
+    };
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("failed-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("failed-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = default_notebook(window.hwnd).unwrap();
+    // B is opened but its worker's answer is not pumped: its load is still in flight.
+    crate::window::library_host::open_folder(window.hwnd, &b.folder());
+    let b_id = crate::window::library_host::notebooks(window.hwnd)
+        .into_iter()
+        .find(|(id, _)| *id != a_id)
+        .map(|(id, _)| id)
+        .unwrap();
+    let (b_generation, _, _) = generations_of(window.hwnd, b_id);
+
+    library_ready(
+        window.hwnd,
+        test_ready_payload(b_generation, Err("boom".to_owned())),
+    );
+
+    assert!(load_failed_of(window.hwnd, b_id));
+    assert!(!load_failed_of(window.hwnd, a_id));
+    assert_eq!(
+        with_notebook(window.hwnd, a_id, |state| state.notes.len()),
+        Some(1),
+        "A's notes are still listed"
+    );
+}
+
+/// Queues a pin of `note` in the notebook `id`.
+fn pin_in(window: &ProductionWindow, id: NotebookId, note: &std::path::Path) {
+    crate::window::library_host::with_notebook(window.hwnd, id, |state| {
+        let mut ids = crate::library::ids::IdSource::new(1, 1);
+        let target = state.note_ref(&mut ids, note);
+        state
+            .apply(crate::library::ops::PendingOp::SetPinned {
+                note: target,
+                value: true,
+            })
+            .unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_busy_library_file_in_one_notebook_does_not_stop_the_other_flushing() {
+    // Break caught: one notebook's locked library.ini ending the flush, so the other
+    // notebook's pins wait for a retry that never comes.
+    use std::os::windows::fs::OpenOptionsExt;
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("busy-a");
+    let a_note = a.note("a.md", "a");
+    let b = LibraryScratch::new("busy-b");
+    let b_note = b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    let b_id = open_and_load(&window, &b);
+    pin_in(&window, a_id, &a_note);
+    pin_in(&window, b_id, &b_note);
+    let ini = crate::library::store::library_file(&a.folder());
+    crate::library::store::write(&ini, &crate::library::model::Library::default()).unwrap();
+    let _lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&ini)
+        .unwrap();
+
+    crate::window::library_host::flush_now(window.hwnd);
+
+    let reloaded = crate::library::load(&b.folder(), &b.root.join("x.ini"), 0).unwrap();
+    assert!(reloaded.is_pinned(&b_note), "B's pin reached its file");
+    let a_pending = crate::window::library_host::with_notebook(window.hwnd, a_id, |state| {
+        !state.pending.is_empty()
+    });
+    assert_eq!(a_pending, Some(true), "A still has its pin to write");
+}
+
+#[test]
+fn closing_the_window_flushes_every_notebook_despite_one_busy_file() {
+    // Break caught: window close writing the default notebook's pins only, or giving up on
+    // every notebook because one library.ini is held open.
+    use std::os::windows::fs::OpenOptionsExt;
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("close-a");
+    let a_note = a.note("a.md", "a");
+    let b = LibraryScratch::new("close-b");
+    let b_note = b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    let b_id = open_and_load(&window, &b);
+    pin_in(&window, a_id, &a_note);
+    pin_in(&window, b_id, &b_note);
+    let ini = crate::library::store::library_file(&a.folder());
+    crate::library::store::write(&ini, &crate::library::model::Library::default()).unwrap();
+    let _lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&ini)
+        .unwrap();
+
+    // The default notebook is the busy one, so a default-only busy retry never reaches B.
+    crate::window::library_host::flush_before_close(window.hwnd);
+
+    let reloaded = crate::library::load(&b.folder(), &b.root.join("x.ini"), 0).unwrap();
+    assert!(reloaded.is_pinned(&b_note));
+}
+
+#[test]
+fn activation_rescans_only_notebooks_without_a_watcher() {
+    // Break caught: coming back to the window rescanning every notebook (or none, because the
+    // default one is watched), instead of those a watcher does not cover.
+    use crate::window::library_host::{
+        activation_changed, default_notebook, generations_of, set_watch_failed_of,
+    };
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("activate-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("activate-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = default_notebook(window.hwnd).unwrap();
+    let b_id = open_and_load(&window, &b);
+    pump_until(window.hwnd, || {
+        crate::window::library_host::index_loaded_of(window.hwnd, b_id)
+    });
+    // B, not the default notebook, is the one nothing watches.
+    set_watch_failed_of(window.hwnd, b_id);
+    let (a_before, _, _) = generations_of(window.hwnd, a_id);
+    let (b_before, _, _) = generations_of(window.hwnd, b_id);
+
+    activation_changed(window.hwnd, false);
+    app_mut(window.hwnd).library.inactive_since = Some(
+        std::time::Instant::now()
+            - crate::window::library_host::RESCAN_AFTER
+            - std::time::Duration::from_secs(1),
+    );
+    activation_changed(window.hwnd, true);
+
+    let (a_after, _, _) = generations_of(window.hwnd, a_id);
+    let (b_after, _, _) = generations_of(window.hwnd, b_id);
+    assert_ne!(b_after, b_before, "B, with no watcher, was rescanned");
+    assert_eq!(a_after, a_before, "A, watched, was not");
+}
+
+#[test]
+fn a_watcher_batch_marks_changes_in_its_own_notebook() {
+    // Break caught: a note edited outside FastPad in the second notebook being marked (or its
+    // rescan and index request run) against the default notebook.
+    use crate::library::watch::FileChanges;
+    use crate::window::library_host::{default_notebook, generations_of, with_notebook};
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("batch-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("batch-b");
+    let note = b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let a_id = default_notebook(window.hwnd).unwrap();
+    let b_id = open_and_load(&window, &b);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&note, "b, edited by an agent, longer\n").unwrap();
+    let (_, watch, _) = generations_of(window.hwnd, b_id);
+    let (load_before, _, _) = generations_of(window.hwnd, b_id);
+    let (a_load_before, _, _) = generations_of(window.hwnd, a_id);
+
+    crate::window::library_host::files_changed(
+        window.hwnd,
+        Box::into_raw(Box::new(FileChanges {
+            generation: watch,
+            paths: vec![note.clone()],
+            names_changed: true,
+            overflow: false,
+            failed: false,
+        })) as isize,
+    );
+
+    let marked = |id| {
+        with_notebook(window.hwnd, id, |state| {
+            state.local.is_changed(std::path::Path::new("b.md"))
+        })
+        .unwrap()
+    };
+    assert!(marked(b_id), "B marks its own note");
+    assert!(!marked(a_id));
+    let (load_after, _, _) = generations_of(window.hwnd, b_id);
+    let (a_load_after, _, _) = generations_of(window.hwnd, a_id);
+    assert_ne!(load_after, load_before, "B was rescanned");
+    assert_eq!(a_load_after, a_load_before, "A was not");
+}

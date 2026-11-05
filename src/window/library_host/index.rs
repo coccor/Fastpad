@@ -109,6 +109,16 @@ pub(crate) fn request_index_of(hwnd: HWND, id: NotebookId) {
     });
 }
 
+/// An empty finished build for the index generation `generation`, as a worker would post it.
+#[cfg(test)]
+pub(crate) fn test_index_ready_payload(generation: u64, folder: PathBuf) -> isize {
+    Box::into_raw(Box::new(IndexReady {
+        generation,
+        folder,
+        index: NoteIndex::default(),
+    })) as isize
+}
+
 /// `WM_FASTPAD_INDEX_READY`: a build landed. It replaces the index when it is for the open
 /// notebook, and runs once more if a request arrived meanwhile.
 pub(crate) fn index_ready(hwnd: HWND, lparam: isize) {
@@ -131,7 +141,7 @@ pub(crate) fn index_ready(hwnd: HWND, lparam: isize) {
         std::mem::take(&mut slot.index_again)
     })
     .unwrap_or(false);
-    outside_renames_check(hwnd);
+    outside_renames_check_of(hwnd, id);
     crate::window::side_panel::index_changed(hwnd);
     if again {
         request_index_of(hwnd, id);

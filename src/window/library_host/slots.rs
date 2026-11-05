@@ -6,6 +6,7 @@ use super::*;
 use crate::library::index::NoteIndex;
 use crate::library::notebook_ini::NotebookSettings;
 use crate::library::watch::Watcher;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Names one open notebook for the session. Handed out when the notebook opens and never reused.
@@ -227,4 +228,29 @@ pub(crate) fn generations_of(hwnd: HWND, id: NotebookId) -> (u64, u64, u64) {
         )
     })
     .unwrap_or_default()
+}
+
+/// The open notebook whose folder is `path` or holds it, if any. Nested notebooks are refused,
+/// so at most one notebook owns a path.
+pub(crate) fn notebook_of(hwnd: HWND, path: &Path) -> Option<NotebookId> {
+    let open = notebooks(hwnd);
+    if let Some((id, _)) = open
+        .iter()
+        .find(|(_, folder)| crate::library::model::same_path(folder, path))
+    {
+        return Some(*id);
+    }
+    let folders: Vec<PathBuf> = open.iter().map(|(_, folder)| folder.clone()).collect();
+    crate::library::roots::owner(&folders, path).map(|index| open[index].0)
+}
+
+/// Marks the notebook `id`'s watcher as failed, as when Windows cannot watch its folder.
+#[cfg(test)]
+pub(crate) fn set_watch_failed_of(hwnd: HWND, id: NotebookId) {
+    let watcher = slot(hwnd, id, |slot| {
+        slot.watch_failed = true;
+        slot.watcher.take()
+    })
+    .flatten();
+    drop(watcher);
 }

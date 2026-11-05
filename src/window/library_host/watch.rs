@@ -118,6 +118,7 @@ pub(crate) fn stop_watcher_of(hwnd: HWND, id: NotebookId) {
 }
 
 /// Whether a watcher is watching the default notebook right now.
+#[cfg(test)]
 pub(crate) fn watching(hwnd: HWND) -> bool {
     default_notebook(hwnd).is_some_and(|id| watching_of(hwnd, id))
 }
@@ -209,7 +210,7 @@ pub(crate) fn files_changed(hwnd: HWND, lparam: isize) -> bool {
         return true;
     }
     check_paths(hwnd, &paths);
-    mark_outside_changes(hwnd, &paths);
+    mark_outside_changes_of(hwnd, id, &paths);
     if paths.iter().any(|path| {
         path.file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case(library::notebook_ini::NOTEBOOK_FILE))
@@ -242,9 +243,9 @@ fn visible_paths(hwnd: HWND) -> Vec<PathBuf> {
 
 /// Marks the notes among `paths` whose size or write time changed, unless a tab shows them
 /// (second brain phase 1 spec §5.5), and redraws the tree when a mark is new.
-fn mark_outside_changes(hwnd: HWND, paths: &[PathBuf]) {
+fn mark_outside_changes_of(hwnd: HWND, id: NotebookId, paths: &[PathBuf]) {
     let visible = visible_paths(hwnd);
-    let marked = with_state(hwnd, |state| {
+    let marked = with_notebook(hwnd, id, |state| {
         let mut marked = false;
         for path in paths {
             let changed = state.take_outside_stamp(path) == Some(true);
@@ -262,7 +263,14 @@ fn mark_outside_changes(hwnd: HWND, paths: &[PathBuf]) {
     })
     .unwrap_or(false);
     if marked {
-        save_local_soon(hwnd);
+        save_local_of(
+            hwnd,
+            id,
+            LocalWrite {
+                wait: false,
+                force: false,
+            },
+        );
         crate::window::side_panel::refresh(hwnd);
     }
 }
@@ -277,13 +285,20 @@ pub(crate) fn note_seen(hwnd: HWND, path: &Path) {
 }
 
 /// Clears the marks of the notes the tabs show right now, after a rescan found them changed.
-pub(super) fn clear_visible_marks(hwnd: HWND) {
+pub(super) fn clear_visible_marks_of(hwnd: HWND, id: NotebookId) {
     let cleared = visible_paths(hwnd)
         .iter()
-        .filter(|path| with_state(hwnd, |state| state.clear_changed(path)).unwrap_or(false))
+        .filter(|path| with_notebook(hwnd, id, |state| state.clear_changed(path)).unwrap_or(false))
         .count();
     if cleared > 0 {
-        save_local_soon(hwnd);
+        save_local_of(
+            hwnd,
+            id,
+            LocalWrite {
+                wait: false,
+                force: false,
+            },
+        );
     }
 }
 
