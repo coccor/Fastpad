@@ -12,6 +12,7 @@ pub mod incremental;
 pub mod inline_object;
 pub mod layout;
 pub mod links;
+pub mod mermaid;
 pub mod model;
 pub mod outline;
 pub mod render;

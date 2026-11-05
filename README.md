@@ -62,8 +62,9 @@ There is no single trick. FastPad is fast because of everything it doesn't do be
   that post their results back. Direct2D, DirectWrite and the GPU driver load the first time you open the Markdown preview,
   and not before, which is a big part of why idle memory stays around 2 MB. Recovery snapshots are
   written on a timer, only once you've paused typing for two seconds.
-- **A small, pinned dependency tree.** Seven direct crates (`windows-sys`, `windows`, `serde_json`,
-  `pulldown-cmark`, `regex`, `resvg`, `windows-numerics`), each pinned to an exact version.
+- **A small, pinned dependency tree.** Eight direct crates (`windows-sys`, `windows`, `serde_json`,
+  `pulldown-cmark`, `regex`, `resvg`, `mermaid-rs-renderer`, `windows-numerics`), each pinned to an
+  exact version.
   [`tools/audit-dependencies.ps1`](tools/audit-dependencies.ps1) fails if anything else gets in.
   Release builds use fat LTO, one codegen unit and `panic = "abort"`. Code that never runs at
   startup, like the SVG renderer, is optimized for size instead of speed.
@@ -142,6 +143,11 @@ typing. Both panes scroll together.
   and tables.
 - Links just work: web links open in your browser, `#headings` jump inside the preview, and links to
   local files open in a new FastPad tab.
+- Mermaid diagrams: a ```` ```mermaid ```` code block draws as a diagram (flowcharts, sequence,
+  class, state, ER, pie, Gantt, journey, mindmap, timeline, Git graphs and more) in the preview's
+  own colors and font. It renders in Rust on a worker thread, with no browser or JavaScript. While you
+  edit, the last good diagram stays up, and a mistake shows its error above it. Copying a selection
+  across a diagram copies its source.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
 - Writing helpers in Markdown files: `Ctrl+B`, `Ctrl+I`, ``Ctrl+` `` and `Ctrl+K` make the selection
