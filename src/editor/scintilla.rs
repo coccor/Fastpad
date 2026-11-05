@@ -79,6 +79,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 mod document_text;
 mod editing;
+mod find_highlight_ops;
 mod line_ops;
 mod link_ops;
 mod live_support;

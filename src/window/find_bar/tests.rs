@@ -366,13 +366,28 @@ fn a_count_reads_as_its_index_of_its_total_and_marks_a_capped_total() {
 fn tally_finds_the_selected_match_and_caps_the_count_without_reading_past_it() {
     // Break caught: an off-by-one index, an uncapped scan of a huge match list, a selection that
     // is not exactly a match given an index, or "1000+" shown for exactly 1000.
-    use super::count::tally;
+    use super::count::tally as tally_matches;
+    fn tally(
+        matches: impl Iterator<Item = std::ops::Range<usize>>,
+        selection: &std::ops::Range<usize>,
+        cap: usize,
+    ) -> super::MatchCount {
+        tally_matches(matches, selection, cap).count
+    }
     let ranges = |n: usize| (0..n).map(|i| i * 2..i * 2 + 1);
     let found = tally(ranges(12), &(4..5), 1000);
     assert_eq!(
         (found.total, found.capped, found.index),
         (12, false, Some(3))
     );
+    // Break caught: the highlighted ranges differing from the counted ones, the current match
+    // not the selected one, or more than the cap kept to highlight.
+    let kept = tally_matches(ranges(12), &(4..5), 1000);
+    assert_eq!(kept.ranges, ranges(12).collect::<Vec<_>>());
+    assert_eq!(kept.current(), Some(4..5));
+    assert_eq!(tally_matches(ranges(12), &(4..6), 1000).current(), None);
+    let capped = tally_matches(ranges(5000), &(0..1), 1000);
+    assert_eq!(capped.ranges.len(), 1000);
     let found = tally(ranges(12), &(4..6), 1000);
     assert_eq!(found.index, None, "the selection is not exactly a match");
     let found = tally(ranges(12), &(0..0), 1000);
@@ -400,8 +415,11 @@ fn tally_finds_the_selected_match_and_caps_the_count_without_reading_past_it() {
 fn plain_counting_walks_the_matches_through_scintilla_and_finds_the_selection() {
     // Break caught: counting from the caret instead of the document start, not advancing past a
     // match, a miss counted as a match, or an empty query searched at all.
-    use super::count_matches;
     use crate::search::MatchOptions;
+    let count_matches =
+        |editor: &Editor, query: &str, options, selection: &std::ops::Range<usize>| {
+            super::find_matches(editor, query, options, selection).map(|found| found.count)
+        };
     let log = Mutex::new(TargetLog {
         responses: VecDeque::from([0_isize, 8, -1]),
         length: 11,
