@@ -57,10 +57,42 @@ pub(super) fn save_before_leaving_of(hwnd: HWND, id: NotebookId) -> bool {
 
 /// Records the open notebooks, in sidebar order, and the default in `folders.ini`.
 fn record_open_notebooks(hwnd: HWND) {
-    let roots: Vec<PathBuf> = notebooks(hwnd)
+    let open: Vec<PathBuf> = notebooks(hwnd)
         .into_iter()
         .map(|(_, folder)| folder)
         .collect();
+    // A remembered notebook that was not available at startup keeps its place on its `open=`
+    // line, so it comes back when its drive does; one that is open again is just an open one.
+    let roots = host(hwnd, |host| {
+        let is_open = |folder: &PathBuf| {
+            open.iter()
+                .any(|root| library::model::same_path(root, folder))
+        };
+        host.unavailable.retain(|folder| !is_open(folder));
+        let mut roots: Vec<PathBuf> = host
+            .open_order
+            .iter()
+            .filter(|folder| {
+                is_open(folder)
+                    || host
+                        .unavailable
+                        .iter()
+                        .any(|gone| library::model::same_path(gone, folder))
+            })
+            .cloned()
+            .collect();
+        for folder in &open {
+            if !roots
+                .iter()
+                .any(|root| library::model::same_path(root, folder))
+            {
+                roots.push(folder.clone());
+            }
+        }
+        host.open_order = roots.clone();
+        roots
+    })
+    .unwrap_or(open);
     let default = default_notebook(hwnd).and_then(|id| notebook_folder(hwnd, id));
     update_folders(hwnd, |folders| folders.set_open(&roots, default.as_deref()));
 }

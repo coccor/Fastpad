@@ -52,6 +52,7 @@ pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
         host.notebooks.clear();
         host.default_notebook = None;
         host.startup_load = None;
+        host.startup_notice = None;
     });
 }
 

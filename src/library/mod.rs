@@ -212,8 +212,62 @@ pub fn folder_checks() -> usize {
 /// drive, so it belongs on a worker thread.
 pub fn folder_exists(folder: &Path) -> bool {
     #[cfg(test)]
-    FOLDER_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    {
+        FOLDER_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        wait_while_blocked(folder);
+    }
     folder.is_dir()
+}
+
+#[cfg(test)]
+type Gate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+#[cfg(test)]
+static BLOCKED_FOLDERS: std::sync::Mutex<Vec<(PathBuf, Gate)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn wait_while_blocked(folder: &Path) {
+    let gate = BLOCKED_FOLDERS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(blocked, _)| blocked == folder)
+        .map(|(_, gate)| gate.clone());
+    if let Some(gate) = gate {
+        let (released, wake) = &*gate;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+    }
+}
+
+/// Makes `folder_exists` on `folder` wait, as it does on an offline network drive, until the
+/// gate is released or dropped.
+#[cfg(test)]
+pub struct FolderCheckGate(Gate);
+
+#[cfg(test)]
+pub fn block_folder_checks(folder: &Path) -> FolderCheckGate {
+    let gate: Gate = Gate::default();
+    BLOCKED_FOLDERS
+        .lock()
+        .unwrap()
+        .push((folder.to_path_buf(), gate.clone()));
+    FolderCheckGate(gate)
+}
+
+#[cfg(test)]
+impl Drop for FolderCheckGate {
+    fn drop(&mut self) {
+        let (released, wake) = &*self.0;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        BLOCKED_FOLDERS
+            .lock()
+            .unwrap()
+            .retain(|(_, gate)| !std::sync::Arc::ptr_eq(gate, &self.0));
+    }
 }
 
 pub fn is_inside(folder: &Path, path: &Path) -> bool {

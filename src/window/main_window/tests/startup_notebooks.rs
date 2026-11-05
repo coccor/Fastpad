@@ -136,15 +136,114 @@ fn hand_edited_duplicate_and_nested_open_lines_are_dropped_silently() {
     crate::library::local::write_folders(&crate::library::local::folders_file(&a.data()), &folders)
         .unwrap();
     let (window, _editor) = start(&a);
+    let ini = crate::library::local::folders_file(&a.data());
+    let before = std::fs::read(&ini).unwrap();
 
     crate::window::library_host::open_library_step(window.hwnd);
     assert_eq!(open_folders(&window), [a.folder(), b.folder()]);
     pump_until(window.hwnd, || all_loaded(&window, 2));
+    assert_eq!(
+        std::fs::read(&ini).unwrap(),
+        before,
+        "folders.ini untouched"
+    );
     assert!(
         notices(window.hwnd).is_empty(),
         "{:?}",
         notices(window.hwnd)
     );
+}
+
+fn saved_open(a: &LibraryScratch) -> Vec<std::path::PathBuf> {
+    crate::library::local::read_folders(&crate::library::local::folders_file(&a.data()))
+        .startup_roots()
+        .0
+}
+
+#[test]
+fn an_offline_notebook_does_not_stall_the_others() {
+    // Break caught: every notebook sitting on "Loading…" until an offline drive's existence check
+    // times out, because loads only started once all the checks had finished.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("startup10-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("startup10-b");
+    b.note("b.md", "b");
+    write_open(&a.data(), &[a.folder(), b.folder()], None);
+    let (window, _editor) = start(&a);
+
+    let gate = crate::library::block_folder_checks(&a.folder());
+    crate::window::library_host::open_library_step(window.hwnd);
+    let b_id = notebooks(window.hwnd)[1].0;
+    pump_until(window.hwnd, || {
+        with_notebook(window.hwnd, b_id, |_| ()).is_some()
+    });
+    let a_id = notebooks(window.hwnd)[0].0;
+    assert!(
+        with_notebook(window.hwnd, a_id, |_| ()).is_none(),
+        "A is still being checked"
+    );
+    drop(gate);
+    pump_until(window.hwnd, || all_loaded(&window, 2));
+}
+
+#[test]
+fn a_missing_notebook_stays_remembered_when_a_launch_folder_is_added() {
+    // Break caught: open=[Missing, A] plus `fastpad.exe B` rewriting open= to [A, B], so the
+    // notebook is forgotten although its drive is only offline.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("startup11-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("startup11-b");
+    b.note("b.md", "b");
+    let gone = a.root.join("gone");
+    write_open(&a.data(), &[gone.clone(), a.folder()], None);
+    let (window, _editor) = start(&a);
+    launch_with(&window, &b.folder());
+
+    crate::window::library_host::open_library_step(window.hwnd);
+    pump_until(window.hwnd, || all_loaded(&window, 2));
+    assert_eq!(open_folders(&window), [a.folder(), b.folder()]);
+    assert_eq!(saved_open(&a), [gone, a.folder(), b.folder()]);
+}
+
+#[test]
+fn a_missing_notebook_stays_remembered_when_another_is_opened_later() {
+    // Break caught: the first open or close after startup forgetting a notebook whose drive was
+    // offline.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("startup12-a");
+    a.note("a.md", "a");
+    let c = LibraryScratch::new("startup12-c");
+    c.note("c.md", "c");
+    let gone = a.root.join("gone");
+    write_open(&a.data(), &[gone.clone(), a.folder()], None);
+    let (window, _editor) = start(&a);
+
+    crate::window::library_host::open_library_step(window.hwnd);
+    pump_until(window.hwnd, || all_loaded(&window, 1));
+    crate::window::library_host::open_folder(window.hwnd, &c.folder());
+    assert_eq!(saved_open(&a), [gone, a.folder(), c.folder()]);
+}
+
+#[test]
+fn a_remembered_notebook_that_comes_back_opens_once_in_its_place() {
+    // Break caught: opening a folder that was unavailable at startup listing it twice in open=.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("startup13-a");
+    a.note("a.md", "a");
+    let gone = a.root.join("gone");
+    write_open(&a.data(), &[gone.clone(), a.folder()], None);
+    let (window, _editor) = start(&a);
+
+    crate::window::library_host::open_library_step(window.hwnd);
+    pump_until(window.hwnd, || all_loaded(&window, 1));
+    std::fs::create_dir_all(&gone).unwrap();
+    crate::window::library_host::open_folder(window.hwnd, &gone);
+    pump_until(window.hwnd, || all_loaded(&window, 2));
+
+    assert_eq!(open_folders(&window), [a.folder(), gone.clone()]);
+    assert_eq!(saved_open(&a), [gone, a.folder()]);
 }
 
 fn launch_with(window: &ProductionWindow, folder: &std::path::Path) {
