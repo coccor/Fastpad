@@ -212,6 +212,21 @@ thread_local! {
     static LAST_CHOICE: std::cell::RefCell<Option<(String, Vec<String>)>> =
         const { std::cell::RefCell::new(None) };
 }
+/// The New notebook dialog, starting in `folder`: the path of the folder to create, or `None`
+/// for Cancel.
+pub(crate) fn choose_new_notebook_path(
+    hwnd: HWND,
+    folder: Option<&std::path::Path>,
+) -> crate::Result<Option<PathBuf>> {
+    let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    LAST_NEW_NOTEBOOK_START.with(|last| *last.borrow_mut() = folder.map(|f| f.to_path_buf()));
+    #[cfg(test)]
+    if let Some(answer) = NEW_NOTEBOOK_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return Ok(answer(hwnd));
+    }
+    crate::window::commands::choose_new_notebook_path(hwnd, folder)
+}
 
 #[cfg(test)]
 type Answer<T> = Box<dyn FnOnce(HWND) -> T>;
@@ -226,6 +241,10 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static CONFIRM_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<bool>>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static NEW_NOTEBOOK_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<Option<PathBuf>>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static LAST_NEW_NOTEBOOK_START: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
     static LAST_SAVE_REQUEST: std::cell::RefCell<Option<(String, Option<PathBuf>)>> =
         const { std::cell::RefCell::new(None) };
     static LAST_CONFIRM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -279,6 +298,24 @@ pub(crate) fn answer_next_save_dialog(answer: impl FnOnce(HWND) -> Option<PathBu
 #[cfg(test)]
 pub(crate) fn answer_next_folder_dialog(answer: impl FnOnce(HWND) -> Option<PathBuf> + 'static) {
     FOLDER_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// Answers the next New notebook dialog from inside its modal scope; `None` is Cancel.
+#[cfg(test)]
+pub(crate) fn answer_next_new_notebook_dialog(
+    answer: impl FnOnce(HWND) -> Option<PathBuf> + 'static,
+) {
+    NEW_NOTEBOOK_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// The folder the last New notebook dialog started in.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn take_last_new_notebook_start() -> Option<PathBuf> {
+    LAST_NEW_NOTEBOOK_START.with(|last| last.borrow_mut().take())
 }
 
 /// Answers the next OK/Cancel confirmation from inside its modal scope.

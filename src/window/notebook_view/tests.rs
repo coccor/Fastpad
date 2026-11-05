@@ -58,8 +58,8 @@ fn a_row_indents_by_depth_and_keeps_the_pin_at_the_right_edge() {
 
 #[test]
 fn the_no_notebook_state_lists_recent_notebooks_below_its_button() {
-    // Break caught: the RECENT rows painted over the Open notebook… button, or a list rect
-    // that turns inside out in a short panel.
+    // Break caught: the RECENT rows painted over the Open notebook… or New notebook… button,
+    // or a list rect that turns inside out in a short panel.
     let body = RECT {
         left: 0,
         top: 38,
@@ -68,7 +68,8 @@ fn the_no_notebook_state_lists_recent_notebooks_below_its_button() {
     };
     let layout = state_layout(body, 96);
     assert!(layout.message.bottom <= layout.button.top);
-    assert!(layout.button.bottom <= layout.label.top);
+    assert!(layout.button.bottom <= layout.second.top);
+    assert!(layout.second.bottom <= layout.label.top);
     assert_eq!(layout.list.top, layout.label.bottom);
     assert_eq!(layout.list.bottom, 600);
     let short = state_layout(

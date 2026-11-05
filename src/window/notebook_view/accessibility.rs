@@ -97,7 +97,10 @@ impl NotebookView {
         match self.mode {
             // The states under a collapsed root are not painted.
             Mode::Empty | Mode::Failed if !self.root_expanded => {}
-            Mode::NoNotebook => buttons.push(("Open notebook…".to_owned(), state.button)),
+            Mode::NoNotebook => {
+                buttons.push(("Open notebook…".to_owned(), state.button));
+                buttons.push(("New notebook…".to_owned(), state.second));
+            }
             Mode::Empty => buttons.push(("New note".to_owned(), state.button)),
             Mode::Failed => {
                 buttons.push(("Retry".to_owned(), state.button));

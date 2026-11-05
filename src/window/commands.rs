@@ -199,6 +199,8 @@ pub enum CommandId {
     MarkdownInsertTable = 295,
     MarkdownAddTableColumn = 296,
     MarkdownDeleteTableColumn = 297,
+    // File: New notebook… (2026-11-05).
+    NewNotebook = 298,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -402,6 +404,7 @@ impl CommandId {
                 | Self::NotesEditNotebookSettings
                 | Self::ToggleNotesMode
                 | Self::OpenFolder
+                | Self::NewNotebook
                 | Self::OpenRecentFolder
                 | Self::ToggleFolderAutosave
                 | Self::ToggleSidebar
@@ -577,7 +580,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 187] = [
+        const COMMANDS: [CommandId; 188] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -765,6 +768,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownInsertTable,
             CommandId::MarkdownAddTableColumn,
             CommandId::MarkdownDeleteTableColumn,
+            CommandId::NewNotebook,
         ];
         COMMANDS
             .into_iter()
@@ -783,6 +787,19 @@ pub(crate) fn choose_folder_path(
     owner: windows_sys::Win32::Foundation::HWND,
 ) -> crate::Result<Option<std::path::PathBuf>> {
     crate::platform::dialogs::show_folder_dialog(owner)
+}
+
+pub(crate) fn choose_new_notebook_path(
+    owner: windows_sys::Win32::Foundation::HWND,
+    folder: Option<&std::path::Path>,
+) -> crate::Result<Option<std::path::PathBuf>> {
+    crate::platform::dialogs::show_new_folder_dialog(
+        owner,
+        "New notebook",
+        folder,
+        "New notebook",
+        "Create",
+    )
 }
 
 pub(crate) fn choose_save_path(
@@ -870,6 +887,8 @@ mod tests {
         assert_eq!(CommandId::try_from(159), Ok(CommandId::OpenRecentFolder));
         assert!(!CommandId::OpenFolder.needs_document());
         assert!(!CommandId::OpenRecentFolder.needs_document());
+        assert_eq!(CommandId::try_from(298), Ok(CommandId::NewNotebook));
+        assert!(!CommandId::NewNotebook.needs_document());
         assert_eq!(CommandId::try_from(183), Ok(CommandId::FocusNextPane));
         assert_eq!(CommandId::try_from(184), Ok(CommandId::FocusPreviousPane));
         assert!(!CommandId::FocusNextPane.needs_document());
@@ -1118,7 +1137,7 @@ mod tests {
         assert!(CommandId::ToggleReadOnly.needs_text());
         assert_eq!(CommandId::MarkdownViewLive.scope(), Scope::Global);
         assert!(CommandId::MarkdownViewLive.is_markdown_edit());
-        assert!(CommandId::try_from(298).is_err());
+        assert!(CommandId::try_from(299).is_err());
     }
 
     #[test]
