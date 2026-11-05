@@ -17,6 +17,7 @@ pub mod notebook_ini;
 pub mod ops;
 pub mod quick_open;
 pub mod reconcile;
+pub mod roots;
 pub mod scan;
 pub mod store;
 pub mod template;
