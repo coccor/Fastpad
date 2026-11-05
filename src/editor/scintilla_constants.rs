@@ -2,6 +2,8 @@
 // Do not edit by hand.
 
 pub const INDIC_PLAIN: u32 = 0;
+pub const INDIC_ROUNDBOX: u32 = 7;
+pub const INDIC_STRAIGHTBOX: u32 = 8;
 pub const SC_AUTOMATICFOLD_CHANGE: u32 = 0x0004;
 pub const SC_AUTOMATICFOLD_CLICK: u32 = 0x0002;
 pub const SC_AUTOMATICFOLD_SHOW: u32 = 0x0001;
@@ -401,7 +403,9 @@ pub const SCI_GOTOLINE: u32 = 2024;
 pub const SCI_GOTOPOS: u32 = 2025;
 pub const SCI_INDICATORCLEARRANGE: u32 = 2505;
 pub const SCI_INDICATORFILLRANGE: u32 = 2504;
+pub const SCI_INDICSETALPHA: u32 = 2523;
 pub const SCI_INDICSETFORE: u32 = 2082;
+pub const SCI_INDICSETOUTLINEALPHA: u32 = 2558;
 pub const SCI_INDICSETSTYLE: u32 = 2080;
 pub const SCI_INDICSETUNDER: u32 = 2510;
 pub const SCI_LINEDOWNRECTEXTEND: u32 = 2426;

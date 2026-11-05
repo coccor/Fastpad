@@ -43,38 +43,62 @@ impl MatchCount {
     }
 }
 
-/// Counts `matches` (ascending, non-overlapping) up to `cap`, and finds `selection` among them.
-/// The iterator is read at most `cap + 1` items, so an unbounded source stays bounded.
+/// The counted matches of a query: the counter's figures and the ranges it counted, which the
+/// editor shades.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FoundMatches {
+    pub(crate) count: MatchCount,
+    /// The counted matches, ascending, at most `COUNT_CAP` of them.
+    pub(crate) ranges: Vec<Range<usize>>,
+}
+
+impl FoundMatches {
+    /// The counted match the selection is, if any.
+    pub(crate) fn current(&self) -> Option<Range<usize>> {
+        let index = self.count.index?;
+        self.ranges.get(index - 1).cloned()
+    }
+}
+
+/// Counts `matches` (ascending, non-overlapping) up to `cap`, keeping them, and finds `selection`
+/// among them. The iterator is read at most `cap + 1` items, so an unbounded source stays bounded.
 pub(super) fn tally(
     matches: impl Iterator<Item = Range<usize>>,
     selection: &Range<usize>,
     cap: usize,
-) -> MatchCount {
+) -> FoundMatches {
     let mut total = 0;
     let mut index = None;
+    let mut ranges = Vec::new();
     for range in matches.take(cap + 1) {
-        if total < cap && range == *selection {
-            index = Some(total + 1);
+        if total < cap {
+            if range == *selection {
+                index = Some(total + 1);
+            }
+            ranges.push(range);
         }
         total += 1;
     }
     let capped = total > cap;
-    MatchCount {
-        total: total.min(cap),
-        capped,
-        index,
+    FoundMatches {
+        count: MatchCount {
+            total: total.min(cap),
+            capped,
+            index,
+        },
+        ranges,
     }
 }
 
-/// The count of `query` under `options` in `editor`'s document, with `selection` as the current
-/// match. `None` shows nothing: an empty query, or a document too large to count. A pattern that
-/// doesn't compile has no matches, as the bar's navigation treats it.
-pub(crate) fn count_matches(
+/// The matches of `query` under `options` in `editor`'s document, counted, with `selection` as
+/// the current match. `None` shows nothing: an empty query, or a document too large to count. A
+/// pattern that doesn't compile has no matches, as the bar's navigation treats it.
+pub(crate) fn find_matches(
     editor: &Editor,
     query: &str,
     options: MatchOptions,
     selection: &Range<usize>,
-) -> Option<MatchCount> {
+) -> Option<FoundMatches> {
     if query.is_empty() {
         return None;
     }

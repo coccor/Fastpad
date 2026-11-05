@@ -124,6 +124,7 @@ pub(crate) fn close_find_bar(hwnd: HWND) {
     if !closed || !identity.is_live_for(hwnd) {
         return;
     }
+    clear_find_highlights(hwnd);
     layout_editor_and_find_bar(hwnd);
     focus_content(hwnd);
 }
@@ -249,10 +250,38 @@ pub(super) fn find_field_changed(hwnd: HWND, control: HWND) {
     });
     if query {
         set_find_no_match(hwnd, false);
-        // The old count no longer describes the query. The new one waits for a pause in typing.
+        // The old count no longer describes the query. The new one waits for a pause in typing;
+        // the old highlights stay until then, so typing doesn't make them flicker, unless the
+        // query is now empty and no recount will come.
         set_find_count(hwnd, None);
+        let emptied = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+            unsafe { app.as_ref() }
+                .find_bar()
+                .is_some_and(|bar| !bar.has_query())
+        });
+        if emptied {
+            clear_find_highlights(hwnd);
+        }
         schedule_find_count(hwnd);
     }
+}
+
+/// Removes the find highlights from the active document.
+fn clear_find_highlights(hwnd: HWND) {
+    if let Some(editor) =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor().cloned())
+    {
+        let _ = editor.clear_find_matches();
+    }
+}
+
+/// Whether the active group's find bar is showing, so its matches are highlighted.
+fn find_bar_visible(hwnd: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .find_bar()
+            .is_some_and(|bar| bar.is_visible())
+    })
 }
 
 fn set_find_count(hwnd: HWND, count: Option<find_bar::MatchCount>) {
@@ -293,7 +322,8 @@ pub(crate) fn find_count_timer(hwnd: HWND) {
 }
 
 /// Counts the matches of the bar's query in the active document now, with the current selection
-/// as the current match, and shows the result.
+/// as the current match, shows the result, and highlights the matches counted: all of them
+/// shaded, the current one more strongly.
 pub(crate) fn refresh_find_count(hwnd: HWND) {
     let Some((editor, query, options)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
@@ -302,11 +332,15 @@ pub(crate) fn refresh_find_count(hwnd: HWND) {
     }) else {
         return;
     };
-    let count = editor
+    let found = editor
         .selection()
         .ok()
-        .and_then(|selection| find_bar::count_matches(&editor, &query, options, &selection));
-    set_find_count(hwnd, count);
+        .and_then(|selection| find_bar::find_matches(&editor, &query, options, &selection));
+    let _ = match &found {
+        Some(found) => editor.mark_find_matches(&found.ranges, found.current()),
+        None => editor.clear_find_matches(),
+    };
+    set_find_count(hwnd, found.map(|found| found.count));
 }
 
 /// `WM_PAINT` for an empty find field; false when there is no find bar to paint it.
@@ -407,6 +441,11 @@ pub(super) fn select_match(
     if let Some(found) = found.clone() {
         let _ = editor.set_selection(found.clone());
         editor.scroll_caret_into_view();
+    }
+    // The current match's box moves at once; the recount scheduled below redraws the rest. With
+    // the bar closed (F3), nothing is highlighted.
+    if find_bar_visible(hwnd) {
+        let _ = editor.mark_find_current(found.clone());
     }
     set_find_no_match(hwnd, found.is_none());
     schedule_find_count(hwnd);

@@ -165,6 +165,53 @@ fn the_counter_counts_after_a_pause_and_the_arrow_buttons_step_through_matches()
 }
 
 #[test]
+fn every_match_is_highlighted_and_the_current_one_more_strongly() {
+    // Break caught: only the selection shaded, the current box left on the previous match after
+    // find next, highlights kept for an emptied query, or kept after the bar closes.
+    const SCI_INDICATORALLONFOR: u32 = 2506;
+    const MATCH: isize = 1 << 9;
+    const CURRENT: isize = 1 << 10;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    editor.populate_clean("cat dog cat bird cat").unwrap();
+    let marks = |position: usize| {
+        let on = unsafe { SendMessageW(editor.hwnd(), SCI_INDICATORALLONFOR, position, 0) };
+        on & (MATCH | CURRENT)
+    };
+    execute_command(window.hwnd, CommandId::Find);
+    set_find_query(window.hwnd, "cat");
+    super::super::refresh_find_count(window.hwnd);
+    for position in [0, 2, 8, 10, 17, 19] {
+        assert_eq!(marks(position), MATCH, "a match at {position}");
+    }
+    for position in [3, 4, 11, 16] {
+        assert_eq!(marks(position), 0, "not a match at {position}");
+    }
+
+    editor.set_selection(0..0).unwrap();
+    super::super::find_next(window.hwnd);
+    assert_eq!(marks(0), MATCH | CURRENT, "the current box moves at once");
+    super::super::find_next(window.hwnd);
+    assert_eq!(marks(0), MATCH);
+    assert_eq!(marks(8), MATCH | CURRENT);
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(
+        (marks(0), marks(8)),
+        (MATCH, MATCH | CURRENT),
+        "a recount keeps it"
+    );
+
+    set_find_query(window.hwnd, "");
+    assert_eq!((marks(0), marks(8)), (0, 0), "an emptied query clears them");
+    set_find_query(window.hwnd, "dog");
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(marks(4), MATCH);
+    super::super::close_find_bar(window.hwnd);
+    assert_eq!(marks(4), 0, "closing the bar clears them");
+}
+
+#[test]
 fn replace_current_replaces_a_selection_that_matches_under_the_options() {
     // Break caught: Enter in Replace comparing the selection to the query byte for byte, so
     // a case-insensitive "CAT" is skipped instead of replaced.
