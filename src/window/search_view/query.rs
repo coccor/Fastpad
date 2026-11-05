@@ -79,7 +79,7 @@ pub(super) fn clear_search(hwnd: HWND) {
 /// notebook runs the query again if its notes changed, or, while the view is hidden, checks once
 /// it shows again.
 pub(crate) fn library_changed(hwnd: HWND) {
-    let target = library_host::target_notebook(hwnd);
+    let target = shown_target(hwnd);
     let notebook = target.and_then(|id| library_host::notebook_folder(hwnd, id));
     let name = target.and_then(|id| library_host::notebook_display_name(hwnd, id));
     let loaded = target.is_some_and(|id| library_host::with_notebook(hwnd, id, |_| ()).is_some());
@@ -130,8 +130,7 @@ pub(crate) fn library_changed(hwnd: HWND) {
 /// The target notebook may have changed (another tab came to the front, the view showed): the
 /// view catches up only when it now names another notebook, as `library_changed` does.
 pub(crate) fn target_changed(hwnd: HWND) {
-    let notebook =
-        library_host::target_notebook(hwnd).and_then(|id| library_host::notebook_folder(hwnd, id));
+    let notebook = shown_target(hwnd).and_then(|id| library_host::notebook_folder(hwnd, id));
     let moved = with_view(hwnd, |view| match (&view.notebook, &notebook) {
         (Some(old), Some(new)) => !same_path(old, new),
         (None, None) => false,
@@ -141,6 +140,20 @@ pub(crate) fn target_changed(hwnd: HWND) {
     if moved {
         library_changed(hwnd);
     }
+}
+
+/// The notebook the view should show: the target notebook, except while a replace runs, when
+/// the view keeps the notebook it started in (while that is still open) so the replace is not
+/// cancelled by a tab switch; `text_search_host::finish_replace` catches the view up.
+fn shown_target(hwnd: HWND) -> Option<library_host::NotebookId> {
+    if text_search_host::replacing(hwnd)
+        && let Some(kept) = notebook(hwnd)
+        && let Some(id) = library_host::notebook_of(hwnd, &kept)
+        && library_host::notebook_folder(hwnd, id).is_some_and(|open| same_path(&open, &kept))
+    {
+        return Some(id);
+    }
+    library_host::target_notebook(hwnd)
 }
 
 /// The folder of the notebook the view searches and its results come from.

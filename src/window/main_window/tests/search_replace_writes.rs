@@ -835,3 +835,100 @@ fn a_regex_prefill_with_hash_and_dash_opens_to_its_match_in_the_find_bar() {
     assert!(bar.options().regex);
     assert!(!bar.no_match());
 }
+
+#[test]
+fn a_replace_finishes_in_the_notebook_it_started_in() {
+    // Break caught (Task 8 review): a tab of another notebook brought to the front while a
+    // replace in B writes, so the write is cancelled and never reported, or its report lands in
+    // the other notebook: B's stamps recorded in A, A's tabs reloaded, and B's own-write marks
+    // never ended.
+    use crate::window::text_search_host::writer_hooks;
+    struct Unpause;
+    impl Drop for Unpause {
+        fn drop(&mut self) {
+            writer_hooks::set_pause(0);
+        }
+    }
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("replace-own-notebook", "alpha needle", "beta needle");
+    let hwnd = ab.window.hwnd;
+    // Both notebooks hold a closed c.md, so B's report would fit A's list too.
+    for (id, folder, text) in [
+        (ab.a_id, &ab.a, "alpha c"),
+        (ab.b_id, &ab.b, "beta needle c"),
+    ] {
+        let path = folder.join("c.md");
+        std::fs::write(&path, text).unwrap();
+        crate::window::library_host::with_notebook(hwnd, id, |state| state.add_note(&path));
+    }
+    let size = |id, relative: &str| {
+        crate::window::library_host::with_notebook(hwnd, id, |state| {
+            state
+                .notes
+                .iter()
+                .find(|note| {
+                    crate::library::model::same_path(&note.path, std::path::Path::new(relative))
+                })
+                .map(|note| (note.size, note.mtime))
+        })
+        .flatten()
+    };
+    let a_before = (size(ab.a_id, "a.md"), size(ab.a_id, "c.md"));
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
+    search_to_replace(hwnd, "needle", "pin");
+    assert_eq!(search_rows(hwnd).len(), 2, "b.md and c.md of B");
+
+    let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let answered = std::rc::Rc::clone(&asked);
+    crate::window::answer_next_confirm(move |_| {
+        answered.set(true);
+        true
+    });
+    let _unpause = Unpause;
+    writer_hooks::set_pause(300);
+    crate::window::text_search_host::replace_all(hwnd);
+    pump_until(hwnd, || asked.get());
+    // The write worker waits before it reports: an A tab comes to the front meanwhile.
+    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let reported = || notices(hwnd).iter().any(|n| n.starts_with("Replaced "));
+    while !reported() && std::time::Instant::now() < deadline {
+        pump_posted_messages(hwnd);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(reported(), "the replace reported: {:?}", notices(hwnd));
+    let c = ab.b.join("c.md");
+    assert_eq!(std::fs::read_to_string(&c).unwrap(), "beta pin c");
+    assert_eq!(
+        size(ab.b_id, "c.md").map(|(size, _)| size),
+        Some("beta pin c".len() as u64),
+        "B's list took the written stamp"
+    );
+    assert_eq!(
+        (size(ab.a_id, "a.md"), size(ab.a_id, "c.md")),
+        a_before,
+        "A's list is untouched"
+    );
+    let own = app_mut(hwnd).library.own_writes.clone();
+    let key = c.to_string_lossy().to_lowercase();
+    let until = own
+        .get(&key)
+        .copied()
+        .flatten()
+        .expect("B's c.md was marked");
+    assert!(
+        until <= std::time::Instant::now() + std::time::Duration::from_secs(2),
+        "B's own write ended"
+    );
+    assert!(
+        !own.contains_key(&ab.a.join("c.md").to_string_lossy().to_lowercase()),
+        "nothing marked in A"
+    );
+    // Once the replace is over, the view follows the tab in front.
+    assert_eq!(
+        crate::window::search_view::shown_header(hwnd),
+        "Searching A"
+    );
+}

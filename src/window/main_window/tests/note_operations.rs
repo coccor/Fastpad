@@ -685,14 +685,23 @@ fn move_to_notebook_lists_open_notebooks_first_and_updates_an_open_destination()
     std::fs::create_dir_all(&c).unwrap();
     let c_id = open_and_load_folder(&ab.window, &c);
     assert!(crate::window::library_host::close_notebook_of(hwnd, c_id));
-    // C is now the most recent notebook, and not open.
+    // D is a favorite, more recent than C, and not open.
+    let d = ab.scratch.root.join("D");
+    std::fs::create_dir_all(&d).unwrap();
+    let d_id = open_and_load_folder(&ab.window, &d);
+    crate::window::library_host::toggle_notebook_favorite_of(hwnd, d_id);
+    assert!(crate::window::library_host::close_notebook_of(hwnd, d_id));
 
     let note = ab.a.join("a.md");
     crate::window::library_host::move_to_notebook(hwnd, &note);
     let items = with_command_palette(hwnd, |p| p.picker().map(|picker| picker.items.clone()))
         .flatten()
         .unwrap();
-    assert_eq!(items, ["B", "C", "Browse…"]);
+    assert_eq!(
+        items,
+        ["B", "D", "C", "Browse…"],
+        "open, then favorites, then recent"
+    );
 
     crate::window::library_host::picked(
         hwnd,
