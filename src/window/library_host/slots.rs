@@ -186,10 +186,6 @@ pub(super) fn default_slot<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookSlot) -> R
 }
 
 /// The open notebooks and their folders, in sidebar order.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the multi-root tree lists them")
-)]
 pub(crate) fn notebooks(hwnd: HWND) -> Vec<(NotebookId, PathBuf)> {
     host(hwnd, |host| {
         host.notebooks

@@ -211,7 +211,7 @@ fn a_preview_tab_is_kept_by_the_session_and_comes_back_as_a_normal_tab() {
 }
 
 #[test]
-fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_tabs() {
+fn opening_another_folder_adds_it_and_closing_the_old_one_flushes_it_and_keeps_tabs() {
     let _scintilla = load_native_scintilla();
     let first = LibraryScratch::new("switch-a");
     let second = LibraryScratch::new("switch-b");
@@ -237,6 +237,16 @@ fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_ta
         move |_| Some(folder)
     });
     execute_command(window.hwnd, CommandId::OpenFolder);
+    let first_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    assert_eq!(
+        crate::window::library_host::notebooks(window.hwnd).len(),
+        2,
+        "opening adds a root"
+    );
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        first_id
+    ));
 
     assert!(
         crate::library::store::library_file(&first.folder()).exists(),
@@ -276,12 +286,11 @@ fn opening_a_path_that_is_not_a_folder_explains_why() {
 }
 
 #[test]
-fn a_failed_flush_keeps_the_current_folder_open() {
-    // Break caught: switching folders after library.ini could not be written, which drops
+fn a_failed_flush_keeps_the_notebook_being_closed_open() {
+    // Break caught: closing a notebook after library.ini could not be written, which drops
     // the unsaved pins with the old state.
     let _scintilla = load_native_scintilla();
     let first = LibraryScratch::new("flushfail-a");
-    let second = LibraryScratch::new("flushfail-b");
     let a = first.note("a.md", "a");
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
@@ -300,7 +309,11 @@ fn a_failed_flush_keeps_the_current_folder_open() {
     // A file where the .fastpad directory belongs makes the write fail.
     std::fs::write(first.folder().join(".fastpad"), "not a directory").unwrap();
 
-    crate::window::library_host::open_folder(window.hwnd, &second.folder());
+    let first_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    assert!(!crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        first_id
+    ));
 
     assert_eq!(
         crate::window::library_host::folder(window.hwnd),
@@ -314,9 +327,9 @@ fn a_failed_flush_keeps_the_current_folder_open() {
         "{:?}",
         notices(window.hwnd)
     );
-    let recent =
+    let open =
         crate::library::local::read_folders(&crate::library::local::folders_file(&first.data()));
-    assert!(!recent.folders.contains(&second.folder()));
+    assert!(!open.closed, "the notebook stays recorded as open");
 }
 
 #[test]

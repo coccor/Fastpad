@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW};
 
-/// Opens `path` as the notebook, flushing the current one first. Open tabs stay open. The folder
-/// was just chosen in a dialog, dropped or named by a launch, so it is checked here.
+/// Opens `path` as a notebook beside the ones already open. The folder was just chosen in a
+/// dialog, dropped or named by a launch, so it is checked here.
 pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
     if !notes_mode(hwnd) {
         push_notice(hwnd, NOTES_MODE_OFF.to_owned());
@@ -27,19 +27,19 @@ pub(crate) fn open_folder(hwnd: HWND, path: &Path) {
 pub(super) const NOTES_MODE_OFF: &str =
     "Notes mode is off. Turn it on with Notes: Toggle notes mode to open notebooks.";
 
-/// Saves the dirty notes of the notebook that is about to be replaced or closed, while autosave
-/// still applies to them, and flushes its pending pins. Losing the notebook now would drop the
+/// Saves the dirty notes of the notebook `id`, which is about to close, while autosave still
+/// applies to them, and flushes its pending pins. Losing the notebook now would drop the
 /// unsaved pins, so a failed write keeps it open: this schedules a retry, reports it and returns
 /// false. `false` also means the window went away meanwhile.
-pub(super) fn save_before_leaving(hwnd: HWND) -> bool {
+pub(super) fn save_before_leaving_of(hwnd: HWND, id: NotebookId) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
-    autosave_all(hwnd);
+    autosave_all_of(hwnd, id);
     if !identity.is_live_for(hwnd) {
         return false;
     }
-    let failure = match try_flush(hwnd, false) {
+    let failure = match try_flush_of(hwnd, id, false) {
         Ok(library::Flushed::Busy) => Some("its library.ini is in use by another program".into()),
         Ok(_) => None,
         Err(error) => Some(error.to_string()),
@@ -55,39 +55,88 @@ pub(super) fn save_before_leaving(hwnd: HWND) -> bool {
     true
 }
 
-/// The switch itself, once `path` is known to exist.
+/// Records the open notebooks, in sidebar order, and the default in `folders.ini`.
+fn record_open_notebooks(hwnd: HWND) {
+    let roots: Vec<PathBuf> = notebooks(hwnd)
+        .into_iter()
+        .map(|(_, folder)| folder)
+        .collect();
+    let default = default_notebook(hwnd).and_then(|id| notebook_folder(hwnd, id));
+    update_folders(hwnd, |folders| folders.set_open(&roots, default.as_deref()));
+}
+
+/// Adds the notebook `path`, which exists, as a root (multi-root notebooks spec 3.3).
 pub(super) fn open_checked_folder(hwnd: HWND, path: PathBuf) {
     if !notes_mode(hwnd) {
         push_notice(hwnd, NOTES_MODE_OFF.to_owned());
         return;
     }
-    if !save_before_leaving(hwnd) {
+    let open = notebooks(hwnd);
+    if let Some((id, _)) = open
+        .iter()
+        .find(|(_, folder)| library::model::same_path(folder, &path))
+    {
+        crate::window::notebook_view::reveal_notebook(hwnd, *id);
         return;
     }
-    // The old notebook's watcher goes; the new one starts once its first scan lands.
-    stop_watcher(hwnd);
-    // One notebook at a time for now: the new one replaces the default, and becomes it.
-    host(hwnd, |host| {
-        let notified = host
-            .default_notebook
-            .and_then(|id| host.remove_notebook(id))
-            .and_then(|slot| slot.notified);
+    let roots: Vec<PathBuf> = open.into_iter().map(|(_, folder)| folder).collect();
+    if let Some(nesting) = library::roots::nesting(&roots, &path) {
+        let names = library::local::display_names(&roots);
+        let notice = match nesting {
+            library::roots::Nesting::Inside(index) => format!(
+                "{} is inside the open notebook {}.",
+                path.display(),
+                names[index].0
+            ),
+            library::roots::Nesting::Contains(index) => format!(
+                "{} contains the open notebook {}.",
+                path.display(),
+                names[index].0
+            ),
+        };
+        push_notice(hwnd, notice);
+        return;
+    }
+    let Some(id) = host(hwnd, |host| {
         let id = host.add_notebook(path.clone());
-        if let Some(slot) = host.slot_mut(id) {
-            // Reopening the same notebook does not repeat its first-load notices.
-            slot.notified = notified;
-        }
         // A startup load still running is for a notebook the user moved on from.
         host.startup_load = None;
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);
-    });
-    // A folder box names a folder of the notebook that just went.
-    close_stale_name_box(hwnd);
+        id
+    }) else {
+        return;
+    };
     update_folders(hwnd, |folders| folders.push(path.clone()));
-    start_load(hwnd);
+    record_open_notebooks(hwnd);
+    start_load_of(hwnd, id);
+    notebook_opened(hwnd, id);
+}
+
+/// A notebook was added: the title strip and the sidebar show it.
+pub(crate) fn notebook_opened(hwnd: HWND, _id: NotebookId) {
     crate::window::main_window::invalidate_title_strip(hwnd);
     crate::window::side_panel::refresh(hwnd);
+}
+
+/// Makes the open notebook `id` the default one: where capture and the single-notebook commands
+/// go.
+#[cfg_attr(not(test), expect(dead_code, reason = "the root menu offers it"))]
+pub(crate) fn set_default_notebook(hwnd: HWND, id: NotebookId) {
+    let changed = host(hwnd, |host| {
+        let known = host.notebooks.iter().any(|slot| slot.id == id);
+        let changed = known && host.default_notebook != Some(id);
+        if changed {
+            host.default_notebook = Some(id);
+        }
+        changed
+    })
+    .unwrap_or(false);
+    if changed {
+        record_open_notebooks(hwnd);
+        crate::window::main_window::invalidate_title_strip(hwnd);
+        crate::window::side_panel::refresh(hwnd);
+    }
 }
 
 /// What the existence worker found for a notebook picked from a list.
@@ -173,11 +222,7 @@ pub(crate) fn notebook_checked(hwnd: HWND, lparam: LPARAM) {
         );
         return;
     }
-    let already_open =
-        folder(hwnd).is_some_and(|open| library::model::same_path(&open, &checked.folder));
-    if !already_open {
-        open_checked_folder(hwnd, checked.folder);
-    }
+    open_checked_folder(hwnd, checked.folder);
     if let Some(focus) = checked.show_notebook {
         crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, focus);
     }
@@ -298,40 +343,76 @@ pub(crate) fn remove_favorite(hwnd: HWND, folder: &Path) {
     }
 }
 
-/// Notebook: Close. Saves the notebook's dirty notes while autosave still applies, writes its
-/// pending pins and unloads it. Tabs stay open as plain files, and the next start opens no
-/// notebook (`open=none`).
+/// Notebook: Close, on the default notebook.
 pub(crate) fn close_notebook(hwnd: HWND) {
-    let Some(open) = folder(hwnd) else {
-        push_notice(hwnd, "No notebook is open.".to_owned());
-        return;
+    match default_notebook(hwnd) {
+        Some(id) => {
+            close_notebook_of(hwnd, id);
+        }
+        None => push_notice(hwnd, "No notebook is open.".to_owned()),
+    }
+}
+
+/// Closes the notebook `id` (spec 3.4). Saves its dirty notes while autosave still applies,
+/// writes its pending pins and unloads it. Tabs stay open as plain files. The next default is
+/// the first notebook left, and the next start opens no notebook (`open=none`) when none is.
+/// False means the notebook was kept open because its pins could not be written.
+pub(crate) fn close_notebook_of(hwnd: HWND, id: NotebookId) -> bool {
+    let Some(closing) = notebook_folder(hwnd, id) else {
+        return true;
     };
-    if !save_before_leaving(hwnd) {
-        return;
+    if !save_before_leaving_of(hwnd, id) {
+        return false;
     }
-    // A first-save name box would save into the notebook that is going away.
-    close_name_box(hwnd);
-    unsafe {
-        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
-        KillTimer(hwnd, AUTOSAVE_TIMER_ID);
+    // A name box that would save into, or rename a note of, the notebook that is going away.
+    if name_box_targets(hwnd, id, &closing) {
+        close_name_box(hwnd);
     }
-    stop_watcher(hwnd);
+    let last = notebooks(hwnd).len() <= 1;
+    if last {
+        unsafe {
+            KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
+            KillTimer(hwnd, AUTOSAVE_TIMER_ID);
+        }
+    }
+    stop_watcher_of(hwnd, id);
+    forget_closed_notebook(hwnd, &closing, last);
     host(hwnd, |host| {
         // A load or rescan still running for the closed notebook names no slot when it lands.
-        if let Some(id) = host.default_notebook {
-            host.remove_notebook(id);
+        host.remove_notebook(id);
+        if last {
+            host.startup_load = None;
         }
-        host.startup_load = None;
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);
     });
-    update_folders(hwnd, |folders| folders.set_closed(true));
+    record_open_notebooks(hwnd);
     push_notice(
         hwnd,
-        format!("Closed the notebook {}.", notebook_name(&open)),
+        format!("Closed the notebook {}.", notebook_name(&closing)),
     );
     crate::window::main_window::invalidate_title_strip(hwnd);
     crate::window::side_panel::refresh(hwnd);
+    true
+}
+
+/// Whether the open name box acts on the notebook `id` (folder `notebook`): a first save goes to
+/// the default notebook, a rename to the folder of the note's own path.
+fn name_box_targets(hwnd: HWND, id: NotebookId, notebook: &Path) -> bool {
+    let Some(purpose) = name_box_purpose(hwnd) else {
+        return false;
+    };
+    match purpose {
+        crate::window::name_box::NamePurpose::FirstSave(_) => default_notebook(hwnd) == Some(id),
+        crate::window::name_box::NamePurpose::RenameNote(document) => unsafe { app_ptr(hwnd) }
+            .is_some_and(|app| {
+                unsafe { app.as_ref() }
+                    .tabs
+                    .document(document)
+                    .and_then(|document| document.path.as_deref())
+                    .is_some_and(|path| library::is_inside(notebook, path))
+            }),
+    }
 }
 
 pub(crate) fn open_recent_folder_picker(hwnd: HWND) {

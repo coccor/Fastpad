@@ -605,7 +605,7 @@ fn deleting_a_note_with_unsaved_edits_says_they_are_discarded() {
 }
 
 #[test]
-fn opening_another_folder_autosaves_the_old_folders_notes_and_normalizes_the_new_path() {
+fn closing_a_notebook_autosaves_its_notes_and_opening_normalizes_the_new_path() {
     // Break caught: a dirty note in the old folder left unsaved (and no longer autosaved)
     // after a switch, or a folder spelled with a trailing separator becoming a second
     // recent folder.
@@ -624,6 +624,13 @@ fn opening_another_folder_autosaves_the_old_folders_notes_and_normalizes_the_new
     let spelled = std::path::PathBuf::from(format!("{}\\", second.folder().display()));
     crate::window::library_host::open_folder(window.hwnd, &spelled);
 
+    // Opening another notebook leaves the first one alone; closing it saves its dirty notes.
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "one");
+    let first_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        first_id
+    ));
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "two");
     assert_eq!(
         crate::window::library_host::folder(window.hwnd),

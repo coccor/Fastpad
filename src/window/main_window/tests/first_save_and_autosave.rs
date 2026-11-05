@@ -425,18 +425,25 @@ fn opening_a_listed_notebook_switches_once_the_worker_finds_it() {
     app_mut(window.hwnd).library.data_dir = Some(first.data());
     first.install(window.hwnd);
 
+    let roots = || {
+        crate::window::library_host::notebooks(window.hwnd)
+            .into_iter()
+            .map(|(_, folder)| folder)
+            .collect::<Vec<_>>()
+    };
     crate::window::library_host::open_listed_notebook(window.hwnd, &second.folder());
+    assert_eq!(
+        roots(),
+        [first.folder()],
+        "nothing changes before the check lands"
+    );
+    pump_until(window.hwnd, || roots().len() == 2);
+    assert_eq!(roots(), [first.folder(), second.folder()]);
     assert_eq!(
         crate::window::library_host::folder(window.hwnd),
         Some(first.folder()),
-        "nothing changes before the check lands"
+        "the first notebook stays the default"
     );
-    pump_until(window.hwnd, || {
-        crate::window::library_host::folder(window.hwnd) == Some(second.folder())
-    });
-    pump_until(window.hwnd, || {
-        app_mut(window.hwnd).library.default_state().is_some()
-    });
     assert_eq!(
         crate::window::library_host::recent_notebooks(window.hwnd).first(),
         Some(&second.folder())

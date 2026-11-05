@@ -60,9 +60,8 @@ pub(super) fn ensure_watcher_of(hwnd: HWND, id: NotebookId) {
     }
 }
 
-/// Stops the default notebook's watcher: the notebook is closing or switching, notes mode is
-/// going off, or the window is going away. FastPad's own writes and the changed-notes filter
-/// are forgotten with it.
+/// Stops every notebook's watcher: notes mode is going off, or the window is going away.
+/// FastPad's own writes and the changed-notes filter are forgotten with them.
 pub(crate) fn stop_watcher(hwnd: HWND) {
     host(hwnd, |host| {
         host.own_writes.clear();
@@ -70,9 +69,35 @@ pub(crate) fn stop_watcher(hwnd: HWND) {
         host.changed_only = false;
         host.shown_templates = None;
     });
-    if let Some(id) = default_notebook(hwnd) {
+    for (id, _) in notebooks(hwnd) {
         stop_watcher_of(hwnd, id);
     }
+}
+
+/// Forgets what the window-wide state holds for the closed notebook `folder`: FastPad's own
+/// writes under it, and the template list when it was for a folder in it. `last` means no
+/// notebook remains, so the changed-notes filter resets too.
+pub(super) fn forget_closed_notebook(hwnd: HWND, folder: &Path, last: bool) {
+    host(hwnd, |host| {
+        let prefix = own_write_key(folder);
+        host.own_writes.retain(|key, _| {
+            !(key == &prefix
+                || key
+                    .strip_prefix(&prefix)
+                    .is_some_and(|rest| rest.starts_with(['\\', '/'])))
+        });
+        let templates_inside = match &host.shown_templates {
+            Some((Some(parent), _)) => crate::library::is_inside(folder, parent),
+            Some((None, _)) => last,
+            None => false,
+        };
+        if templates_inside || last {
+            host.shown_templates = None;
+        }
+        if last {
+            host.changed_only = false;
+        }
+    });
 }
 
 /// Stops the notebook `id`'s watcher and waits for its thread. The notebook gets a fresh chance

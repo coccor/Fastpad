@@ -817,19 +817,17 @@ fn a_favorite_notebook_opens_from_the_favorites_view() {
 
     forward(&data, &other);
     let other_line = format!("folder={}", other.display());
-    wait_until("the other notebook to open", || {
+    wait_until("the other notebook to open beside the first", || {
         first_folder(&data).as_deref() == Some(other_line.as_str())
-    });
-    wait_until("the tree to list c", || {
-        tree_rows(panel) == ["c.md, Markdown"]
+            && read(&data.data().join("folders.ini"))
+                .lines()
+                .any(|l| l == format!("open={}", other.display()))
     });
 
+    // The first notebook is still open (and the default), so the tree lists it; the favorite is
+    // revealed and the Notebook view shown.
     command(hwnd, CommandId::ShowFavoritesView);
-    click_child(panel, "notes");
-    let notes_line = format!("folder={}", data.folder().display());
-    wait_until("the favorite to open", || {
-        first_folder(&data).as_deref() == Some(notes_line.as_str())
-    });
+    click_child(panel, "notes, open");
     wait_until("the Notebook view to list a", || {
         tree_rows(panel) == ["a.md, Markdown"]
     });

@@ -47,6 +47,13 @@ const GAP: i32 = 6;
 const PIN_BOX: i32 = 24;
 const TYPE_AHEAD_RESET: Duration = Duration::from_secs(1);
 
+/// Brings the root of the open notebook `id` into view (opening a notebook that is already
+/// open does this). Until the tree lists every root, that is the top of the view.
+pub(crate) fn reveal_notebook(hwnd: HWND, _id: crate::window::library_host::NotebookId) {
+    crate::window::side_panel::refresh(hwnd);
+    select_index(hwnd, 0);
+}
+
 pub(crate) const TRUNCATED_ROW: &str = "Showing the first 10,000 notes";
 
 /// The panel's timer while a drag is under way (tree drag spec §3.3).

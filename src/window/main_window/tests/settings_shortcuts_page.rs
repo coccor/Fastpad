@@ -30,10 +30,16 @@ fn a_favorite_opens_from_the_favorites_view_and_its_menu_removes_it() {
     pump_until(window.hwnd, || {
         crate::window::side_panel::current_view(window.hwnd) == SidebarView::Notebook
     });
-    assert!(crate::library::model::same_path(
-        &crate::window::library_host::folder(window.hwnd).unwrap(),
-        &second.folder()
-    ));
+    // Opening adds a root: both notebooks are open, the first still the default.
+    assert_eq!(crate::window::library_host::notebooks(window.hwnd).len(), 2);
+    assert!(
+        crate::window::library_host::notebooks(window.hwnd)
+            .iter()
+            .any(|(_, folder)| crate::library::model::same_path(folder, &second.folder()))
+    );
+    // The star acts on the default notebook until the root menu names its own.
+    let second_id = crate::window::library_host::notebooks(window.hwnd)[1].0;
+    crate::window::library_host::set_default_notebook(window.hwnd, second_id);
 
     crate::window::side_panel::show_view(window.hwnd, SidebarView::Favorites, true);
     let panel = sidebar_panel(window.hwnd);

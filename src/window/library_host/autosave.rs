@@ -110,13 +110,21 @@ pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
 
 /// Before the window closes: save every eligible dirty tab. Failures fall back to the prompt.
 pub(crate) fn autosave_all(hwnd: HWND) {
+    if let Some(id) = default_notebook(hwnd) {
+        autosave_all_of(hwnd, id);
+    }
+}
+
+/// `autosave_all` for the dirty tabs of the notebook `id`.
+pub(crate) fn autosave_all_of(hwnd: HWND, id: NotebookId) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let Some(folder) = folder(hwnd) else {
+    let Some(folder) = notebook_folder(hwnd, id) else {
         return;
     };
-    if !notes_mode(hwnd) || !folder_autosave(hwnd) {
+    let autosave = with_notebook(hwnd, id, |state| state.local.autosave).unwrap_or(false);
+    if !notes_mode(hwnd) || !autosave {
         return;
     }
     let (active, ids): (Option<_>, Vec<_>) = unsafe { app_ptr(hwnd) }
@@ -137,9 +145,9 @@ pub(crate) fn autosave_all(hwnd: HWND) {
             (tabs.active().map(|document| document.id), ids)
         })
         .unwrap_or_default();
-    for id in ids {
+    for document in ids {
         if !identity.is_live_for(hwnd)
-            || !crate::window::main_window::activate_document_by_id(hwnd, id)
+            || !crate::window::main_window::activate_document_by_id(hwnd, document)
         {
             return;
         }

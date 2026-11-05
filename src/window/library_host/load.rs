@@ -114,13 +114,6 @@ pub(crate) fn open_library_step(hwnd: HWND) {
     );
 }
 
-/// Loads (or rescans) the default notebook.
-pub(crate) fn start_load(hwnd: HWND) {
-    if let Some(id) = default_notebook(hwnd) {
-        start_load_of(hwnd, id);
-    }
-}
-
 /// Loads (or rescans) the notebook `id`.
 pub(crate) fn start_load_of(hwnd: HWND, id: NotebookId) {
     spawn_load(hwnd, Some(id), None);

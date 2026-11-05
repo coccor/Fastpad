@@ -1238,18 +1238,17 @@ fn a_palette_rename_and_a_move_turn_the_preview_into_a_normal_tab() {
 }
 
 #[test]
-fn a_load_result_for_a_replaced_notebook_is_dropped() {
-    // Break caught: a load that finishes for a notebook the user has since replaced landing in
-    // the notebook that took its place, because the result is matched to the window rather than
-    // to the notebook it was for (multi-root notebooks spec §3.2).
+fn a_load_result_for_a_closed_notebook_is_dropped() {
+    // Break caught: a load that finishes for a notebook the user has since closed adding a slot
+    // back (or landing in another notebook), because the result is matched to the window rather
+    // than to the notebook it was for (multi-root notebooks spec 3.2).
     use crate::window::library_host::{
-        default_notebook, generations_of, library_ready, notebooks, test_ready_payload, with_state,
+        close_notebook_of, default_notebook, generations_of, library_ready, notebooks,
+        test_ready_payload,
     };
     let _scintilla = load_native_scintilla();
-    let a = LibraryScratch::new("replaced-a");
+    let a = LibraryScratch::new("closed-a");
     a.note("a.md", "a");
-    let b = LibraryScratch::new("replaced-b");
-    b.note("b.md", "b");
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
     app_mut(window.hwnd).library.data_dir = Some(a.data());
@@ -1260,33 +1259,234 @@ fn a_load_result_for_a_replaced_notebook_is_dropped() {
     let state_of_a = crate::library::load(&a.folder(), &local, crate::library::now_unix()).unwrap();
     let stale = test_ready_payload(old_generation, Ok(state_of_a));
 
-    crate::window::library_host::open_folder(window.hwnd, &b.folder());
-    let loaded_b = || {
-        with_state(window.hwnd, |state| {
-            crate::library::model::same_path(&state.folder, &b.folder())
-        })
-        .unwrap_or(false)
-    };
-    pump_until(window.hwnd, loaded_b);
-    let note_paths = || {
-        with_state(window.hwnd, |state| {
-            state
-                .notes
-                .iter()
-                .map(|note| note.path.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-    };
-    let before = note_paths();
-
+    assert!(close_notebook_of(window.hwnd, a_id));
     library_ready(window.hwnd, stale);
 
-    let open: Vec<std::path::PathBuf> = notebooks(window.hwnd)
+    assert!(notebooks(window.hwnd).is_empty(), "no slot came back");
+    assert_eq!(default_notebook(window.hwnd), None);
+}
+
+/// Opens `scratch`'s notebook with `open_folder` and waits until it has loaded and is watched.
+fn open_and_load(window: &ProductionWindow, scratch: &LibraryScratch) -> NotebookId {
+    crate::window::library_host::open_folder(window.hwnd, &scratch.folder());
+    let id = crate::window::library_host::notebooks(window.hwnd)
+        .into_iter()
+        .find(|(_, folder)| crate::library::model::same_path(folder, &scratch.folder()))
+        .map(|(id, _)| id)
+        .expect("the notebook was added");
+    pump_until(window.hwnd, || {
+        crate::window::library_host::with_notebook(window.hwnd, id, |_| ()).is_some()
+            && crate::window::library_host::watching_of(window.hwnd, id)
+    });
+    id
+}
+
+use crate::window::library_host::NotebookId;
+
+fn open_folders(window: &ProductionWindow) -> Vec<std::path::PathBuf> {
+    crate::window::library_host::notebooks(window.hwnd)
         .into_iter()
         .map(|(_, folder)| folder)
-        .collect();
-    assert_eq!(open, [b.folder()]);
-    assert!(loaded_b(), "B is still the loaded notebook");
-    assert_eq!(note_paths(), before, "B's notes are unchanged");
+        .collect()
+}
+
+#[test]
+fn opening_a_second_notebook_adds_a_root_and_keeps_the_first_live() {
+    // Break caught: opening a notebook still replacing the open one, dropping the first's state or
+    // watcher, or handing the default to the newcomer.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("add-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("add-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+
+    let a_id = open_and_load(&window, &a);
+    let b_id = open_and_load(&window, &b);
+
+    assert_eq!(open_folders(&window), [a.folder(), b.folder()]);
+    assert_eq!(
+        crate::window::library_host::default_notebook(window.hwnd),
+        Some(a_id)
+    );
+    for id in [a_id, b_id] {
+        assert!(crate::window::library_host::with_notebook(window.hwnd, id, |_| ()).is_some());
+        assert!(crate::window::library_host::watching_of(window.hwnd, id));
+    }
+    let recorded =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&a.data()));
+    assert_eq!(recorded.open, [a.folder(), b.folder()]);
+    assert_eq!(recorded.default, Some(a.folder()));
+    assert_eq!(recorded.folders[0], b.folder(), "recent, most recent first");
+}
+
+#[test]
+fn opening_the_same_notebook_spelled_differently_reveals_it() {
+    // Break caught: a second slot for a notebook that is already open, or a rescan started by
+    // opening it again.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("same-a");
+    a.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    let a_id = open_and_load(&window, &a);
+    let before = crate::window::library_host::generations_of(window.hwnd, a_id);
+
+    let spelled = format!("{}\\", a.folder().to_string_lossy().to_uppercase());
+    crate::window::library_host::open_folder(window.hwnd, std::path::Path::new(&spelled));
+
+    assert_eq!(open_folders(&window), [a.folder()]);
+    assert_eq!(
+        crate::window::library_host::generations_of(window.hwnd, a_id),
+        before,
+        "no load started"
+    );
+}
+
+#[test]
+fn a_notebook_inside_or_around_an_open_one_is_refused() {
+    // Break caught: nested notebooks, where two roots would own one file.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("nest-a");
+    a.note("a.md", "a");
+    std::fs::create_dir_all(a.folder().join("sub")).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    open_and_load(&window, &a);
+
+    let sub = a.folder().join("sub");
+    crate::window::library_host::open_folder(window.hwnd, &sub);
+    assert_eq!(open_folders(&window), [a.folder()]);
+    assert!(notices(window.hwnd).contains(&format!(
+        "{} is inside the open notebook notes.",
+        sub.display()
+    )));
+
+    crate::window::library_host::open_folder(window.hwnd, &a.root);
+    assert_eq!(open_folders(&window), [a.folder()]);
+    assert!(notices(window.hwnd).contains(&format!(
+        "{} contains the open notebook notes.",
+        a.root.display()
+    )));
+}
+
+#[test]
+fn closing_one_notebook_keeps_its_tabs_and_hands_the_default_on() {
+    // Break caught: closing a notebook closing its tabs, or leaving the default on a notebook
+    // that is gone.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("close-a");
+    let b = LibraryScratch::new("close-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    let note = open_note(&window, &a, "a.md", "a");
+    let a_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    let b_id = open_and_load(&window, &b);
+
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        a_id
+    ));
+
+    assert_eq!(open_folders(&window), [b.folder()]);
+    assert_eq!(
+        crate::window::library_host::default_notebook(window.hwnd),
+        Some(b_id)
+    );
+    assert!(tab_paths(window.hwnd).contains(&Some(note)));
+    let recorded =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&a.data()));
+    assert_eq!(recorded.open, [b.folder()]);
+    assert_eq!(recorded.default, Some(b.folder()));
+}
+
+#[test]
+fn closing_a_notebook_whose_pins_cannot_be_written_keeps_it_open() {
+    // Break caught: closing a notebook while its pending pins cannot be written, which loses
+    // them.
+    use std::os::windows::fs::OpenOptionsExt;
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("close-busy");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    open_note(&window, &a, "a.md", "a");
+    let a_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    let ini = crate::library::store::library_file(&a.folder());
+    crate::library::store::write(&ini, &crate::library::model::Library::default()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&ini)
+        .unwrap();
+
+    let closed = crate::window::library_host::close_notebook_of(window.hwnd, a_id);
+    drop(lock);
+
+    assert!(!closed);
+    assert_eq!(open_folders(&window), [a.folder()]);
+    assert!(
+        notices(window.hwnd).iter().any(|notice| notice
+            .starts_with("FastPad kept this notebook open because it could not save its pins")),
+        "{:?}",
+        notices(window.hwnd)
+    );
+}
+
+#[test]
+fn closing_the_last_notebook_records_open_none() {
+    // Break caught: a closed notebook coming back at the next start.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("close-last");
+    a.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    let a_id = open_and_load(&window, &a);
+    app_mut(window.hwnd).library.changed_only = true;
+
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        a_id
+    ));
+
+    assert!(open_folders(&window).is_empty());
+    let recorded =
+        crate::library::local::read_folders(&crate::library::local::folders_file(&a.data()));
+    assert!(recorded.closed);
+    assert!(!app_mut(window.hwnd).library.changed_only);
+}
+
+#[test]
+fn closing_one_of_two_notebooks_keeps_the_window_wide_changed_filter() {
+    // Break caught: closing one notebook resetting the one filter that covers the others, and
+    // forgetting FastPad's own writes under a notebook that stays open.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("filter-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("filter-b");
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    let a_id = open_and_load(&window, &a);
+    open_and_load(&window, &b);
+    app_mut(window.hwnd).library.changed_only = true;
+    crate::window::library_host::begin_own_writes(window.hwnd, [a.folder().join("a.md").as_path()]);
+    crate::window::library_host::begin_own_writes(window.hwnd, [b.folder().join("b.md").as_path()]);
+
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        a_id
+    ));
+
+    assert!(app_mut(window.hwnd).library.changed_only);
+    assert_eq!(app_mut(window.hwnd).library.own_writes.len(), 1);
 }
