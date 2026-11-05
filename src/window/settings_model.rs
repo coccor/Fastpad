@@ -2,6 +2,7 @@
 //! Pure: no window handles, so the dialog's behaviour is tested without a window.
 
 use crate::config::{FileIconSet, Settings, ThemePreference};
+use crate::preview::ViewMode;
 use crate::window::commands::CommandId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +42,7 @@ pub(crate) enum Row {
     PreviewFont,
     PreviewFontSize,
     PreviewLineHeight,
+    MarkdownView,
     TabWidth,
     InsertSpaces,
     WordWrap,
@@ -54,7 +56,7 @@ pub(crate) enum Row {
 }
 
 impl Row {
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::Theme,
         Self::FileIcons,
         Self::Font,
@@ -62,6 +64,7 @@ impl Row {
         Self::PreviewFont,
         Self::PreviewFontSize,
         Self::PreviewLineHeight,
+        Self::MarkdownView,
         Self::TabWidth,
         Self::InsertSpaces,
         Self::WordWrap,
@@ -83,6 +86,7 @@ impl Row {
             Self::FontSize => "Font size",
             Self::PreviewFontSize => "Preview font size",
             Self::PreviewLineHeight => "Preview line height",
+            Self::MarkdownView => "Markdown view",
             Self::TabWidth => "Tab width",
             Self::InsertSpaces => "Indent with spaces",
             Self::WordWrap => "Word wrap",
@@ -109,7 +113,7 @@ impl Row {
     pub(crate) const fn control(self) -> Control {
         match self {
             Self::Theme | Self::Font | Self::PreviewFont => Control::Dropdown,
-            Self::FileIcons | Self::TabWidth => Control::Segmented,
+            Self::FileIcons | Self::MarkdownView | Self::TabWidth => Control::Segmented,
             Self::FontSize | Self::PreviewFontSize | Self::PreviewLineHeight => Control::Stepper,
             _ => Control::Check,
         }
@@ -188,6 +192,9 @@ pub(crate) const FILE_ICON_CHOICES: [(FileIconSet, &str); 3] = [
     (FileIconSet::Solid, "Solid"),
 ];
 
+/// The Markdown view row's segments: the view Markdown tabs open in (`markdown_view=`).
+pub(crate) const MARKDOWN_VIEW_CHOICES: [ViewMode; 4] = ViewMode::ALL;
+
 pub(crate) const TAB_WIDTH_CHOICES: [u8; 3] = [2, 4, 8];
 
 /// The font size the stepper and the palette's font-size commands keep within.
@@ -202,6 +209,8 @@ const MAX_TYPED_CHARS: usize = 3;
 pub(crate) enum SettingsAction {
     SetTheme(ThemePreference),
     SetFileIcons(FileIconSet),
+    /// The view Markdown tabs open in. Tabs already open keep what they show.
+    SetMarkdownView(ViewMode),
     SetFontFace(String),
     SetPreviewFont(String),
     SetFontSize(u16),
@@ -258,6 +267,13 @@ impl SettingsView {
                     selected: self.settings.file_icons == set,
                 })
                 .collect(),
+            Row::MarkdownView => MARKDOWN_VIEW_CHOICES
+                .iter()
+                .map(|&mode| Segment {
+                    label: mode.label().to_owned(),
+                    selected: self.settings.markdown_view == mode,
+                })
+                .collect(),
             Row::TabWidth => {
                 let width = self.settings.tab_width;
                 let mut segments = TAB_WIDTH_CHOICES
@@ -292,6 +308,9 @@ impl SettingsView {
             Row::FileIcons => FILE_ICON_CHOICES
                 .get(index)
                 .map(|&(set, _)| SettingsAction::SetFileIcons(set)),
+            Row::MarkdownView => MARKDOWN_VIEW_CHOICES
+                .get(index)
+                .map(|&mode| SettingsAction::SetMarkdownView(mode)),
             Row::TabWidth => TAB_WIDTH_CHOICES
                 .get(index)
                 .map(|&width| SettingsAction::SetTabWidth(width)),
@@ -749,8 +768,8 @@ mod tests {
         }
         let sections = Row::ALL.map(Row::section);
         assert_eq!(&sections[..2], [Section::Appearance; 2]);
-        assert_eq!(&sections[2..14], [Section::Editor; 12]);
-        assert_eq!(&sections[14..], [Section::NotesAndSession; 3]);
+        assert_eq!(&sections[2..15], [Section::Editor; 13]);
+        assert_eq!(&sections[15..], [Section::NotesAndSession; 3]);
         for (index, section) in Section::ALL.into_iter().enumerate() {
             assert_eq!(section as usize, index);
         }
@@ -913,6 +932,28 @@ mod tests {
         assert_eq!(view().segments(Row::TabWidth).len(), 3);
         assert_eq!(view().selected_segment(Row::TabWidth), Some(1));
         assert_eq!(view().selected_segment(Row::FileIcons), Some(0));
+    }
+
+    #[test]
+    fn the_markdown_view_row_offers_the_four_modes_and_selects_the_setting() {
+        // Break caught: the row showing a mode other than `markdown_view`, or a segment that
+        // sets a different mode than its label says.
+        let mut view = view();
+        assert_eq!(
+            view.segments(Row::MarkdownView)
+                .iter()
+                .map(|s| s.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Source", "Live", "Split", "Preview"]
+        );
+        assert_eq!(view.selected_segment(Row::MarkdownView), Some(0));
+        view.settings.markdown_view = ViewMode::Split;
+        assert_eq!(view.selected_segment(Row::MarkdownView), Some(2));
+        assert_eq!(
+            view.segment_action(Row::MarkdownView, 1),
+            Some(SettingsAction::SetMarkdownView(ViewMode::Live))
+        );
+        assert_eq!(view.segment_action(Row::MarkdownView, 4), None);
     }
 
     #[test]

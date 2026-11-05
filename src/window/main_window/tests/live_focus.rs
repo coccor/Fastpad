@@ -129,3 +129,40 @@ fn escape_from_preview_returns_to_live_and_its_focus() {
     execute_command(f.window.hwnd, CommandId::MarkdownViewSource);
     assert_eq!(focused(), f.editor.hwnd());
 }
+
+#[test]
+fn a_new_markdown_view_default_reaches_new_tabs_and_leaves_open_ones_alone() {
+    // Break caught: picking Live in Settings flipping every open Markdown tab out of Source, or
+    // the new default not reaching the next Markdown tab opened.
+    use crate::preview::ViewMode;
+    use crate::window::preview_host::group_mode;
+    use crate::window::settings_model::SettingsAction;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let markdown = || {
+        app_mut(window.hwnd)
+            .tabs
+            .set_active_language(Language::Markdown);
+    };
+    markdown();
+    let group = app_mut(window.hwnd).tabs.active_group();
+    assert_eq!(group_mode(window.hwnd, group), ViewMode::Source);
+
+    super::super::apply_settings_action(
+        window.hwnd,
+        SettingsAction::SetMarkdownView(ViewMode::Live),
+    );
+    assert_eq!(app_mut(window.hwnd).settings.markdown_view, ViewMode::Live);
+    assert_eq!(
+        group_mode(window.hwnd, group),
+        ViewMode::Source,
+        "the open tab"
+    );
+
+    execute_command(window.hwnd, CommandId::New);
+    markdown();
+    assert_eq!(group_mode(window.hwnd, group), ViewMode::Live, "a new tab");
+    execute_command(window.hwnd, CommandId::PreviousTab);
+    assert_eq!(group_mode(window.hwnd, group), ViewMode::Source);
+}

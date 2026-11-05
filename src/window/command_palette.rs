@@ -55,10 +55,11 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 165] = [
+pub(crate) const ENTRIES: [PaletteEntry; 166] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Open notebook...", CommandId::OpenFolder),
+    entry("File: New notebook...", CommandId::NewNotebook),
     entry("File: Open recent notebook...", CommandId::OpenRecentFolder),
     entry("Go to note\u{2026}", CommandId::QuickOpen),
     entry("File: Save", CommandId::Save),

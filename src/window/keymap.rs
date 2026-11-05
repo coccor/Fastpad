@@ -180,6 +180,7 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::New, "file.new"),
     (CommandId::Open, "file.open"),
     (CommandId::OpenFolder, "file.openNotebook"),
+    (CommandId::NewNotebook, "file.newNotebook"),
     (CommandId::OpenRecentFolder, "file.openRecentNotebook"),
     (CommandId::QuickOpen, "file.goToNote"),
     (CommandId::Save, "file.save"),

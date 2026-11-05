@@ -413,6 +413,11 @@ pub(crate) fn remember_view(hwnd: HWND, id: GroupId) {
         let editor = app.group(id)?.editor.clone();
         (!app.tabs.document(document)?.is_image()).then_some((document, editor))
     });
+    if let Some((_, editor)) = &shown {
+        // The find highlights belong to the bar's query in the shown document; a document left
+        // behind must not keep them. The next document's are drawn by its own recount.
+        let _ = editor.clear_find_matches();
+    }
     if let Some((document, editor)) = shown
         && let Ok(state) = editor.view_state()
         && let Some(mut app) = unsafe { app_ptr(hwnd) }

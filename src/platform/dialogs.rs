@@ -10,8 +10,8 @@ use windows_sys::Win32::System::Com::{
     CoTaskMemFree, CoUninitialize,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog,
-    SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, FileOpenDialog,
+    FileSaveDialog, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
 };
 use windows_sys::core::{GUID, HRESULT};
 
@@ -47,8 +47,8 @@ struct FileDialogVtable {
     // and the #[cfg(test)] Open dialog test seam calls it only under `#[cfg(test)]` at the call site.
     set_file_name: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
     get_file_name: usize,
-    set_title: usize,
-    set_ok_button_label: usize,
+    set_title: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    set_ok_button_label: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
     set_file_name_label: usize,
     get_result: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
 }
@@ -203,6 +203,33 @@ pub fn show_save_dialog(
     suggested_name: &str,
     folder: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
+    run_save_dialog(owner, suggested_name, folder, None)
+}
+
+/// A Save-style dialog that names a folder to create: titled `title`, its OK button reading
+/// `ok_label`, and with no "replace it?" prompt, as nothing is replaced. The folder is not
+/// created here.
+pub fn show_new_folder_dialog(
+    owner: HWND,
+    suggested_name: &str,
+    folder: Option<&Path>,
+    title: &str,
+    ok_label: &str,
+) -> Result<Option<PathBuf>> {
+    run_save_dialog(owner, suggested_name, folder, Some((title, ok_label)))
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `labels` is the title and OK button label of a New folder dialog; `None` is a plain Save As.
+fn run_save_dialog(
+    owner: HWND,
+    suggested_name: &str,
+    folder: Option<&Path>,
+    labels: Option<(&str, &str)>,
+) -> Result<Option<PathBuf>> {
     let _apartment = ComApartment::initialize()?;
     let mut dialog = Interface(std::ptr::null_mut());
     check(unsafe {
@@ -224,12 +251,26 @@ pub fn show_save_dialog(
     // see the shell's standard "this file already exists, replace it?" confirmation before FastPad
     // replaces it. (A colliding path already open in another FastPad tab is rejected separately by
     // `Tabs::set_active_path`, before that file is ever touched.)
-    check(unsafe { (dialog.dialog().set_options)(dialog.0, options | FOS_FORCEFILESYSTEM) })?;
-    let name = suggested_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+    let mut options = options | FOS_FORCEFILESYSTEM;
+    if labels.is_some() {
+        // A new folder replaces nothing; an existing one is the caller's question to ask.
+        options &= !FOS_OVERWRITEPROMPT;
+    }
+    check(unsafe { (dialog.dialog().set_options)(dialog.0, options) })?;
+    #[cfg(test)]
+    let suggested_name = &NEXT_FILE_NAME
+        .with(|value| value.borrow_mut().take())
+        .map_or_else(
+            || suggested_name.to_owned(),
+            |path| path.display().to_string(),
+        );
+    let name = wide(suggested_name);
     check(unsafe { (dialog.dialog().set_file_name)(dialog.0, name.as_ptr()) })?;
+    if let Some((title, ok_label)) = labels {
+        let (title, ok_label) = (wide(title), wide(ok_label));
+        check(unsafe { (dialog.dialog().set_title)(dialog.0, title.as_ptr()) })?;
+        check(unsafe { (dialog.dialog().set_ok_button_label)(dialog.0, ok_label.as_ptr()) })?;
+    }
     // Best-effort: if either call fails, the dialog simply opens where it normally would.
     if let Some(folder) = folder.filter(|folder| folder.is_dir()) {
         let wide_folder = folder
@@ -308,8 +349,9 @@ fn note_event(event: DialogEvent) {
 #[cfg(test)]
 #[allow(
     dead_code,
-    reason = "consumed by the source-linked open_file integration target"
+    reason = "consumed by the source-linked open_file and save_file integration targets"
 )]
+/// The file name the next Open or Save-style dialog starts with, in place of its own.
 pub(crate) fn set_next_open_dialog_filename(path: PathBuf) {
     NEXT_FILE_NAME.with(|value| *value.borrow_mut() = Some(path));
     EVENTS.with(|events| events.borrow_mut().clear());

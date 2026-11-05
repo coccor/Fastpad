@@ -55,6 +55,7 @@ mod links_and_backlinks;
 mod live_focus;
 mod markdown_keys;
 mod menus_and_settings_commands;
+mod new_notebook;
 mod note_attachments;
 mod note_operations;
 mod notebook_tree;

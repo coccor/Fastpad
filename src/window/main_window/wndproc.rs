@@ -804,6 +804,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {
         let _ = editor.remeasure_line_numbers();
         crate::window::live_host::refresh_appearance(hwnd);
+        super::chrome::invalidate_status_bar(hwnd);
         return;
     }
     // Every editor showing the document reports each change: its group's Live view follows.

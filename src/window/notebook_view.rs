@@ -96,7 +96,8 @@ const TOOL_TOGGLE_FOLDERS: usize = 8;
 /// What the view shows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
-    /// No notebook: "Open a notebook to see its notes.", a button and the RECENT list.
+    /// No notebook: "Open a notebook to see its notes.", "Open notebook…", "New notebook…" and
+    /// the RECENT list.
     NoNotebook,
     /// A notebook is open but its state has not arrived from the worker.
     Loading,
@@ -152,7 +153,8 @@ enum Hit {
     Header(HeaderButton),
     /// "Open notebook…" (no notebook), "New note" (empty notebook) or "Retry" (failed load).
     StateButton,
-    /// "Open notebook…" under "Retry", after a failed load.
+    /// "New notebook…" under "Open notebook…" (no notebook), or "Open notebook…" under "Retry"
+    /// (failed load).
     SecondButton,
     /// The scroll thumb, with where on it the press landed.
     Thumb(i32),
@@ -224,7 +226,7 @@ pub(crate) fn row_parts(row: RECT, depth: u16, dpi: u32) -> RowParts {
 pub(crate) struct StateLayout {
     pub message: RECT,
     pub button: RECT,
-    /// "Open notebook…" under "Retry", in the failed state.
+    /// "New notebook…" (no notebook) or "Open notebook…" (failed load) under `button`.
     pub second: RECT,
     /// "RECENT", in the no-notebook state.
     pub label: RECT,
@@ -254,11 +256,12 @@ pub(crate) fn state_layout(body: RECT, dpi: u32) -> StateLayout {
         bottom: button.bottom + scale_text(8, dpi) + (button.bottom - button.top),
         ..button
     };
+    // RECENT is painted only with no notebook, under both of its buttons.
     let label = RECT {
         left,
-        top: button.bottom + scale_text(16, dpi),
+        top: second.bottom + scale_text(16, dpi),
         right,
-        bottom: button.bottom + scale_text(36, dpi),
+        bottom: second.bottom + scale_text(36, dpi),
     };
     let list = RECT {
         left: body.left,

@@ -421,6 +421,8 @@ fn notices(main: &TestMain) -> Vec<String> {
 
 /// Drives a Save/Save As command and immediately cancels the native dialog.
 fn cancel_save_dialog(owner: HWND, command: CommandId) {
+    // This helper deliberately drives the real Save As dialog; other tests must queue an answer.
+    let _real_dialogs = window::allow_real_dialogs();
     let pid = std::process::id();
     let driver = std::thread::spawn(move || {
         let dialog = wait_dialog(pid);
@@ -615,4 +617,57 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn new_notebook_shows_a_create_dialog_and_opens_the_folder_it_names() {
+    // Break caught: the dialog titled or labelled as Save As, a "replace it?" prompt for a
+    // folder that does not exist yet, or the named folder not created and opened.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, IDOK};
+    fn text(hwnd: HWND) -> String {
+        let mut buffer = [0u16; 128];
+        let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+        String::from_utf16_lossy(&buffer[..len as usize])
+    }
+    let scratch = ScratchDir::new("new-notebook");
+    let target = scratch.path().join("Recipes");
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    // The name goes in through IFileDialog::SetFileName, as a typed one would be read back.
+    platform::dialogs::set_next_open_dialog_filename(target.clone());
+    let pid = std::process::id();
+    let driver = std::thread::spawn(move || {
+        let dialog = wait_dialog(pid);
+        let ok = unsafe { GetDlgItem(dialog, IDOK) };
+        let seen = (text(dialog), text(ok));
+        // A click that lands before the dialog has installed its name is dropped: press again
+        // until it closes.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut next_click = Instant::now();
+        while unsafe { IsWindow(dialog) } != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                let other = wait_dialog(pid);
+                let found = (text(other), other == dialog);
+                unsafe { PostMessageW(GetDlgItem(dialog, IDCANCEL), BM_CLICK, 0, 0) };
+                panic!("Create did not close the dialog {seen:?}; top dialog {found:?}");
+            }
+            if now >= next_click {
+                unsafe { PostMessageW(ok, BM_CLICK, 0, 0) };
+                next_click = now + Duration::from_millis(500);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        seen
+    });
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::NewNotebook as usize, 0);
+    }
+    let (title, ok) = driver.join().unwrap();
+
+    assert_eq!(title, "New notebook");
+    assert_eq!(ok, "Create");
+    assert!(target.is_dir(), "{:?}", notices(&main));
+    let opened = window::library_host::folder(main.hwnd).unwrap();
+    assert_eq!(opened.file_name(), target.file_name());
 }

@@ -406,6 +406,8 @@ fn apply_chrome_colors_to(editor: &Editor, palette: Palette, highlight_current_l
     );
     // Wikilinks are underlined in the accent color (second brain phase 1 spec §7.3).
     let _ = editor.set_link_color(palette.accent);
+    // Find matches are shaded in the accent color too, the current one more strongly.
+    let _ = editor.set_find_highlight_color(palette.accent);
 }
 
 /// Every group's editor, the active group's first.

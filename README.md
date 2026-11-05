@@ -175,14 +175,17 @@ typing. Both panes scroll together.
   Copy link address; dropped text lands where you drop it, and a selection can be dragged to move
   it (Ctrl+drag copies). Screen readers see it as editable text. Commands that need the source
   view's own features (multiple cursors, column selection, folding) switch back to it with a
-  notice. Set `markdown_view=live` to open Markdown tabs in it.
+  notice. To open Markdown tabs in it, pick **Live** under **Markdown view** in Settings (or set
+  `markdown_view=live`). Tabs already open keep their view; the change applies to tabs you open
+  next.
 
 ### Notes and notebooks
 
 <img src="docs/images/notebook.png" alt="The notebook sidebar with folders and notes, and a note open in the editor" width="800">
 
 Open any folder and it becomes your notebook: a tree in the sidebar, folders as they are on disk,
-pinned notes first. Notes are plain files, so nothing is locked in.
+pinned notes first. Notes are plain files, so nothing is locked in. **File → New notebook…** names
+a new folder and opens it as your notebook in one step.
 
 - **Write fast.** New notes are named inline and save themselves once they're in the notebook.
   Create, rename, move (drag and drop) and delete notes and folders right in the tree.
@@ -445,7 +448,7 @@ line in a notification and applies the rest.
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `capture_hotkey` | A key like `Ctrl+Alt+N`; empty turns it off | `Ctrl+Alt+N` |
 | `capture_source` | `true`/`false`: note the window you were in when you pressed the capture hotkey | `false` |
-| `markdown_view` | `source`, `live`, `split`, `preview`: the view Markdown tabs open in | `source` |
+| `markdown_view` | `source`, `live`, `split`, `preview`: the view Markdown tabs open in (also **Settings > Markdown view**) | `source` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |

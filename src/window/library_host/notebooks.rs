@@ -246,6 +246,58 @@ pub(crate) fn choose_and_open_folder(hwnd: HWND) {
     }
 }
 
+/// File: New notebook…: asks for a folder in a Save-style dialog, starting beside the open
+/// notebook (else in Documents), creates it and opens it as the notebook. Nothing is written
+/// into it. A name that is already a folder is opened after asking; one that is a file, or a
+/// folder that cannot be created, gets a notice and changes nothing.
+pub(crate) fn create_and_open_notebook(hwnd: HWND) {
+    if !notes_mode(hwnd) {
+        push_notice(hwnd, NOTES_MODE_OFF.to_owned());
+        return;
+    }
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let start = folder(hwnd)
+        .and_then(|open| open.parent().map(Path::to_path_buf))
+        .filter(|parent| parent.is_dir())
+        .or_else(|| crate::platform::paths::documents_dir().ok());
+    let choice = crate::window::modal::choose_new_notebook_path(hwnd, start.as_deref());
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    let path = match choice {
+        Ok(Some(path)) => library::normalize_folder(&path),
+        Ok(None) => return,
+        Err(error) => {
+            push_notice(
+                hwnd,
+                format!("FastPad could not open the New notebook dialog: {error}"),
+            );
+            return;
+        }
+    };
+    if path.is_dir() {
+        let question = format!("{} already exists. Open it as a notebook?", path.display());
+        if crate::window::modal::confirm(hwnd, &question, "Open") && identity.is_live_for(hwnd) {
+            open_checked_folder(hwnd, path);
+        }
+        return;
+    }
+    if path.exists() {
+        push_notice(hwnd, format!("{} is a file, not a folder.", path.display()));
+        return;
+    }
+    if let Err(error) = std::fs::create_dir(&path) {
+        push_notice(
+            hwnd,
+            format!("FastPad could not create {}: {error}", path.display()),
+        );
+        return;
+    }
+    open_checked_folder(hwnd, path);
+}
+
 /// The cached `folders.ini`. `read_if_unknown` reads the file when nothing is cached yet: only
 /// for something the user just asked for (a picker), never for painting.
 pub(super) fn known_folders(hwnd: HWND, read_if_unknown: bool) -> library::local::RecentFolders {

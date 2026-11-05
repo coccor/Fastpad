@@ -121,11 +121,19 @@ pub(super) fn choose_save_path(
     if let Some(answer) = SAVE_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return Ok(answer(hwnd));
     }
+    #[cfg(test)]
+    real_dialog_or_panic("choose_save_path", "answer_next_save_dialog");
     crate::window::commands::choose_save_path(hwnd, suggested_name, folder)
 }
 
 pub(super) fn choose_open_path(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
     let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    if let Some(answer) = OPEN_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return Ok(answer(hwnd));
+    }
+    #[cfg(test)]
+    real_dialog_or_panic("choose_open_path", "answer_next_open_dialog");
     crate::window::commands::choose_open_path(hwnd)
 }
 
@@ -135,7 +143,46 @@ pub(crate) fn choose_folder(hwnd: HWND) -> crate::Result<Option<PathBuf>> {
     if let Some(answer) = FOLDER_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return Ok(answer(hwnd));
     }
+    #[cfg(test)]
+    real_dialog_or_panic("choose_folder", "answer_next_folder_dialog");
     crate::window::commands::choose_folder_path(hwnd)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALLOW_REAL_DIALOGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lets this thread's modal choosers open the real Windows dialogs again until the guard drops.
+/// Only for tests that drive the native dialog through automation.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "used by the in_process open_file test, not by the lib window tests"
+)]
+pub(crate) fn allow_real_dialogs() -> RealDialogsGuard {
+    ALLOW_REAL_DIALOGS.with(|allow| allow.set(true));
+    RealDialogsGuard
+}
+
+#[cfg(test)]
+pub(crate) struct RealDialogsGuard;
+
+#[cfg(test)]
+impl Drop for RealDialogsGuard {
+    fn drop(&mut self) {
+        ALLOW_REAL_DIALOGS.with(|allow| allow.set(false));
+    }
+}
+
+/// A real file or folder dialog blocks forever in an unattended test run, so tests must queue an
+/// answer instead of falling through to one.
+#[cfg(test)]
+fn real_dialog_or_panic(function: &str, seam: &str) {
+    if ALLOW_REAL_DIALOGS.with(std::cell::Cell::get) {
+        return;
+    }
+    panic!("{function} reached the real dialog in a test; queue an answer with {seam} first")
 }
 
 /// Themed two-button confirmation: `action` is the primary button, Cancel the other. Returns
@@ -212,12 +259,29 @@ thread_local! {
     static LAST_CHOICE: std::cell::RefCell<Option<(String, Vec<String>)>> =
         const { std::cell::RefCell::new(None) };
 }
+/// The New notebook dialog, starting in `folder`: the path of the folder to create, or `None`
+/// for Cancel.
+pub(crate) fn choose_new_notebook_path(
+    hwnd: HWND,
+    folder: Option<&std::path::Path>,
+) -> crate::Result<Option<PathBuf>> {
+    let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    LAST_NEW_NOTEBOOK_START.with(|last| *last.borrow_mut() = folder.map(|f| f.to_path_buf()));
+    #[cfg(test)]
+    if let Some(answer) = NEW_NOTEBOOK_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return Ok(answer(hwnd));
+    }
+    crate::window::commands::choose_new_notebook_path(hwnd, folder)
+}
 
 #[cfg(test)]
 type Answer<T> = Box<dyn FnOnce(HWND) -> T>;
 
 #[cfg(test)]
 thread_local! {
+    static OPEN_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<Option<PathBuf>>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static CLOSE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<CloseDecision>>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static SAVE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<Option<PathBuf>>>> =
@@ -226,6 +290,10 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static CONFIRM_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<bool>>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static NEW_NOTEBOOK_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<Option<PathBuf>>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static LAST_NEW_NOTEBOOK_START: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
     static LAST_SAVE_REQUEST: std::cell::RefCell<Option<(String, Option<PathBuf>)>> =
         const { std::cell::RefCell::new(None) };
     static LAST_CONFIRM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -275,10 +343,38 @@ pub(crate) fn answer_next_save_dialog(answer: impl FnOnce(HWND) -> Option<PathBu
     SAVE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }
 
+/// Answers the next Open dialog from inside its modal scope; `None` is Cancel.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn answer_next_open_dialog(answer: impl FnOnce(HWND) -> Option<PathBuf> + 'static) {
+    OPEN_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
 /// Answers the next folder picker from inside its modal scope; `None` is Cancel.
 #[cfg(test)]
 pub(crate) fn answer_next_folder_dialog(answer: impl FnOnce(HWND) -> Option<PathBuf> + 'static) {
     FOLDER_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// Answers the next New notebook dialog from inside its modal scope; `None` is Cancel.
+#[cfg(test)]
+pub(crate) fn answer_next_new_notebook_dialog(
+    answer: impl FnOnce(HWND) -> Option<PathBuf> + 'static,
+) {
+    NEW_NOTEBOOK_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// The folder the last New notebook dialog started in.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn take_last_new_notebook_start() -> Option<PathBuf> {
+    LAST_NEW_NOTEBOOK_START.with(|last| last.borrow_mut().take())
 }
 
 /// Answers the next OK/Cancel confirmation from inside its modal scope.
@@ -422,5 +518,13 @@ mod tests {
         assert_eq!(decision, CloseDecision::Cancel);
         assert_ne!(quit, 0, "WM_QUIT re-posted for the outer loop");
         assert_eq!(message.message, WM_QUIT);
+    }
+
+    #[test]
+    #[should_panic(expected = "choose_folder reached the real dialog in a test")]
+    fn choosing_a_folder_with_no_queued_answer_panics_instead_of_blocking() {
+        // Break caught: a test with no queued FOLDER_ANSWERS falling through to the real
+        // IFileOpenDialog, which hangs the run forever.
+        let _ = choose_folder(std::ptr::null_mut());
     }
 }
