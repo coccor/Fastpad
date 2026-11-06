@@ -282,7 +282,10 @@ fn closing_the_notebook_saves_its_notes_keeps_the_tabs_and_is_remembered_as_clos
         app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
         Some(path.as_path())
     );
-    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert_eq!(
+        crate::window::library_host::default_folder(window.hwnd),
+        None
+    );
     assert!(app_mut(window.hwnd).library.default_state().is_none());
     let folders =
         crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
@@ -404,7 +407,7 @@ fn opening_a_listed_notebook_that_is_missing_says_so_and_changes_nothing() {
     });
 
     assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
+        crate::window::library_host::default_folder(window.hwnd),
         Some(scratch.folder())
     );
     assert!(app_mut(window.hwnd).library.default_state().is_some());
@@ -440,7 +443,7 @@ fn opening_a_listed_notebook_switches_once_the_worker_finds_it() {
     pump_until(window.hwnd, || roots().len() == 2);
     assert_eq!(roots(), [first.folder(), second.folder()]);
     assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
+        crate::window::library_host::default_folder(window.hwnd),
         Some(first.folder()),
         "the first notebook stays the default"
     );
@@ -475,7 +478,7 @@ fn a_stale_listed_notebook_check_is_dropped_once_the_user_has_moved_on() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
+        crate::window::library_host::default_folder(window.hwnd),
         None,
         "a check that started before Close notebook must not reopen the notebook"
     );
@@ -483,7 +486,7 @@ fn a_stale_listed_notebook_check_is_dropped_once_the_user_has_moved_on() {
     // A later, non-stale listed open still works normally.
     crate::window::library_host::open_listed_notebook(window.hwnd, &fresh.folder());
     pump_until(window.hwnd, || {
-        crate::window::library_host::folder(window.hwnd) == Some(fresh.folder())
+        crate::window::library_host::default_folder(window.hwnd) == Some(fresh.folder())
     });
 }
 

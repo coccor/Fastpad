@@ -26,18 +26,23 @@ fn the_notice_explains_an_empty_list() {
 fn the_placeholder_says_it_searches_text_in_the_open_notebook() {
     // Break caught: the box saying "Search" with no hint that it searches the notes' text,
     // or of which notebook.
+    assert_eq!(placeholder(Some("Work")), "Search text in Work");
     assert_eq!(
-        placeholder(Some(Path::new(r"C:\Users\me\Work"))),
-        "Search text in Work"
+        placeholder(Some("all notebooks")),
+        "Search text in all notebooks"
     );
     assert_eq!(placeholder(None), "Search text");
 }
 
 #[test]
 fn the_header_names_the_notebook_it_searches() {
-    // Break caught: with several notebooks open, nothing saying which one Search covers
-    // (multi-root notebooks spec §5.3).
+    // Break caught: with several notebooks open, nothing saying what Search covers (multi-root
+    // search spec §4.1).
     assert_eq!(header_text(Some("Work")), "Searching Work");
+    assert_eq!(
+        header_text(Some("all notebooks")),
+        "Searching all notebooks"
+    );
     assert_eq!(header_text(None), "Search");
 }
 
@@ -129,12 +134,17 @@ fn a_result_reads_its_name_folder_and_snippet() {
         stamp: None,
     };
     assert_eq!(
-        result_name(&hit("work")),
+        result_name(&hit("work"), "work"),
         "Q1 budget, work: \u{2026}paid the invoice march 3\u{2026}"
     );
     assert_eq!(
-        result_name(&hit("")),
+        result_name(&hit(""), ""),
         "Q1 budget: \u{2026}paid the invoice march 3\u{2026}"
+    );
+    assert_eq!(
+        result_name(&hit("work"), "Work › work"),
+        "Q1 budget, Work › work: \u{2026}paid the invoice march 3\u{2026}",
+        "several notebooks: the row's notebook too"
     );
 }
 
@@ -229,9 +239,10 @@ fn hit(name: &str, folder: &str) -> TextHit {
 }
 
 fn batch(hits: Vec<TextHit>, visited: usize, end: Option<RunEnd>) -> SearchBatch {
+    let one = crate::window::library_host::NotebookId(1);
     SearchBatch {
         generation: 1,
-        hits,
+        hits: hits.into_iter().map(|hit| (one, hit)).collect(),
         progress: Progress {
             visited,
             total: 10,
@@ -450,7 +461,7 @@ fn replace_all_waits_for_a_finished_search_with_results() {
     // Break caught: Replace all pressable while results stream in (the list and its stamps
     // aren't final), after a pattern error, or with nothing listed (spec §11).
     let mut view = SearchView::new(std::ptr::null_mut(), 96);
-    view.notebook = Some(PathBuf::from(r"C:\notes"));
+    view.open = true;
     view.loaded = true;
     assert!(!view.replace_all_enabled(), "idle");
     view.begin("needle", 10);
@@ -591,23 +602,39 @@ fn tab_cycles_the_box_the_replace_field_and_the_results_and_wraps() {
     // empty result list, or Shift+Tab not the exact reverse.
     use FocusStop::{Box, Replace, Results};
     // The replace field open, results listed: Box -> Replace -> Results -> Box.
-    assert_eq!(next_stop(Box, false, true, true), Replace);
-    assert_eq!(next_stop(Replace, false, true, true), Results);
-    assert_eq!(next_stop(Results, false, true, true), Box);
-    assert_eq!(next_stop(Box, true, true, true), Results);
-    assert_eq!(next_stop(Results, true, true, true), Replace);
-    assert_eq!(next_stop(Replace, true, true, true), Box);
+    assert_eq!(next_stop(Box, false, true, true, false), Replace);
+    assert_eq!(next_stop(Replace, false, true, true, false), Results);
+    assert_eq!(next_stop(Results, false, true, true, false), Box);
+    assert_eq!(next_stop(Box, true, true, true, false), Results);
+    assert_eq!(next_stop(Results, true, true, true, false), Replace);
+    assert_eq!(next_stop(Replace, true, true, true, false), Box);
     // The replace field closed: Box <-> Results.
-    assert_eq!(next_stop(Box, false, false, true), Results);
-    assert_eq!(next_stop(Results, false, false, true), Box);
-    assert_eq!(next_stop(Box, true, false, true), Results);
-    assert_eq!(next_stop(Results, true, false, true), Box);
+    assert_eq!(next_stop(Box, false, false, true, false), Results);
+    assert_eq!(next_stop(Results, false, false, true, false), Box);
+    assert_eq!(next_stop(Box, true, false, true, false), Results);
+    assert_eq!(next_stop(Results, true, false, true, false), Box);
     // No results: the fields only, or the box stays put alone.
-    assert_eq!(next_stop(Box, false, true, false), Replace);
-    assert_eq!(next_stop(Replace, false, true, false), Box);
-    assert_eq!(next_stop(Replace, true, true, false), Box);
-    assert_eq!(next_stop(Box, false, false, false), Box);
-    assert_eq!(next_stop(Box, true, false, false), Box);
+    assert_eq!(next_stop(Box, false, true, false, false), Replace);
+    assert_eq!(next_stop(Replace, false, true, false, false), Box);
+    assert_eq!(next_stop(Replace, true, true, false, false), Box);
+    assert_eq!(next_stop(Box, false, false, false, false), Box);
+    assert_eq!(next_stop(Box, true, false, false, false), Box);
+}
+
+#[test]
+fn tab_reaches_the_scope_button_while_it_shows() {
+    // Break caught: a scope button keyboard users can't reach (multi-root search spec §4.1).
+    use FocusStop::{Box, Replace, Results, Scope};
+    assert_eq!(next_stop(Results, false, true, true, true), Scope);
+    assert_eq!(next_stop(Scope, false, true, true, true), Box);
+    assert_eq!(next_stop(Box, true, true, true, true), Scope);
+    assert_eq!(next_stop(Scope, true, true, true, true), Results);
+    assert_eq!(next_stop(Replace, false, true, false, true), Scope);
+    assert_eq!(
+        next_stop(Results, false, true, true, false),
+        Box,
+        "hidden: skipped"
+    );
 }
 
 #[test]

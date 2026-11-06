@@ -535,7 +535,7 @@ fn with_no_notebook_open_the_picker_shows_one_row_that_cannot_be_picked() {
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
-    assert!(crate::window::library_host::folder(window.hwnd).is_none());
+    assert!(crate::window::library_host::default_folder(window.hwnd).is_none());
 
     execute_command(window.hwnd, CommandId::QuickOpen);
     let rows = || with_command_palette(window.hwnd, |p| p.shown_picker_rows().to_vec()).unwrap();
@@ -633,7 +633,7 @@ fn a_note_removed_from_the_library_after_listing_reports_it_and_opens_nothing() 
     execute_command(window.hwnd, CommandId::QuickOpen);
     type_query(window.hwnd, "gam");
     assert_eq!(quick_open_names(window.hwnd), ["gamma.md"]);
-    crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&gamma));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.remove_note(&gamma));
     std::fs::remove_file(&gamma).unwrap();
     press_enter_in_palette(window.hwnd);
 
@@ -749,25 +749,114 @@ fn the_target_is_the_selected_row_then_the_active_tab_then_the_default() {
     assert_eq!(open, [ab.a_id], "B closed, A stays open");
 }
 
+/// The quick-open rows as their accessible labels ("name, in folder").
+fn quick_open_labels(hwnd: HWND) -> Vec<String> {
+    with_command_palette(hwnd, |palette| {
+        let picker = palette.picker().unwrap().clone();
+        palette
+            .shown_picker_rows()
+            .iter()
+            .map(|row| crate::window::command_palette::picker_row_label(&picker, row))
+            .collect()
+    })
+    .unwrap()
+}
+
 #[test]
-fn quick_open_lists_the_target_notebook_and_names_it() {
-    // Break caught: Quick Open listing the default notebook's notes while a note of another
-    // notebook is in front, or not saying which notebook it searches.
+fn quick_open_lists_every_notebook_and_labels_rows() {
+    // Break caught: Quick Open listing only the target notebook (multi-root search spec §5), rows
+    // that don't say which notebook they're in, or a pick opened under the wrong folder.
     let _scintilla = load_native_scintilla();
-    let ab = notebooks_a_and_b("quick-open-target", "a", "b");
+    let ab = notebooks_a_and_b("quick-open-all", "a", "b");
     let hwnd = ab.window.hwnd;
-    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    std::fs::create_dir_all(ab.b.join("sub")).unwrap();
+    std::fs::write(ab.b.join("sub").join("x.md"), "x").unwrap();
+    pump_until(hwnd, || {
+        crate::window::library_host::with_notebook(hwnd, ab.b_id, |state| {
+            state.notes.iter().any(|note| note.path.ends_with("x.md"))
+        })
+        .unwrap_or(false)
+    });
 
     execute_command(hwnd, CommandId::QuickOpen);
     assert_eq!(
         with_command_palette(hwnd, |p| p.placeholder().map(str::to_owned)).flatten(),
-        Some("Search notes in B".to_owned())
-    );
-    assert_eq!(
-        quick_open_names(hwnd),
-        ["b.md"],
-        "the open tab, a note of B"
+        Some("Search notes in all notebooks".to_owned())
     );
     type_query(hwnd, "md");
-    assert_eq!(quick_open_names(hwnd), ["b.md"]);
+    let labels = quick_open_labels(hwnd);
+    assert!(labels.contains(&"a.md, in A".to_owned()), "{labels:?}");
+    assert!(labels.contains(&"b.md, in B".to_owned()), "{labels:?}");
+    assert!(
+        labels.contains(&"x.md, in B › sub".to_owned()),
+        "{labels:?}"
+    );
+
+    type_query(hwnd, "b.md");
+    assert_eq!(quick_open_labels(hwnd)[0], "b.md, in B");
+    press_enter_in_palette(hwnd);
+    assert_eq!(active_path(hwnd), Some(ab.b.join("b.md")));
+}
+
+#[test]
+fn quick_open_empty_query_lists_tabs_from_both() {
+    // Break caught: the open-tabs list still limited to the target notebook.
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("quick-open-tabs", "a", "b");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    execute_command(hwnd, CommandId::QuickOpen);
+    let mut names = quick_open_names(hwnd);
+    names.sort();
+    assert_eq!(names, ["a.md", "b.md"]);
+}
+
+#[test]
+fn quick_open_while_the_notebook_loads_says_no_notebook_is_open_never() {
+    // Break caught (final review): Ctrl+P right after startup, while the only notebook is still
+    // loading, saying "No notebook is open", which is false and a changed one-notebook string.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-loading");
+    std::fs::write(scratch.folder().join("n.md"), "n").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    ensure_sidebar(window.hwnd);
+    // Opened, but its load's answer is not pumped: it is still loading.
+    crate::window::library_host::open_folder(window.hwnd, &scratch.folder());
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "n.md");
+    let notice = format!(
+        "{:?}",
+        crate::window::command_palette::PickerRow::Notice(
+            crate::window::command_palette::NO_NOTEBOOK
+        )
+    );
+    assert!(
+        !quick_open_names(window.hwnd).contains(&notice),
+        "{:?}",
+        quick_open_names(window.hwnd)
+    );
+}
+
+#[test]
+fn quick_open_with_one_notebook_is_unchanged() {
+    // Break caught: the notebook name leaking into rows or the placeholder with one notebook.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-one");
+    std::fs::write(scratch.folder().join("n.md"), "n").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    ensure_sidebar(window.hwnd);
+    open_and_load_folder(&window, &scratch.folder());
+    let name = crate::window::library_host::notebook_name(&scratch.folder());
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    assert_eq!(
+        with_command_palette(window.hwnd, |p| p.placeholder().map(str::to_owned)).flatten(),
+        Some(format!("Search notes in {name}"))
+    );
+    type_query(window.hwnd, "n.md");
+    assert_eq!(quick_open_labels(window.hwnd), ["n.md"]);
 }

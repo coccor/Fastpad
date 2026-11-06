@@ -257,7 +257,7 @@ fn typing_waits_for_the_debounce_and_gives_sorted_results_with_the_selection_kep
         .list
         .selected = Some(2);
     let added = scratch.note("a.md", "needle first");
-    crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.add_note(&added));
     let before = search_generation(window.hwnd);
     crate::window::side_panel::refresh(window.hwnd);
     wait_for_search(window.hwnd, before);
@@ -283,6 +283,7 @@ fn a_batch_from_an_older_generation_is_dropped() {
 
     let current = search_generation(window.hwnd);
     let stale = crate::window::text_search_host::test_batch(
+        window.hwnd,
         current.wrapping_sub(1),
         vec![stray_hit("old")],
         None,
@@ -294,6 +295,7 @@ fn a_batch_from_an_older_generation_is_dropped() {
         "dropped when handled directly"
     );
     let stale = crate::window::text_search_host::test_batch(
+        window.hwnd,
         current.wrapping_sub(1),
         vec![stray_hit("older")],
         Some(crate::library::text_search::RunEnd::Completed),
@@ -315,11 +317,17 @@ fn a_batch_from_an_older_generation_is_dropped() {
 
     // A keystroke cancels the running search, so its late batches are stale too.
     type_into_search(window.hwnd, "needles");
-    let late = crate::window::text_search_host::test_batch(current, vec![stray_hit("late")], None);
+    let late = crate::window::text_search_host::test_batch(
+        window.hwnd,
+        current,
+        vec![stray_hit("late")],
+        None,
+    );
     crate::window::text_search_host::batch_arrived(window.hwnd, late);
     assert_eq!(search_rows(window.hwnd), shown);
     // The current generation's batch is the one that shows.
     let now = crate::window::text_search_host::test_batch(
+        window.hwnd,
         search_generation(window.hwnd),
         vec![stray_hit("b")],
         None,
@@ -583,6 +591,7 @@ fn a_rescan_during_a_search_keeps_its_end_from_narrowing_the_next_one() {
     // The rescan lands while that search runs; then its end arrives.
     crate::window::text_search_host::notes_reloaded(window.hwnd);
     let end = crate::window::text_search_host::test_batch(
+        window.hwnd,
         search_generation(window.hwnd),
         Vec::new(),
         Some(crate::library::text_search::RunEnd::Completed),
@@ -637,7 +646,7 @@ fn a_narrowed_search_still_counts_the_notes_the_last_one_skipped() {
     let _editor = install_test_editor(&window);
     scratch.install(window.hwnd);
     let relative = crate::library::record_path(&scratch.folder(), &cloud);
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         for note in state.notes.iter_mut() {
             note.online_only = note.path == relative;
         }
@@ -949,43 +958,316 @@ fn with_no_notebook_the_search_view_says_to_open_one() {
     );
 }
 
-#[test]
-fn search_covers_the_target_notebook_and_names_it() {
-    // Break caught: Search reading the default notebook while a note of another notebook is in
-    // front, or not saying which notebook it searches (multi-root notebooks spec §5.3).
-    let _scintilla = load_native_scintilla();
-    let ab = notebooks_a_and_b("search-target", "alpha needle", "beta needle");
-    let hwnd = ab.window.hwnd;
-    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
-    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true);
+/// A and B, both notes holding "needle", the Search view shown and searched for it.
+fn searched_ab(label: &str) -> NotebooksAB {
+    let ab = notebooks_a_and_b(label, "alpha needle", "beta needle");
+    crate::window::side_panel::show_view(ab.window.hwnd, crate::config::SidebarView::Search, true);
+    search_for(ab.window.hwnd, "needle");
+    ab
+}
 
-    search_for(hwnd, "needle");
-    let rows = search_rows(hwnd);
+/// The listed rows as (name, dim folder text).
+fn labelled_rows(hwnd: HWND) -> Vec<(String, String)> {
+    crate::window::search_view::shown_hits(hwnd)
+        .into_iter()
+        .map(|(name, folder, _)| (name, folder))
+        .collect()
+}
+
+#[test]
+fn search_covers_every_notebook() {
+    // Break caught: Search reading only the target notebook (multi-root search spec §4), rows
+    // that don't say their notebook, or a header naming one notebook.
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-all");
+    let hwnd = ab.window.hwnd;
     assert_eq!(
-        rows.iter()
-            .map(|(_, snippet)| snippet.as_str())
-            .collect::<Vec<_>>(),
-        ["beta needle"],
-        "{rows:?}"
+        labelled_rows(hwnd),
+        [
+            ("a".to_owned(), "A".to_owned()),
+            ("b".to_owned(), "B".to_owned())
+        ]
     );
     assert_eq!(
         crate::window::search_view::shown_header(hwnd),
-        "Searching B"
+        "Searching all notebooks"
     );
+    assert_eq!(
+        crate::window::search_view::placeholder_text(hwnd),
+        "Search text in all notebooks"
+    );
+}
 
-    // Another notebook's note in front: the view now searches that notebook.
+#[test]
+fn switching_tabs_keeps_the_query() {
+    // Break caught: the phase 1 clear-on-switch, losing the query whenever another notebook's
+    // tab comes to the front (spec §4.2).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-switch");
+    let hwnd = ab.window.hwnd;
     super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    assert_eq!(
+        crate::window::search_view::current_query(hwnd).map(|(text, _)| text),
+        Some("needle".to_owned())
+    );
+    assert_eq!(search_rows(hwnd).len(), 2);
+}
+
+#[test]
+fn opening_a_hit_from_b_opens_bs_file() {
+    // Break caught: a hit's relative path joined to the wrong notebook's folder (spec §4.6).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-open-b");
+    let hwnd = ab.window.hwnd;
+    let (_, _, note) = crate::window::search_view::shown_hits(hwnd)
+        .into_iter()
+        .find(|(name, ..)| name == "b")
+        .unwrap();
+    crate::window::main_window::open_search_result(
+        hwnd,
+        &note,
+        crate::window::main_window::OpenMode::Permanent,
+        false,
+    );
+    assert_eq!(active_path(hwnd), Some(ab.b.join("b.md")));
+}
+
+#[test]
+fn same_named_note_in_both_opens_each() {
+    // Break caught: rows deduplicated by relative path across notebooks, or both opening the
+    // same file.
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("search-same-name", "a", "b");
+    let hwnd = ab.window.hwnd;
+    std::fs::write(ab.a.join("todo.md"), "needle").unwrap();
+    std::fs::write(ab.b.join("todo.md"), "needle").unwrap();
+    let listed = |id| {
+        crate::window::library_host::with_notebook(hwnd, id, |state| {
+            state
+                .notes
+                .iter()
+                .any(|note| note.path.ends_with("todo.md"))
+        })
+        .unwrap_or(false)
+    };
+    pump_until(hwnd, || listed(ab.a_id) && listed(ab.b_id));
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true);
+    search_for(hwnd, "needle");
+    let hits = crate::window::search_view::shown_hits(hwnd);
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    for ((_, _, note), folder) in hits.iter().zip([&ab.a, &ab.b]) {
+        crate::window::main_window::open_search_result(
+            hwnd,
+            note,
+            crate::window::main_window::OpenMode::Permanent,
+            false,
+        );
+        assert_eq!(active_path(hwnd), Some(folder.join("todo.md")));
+    }
+}
+
+#[test]
+fn closing_b_drops_its_hits() {
+    // Break caught: a closed notebook's rows left listed, opening into nothing (spec §4.2).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-close-b");
+    let hwnd = ab.window.hwnd;
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    assert_eq!(labelled_rows(hwnd), [("a".to_owned(), String::new())]);
     assert_eq!(
         crate::window::search_view::shown_header(hwnd),
         "Searching A"
     );
-    search_for(hwnd, "needle");
-    let rows = search_rows(hwnd);
+}
+
+#[test]
+fn scope_limits_to_one_notebook() {
+    // Break caught: no way to narrow Search to one notebook, or a scope left pointing at a
+    // notebook that closed (spec §4.1).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope");
+    let hwnd = ab.window.hwnd;
+    let before = search_generation(hwnd);
+    crate::window::search_view::set_scope(hwnd, Some(ab.b_id));
+    wait_for_search(hwnd, before);
+    assert_eq!(labelled_rows(hwnd), [("b".to_owned(), "B".to_owned())]);
     assert_eq!(
-        rows.iter()
-            .map(|(_, snippet)| snippet.as_str())
-            .collect::<Vec<_>>(),
-        ["alpha needle"],
-        "{rows:?}"
+        crate::window::search_view::shown_header(hwnd),
+        "Searching B"
+    );
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    assert_eq!(crate::window::search_view::scope(hwnd), None);
+}
+
+#[test]
+fn opening_a_notebook_reruns_the_query() {
+    // Break caught: a notebook opened after the search left out of its results (spec §4.2).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("search-reopen", "alpha needle", "beta needle");
+    let hwnd = ab.window.hwnd;
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true);
+    search_for(hwnd, "needle");
+    assert_eq!(search_rows(hwnd).len(), 1);
+    open_and_load_folder(&ab.window, &ab.b);
+    pump_until(hwnd, || search_rows(hwnd).len() == 2);
+}
+
+/// The Search view's accessible children's names.
+fn search_children(hwnd: HWND) -> Vec<String> {
+    let panel = sidebar_panel(hwnd);
+    (0..crate::window::side_panel::accessible_item_count(panel))
+        .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+        .map(|item| item.name)
+        .collect()
+}
+
+#[test]
+fn the_scope_button_lists_the_notebooks_and_sets_the_scope() {
+    // Break caught: a scope menu missing a notebook or the current choice's check, a pick that
+    // doesn't narrow the search, or a button screen readers can't name (spec §4.1).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-menu");
+    let hwnd = ab.window.hwnd;
+    assert!(
+        search_children(hwnd).contains(&"Search scope: All notebooks".to_owned()),
+        "{:?}",
+        search_children(hwnd)
+    );
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&offered);
+    crate::window::search_view::answer_next_scope_menu(move |items| {
+        *seen.borrow_mut() = items.to_vec();
+        Some(2)
+    });
+    let before = search_generation(hwnd);
+    crate::window::search_view::click_scope(hwnd);
+    assert_eq!(
+        *offered.borrow(),
+        [
+            ("All notebooks".to_owned(), true),
+            ("A".to_owned(), false),
+            ("B".to_owned(), false)
+        ]
+    );
+    wait_for_search(hwnd, before);
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.b_id));
+    assert_eq!(labelled_rows(hwnd), [("b".to_owned(), "B".to_owned())]);
+    assert!(search_children(hwnd).contains(&"Search scope: B".to_owned()));
+
+    // Dismissed: nothing changes.
+    crate::window::search_view::answer_next_scope_menu(|_| None);
+    crate::window::search_view::click_scope(hwnd);
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.b_id));
+}
+
+#[test]
+fn scope_button_hidden_with_one_notebook() {
+    // Break caught: a scope button offering a choice of one, or the single notebook's header
+    // and placeholder changed (spec §4.1).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-one");
+    let hwnd = ab.window.hwnd;
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    assert!(
+        !search_children(hwnd)
+            .iter()
+            .any(|name| name.starts_with("Search scope")),
+        "{:?}",
+        search_children(hwnd)
+    );
+    assert_eq!(
+        crate::window::search_view::shown_header(hwnd),
+        "Searching A"
+    );
+    assert_eq!(
+        crate::window::search_view::placeholder_text(hwnd),
+        "Search text in A"
+    );
+}
+
+#[test]
+fn the_scope_menu_still_lists_every_notebook_once_scoped() {
+    // Break caught (final review): the menu built from the scoped list, so after picking B
+    // only "All notebooks" and B are offered and A can't be picked directly (spec §4.1).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-relist");
+    let hwnd = ab.window.hwnd;
+    crate::window::search_view::set_scope(hwnd, Some(ab.b_id));
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&offered);
+    crate::window::search_view::answer_next_scope_menu(move |items| {
+        *seen.borrow_mut() = items.to_vec();
+        Some(1)
+    });
+    crate::window::search_view::click_scope(hwnd);
+    assert_eq!(
+        *offered.borrow(),
+        [
+            ("All notebooks".to_owned(), false),
+            ("A".to_owned(), false),
+            ("B".to_owned(), true)
+        ]
+    );
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.a_id));
+}
+
+#[test]
+fn tab_reaches_the_scope_button_and_enter_opens_its_menu() {
+    // Break caught (final review): a scope button only the mouse and screen readers can use
+    // (spec §4.1: Enter or Space when focused).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-keys");
+    let hwnd = ab.window.hwnd;
+    let panel = sidebar_panel(hwnd);
+    let key = |vk: u16| {
+        crate::window::search_view::handle(hwnd, panel, WM_KEYDOWN, usize::from(vk), 0);
+    };
+    crate::window::search_view::focus_results_for_test(hwnd);
+    key(VK_TAB);
+    assert!(crate::window::search_view::scope_focused(hwnd));
+    crate::window::search_view::answer_next_scope_menu(|_| Some(2));
+    key(VK_RETURN);
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.b_id));
+    key(VK_TAB);
+    assert!(
+        !crate::window::search_view::scope_focused(hwnd),
+        "on to the box"
+    );
+}
+
+#[test]
+fn a_batch_carrying_a_closed_notebooks_hits_lists_none_of_them() {
+    // Break caught (final review): a search still running when B closes posting B's hits
+    // afterwards, listed with no notebook to open them in (spec §4.3).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-closed-batch");
+    let hwnd = ab.window.hwnd;
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    let generation = search_generation(hwnd);
+    let late = crate::window::text_search_host::test_batch_in(
+        generation,
+        ab.b_id,
+        vec![stray_hit("late")],
+        None,
+    );
+    crate::window::text_search_host::batch_arrived(hwnd, late);
+    assert!(
+        !search_rows(hwnd).iter().any(|(name, _)| name == "late"),
+        "{:?}",
+        search_rows(hwnd)
     );
 }

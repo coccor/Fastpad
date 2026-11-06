@@ -8,12 +8,11 @@ use crate::window::option_toggles;
 use crate::window::row_list::{self, ListKey};
 use crate::window::text_search_host;
 use crate::window::tooltip::Tooltip;
-use std::path::Path;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::UI::Controls::{EM_SETSEL, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
+    VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, WM_CAPTURECHANGED, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
@@ -25,27 +24,36 @@ pub(super) fn key_down(key: VIRTUAL_KEY) -> bool {
 }
 
 /// Where Tab and Shift+Tab move the caret in the Search view: the search box, the replace field
-/// while it is open, and the results, in that order, wrapping.
+/// while it is open, the results, and the scope button while it shows (multi-root search spec
+/// §4.1), in that order, wrapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FocusStop {
     Box,
     Replace,
     Results,
+    Scope,
 }
 
 /// The stop after `from` (before it with `back`). The replace field is skipped while it is
-/// closed, and the results while there are none.
+/// closed, the results while there are none, and the scope button while it doesn't show.
 pub(super) fn next_stop(
     from: FocusStop,
     back: bool,
     replace_open: bool,
     has_results: bool,
+    scope_shown: bool,
 ) -> FocusStop {
-    let order = [FocusStop::Box, FocusStop::Replace, FocusStop::Results];
+    let order = [
+        FocusStop::Box,
+        FocusStop::Replace,
+        FocusStop::Results,
+        FocusStop::Scope,
+    ];
     let usable = |stop: FocusStop| match stop {
         FocusStop::Box => true,
         FocusStop::Replace => replace_open,
         FocusStop::Results => has_results,
+        FocusStop::Scope => scope_shown,
     };
     let start = order.iter().position(|stop| *stop == from).unwrap_or(0);
     (1..=order.len())
@@ -63,22 +71,22 @@ pub(super) fn next_stop(
 
 /// Opens the selected result, or the first one, as the preview tab or a normal tab.
 pub(crate) fn open_selected(hwnd: HWND, mode: OpenMode, focus_editor: bool) {
-    let Some(path) = with_view(hwnd, |view| {
+    let Some(note) = with_view(hwnd, |view| {
         let index = view.list.selected.unwrap_or(0);
-        view.results.get(index).map(|result| result.path.clone())
+        view.results.get(index).map(SearchHit::note)
     })
     .flatten() else {
         return;
     };
-    open_result(hwnd, &path, mode, focus_editor);
+    open_result(hwnd, &note, mode, focus_editor);
 }
 
-pub(super) fn open_result(hwnd: HWND, relative: &Path, mode: OpenMode, focus_editor: bool) {
+pub(super) fn open_result(hwnd: HWND, note: &NoteRef, mode: OpenMode, focus_editor: bool) {
     // A replace is changing these notes: a result opens again once its report is in.
     if with_view(hwnd, |view| view.replacing).unwrap_or(false) {
         return;
     }
-    crate::window::main_window::open_search_result(hwnd, relative, mode, focus_editor);
+    crate::window::main_window::open_search_result(hwnd, note, mode, focus_editor);
 }
 
 /// Down from the box: the focus moves into the results.
@@ -88,6 +96,7 @@ pub(super) fn enter_results(hwnd: HWND, panel: HWND) {
         if view.results.is_empty() {
             return false;
         }
+        view.scope_focused = false;
         let area = view.list_area(client, dpi);
         let index = view.list.selected.unwrap_or(0);
         view.list.select(index, height(area));
@@ -106,24 +115,33 @@ pub(super) fn enter_results(hwnd: HWND, panel: HWND) {
 /// replace field while it is open, and the results while there are any, wrapping. Focused with
 /// nothing of the App borrowed.
 pub(super) fn cycle_focus(hwnd: HWND, panel: HWND, from: FocusStop, back: bool) {
-    let Some((edit, replace, has_results)) = with_view(hwnd, |view| {
+    let Some((edit, replace, has_results, scope)) = with_view(hwnd, |view| {
         (
             view.edit,
             view.replace_edit.filter(|_| view.replace_open),
             !view.results.is_empty(),
+            view.scope_shown(),
         )
     }) else {
         return;
     };
-    let to = next_stop(from, back, replace.is_some(), has_results);
+    let to = next_stop(from, back, replace.is_some(), has_results, scope);
     if to == from {
         return;
     }
+    with_view(hwnd, |view| view.scope_focused = to == FocusStop::Scope);
     let field = match to {
         FocusStop::Box => edit,
         FocusStop::Replace => replace,
         FocusStop::Results => {
             enter_results(hwnd, panel);
+            return;
+        }
+        FocusStop::Scope => {
+            unsafe {
+                SetFocus(panel);
+            }
+            invalidate(panel);
             return;
         }
     };
@@ -151,16 +169,16 @@ pub(super) fn replace_all_requested(hwnd: HWND) {
 /// A result's replace button, or Ctrl+Shift+1 on the selected result: replaces in that note only
 /// (spec §11). It runs under the same rule as Replace all, while the replace field is open.
 pub(super) fn row_replace_requested(hwnd: HWND, index: usize) {
-    let path = with_view(hwnd, |view| {
+    let note = with_view(hwnd, |view| {
         (view.replace_open && view.replace_all_enabled())
-            .then(|| view.results.get(index).map(|hit| hit.path.clone()))
+            .then(|| view.results.get(index).map(SearchHit::note))
             .flatten()
     })
     .flatten();
-    if let Some(path) = path {
+    if let Some(note) = note {
         #[cfg(test)]
         with_view(hwnd, |view| view.row_replace_requests.push(index));
-        text_search_host::replace_in(hwnd, &path);
+        text_search_host::replace_in(hwnd, &note);
     }
 }
 
@@ -169,9 +187,149 @@ pub(super) fn row_replace_requested(hwnd: HWND, index: usize) {
 pub(crate) fn header_hit(hwnd: HWND, panel: HWND, x: i32, y: i32) -> bool {
     let (client, dpi) = geometry(panel);
     let point = POINT { x, y };
-    with_view(hwnd, |view| view.edit.is_some()).unwrap_or(false)
-        && (inside(SearchView::field_rect(client, dpi), point)
-            || inside(SearchView::chevron_rect(client, dpi), point))
+    let (edit, scope) =
+        with_view(hwnd, |view| (view.edit.is_some(), view.scope_shown())).unwrap_or_default();
+    (scope && inside(SearchView::scope_rect(client, dpi), point))
+        || (edit
+            && (inside(SearchView::field_rect(client, dpi), point)
+                || inside(SearchView::chevron_rect(client, dpi), point)))
+}
+
+/// The scope button (multi-root search spec §4.1): a menu of "All notebooks", a separator, then
+/// each open notebook by label, the current choice checked, under the button. Picking one sets
+/// the scope and runs the query again. Shown with nothing of the App borrowed: the menu runs a
+/// modal loop.
+pub(super) fn scope_menu(hwnd: HWND, panel: HWND) {
+    let Some(scope) = with_view(hwnd, |view| view.scope) else {
+        return;
+    };
+    // Every searchable notebook, not the view's list, which a scope narrows to one.
+    let notebooks = crate::window::library_host::searchable_notebooks(hwnd);
+    let mut items = vec![("All notebooks".to_owned(), scope.is_none())];
+    items.extend(
+        notebooks
+            .iter()
+            .map(|s| (s.label.clone(), scope == Some(s.id))),
+    );
+    // A modal loop, as every menu's: timers that read the tabs wait until it ends.
+    let picked = {
+        let _modal = crate::window::modal::ModalScope::enter(hwnd);
+        choose_scope(hwnd, panel, &items)
+    };
+    let Some(picked) = picked else {
+        return;
+    };
+    let scope = picked
+        .checked_sub(1)
+        .and_then(|index| notebooks.get(index))
+        .map(|s| s.id);
+    set_scope(hwnd, scope);
+}
+
+/// The scope menu under test: answered by `answer_next_scope_menu`, never shown.
+#[cfg(test)]
+fn choose_scope(_hwnd: HWND, _panel: HWND, items: &[(String, bool)]) -> Option<usize> {
+    let answer = SCOPE_ANSWERS
+        .with(|answers| answers.borrow_mut().pop_front())
+        .expect("a test opened the scope menu without queuing an answer");
+    answer(items)
+}
+
+/// Shows the scope menu and returns the index of the item picked (0 for all notebooks), or
+/// `None` when it was dismissed.
+#[cfg(not(test))]
+fn choose_scope(hwnd: HWND, panel: HWND, items: &[(String, bool)]) -> Option<usize> {
+    {
+        use crate::platform::wide_null;
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, DestroyMenu, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+            TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu,
+        };
+        let (client, dpi) = geometry(panel);
+        let button = SearchView::scope_rect(client, dpi);
+        let mut at = POINT {
+            x: button.left,
+            y: button.bottom,
+        };
+        unsafe {
+            ClientToScreen(panel, &mut at);
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return None;
+            }
+            for (index, (label, checked)) in items.iter().enumerate() {
+                let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 };
+                let text = wide_null(label);
+                AppendMenuW(menu, flags, index + 1, text.as_ptr());
+                if index == 0 {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                }
+            }
+            let picked = TrackPopupMenu(
+                menu,
+                TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+                at.x,
+                at.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            );
+            DestroyMenu(menu);
+            usize::try_from(picked).ok()?.checked_sub(1)
+        }
+    }
+}
+
+#[cfg(test)]
+type ScopeAnswer = Box<dyn FnOnce(&[(String, bool)]) -> Option<usize>>;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<ScopeAnswer>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Queues the answer to the next scope menu: given its items as (label, checked), the index
+/// picked or `None` for a dismissed menu.
+#[cfg(test)]
+pub(crate) fn answer_next_scope_menu(
+    answer: impl FnOnce(&[(String, bool)]) -> Option<usize> + 'static,
+) {
+    SCOPE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// Whether the scope button has the keyboard focus, for in-process tests.
+#[cfg(test)]
+pub(crate) fn scope_focused(hwnd: HWND) -> bool {
+    with_view(hwnd, |view| view.scope_focused).unwrap_or(false)
+}
+
+/// Moves the focus into the results, as Down from the box does, for in-process tests.
+#[cfg(test)]
+pub(crate) fn focus_results_for_test(hwnd: HWND) {
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        enter_results(hwnd, panel);
+    }
+}
+
+/// Clicks the scope button, for in-process tests.
+#[cfg(test)]
+pub(crate) fn click_scope(hwnd: HWND) {
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        let (client, dpi) = geometry(panel);
+        let button = SearchView::scope_rect(client, dpi);
+        let x = (button.left + button.right) / 2;
+        let y = (button.top + button.bottom) / 2;
+        handle(
+            hwnd,
+            panel,
+            WM_LBUTTONDOWN,
+            0,
+            ((y as isize) << 16) | (x as isize & 0xFFFF),
+        );
+    }
 }
 
 /// A press on the field's padding, outside the box itself, puts the caret in the box. Reports
@@ -329,6 +487,7 @@ pub(crate) fn handle(
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let at = point(lparam);
+            with_view(hwnd, |view| view.scope_focused = false);
             if let Some(option) = with_view(hwnd, |view| view.toggle_at(at, client, dpi)).flatten()
             {
                 toggle_option(hwnd, option);
@@ -352,6 +511,12 @@ pub(crate) fn handle(
                 Some(HeaderButton::ReplaceAll) => {
                     if pressed {
                         replace_all_requested(hwnd);
+                    }
+                    return Some(0);
+                }
+                Some(HeaderButton::Scope) => {
+                    if pressed {
+                        scope_menu(hwnd, panel);
                     }
                     return Some(0);
                 }
@@ -381,22 +546,22 @@ pub(crate) fn handle(
                 }
                 return Some(0);
             }
-            let path = with_view(hwnd, |view| {
+            let note = with_view(hwnd, |view| {
                 let index = view.row_under(at, client, dpi)?;
                 let area = view.list_area(client, dpi);
                 view.list.select(index, height(area));
-                Some(view.results[index].path.clone())
+                Some(view.results[index].note())
             })
             .flatten();
             invalidate(panel);
-            if let Some(path) = path {
+            if let Some(note) = note {
                 let mode = if message == WM_LBUTTONDBLCLK {
                     OpenMode::Permanent
                 } else {
                     OpenMode::Preview
                 };
                 // A mouse click moves the focus to the editor (spec §6.4).
-                open_result(hwnd, &path, mode, true);
+                open_result(hwnd, &note, mode, true);
             }
             Some(0)
         }
@@ -429,6 +594,24 @@ pub(crate) fn handle(
             let key = wparam as u16;
             let ctrl = key_down(VK_CONTROL);
             let shift = key_down(VK_SHIFT);
+            // The scope button's stop (spec §4.1): Enter or Space opens its menu, Tab moves on,
+            // and any other key goes back to the results.
+            if with_view(hwnd, |view| view.scope_focused).unwrap_or(false) {
+                match key {
+                    VK_TAB if !ctrl => {
+                        cycle_focus(hwnd, panel, FocusStop::Scope, shift);
+                        return Some(0);
+                    }
+                    VK_RETURN | VK_SPACE => {
+                        scope_menu(hwnd, panel);
+                        return Some(0);
+                    }
+                    _ => {
+                        with_view(hwnd, |view| view.scope_focused = false);
+                        invalidate(panel);
+                    }
+                }
+            }
             // Tab and Shift+Tab move on to the search box or the replace field.
             if key == VK_TAB && !ctrl {
                 cycle_focus(hwnd, panel, FocusStop::Results, shift);
@@ -464,6 +647,13 @@ pub(crate) fn handle(
                 view.list.move_selection(movement, height(area))
             });
             invalidate(panel);
+            Some(0)
+        }
+        // Space on the scope button opened its menu: its character types nothing.
+        WM_CHAR
+            if wparam as u32 == 0x20
+                && with_view(hwnd, |view| view.scope_focused).unwrap_or(false) =>
+        {
             Some(0)
         }
         // Typing in the list goes on in the box.

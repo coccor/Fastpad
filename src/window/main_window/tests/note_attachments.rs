@@ -53,7 +53,7 @@ fn a_pasted_image_is_saved_beside_the_notebook_and_linked_at_the_caret_in_one_un
         editor.text().unwrap(),
         "Before ![](../attachments/Atlas%20plan%202026-10-19%20103000.png)after"
     );
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_listed(std::path::Path::new(
             r"attachments\Atlas plan 2026-10-19 103000.png"
         )));

@@ -502,7 +502,7 @@ fn a_metadata_flush_leaves_the_local_file_alone_and_an_expansion_change_writes_i
     assert!(crate::library::store::library_file(&scratch.folder()).exists());
     assert!(!local.exists(), "only library.ini changed");
 
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         state.local.set_expanded(std::path::Path::new("sub"), true);
     });
     crate::window::library_host::flush_now(window.hwnd);
@@ -535,10 +535,13 @@ fn the_library_step_checks_no_folder_on_the_ui_thread_and_a_missing_one_is_skipp
     let before = crate::library::folder_checks();
     crate::window::library_host::open_library_step(window.hwnd);
     assert_eq!(crate::library::folder_checks(), before, "no stat here");
-    assert_eq!(crate::window::library_host::folder(window.hwnd), Some(gone));
+    assert_eq!(
+        crate::window::library_host::default_folder(window.hwnd),
+        Some(gone)
+    );
 
     pump_until(window.hwnd, || {
-        crate::window::library_host::folder(window.hwnd).is_none()
+        crate::window::library_host::default_folder(window.hwnd).is_none()
     });
     assert!(
         notices(window.hwnd)
@@ -570,7 +573,10 @@ fn a_session_that_ended_with_no_notebook_open_opens_none_at_startup() {
     let before = crate::library::folder_checks();
     crate::window::library_host::open_library_step(window.hwnd);
     assert_eq!(crate::library::folder_checks(), before);
-    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert_eq!(
+        crate::window::library_host::default_folder(window.hwnd),
+        None
+    );
     assert!(!app_mut(window.hwnd).library.scanning(), "no worker starts");
 }
 
@@ -581,7 +587,7 @@ fn turning_notes_mode_off_says_so_when_metadata_cannot_be_written_and_closes_the
     let _scintilla = load_native_scintilla();
     let (scratch, window, _editor) = open_first_save_box("mode-off-flush");
     let a = scratch.note("a.md", "a");
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         let mut ids = crate::library::ids::IdSource::new(1, 1);
         let target = state.note_ref(&mut ids, &a);
         state
@@ -676,7 +682,7 @@ fn closing_a_notebook_autosaves_its_notes_and_opening_normalizes_the_new_path() 
     ));
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "two");
     assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
+        crate::window::library_host::default_folder(window.hwnd),
         Some(second.folder())
     );
     let recent =

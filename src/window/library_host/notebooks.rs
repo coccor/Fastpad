@@ -417,7 +417,7 @@ pub(crate) fn recent_notebooks(hwnd: HWND) -> Vec<PathBuf> {
 /// Whether the open notebook is a favorite.
 #[cfg(test)]
 pub(crate) fn is_favorite(hwnd: HWND) -> bool {
-    folder(hwnd).is_some_and(|open| is_favorite_folder(hwnd, &open))
+    default_folder(hwnd).is_some_and(|open| is_favorite_folder(hwnd, &open))
 }
 
 /// Whether the notebook at `folder` is a favorite.

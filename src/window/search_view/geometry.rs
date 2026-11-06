@@ -20,6 +20,39 @@ impl SearchView {
         }
     }
 
+    /// The scope button at the title band's right end (multi-root search spec §4.1): at most
+    /// half the panel wide, its label cut with an ellipsis when it doesn't fit.
+    pub(crate) fn scope_rect(client: RECT, dpi: u32) -> RECT {
+        let header = panel_header(dpi);
+        let height = scale(SCOPE_HEIGHT_AT_96_DPI, dpi).min(header);
+        let right = client.right - scale(GAP_AT_96_DPI, dpi);
+        let width = scale(SCOPE_WIDTH_AT_96_DPI, dpi).min((client.right - client.left) / 2);
+        let top = client.top + (header - height) / 2;
+        RECT {
+            left: right - width,
+            top,
+            right,
+            bottom: top + height,
+        }
+    }
+
+    /// The scope button shows while several notebooks are open.
+    pub(super) fn scope_shown(&self) -> bool {
+        self.several
+    }
+
+    /// The scope button's label: "All notebooks ▾" or "<label> ▾".
+    pub(crate) fn scope_label(&self) -> String {
+        format!("{} \u{25BE}", self.scope_name())
+    }
+
+    /// What the search is limited to, as the scope button and its accessible name say it.
+    pub(super) fn scope_name(&self) -> String {
+        self.scope
+            .and_then(|id| self.notebooks.iter().find(|s| s.id == id))
+            .map_or_else(|| "All notebooks".to_owned(), |s| s.label.clone())
+    }
+
     /// Where the header (the search field's row) begins: under the title band.
     fn header_top(client: RECT, dpi: u32) -> i32 {
         Self::title_rect(client, dpi).bottom
@@ -188,6 +221,9 @@ impl SearchView {
         client: RECT,
         dpi: u32,
     ) -> Option<HeaderButton> {
+        if self.scope_shown() && inside(Self::scope_rect(client, dpi), point) {
+            return Some(HeaderButton::Scope);
+        }
         self.edit?;
         if inside(Self::chevron_rect(client, dpi), point) {
             Some(HeaderButton::Chevron)

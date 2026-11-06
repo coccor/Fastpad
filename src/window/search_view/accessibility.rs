@@ -44,6 +44,9 @@ impl SearchView {
                 head.push(SearchChild::ReplaceAll);
             }
         }
+        if self.scope_shown() {
+            head.push(SearchChild::Scope);
+        }
         let (summary, status) = self.shown_lines();
         if summary.is_some() {
             head.push(SearchChild::Summary);
@@ -220,6 +223,11 @@ impl sidebar_accessibility::AccessibleView for SearchView {
                 self.replace_all_enabled(),
                 SearchView::replace_all_rect(client, dpi),
             ),
+            SearchChild::Scope => sidebar_accessibility::action_item(
+                &format!("Search scope: {}", self.scope_name()),
+                true,
+                SearchView::scope_rect(client, dpi),
+            ),
             SearchChild::RowReplace(row) => {
                 let hit = self.results.get(row)?;
                 let (rect, visible) =
@@ -247,7 +255,7 @@ impl sidebar_accessibility::AccessibleView for SearchView {
                 let (rect, visible) =
                     sidebar_accessibility::row_rect(self.list_area(client, dpi), &self.list, row);
                 sidebar_accessibility::list_item(
-                    &result_name(hit),
+                    &result_name(hit, &hit.shown_folder),
                     self.list.selected == Some(row),
                     focused,
                     rect,
@@ -266,7 +274,9 @@ impl sidebar_accessibility::AccessibleView for SearchView {
             inside(SearchView::row_replace_rect(rect, dpi), point)
         });
         let replace = self.replace_field_shown();
-        let child = if self.box_shown() && inside(field, point) {
+        let child = if self.scope_shown() && inside(SearchView::scope_rect(client, dpi), point) {
+            SearchChild::Scope
+        } else if self.box_shown() && inside(field, point) {
             option_toggles::hit(&option_toggles::toggle_rects(field, dpi), point)
                 .map_or(SearchChild::Box, SearchChild::Toggle)
         } else if self.box_shown() && inside(SearchView::chevron_rect(client, dpi), point) {
@@ -310,13 +320,14 @@ impl sidebar_accessibility::AccessibleView for SearchView {
             SearchChild::Chevron => sidebar_accessibility::identity_of(&"replace toggle"),
             SearchChild::ReplaceField => sidebar_accessibility::identity_of(&"replace field"),
             SearchChild::ReplaceAll => sidebar_accessibility::identity_of(&"replace all"),
+            SearchChild::Scope => sidebar_accessibility::identity_of(&"scope"),
             SearchChild::RowReplace(row) => {
-                sidebar_accessibility::identity_of(&("replace in", &self.results.get(row)?.path))
+                sidebar_accessibility::identity_of(&("replace in", &self.results.get(row)?.note()))
             }
             SearchChild::Summary => sidebar_accessibility::identity_of(&"summary"),
             SearchChild::Status => sidebar_accessibility::identity_of(&"status"),
             SearchChild::Result(row) => {
-                sidebar_accessibility::identity_of(&self.results.get(row)?.path)
+                sidebar_accessibility::identity_of(&self.results.get(row)?.note())
             }
         })
     }

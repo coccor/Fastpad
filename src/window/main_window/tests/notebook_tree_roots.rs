@@ -353,7 +353,7 @@ fn a_refresh_while_search_is_hidden_keeps_its_query() {
     search_for(hwnd, "needle");
     assert_eq!(
         crate::window::search_view::shown_header(hwnd),
-        "Searching B"
+        "Searching all notebooks"
     );
 
     // A stale A row selected while the Notebook view shows, then a refresh.
@@ -369,26 +369,72 @@ fn a_refresh_while_search_is_hidden_keeps_its_query() {
     );
     assert_eq!(
         crate::window::search_view::shown_header(hwnd),
-        "Searching B"
+        "Searching all notebooks"
     );
+    assert_eq!(search_rows(hwnd).len(), 2, "both notebooks' results stay");
+}
+
+/// The notebooks A and B, each with one note tagged `#x`, indexed, with the Tags view shown.
+fn tagged_ab(label: &str) -> NotebooksAB {
+    let ab = notebooks_a_and_b(label, "a #x\n", "b #x\n");
+    let hwnd = ab.window.hwnd;
+    let tagged = |id, path: &str| {
+        crate::window::library_host::note_index_of(hwnd, id)
+            .facts(std::path::Path::new(path))
+            .is_some_and(|facts| !facts.tags.is_empty())
+    };
+    pump_until(hwnd, || tagged(ab.a_id, "a.md") && tagged(ab.b_id, "b.md"));
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, false);
+    crate::window::side_panel::refresh(hwnd);
+    ab
 }
 
 #[test]
-fn showing_the_tags_view_catches_up_with_the_target_notebook() {
-    // Break caught: a refresh while a B row is selected in the tree leaving Tags on "Tags in
-    // B" when it is shown with A's note in front, until some unrelated refresh flips it.
+fn tags_merge_every_notebook() {
+    // Break caught: Tags listing only the target notebook (multi-root search spec §6), a shared
+    // tag listed once per notebook, note rows that don't say their notebook, or a note opened
+    // under the wrong folder.
+    use crate::window::tags_view::{self, TagAction, TagRowKind};
     let _scintilla = load_native_scintilla();
-    let ab = roots_ab("roots-tags-shown");
+    let ab = tagged_ab("roots-tags-merged");
     let hwnd = ab.window.hwnd;
-    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
-    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
-    crate::window::notebook_view::rebuild(hwnd);
-    let b_row = row_in(hwnd, ab.b_id, &RowKind::Note("b.md".into()));
-    notebook_view(hwnd).list.selected = Some(b_row);
-    crate::window::side_panel::refresh(hwnd);
-    assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in B");
+    assert_eq!(tags_view::shown_header(hwnd), "Tags in all notebooks");
+    let rows = tags_view::shown_rows(hwnd);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].name.as_str(), rows[0].count), ("#x", 2));
 
-    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, false);
+    tags_view::test_run(hwnd, TagAction::Toggle("x".to_owned()));
+    let rows = tags_view::shown_rows(hwnd);
+    let notes: Vec<_> = rows
+        .iter()
+        .filter(|row| matches!(row.kind, TagRowKind::Note(_)))
+        .map(|row| (row.name.as_str(), row.detail.as_str()))
+        .collect();
+    assert_eq!(notes, [("a.md", "A"), ("b.md", "B")]);
+    let TagRowKind::Note(b_note) = rows[2].kind.clone() else {
+        panic!("{rows:?}");
+    };
+    tags_view::test_run(
+        hwnd,
+        TagAction::Open {
+            note: b_note,
+            keep: true,
+        },
+    );
+    assert_eq!(active_path(hwnd), Some(ab.b.join("b.md")));
+}
+
+#[test]
+fn tags_refresh_when_a_notebook_closes() {
+    // Break caught: a closed notebook's notes still counted under its tags.
+    let _scintilla = load_native_scintilla();
+    let ab = tagged_ab("roots-tags-close");
+    let hwnd = ab.window.hwnd;
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    let rows = crate::window::tags_view::shown_rows(hwnd);
+    assert_eq!((rows[0].name.as_str(), rows[0].count), ("#x", 1));
     assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in A");
 }
 

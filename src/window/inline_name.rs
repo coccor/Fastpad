@@ -1146,7 +1146,7 @@ pub(crate) fn commit_unchecked(hwnd: HWND, purpose: Purpose, text: &str) {
     let Some(field) = ensure_field(hwnd) else {
         return;
     };
-    let root = library_host::folder(hwnd);
+    let root = library_host::default_folder(hwnd);
     with_inline(hwnd, |inline| {
         inline.begin(purpose, root, String::new(), String::new())
     });

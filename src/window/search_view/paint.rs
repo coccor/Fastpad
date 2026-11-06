@@ -188,17 +188,43 @@ impl SearchView {
         unsafe {
             fill(paint.hdc, client, paint.background);
             let title = Self::title_rect(client, dpi);
+            let scope = self.scope_shown().then(|| Self::scope_rect(client, dpi));
             draw_text(
                 paint.hdc,
                 &self.header(),
                 RECT {
                     left: title.left + scale(TITLE_INSET_AT_96_DPI, dpi),
+                    right: scope.map_or(title.right, |scope| scope.left),
                     ..title
                 },
                 paint.fonts.bold,
                 palette.muted_foreground,
                 line,
             );
+            if let Some(scope) = scope {
+                let hover = self.header_hover == Some(HeaderButton::Scope);
+                if hover {
+                    paint_hover(paint.hdc, scope, &palette, paint.background, dpi);
+                }
+                if self.scope_focused
+                    && windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == self.panel
+                {
+                    crate::window::design::round::paint_focus_ring(paint.hdc, scope, &palette, dpi);
+                }
+                let inset = scale(SCOPE_INSET_AT_96_DPI, dpi);
+                draw_text(
+                    paint.hdc,
+                    &self.scope_label(),
+                    RECT {
+                        left: scope.left + inset,
+                        right: scope.right - inset,
+                        ..scope
+                    },
+                    paint.fonts.text,
+                    button_color(true, hover, palette.editor_foreground, &palette),
+                    line,
+                );
+            }
             if self.edit.is_some() {
                 let field = Self::field_rect(client, dpi);
                 paint_field(paint.hdc, field, &palette, paint.background, dpi);
@@ -380,10 +406,10 @@ impl SearchView {
                 foreground,
                 line | DT_LEFT | DT_END_ELLIPSIS,
             );
-            if !result.folder.is_empty() {
+            if !result.shown_folder.is_empty() {
                 draw_text(
                     hdc,
-                    &result.folder,
+                    &result.shown_folder,
                     RECT {
                         left: text.left + width + scale(GAP_AT_96_DPI, dpi),
                         ..text

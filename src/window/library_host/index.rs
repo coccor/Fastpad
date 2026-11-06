@@ -12,8 +12,10 @@ struct IndexReady {
     index: NoteIndex,
 }
 
-/// The default notebook's index as it stands (empty until the first build lands).
-pub(crate) fn note_index(hwnd: HWND) -> Arc<NoteIndex> {
+/// The default notebook's index as it stands (empty until the first build lands), for tests that
+/// open one notebook.
+#[cfg(test)]
+pub(crate) fn default_note_index(hwnd: HWND) -> Arc<NoteIndex> {
     default_notebook(hwnd)
         .map(|id| note_index_of(hwnd, id))
         .unwrap_or_default()

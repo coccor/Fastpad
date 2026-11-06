@@ -11,6 +11,7 @@ use crate::window::design::round::{
     Corners, fill_bordered, fill_rounded, paint_selection_bar, radius_for,
 };
 use crate::window::design::text_scale::scale_text;
+use crate::window::library_host::NotebookId;
 use crate::window::palette::Palette;
 use crate::window::panel::{create_child, create_panel, fill, inset, text_height};
 use std::cell::Cell;
@@ -405,8 +406,9 @@ pub(crate) struct Picker {
 pub(crate) enum PickerRow {
     Item(usize),
     Create(String),
-    /// A quick-open note, and the line the query's `:<n>` names.
+    /// A quick-open note of the open notebook `notebook`, and the line the query's `:<n>` names.
     Note {
+        notebook: NotebookId,
         found: QuickMatch,
         line: Option<u32>,
     },
@@ -414,9 +416,10 @@ pub(crate) enum PickerRow {
     GoToLine(u32),
     /// A row that can't be picked, such as `NO_NOTEBOOK`.
     Notice(&'static str),
-    /// An empty query's open tab: the note shown in `group`, whose number the row shows while
-    /// there are several groups (split editors spec §7).
+    /// An empty query's open tab: a note of `notebook` shown in `group`, whose number the row
+    /// shows while there are several groups (split editors spec §7).
     View {
+        notebook: NotebookId,
         found: QuickMatch,
         group: crate::window::split_tree::GroupId,
         number: Option<usize>,
@@ -427,14 +430,16 @@ pub(crate) enum PickerRow {
 pub(crate) enum PickerChoice {
     Item(usize),
     Create(String),
-    /// A quick-open note, relative to the notebook.
+    /// A quick-open note, relative to the open notebook `notebook`.
     Note {
+        notebook: NotebookId,
         path: PathBuf,
         line: Option<u32>,
     },
     GoToLine(u32),
-    /// An open tab: the note, relative to the notebook, in `group`.
+    /// An open tab: the note, relative to the open notebook `notebook`, in `group`.
     View {
+        notebook: NotebookId,
         path: PathBuf,
         group: crate::window::split_tree::GroupId,
     },
@@ -987,13 +992,24 @@ impl CommandPalette {
         Some(match row {
             PickerRow::Item(index) => PickerChoice::Item(*index),
             PickerRow::Create(name) => PickerChoice::Create(name.clone()),
-            PickerRow::Note { found, line } => PickerChoice::Note {
+            PickerRow::Note {
+                notebook,
+                found,
+                line,
+            } => PickerChoice::Note {
+                notebook: *notebook,
                 path: found.path.clone(),
                 line: *line,
             },
             PickerRow::GoToLine(line) => PickerChoice::GoToLine(*line),
             PickerRow::Notice(_) => return None,
-            PickerRow::View { found, group, .. } => PickerChoice::View {
+            PickerRow::View {
+                notebook,
+                found,
+                group,
+                ..
+            } => PickerChoice::View {
+                notebook: *notebook,
                 path: found.path.clone(),
                 group: *group,
             },

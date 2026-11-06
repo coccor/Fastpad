@@ -33,6 +33,19 @@ pub struct QuickMatch {
 }
 
 impl QuickMatch {
+    /// The row as listed with several notebooks open (multi-root search spec §3.3): `folder`
+    /// becomes "Label › folder", or "Label" at the root, with `folder_hits` moved past the
+    /// label so they still mark the same letters.
+    pub fn labelled(mut self, label: &str) -> Self {
+        let folder = super::roots::notebook_prefixed(label, &self.folder, true);
+        let shift = folder.chars().count() - self.folder.chars().count();
+        for hit in &mut self.folder_hits {
+            *hit += shift;
+        }
+        self.folder = folder;
+        self
+    }
+
     /// `path` as a row with nothing matched: how the open tabs are listed before anything is
     /// typed. `None` for a path with no file name.
     pub fn plain(path: &Path) -> Option<Self> {
@@ -346,11 +359,14 @@ struct Candidate<'a> {
     name_len: usize,
     name: Cow<'a, str>,
     path: &'a Path,
+    /// The index of the notebook it came from, in the order `search_many` was given them.
+    source: usize,
 }
 
 /// Name matches first, then the higher score, the shorter name, natural name order, natural
-/// folder order (the root first) and the exact path (spec §3.3). The folder is only joined into
-/// a string when a comparison actually reaches it, which for distinct names it rarely does.
+/// folder order (the root first), the notebook's order and the exact path (spec §3.3; multi-root
+/// search spec §3.3). The folder is only joined into a string when a comparison actually
+/// reaches it, which for distinct names it rarely does.
 fn rank(a: &Candidate<'_>, b: &Candidate<'_>) -> Ordering {
     b.all_name
         .cmp(&a.all_name)
@@ -358,6 +374,7 @@ fn rank(a: &Candidate<'_>, b: &Candidate<'_>) -> Ordering {
         .then_with(|| a.name_len.cmp(&b.name_len))
         .then_with(|| natural_cmp(&a.name, &b.name))
         .then_with(|| natural_cmp(&folder_of(a.path), &folder_of(b.path)))
+        .then_with(|| a.source.cmp(&b.source))
         .then_with(|| a.path.cmp(b.path))
 }
 
@@ -371,6 +388,23 @@ pub fn search<'a, P>(
 where
     P: AsRef<Path> + ?Sized + 'a,
 {
+    search_many(vec![((), notes.into_iter().collect())], query, limit)
+        .into_iter()
+        .map(|((), found)| found)
+        .collect()
+}
+
+/// `search` over several notebooks' notes at once (multi-root search spec §5): one ranking
+/// across all of them, at most `limit` in total, each match with the key of the notebook it
+/// came from. Equal matches keep `sources`' order.
+pub fn search_many<'a, K: Copy, P>(
+    sources: Vec<(K, Vec<&'a P>)>,
+    query: &str,
+    limit: usize,
+) -> Vec<(K, QuickMatch)>
+where
+    P: AsRef<Path> + ?Sized + 'a,
+{
     let terms: Vec<Vec<char>> = query
         .split_whitespace()
         .map(|term| term.chars().map(fold).collect())
@@ -378,20 +412,24 @@ where
     if terms.is_empty() || limit == 0 {
         return Vec::new();
     }
+    let keys: Vec<K> = sources.iter().map(|(key, _)| *key).collect();
     let mut scratch = Scratch::default();
     let mut found: Vec<Candidate<'_>> = Vec::new();
-    for path in notes {
-        let path = path.as_ref();
-        let Some((all_name, score, name, name_len)) = scratch.score(&terms, path, None) else {
-            continue;
-        };
-        found.push(Candidate {
-            all_name,
-            score,
-            name_len,
-            name,
-            path,
-        });
+    for (source, (_, notes)) in sources.into_iter().enumerate() {
+        for path in notes {
+            let path = path.as_ref();
+            let Some((all_name, score, name, name_len)) = scratch.score(&terms, path, None) else {
+                continue;
+            };
+            found.push(Candidate {
+                all_name,
+                score,
+                name_len,
+                name,
+                path,
+                source,
+            });
+        }
     }
     // Only the best `limit` need a full sort: one letter can match every note.
     if found.len() > limit {
@@ -409,13 +447,14 @@ where
                 candidate.path,
                 Some((&mut name_hits, &mut folder_hits)),
             );
-            QuickMatch {
+            let found = QuickMatch {
                 path: candidate.path.to_path_buf(),
                 name: candidate.name.into_owned(),
                 folder: folder_of(candidate.path),
                 name_hits,
                 folder_hits,
-            }
+            };
+            (keys[candidate.source], found)
         })
         .collect()
 }
@@ -440,6 +479,56 @@ mod tests {
 
     fn names(matches: &[QuickMatch]) -> Vec<&str> {
         matches.iter().map(|found| found.name.as_str()).collect()
+    }
+
+    #[test]
+    fn search_many_ranks_across_sources_and_breaks_ties_by_source_order() {
+        // Break caught: one notebook's rows always listed before another's whatever their score,
+        // or equal rows ordered by something other than the sidebar.
+        let a = paths(&["ideas.md", r"x\meeting notes.md"]);
+        let b = paths(&["meeting.md", "ideas.md"]);
+        let sources = || vec![(0u32, a.iter().collect()), (1u32, b.iter().collect())];
+        let found = search_many(sources(), "meeting", 50);
+        assert_eq!(found[0].0, 1);
+        assert_eq!(found[0].1.path, PathBuf::from("meeting.md"));
+        let ideas = search_many(sources(), "ideas", 50);
+        assert_eq!(ideas.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn labelled_puts_the_notebook_before_the_folder_and_shifts_its_hits() {
+        // Break caught: highlighted folder letters landing on the notebook name once it is put
+        // in front, or a root note's row without its notebook.
+        let found = &search(&paths(&[r"team\q3.md"]), "tq", 50)[0];
+        assert_eq!(found.folder_hits, [0]);
+        let labelled = found.clone().labelled("Work");
+        assert_eq!(labelled.folder, r"Work › team");
+        assert_eq!(labelled.folder_hits, [7]);
+        assert_eq!(labelled.name_hits, found.name_hits);
+        let root = QuickMatch::plain(Path::new("n.md"))
+            .unwrap()
+            .labelled("Work");
+        assert_eq!(root.folder, "Work");
+    }
+
+    #[test]
+    fn same_path_in_two_notebooks_gives_two_rows() {
+        // Break caught: rows deduplicated by relative path, hiding one notebook's note.
+        let a = paths(&["todo.md"]);
+        let b = paths(&["todo.md"]);
+        let sources = vec![(0u32, a.iter().collect()), (1u32, b.iter().collect())];
+        assert_eq!(search_many(sources, "todo", 50).len(), 2);
+    }
+
+    #[test]
+    fn search_many_caps_the_total() {
+        // Break caught: the row limit applied per notebook, so two notebooks list twice as many.
+        let a: Vec<PathBuf> = (0..40).map(|i| PathBuf::from(format!("n{i}.md"))).collect();
+        let b: Vec<PathBuf> = (0..40)
+            .map(|i| PathBuf::from(format!("n{i}x.md")))
+            .collect();
+        let sources = vec![(0u32, a.iter().collect()), (1u32, b.iter().collect())];
+        assert_eq!(search_many(sources, "n", 50).len(), 50);
     }
 
     #[test]

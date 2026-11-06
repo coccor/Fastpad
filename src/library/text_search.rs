@@ -196,10 +196,43 @@ pub fn run_noting_skipped(
     sink: &mut dyn FnMut(Vec<TextHit>, Progress),
     skipped: &mut Vec<PathBuf>,
 ) -> RunEnd {
+    let mut tagged = Vec::new();
+    let end = run_roots(
+        &[SearchRoot {
+            folder: notebook,
+            notes,
+            overlays,
+        }],
+        matcher,
+        cancel,
+        &mut |hits, progress| sink(untagged(hits), progress),
+        &mut tagged,
+    );
+    skipped.extend(untagged(tagged));
+    end
+}
+
+/// One notebook a search covers (multi-root search spec §4.3): its folder, the notes to read
+/// (relative to it) and its dirty tabs' text by relative path.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchRoot<'a> {
+    pub folder: &'a Path,
+    pub notes: &'a [SearchNote],
+    pub overlays: &'a HashMap<PathBuf, String>,
+}
+
+/// `run` over several notebooks as one search: the readers, the batching and `RESULT_CAP` are
+/// shared, the notebooks are read in `roots`' order, and `Progress` counts every root's notes.
+/// Each hit, and each skipped note pushed onto `skipped`, carries the index of its root.
+pub fn run_roots(
+    roots: &[SearchRoot<'_>],
+    matcher: &Matcher,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(Vec<(usize, TextHit)>, Progress),
+    skipped: &mut Vec<(usize, PathBuf)>,
+) -> RunEnd {
     search_all(
-        notebook,
-        notes,
-        overlays,
+        roots,
         matcher,
         cancel,
         sink,
@@ -207,6 +240,17 @@ pub fn run_noting_skipped(
         skipped,
         reader_count(),
     )
+}
+
+/// A narrowed search may reuse the previous hits only when it covers exactly the same
+/// notebooks, each with the same mark (multi-root search spec §4.4). Marks are keyed by
+/// notebook; their order doesn't matter.
+pub fn marks_match(previous: &[(u32, u64)], current: &[(u32, u64)]) -> bool {
+    previous.len() == current.len() && previous.iter().all(|mark| current.contains(mark))
+}
+
+fn untagged<T>(tagged: Vec<(usize, T)>) -> Vec<T> {
+    tagged.into_iter().map(|(_, item)| item).collect()
 }
 
 /// `run` with the clock and the reader count passed in, so tests can step time and, with one
@@ -227,46 +271,55 @@ fn run_with_clock(
     readers: usize,
 ) -> RunEnd {
     search_all(
-        notebook,
-        notes,
-        overlays,
+        &[SearchRoot {
+            folder: notebook,
+            notes,
+            overlays,
+        }],
         matcher,
         cancel,
-        sink,
+        &mut |hits, progress| sink(untagged(hits), progress),
         clock,
         &mut Vec::new(),
         readers,
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "`run_noting_skipped`'s arguments plus the test clock and reader count"
-)]
 fn search_all(
-    notebook: &Path,
-    notes: &[SearchNote],
-    overlays: &HashMap<PathBuf, String>,
+    roots: &[SearchRoot<'_>],
     matcher: &Matcher,
     cancel: &AtomicBool,
-    sink: &mut dyn FnMut(Vec<TextHit>, Progress),
+    sink: &mut dyn FnMut(Vec<(usize, TextHit)>, Progress),
     clock: &mut dyn FnMut() -> Instant,
-    skipped: &mut Vec<PathBuf>,
+    skipped: &mut Vec<(usize, PathBuf)>,
     readers: usize,
 ) -> RunEnd {
     let cancelled = || cancel.load(Relaxed);
-    let overlays: Vec<(String, &str)> = overlays
+    // Each root's overlays by path key.
+    let overlays: Vec<Vec<(String, &str)>> = roots
         .iter()
-        .map(|(path, text)| (path_key(path), text.as_str()))
+        .map(|root| {
+            root.overlays
+                .iter()
+                .map(|(path, text)| (path_key(path), text.as_str()))
+                .collect()
+        })
         .collect();
     let overlays = overlays.as_slice();
+    // Every note of every root, in the roots' order, with its root's index.
+    let work: Vec<(usize, &SearchNote)> = roots
+        .iter()
+        .enumerate()
+        .flat_map(|(root, entry)| entry.notes.iter().map(move |note| (root, note)))
+        .collect();
+    let work = work.as_slice();
     // The next note a reader takes, and whether the batching loop has stopped (capped or
     // cancelled), so readers don't start another note.
     let next = AtomicUsize::new(0);
     let stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let (sender, outcomes) = mpsc::channel::<(usize, Searched)>();
-        for _ in 0..readers.clamp(1, notes.len().max(1)) {
+        for _ in 0..readers.clamp(1, work.len().max(1)) {
             let sender = sender.clone();
             let (next, stopped) = (&next, &stopped);
             scope.spawn(move || {
@@ -274,10 +327,16 @@ fn search_all(
                 let mut bytes = Vec::new();
                 while !stopped.load(Relaxed) && !cancelled() {
                     let index = next.fetch_add(1, Relaxed);
-                    let Some(note) = notes.get(index) else {
+                    let Some(&(root, note)) = work.get(index) else {
                         break;
                     };
-                    let outcome = search_note(notebook, note, overlays, matcher, &mut bytes);
+                    let outcome = search_note(
+                        roots[root].folder,
+                        note,
+                        &overlays[root],
+                        matcher,
+                        &mut bytes,
+                    );
                     if sender.send((index, outcome)).is_err() {
                         break;
                     }
@@ -286,7 +345,7 @@ fn search_all(
         }
         // The loop below ends when every reader has finished and dropped its sender.
         drop(sender);
-        let end = batch_outcomes(notes, outcomes, &cancelled, sink, clock, skipped);
+        let end = batch_outcomes(work, outcomes, &cancelled, sink, clock, skipped);
         stopped.store(true, Relaxed);
         end
     })
@@ -295,15 +354,15 @@ fn search_all(
 /// The batching loop: counts each note's outcome as the readers send it, and sends batches,
 /// honoring the cap and `cancelled`.
 fn batch_outcomes(
-    notes: &[SearchNote],
+    work: &[(usize, &SearchNote)],
     outcomes: mpsc::Receiver<(usize, Searched)>,
     cancelled: &dyn Fn() -> bool,
-    sink: &mut dyn FnMut(Vec<TextHit>, Progress),
+    sink: &mut dyn FnMut(Vec<(usize, TextHit)>, Progress),
     clock: &mut dyn FnMut() -> Instant,
-    skipped: &mut Vec<PathBuf>,
+    skipped: &mut Vec<(usize, PathBuf)>,
 ) -> RunEnd {
     let mut progress = Progress {
-        total: notes.len(),
+        total: work.len(),
         ..Progress::default()
     };
     let mut batch = Vec::new();
@@ -313,15 +372,16 @@ fn batch_outcomes(
         if cancelled() {
             return RunEnd::Cancelled;
         }
+        let (root, note) = work[index];
         match outcome {
             Searched::Hit(hit) => {
-                batch.push(hit);
+                batch.push((root, hit));
                 hits += 1;
             }
             Searched::NoMatch => {}
             Searched::Skipped(reason) => {
                 progress.skipped[reason.index()] += 1;
-                skipped.push(notes[index].path.clone());
+                skipped.push((root, note.path.clone()));
             }
         }
         progress.visited += 1;
@@ -574,6 +634,164 @@ mod tests {
             .map(|note| (note.path.clone(), "a needle here".to_owned()))
             .collect();
         (notes, overlays)
+    }
+
+    /// `run_roots` to the end, its hits with their root index.
+    fn search_roots(
+        roots: &[SearchRoot<'_>],
+        query: &str,
+    ) -> (RunEnd, Vec<(usize, TextHit)>, Progress) {
+        let mut batches: Vec<(Vec<(usize, TextHit)>, Progress)> = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let end = run_roots(
+            roots,
+            &find(query),
+            &cancel,
+            &mut |hits, progress| batches.push((hits, progress)),
+            &mut Vec::new(),
+        );
+        let progress = batches.last().map(|(_, progress)| *progress).unwrap();
+        let hits = batches.into_iter().flat_map(|(hits, _)| hits).collect();
+        (end, hits, progress)
+    }
+
+    #[test]
+    fn run_roots_tags_hits_with_their_root_and_shares_the_cap() {
+        // Break caught: the cap applied per notebook (two notebooks listing 1000), or a hit's
+        // root index pointing at a notebook that doesn't hold the file.
+        let (a, b) = (Scratch::new("roots-cap-a"), Scratch::new("roots-cap-b"));
+        let a_notes: Vec<SearchNote> = (0..RESULT_CAP)
+            .map(|i| a.file(&format!("a{i}.md"), b"needle"))
+            .collect();
+        let b_notes: Vec<SearchNote> = (0..RESULT_CAP)
+            .map(|i| b.file(&format!("b{i}.md"), b"needle"))
+            .collect();
+        let none = HashMap::new();
+        let roots = [
+            SearchRoot {
+                folder: &a.0,
+                notes: &a_notes,
+                overlays: &none,
+            },
+            SearchRoot {
+                folder: &b.0,
+                notes: &b_notes,
+                overlays: &none,
+            },
+        ];
+        let (end, hits, _) = search_roots(&roots, "needle");
+        assert_eq!(end, RunEnd::Capped);
+        assert_eq!(hits.len(), RESULT_CAP);
+        for (index, hit) in &hits {
+            assert!(
+                roots[*index].folder.join(&hit.path).is_file(),
+                "{index} {hit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_roots_progress_totals_every_root() {
+        // Break caught: progress reading "2 of 2" while a second notebook is still unsearched.
+        let (a, b) = (Scratch::new("roots-total-a"), Scratch::new("roots-total-b"));
+        let a_notes = vec![a.file("1.md", b"x"), a.file("2.md", b"x")];
+        let b_notes = vec![
+            b.file("3.md", b"x"),
+            b.file("4.md", b"x"),
+            b.file("5.md", b"x"),
+        ];
+        let none = HashMap::new();
+        let roots = [
+            SearchRoot {
+                folder: &a.0,
+                notes: &a_notes,
+                overlays: &none,
+            },
+            SearchRoot {
+                folder: &b.0,
+                notes: &b_notes,
+                overlays: &none,
+            },
+        ];
+        let (end, hits, progress) = search_roots(&roots, "needle");
+        assert_eq!(end, RunEnd::Completed);
+        assert!(hits.is_empty());
+        assert_eq!((progress.visited, progress.total), (5, 5));
+    }
+
+    #[test]
+    fn run_roots_reads_each_roots_overlay_by_its_own_folder() {
+        // Break caught: B's dirty tab text used for A's note of the same relative path.
+        let (a, b) = (
+            Scratch::new("roots-overlay-a"),
+            Scratch::new("roots-overlay-b"),
+        );
+        let a_notes = vec![a.file("n.md", b"plain")];
+        let b_notes = vec![b.file("n.md", b"plain")];
+        let none = HashMap::new();
+        let b_overlays: HashMap<PathBuf, String> =
+            [(PathBuf::from("n.md"), "a needle".to_owned())].into();
+        let roots = [
+            SearchRoot {
+                folder: &a.0,
+                notes: &a_notes,
+                overlays: &none,
+            },
+            SearchRoot {
+                folder: &b.0,
+                notes: &b_notes,
+                overlays: &b_overlays,
+            },
+        ];
+        let (_, hits, _) = search_roots(&roots, "needle");
+        assert_eq!(
+            hits.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [1]
+        );
+    }
+
+    #[test]
+    fn run_roots_names_skipped_notes_with_their_root() {
+        // Break caught: a narrowed search revisiting a skipped note in the wrong notebook.
+        let b = Scratch::new("roots-skipped-b");
+        let a_notes: Vec<SearchNote> = Vec::new();
+        let b_notes = vec![SearchNote {
+            online_only: true,
+            ..b.file("cloud.md", b"needle")
+        }];
+        let none = HashMap::new();
+        let roots = [
+            SearchRoot {
+                folder: Path::new(r"C:\nowhere"),
+                notes: &a_notes,
+                overlays: &none,
+            },
+            SearchRoot {
+                folder: &b.0,
+                notes: &b_notes,
+                overlays: &none,
+            },
+        ];
+        let mut skipped = Vec::new();
+        let cancel = AtomicBool::new(false);
+        run_roots(
+            &roots,
+            &find("needle"),
+            &cancel,
+            &mut |_, _| {},
+            &mut skipped,
+        );
+        assert_eq!(skipped, [(1, PathBuf::from("cloud.md"))]);
+    }
+
+    #[test]
+    fn narrowing_reruns_when_the_notebook_set_changes() {
+        // Break caught: a longer query reusing hits that never searched a notebook opened since,
+        // or a notebook whose notes changed.
+        assert!(marks_match(&[(1, 10), (2, 20)], &[(2, 20), (1, 10)]));
+        assert!(!marks_match(&[(1, 10)], &[(1, 10), (2, 20)]));
+        assert!(!marks_match(&[(1, 10), (2, 20)], &[(1, 10), (2, 21)]));
+        assert!(!marks_match(&[(1, 10), (2, 20)], &[(1, 10)]));
     }
 
     #[test]

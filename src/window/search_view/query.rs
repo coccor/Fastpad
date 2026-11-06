@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::config::SidebarView;
-use crate::library::model::same_path;
 use crate::platform::wide_null;
 use crate::search::{MatchOptions, SearchOption};
 use crate::window::library_host;
@@ -74,42 +73,92 @@ pub(super) fn clear_search(hwnd: HWND) {
     }
 }
 
-/// Part of `side_panel::refresh`. The view searches the target notebook (multi-root notebooks
-/// spec §5.3). A new target cancels the search and clears the query and the results. The same
-/// notebook runs the query again if its notes changed, or, while the view is hidden, checks once
-/// it shows again.
+/// Part of `side_panel::refresh`. The view searches every loaded open notebook, or the scoped
+/// one (multi-root search spec §4); switching tabs changes nothing. A notebook opening, closing
+/// or finishing its load drops the rows of notebooks no longer searched at once and runs the
+/// query again (through the note lists' marks, `text_search_host::library_changed`), or, while
+/// the view is hidden, once it shows again. With no notebook open at all, the query and the
+/// results are cleared.
 pub(crate) fn library_changed(hwnd: HWND) {
-    let target = shown_target(hwnd);
-    let notebook = target.and_then(|id| library_host::notebook_folder(hwnd, id));
-    let name = target.and_then(|id| library_host::notebook_display_name(hwnd, id));
-    let loaded = target.is_some_and(|id| library_host::with_notebook(hwnd, id, |_| ()).is_some());
-    let failed = target.is_some_and(|id| library_host::load_failed_of(hwnd, id));
-    let Some((edit, changed)) = with_view(hwnd, |view| {
-        let changed = match (&view.notebook, &notebook) {
-            (Some(old), Some(new)) => !same_path(old, new),
-            (None, None) => false,
-            _ => true,
-        };
-        view.loaded = loaded;
+    // A replace writing into a notebook that just closed stops writing there.
+    text_search_host::stop_closed_parts(hwnd);
+    let open = library_host::notebooks(hwnd);
+    let several = open.len() > 1;
+    let all = library_host::searchable_notebooks(hwnd);
+    let failed = !open.is_empty()
+        && open
+            .iter()
+            .all(|(id, _)| library_host::load_failed_of(hwnd, *id));
+    // A scope whose notebook closed goes back to all notebooks (spec §4.1).
+    let scope = with_view(hwnd, |view| view.scope)
+        .flatten()
+        .filter(|id| several && open.iter().any(|(open, _)| open == id));
+    let searched: Vec<Searchable> = all
+        .iter()
+        .filter(|s| scope.is_none_or(|id| s.id == id))
+        .cloned()
+        .collect();
+    let name = match scope {
+        Some(id) => all.iter().find(|s| s.id == id).map(|s| s.label.clone()),
+        None if several => Some("all notebooks".to_owned()),
+        None => open
+            .first()
+            .and_then(|(id, _)| library_host::notebook_display_name(hwnd, *id)),
+    };
+    let suffix = if several && scope.is_none() {
+        library_host::skipped_suffix(library_host::skipped_notebooks(hwnd))
+    } else {
+        String::new()
+    };
+    let header = format!("{}{suffix}", header_text(name.as_deref()));
+    let Some((edit, closed_all, refolded)) = with_view(hwnd, |view| {
+        let closed_all = view.open && open.is_empty();
+        // A notebook whose folder changed under the same id: its rows, and any search reading
+        // it, are another folder's.
+        let refolded: Vec<library_host::NotebookId> = view
+            .notebooks
+            .iter()
+            .filter(|old| {
+                searched
+                    .iter()
+                    .any(|new| new.id == old.id && new.folder != old.folder)
+            })
+            .map(|old| old.id)
+            .collect();
+        view.results
+            .retain(|result| !refolded.contains(&result.notebook));
+        view.open = !open.is_empty();
+        view.loaded = !all.is_empty();
         view.failed = failed;
-        if view.notebook_name != name {
-            // The header names the notebook ("Searching <name>").
-            view.notebook_name = name;
+        view.scope = scope;
+        if view.header != header {
+            view.header = header;
             invalidate(view.panel);
         }
-        if changed {
-            view.notebook = notebook.clone();
-            view.placeholder = placeholder(notebook.as_deref());
+        view.placeholder = placeholder(name.as_deref());
+        let moved = view.several != several
+            || view.notebooks.len() != searched.len()
+            || view.notebooks.iter().zip(&searched).any(|(a, b)| a != b);
+        view.several = several;
+        view.notebooks = searched;
+        if moved {
+            view.relist();
+            invalidate(view.panel);
+        }
+        if closed_all {
             view.clear_results();
             view.query.clear();
             view.search = SearchState::Idle;
             view.stale = false;
         }
-        (view.edit, changed)
+        (view.edit, closed_all, !refolded.is_empty())
     }) else {
         return;
     };
-    if changed {
+    if refolded {
+        text_search_host::forget(hwnd);
+    }
+    if closed_all {
         text_search_host::forget(hwnd);
         // Clearing the box sends EN_CHANGE, which leaves the view idle.
         if let Some(edit) = edit {
@@ -127,43 +176,25 @@ pub(crate) fn library_changed(hwnd: HWND) {
     }
 }
 
-/// The target notebook may have changed (another tab came to the front, the view showed): the
-/// view catches up only when it now names another notebook, as `library_changed` does.
-pub(crate) fn target_changed(hwnd: HWND) {
-    let notebook = shown_target(hwnd).and_then(|id| library_host::notebook_folder(hwnd, id));
-    let moved = with_view(hwnd, |view| match (&view.notebook, &notebook) {
-        (Some(old), Some(new)) => !same_path(old, new),
-        (None, None) => false,
-        _ => true,
-    })
-    .unwrap_or(false);
-    if moved {
-        library_changed(hwnd);
+/// Limits the search to the open notebook `scope`, or to none for all notebooks (spec §4.1),
+/// and runs the query again at once.
+pub(crate) fn set_scope(hwnd: HWND, scope: Option<library_host::NotebookId>) {
+    if with_view(hwnd, |view| view.scope = scope).is_none() {
+        return;
     }
+    library_changed(hwnd);
+    text_search_host::run_now(hwnd);
 }
 
-/// The notebook the view should show: the target notebook, except while a replace runs, when
-/// the view keeps the notebook it started in (while that is still open) so the replace is not
-/// cancelled by a tab switch; `text_search_host::finish_replace` catches the view up.
-fn shown_target(hwnd: HWND) -> Option<library_host::NotebookId> {
-    // A hidden view keeps its notebook, and its query, while that notebook is open: a refresh
-    // while another view shows (where a stale tree row can move the target) must not clear
-    // it. `shown` catches the view up when it shows again.
-    let hidden =
-        crate::window::side_panel::current_view(hwnd) != crate::config::SidebarView::Search;
-    if (hidden || text_search_host::replacing(hwnd))
-        && let Some(kept) = notebook(hwnd)
-        && let Some(id) = library_host::notebook_of(hwnd, &kept)
-        && library_host::notebook_folder(hwnd, id).is_some_and(|open| same_path(&open, &kept))
-    {
-        return Some(id);
-    }
-    library_host::target_notebook(hwnd)
+/// The notebook the search is limited to, `None` for all.
+#[cfg(test)]
+pub(crate) fn scope(hwnd: HWND) -> Option<library_host::NotebookId> {
+    with_view(hwnd, |view| view.scope).flatten()
 }
 
-/// The folder of the notebook the view searches and its results come from.
-pub(crate) fn notebook(hwnd: HWND) -> Option<std::path::PathBuf> {
-    with_view(hwnd, |view| view.notebook.clone()).flatten()
+/// The notebooks the view searches, in sidebar order (spec §4.3).
+pub(crate) fn searched_notebooks(hwnd: HWND) -> Vec<Searchable> {
+    with_view(hwnd, |view| view.notebooks.clone()).unwrap_or_default()
 }
 
 /// The box's text and the options, or `None` before the box exists.

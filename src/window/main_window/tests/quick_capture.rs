@@ -73,7 +73,7 @@ fn ctrl_enter_appends_to_the_inbox_and_closes_the_box() {
         "# Inbox\n\n- 10:30 Call Dana about the budget #atlas\n  soon\n"
     );
     assert_eq!(notices(window.hwnd), ["Captured to inbox.md."]);
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_listed(std::path::Path::new("inbox.md")));
     });
 }

@@ -13,7 +13,6 @@ use crate::window::option_toggles;
 use crate::window::panel::{create_child, fill, text_height};
 use crate::window::side_panel::{self, draw_text};
 use crate::window::text_search_host;
-use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, EndPaint, HFONT, InvalidateRect,
@@ -90,13 +89,10 @@ pub(crate) fn show_replace(hwnd: HWND) {
     }
 }
 
-/// The listed notes' paths, relative to the notebook, in list order.
-pub(crate) fn result_paths(hwnd: HWND) -> Vec<PathBuf> {
+/// The listed notes, in list order.
+pub(crate) fn result_notes(hwnd: HWND) -> Vec<NoteRef> {
     with_view(hwnd, |view| {
-        view.results
-            .iter()
-            .map(|result| result.path.clone())
-            .collect()
+        view.results.iter().map(SearchHit::note).collect()
     })
     .unwrap_or_default()
 }
@@ -109,6 +105,7 @@ pub(crate) fn replace_candidates(hwnd: HWND) -> (Vec<text_search_host::Candidate
             .results
             .iter()
             .map(|hit| text_search_host::Candidate {
+                notebook: hit.notebook,
                 path: hit.path.clone(),
                 name: hit.name.clone(),
                 stamp: hit.stamp,
@@ -311,7 +308,7 @@ pub(super) fn create_edit(panel: HWND, hook: usize) -> crate::Result<HWND> {
 /// replace field's state changes. It never makes the box without a notebook: at startup that
 /// would come before the first paint. `shown` makes it once the user opens the view.
 pub(crate) fn layout(hwnd: HWND) {
-    let Some(has_notebook) = with_view(hwnd, |view| view.notebook.is_some()) else {
+    let Some(has_notebook) = with_view(hwnd, |view| view.open) else {
         return;
     };
     let show = side_panel::current_view(hwnd) == SidebarView::Search;
@@ -398,8 +395,6 @@ pub(super) fn hide_box(edit: HWND) {
 /// with no notebook: its toggles set the options (spec §4). `focus` puts the caret in the box. A
 /// library change while the view was hidden runs the query again now, if the notes changed.
 pub(crate) fn shown(hwnd: HWND, focus: bool) {
-    // The Notebook view no longer shows, so the target may be another notebook now.
-    super::target_changed(hwnd);
     ensure_edit(hwnd);
     layout(hwnd);
     if with_view(hwnd, |view| std::mem::take(&mut view.stale)).unwrap_or(false) {

@@ -44,7 +44,7 @@ fn renaming_a_folder_with_an_open_note_rebinds_the_tab_and_keeps_the_notes_pin()
         selected_kind(window.hwnd),
         Some(RowKind::Folder("Projects".into()))
     );
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_pinned(&new));
         assert!(!state.is_folder(std::path::Path::new("sub")));
     });
@@ -187,7 +187,7 @@ fn a_folder_rename_an_open_tab_cannot_follow_is_undone() {
     assert!(!scratch.folder().join("Moved").exists());
     let a_id = app_mut(window.hwnd).tabs.find_stored_path(&a);
     assert!(a_id.is_some(), "a's tab is back on its old path");
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_folder(std::path::Path::new("sub")));
         assert!(!state.is_folder(std::path::Path::new("Moved")));
     });
@@ -270,7 +270,7 @@ fn tree_move_a_note_moves_into_a_folder_with_its_dirty_tab_and_pin() {
     let active = app_mut(window.hwnd).tabs.active().unwrap();
     assert_eq!(active.path.as_deref(), Some(moved.as_path()));
     assert!(active.dirty);
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_pinned(&moved));
     });
     assert!(

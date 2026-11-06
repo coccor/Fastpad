@@ -65,9 +65,10 @@ fn the_search_view_finds_note_text_shows_folders_and_enter_opens_a_normal_tab() 
 }
 
 #[test]
-fn the_search_query_survives_a_view_switch_but_not_a_notebook_switch() {
-    // Break caught: the query lost whenever another view is shown, or kept (with results
-    // from the old notebook, or its search still reading) after a different notebook opens.
+fn the_search_query_survives_a_view_switch_and_a_notebooks_new_folder() {
+    // Break caught: the query lost whenever another view is shown, or the old folder's
+    // results (or its search still reading) kept after the notebook's folder changed; the
+    // query itself now stays and runs over the new notes (multi-root search spec §4.2).
     let _scintilla = load_native_scintilla();
     let first = LibraryScratch::new("search-keep-a");
     first.note("plan.md", "the plan");
@@ -88,21 +89,21 @@ fn the_search_query_survives_a_view_switch_but_not_a_notebook_switch() {
     second.install(window.hwnd);
     assert!(
         flag.load(Ordering::Relaxed),
-        "the notebook change cancelled it"
+        "the folder change cancelled it"
     );
-    assert!(search_rows(window.hwnd).is_empty());
-    assert_eq!(
-        search_state(window.hwnd),
-        crate::window::search_view::SearchState::Idle
+    assert!(
+        search_rows(window.hwnd).is_empty(),
+        "the old folder's rows went"
     );
     let edit = crate::window::search_view::edit_hwnd(window.hwnd).unwrap();
     assert_eq!(
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit) },
-        0
+        4,
+        "the query stays"
     );
-    // A late batch of the cancelled search shows nothing.
-    pump_posted_messages(window.hwnd);
-    assert!(search_rows(window.hwnd).is_empty());
+    // The query runs again, over the new folder's notes.
+    pump_until(window.hwnd, || search_rows(window.hwnd).len() == 1);
+    assert_eq!(search_rows(window.hwnd)[0].0, "other");
 }
 
 #[test]
@@ -125,7 +126,7 @@ fn a_hidden_search_view_searches_again_only_once_it_shows() {
 
     crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
     let added = scratch.note("planning.md", "planning");
-    crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.add_note(&added));
     let before = search_generation(window.hwnd);
     crate::window::side_panel::refresh(window.hwnd);
     // Past the debounce, so a re-run wrongly scheduled would have started.
@@ -477,7 +478,7 @@ fn replace_all_writes_the_closed_notes_updates_the_library_and_searches_again() 
     assert_eq!(std::fs::read_to_string(&b).unwrap(), "pin\n");
     assert_eq!(std::fs::read_to_string(&c).unwrap(), "nothing");
     let size = |relative: &str| {
-        crate::window::library_host::with_state(window.hwnd, |state| {
+        crate::window::library_host::with_default_state(window.hwnd, |state| {
             state
                 .notes
                 .iter()
@@ -621,7 +622,7 @@ fn the_row_replace_changes_one_note_and_asks_only_when_it_is_closed() {
     crate::window::modal::take_last_confirm();
     let before = search_generation(window.hwnd);
 
-    crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("b.md"));
+    crate::window::text_search_host::replace_in(window.hwnd, &first_note(window.hwnd, "b.md"));
     assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
     assert_eq!(crate::window::modal::take_last_confirm(), None, "b is open");
     assert_eq!(editor.text().unwrap(), "b pin");
@@ -635,7 +636,7 @@ fn the_row_replace_changes_one_note_and_asks_only_when_it_is_closed() {
 
     app_mut(window.hwnd).notifications.dismiss_all();
     crate::window::answer_next_confirm(|_| true);
-    crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("a.md"));
+    crate::window::text_search_host::replace_in(window.hwnd, &first_note(window.hwnd, "a.md"));
     assert_eq!(wait_for_report(window.hwnd), "Replaced 1 match in 1 note.");
     assert_eq!(
         crate::window::modal::take_last_confirm().as_deref(),

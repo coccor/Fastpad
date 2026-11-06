@@ -340,9 +340,126 @@ pub fn cache_file(local_path: &Path) -> PathBuf {
     local_path.with_extension("notes.cache")
 }
 
+/// One tag across several notebooks (multi-root search spec §6): as `TagNode`, with each note
+/// tagged by the key of the notebook it is in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergedTag<K> {
+    pub name: String,
+    pub full: String,
+    pub notes: Vec<(K, PathBuf)>,
+    pub count: usize,
+    pub children: Vec<MergedTag<K>>,
+}
+
+/// Merges several notebooks' tag trees into one: a tag in several is one node, spelled as the
+/// first of `sources` spells it, with its count the sum and its notes and child tags merged.
+/// Tags keep `tags`' natural name order; notes keep their natural path order, the earlier
+/// source first among equal paths.
+pub fn merge_tags<K: Copy>(sources: Vec<(K, Vec<TagNode>)>) -> Vec<MergedTag<K>> {
+    let mut merged: Vec<MergedTag<K>> = Vec::new();
+    let mut children: Vec<Vec<(K, Vec<TagNode>)>> = Vec::new();
+    for (key, nodes) in sources {
+        for node in nodes {
+            let index = match merged.iter().position(|tag| tag.full == node.full) {
+                Some(index) => index,
+                None => {
+                    merged.push(MergedTag {
+                        name: node.name.clone(),
+                        full: node.full.clone(),
+                        notes: Vec::new(),
+                        count: 0,
+                        children: Vec::new(),
+                    });
+                    children.push(Vec::new());
+                    merged.len() - 1
+                }
+            };
+            let tag = &mut merged[index];
+            tag.count += node.count;
+            tag.notes
+                .extend(node.notes.into_iter().map(|note| (key, note)));
+            children[index].push((key, node.children));
+        }
+    }
+    for (tag, children) in merged.iter_mut().zip(children) {
+        tag.children = merge_tags(children);
+        tag.notes.sort_by(|(_, a), (_, b)| {
+            super::tree::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy())
+        });
+    }
+    merged.sort_by(|a, b| super::tree::natural_cmp(&a.name, &b.name));
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tag whose count is its own notes plus its children's counts, as `tags` builds it.
+    fn node(name: &str, full: &str, notes: &[&str], children: Vec<TagNode>) -> TagNode {
+        TagNode {
+            name: name.to_owned(),
+            full: full.to_owned(),
+            count: notes.len() + children.iter().map(|child| child.count).sum::<usize>(),
+            notes: notes.iter().map(PathBuf::from).collect(),
+            children,
+        }
+    }
+
+    #[test]
+    fn merge_sums_counts_and_merges_children() {
+        // Break caught: one notebook's tag hiding another's, counts not added, or a child tag
+        // left under one notebook's copy (multi-root search spec §6).
+        let a = vec![node(
+            "project",
+            "project",
+            &["a.md"],
+            vec![node("q3", "project/q3", &["q.md"], vec![])],
+        )];
+        let b = vec![node("project", "project", &["b.md"], vec![])];
+        let merged = merge_tags(vec![(0u32, a), (1u32, b)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].count, 3);
+        assert_eq!(
+            merged[0].notes,
+            [(0, PathBuf::from("a.md")), (1, PathBuf::from("b.md"))]
+        );
+        assert_eq!(merged[0].children[0].full, "project/q3");
+        assert_eq!(merged[0].children[0].notes, [(0, PathBuf::from("q.md"))]);
+    }
+
+    #[test]
+    fn merge_folds_case_and_keeps_first_spelling() {
+        // Break caught: #Project and #project listed twice, or the spelling flipping with the
+        // order the indexes finished in.
+        let a = vec![node("Project", "project", &["a.md"], vec![])];
+        let b = vec![node("project", "project", &["b.md"], vec![])];
+        let merged = merge_tags(vec![(0u32, a), (1u32, b)]);
+        assert_eq!((merged[0].name.as_str(), merged[0].count), ("Project", 2));
+    }
+
+    #[test]
+    fn merge_keeps_same_path_from_two_notebooks() {
+        // Break caught: notes deduplicated by relative path across notebooks.
+        let a = vec![node("x", "x", &["todo.md"], vec![])];
+        let b = vec![node("x", "x", &["todo.md"], vec![])];
+        assert_eq!(merge_tags(vec![(0u32, a), (1u32, b)])[0].notes.len(), 2);
+    }
+
+    #[test]
+    fn merge_orders_tags_by_name() {
+        // Break caught: tags from the second notebook appended after the first's.
+        let a = vec![node("b", "b", &["1.md"], vec![])];
+        let b = vec![node("a", "a", &["2.md"], vec![])];
+        let merged = merge_tags(vec![(0u32, a), (1u32, b)]);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|tag| tag.full.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
 
     struct Scratch(PathBuf);
     impl Scratch {
