@@ -254,7 +254,143 @@ pub(crate) fn move_items(hwnd: HWND, from: NotebookId, items: Vec<RowKind>, dest
         side_panel::refresh(hwnd);
         return;
     }
-    finish(hwnd, from, dest_id, &dest_label, &plan, &done);
+    let failed = match dest_id {
+        Some(id) if answer == Answer::MoveWithImages => {
+            bring_images(hwnd, id, &source_root, &dest_root, &source, &plan, &done)
+        }
+        _ => 0,
+    };
+    finish(hwnd, dest_id, &dest_label, &plan, &done, failed);
+}
+
+/// A byte range of a note and its new text.
+type Edit = (std::ops::Range<usize>, String);
+
+/// The notes of `plan` that moved with `done`, before and after.
+fn moved_notes<'a>(
+    plan: &'a MovePlan,
+    done: &'a [(Item, PathBuf)],
+) -> impl Iterator<Item = &'a (PathBuf, PathBuf)> {
+    plan.notes.iter().filter(move |(old, _)| {
+        done.iter().any(|(item, _)| match item {
+            Item::Note(path) => library::model::same_path(path, old),
+            Item::Folder(folder) => library::is_inside(folder, old),
+        })
+    })
+}
+
+/// Move with images (spec §4.2): each image only moving notes use moves, any other is copied,
+/// into the destination's attachments folder for the note, under a free name, and the moved
+/// notes' links to it are rewritten. An image that fails keeps its links. Returns how many
+/// failed.
+fn bring_images(
+    hwnd: HWND,
+    dest_id: NotebookId,
+    source_root: &Path,
+    dest_root: &Path,
+    source: &Facts,
+    plan: &MovePlan,
+    done: &[(Item, PathBuf)],
+) -> usize {
+    let notes: Vec<&(PathBuf, PathBuf)> = moved_notes(plan, done).collect();
+    let exists = |relative: &Path| source_root.join(relative).is_file();
+    // Each moved note's text now, read before any image moves: the links resolve against the
+    // source as it still is.
+    let texts: Vec<(&(PathBuf, PathBuf), String, Option<library::DiskStamp>)> = notes
+        .iter()
+        .filter_map(|pair| {
+            let path = dest_root.join(&pair.1);
+            let stamp = library::disk_stamp(&path);
+            let text = crate::file::loader::load(&path).ok()?.text;
+            Some((*pair, text, stamp))
+        })
+        .collect();
+    let mut chosen: Vec<PathBuf> = Vec::new();
+    let mut edits: Vec<(usize, Vec<Edit>)> = Vec::new();
+    let mut failed = 0;
+    for image in &plan.images {
+        // Only images a moved note uses come along.
+        let Some(first) = image.uses.iter().find_map(|usage| {
+            notes
+                .iter()
+                .find(|(old, _)| library::model::same_path(old, &usage.note))
+        }) else {
+            continue;
+        };
+        let folder = attachments_folder(hwnd, dest_id, dest_root, &first.1);
+        let taken = |relative: &Path| {
+            dest_root.join(relative).exists()
+                || chosen
+                    .iter()
+                    .any(|other| library::model::same_path(other, relative))
+        };
+        let landing = cross_move::image_destination(
+            &folder,
+            image.source.file_name().unwrap_or_default(),
+            &taken,
+        );
+        chosen.push(landing.clone());
+        let pair = [(image.source.clone(), landing.clone())];
+        let image_edits: Vec<(usize, Vec<_>)> = texts
+            .iter()
+            .enumerate()
+            .map(|(index, ((old, new), text, _))| {
+                (
+                    index,
+                    cross_move::image_link_edits(
+                        text,
+                        old,
+                        new,
+                        &source.attachments,
+                        &exists,
+                        &pair,
+                    ),
+                )
+            })
+            .filter(|(_, edits)| !edits.is_empty())
+            .collect();
+        let (from, to) = (source_root.join(&image.source), dest_root.join(&landing));
+        library_host::begin_own_writes(hwnd, [from.as_path(), to.as_path()]);
+        let arrived = to
+            .parent()
+            .is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
+            && if image.users_only_moving {
+                files::move_file(&from, &to).is_ok()
+            } else {
+                files::copy_file_no_replace(&from, &to).is_ok()
+            };
+        if !arrived {
+            failed += 1;
+            continue;
+        }
+        edits.extend(image_edits);
+    }
+    let mut note_edits: Vec<library::links::NoteEdits> = Vec::new();
+    for (index, ((_, new), _, stamp)) in texts.iter().enumerate() {
+        let mut ranges: Vec<_> = edits
+            .iter()
+            .filter(|(at, _)| *at == index)
+            .flat_map(|(_, edits)| edits.iter().cloned())
+            .collect();
+        if ranges.is_empty() {
+            continue;
+        }
+        let Some(stamp) = stamp else {
+            continue;
+        };
+        ranges.sort_by_key(|(range, _)| range.start);
+        note_edits.push(library::links::NoteEdits {
+            note: new.clone(),
+            size: stamp.size,
+            mtime: library::filetime_ticks(stamp.modified),
+            own: true,
+            edits: ranges,
+        });
+    }
+    if !note_edits.is_empty() {
+        library_host::write_link_edits_of(hwnd, dest_id, &note_edits);
+    }
+    failed
 }
 
 /// A note going to another drive: `move_file` copies then deletes. `Err(None)` when the copy
@@ -388,15 +524,14 @@ fn hand_off(
 /// strip repaints and a notice says what moved.
 fn finish(
     hwnd: HWND,
-    from: NotebookId,
     dest_id: Option<NotebookId>,
     dest_label: &str,
     plan: &MovePlan,
     done: &[(Item, PathBuf)],
+    failed_images: usize,
 ) {
-    let _ = from;
     super::main_window::invalidate_title_strip(hwnd);
-    let notice = match done {
+    let mut notice = match done {
         [(Item::Note(path), _)] => format!("Moved {} to {dest_label}.", name_of(path)),
         [(Item::Folder(path), _)] => {
             let count = plan
@@ -413,6 +548,11 @@ fn finish(
         }
         _ => format!("Moved {} items to {dest_label}.", done.len()),
     };
+    match failed_images {
+        0 => {}
+        1 => notice.push_str(" 1 image couldn't be brought along."),
+        count => notice.push_str(&format!(" {count} images couldn't be brought along.")),
+    }
     match (dest_id, done.last()) {
         (Some(id), Some((item, landing))) => {
             for ancestor in tree::ancestors(landing) {

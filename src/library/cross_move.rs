@@ -412,46 +412,41 @@ pub fn image_destination(folder: &Path, name: &OsStr, taken: &dyn Fn(&Path) -> b
         .unwrap_or(first)
 }
 
-/// The edits to the note that moved from `note_old` to `note_new` (relative to the source and
-/// the destination) that point its image links at where `moved` (source → destination) put
-/// the images: a Markdown image gets its new relative path, a wiki embed the new file name.
-/// In order of position.
+/// The edits to `text`, the note that moved from `note_old` to `note_new` (relative to the
+/// source and the destination), that point its image links at where `moved` (source →
+/// destination) put the images: a Markdown image gets its new relative path, a wiki embed the
+/// new file name. Read from `text` as it is now, not from the index, which may predate a save.
+/// Links resolve as the planner resolves them, against the source (`attachments`, `exists`),
+/// so this runs before the images move. In order of position.
 pub fn image_link_edits(
-    images: &[Image],
+    text: &str,
     note_old: &Path,
     note_new: &Path,
+    attachments: &Path,
+    exists: &dyn Fn(&Path) -> bool,
     moved: &[(PathBuf, PathBuf)],
 ) -> Vec<(Range<usize>, String)> {
-    let mut edits: Vec<(Range<usize>, String)> = images
+    super::facts::note_facts(text)
+        .links
         .iter()
-        .filter_map(|image| {
+        .filter_map(|link| {
+            let target = image_target(note_old, link, attachments, exists)?;
             let (_, new) = moved
                 .iter()
-                .find(|(old, _)| super::model::same_path(old, &image.source))?;
-            Some((image, new))
+                .find(|(old, _)| super::model::same_path(old, &target))?;
+            let replacement = match link.kind {
+                LinkKind::Image | LinkKind::Markdown => {
+                    super::links::relative_target(note_new, new, &link.target)
+                }
+                LinkKind::Wiki => new
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            Some((link.start as usize..link.end as usize, replacement))
         })
-        .flat_map(|(image, new)| {
-            image
-                .uses
-                .iter()
-                .filter(|usage| super::model::same_path(&usage.note, note_old))
-                .map(move |usage| {
-                    let text = match usage.kind {
-                        LinkKind::Image | LinkKind::Markdown => {
-                            super::links::relative_target(note_new, new, &usage.target)
-                        }
-                        LinkKind::Wiki => new
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned(),
-                    };
-                    (usage.range.clone(), text)
-                })
-        })
-        .collect();
-    edits.sort_by_key(|(range, _)| range.start);
-    edits
+        .collect()
 }
 
 #[cfg(test)]
@@ -781,16 +776,24 @@ mod tests {
             PathBuf::from(r"attachments\x.png"),
             PathBuf::from(r"assets\x (2).png"),
         )];
+        assert_eq!(plan.images.len(), 1);
+        // The note was saved after the index read it: the edits follow the text on disk now.
+        let now = "New first line.\nSee ![a](../attachments/x.png) and ![[x.png]].";
         let edits = image_link_edits(
-            &plan.images,
+            now,
             Path::new(r"work\b.md"),
             Path::new(r"p\b.md"),
+            Path::new("attachments"),
+            &exists,
             &moved,
         );
-        let mut out = text.to_owned();
+        let mut out = now.to_owned();
         for (range, new) in edits.iter().rev() {
             out.replace_range(range.clone(), new);
         }
-        assert_eq!(out, "See ![a](../assets/x%20(2).png) and ![[x (2).png]].");
+        assert_eq!(
+            out,
+            "New first line.\nSee ![a](../assets/x%20(2).png) and ![[x (2).png]]."
+        );
     }
 }

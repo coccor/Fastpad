@@ -365,3 +365,125 @@ fn a_note_to_another_drive_moves_through_move_file() {
     assert!(t.b.join("a.md").exists());
     assert!(listed(hwnd, t.b_id, "a.md"));
 }
+
+/// A with `a.md` embedding `x.png` (only it) and `y.png` (shared with `stay.md`), both in A's
+/// attachments folder; `a.md` open in a clean tab.
+fn with_images(label: &str, b_notes: &[(&str, &str)]) -> Two {
+    let t = two(
+        label,
+        &[
+            ("a.md", "![x](attachments/x.png)\n![y](attachments/y.png)\n"),
+            ("stay.md", "![y](attachments/y.png)\n"),
+            (r"attachments\x.png", "x-image"),
+            (r"attachments\y.png", "y-image"),
+        ],
+        b_notes,
+    );
+    super::super::open_path(t.window.hwnd, &t.a.join("a.md")).unwrap();
+    app_mut(t.window.hwnd).notifications.dismiss_all();
+    t
+}
+
+#[test]
+fn move_with_images_moves_a_sole_image_copies_a_shared_one_and_rewrites_the_link() {
+    // Break caught: a moved note that loses its images, a shared image taken from the note that
+    // stays, or links left pointing at the old notebook.
+    let _scintilla = load_native_scintilla();
+    let t = with_images("ximg-with", &[(r"projects\keep.md", "")]);
+    let hwnd = t.window.hwnd;
+    crate::window::modal::answer_next_choice(|_| 0);
+
+    cross_move_host::move_items(hwnd, t.a_id, vec![note("a.md")], into(t.b_id, "projects"));
+
+    let (text, buttons) = crate::window::modal::take_last_choice().unwrap();
+    assert_eq!(
+        text,
+        "Move a.md to B? It uses 2 images from A's attachments folder."
+    );
+    assert_eq!(
+        buttons,
+        ["Move with images", "Move without images", "Cancel"]
+    );
+    assert!(t.b.join(r"attachments\x.png").exists());
+    assert!(!t.a.join(r"attachments\x.png").exists(), "x moved");
+    assert!(t.b.join(r"attachments\y.png").exists());
+    assert!(t.a.join(r"attachments\y.png").exists(), "y copied");
+    let expected = "![x](../attachments/x.png)\n![y](../attachments/y.png)\n";
+    assert_eq!(
+        std::fs::read_to_string(t.b.join(r"projects\a.md")).unwrap(),
+        expected
+    );
+    assert_eq!(t.editor.text().unwrap(), expected, "the clean tab shows it");
+}
+
+#[test]
+fn move_without_images_touches_no_image() {
+    let _scintilla = load_native_scintilla();
+    let t = with_images("ximg-without", &[]);
+    let hwnd = t.window.hwnd;
+    crate::window::modal::answer_next_choice(|_| 1);
+
+    cross_move_host::move_items(hwnd, t.a_id, vec![note("a.md")], into(t.b_id, ""));
+
+    assert!(t.b.join("a.md").exists());
+    assert!(t.a.join(r"attachments\x.png").exists());
+    assert!(!t.b.join("attachments").exists());
+    assert_eq!(
+        std::fs::read_to_string(t.b.join("a.md")).unwrap(),
+        "![x](attachments/x.png)\n![y](attachments/y.png)\n"
+    );
+}
+
+#[test]
+fn a_taken_image_name_gets_a_number_and_the_link_follows() {
+    // Break caught: a brought-along image written over the destination's own image.
+    let _scintilla = load_native_scintilla();
+    let t = with_images("ximg-taken", &[(r"attachments\x.png", "b's own")]);
+    let hwnd = t.window.hwnd;
+    crate::window::modal::answer_next_choice(|_| 0);
+
+    cross_move_host::move_items(hwnd, t.a_id, vec![note("a.md")], into(t.b_id, ""));
+
+    assert_eq!(
+        std::fs::read_to_string(t.b.join(r"attachments\x.png")).unwrap(),
+        "b's own"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.b.join(r"attachments\x (2).png")).unwrap(),
+        "x-image"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.b.join("a.md")).unwrap(),
+        "![x](attachments/x%20(2).png)\n![y](attachments/y.png)\n"
+    );
+}
+
+#[test]
+fn an_image_that_fails_keeps_its_link_and_the_notice_says_so() {
+    // Break caught: a link rewritten to an image that never arrived, or a failure nobody hears
+    // about.
+    let _scintilla = load_native_scintilla();
+    let t = with_images("ximg-fail", &[]);
+    let hwnd = t.window.hwnd;
+    let gone = t.a.join(r"attachments\x.png");
+    crate::window::modal::answer_next_choice(move |_| {
+        std::fs::remove_file(&gone).unwrap();
+        0
+    });
+
+    cross_move_host::move_items(hwnd, t.a_id, vec![note("a.md")], into(t.b_id, ""));
+
+    assert_eq!(
+        std::fs::read_to_string(t.b.join("a.md")).unwrap(),
+        "![x](attachments/x.png)\n![y](attachments/y.png)\n",
+        "x's link unchanged, y's needed no change"
+    );
+    assert!(t.b.join(r"attachments\y.png").exists());
+    assert!(
+        notices(hwnd)
+            .iter()
+            .any(|notice| notice.ends_with("1 image couldn't be brought along.")),
+        "{:?}",
+        notices(hwnd)
+    );
+}
