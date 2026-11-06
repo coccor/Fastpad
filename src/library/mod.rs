@@ -4,6 +4,7 @@
 
 pub mod capture;
 pub mod capture_file;
+pub mod cross_move;
 pub mod dates;
 pub mod external;
 pub mod facts;
