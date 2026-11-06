@@ -211,14 +211,14 @@ fn the_split_preview_and_source_segments_show_their_modes() {
 }
 
 #[test]
-fn ctrl_shift_v_cycles_source_live_split_preview() {
+fn ctrl_shift_v_cycles_source_split_preview_live() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
     main.make_markdown("text\n");
     for expected in [
-        ViewMode::Live,
         ViewMode::Split,
         ViewMode::Preview,
+        ViewMode::Live,
         ViewMode::Source,
     ] {
         main.command(CommandId::MarkdownViewCycle);

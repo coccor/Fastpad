@@ -944,13 +944,13 @@ mod tests {
                 .iter()
                 .map(|s| s.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Source", "Live", "Split", "Preview"]
+            ["Source", "Split", "Preview", "Live"]
         );
         assert_eq!(view.selected_segment(Row::MarkdownView), Some(0));
         view.settings.markdown_view = ViewMode::Split;
-        assert_eq!(view.selected_segment(Row::MarkdownView), Some(2));
+        assert_eq!(view.selected_segment(Row::MarkdownView), Some(1));
         assert_eq!(
-            view.segment_action(Row::MarkdownView, 1),
+            view.segment_action(Row::MarkdownView, 3),
             Some(SettingsAction::SetMarkdownView(ViewMode::Live))
         );
         assert_eq!(view.segment_action(Row::MarkdownView, 4), None);
