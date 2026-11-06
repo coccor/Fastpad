@@ -327,7 +327,7 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
         key(VK_TAB); // Preview line height
         key(VK_UP); // 1.6 -> 1.7
         key(VK_TAB); // Markdown view
-        key(VK_RIGHT); // Source → Live
+        key(VK_RIGHT); // Source → Split
         key(VK_TAB); // Tab width
         key(VK_RIGHT); // 4 → 8
         key(VK_TAB); // Indent with spaces
@@ -342,14 +342,14 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
     assert_eq!(settings.font_size, 16);
     assert_eq!(settings.preview_font_size, 15);
     assert_eq!(settings.preview_line_height, 17);
-    assert_eq!(settings.markdown_view, crate::preview::ViewMode::Live);
+    assert_eq!(settings.markdown_view, crate::preview::ViewMode::Split);
     assert_eq!(settings.tab_width, 8);
     assert!(settings.insert_spaces);
     super::super::save_settings_to(None);
     assert_eq!(
         std::fs::read_to_string(&ini).unwrap(),
         "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\npreview_font_size=15\r\n\
-         preview_line_height=1.7\r\nmarkdown_view=live\r\ntab_width=8\r\ninsert_spaces=true\r\n"
+         preview_line_height=1.7\r\nmarkdown_view=split\r\ntab_width=8\r\ninsert_spaces=true\r\n"
     );
 }
 

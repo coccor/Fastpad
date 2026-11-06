@@ -451,19 +451,19 @@ fn the_toolbar_segments_switch_the_view_mode() {
         .set_active_language(crate::document::Language::Markdown);
     crate::window::preview_host::sync_visibility(window.hwnd);
     let hwnd = crate::window::editor_toolbar::hwnd(window.hwnd).unwrap();
-    // Segments: Source, Live, Split, Preview.
+    // Segments: Source, Split, Preview, Live.
     let click = |index| unsafe {
         let at = crate::window::editor_toolbar::segment_rect(hwnd, 4, index).center();
         SendMessageW(hwnd, WM_LBUTTONDOWN, 1, client_lparam(at.x, at.y));
         SendMessageW(hwnd, WM_LBUTTONUP, 0, client_lparam(at.x, at.y));
     };
-    click(2);
+    click(1);
     assert_eq!(
         crate::window::preview_host::mode(window.hwnd),
         crate::preview::ViewMode::Split
     );
     // The current segment stays selected.
-    click(2);
+    click(1);
     assert_eq!(
         crate::window::preview_host::mode(window.hwnd),
         crate::preview::ViewMode::Split

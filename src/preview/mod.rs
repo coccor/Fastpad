@@ -36,7 +36,7 @@ pub enum ViewMode {
 
 impl ViewMode {
     /// The cycle order, and the floating control's order.
-    pub const ALL: [Self; 4] = [Self::Source, Self::Live, Self::Split, Self::Preview];
+    pub const ALL: [Self; 4] = [Self::Source, Self::Split, Self::Preview, Self::Live];
     /// The modes an SVG tab can show.
     pub const SVG: [Self; 3] = [Self::Source, Self::Split, Self::Preview];
 
@@ -100,10 +100,10 @@ mod tests {
     #[test]
     fn the_cycle_visits_every_mode_and_skips_the_unavailable_ones() {
         let all = |_| true;
-        assert_eq!(ViewMode::Source.next(all), ViewMode::Live);
-        assert_eq!(ViewMode::Live.next(all), ViewMode::Split);
+        assert_eq!(ViewMode::Source.next(all), ViewMode::Split);
         assert_eq!(ViewMode::Split.next(all), ViewMode::Preview);
-        assert_eq!(ViewMode::Preview.next(all), ViewMode::Source);
+        assert_eq!(ViewMode::Preview.next(all), ViewMode::Live);
+        assert_eq!(ViewMode::Live.next(all), ViewMode::Source);
         // Break caught: an SVG tab cycling into Live and getting a "Markdown only" notice.
         let no_live = |mode| mode != ViewMode::Live;
         assert_eq!(ViewMode::Source.next(no_live), ViewMode::Split);
